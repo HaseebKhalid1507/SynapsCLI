@@ -364,6 +364,7 @@ fn screen_text(text: &str) -> String {
 pub(super) fn capture_text(message: &Value) -> Option<String> {
     if message.get("_synaps_context").is_some()
         || crate::engine::interrupt::is_tool_in_flight_note(message)
+        || crate::engine::interrupt::is_harness_note(message)
         || !visible(message)
     {
         return None;
@@ -497,6 +498,14 @@ mod tests {
             &["bash".into()],
         );
         assert!(capture_text(&note).is_none());
+        // Nor are the turn loop's harness notes.
+        for note in [
+            agent_core::core::host_note::OUTPUT_LIMIT_NOTE.to_string(),
+            agent_core::core::host_note::output_limit_tool_note_text("write"),
+            agent_core::core::host_note::PREAMBLE_NUDGE_NOTE.to_string(),
+        ] {
+            assert!(capture_text(&json!({"role":"user","content":note})).is_none());
+        }
     }
 
     #[test]

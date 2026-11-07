@@ -505,6 +505,11 @@ define_settings! {
             Err(_) => SettingApply::Local(Err("expected a whole number".to_string())),
         };
 
+    "output_limit_continuations", "Cut-off continuations", Context,
+        EditorKind::Text { numeric: true },
+        "Automatic continuations in a row when a response is cut off at the output-token limit with nothing to run (0–10, default 2; 0 = the turn ends there). A round that runs its tools resets the count. Takes effect next launch.",
+        |_app, value| whole_number("output_limit_continuations", value);
+
     "telemetry", "Telemetry", Context, EditorKind::Cycler(&["off", "basic", "full"]),
         "Per-request API log in ~/.cache/synaps/api-log.jsonl (stays on this machine): off (default), basic (timing, usage, cost) or full (adds rate-limit headers and cache diagnostics). Takes effect next launch.",
         |_app, value| match value {
@@ -1318,6 +1323,10 @@ mod tests {
             assert!(is_err(d("compaction_exclude", "thinking, secrets")));
             assert!(is_ok(d("refusal_retries", "4")));
             assert!(is_err(d("refusal_retries", "-1")));
+            assert!(is_ok(d("output_limit_continuations", "0")));
+            assert!(is_ok(d("output_limit_continuations", "10")));
+            assert!(is_err(d("output_limit_continuations", "11")));
+            assert!(is_err(d("output_limit_continuations", "-1")));
             assert!(is_err(d("telemetry", "loud")));
             assert!(is_ok(d("telemetry_log_generations", "5")));
             assert!(is_err(d("telemetry_log_generations", "0")));

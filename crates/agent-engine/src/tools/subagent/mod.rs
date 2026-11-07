@@ -1617,6 +1617,25 @@ mod retry_inheritance_tests {
             );
         }
     }
+
+    /// Workers continue after an output-limit cut-off on the parent's
+    /// `output_limit_continuations` (subagents have no human to say "continue").
+    #[test]
+    fn worker_policy_inherits_output_limit_continuations() {
+        for cap in [0, 1, 2, 10] {
+            let mut worker = crate::Runtime::new_headless();
+            let config = crate::SynapsConfig {
+                output_limit_continuations: cap,
+                ..Default::default()
+            };
+            super::apply_subagent_runtime_policy(&mut worker, &config, None, None, None, &Default::default());
+            assert_eq!(worker.output_limit_continuations(), cap);
+        }
+        assert_eq!(
+            crate::Runtime::new_headless().output_limit_continuations(),
+            crate::config::DEFAULT_OUTPUT_LIMIT_CONTINUATIONS
+        );
+    }
 }
 
 /// Workers run in the PARENT SESSION's directory and environment, not the

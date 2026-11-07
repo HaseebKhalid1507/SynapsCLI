@@ -44,6 +44,7 @@ pub mod memory_context;
 pub mod memory_history;
 pub mod message_time;
 pub mod openai;
+mod output_limit;
 pub mod relay;
 mod request;
 mod request_encoding;
@@ -624,6 +625,9 @@ pub struct Runtime {
     subagent_timeout: u64,
     api_retries: u32,
     refusal_retries: u32,
+    /// Automatic continuations in a row after a response stops at the
+    /// output-token limit with nothing to execute (`output_limit_continuations`).
+    output_limit_continuations: u32,
     /// Telemetry level for structured per-request API logging (opt-in).
     telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     /// Rotated generations kept per log (`telemetry_log_generations`), read
@@ -1343,6 +1347,7 @@ impl Runtime {
             subagent_timeout: 300,
             api_retries: 3,
             refusal_retries: 2,
+            output_limit_continuations: agent_core::config::DEFAULT_OUTPUT_LIMIT_CONTINUATIONS,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             telemetry_log_generations: crate::runtime::telemetry::DEFAULT_MAX_GENERATIONS,
             telemetry_writer: None,
@@ -3032,6 +3037,7 @@ impl Runtime {
         self.subagent_timeout = config.subagent_timeout;
         self.api_retries = config.api_retries;
         self.refusal_retries = config.refusal_retries;
+        self.output_limit_continuations = config.output_limit_continuations;
         self.telemetry_level =
             crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.telemetry_log_generations = config.telemetry_log_generations;
@@ -3263,10 +3269,15 @@ impl Runtime {
     pub(crate) fn apply_retry_config(&mut self, config: &crate::SynapsConfig) {
         self.api_retries = config.api_retries;
         self.refusal_retries = config.refusal_retries;
+        self.output_limit_continuations = config.output_limit_continuations;
     }
 
     pub fn refusal_retries(&self) -> u32 {
         self.refusal_retries
+    }
+
+    pub fn output_limit_continuations(&self) -> u32 {
+        self.output_limit_continuations
     }
 
     pub fn set_api_retries(&mut self, v: u32) {
@@ -5105,6 +5116,7 @@ impl Runtime {
             extension_runtime: self.extension_runtime.clone(),
             extension_session_scope: self.extension_session_scope.clone(),
             turn_budget: self.turn_budget.clone(),
+            output_limit_continuations: self.output_limit_continuations,
             owner_steer_budget: self.owner_steer_budget.clone(),
             message_clock: self.message_clock.clone(),
         };
@@ -5183,6 +5195,7 @@ impl Clone for Runtime {
             subagent_timeout: self.subagent_timeout,
             api_retries: self.api_retries,
             refusal_retries: self.refusal_retries,
+            output_limit_continuations: self.output_limit_continuations,
             telemetry_level: self.telemetry_level,
             telemetry_log_generations: self.telemetry_log_generations,
             // Shared session observability: clones (subagents) enqueue into
@@ -5817,6 +5830,23 @@ mod tests {
         assert!(runtime.clone().read_dedupe(), "clones keep it");
         runtime.apply_config(&agent_core::config::load_config_from_str("read_dedupe = off\n"));
         assert!(!runtime.read_dedupe());
+    }
+
+    /// `output_limit_continuations` reaches the foreground through
+    /// `apply_config` and survives a clone (a worker's starting point).
+    #[test]
+    fn output_limit_continuations_apply_from_config() {
+        let mut runtime = Runtime::new_headless();
+        assert_eq!(runtime.output_limit_continuations(), 2);
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "output_limit_continuations = 0\n",
+        ));
+        assert_eq!(runtime.output_limit_continuations(), 0);
+        assert_eq!(runtime.clone().output_limit_continuations(), 0);
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "output_limit_continuations = 5\n",
+        ));
+        assert_eq!(runtime.output_limit_continuations(), 5);
     }
 
     /// `thinking_display` reaches the foreground's requests; a worker (and

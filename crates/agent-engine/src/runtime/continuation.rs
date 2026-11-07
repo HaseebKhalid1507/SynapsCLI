@@ -1361,6 +1361,7 @@ fn is_user_request(message: &Value) -> bool {
     message["role"] == "user"
         && message["_synaps_context"]["schema"] != MARKER
         && !crate::engine::interrupt::is_tool_in_flight_note(message)
+        && !crate::engine::interrupt::is_harness_note(message)
         && (message["content"].is_string()
             || message["content"]
                 .as_array()
@@ -3177,6 +3178,35 @@ mod budget_tests {
         let restored = Arc::new(Mutex::new(ContinuationState::default()));
         restore_window_syntactic(&m, &restored);
         assert!(!restored.lock().unwrap().restore_pending, "no archive marker here");
+    }
+
+    /// The turn loop's harness notes (output-limit continuation, preamble
+    /// nudge) are host-authored too: never a user request or a turn start,
+    /// so a wake after them keeps the turn start on the real prompt.
+    #[test]
+    fn harness_notes_are_not_user_requests_or_turn_starts() {
+        use agent_core::core::host_note::{
+            output_limit_tool_note_text, OUTPUT_LIMIT_NOTE, PREAMBLE_NUDGE_NOTE,
+        };
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        let mut m = vec![charter(), user("REAL TASK")];
+        record_turn_start(&state, &mut m);
+        let id = state.lock().unwrap().turn_start.clone().expect("turn recorded");
+        m.push(assistant("part one"));
+        m.push(user(OUTPUT_LIMIT_NOTE));
+        m.push(assistant("part two"));
+        m.push(user(output_limit_tool_note_text("write")));
+        m.push(assistant("part three"));
+        m.push(user(PREAMBLE_NUDGE_NOTE));
+        for i in [3, 5, 7] {
+            assert!(!is_user_request(&m[i]), "{}", m[i]);
+            assert!(!starts_turn(&m[i]), "{}", m[i]);
+        }
+        m.push(event(1, 50));
+        let wake = Arc::new(Mutex::new(ContinuationState::default()));
+        record_turn_start(&wake, &mut m);
+        assert_eq!(wake.lock().unwrap().turn_start.as_deref(), Some(id.as_str()));
+        assert!(m[2..].iter().all(|x| turn_id(x).is_none()), "no note starts a turn");
     }
 
     /// A resumed history holding the note passes restore validation

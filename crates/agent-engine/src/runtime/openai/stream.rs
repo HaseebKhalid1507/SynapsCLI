@@ -594,10 +594,16 @@ pub(crate) async fn call_oai_stream_inner(
         }
         content.extend(tool_use_blocks);
 
-        return Ok(json!({
+        let mut response = json!({
             "role": "assistant",
             "content": content,
-        }));
+        });
+        // `finish_reason: "length"` is the output-token limit: the turn
+        // loop's bounded continuation reads it (`runtime::output_limit`).
+        if decoder.finish_reason.as_deref() == Some("length") {
+            crate::runtime::output_limit::mark_output_limit(&mut response);
+        }
+        return Ok(response);
     }
 }
 
@@ -2260,8 +2266,14 @@ fn handle_events(
         if let OaiEvent::TextDelta(t) = ev {
             text_acc.push_str(t);
         }
-        if let OaiEvent::ToolCallsComplete { calls, .. } = ev {
-            tool_blocks.extend(translate::tool_calls_to_content_blocks(calls, name_map));
+        if let OaiEvent::ToolCallsComplete { calls, truncated } = ev {
+            if *truncated {
+                tool_blocks.extend(translate::truncated_tool_calls_to_content_blocks(
+                    calls, name_map,
+                ));
+            } else {
+                tool_blocks.extend(translate::tool_calls_to_content_blocks(calls, name_map));
+            }
         }
         if !suppress_stream_deltas {
             if let Some(se) = translate::oai_event_to_llm(ev) {
@@ -3467,6 +3479,83 @@ mod broker_stream_tests {
         assert_eq!(&*seen_auth.lock().unwrap(), "Bearer local");
     }
 
+    /// One fixed Chat Completions SSE body per request.
+    async fn spawn_fixed_openai_sse(body: &'static str) -> String {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(move || async move { ([("content-type", "text/event-stream")], body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn run_fixed_openai_sse(body: &'static str) -> Value {
+        let upstream = spawn_fixed_openai_sse(body).await;
+        let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::with_local_base_url(
+            reqwest::Client::new(),
+            upstream,
+        ));
+        let cfg = ProviderConfig {
+            base_url: "unused-broker-derives-the-url".to_string(),
+            model: "test-model".to_string(),
+            provider: "local".to_string(),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        call_oai_stream_inner(
+            &cfg,
+            &broker,
+            &[],
+            &None,
+            &[],
+            &tx,
+            None,
+            None,
+            0,
+            agent_core::reasoning::ReasoningLevel::Medium,
+            &tokio_util::sync::CancellationToken::new(),
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+            false,
+            0,
+        )
+        .await
+        .expect("stream must complete")
+    }
+
+    /// `finish_reason: "length"` is the output-token limit: the envelope
+    /// says so (the turn loop's bounded continuation reads it) and a call
+    /// cut off mid-arguments is marked unfinished, never given `{}` to run.
+    #[tokio::test]
+    async fn length_finish_marks_the_output_limit_and_the_cut_off_call() {
+        let result = run_fixed_openai_sse(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Writing it\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"a\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert!(crate::runtime::output_limit::hit_output_limit(&result), "{result}");
+        assert_eq!(result["content"][0], json!({"type":"text","text":"Writing it"}));
+        let call = &result["content"][1];
+        assert_eq!(call["type"], "tool_use");
+        assert_eq!(call["id"], "call_1");
+        assert!(call["input"].get("__parse_error").is_some(), "{call}");
+
+        let clean = run_fixed_openai_sse(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        assert!(!crate::runtime::output_limit::hit_output_limit(&clean), "{clean}");
+        assert!(clean.get("stop_reason").is_none(), "{clean}");
+    }
+
     /// Broker errors surface as typed failures without opening a stream and
     /// without any credential material in the message.
     #[tokio::test]
@@ -4122,8 +4211,9 @@ pub(crate) fn muse_dangling_preamble(
 
 /// Harness-authored nudge appended (once per user turn) after a dangling
 /// preamble. Framed like the context advisories so the model does not read
-/// it as a new user request.
-pub(crate) const PREAMBLE_NUDGE: &str = "[Host harness note, not a new user request] You ended your turn on a preamble without acting. Continue now: run the tool call you announced, or ask your question in full.";
+/// it as a new user request. The text lives in `host_note`, so history
+/// readers recognise it as a harness note, never the user's words.
+pub(crate) const PREAMBLE_NUDGE: &str = agent_core::core::host_note::PREAMBLE_NUDGE_NOTE;
 
 /// Visible system note shown when the nudge fires.
 pub(crate) const PREAMBLE_NUDGE_NOTICE: &str = "Muse ended its turn on a preamble without acting; continuing once automatically (disable: SYNAPS_MUSE_PREAMBLE_NUDGE=0).";

@@ -207,7 +207,9 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
 /// prepends the identical sentinel `cap_resumed_display` produced at
 /// 741b6b60 (same text, same position).
 pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app: &mut App) {
-    use agent_engine::engine::interrupt::{interruption_label, tool_in_flight_note_label};
+    use agent_engine::engine::interrupt::{
+        harness_note_label, interruption_label, tool_in_flight_note_label,
+    };
     use agent_engine::session::DisplayItem;
     app.transcript.clear();
     if tail.omitted > 0 {
@@ -236,7 +238,12 @@ pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app:
                 // was shown live, not something the user typed.
                 None => match tool_in_flight_note_label(text) {
                     Some(note) => ChatMessage::System(note.to_string()),
-                    None => ChatMessage::User(text.clone()),
+                    // The turn loop's own notes (output-limit continuation,
+                    // preamble nudge): a system line, never the user's words.
+                    None => match harness_note_label(text) {
+                        Some(label) => ChatMessage::System(label.to_string()),
+                        None => ChatMessage::User(text.clone()),
+                    },
                 },
             },
             DisplayItem::Thinking { text } => ChatMessage::Thinking(text.clone()),
@@ -616,6 +623,38 @@ mod tests {
             app.transcript.messages().last().map(|m| &m.msg),
             Some(ChatMessage::Error(_))
         ));
+    }
+
+    /// The turn loop's harness notes replay as system lines, never as text
+    /// the user typed.
+    #[test]
+    fn harness_notes_replay_as_system_lines() {
+        use agent_core::core::host_note::{
+            output_limit_tool_note_text, OUTPUT_LIMIT_NOTE, OUTPUT_LIMIT_NOTE_LABEL,
+            PREAMBLE_NUDGE_NOTE, PREAMBLE_NUDGE_NOTE_LABEL,
+        };
+        let history = vec![
+            j(serde_json::json!({"role": "user", "content": "build it"})),
+            j(serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "part one"}]})),
+            j(serde_json::json!({"role": "user", "content": OUTPUT_LIMIT_NOTE})),
+            j(serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "part two"}]})),
+            j(serde_json::json!({"role": "user", "content": output_limit_tool_note_text("write")})),
+            j(serde_json::json!({"role": "user", "content": PREAMBLE_NUDGE_NOTE})),
+        ];
+        let mut app = test_app();
+        rebuild_display_messages(&history, &mut app);
+        let repr = transcript_repr(&app);
+        assert_eq!(
+            repr,
+            [
+                "U|build it".to_string(),
+                "T|part one".into(),
+                format!("S|{OUTPUT_LIMIT_NOTE_LABEL}"),
+                "T|part two".into(),
+                format!("S|{OUTPUT_LIMIT_NOTE_LABEL}"),
+                format!("S|{PREAMBLE_NUDGE_NOTE_LABEL}"),
+            ]
+        );
     }
 
     fn local_hhmm(ts: &str) -> String {

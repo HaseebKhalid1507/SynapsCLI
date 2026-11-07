@@ -2516,7 +2516,14 @@ impl ApiMethods {
                 stop_reason_is_refusal,
                 cancelled,
             ) {
-                StreamOutcome::Done(v) => {
+                StreamOutcome::Done(mut v) => {
+                    // The turn loop's output-limit continuation reads this
+                    // (`runtime::output_limit`); history takes only `content`.
+                    if !cancelled
+                        && trace_stop_reason == Some(crate::runtime::trace::StopReason::MaxTokens)
+                    {
+                        super::output_limit::mark_output_limit(&mut v);
+                    }
                     if let Some(t) = tracer.take() {
                         let terminal = if cancelled {
                             agent_core::TurnOutcome::Canceled

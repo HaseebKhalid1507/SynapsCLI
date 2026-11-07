@@ -39,6 +39,26 @@ All notable changes to this project will be documented in this file.
   the result (what the parent model reads, and the subagent card) ran
   sentences together: "…read them all.Found 2 files…". Each response now
   starts a new paragraph, as `subagent_start` workers already did.
+- **A response cut off at the output-token limit no longer ends the turn.**
+  When a response stopped at the output limit with no complete tool call
+  to run, the turn just ended. Nobody sends "continue" in headless or
+  daemon automation or inside a subagent, so the work stopped there. The
+  turn now adds a short note asking the model to carry on from where it
+  stopped and continues, shown as `↻ response hit the output limit —
+  continuing (1/2)`. If the limit cut a tool call, the note names it and
+  says it was not run, so the model re-issues it in smaller pieces. New
+  `output_limit_continuations` setting: continuations in a row, 0–10,
+  default 2 (a round that runs its tools starts the count again); `0`
+  keeps the old behaviour. Once they are used up the turn ends with a
+  notice. A cancel, steering and the turn budgets still stop it. This
+  covers native Anthropic (`max_tokens`), OpenAI-compatible Chat
+  Completions (`finish_reason: length`) and Gemini (`MAX_TOKENS`); an
+  incomplete Codex or Responses API response is still reported as an
+  error. A tool call the limit cut off mid-input, and thinking cut off
+  before its signature, are dropped instead of being sent back (the call
+  never runs); on OpenAI-compatible providers such a call used to run
+  with empty input. On a non-Anthropic route, a cut-off that leaves
+  nothing to keep ends the turn with a notice instead of continuing.
 
 ## [0.11.1] — 2026-10-31
 
