@@ -5,22 +5,22 @@
 //! execute used to end the turn silently: nobody sends "continue" in
 //! headless/daemon automation or inside a subagent, so the work just stopped.
 //! The turn loop now appends one short host note and continues, at most
-//! `output_limit_continuations` times per user turn (`0` = the old behaviour).
+//! `output_limit_continuations` times IN A ROW (`0` = the old behaviour): a
+//! response that is not cut off and has its tool calls run resets the count,
+//! so a long worker that hits the limit now and then never runs out.
 //!
 //! Transports report the output limit on the response envelope as the
 //! top-level `"stop_reason": "max_tokens"` (Anthropic `max_tokens`,
-//! OpenAI-compatible `finish_reason: "length"`, Gemini `MAX_TOKENS`, an
-//! extension provider's `max_tokens`). History only ever takes the
-//! envelope's `content`, so the key never reaches a request.
+//! OpenAI-compatible Chat Completions `finish_reason: "length"`, Gemini
+//! `MAX_TOKENS`, an extension provider's `max_tokens`). History only ever
+//! takes the envelope's `content`, so the key never reaches a request.
+//! Codex/Responses `response.incomplete` stays a provider error.
 
+use agent_core::core::host_note;
 use serde_json::{json, Value};
 
 /// The envelope `stop_reason` every transport uses for the output limit.
 pub(crate) const OUTPUT_LIMIT_STOP_REASON: &str = "max_tokens";
-
-/// Host note appended (append-only, like the other harness notes) when a
-/// cut-off response leaves nothing to execute.
-pub(crate) const CONTINUATION_PROMPT: &str = "[Host harness note, not a new user request] Your previous response was cut off at the output-token limit. Continue from where it stopped. Do long work through tool calls and keep each response shorter.";
 
 /// UI-only result for a tool call the limit cut off mid-input. The call
 /// never enters history and never runs; this closes its card.
@@ -39,9 +39,28 @@ pub(crate) fn hit_output_limit(response: &Value) -> bool {
     response.get("stop_reason").and_then(Value::as_str) == Some(OUTPUT_LIMIT_STOP_REASON)
 }
 
-/// The continuation message the turn loop appends.
-pub(crate) fn continuation_message() -> crate::SharedMessage {
-    std::sync::Arc::new(json!({"role": "user", "content": CONTINUATION_PROMPT}))
+/// The host note the turn loop appends (append-only, plain user-role text
+/// like the other harness notes): when the limit cut a tool call
+/// (`cut_tool`), the note naming it and saying it was NOT run; otherwise
+/// the plain "continue from where it stopped" note.
+pub(crate) fn continuation_message(cut_tool: Option<&str>) -> crate::SharedMessage {
+    let text = match cut_tool {
+        Some(tool) => host_note::output_limit_tool_note_text(tool),
+        None => host_note::OUTPUT_LIMIT_NOTE.to_string(),
+    };
+    std::sync::Arc::new(json!({"role": "user", "content": text}))
+}
+
+/// " while writing a `write` call (not run)" for notices; the name is quoted
+/// only when it is a plausible tool name.
+fn cut_call_phrase(cut_tool: Option<&str>) -> String {
+    match cut_tool {
+        Some(tool) if host_note::is_plausible_tool_name(tool) => {
+            format!(" while writing a `{tool}` call (not run)")
+        }
+        Some(_) => " while writing a tool call (not run)".to_string(),
+        None => String::new(),
+    }
 }
 
 /// A `tool_use` whose input was still being written: its JSON did not parse
@@ -63,93 +82,130 @@ pub(crate) enum OutputLimitStep {
     /// Not cut off at the output limit, cancelled, or the feature is off:
     /// the response is untouched and the turn runs exactly as before.
     Unchanged,
-    /// Cut off, but complete tool calls remain: they run as normal, without
-    /// any extra message. Unfinished blocks were removed.
+    /// Cut off, but complete tool calls remain: they run as normal.
+    /// Unfinished blocks were removed; a cut call is reported after the
+    /// results with the tool note.
     RunTools,
     /// Cut off with nothing to execute: unfinished blocks were removed; the
     /// loop appends [`continuation_message`] and continues.
     Continue,
-    /// Cut off with nothing to execute and no continuations left: the
-    /// response is untouched and the turn proceeds as before.
+    /// Cut off with nothing to execute and the consecutive continuations
+    /// used up: unfinished blocks were removed (nothing half-written runs or
+    /// reaches history) and the turn ends with
+    /// [`OutputLimitContinuation::exhausted_notice`].
     Exhausted,
 }
 
-/// Per-user-turn continuation counter.
+/// What [`OutputLimitContinuation::inspect`] removed from a cut-off response.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Unfinished {
+    /// Ids of the tool calls cut off mid-input: their UI cards get
+    /// [`UNFINISHED_TOOL_CALL`].
+    pub(crate) tool_ids: Vec<String>,
+    /// The call the limit cut (the last unfinished one), by the name the
+    /// model wrote; `None` when no call was cut. Only ever quoted through
+    /// the plausible-name check.
+    pub(crate) cut_tool: Option<String>,
+}
+
+/// Consecutive output-limit continuations, against the configured cap.
 #[derive(Debug)]
 pub(crate) struct OutputLimitContinuation {
     cap: u32,
-    used: u32,
+    consecutive: u32,
 }
 
 impl OutputLimitContinuation {
     pub(crate) fn new(cap: u32) -> Self {
-        Self { cap, used: 0 }
+        Self { cap, consecutive: 0 }
     }
 
     pub(crate) fn cap(&self) -> u32 {
         self.cap
     }
 
-    pub(crate) fn used(&self) -> u32 {
-        self.used
+    pub(crate) fn consecutive(&self) -> u32 {
+        self.consecutive
     }
 
-    /// Classify `response`. For [`OutputLimitStep::RunTools`] and
-    /// [`OutputLimitStep::Continue`] the blocks the provider never finished
-    /// (a tool call cut off mid-input, thinking without a signature) are
-    /// removed from its content; their tool ids are returned so the UI can
-    /// close those cards. Otherwise the response is left byte-identical.
-    pub(crate) fn inspect(
-        &self,
-        response: &mut Value,
-        cancelled: bool,
-    ) -> (OutputLimitStep, Vec<String>) {
+    /// Classify `response`. Unless it is [`OutputLimitStep::Unchanged`], the
+    /// blocks the provider never finished (a tool call cut off mid-input,
+    /// thinking without a signature) are removed from its content and
+    /// reported in [`Unfinished`]. An unchanged response is left
+    /// byte-identical.
+    pub(crate) fn inspect(&self, response: &mut Value, cancelled: bool) -> (OutputLimitStep, Unfinished) {
         if self.cap == 0 || cancelled || !hit_output_limit(response) {
-            return (OutputLimitStep::Unchanged, Vec::new());
+            return (OutputLimitStep::Unchanged, Unfinished::default());
         }
-        let Some(content) = response.get("content").and_then(Value::as_array) else {
-            return (OutputLimitStep::Unchanged, Vec::new());
+        let Some(content) = response.get_mut("content").and_then(Value::as_array_mut) else {
+            return (OutputLimitStep::Unchanged, Unfinished::default());
         };
-        let has_complete_tool_use = content
-            .iter()
-            .any(|b| b["type"].as_str() == Some("tool_use") && !is_unfinished_tool_use(b));
-        let step = if has_complete_tool_use {
+        let unfinished = Unfinished {
+            tool_ids: content
+                .iter()
+                .filter(|b| is_unfinished_tool_use(b))
+                .filter_map(|b| b["id"].as_str().map(str::to_string))
+                .collect(),
+            cut_tool: content
+                .iter()
+                .rev()
+                .find(|b| is_unfinished_tool_use(b))
+                .map(|b| b["name"].as_str().unwrap_or_default().to_string()),
+        };
+        content.retain(|b| !is_unfinished_tool_use(b) && !is_unsigned_thinking(b));
+        let step = if content.iter().any(|b| b["type"].as_str() == Some("tool_use")) {
             OutputLimitStep::RunTools
-        } else if self.used < self.cap {
+        } else if self.consecutive < self.cap {
             OutputLimitStep::Continue
         } else {
-            return (OutputLimitStep::Exhausted, Vec::new());
+            OutputLimitStep::Exhausted
         };
-        let dropped: Vec<String> = content
-            .iter()
-            .filter(|b| is_unfinished_tool_use(b))
-            .filter_map(|b| b["id"].as_str().map(str::to_string))
-            .collect();
-        if content
-            .iter()
-            .any(|b| is_unfinished_tool_use(b) || is_unsigned_thinking(b))
-        {
-            if let Some(content) = response.get_mut("content").and_then(Value::as_array_mut) {
-                content.retain(|b| !is_unfinished_tool_use(b) && !is_unsigned_thinking(b));
-            }
-        }
-        (step, dropped)
+        (step, unfinished)
     }
 
     /// Spend one continuation; the visible notice for it.
     pub(crate) fn take(&mut self) -> String {
-        self.used = self.used.saturating_add(1).min(self.cap);
+        self.consecutive = self.consecutive.saturating_add(1).min(self.cap);
         format!(
             "↻ response hit the output limit — continuing ({}/{})",
-            self.used, self.cap
+            self.consecutive, self.cap
         )
     }
 
-    /// Notice for a cut-off response once every continuation is spent.
-    pub(crate) fn exhausted_notice(&self) -> String {
+    /// A response that was not cut off had its tool calls run: the run of
+    /// consecutive cut-offs is over.
+    pub(crate) fn reset(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Notice for a cut-off response once the consecutive continuations are
+    /// spent; the turn ends.
+    pub(crate) fn exhausted_notice(&self, cut_tool: Option<&str>) -> String {
         format!(
-            "response hit the output limit — automatic continuations used up ({}/{}); the turn ends here. Send a message to continue.",
-            self.used, self.cap
+            "response hit the output limit{} — automatic continuations used up ({}/{}); the turn ends here. Send a message to continue.",
+            cut_call_phrase(cut_tool),
+            self.consecutive,
+            self.cap
+        )
+    }
+
+    /// Notice for a cut-off response that left nothing to keep on a route
+    /// that cannot take a note straight after a user-role message; the turn
+    /// ends.
+    pub(crate) fn ended_notice(cut_tool: Option<&str>) -> String {
+        let what = match cut_tool {
+            Some(_) => cut_call_phrase(cut_tool),
+            None => " before writing anything usable".to_string(),
+        };
+        format!("response hit the output limit{what}; the turn ends here. Send a message to continue.")
+    }
+
+    /// Notice for a cut-off response whose complete calls ran: the cut one
+    /// did not, and the model is told so.
+    pub(crate) fn cut_call_notice(cut_tool: &str) -> String {
+        format!(
+            "response hit the output limit{}; the complete calls ran",
+            cut_call_phrase(Some(cut_tool))
         )
     }
 }
@@ -164,6 +220,17 @@ mod tests {
 
     fn partial_tool(id: &str) -> Value {
         json!({"type":"tool_use","id":id,"name":"write","input":{"__parse_error":"invalid tool input JSON: EOF"}})
+    }
+
+    fn none() -> Unfinished {
+        Unfinished::default()
+    }
+
+    fn cut_write(ids: &[&str]) -> Unfinished {
+        Unfinished {
+            tool_ids: ids.iter().map(|s| s.to_string()).collect(),
+            cut_tool: Some("write".into()),
+        }
     }
 
     #[test]
@@ -186,7 +253,7 @@ mod tests {
             partial_tool("t1"),
         ]));
         let mut response = original.clone();
-        assert_eq!(limit.inspect(&mut response, false), (OutputLimitStep::Unchanged, vec![]));
+        assert_eq!(limit.inspect(&mut response, false), (OutputLimitStep::Unchanged, none()));
         assert_eq!(response, original);
     }
 
@@ -209,7 +276,7 @@ mod tests {
         let original = cut(json!([{"type":"text","text":"I will now"}]));
         for n in 1..=2 {
             let mut response = original.clone();
-            assert_eq!(limit.inspect(&mut response, false), (OutputLimitStep::Continue, vec![]));
+            assert_eq!(limit.inspect(&mut response, false), (OutputLimitStep::Continue, none()));
             assert_eq!(response, original, "nothing unfinished to drop");
             assert_eq!(
                 limit.take(),
@@ -217,9 +284,27 @@ mod tests {
             );
         }
         let mut response = original.clone();
-        assert_eq!(limit.inspect(&mut response, false), (OutputLimitStep::Exhausted, vec![]));
-        assert_eq!(response, original, "exhausted leaves the response as before");
-        assert!(limit.exhausted_notice().contains("(2/2)"));
+        assert_eq!(limit.inspect(&mut response, false), (OutputLimitStep::Exhausted, none()));
+        assert_eq!(response, original, "nothing unfinished to drop");
+        assert_eq!(
+            limit.exhausted_notice(None),
+            "response hit the output limit — automatic continuations used up (2/2); the turn ends here. Send a message to continue."
+        );
+    }
+
+    /// The count is of consecutive cut-offs: a round that ran its tools
+    /// without being cut off starts it again.
+    #[test]
+    fn reset_starts_the_consecutive_count_again() {
+        let mut limit = OutputLimitContinuation::new(1);
+        let original = cut(json!([{"type":"text","text":"I will now"}]));
+        assert_eq!(limit.inspect(&mut original.clone(), false).0, OutputLimitStep::Continue);
+        limit.take();
+        assert_eq!(limit.inspect(&mut original.clone(), false).0, OutputLimitStep::Exhausted);
+        limit.reset();
+        assert_eq!(limit.consecutive(), 0);
+        assert_eq!(limit.inspect(&mut original.clone(), false).0, OutputLimitStep::Continue);
+        assert_eq!(limit.take(), "↻ response hit the output limit — continuing (1/1)");
     }
 
     #[test]
@@ -231,9 +316,9 @@ mod tests {
             {"type":"thinking","thinking":"cut mid-thought","signature":""},
             partial_tool("t9"),
         ]));
-        let (step, dropped) = limit.inspect(&mut response, false);
+        let (step, unfinished) = limit.inspect(&mut response, false);
         assert_eq!(step, OutputLimitStep::Continue);
-        assert_eq!(dropped, vec!["t9".to_string()]);
+        assert_eq!(unfinished, cut_write(&["t9"]));
         assert_eq!(
             response["content"],
             json!([
@@ -243,11 +328,32 @@ mod tests {
         );
     }
 
+    /// Past the cap, nothing half-written stays either: the partial call
+    /// never reaches history, so it can never run as a parse-error round.
+    #[test]
+    fn exhausted_drops_unfinished_blocks_too() {
+        let mut limit = OutputLimitContinuation::new(1);
+        limit.take();
+        let mut response = cut(json!([
+            {"type":"text","text":"Writing the file now."},
+            {"type":"thinking","thinking":"cut","signature":""},
+            partial_tool("t9"),
+        ]));
+        let (step, unfinished) = limit.inspect(&mut response, false);
+        assert_eq!(step, OutputLimitStep::Exhausted);
+        assert_eq!(unfinished, cut_write(&["t9"]));
+        assert_eq!(response["content"], json!([{"type":"text","text":"Writing the file now."}]));
+        assert_eq!(
+            limit.exhausted_notice(unfinished.cut_tool.as_deref()),
+            "response hit the output limit while writing a `write` call (not run) — automatic continuations used up (1/1); the turn ends here. Send a message to continue."
+        );
+    }
+
     #[test]
     fn thinking_without_any_signature_field_is_dropped() {
         let limit = OutputLimitContinuation::new(1);
         let mut response = cut(json!([{"type":"thinking","thinking":"no sig field"}]));
-        assert_eq!(limit.inspect(&mut response, false).0, OutputLimitStep::Continue);
+        assert_eq!(limit.inspect(&mut response, false), (OutputLimitStep::Continue, none()));
         assert_eq!(response["content"], json!([]));
     }
 
@@ -256,9 +362,9 @@ mod tests {
         let limit = OutputLimitContinuation::new(1);
         let complete = json!({"type":"tool_use","id":"t1","name":"bash","input":{"command":"ls"}});
         let mut response = cut(json!([complete.clone(), partial_tool("t2")]));
-        let (step, dropped) = limit.inspect(&mut response, false);
+        let (step, unfinished) = limit.inspect(&mut response, false);
         assert_eq!(step, OutputLimitStep::RunTools);
-        assert_eq!(dropped, vec!["t2".to_string()]);
+        assert_eq!(unfinished, cut_write(&["t2"]));
         assert_eq!(response["content"], json!([complete]));
     }
 
@@ -268,15 +374,49 @@ mod tests {
         limit.take();
         let complete = json!({"type":"tool_use","id":"t1","name":"bash","input":{"command":"ls"}});
         let mut response = cut(json!([complete.clone()]));
-        assert_eq!(limit.inspect(&mut response, false), (OutputLimitStep::RunTools, vec![]));
+        assert_eq!(limit.inspect(&mut response, false), (OutputLimitStep::RunTools, none()));
         assert_eq!(response["content"], json!([complete]));
     }
 
+    /// The note names the call the limit cut (the last one); a name that
+    /// isn't a plausible tool name reads "a tool call". Text or thinking
+    /// only gets the plain note.
     #[test]
-    fn continuation_message_is_a_plain_user_note() {
-        let message = continuation_message();
-        assert_eq!(message["role"], "user");
-        assert_eq!(message["content"], CONTINUATION_PROMPT);
-        assert!(CONTINUATION_PROMPT.starts_with("[Host harness note, not a new user request]"));
+    fn the_note_names_the_cut_call_or_falls_back_to_a_generic_one() {
+        let limit = OutputLimitContinuation::new(1);
+        let mut response = cut(json!([
+            {"type":"tool_use","id":"t1","name":"read","input":{"__parse_error":"EOF"}},
+            {"type":"tool_use","id":"t2","name":"edit","input":{"__parse_error":"EOF"}},
+        ]));
+        let (_, unfinished) = limit.inspect(&mut response, false);
+        assert_eq!(unfinished.tool_ids, vec!["t1".to_string(), "t2".to_string()]);
+        assert_eq!(unfinished.cut_tool.as_deref(), Some("edit"));
+        let note = continuation_message(unfinished.cut_tool.as_deref());
+        assert_eq!(note["role"], "user");
+        let text = note["content"].as_str().unwrap();
+        assert!(text.contains("while writing a `edit` call; that call was incomplete and was NOT run"), "{text}");
+        assert!(host_note::is_output_limit_note(&note));
+
+        for bad in ["rm -rf /`", "", "a\nb"] {
+            let mut response = cut(json!([
+                {"type":"tool_use","id":"t1","name":bad,"input":{"__parse_error":"EOF"}},
+            ]));
+            let (_, unfinished) = limit.inspect(&mut response, false);
+            let note = continuation_message(unfinished.cut_tool.as_deref());
+            let text = note["content"].as_str().unwrap();
+            assert!(text.contains("while writing a tool call; that call was incomplete"), "{text}");
+            assert!(!text.contains('`'), "{text}");
+            assert!(host_note::is_output_limit_note(&note));
+            assert!(OutputLimitContinuation::ended_notice(unfinished.cut_tool.as_deref())
+                .contains("while writing a tool call (not run)"));
+        }
+
+        let plain = continuation_message(None);
+        assert_eq!(plain["content"], host_note::OUTPUT_LIMIT_NOTE);
+        assert!(host_note::is_output_limit_note(&plain));
+        assert_eq!(
+            OutputLimitContinuation::ended_notice(None),
+            "response hit the output limit before writing anything usable; the turn ends here. Send a message to continue."
+        );
     }
 }

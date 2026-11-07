@@ -505,9 +505,9 @@ define_settings! {
             Err(_) => SettingApply::Local(Err("expected a whole number".to_string())),
         };
 
-    "output_limit_continuations", "Output-limit continuations", Context,
+    "output_limit_continuations", "Cut-off continuations", Context,
         EditorKind::Text { numeric: true },
-        "Automatic continuations per turn when a response is cut off at the output-token limit with nothing to run (0–10, default 2; 0 = the turn ends there). Takes effect next launch.",
+        "Automatic continuations in a row when a response is cut off at the output-token limit with nothing to run (0–10, default 2; 0 = the turn ends there). A round that runs its tools resets the count. Takes effect next launch.",
         |_app, value| whole_number("output_limit_continuations", value);
 
     "telemetry", "Telemetry", Context, EditorKind::Cycler(&["off", "basic", "full"]),

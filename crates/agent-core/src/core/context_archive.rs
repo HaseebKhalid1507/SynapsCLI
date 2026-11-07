@@ -892,11 +892,13 @@ fn eligible_class(value: &Value) -> Option<DisclosureClass> {
 }
 
 /// Shared message-envelope selection for preflight and projection. Host
-/// continuation notes and the host's tool-in-flight note are derived
-/// working context, never source evidence (nor the user's words).
+/// continuation notes, the host's tool-in-flight note and the turn loop's
+/// harness notes are derived working context, never source evidence (nor
+/// the user's words).
 fn projection_content(message: &Value) -> Option<(DisclosureClass, &str, &Value)> {
     if message.get("_synaps_context").is_some()
         || crate::core::host_note::is_tool_in_flight_note(message)
+        || crate::core::host_note::is_harness_note(message)
     {
         return None;
     }
@@ -1777,6 +1779,10 @@ mod projection_tests {
                 "Canceled by user",
                 &["bash".into()],
             )})),
+            // The turn loop's output-limit notes: never archived either.
+            Arc::new(json!({"role":"user","content":crate::core::host_note::OUTPUT_LIMIT_NOTE})),
+            Arc::new(json!({"role":"user","content":
+                crate::core::host_note::output_limit_tool_note_text("write")})),
         ];
         let projected =
             project_archive("session", &messages, "classified-value", Some(redactor)).unwrap();
@@ -1785,6 +1791,7 @@ mod projection_tests {
         assert!(!json.contains("classified-value"));
         assert!(!json.contains("NOTE_ONLY"));
         assert!(!json.contains("partially applied"), "the tool note is not archived");
+        assert!(!json.contains("output-token limit"), "harness notes are not archived");
         assert!(!json.contains("OMITTED"));
         assert!(json.contains("src/lib.rs"));
         assert_eq!(projected.messages.len(), 2);

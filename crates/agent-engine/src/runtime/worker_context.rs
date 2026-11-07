@@ -304,6 +304,7 @@ fn is_host_bookkeeping(message: &Value) -> bool {
     is_note(message)
         || message.get("_synaps_context").is_some()
         || crate::engine::interrupt::is_tool_in_flight_note(message)
+        || crate::engine::interrupt::is_harness_note(message)
         || message["content"]
             .as_str()
             .is_some_and(crate::engine::interrupt::is_interruption_marker)
@@ -1167,6 +1168,47 @@ mod tests {
         assert!(!s.iter().any(|x| x["content"].as_str().is_some_and(
             crate::engine::interrupt::is_interruption_marker)));
         assert!(unpaired_tool_ids(s).is_empty());
+    }
+
+    /// The turn loop's harness notes (output-limit continuation, preamble
+    /// nudge) are host bookkeeping: a rollover never pins one as an
+    /// orchestrator instruction.
+    #[test]
+    fn harness_notes_are_never_carried_as_instructions() {
+        use agent_core::core::host_note::{
+            output_limit_tool_note_text, OUTPUT_LIMIT_NOTE, PREAMBLE_NUDGE_NOTE,
+        };
+        for note in [
+            OUTPUT_LIMIT_NOTE.to_string(),
+            output_limit_tool_note_text("write"),
+            output_limit_tool_note_text("a`b"),
+            PREAMBLE_NUDGE_NOTE.to_string(),
+        ] {
+            assert!(carried_instruction(&user(&note)).is_none(), "{note}");
+        }
+        assert!(carried_instruction(&user("STEER: also update the docs")).is_some());
+
+        let mut m = worker_history(3, 3_000);
+        m.push(user("STEER: also update the docs"));
+        m.extend(round(3, 3_000));
+        m.push(user(OUTPUT_LIMIT_NOTE));
+        m.extend(round(4, 3_000));
+        m.push(user(&output_limit_tool_note_text("write")));
+        for i in 5..30 {
+            m.extend(round(i, 3_000));
+        }
+        let plan = plan_rollover(&m, budget(15_000), 1, path).unwrap();
+        let carried: Vec<String> = plan
+            .successor
+            .iter()
+            .take_while(|x| x.get(MARKER_KEY).is_none())
+            .map(|x| x["content"].to_string())
+            .collect();
+        assert_eq!(carried.len(), 2, "brief + the steer only: {carried:?}");
+        assert!(carried[1].contains("STEER: also update the docs"));
+        assert!(!plan.successor.iter().any(|x| x["content"]
+            .as_str()
+            .is_some_and(|t| t.contains("output-token limit"))));
     }
 
     #[test]

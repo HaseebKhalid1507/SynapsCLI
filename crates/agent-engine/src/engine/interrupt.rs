@@ -124,6 +124,9 @@ pub fn tool_in_flight_note_message(reason: InterruptReason, tools: &[String]) ->
 /// Exactly a generated note (text / message): never a user request, never
 /// archived or captured as the user's words, a system line on replay.
 pub use agent_core::core::host_note::{is_tool_in_flight_note, tool_in_flight_note_label};
+/// The turn loop's own notes (output-limit continuation, preamble nudge),
+/// recognised the same way: never a user request, a system line on replay.
+pub use agent_core::core::host_note::{harness_note_label, is_harness_note};
 
 fn marker_of(message: &Value) -> bool {
     message["role"] == "user"

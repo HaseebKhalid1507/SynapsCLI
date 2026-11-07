@@ -625,7 +625,7 @@ pub struct Runtime {
     subagent_timeout: u64,
     api_retries: u32,
     refusal_retries: u32,
-    /// Automatic continuations per user turn after a response stops at the
+    /// Automatic continuations in a row after a response stops at the
     /// output-token limit with nothing to execute (`output_limit_continuations`).
     output_limit_continuations: u32,
     /// Telemetry level for structured per-request API logging (opt-in).

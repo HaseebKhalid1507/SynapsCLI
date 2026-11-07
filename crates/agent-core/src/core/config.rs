@@ -1468,8 +1468,9 @@ pub struct SynapsConfig {
     pub subagent_thinking: crate::core::reasoning::ReasoningLevel,
     pub api_retries: u32,        // default 3
     pub refusal_retries: u32,    // default 2 — retries on stop_reason=refusal
-    /// Automatic continuations per user turn when a response stops at the
-    /// output-token limit and leaves nothing to execute
+    /// Automatic continuations IN A ROW when a response stops at the
+    /// output-token limit and leaves nothing to execute; a round that is not
+    /// cut off and runs its tools resets the count
     /// (`output_limit_continuations`, 0–[`MAX_OUTPUT_LIMIT_CONTINUATIONS`],
     /// default [`DEFAULT_OUTPUT_LIMIT_CONTINUATIONS`]; `0` = the turn ends
     /// there, as before).
@@ -1726,8 +1727,8 @@ pub fn scope_slice_problem(name: &str) -> Option<&'static str> {
 pub const MAX_TELEMETRY_LOG_GENERATIONS: u32 = 100;
 
 /// Default `output_limit_continuations`: a cut-off response is almost never
-/// where the work should stop, and two bounds the extra output a model
-/// that keeps hitting the limit can spend in one turn.
+/// where the work should stop, and two in a row bounds the extra output a
+/// model that keeps hitting the limit can spend before the turn ends.
 pub const DEFAULT_OUTPUT_LIMIT_CONTINUATIONS: u32 = 2;
 
 /// Upper bound for `output_limit_continuations` (each continuation can cost

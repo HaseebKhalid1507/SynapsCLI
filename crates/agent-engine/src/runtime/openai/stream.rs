@@ -4211,8 +4211,9 @@ pub(crate) fn muse_dangling_preamble(
 
 /// Harness-authored nudge appended (once per user turn) after a dangling
 /// preamble. Framed like the context advisories so the model does not read
-/// it as a new user request.
-pub(crate) const PREAMBLE_NUDGE: &str = "[Host harness note, not a new user request] You ended your turn on a preamble without acting. Continue now: run the tool call you announced, or ask your question in full.";
+/// it as a new user request. The text lives in `host_note`, so history
+/// readers recognise it as a harness note, never the user's words.
+pub(crate) const PREAMBLE_NUDGE: &str = agent_core::core::host_note::PREAMBLE_NUDGE_NOTE;
 
 /// Visible system note shown when the nudge fires.
 pub(crate) const PREAMBLE_NUDGE_NOTICE: &str = "Muse ended its turn on a preamble without acting; continuing once automatically (disable: SYNAPS_MUSE_PREAMBLE_NUDGE=0).";
