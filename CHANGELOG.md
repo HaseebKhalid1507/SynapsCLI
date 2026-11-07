@@ -39,6 +39,19 @@ All notable changes to this project will be documented in this file.
   the result (what the parent model reads, and the subagent card) ran
   sentences together: "…read them all.Found 2 files…". Each response now
   starts a new paragraph, as `subagent_start` workers already did.
+- **`bash` says when it stopped a command.** Output past the 256 KiB
+  tool buffer kills the command, but the result only ended
+  `[output truncated at N]`, which reads like a display cut of a command
+  that finished. It now says the command was stopped at that limit before
+  it finished and its exit status is unknown, and to redirect large output
+  to a file; the streamed output ends with the same notice and never shows
+  bytes past the cap. A timeout returned only `Command timed out after Ns`
+  and lost everything the command had printed; the error now says it was
+  stopped, notes when `bash_max_timeout` cut a timeout the model asked
+  for, and keeps the output from before the timeout (redacted, at most the
+  last 256 KiB). Caps, timeouts and kills are unchanged (the process group
+  on Unix, only the shell process on Windows); the same messages apply to
+  the Windows `powershell` tool.
 
 ## [0.11.1] — 2026-10-31
 
