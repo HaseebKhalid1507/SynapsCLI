@@ -197,14 +197,16 @@ fn output_limit_notice(max_output: usize) -> String {
 /// `Command timed out after`; what the command printed before the timeout
 /// follows, already sanitized and redacted like any result, and cut to its
 /// last `max_output` bytes if it must be: a hang shows at the end.
+/// `requested_secs` is the timeout the model passed, if it passed one: a
+/// configured default above `bash_max_timeout` was never asked for.
 fn timed_out_message(
     timeout_secs: u64,
-    requested_secs: u64,
+    requested_secs: Option<u64>,
     output: &str,
     max_output: usize,
 ) -> String {
     let mut message = format!("Command timed out after {timeout_secs}s and was stopped");
-    if requested_secs > timeout_secs {
+    if let Some(requested_secs) = requested_secs.filter(|&secs| secs > timeout_secs) {
         message.push_str(&format!(
             " ({requested_secs}s was requested; the maximum is {timeout_secs}s)"
         ));
@@ -511,13 +513,13 @@ pub(crate) async fn run_shell_command(
     askpass: Option<Askpass>,
 ) -> Result<String> {
     {
-        let requested_timeout = requested_timeout.unwrap_or(ctx.limits.bash_timeout);
+        let timeout_secs = requested_timeout.unwrap_or(ctx.limits.bash_timeout);
         // H5: enforce bash_max_timeout cap — prevent DoS via prompt injection
         // requesting unbounded timeouts (e.g. timeout:2592000 + infinite loop).
         let timeout_secs = if ctx.limits.bash_max_timeout > 0 {
-            requested_timeout.min(ctx.limits.bash_max_timeout)
+            timeout_secs.min(ctx.limits.bash_max_timeout)
         } else {
-            requested_timeout
+            timeout_secs
         };
         let max_output = ctx.limits.max_tool_buffer;
 
@@ -739,7 +741,8 @@ pub(crate) async fn run_shell_command(
                 e
             ))),
             // The group is still armed: `group` drops on this return and
-            // kills it, exactly as before.
+            // kills it (Unix), exactly as before. Elsewhere only the shell
+            // is killed, by `kill_on_drop`.
             Err(_) => Err(RuntimeError::Tool(timed_out_message(
                 timeout_secs,
                 requested_timeout,
@@ -1100,6 +1103,20 @@ mod tests {
         );
     }
 
+    /// The configured default above `bash_max_timeout` is cut too, but the
+    /// model asked for nothing, so the error does not say it did.
+    #[tokio::test]
+    async fn a_default_timeout_cut_by_the_maximum_is_not_called_requested() {
+        let mut ctx = create_tool_context();
+        ctx.limits.bash_timeout = 10;
+        ctx.limits.bash_max_timeout = 1;
+
+        let error = tool_error(BashTool.execute(json!({"command": "sleep 5"}), ctx).await);
+        let head = "Tool execution failed: Command timed out after 1s and was stopped. ";
+        assert!(error.starts_with(head), "{error}");
+        assert!(!error.contains("requested"), "{error}");
+    }
+
     fn prompt_channel() -> (
         crate::tools::SecretPromptHandle,
         tokio::sync::mpsc::UnboundedReceiver<crate::tools::SecretPromptRequest>,
@@ -1359,23 +1376,29 @@ if read -r got; then echo "stdin gave: $got"; else echo stdin-eof; fi"#;
     #[test]
     fn the_timeout_message_names_the_stop_and_keeps_the_output() {
         assert_eq!(
-            timed_out_message(30, 30, "", 256),
+            timed_out_message(30, None, "", 256),
             "Command timed out after 30s and was stopped. No output was captured before \
              the timeout; output the program had buffered but not flushed is lost."
         );
         assert_eq!(
-            timed_out_message(30, 30, "step 1\nstep 2\n", 256),
+            timed_out_message(30, Some(30), "step 1\nstep 2\n", 256),
             "Command timed out after 30s and was stopped. Output before the timeout:\n\
              step 1\nstep 2\n"
         );
         assert_eq!(
-            timed_out_message(300, 600, "x", 256),
+            timed_out_message(300, Some(600), "x", 256),
             "Command timed out after 300s and was stopped (600s was requested; \
              the maximum is 300s). Output before the timeout:\nx"
         );
+        // No timeout from the model: a default the maximum cut was never
+        // requested, so the message does not say it was.
+        assert_eq!(
+            timed_out_message(300, None, "x", 256),
+            "Command timed out after 300s and was stopped. Output before the timeout:\nx"
+        );
         let long = format!("{}END", "a".repeat(1000));
         assert_eq!(
-            timed_out_message(1, 1, &long, 10),
+            timed_out_message(1, Some(1), &long, 10),
             "Command timed out after 1s and was stopped. \
              Output before the timeout (last 10 of 1003 bytes):\naaaaaaaEND"
         );
@@ -1400,7 +1423,7 @@ if read -r got; then echo "stdin gave: $got"; else echo stdin-eof; fi"#;
             );
         }
         assert_eq!(
-            timed_out_message(1, 1, "▀▀▀", 4),
+            timed_out_message(1, None, "▀▀▀", 4),
             "Command timed out after 1s and was stopped. \
              Output before the timeout (last 3 of 9 bytes):\n▀"
         );
