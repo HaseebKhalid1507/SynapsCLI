@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Runs one Terminal-Bench task through the synaps daemon inside the task container.
 #
-#   synaps-run.sh <prompts.jsonl> <log-dir>
+#   synaps-run.sh <prompts.jsonl> <log-dir> [<completion.env>]
 #
-# prompts.jsonl holds one JSON string per line, built on the host: the task
-# instruction, then the fixed confirmation message.
+# prompts.jsonl holds one JSON string per line, built on the host. Default
+# (completion=confirm, the published run): the task instruction, then the fixed
+# confirmation message. With completion.env (completion=closeout, opt-in) it
+# holds only the instruction; what follows depends on how each turn ended
+# (turn_end, next_step), and every decision is logged to completion.jsonl.
 #
 # This is how Synaps is used day to day (a client attached to `synaps daemon`),
 # not `synaps rpc`. The script starts a daemon, then speaks its line-JSON socket
@@ -15,10 +18,60 @@
 # (event-woken turns, e.g. subagent completions, count as more work).
 set -uo pipefail
 
+# How the last finished turn ended, from the session's last done/error/aborted
+# event and the stop_reason of the session's last api-log row written since the
+# turn was submitted (<rows-before> of its rows existed then). Child sessions'
+# rows carry no session_id and are ignored. Prints "<end> <event> <stop_reason>",
+# end one of end_turn max_tokens refusal error cancelled unknown, "-" if missing.
+#   turn_end <events.jsonl> <api-log.jsonl> <session-id> <rows-before>
+turn_end() {
+  local last reason
+  last="$(grep -E -o '"session":"(done|error)"|"ev":"aborted"' "$1" 2>/dev/null | tail -n 1 | sed 's/.*:"//; s/"$//')"
+  reason="$(grep -F "\"session_id\":\"$3\"" "$2" 2>/dev/null | tail -n +"$(($4 + 1))" | tail -n 1 \
+    | sed -n 's/.*"stop_reason":"\([a-z_]*\)".*/\1/p')"
+  case "$last:$reason" in
+    done:end_turn) echo "end_turn done end_turn" ;;
+    done:max_tokens) echo "max_tokens done max_tokens" ;;
+    error:refusal) echo "refusal error refusal" ;;
+    error:*) echo "error error ${reason:--}" ;;
+    aborted:*) echo "cancelled aborted ${reason:--}" ;;
+    *) echo "unknown ${last:--} ${reason:--}" ;;
+  esac
+}
+
+# What to send after a turn that ended <end>: continue (at most 2), then the one
+# close-out; after a refusal only the optional note; nothing after the close-out
+# or the note, on error/cancellation/unknown signals, or with under 60 s left.
+#   next_step <end> <continuations-sent> <final-sent 0|1> <refusal-note 0|1> [<seconds-left>]
+# Prints continue | closeout | refusal_note | none:<why>.
+next_step() {
+  local end="$1" cont="$2" final="$3" note="$4" left="${5:-}"
+  if [ "$final" != 0 ]; then echo none:final_sent; return; fi
+  if [ -n "$left" ] && [ "$left" -lt 60 ]; then echo none:deadline; return; fi
+  case "$end" in
+    end_turn) echo closeout ;;
+    max_tokens) if [ "$cont" -lt 2 ]; then echo continue; else echo closeout; fi ;;
+    refusal) if [ "$note" = 1 ]; then echo refusal_note; else echo none:refusal; fi ;;
+    *) echo "none:$end" ;;
+  esac
+}
+
+# Sourced (tests): functions only.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+
 prompts="$1"
 logs="$2"
+completion="${3:-}"
 mkdir -p "$logs"
 cp "$prompts" "$logs/prompts.jsonl"
+SX_TIMEOUT_S="" SX_CLOSEOUT="" SX_CONTINUE="" SX_REFUSAL_NOTE=""
+if [ -n "$completion" ]; then
+  cp "$completion" "$logs/completion.env"
+  # shellcheck disable=SC1090
+  . "$completion"
+  start="$(date +%s)"
+fi
+api="$HOME/.cache/synaps/api-log.jsonl"
 st="$(mktemp -d /tmp/synaps-run.XXXXXX)"
 echo 0 > "$st/turns"
 echo 0 > "$st/ends"
@@ -48,10 +101,15 @@ fi
   fi
   rm -f "$st/clamped"
 
-  while IFS= read -r text; do
-    [ -n "$text" ] || continue
+  # Submit one prompt (a JSON string) and wait until its turn has finished.
+  # Fails if the connection is gone.
+  sent=0
+  submit() {
+    rows0="$(grep -c -F "\"session_id\":\"$sid\"" "$api" 2>/dev/null)"
+    rows0="${rows0:-0}"
     t0="$(cat "$st/turns")"
-    printf '{"type":"cmd","session_id":"%s","cmd":{"cmd":"submit","text":%s,"attachments":[]}}\n' "$sid" "$text"
+    printf '{"type":"cmd","session_id":"%s","cmd":{"cmd":"submit","text":%s,"attachments":[]}}\n' "$sid" "$1"
+    sent=$((sent + 1))
     until [ "$(cat "$st/turns")" -gt "$t0" ] || [ -e "$st/dead" ]; do sleep 1; done
     # Finished: every started turn has ended (done/error/aborted) and none
     # starts for 5 s (event-woken turns, e.g. subagent completions, are work).
@@ -64,9 +122,44 @@ fi
         sleep 2
       fi
     done
-    [ -e "$st/dead" ] && break
+    [ -e "$st/dead" ] && return 1
     [ -e "$st/idle" ] || echo "synaps-run: note: no Idle after turn $n" >> "$st/notes"
+  }
+
+  ok=1
+  while IFS= read -r text; do
+    [ -n "$text" ] || continue
+    submit "$text" || { ok=0; break; }
   done < "$prompts"
+
+  # completion=closeout: decide each follow-up from how the last turn ended.
+  if [ -n "$completion" ] && [ "$ok" = 1 ]; then
+    cont=0 final=0 note=0
+    [ -n "$SX_REFUSAL_NOTE" ] && note=1
+    while :; do
+      read -r end event reason <<< "$(turn_end "$logs/daemon-events.jsonl" "$api" "$sid" "$rows0")"
+      used=$(( $(date +%s) - start ))
+      left=""
+      [ -n "$SX_TIMEOUT_S" ] && left=$((SX_TIMEOUT_S - used))
+      step="$(next_step "$end" "$cont" "$final" "$note" "$left")"
+      action="${step%%:*}" why=""
+      [ "$action" = none ] && why="${step#none:}"
+      printf '{"after":%s,"end":"%s","event":"%s","stop_reason":"%s","action":"%s","why":"%s","elapsed_s":%s}\n' \
+        "$sent" "$end" "$event" "$reason" "$action" "$why" "$used" >> "$logs/completion.jsonl"
+      case "$action" in
+        continue) msg="$SX_CONTINUE"; cont=$((cont + 1)) ;;
+        closeout)
+          msg="$SX_CLOSEOUT"; final=1
+          if [ -n "$left" ]; then
+            msg="${msg//@E@/$((used / 60))}"; msg="${msg//@T@/$((SX_TIMEOUT_S / 60))}"
+            msg="${msg//@R@/$((left / 60))}"
+          fi ;;
+        refusal_note) msg="$SX_REFUSAL_NOTE"; final=1 ;;
+        *) break ;;
+      esac
+      submit "$msg" || break
+    done
+  fi
 
   # /close: save and end the session in the daemon, like the TUI's /close.
   printf '{"type":"cmd","session_id":"%s","cmd":{"cmd":"engine_command","id":3,"name":"close","arg":""}}\n' "$sid"
