@@ -2,7 +2,8 @@
 
 How Synaps measures startup latency and memory footprint, how to reproduce it,
 and what the numbers were on the reference machine. Prompt-cache hit rates from
-real use are in [`benchmarks/prompt-cache/`](benchmarks/prompt-cache/).
+real use are in [`benchmarks/prompt-cache/`](benchmarks/prompt-cache/). Task success on
+Terminal-Bench 4.1 is in [`benchmarks/terminal-bench/`](benchmarks/terminal-bench/).
 
 The harnesses live in [`benchmarks/`](benchmarks/). Methodology and portions of
 their source are adapted from [jcode](https://github.com/1jehuang/jcode)'s
@@ -22,6 +23,11 @@ Measured 2026-10-26 on one machine, same day, current versions (details in
 - **97.9% of prompt tokens served from the Anthropic prompt cache** since
   v0.8.0, over 127k real requests (median request 99.4%). See
   [Prompt cache](#prompt-cache).
+- **Terminal-Bench 4.1: 39/63 (61.9%)** (2026-11-05/06) with Claude Opus 5.5, one trial per
+  task. Claude Code with the same model would be expected to pass 40.0 of
+  the same tasks (public TB 4.0 board). The API refused 3 tasks for Synaps;
+  without them it is 39/60 (65.0%) against 38.2 (63.7%). See
+  [Terminal-Bench](#terminal-bench).
 
 ## Methodology
 
@@ -179,6 +185,32 @@ The dollar figures are list-price equivalents, not money spent.
 
 ![weekly prompt-cache hit rate](benchmarks/prompt-cache/charts/1-weekly-hit-rate.png)
 
+## Terminal-Bench
+
+One pass of Terminal-Bench 4.1.0 (63 tasks, 1 trial each) on 2026-11-05/06:
+Synaps 0.11.1 in its daemon mode inside each task container, Claude Opus 5.5
+at `thinking = xhigh`, the same prompt and config for every task. The
+comparison is Claude Code + Opus 5.5 (`max`) from the public TB 4.0
+leaderboard, as expected passes over the same 63 tasks (the sum of its
+per-task pass rates over 5 trials). Full write-up, per-task table, harness
+and raw data: [`benchmarks/terminal-bench/`](benchmarks/terminal-bench/README.md).
+
+| | Synaps (TB 4.1, 1 trial) | Claude Code (TB 4.0 board, same tasks) |
+|---|--:|--:|
+| Passed | **39 / 63 (61.9%)** | 40.0 expected (63.5%) |
+| Excluding 3 API refusals | **39 / 60 (65.0%)** | 38.2 (63.7%) |
+| Median agent time per task | 23 min | 55 min |
+| List-price cost per trial | $7.94 | $13.77 |
+
+The refusals (`uefi-bootkit`, `formal-crypto`, `kv-live-surgery`) cost 1.8
+expected passes, more than the whole 1.0 gap. Claude Code was refused at the
+same steps and passes those tasks by falling back to Claude Opus 5; Synaps
+ends the turn. Most other failures miss one or two checks, and in 13 of 21 the
+agent's own summary named the decision that failed. Every failure has a
+write-up with general fixes in
+[`benchmarks/terminal-bench/failures/`](benchmarks/terminal-bench/failures/README.md).
+One trial per task is noisy, and versions, effort and hosts differ.
+
 ## Caveats (read these)
 
 - **Single machine.** Cross-machine comparison to any vendor's *published*
@@ -198,8 +230,10 @@ The dollar figures are list-price equivalents, not money spent.
   September 2026 (v0.9.x) and was not re-measured.
 - **Latency vs other daemon harnesses is not settled here.** Only Synaps
   latency was re-measured.
-- **What is *not* measured here:** time-to-first-token, cost-per-task, and task
-  success. First-frame latency and idle RAM are necessary, not sufficient.
+- **What the latency and memory runs do *not* measure:** time-to-first-token,
+  cost per task, and task success. First-frame latency and idle RAM are
+  necessary, not sufficient. Task success and cost are covered separately by
+  [Terminal-Bench](#terminal-bench).
 - **The prompt-cache numbers are one heavy user's workload** (daily
   development of Synaps itself, mostly Claude, many subagents). Your hit rate
   depends on how you work: long pauses past the cache TTL cost a rebuild.
