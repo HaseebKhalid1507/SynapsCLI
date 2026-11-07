@@ -129,6 +129,109 @@ def _now_iso(ms: int | None = None) -> str:
     return t.isoformat().replace("+00:00", "Z")
 
 
+# ── api-log attribution ─────────────────────────────────────────────────
+# api-log.jsonl holds one row per model request (refused attempts included) for
+# the attached session *and* for every subagent it spawned, interleaved in time.
+# Parent rows carry the attached session's `session_id`; subagent rows carry none,
+# but have their own `runtime_session_id` and name their parent
+# (`worker`, `parent_session_id`, `parent_runtime_session_id`).
+
+def _read_api_log(path: Path) -> list[dict[str, Any]] | None:
+    """Rows that carry usage, in file order; None if there is no log."""
+    if not path.exists():
+        return None
+    rows = []
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("usage"):
+            rows.append(row)
+    return rows
+
+
+def _split_rows(session_id: str | None, rows: list[dict[str, Any]]):
+    """(parent, subagent, unattributed) rows, each in file order."""
+    parent, sub, other = [], [], []
+    for r in rows:
+        if session_id and r.get("session_id") == session_id:
+            parent.append(r)
+        elif r.get("worker") or r.get("parent_session_id") or r.get("parent_runtime_session_id"):
+            sub.append(r)
+        else:
+            other.append(r)
+    return parent, sub, other
+
+
+def _prompt_tokens(u: dict[str, Any]) -> int:
+    return (u.get("input") or 0) + (u.get("cache_read") or 0) + (u.get("cache_write") or 0)
+
+
+def _row_usage(row: dict[str, Any]) -> tuple[int, ...]:
+    u = row["usage"]
+    return tuple(u.get(k) or 0 for k in ("input", "output", "cache_read", "cache_write"))
+
+
+def _event_usage(ev: dict[str, Any]) -> tuple[int, ...]:
+    return tuple(ev.get(k) or 0 for k in ("input_tokens", "output_tokens",
+                                          "cache_read_input_tokens", "cache_creation_input_tokens"))
+
+
+def _runtime_ids(rows: list[dict[str, Any]]) -> list[str | None]:
+    return list(dict.fromkeys(r.get("runtime_session_id") for r in rows))
+
+
+def _pair_responses(
+    session_id: str | None,
+    rows: list[dict[str, Any]] | None,
+    parent: list[dict[str, Any]],
+    usages: list[tuple[int, ...] | None],
+) -> tuple[list[dict[str, Any] | None], dict[str, Any]]:
+    """Pair the attached session's responses (`usages`: each one's streamed usage,
+    if seen) with the parent rows, in order: the daemon streams one
+    response_start per request. All or nothing: with no identity, an
+    inconsistent one, a count mismatch or a usage mismatch, no response is
+    paired and the reason is returned, instead of guessing by position."""
+    n = len(usages)
+    runtimes = _runtime_ids(parent)
+    info: dict[str, Any] = {"responses": n, "parent_rows": len(parent)}
+    problem = None
+    if rows is None:
+        problem = f"no {API_LOG}"
+    elif not session_id:
+        problem = "no attached session id"
+    elif len(runtimes) > 1:
+        problem = f"parent rows span runtime sessions {runtimes}"
+    elif runtimes and runtimes[0] and any(
+        r.get("runtime_session_id") == runtimes[0] and r.get("session_id") != session_id for r in rows
+    ):
+        problem = f"runtime session {runtimes[0]} also on rows without session id {session_id}"
+    elif len(parent) != n:
+        problem = f"{n} responses but {len(parent)} parent {API_LOG} rows"
+    else:
+        info["usage_checked"] = sum(u is not None for u in usages)
+        bad = [i for i, (u, r) in enumerate(zip(usages, parent)) if u is not None and u != _row_usage(r)]
+        if bad:
+            problem = f"streamed usage differs from the paired row for responses {bad[:5]}"
+    if problem:
+        info.update(status="unpaired", problem=problem)
+        return [None] * n, info
+    info["status"] = "paired"
+    return list(parent), info
+
+
+def _tally(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    cost = sum(r.get("cost_usd") or 0 for r in rows)
+    return {
+        "requests": len(rows),
+        "prompt_tokens": sum(_prompt_tokens(r["usage"]) for r in rows),
+        "cached_tokens": sum(r["usage"].get("cache_read") or 0 for r in rows),
+        "completion_tokens": sum(r["usage"].get("output") or 0 for r in rows),
+        "cost_usd": cost or None,  # OAuth sessions report 0: unknown, not free
+    }
+
+
 class SynapsAgent(BaseInstalledAgent):
     # skills: a task's skills_dir is copied into ~/.synaps-cli/skills (synaps
     # loads <name>/SKILL.md there), as Claude Code's adapter copies it into its
@@ -301,6 +404,7 @@ class SynapsAgent(BaseInstalledAgent):
         if traj is None:
             return
         (self.logs_dir / "trajectory.json").write_text(format_trajectory_json(traj.to_json_dict()))
+        # Task totals: every api-log row once, subagents included (see convert_trajectory).
         fm = traj.final_metrics
         context.n_input_tokens = fm.total_prompt_tokens
         context.n_cache_tokens = fm.total_cached_tokens
@@ -312,58 +416,24 @@ class SynapsAgent(BaseInstalledAgent):
     @override
     def convert_trajectory(self, logs_dir: Path) -> Trajectory | None:
         """ATIF from the daemon event log: one user step per turn (its text comes
-        from `turn_started`), one agent step per model response, metrics from
-        the api-log row of that response (same order)."""
+        from `turn_started`), one agent step per model response of the attached
+        session (refused attempts included), metrics from that session's own
+        api-log row for the response (see _pair_responses)."""
         events = logs_dir / EVENTS_LOG
         if not events.exists():
             return None
-        requests = []  # one api-log row per model response, in order
-        if (logs_dir / API_LOG).exists():
-            for line in (logs_dir / API_LOG).read_text(errors="replace").splitlines():
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if row.get("usage"):
-                    requests.append(row)
+        rows = _read_api_log(logs_dir / API_LOG)
 
-        steps: list[Step] = [Step(step_id=1, source="system", message=SYSTEM_PROMPT)]
+        items: list[dict[str, Any]] = []  # user turns and model responses, in order
         cur: dict[str, Any] | None = None
-        n_resp = 0
         session_id = None
+        skipped_frames = 0
 
         def flush() -> None:
             nonlocal cur
-            if cur is None:
-                return
-            calls = [ToolCall(tool_call_id=i, function_name=c["name"], arguments=c["args"])
-                     for i, c in cur["calls"].items()]
-            results = [ObservationResult(source_call_id=i, content=c["result"])
-                       for i, c in cur["calls"].items() if c["result"] is not None]
-            req = requests[cur["n"]] if cur["n"] < len(requests) else None
-            metrics = None
-            if req:
-                u = req["usage"]
-                metrics = Metrics(
-                    prompt_tokens=(u.get("input") or 0) + (u.get("cache_read") or 0)
-                    + (u.get("cache_write") or 0),
-                    completion_tokens=u.get("output"),
-                    cached_tokens=u.get("cache_read"),
-                    cost_usd=req.get("cost_usd") or None,
-                    extra={"cache_write_tokens": u.get("cache_write"),
-                           "stop_reason": req.get("stop_reason")},
-                )
-            steps.append(Step(
-                step_id=len(steps) + 1, source="agent",
-                timestamp=_now_iso(req.get("ts")) if req else cur["ts"],
-                model_name=req.get("model") if req else None,
-                message="".join(cur["text"]),
-                reasoning_content="".join(cur["think"]) or None,
-                tool_calls=calls or None,
-                observation=Observation(results=results) if results else None,
-                metrics=metrics, llm_call_count=1,
-            ))
-            cur = None
+            if cur is not None:
+                items.append(cur)
+                cur = None
 
         for line in events.read_text(errors="replace").splitlines():
             try:
@@ -375,27 +445,31 @@ class SynapsAgent(BaseInstalledAgent):
                 continue
             if fr.get("type") != "event":
                 continue
+            if session_id and fr.get("session_id") not in (None, session_id):
+                skipped_frames += 1  # another session's frame
+                continue
             ev = fr.get("event") or {}
             kind = ev.get("ev")
             if kind == "turn_started":
                 flush()
-                steps.append(Step(step_id=len(steps) + 1, source="user",
-                                  message=ev.get("user_text") or f"[{ev.get('trigger')} turn]",
-                                  timestamp=fr.get("ts")))
+                items.append({"user": ev.get("user_text") or f"[{ev.get('trigger')} turn]",
+                              "ts": fr.get("ts")})
                 continue
             if kind != "stream":
                 continue
             inner = ev.get("event") or {}
-            if inner.get("kind") == "session" and inner.get("session") in ("done", "error"):
-                flush()
+            if inner.get("kind") == "session":
+                if inner.get("session") in ("done", "error"):
+                    flush()
+                elif inner.get("session") == "usage" and cur is not None and cur["usage"] is None:
+                    cur["usage"] = _event_usage(inner)
                 continue
             if inner.get("kind") != "llm":
                 continue
             et = inner.get("llm")
             if et == "response_start":
                 flush()
-                cur = {"n": n_resp, "ts": fr.get("ts"), "text": [], "think": [], "calls": {}}
-                n_resp += 1
+                cur = {"ts": fr.get("ts"), "text": [], "think": [], "calls": {}, "usage": None}
             elif cur is None:
                 continue
             elif et == "text":
@@ -415,11 +489,63 @@ class SynapsAgent(BaseInstalledAgent):
                 r = inner.get("result")
                 c["result"] = r if isinstance(r, str) else json.dumps(r)
         flush()
-        if len(steps) == 1:
+        if not items:
             return None
 
-        agent_steps = [s for s in steps if s.source == "agent" and s.metrics]
-        cost = sum(s.metrics.cost_usd or 0 for s in agent_steps)
+        parent, subagent, other = _split_rows(session_id, rows or [])
+        responses = [it for it in items if "user" not in it]
+        paired, attribution = _pair_responses(session_id, rows, parent, [r["usage"] for r in responses])
+        if skipped_frames:
+            attribution["other_session_frames"] = skipped_frames
+        req_of = {id(r): q for r, q in zip(responses, paired)}
+
+        steps: list[Step] = [Step(step_id=1, source="system", message=SYSTEM_PROMPT)]
+        for it in items:
+            if "user" in it:
+                steps.append(Step(step_id=len(steps) + 1, source="user", message=it["user"],
+                                  timestamp=it["ts"]))
+                continue
+            req = req_of[id(it)]
+            calls = [ToolCall(tool_call_id=i, function_name=c["name"], arguments=c["args"])
+                     for i, c in it["calls"].items()]
+            results = [ObservationResult(source_call_id=i, content=c["result"])
+                       for i, c in it["calls"].items() if c["result"] is not None]
+            metrics = None
+            if req:
+                u = req["usage"]
+                metrics = Metrics(
+                    prompt_tokens=_prompt_tokens(u),
+                    completion_tokens=u.get("output"),
+                    cached_tokens=u.get("cache_read"),
+                    cost_usd=req.get("cost_usd") or None,
+                    extra={"cache_write_tokens": u.get("cache_write"),
+                           "stop_reason": req.get("stop_reason")},
+                )
+            steps.append(Step(
+                step_id=len(steps) + 1, source="agent",
+                timestamp=_now_iso(req.get("ts")) if req else it["ts"],
+                model_name=req.get("model") if req else None,
+                message="".join(it["text"]),
+                reasoning_content="".join(it["think"]) or None,
+                tool_calls=calls or None,
+                observation=Observation(results=results) if results else None,
+                metrics=metrics, llm_call_count=1,
+            ))
+
+        # Totals are the task's: every api-log row exactly once, the attached
+        # session's and its subagents' (subagent work is part of the task's cost).
+        # Step metrics cover the attached session only, so with subagents the
+        # totals exceed the sum over steps; `extra` has the split.
+        total = _tally(rows or [])
+        extra: dict[str, Any] = {
+            "attribution": attribution,
+            "api_requests": total["requests"],
+            "parent": {"session_id": session_id, "runtime_session_ids": _runtime_ids(parent),
+                       **_tally(parent)},
+            "subagents": {"runtime_session_ids": _runtime_ids(subagent), **_tally(subagent)},
+        }
+        if other:
+            extra["unattributed"] = {"runtime_session_ids": _runtime_ids(other), **_tally(other)}
         return Trajectory(
             schema_version="ATIF-v1.7",
             session_id=session_id,
@@ -428,10 +554,11 @@ class SynapsAgent(BaseInstalledAgent):
                         extra={"thinking": self._effort(), "transport": "synaps daemon"}),
             steps=steps,
             final_metrics=FinalMetrics(
-                total_prompt_tokens=sum(s.metrics.prompt_tokens or 0 for s in agent_steps),
-                total_completion_tokens=sum(s.metrics.completion_tokens or 0 for s in agent_steps),
-                total_cached_tokens=sum(s.metrics.cached_tokens or 0 for s in agent_steps),
-                total_cost_usd=cost or None,  # OAuth sessions report 0: unknown, not free
+                total_prompt_tokens=total["prompt_tokens"],
+                total_completion_tokens=total["completion_tokens"],
+                total_cached_tokens=total["cached_tokens"],
+                total_cost_usd=total["cost_usd"],
                 total_steps=len(steps),
+                extra=extra,
             ),
         )

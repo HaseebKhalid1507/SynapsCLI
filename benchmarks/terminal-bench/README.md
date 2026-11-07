@@ -111,7 +111,11 @@ plan](analysis/README.md#6-ranked-changes-and-exact-regression-guards).
   settings.
 - **Harbor adapter:** [`harness/synaps_agent.py`](harness/synaps_agent.py)
   (Harbor 0.25 installed agent). It converts the daemon event log to an ATIF
-  trajectory, which the leaderboard requires. MCP tasks get their SSE servers
+  trajectory, which the leaderboard requires. Step metrics come from the
+  attached session's own API records; `final_metrics` totals and Harbor's
+  `cost_usd` count every record once, subagents included, with the split in
+  `final_metrics.extra`. (The run above predates this and paired records by
+  position; see the audit.) MCP tasks get their SSE servers
   through [`mcp-sse-bridge`](harness/mcp-sse-bridge/), because Synaps 0.11.1
   spawns stdio servers only.
 - **Auth:** containers never hold an OAuth credential. They fetch short-lived
