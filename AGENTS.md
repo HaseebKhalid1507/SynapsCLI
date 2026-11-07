@@ -639,7 +639,12 @@ Execute shell commands via `bash -c`.
 | `command` | string | ✓ | — | |
 | `timeout` | integer | | 30 | Seconds, max 300 |
 
-ANSI stripped. Output truncated at 30KB. `kill_on_drop` on timeout. Combined stdout+stderr.
+ANSI stripped. Combined stdout+stderr.
+
+- **Output cap:** output past the 256 KiB tool buffer (`max_tool_buffer`) stops the command: its process group is killed and the result (still a success, not an error) ends `[output truncated at N bytes: the command was stopped at this limit before it finished, so its exit status is unknown. …]`, with advice to redirect large output to a file. The streamed output carries the same bytes and notice.
+- **Timeout:** the process group is killed too, and the error starts `Command timed out after Ns and was stopped` (with `(Ms was requested; the maximum is Ns)` when `bash_max_timeout` cut the request). Then comes `Output before the timeout:` and what the command printed, redacted like any result: at most the last `max_tool_buffer` bytes, marked `(last K of M bytes)` when cut. If nothing was captured, it says so.
+- A command that exits by itself leaves what it started in the background (`server &`) running.
+- After the tool returns, the result goes through the usual `max_tool_output` cut or the spill preview (`tool_output_spill_bytes`).
 
 ### `read`
 Read file with line numbers.
