@@ -9,6 +9,12 @@ its own write-up: what the grader checks, what Synaps did, the exact failing
 checks traced back to a decision in the transcript, what Claude Code did
 differently where it passed, and ranked fixes.
 
+**Follow-up:** the [whole-run audit](../analysis/README.md) examines passing
+controls as well as failures, all request telemetry, and 84 selected CC traces.
+Its regression-controlled plan supersedes the recommendations below. In
+particular, “likely flips” are untested hypotheses; passing solutions also have
+caveats, and model fallback must not be used to evade safety refusals.
+
 ## How these were made
 
 An analyst agent per group of tasks read the Synaps event log, the grader
@@ -35,12 +41,13 @@ has to be measured on a fresh full pass, not assumed.
   builds graphs one `add_edge` at a time … the ratio would drop"). In 3 more it
   foresaw the failure mid-run and dropped it. The caveats were written for a
   reader who doesn't exist.
-- **The confirmation turn did nothing.** After the first turn ends, the harness
+- **The confirmation turn usually prompted no further tool work on failures.** After the first turn ends, the harness
   sends one fixed message ("if any part of the task is not yet complete and
   verified, continue now…"). In 19 of 24 failures the answer had no tool calls
   at all ("complete and checked"), and in 3 more, one.
-- **It stopped early.** On failed tasks Synaps used a median 42% of Claude
-  Code's average time (60% on passed tasks), and between 3 and 179 of the 480
+- **It often stopped with time available.** On non-refused failed tasks Synaps
+  used a median 48% of Claude Code's average time (60% on passed tasks), and
+  between 3 and 179 of the 480
   minutes available. `vf2` stopped with 6.5 hours left after naming the exact
   risk that failed it.
 - **Refusals ended three runs outright** (`formal-crypto`, `uefi-bootkit`,
@@ -108,34 +115,27 @@ Would likely have flipped: `fin-saccr-rwa`, `atrx-vep-crispr`,
 `foodstuff-beta-activity`, `medical-claims-processing`, `music-harmony`,
 `protein-autointerp-disulfide`, `ontology-kg-querying`. Cost: more wall time
 and tokens on tasks with open caveats, which is the point; little on tasks
-without. Risk: an agent that "fixes" a correct caveat. The tie-break rules
-below keep that one-directional.
+without. Risk: an agent that "fixes" a correct caveat. The follow-up found
+concrete passing counterexamples: tie-break rules do not make this risk
+one-directional. Treat the proposed flips as hypotheses, not measured gains.
 
-### 2. Recover from refusals instead of ending the turn (runtime, all tasks)
+### 2. Preserve refusal outcomes and safety boundaries (runtime)
 
 Today (`crates/agent-engine/src/runtime/api.rs`, refusal retry loop) Synaps
 discards the partial response, re-sends the byte-identical request up to
 `refusal_retries = 2` times and then ends the turn with an error, writing
-nothing into the conversation. Over the whole run, 19 requests were refused: 9
-recovered on the first retry (all were cut off mid-generation), 0 of 8 third
-attempts and 0 of 2 zero-output refusals ever recovered.
+nothing into the conversation, although the user receives a notice. Corrected
+whole-run telemetry finds **24 refused attempts across 12 request sequences**:
+six recovered on their second attempt and six exhausted three attempts. No third
+attempt recovered; two exhausted sequences had zero output throughout.
 
-- After a refusal, append a short factual note (the response was stopped by
-  the safety classifier, the content was withheld, its tool calls did not run,
-  do not reproduce it) and keep looping, capped at ~3 per session.
-- Retry identically at most once, and only when the refusal came
-  mid-generation; never after a zero-output refusal.
-- Optionally, a fallback model on refusal, which is what Claude Code does. It
-  changes the model under test, so it should be off by default and disclosed
-  in any benchmark result.
-
-Affects `formal-crypto`, `uefi-bootkit`, `kv-live-surgery` (Claude Code passes
-3/5, 4/5, 2/5, mostly on its fallback model). Without a fallback the gain is
-uncertain: the note lets the model change course instead of being re-rolled.
-Better system-prompt framing is unlikely to help: Claude Code's long,
-security-aware prompt was refused at the same steps. An honest line saying the
-container is isolated and its contents came with the task is cheap to add and
-can be A/B tested by counting refusals.
+Preserve withheld-content discarding and explicit user notice. Carry a typed
+refusal outcome into the harness so a generic completion message does not
+blindly restart a refused task. Report safe partial results and an honest
+blocker, rather than claiming completion. Do not use model fallback or repeated
+reframing to evade a safety refusal. Observed CC model switches are a comparison
+confounder, not a recommended recovery strategy. See the follow-up for tests
+covering cancellation, refusal, and output-limit continuation separately.
 
 ### 3. Tie-break rules in the system prompt (prompt, all tasks)
 
@@ -181,7 +181,7 @@ phrased that way.
 - Raise Docker's `default-address-pools` before running many compose tasks
   at once (see the main write-up).
 
-### Not fixable by a general change
+### No demonstrated general fix in this analysis
 
 `freecad-impeller` (the grader only measures one CAD construction the
 instruction never asks for), `glycan-ms2-elucidation` (correct chemistry, but
