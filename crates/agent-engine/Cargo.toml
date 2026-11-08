@@ -78,6 +78,12 @@ dirs               = "5"
 fs4                = "0.13"
 notify             = "6.1"
 globset            = "0.4"
+# Content and file search (ripgrep's engine, in-process: grep and find tools)
+ignore             = "0.4"
+grep-matcher       = "0.1"
+grep-regex         = "0.1"
+grep-searcher      = "0.1"
+grep-printer       = "0.3"
 zeroize            = "1.8.2"
 tempfile           = "3"
 
