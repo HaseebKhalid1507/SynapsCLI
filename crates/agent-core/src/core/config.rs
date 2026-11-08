@@ -2987,7 +2987,8 @@ macro_rules! default_prompt_steering {
 /// `system.md` exist. Custom prompts never include it.
 pub const DEFAULT_PROMPT_WINDOWS: &str = concat!(
     "You are a helpful AI agent running in a terminal on Windows. \
-    You have access to powershell, bash, read, and write tools. \
+    Your tools run PowerShell and bash commands, read, edit and write files, \
+    and search file names and contents. \
     Prefer the powershell tool for system commands and filesystem operations — it is native \
     to Windows and avoids quoting/path translation issues. \
     Use bash only when the task specifically requires WSL or a Unix environment. \
@@ -2998,10 +2999,28 @@ pub const DEFAULT_PROMPT_WINDOWS: &str = concat!(
 /// Stock system prompt on every other platform; see [`DEFAULT_PROMPT_WINDOWS`].
 pub const DEFAULT_PROMPT_UNIX: &str = concat!(
     "You are a helpful AI agent running in a terminal. \
-    You have access to bash, read, and write tools. \
+    Your tools run shell commands, read, edit and write files, \
+    and search file names and contents. \
     Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.",
     default_prompt_steering!("`| tail -n`, `grep`, `head`")
 );
+
+/// Delegation guidance appended to the stock prompt (either platform) only
+/// while the session can start subagents; see
+/// `Runtime::effective_system_prompt`. Never part of a custom prompt, and
+/// workers never see it: their prompt is the agent's own and they have no
+/// subagent tools.
+pub const DEFAULT_PROMPT_DELEGATION: &str = " You can delegate to subagents, \
+    each a separate agent with its own context. \
+    When a task splits into large, independent pieces (exploring a big codebase, \
+    separate modules, an independent review of finished work), run them in parallel, \
+    each with a self-contained brief and its own files, then reconcile the results. \
+    Do small or sequential work yourself.";
+
+/// Whether `prompt` is a stock prompt, byte for byte (either platform's).
+pub fn is_default_prompt(prompt: &str) -> bool {
+    prompt == DEFAULT_PROMPT_UNIX || prompt == DEFAULT_PROMPT_WINDOWS
+}
 
 /// The stock system prompt for this platform.
 #[cfg(windows)]
@@ -4621,6 +4640,7 @@ mod tests {
         ] {
             for needle in [
                 "helpful AI agent running in a terminal",
+                "read, edit and write files, and search file names and contents.",
                 "Be concise and direct.",
                 "targeted edits rather than rewriting them whole",
                 "re-read it only if it may have changed",
@@ -4632,9 +4652,15 @@ mod tests {
             }
             assert!(!prompt.contains("  "), "{name} prompt has a double space");
             assert!(prompt.ends_with("selectively."), "{name}: {prompt}");
+            assert!(!prompt.contains("You have access to"), "{name}: {prompt}");
+            // Subagents are offered only by the runtime, when it has them.
+            assert!(!prompt.contains("subagent"), "{name}: {prompt}");
+            assert!(is_default_prompt(prompt));
         }
+        assert!(DEFAULT_PROMPT_UNIX.contains("Your tools run shell commands"));
         assert!(DEFAULT_PROMPT_UNIX.contains("`| tail -n`"));
         assert!(DEFAULT_PROMPT_WINDOWS.contains("on Windows"));
+        assert!(DEFAULT_PROMPT_WINDOWS.contains("Your tools run PowerShell and bash commands"));
         assert!(DEFAULT_PROMPT_WINDOWS.contains("`Select-Object -Last N`"));
         assert!(!DEFAULT_PROMPT_WINDOWS.contains("tail -n"));
     }
@@ -4645,6 +4671,43 @@ mod tests {
     fn default_prompts_stay_small() {
         assert!(DEFAULT_PROMPT_UNIX.len() <= 640, "{}", DEFAULT_PROMPT_UNIX.len());
         assert!(DEFAULT_PROMPT_WINDOWS.len() <= 900, "{}", DEFAULT_PROMPT_WINDOWS.len());
+        let delegation = DEFAULT_PROMPT_DELEGATION.len();
+        assert!(delegation <= 400, "{delegation}");
+    }
+
+    /// The delegation guidance appends cleanly to either stock prompt and
+    /// says when to delegate, not just that it is possible.
+    #[test]
+    fn default_prompt_delegation_is_conditional_guidance() {
+        let text = DEFAULT_PROMPT_DELEGATION;
+        assert!(text.starts_with(" You can delegate to subagents"), "{text}");
+        for needle in [
+            "large, independent pieces",
+            "in parallel",
+            "self-contained brief and its own files",
+            "reconcile the results",
+            "Do small or sequential work yourself.",
+        ] {
+            assert!(text.contains(needle), "lacks {needle:?}");
+        }
+        assert!(!text.contains("  ") && text.ends_with("yourself."), "{text}");
+    }
+
+    /// Only the exact stock text counts as stock: any edit makes it custom.
+    #[test]
+    fn is_default_prompt_matches_only_the_stock_bytes() {
+        assert!(is_default_prompt(DEFAULT_PROMPT));
+        assert!(is_default_prompt(DEFAULT_PROMPT_UNIX));
+        assert!(is_default_prompt(DEFAULT_PROMPT_WINDOWS));
+        for custom in [
+            String::new(),
+            "You are spike.".to_string(),
+            format!("{DEFAULT_PROMPT}\n"),
+            format!(" {DEFAULT_PROMPT}"),
+            format!("{DEFAULT_PROMPT}{DEFAULT_PROMPT_DELEGATION}"),
+        ] {
+            assert!(!is_default_prompt(&custom), "{custom:?}");
+        }
     }
 
     /// Explicit `--system` text and files are used byte for byte; the stock

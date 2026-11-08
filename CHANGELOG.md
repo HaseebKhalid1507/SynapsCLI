@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **The stock system prompt describes the real toolset and when to
+  delegate.** It said "You have access to bash, read, and write tools"
+  (Windows: powershell, bash, read and write), a fraction of what the model
+  has. It now says the tools run shell commands (Windows: PowerShell and
+  bash), read, edit and write files, and search file names and contents. A
+  session that can start subagents also gets three sentences on when to:
+  run large, independent pieces (exploring a big codebase, separate
+  modules, an independent review of finished work) in parallel, each with a
+  self-contained brief and its own files, then reconcile the results; do
+  small or sequential work yourself. Workers never get them (their prompt
+  is the agent's own and they have no subagent tools), nor does a session
+  whose `disabled_tools` removes `subagent_start` or that runs progressive
+  tool disclosure with `tools.activation_confirm = deny`. The default grows
+  from 539 to 586 bytes, 937 with the delegation sentences (Windows: 797 to
+  846, 1197). A `--system` prompt, `system.md`, a prompt manifest, agent
+  files and worker prompts are sent byte for byte as before. Upgrading
+  rewrites the prompt cache once for every session on the stock prompt;
+  within a session the prompt stays byte-stable.
+
 ### Fixed
 
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare

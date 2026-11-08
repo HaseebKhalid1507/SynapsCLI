@@ -880,7 +880,9 @@ mod cache_ttl_policy_tests {
 
 #[cfg(test)]
 mod preamble_tests {
-    use super::{compose_system_prompt, compose_system_prompt_with_preamble, FORUM_GUIDANCE};
+    use super::{
+        compose_system_prompt, compose_system_prompt_with_preamble, subagent_tools, FORUM_GUIDANCE,
+    };
 
     #[test]
     fn prompt_includes_agent_and_forum_guidance_when_forum_is_on() {
@@ -935,6 +937,29 @@ mod preamble_tests {
             assert_eq!(result, expected);
             assert!(!result.contains(crate::config::DEFAULT_PROMPT));
             assert!(!result.contains("targeted edits"));
+            assert!(!result.contains(crate::config::DEFAULT_PROMPT_DELEGATION));
+        }
+    }
+
+    /// What a worker sends is free of the stock delegation guidance: its
+    /// prompt is the agent's own, and its registry (`subagent_tools`, all
+    /// three spawn paths) has no `subagent_start`, so even an inline prompt
+    /// that is the stock text byte for byte gets none.
+    #[tokio::test]
+    async fn worker_wire_prompt_never_gets_delegation_guidance() {
+        for agent_prompt in ["You are spike.", crate::config::DEFAULT_PROMPT] {
+            for forum in [false, true] {
+                let mut runtime = crate::Runtime::new_headless();
+                runtime.set_model("anthropic/claude-sonnet-5-5".to_string());
+                runtime.set_tools(subagent_tools(&[]).await);
+                let composed =
+                    compose_system_prompt_with_preamble(agent_prompt.into(), None, forum);
+                runtime.set_system_prompt(composed.clone());
+                let wire = runtime.effective_system_prompt().await.unwrap();
+                assert_eq!(wire, composed, "worker prompt is sent as composed");
+                assert!(!wire.contains(crate::config::DEFAULT_PROMPT_DELEGATION));
+                assert!(!wire.contains("subagent"), "{wire}");
+            }
         }
     }
 }
