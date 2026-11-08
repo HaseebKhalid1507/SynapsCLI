@@ -65,10 +65,14 @@
     }
   },
   {
-    "description": "Find files by name using glob patterns. Searches recursively from the given path. Excludes .git directories.",
+    "description": "Find files by name: a glob matched against file names, searched recursively from the given path. Respects .gitignore (use no_ignore to include ignored files, node_modules and target); hidden files are listed, VCS dirs (.git) never.",
     "name": "find",
     "parameters": {
       "properties": {
+        "no_ignore": {
+          "description": "Also list files skipped by .gitignore/.ignore, node_modules and target (default false)",
+          "type": "boolean"
+        },
         "path": {
           "description": "Directory to search in (default: current directory)",
           "type": "string"

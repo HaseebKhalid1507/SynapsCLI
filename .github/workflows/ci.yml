@@ -106,8 +106,9 @@ jobs:
       # The macOS Git resolution (`git_program`: PATH, the /usr/bin/git
       # shim, developer directories) only takes its real branch here.
       - run: cargo test --locked -p synaps-core --lib git_program
-      # grep's in-process search (FIFOs, symlinks, O_NONBLOCK) on BSD libc.
-      - run: cargo test --locked -p synaps-engine --lib -- tools::search tools::grep
+      # grep's and find's in-process search (FIFOs, symlinks, O_NONBLOCK) on
+      # BSD libc.
+      - run: cargo test --locked -p synaps-engine --lib -- tools::search tools::grep tools::find
 
   # Nothing else compiles for Windows, so Windows-only breakage landed
   # unnoticed: `dev` stopped building there when the Unix-socket daemon

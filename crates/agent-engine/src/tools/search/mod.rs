@@ -1,26 +1,29 @@
-//! In-process search for the `grep` tool: ripgrep's crates (`ignore`,
-//! `grep-regex`, `grep-searcher`) instead of a spawned GNU grep. Nothing is
-//! spawned, so grep behaves the same on Linux, macOS and Windows (no Git for
-//! Windows needed) and in the hardened `--no-default-features` build.
+//! In-process search for the `grep` and `find` tools: ripgrep's crates
+//! (`ignore`, `globset`, `grep-regex`, `grep-searcher`) instead of a spawned
+//! GNU grep or find. Nothing is spawned, so both behave the same on Linux,
+//! macOS and Windows (no Git for Windows needed) and in the hardened
+//! `--no-default-features` build.
 //!
-//! The pieces here are shared with the `find` tool, which moves onto them
-//! next (its walk goes in `files.rs`):
+//! The shared pieces:
 //! - [`walk`]: the directory walk. Sorted by file name, so output and any cut
 //!   are deterministic. Hidden files are included and links inside the tree
 //!   are not followed. `.gitignore`, `.ignore`, `.git/info/exclude` and the
 //!   global git excludes apply as in ripgrep. VCS directories are always
 //!   skipped, `node_modules` and `target` unless `no_ignore`.
+//! - [`check_root`]: a missing path is `Path not found: …`.
 //! - [`Control`]: a cancel flag, the turn's cancellation token and a
-//!   deadline, checked between files and on every read ([`CancelReader`]).
+//!   deadline, checked between entries and on every read ([`CancelReader`]).
 //! - [`run_blocking`]: runs a search on the blocking pool. Dropping the tool's
 //!   future (cancellation) sets the cancel flag, so the thread stops too.
 //! - [`open_regular`]: opens regular files only, never blocking on a FIFO.
-//! - [`Tally`]: per-file errors, reported in a note instead of dropped.
+//! - [`Tally`]: per-entry errors, reported in a note instead of dropped.
 //!
-//! `pattern` builds the regex and the `include` glob; `content` is the grep
-//! engine and its `grep -rn` style output.
+//! `pattern` builds grep's regex and `include` glob and find's name glob;
+//! `content` is the grep engine and its `grep -rn` style output; `files` is
+//! the find engine and its `find PATH` style output.
 
 pub(crate) mod content;
+pub(crate) mod files;
 pub(crate) mod pattern;
 
 use std::ffi::OsStr;
@@ -56,6 +59,15 @@ pub(crate) struct WalkOptions {
 /// The walk under `root`, single-threaded and sorted by file name. The root
 /// itself (depth 0) is never filtered: an explicit path is always searched.
 pub(crate) fn walk(root: &Path, opts: &WalkOptions) -> Walk {
+    // ignore reads a bare `-` as stdin (a `<stdin>` entry); here it's a file
+    // named `-`, which a relative path with no session cwd can be.
+    let dashed;
+    let root = if root == Path::new("-") {
+        dashed = Path::new(".").join("-");
+        dashed.as_path()
+    } else {
+        root
+    };
     let respect = !opts.no_ignore;
     let mut builder = WalkBuilder::new(root);
     builder
@@ -88,6 +100,18 @@ fn excluded(entry: &DirEntry, no_ignore: bool) -> bool {
     !no_ignore
         && entry.file_type().is_some_and(|t| t.is_dir())
         && HARD_EXCLUDES.iter().any(|dir| name == OsStr::new(dir))
+}
+
+/// The error for a search path that can't be searched at all: `Path not
+/// found: …` when it doesn't exist, else the path and the OS error.
+pub(crate) fn check_root(root: &Path) -> Result<(), String> {
+    match std::fs::metadata(root) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Err(format!("Path not found: {}", root.display()))
+        }
+        Err(err) => Err(format!("{}: {err}", root.display())),
+    }
 }
 
 /// Why a search stopped before the end.
@@ -269,8 +293,7 @@ impl Tally {
     }
 }
 
-/// The footer for output stopped at `cap` bytes, for grep and for `find`
-/// (which still runs a program, see `unix_programs::run_bounded`). The
+/// The footer for output stopped at `cap` bytes, for grep and find. The
 /// wording is grep's old one; the total is a lower bound, as the search
 /// stops at the cap.
 pub(crate) fn truncation_footer(cap: usize) -> String {
@@ -301,6 +324,22 @@ pub(crate) fn append_note(text: &mut String, note: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `-` root is walked as the path `./-`, never as ignore's stdin.
+    #[test]
+    fn a_dash_root_is_a_path_not_stdin() {
+        let dashed = Path::new(".").join("-");
+        match walk(Path::new("-"), &WalkOptions::default())
+            .next()
+            .unwrap()
+        {
+            Ok(entry) => assert_eq!(entry.path(), dashed),
+            Err(err) => assert!(
+                err.to_string().contains(&dashed.display().to_string()),
+                "{err}"
+            ),
+        }
+    }
 
     #[test]
     fn control_reports_cancel_before_deadline() {

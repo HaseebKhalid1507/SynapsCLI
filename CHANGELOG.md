@@ -44,31 +44,52 @@ All notable changes to this project will be documented in this file.
     are never read.
   - The `grep` schema gained `no_ignore` and a new description, so the
     first request after upgrading rewrites the prompt cache once.
+- **`find` runs on the same in-process walker, and respects `.gitignore`.**
+  It ran GNU `find`, which on Windows needed Git for Windows and in the
+  hardened `--no-default-features` build still spawned a process. Its
+  `-not -path` filters hid the contents of `node_modules`, `.git` and
+  `target` only after walking every entry, so a big `node_modules` was
+  walked in full on every call, and a project whose own path ran through a
+  directory of one of those names (say `~/target/app`) found nothing. It now
+  walks with grep's walker (`ignore` and `globset`, no process), so it
+  behaves the same on Linux, macOS and Windows (no Git for Windows needed
+  for find) and works in the hardened build. The output is unchanged: one
+  path per line, as `find PATH` printed it. Behaviour changes:
+  - **`.gitignore` is respected** (in a git repo), with `.ignore`,
+    `.git/info/exclude` and the global git excludes, as grep does.
+    `node_modules` and `target` are pruned everywhere: not walked and no
+    longer listed themselves. The new `no_ignore: true` parameter lists all
+    of them. `.git`, `.svn`, `.hg`, `.bzr`, `.jj` and `.sl` are never listed
+    or entered; an explicit `path` is always walked. Hidden files are still
+    listed.
+  - Results are sorted (by name, a directory before its entries). Output
+    stops at the 256 KiB tool buffer, on a whole path and with grep's
+    truncation footer. A find that hits the 10 s deadline (or is cancelled)
+    returns what it found with a note, instead of an error and nothing, and
+    stops.
+  - A missing path is an error instead of "No files found.", and errors
+    such as an unreadable directory are reported in a note beside the
+    results. A `pattern` with a `/` (which never matched a name) is an
+    error pointing at `path`; an invalid glob is an error with the parse
+    error.
+  - The `find` schema gained `no_ignore` and a new description; it ships
+    with grep's schema change, so the prompt cache is rewritten once for
+    both.
 
 ### Fixed
 
-- **The `find` tool skips `node_modules`, `.git` and `target` instead of
-  walking them.** It filtered their contents out after walking every entry,
-  so a big `node_modules` was walked in full on every call, and a project
-  whose own path ran through a directory of one of those names (say
-  `~/target/app`) found nothing at all. They are now pruned; the directories
-  themselves are still listed when they match. A missing path is an error
-  instead of "No files found.", errors such as an unreadable directory are
-  reported beside the results, output is capped at the 256 KiB buffer, a
-  timeout keeps the results found so far, and a timed-out or cancelled find
-  is killed.
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
   program names: a stock Windows has no `grep` or `ls` ("program not
   found"), and `find` resolved to `System32\find.exe`, an unrelated string
   search, so the find tool reported "No files found" for files that exist.
-  They now run GNU builds (`grep` now needs none, see Changed): from a
-  `PATH` directory outside the Windows directory, else from Git for
-  Windows' `usr\bin` (found next to `git.exe` on `PATH` or in the standard
-  install folders). Without one, the call says
-  to install Git for Windows or use the `powershell` tool. Git's tools are
-  MSYS programs, which expand wildcards in their own arguments when started
-  from a non-MSYS process (`-name "*.txt"` became file names), so they run
-  with `noglob` added to `MSYS`. Linux and macOS are unchanged.
+  `grep` and `find` now need no program (they search in-process, see
+  Changed). `ls` runs a GNU build: from a `PATH` directory outside the
+  Windows directory, else from Git for Windows' `usr\bin` (found next to
+  `git.exe` on `PATH` or in the standard install folders). Without one, the
+  call says to install Git for Windows or use the `powershell` tool. Git's
+  tools are MSYS programs, which expand wildcards in their own arguments
+  when started from a non-MSYS process, so `ls` runs with `noglob` added to
+  `MSYS`. Linux and macOS are unchanged.
 - **Windows: the `powershell` tool can run scripts.** A stock Windows
   client has the `Restricted` execution policy, so `.\test.ps1` failed with
   "running scripts is disabled on this system" and the model had to retry
