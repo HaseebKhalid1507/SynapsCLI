@@ -4,26 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`grep` runs ripgrep's engine in-process, and understands `a|b`.** It ran
+  GNU grep in basic regex mode, where `a|b`, `+`, `?`, `{n}` and `( )` are
+  literal characters, and it ignored grep's exit status and stderr, so an
+  error also read "No matches found.". In local session history 336 of 448
+  grep tool calls (75%) returned "No matches found."; replaying the 256 of
+  those whose paths still exist with Rust regex finds matches in 228 (89%),
+  mostly `|` alternations. The tool no longer spawns `grep`: it walks and
+  searches with ripgrep's crates (`ignore`, `grep-regex`, `grep-searcher`),
+  so it behaves the same on Linux, macOS and Windows (no Git for Windows
+  needed for grep) and works in the hardened `--no-default-features` build.
+  The output format (`path:line:text`, `path-line-text` context, `--`
+  separators) is unchanged. Behaviour changes:
+  - **Regex dialect is Rust regex** (ripgrep's): `a|b`, `+`, `?`, `{n}`,
+    `\d`, `\b`, `(?i)` work as written; `\|` is a literal pipe; no
+    lookaround or backreferences. Escape `(` `[` `{` to match them
+    literally: `fn main() {`, which used to match, is now an invalid
+    pattern (write `fn main\(\) \{`). An invalid pattern is a tool error
+    with the parse error and a hint, and a missing path is a tool error,
+    instead of "No matches found.".
+  - **`.gitignore` is respected** (in a git repo), with `.ignore`,
+    `.git/info/exclude` and the global git excludes, as ripgrep does.
+    `node_modules` and `target` stay skipped everywhere. The new
+    `no_ignore: true` parameter searches all of them. `.git`, `.svn`, `.hg`,
+    `.bzr`, `.jj` and `.sl` are never searched.
+  - **Hidden files are searched** (`.github/`, `.env.example`, …).
+  - **Binary files are skipped**; the ones that match are listed in a note
+    instead of GNU's "Binary file … matches" lines (or nothing at all, as
+    GNU grep 3.5+ wrote those to stderr). Unreadable files are counted in a
+    note with the first error, beside the matches, instead of vanishing.
+  - Results are sorted by path. Lines over 500 characters are cut. A search
+    that hits the 15 s deadline (or is cancelled) returns what it found with
+    a note, instead of an error and nothing, and stops instead of running
+    on. Output stops at the 256 KiB tool buffer, on a whole line and with
+    the same truncation footer, instead of being read in full and cut
+    after. Links inside the tree are not followed, and FIFOs and devices
+    are never read.
+  - The `grep` schema gained `no_ignore` and a new description, so the
+    first request after upgrading rewrites the prompt cache once.
+
 ### Fixed
 
-- **The `grep` tool understands `a|b`, and no longer reports errors as "No
-  matches found."** It ran grep in basic regex mode, where `a|b`, `+`, `?`,
-  `{n}` and `( )` are literal characters, and it ignored grep's exit status
-  and stderr. In local session history 336 of 448 grep tool calls (75%)
-  returned "No matches found."; replaying the 256 of those whose paths still
-  exist with `grep -E` finds matches in 222 (87%), mostly `|` alternations.
-  It now runs `grep -E` (extended regex), so those patterns work as written.
-  Escape `(` `[` `{` to match them literally: `fn main() {`, which used to
-  match, now reads `()` as an empty group and misses (write `fn main\(\)`).
-  `\|` matches a literal `|` with GNU grep; write `a|b`. An invalid pattern
-  or a missing path is a tool error with grep's message, plus a hint to
-  escape `(` `[` `{` for a bad pattern. Matches that come with errors (an
-  unreadable file) get a note with the error count, warnings such as "stray
-  \ before d" are passed on, and binary files that match are listed instead
-  of vanishing. Output stops at the 256 KiB buffer (grep is killed there
-  rather than read to the end), with the same truncation footer. A timeout
-  returns the matches found so far with a note, and a timed-out or cancelled
-  grep no longer keeps running.
 - **The `find` tool skips `node_modules`, `.git` and `target` instead of
   walking them.** It filtered their contents out after walking every entry,
   so a big `node_modules` was walked in full on every call, and a project
@@ -38,9 +61,10 @@ All notable changes to this project will be documented in this file.
   program names: a stock Windows has no `grep` or `ls` ("program not
   found"), and `find` resolved to `System32\find.exe`, an unrelated string
   search, so the find tool reported "No files found" for files that exist.
-  They now run GNU builds: from a `PATH` directory outside the Windows
-  directory, else from Git for Windows' `usr\bin` (found next to `git.exe`
-  on `PATH` or in the standard install folders). Without one, the call says
+  They now run GNU builds (`grep` now needs none, see Changed): from a
+  `PATH` directory outside the Windows directory, else from Git for
+  Windows' `usr\bin` (found next to `git.exe` on `PATH` or in the standard
+  install folders). Without one, the call says
   to install Git for Windows or use the `powershell` tool. Git's tools are
   MSYS programs, which expand wildcards in their own arguments when started
   from a non-MSYS process (`-name "*.txt"` became file names), so they run

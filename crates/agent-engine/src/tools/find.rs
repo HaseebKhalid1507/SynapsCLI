@@ -1,4 +1,5 @@
-use super::unix_programs::{run_bounded, truncation_footer, BoundedRun};
+use super::search::truncation_footer;
+use super::unix_programs::{run_bounded, BoundedRun};
 use super::util::path_arg_never_option;
 use super::{resolve_path_in, Tool, ToolContext};
 use crate::{Result, RuntimeError};
