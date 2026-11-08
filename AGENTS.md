@@ -415,6 +415,7 @@ This is non-obvious and cost-critical. See `crates/agent-engine/src/runtime/help
 - **Manual breakpoint placement.** We don't rely solely on Anthropic's auto-cache.
 - Anthropic allows up to 4 cache markers per request. We reserve 2 for tools + system prompt (placed elsewhere in `api.rs`), leaving **2 for conversational markers**.
 - Breakpoints advance every **4 user messages**. The latest eligible user message gets a `cache_control: {type: "ephemeral"}` on its last content block.
+- **The system prompt is byte-stable within a session.** It is built from boot-time state only (base prompt, tool registry, model); nothing per-turn goes in. Changing the stock prompt rewrites every stock session's cache once after upgrade.
 - **Prefix stability = cache stability.** Content of historical messages must never change — adding, removing, or altering a visible field in an old message invalidates all downstream cache hits. The one sanctioned exception: `annotate_cache_breakpoint` itself prunes stale `cache_control` markers from older messages when more than 2 exist (this is load-bearing — don't "fix" it), and `sanitize_thinking_blocks` normalizes history before send. Beyond those, do not retroactively mutate messages.
 - **Measured** (bench/ suite, 21-turn tool-heavy sessions, 2026-06-11):
   - `single-last` (1 marker on latest message): **96–97%** hit rate, lowest cost
@@ -630,6 +631,8 @@ IPC is over a Unix socket (`src/watcher/ipc.rs`). Commands: `deploy`, `status`, 
 ## Tool Reference (for agents running INSIDE SynapsCLI)
 
 This is the runtime tool surface. An LLM agent running in the TUI, synaps agent, or as a subagent sees these tools.
+
+The stock system prompt (`DEFAULT_PROMPT_UNIX` / `DEFAULT_PROMPT_WINDOWS` in `crates/agent-core/src/core/config.rs`, used without `--system` or `system.md`) describes this surface by capability, not by tool name. `Runtime::orchestrated_system_prompt` appends `DEFAULT_PROMPT_DELEGATION` (when to delegate to subagents) to a stock prompt only, and only while the model can reach `subagent_start`. Workers (agent prompt, no subagent tools), `disabled_tools` without `subagent_start`, progressive disclosure with `tools.activation_confirm = deny` and custom prompts never get it.
 
 ### `bash`
 Execute shell commands via `bash -c`.

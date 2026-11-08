@@ -1470,13 +1470,15 @@ impl Runtime {
     /// request: the configured base plus any builtin orchestration adapter
     /// (see [`agent_core::prompt::builtin_orchestration_adapters`]) selected
     /// by the *current* model identity, so the doctrine follows mid-session
-    /// model switches. Composition is skipped when:
+    /// model switches. A stock base (`is_default_prompt`) also gets the
+    /// stock delegation guidance when the model can reach `subagent_start`.
+    /// Composition is skipped when:
     /// - a typed prompt manifest is active — the manifest author owns the
     ///   full stack;
-    /// - the runtime exposes no subagent tools (worker runtimes) — the
-    ///   doctrine would be unactionable noise;
+    /// - the runtime exposes no subagent tools (worker runtimes,
+    ///   `disabled_tools`) — doctrine and guidance would be unactionable noise;
     /// - the model identity cannot be canonicalized — fail closed to the
-    ///   unmodified base.
+    ///   base (doctrine only; the delegation guidance is model-independent).
     pub async fn effective_system_prompt(&self) -> Option<String> {
         let base = self.orchestrated_system_prompt().await;
         // A typed prompt manifest owns the full stack: nothing is appended.
@@ -1543,7 +1545,9 @@ impl Runtime {
 
     /// The configured base prompt plus the builtin orchestration doctrine
     /// for the current model (what `effective_system_prompt` returned before
-    /// the tool catalog was appended).
+    /// the tool catalog was appended). A stock base also gets
+    /// [`agent_core::config::DEFAULT_PROMPT_DELEGATION`] when the model can
+    /// reach `subagent_start`; custom prompts never do.
     async fn orchestrated_system_prompt(&self) -> Option<String> {
         if self.effective_prompt.is_some() {
             return self.system_prompt.clone();
@@ -1551,8 +1555,19 @@ impl Runtime {
         if self.tools.read().await.get("subagent_start").is_none() {
             return self.system_prompt.clone();
         }
+        // Progressive disclosure defers subagent tools; with activation
+        // denied the model can never load them.
+        let can_delegate = !(self.progressive_tool_disclosure
+            && self.activation_confirm == agent_core::config::ActivationConfirm::Deny);
+        let delegation = agent_core::config::DEFAULT_PROMPT_DELEGATION;
+        let base = match self.system_prompt.as_deref() {
+            Some(prompt) if can_delegate && agent_core::config::is_default_prompt(prompt) => {
+                Some(format!("{prompt}{delegation}"))
+            }
+            other => other.map(str::to_owned),
+        };
         let Ok(model) = crate::orchestration::canonical_foreground_identity(&self.model) else {
-            return self.system_prompt.clone();
+            return base;
         };
         let workflow_mode = match self.reasoning_level() {
             agent_core::reasoning::ReasoningLevel::UltraCode => {
@@ -1569,9 +1584,9 @@ impl Runtime {
         let Ok(context) = agent_core::prompt::SelectionContext::new(model, None)
             .map(|context| context.with_workflow_mode(workflow_mode))
         else {
-            return self.system_prompt.clone();
+            return base;
         };
-        agent_core::prompt::compose_orchestration_prompt(self.system_prompt.as_deref(), &context)
+        agent_core::prompt::compose_orchestration_prompt(base.as_deref(), &context)
     }
 
     pub fn effective_prompt(&self) -> Option<&agent_core::prompt::PromptStack> {
@@ -7088,6 +7103,83 @@ mod effective_prompt_tests {
             Some("KERNEL."),
             "manifest authors own the full stack; no builtin injection on top"
         );
+    }
+
+    fn stock_prompts() -> [&'static str; 2] {
+        [
+            agent_core::config::DEFAULT_PROMPT_UNIX,
+            agent_core::config::DEFAULT_PROMPT_WINDOWS,
+        ]
+    }
+
+    /// A foreground with subagent tools gets the stock delegation guidance
+    /// after the stock prompt, whatever the model, the same bytes every call.
+    #[tokio::test]
+    async fn stock_prompt_gets_delegation_guidance_in_the_foreground() {
+        let delegation = agent_core::config::DEFAULT_PROMPT_DELEGATION;
+        assert!(delegation.contains("delegate to subagents"));
+        for stock in stock_prompts() {
+            for model in ["anthropic/claude-sonnet-5-5", "definitely-not-a-model"] {
+                let runtime = headless(model, stock);
+                let prompt = runtime.effective_system_prompt().await.unwrap();
+                assert_eq!(prompt, format!("{stock}{delegation}"), "{model}");
+                assert_eq!(runtime.effective_system_prompt().await.unwrap(), prompt);
+            }
+        }
+        // Model doctrine still composes after it.
+        let stock = agent_core::config::DEFAULT_PROMPT;
+        let runtime = headless("openai-codex/gpt-5.6-sol", stock);
+        let prompt = runtime.effective_system_prompt().await.unwrap();
+        assert!(prompt.starts_with(&format!("{stock}{delegation}\n\n")));
+        assert!(prompt.contains("## Subagent supervision"));
+    }
+
+    /// No subagent tools (workers, `disabled_tools`), or tools the model can
+    /// never load: the stock prompt goes out without the guidance.
+    #[tokio::test]
+    async fn stock_prompt_without_reachable_subagent_tools_has_no_delegation() {
+        let names = [
+            "subagent",
+            "subagent_start",
+            "subagent_status",
+            "subagent_steer",
+            "subagent_collect",
+            "subagent_resume",
+            "subagent_model_authorize",
+            "subagent_models",
+        ]
+        .map(String::from);
+        for stock in stock_prompts() {
+            let mut worker = headless("anthropic/claude-sonnet-5-5", stock);
+            worker.set_tools(ToolRegistry::without_subagent());
+            let disabled = headless("anthropic/claude-sonnet-5-5", stock);
+            disabled.tools.write().await.disable(&names);
+            let mut denied = headless("anthropic/claude-sonnet-5-5", stock);
+            denied.progressive_tool_disclosure = true;
+            denied.set_activation_confirm(agent_core::config::ActivationConfirm::Deny);
+            for runtime in [worker, disabled, denied] {
+                let prompt = runtime.effective_system_prompt().await.unwrap();
+                assert_eq!(prompt, stock);
+                assert!(!prompt.contains("subagent"), "{prompt}");
+            }
+        }
+    }
+
+    /// A custom prompt (`system.md`, `--system`), even one that starts with
+    /// the stock text, is sent byte for byte: no delegation guidance.
+    #[tokio::test]
+    async fn custom_prompt_never_gets_delegation_guidance() {
+        for custom in [
+            "You are spike.".to_string(),
+            format!("{}\n", agent_core::config::DEFAULT_PROMPT),
+            format!("{} Also run tests.", agent_core::config::DEFAULT_PROMPT),
+        ] {
+            let runtime = headless("anthropic/claude-sonnet-5-5", &custom);
+            assert_eq!(
+                runtime.effective_system_prompt().await.as_deref(),
+                Some(custom.as_str())
+            );
+        }
     }
 
     #[tokio::test]
