@@ -673,27 +673,33 @@ Run a PowerShell command (`pwsh` if installed, else Windows PowerShell). Same ru
 | `command` (string, req) | `timeout` (integer) |
 
 ### `grep`
-Recursive regex search.
+Recursive regex search: `grep -rnE` (GNU grep on Linux, BSD grep on macOS, Git for Windows' GNU grep on Windows).
 
 | Parameter | Type | Req | Default | Notes |
 |---|---|---|---|---|
-| `pattern` | string | ✓ | — | |
+| `pattern` | string | ✓ | — | POSIX extended regex (ERE) |
 | `path` | string | | `.` | |
-| `include` | string | | — | Glob filter |
+| `include` | string | | — | Glob filter on the file name (`--include`) |
 | `context` | integer | | — | Lines before/after |
 
-Excludes `.git`, `node_modules`, `target`. 15s timeout. Output truncated at `max_tool_output` (default 30KB, shared limit).
+- **Dialect:** ERE, as for `grep -E`: `a|b`, `+`, `?`, `{n}` and `( )` work as written. `\|` is **not** alternation: GNU grep reads it as a literal `|` (BSD grep may differ), so write `a|b`. `\d` and `(?i)` are not ERE: use `[0-9]` or `[[:digit:]]`; grep's warning about them comes back as a note. Escape `(` `[` `{` with a backslash to match them literally: `fn main() {` reads `()` as an empty group and misses `fn main() {` lines; write `fn main\(\)`.
+- **Result:** the exit status decides. Matches (exit 0); exactly `No matches found.` (exit 1); otherwise a tool error with grep's first stderr line (an invalid pattern gets `invalid regex: … — escape regex metacharacters …`). Matches that come with errors (an unreadable file) are kept, with a note giving the error count and the first error. Binary files that match are listed in a note (`[binary file matches, lines not shown: …]`).
+- **Size:** output stops at `max_tool_buffer` (256 KiB): grep is killed, the last partial line dropped, and `... (output truncated, more than N total bytes)` appended. The result then goes through tool output spill (`tool_output_spill_bytes`) like any other; with spill off, the `max_tool_output` cut applies.
+- **Time:** 15s timeout. Matches found by then are returned with a note that more may be missing; with none, a tool error. A timed-out or cancelled grep is killed.
+- Excludes `.git`, `node_modules`, `target` directories.
 
 ### `find`
-Glob-based file search.
+Glob-based file search: `find PATH … -name PATTERN`.
 
 | Parameter | Type | Req | Default | Notes |
 |---|---|---|---|---|
-| `pattern` | string | ✓ | — | |
+| `pattern` | string | ✓ | — | Matched against the file name |
 | `path` | string | | `.` | |
-| `type` | string | | — | `"f"` or `"d"` |
+| `type` | string | | — | `"f"`, `"d"` or `"l"` (symlink) |
 
-Same excludes as grep. 10s timeout.
+- `.git`, `node_modules` and `target` directories are pruned: never walked, but still listed themselves when they match.
+- `No files found.` when find ran cleanly and matched nothing. A missing path or other failure with no results is a tool error with find's first stderr line; results that come with errors (an unreadable directory) get a note with the error count and the first error.
+- Output capped at `max_tool_buffer` with the same footer as grep. 10s timeout, partial results kept as for grep; the process is killed on timeout or cancel.
 
 ### `ls`
 `ls -lah` output.
