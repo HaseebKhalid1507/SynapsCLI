@@ -169,6 +169,10 @@ All notable changes to this project will be documented in this file.
   summary. An empty result says to try one
   shorter keyword and not to guess ids, and `activate_tools` given an
   unknown id says it needs an exact id from `search_tools`.
+- **Anthropic streams that send only keep-alive pings are retried.** A
+  stream that stayed connected but sent only pings waited indefinitely
+  (each ping reset the 90 s idle timer). It is now retried when no first
+  event arrives in 3 minutes, or no progress for 10 minutes.
 
 ## [0.11.1] — 2026-10-31
 
