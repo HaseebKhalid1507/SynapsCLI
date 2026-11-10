@@ -116,7 +116,10 @@ pub enum BudgetDimension {
     ToolResultBytes,
     /// Accumulated estimated USD cost within one stream turn (spec §8.1).
     CostUsd,
-    /// Uncached input + output tokens summed over one stream turn.
+    /// Reserved: uncached input + output tokens summed over one stream
+    /// turn. No budget sets this limit any more (only `synaps watcher` did),
+    /// so nothing produces it; the variant stays because its label
+    /// (`total_tokens`) and chat-capture tag (7) are on the wire.
     TotalTokens,
 }
 
@@ -137,7 +140,7 @@ impl BudgetDimension {
 }
 
 /// Typed terminal outcome of a model turn (spec §5.2). Produced ONCE by the
-/// engine; every frontend (chat, TUI, RPC, server, watcher, subagents)
+/// engine; every frontend (chat, TUI, RPC, server, subagents)
 /// receives the same value and must never re-derive it from message text.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

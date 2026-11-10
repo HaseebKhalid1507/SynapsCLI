@@ -52,7 +52,6 @@ pub mod shell;
 pub(crate) mod util;
 pub(crate) mod utf8_stream;
 pub(crate) use util::expand_path;
-pub mod watcher_exit;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
@@ -105,7 +104,6 @@ pub use subagent::{
     SubagentCollectTool, SubagentModelAuthorizeTool, SubagentModelsTool, SubagentResumeTool,
     SubagentStartTool, SubagentStatusTool, SubagentSteerTool, SubagentTool,
 };
-pub use watcher_exit::{WatcherExitTool, WATCHER_EXIT_ACK};
 pub use write::WriteTool;
 
 // Re-export util items used by sibling tool modules via `super::`
@@ -147,7 +145,6 @@ pub struct ToolCapabilities {
     /// record at the same level through the parent's session writer. `None`
     /// (manual contexts) leaves workers `Off`.
     pub telemetry: Option<crate::runtime::telemetry::WorkerTelemetry>,
-    pub watcher_exit_path: Option<PathBuf>,
     pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,

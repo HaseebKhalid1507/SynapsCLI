@@ -1,4 +1,3 @@
-pub(crate) mod agent;
 pub(crate) mod attach;
 pub(crate) mod auth_accounts;
 pub(crate) mod auth_broker;
@@ -7,6 +6,7 @@ pub(crate) mod daemon;
 pub(crate) mod login;
 pub(crate) mod prompt;
 pub(crate) mod quota_keeper;
+pub(crate) mod removed;
 pub(crate) mod retention;
 pub(crate) mod rpc;
 pub(crate) mod send;
@@ -14,4 +14,3 @@ pub(crate) mod server;
 pub(crate) mod status;
 pub(crate) mod tools;
 pub(crate) mod trace;
-pub(crate) mod watcher;

@@ -5,7 +5,7 @@ This is the onboarding doc for any agent (Cursor, Aider, or SynapsCLI itself) to
 SynapsCLI is a terminal-native AI agent runtime written in Rust. ~210K LOC across the workspace (counts drift — verify with `find src crates -name '*.rs' -not -path '*/target/*' | xargs wc -l`). **Cargo workspace** with three library crates + a root binary crate:
 
 - `synaps-core` (`crates/agent-core/`) — config, session, auth, credential broker, models, memory, orchestration policy, prompt manifests, pricing, protocol primitives
-- `synaps-engine` (`crates/agent-engine/`) — runtime, provider catalogs, credential routing, tools, memory tools, reactive subagent lifecycle, MCP, skills, events, extensions, sidecar, watcher
+- `synaps-engine` (`crates/agent-engine/`) — runtime, provider catalogs, credential routing, tools, memory tools, reactive subagent lifecycle, MCP, skills, events, extensions, sidecar, daemon
 - `synaps-tui` (`crates/agent-tui/`) — the ratatui TUI
 - `synaps` (`src/main.rs`) — the binary; CLI dispatch
 
@@ -40,8 +40,6 @@ to the independently built Axel sidecar; do not multiply parallel build jobs.
 - `synaps --continue [NAME_OR_ID]` — resume last session, or resolve a chain bookmark / session alias / partial session ID via `resolve_session()` (chain name → session name → partial ID)
 - `synaps --no-extensions` — disable the extension system (skips plugin hook registration)
 - `synaps chat` — fully-featured headless mode (MCP, extensions, skills, sessions, compaction, event bus)
-- `synaps agent` — headless worker managed by the watcher
-- `synaps watcher` — supervisor daemon
 - `synaps login` — OAuth flow
 - `synaps server` — WebSocket API server
 - `synaps send` — push events into a running session
@@ -60,7 +58,7 @@ to the independently built Axel sidecar; do not multiply parallel build jobs.
 ```
 src/
 ├── main.rs               — CLI entry point, subcommand dispatch, --profile pinning
-└── cmd/                  — subcommand handlers (chat, server, agent, login, watcher, send, status, rpc, daemon, attach, auth-broker, …)
+└── cmd/                  — subcommand handlers (chat, server, login, send, status, rpc, daemon, attach, auth-broker, …)
     ├── auth_accounts.rs  — `synaps auth list|use|remove|identify|plan`
     ├── quota_keeper.rs   — `synaps quota-keeper` (reset-window watcher, opt-in Codex activation)
     └── status.rs         — `synaps status` (per-account usage, --provider/--account/--all/--json)
@@ -82,8 +80,7 @@ crates/agent-core/src/    (crate: synaps-core)
 │   │   └── muse.rs           — Meta Muse device-flow login + Model API key mint
 │   ├── protocol.rs       — WebSocket wire format (server/client)
 │   ├── error.rs          — SynapsError type
-│   ├── logging.rs        — tracing subscriber setup
-│   └── watcher_types.rs  — shared types for watcher IPC
+│   └── logging.rs        — tracing subscriber setup
 ├── memory/               — session memory store (mod.rs, store.rs)
 ├── orchestration.rs      — worker authorization policy, completion gates, model/role/scope validation
 ├── prompt/               — YAML prompt manifests, module composition, path confinement
@@ -132,7 +129,6 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── extension.rs      — extension-provided tool wrapper
 │   ├── respond.rs        — event-bus response tool
 │   ├── send_channel.rs   — channel send tool
-│   ├── watcher_exit.rs   — graceful-exit tool (watcher agents only)
 │   ├── secret_prompt.rs  — masked secret / confirm prompt plumbing (TUI queue, handle)
 │   ├── sudo_askpass/     — bash tool's sudo password path: `synaps-sudo-askpass` helper + per-call broker (Linux)
 │   ├── shell/            — stateful PTY shell (start/send/end) — session manager
@@ -156,11 +152,6 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── registry.rs       — CommandRegistry: built-ins + skill names → tab-complete
 │   ├── marketplace.rs    — plugin install from marketplace
 │   └── tool.rs           — load_skill Tool impl
-└── watcher/              — supervisor daemon
-    ├── mod.rs            — subsystem entry (invoked by `synaps watcher`)
-    ├── supervisor.rs     — per-agent lifecycle, limits, retries
-    ├── ipc.rs            — Unix socket protocol (deploy, status, stop)
-    └── display.rs        — `watcher status` renderer
 
 crates/agent-tui/src/     (crate: synaps-tui)
 └── tui/                  — the TUI (module, entered via default `synaps` subcommand)
@@ -278,7 +269,7 @@ Implementation split across `crates/agent-engine/src/tools/subagent/` (tools) an
 2. Re-export in `crates/agent-engine/src/tools/mod.rs` (`pub use my_tool::MyTool;`).
 3. Register in `crates/agent-engine/src/tools/registry.rs::ToolRegistry::new()` — add to the `vec![]`.
 4. If it streams output, use `ctx.tx_delta` (UnboundedSender<String>) to push deltas.
-5. If it's restricted (e.g. watcher-only), gate on `ctx.watcher_exit_path.is_some()` or similar.
+5. If subagents must not get it, leave it out of the restricted registry in `crates/agent-engine/src/tools/registry.rs`.
 
 The tool's `parameters()` JSON schema is what the model sees. Be precise — bad schemas lead to malformed tool calls.
 
@@ -524,10 +515,10 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 4. **`cargo test -p <crate>` skips integration tests.** The `tests/` suite (extensions e2e, provider tests) only runs with `cargo test --workspace`. "Single-crate green" can still mean broken.
 5. **Binary swap requires process restart.** `cargo build` replaces `target/release/synaps` on disk but the running process keeps the old binary mmap'd. Must exit + relaunch to pick up changes.
 6. **New StreamEvents need TWO consumers.** `crates/agent-tui/src/tui/stream_handler.rs` AND `crates/agent-engine/src/engine/stream.rs` — update only the TUI one and headless mode silently drops the event.
-7. **Subagent has NO subagent.** No recursion. Subagents also lack `connect_mcp_server`, `load_skill`, `watcher_exit`. Enforced via the restricted registry in `crates/agent-engine/src/tools/registry.rs` (see the second tool list).
+7. **Subagent has NO subagent.** No recursion. Subagents also lack `connect_mcp_server`, `load_skill`. Enforced via the restricted registry in `crates/agent-engine/src/tools/registry.rs` (see the second tool list).
 8. **Theme changes apply live.** `/theme` and the `/settings` theme row apply at once with a cross-fade, no restart. Any path that changes the persisted theme must also call `App::sync_myx_live` (see `apply_theme_from_settings`), or the live `myx` subscriber leaks.
 9. **MCP servers are lazy-spawned.** First `connect_mcp_server` pays the spawn cost. Tools are registered dynamically via `ToolContext::tool_register_tx` — this channel breaks the `Arc<ToolRegistry>` circularity.
-10. **OAuth tokens are file-locked** via `fs4`. Concurrent TUI + watcher instances are safe, but a crashed process holding the lock will block others until its file is cleaned up.
+10. **OAuth tokens are file-locked** via `fs4`. Concurrent TUI + daemon instances are safe, but a crashed process holding the lock will block others until its file is cleaned up.
 11. **Provider model IDs contain slashes.** `nvidia/meta/llama-3.3-70b-instruct` — the first slash separates provider from model. `resolve_shorthand` uses `split_once('/')`. Nested slashes in model IDs (NVIDIA, DeepInfra) are preserved correctly.
 12. **Anthropic auth is optional.** `get_auth_token()` returns `auth_type: "none"` if no credentials found. The app boots fine. Anthropic API calls fail lazily with a clear message pointing to `synaps login` or `/model groq/...`.
 13. **`/compact` doesn't route through providers** — uses the Anthropic-only sync path (`runtime/api_sync.rs`). Known issue (see `docs/open-provider-issues.md`).
@@ -548,10 +539,9 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 - **`serde_json`** — everything JSON (messages, tool schemas, API bodies).
 - **`syntect` 5** — syntax highlighting. `default-themes + default-syntaxes + regex-onig`.
 - **`portable-pty` 0.9** — PTY for stateful shell tool.
-- **`notify` 6.1 + `globset` 0.4** — file-watching for watcher mode.
+- **`notify` 6.1** — file-watching (event inbox, extension config).
 - **`axum` 0.7 + `tokio-tungstenite`** — WS server/client (auxiliary).
 - **`fs4` 0.13** — advisory file locks for auth.json.
-- **`toml` 0.8** — watcher per-agent config (note: global config uses plain `key = value`, NOT TOML).
 
 Release profile: `lto = true, codegen-units = 1, strip = true, panic = "abort"`. Slow compile, small binary.
 
@@ -603,33 +593,15 @@ Things an agent should know about, but not necessarily fix in-passing:
 
 - **`crates/agent-engine/src/tools/agent.rs`** is legacy, superseded by the `subagent` tools. Kept for compatibility with older agent definitions. Remove after deprecation window.
 - **Theme changes require restart.** `Theme` is captured by long-lived render state; refactor to use `Rc<RefCell<Theme>>` or similar if live-swap becomes important.
-- **Watcher subsystem** (`crates/agent-engine/src/watcher/`, `crates/agent-engine/src/cmd/agent.rs`) is being evaluated for removal from the main repo. Don't invest in deep refactors there without checking with project owner first.
 - **`run_script` keybind action is a stub** (`crates/agent-tui/src/tui/input.rs` — TODO). Needs path validation before implementation.
 - **Sliding-4 cache strategy is over-engineered** — bench data shows `single-last` is equivalent (see Prompt Caching Strategy). Simplification pending.
 - **`gamba.rs`** — easter egg. Yes, really. Leave it alone.
 
 ---
 
-## Watcher Subsystem (brief)
-
-The watcher daemon (`target/release/synaps (watcher subcommand)`) supervises headless `synaps agent` processes. Each agent lives at `~/.synaps-cli/watcher/{name}/` with `config.toml`, `soul.md` (system prompt), `handoff.json` (state from last session), `stats.json`, `heartbeat` (timestamp file), and `logs/`.
-
-Trigger modes:
-- `manual` — runs only when deployed via `watcher deploy`
-- `always` — auto-restart with cooldown
-- `watch` — triggered by file changes (via `notify` crate)
-
-Limits (per-agent, in `config.toml`): `max_session_tokens`, `max_session_duration_mins`, `max_session_cost_usd`, `max_daily_cost_usd`, `max_tool_calls`, `cooldown_secs`, `max_retries`.
-
-When a limit is hit, the agent is prompted to call the `watcher_exit` tool to write a handoff. See `crates/agent-engine/src/tools/watcher_exit.rs` and `crates/agent-engine/src/watcher/supervisor.rs`.
-
-IPC is over a Unix socket (`src/watcher/ipc.rs`). Commands: `deploy`, `status`, `stop`, `logs`.
-
----
-
 ## Tool Reference (for agents running INSIDE SynapsCLI)
 
-This is the runtime tool surface. An LLM agent running in the TUI, synaps agent, or as a subagent sees these tools.
+This is the runtime tool surface. An LLM agent running in the TUI, a daemon session, `synaps chat`, or as a subagent sees these tools.
 
 ### `bash`
 Execute shell commands via `bash -c`.
@@ -731,16 +703,6 @@ Load behavioral guidelines. Discovery roots: `.synaps-cli/plugins/`, `.synaps-cl
 ### `shell_start` / `shell_send` / `shell_end`
 Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shell_send` to interact and `shell_end` to clean up. For interactive programs (REPLs, SSH, etc.). See `crates/agent-engine/src/tools/shell/` for the full state machine.
 
-### `watcher_exit`
-**Watcher agents only.** Writes `handoff.json`, triggers shutdown.
-
-| Parameter | Type | Req | Default |
-|---|---|---|---|
-| `reason` | string | ✓ | — |
-| `summary` | string | ✓ | — |
-| `pending` | array[string] | | `[]` |
-| `context` | object | | `{}` |
-
 ---
 
 ## Quick-Reference Summary
@@ -767,9 +729,8 @@ Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shel
 | `subagent_steer` | handle_id, message | — | Inject guidance mid-run |
 | `subagent_collect` | handle_id | — | Collect result (non-blocking poll) |
 | `subagent_resume` | handle_id, instructions | archive_path, timeout, thinking | Continue a finished/timed-out/failed worker from its own archived conversation |
-| `watcher_exit`* | reason, summary | pending, context | Watcher handoff |
 
-*Watcher agents only. Subagents cannot use `subagent`, `connect_mcp_server`, `load_skill`, `watcher_exit`. †Windows only.
+Subagents cannot use `subagent`, `connect_mcp_server`, `load_skill`. †Windows only.
 
 ---
 
@@ -858,7 +819,6 @@ For agents touching this code — what's protected, what isn't, and what to neve
 - **`bash` is unsandboxed.** Full user privileges, no path restrictions. The model can run anything.
 - **The `read` tool can read `~/.synaps-cli/config` and the auth store** — a prompt-injected agent can exfiltrate API keys into context, session logs, or subagent logs (`~/.synaps-cli/logs/subagents/`). There is no denylist.
 - **Event bus has no sender authentication.** Filesystem perms (0600/0700) stop other *users*, but any same-UID process can drop JSON into the inbox or hit the session socket and trigger an unattended model turn. Events are untrusted input — prompt injection by design. Treat event content accordingly.
-- **Watcher IPC** (`src/watcher/ipc.rs`): socket chmod'd `0600` after bind (small race window); no command-level auth on deploy/stop beyond filesystem perms.
 - **Marketplace installs are TOFU** (trust-on-first-use, per `github.com/<owner>` host key — `crates/agent-engine/src/skills/marketplace.rs`). No signature verification — a compromised upstream repo ships straight to users on update.
 - **`run_script` keybind is an unimplemented stub** — when implementing, validate the path stays inside the plugin dir.
 - **`inject_prompt` keybinds** let plugins submit text as the user. Audit third-party plugin manifests before install.

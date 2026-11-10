@@ -90,7 +90,7 @@ A Steer token comes from the input owner, or from an event that arrives while a 
 | Transition | Inputs → outputs | Priority | Code (`runtime/stream.rs` unless noted) |
 |---|---|---|---|
 | start | Idle + Trigger → Ready | – | the session actor starts a turn |
-| call_model | Ready + Rounds → Streaming | 2 | `budget_meter.begin_round()`, then the request. Rounds exist only for bounded roles: Event and Autonomous get 24 with no renewal, Worker gets 64 with 2 renewals, Foreground has no round cap (`TurnBudget::for_role`, `runtime/budget.rs`). |
+| call_model | Ready + Rounds → Streaming | 2 | `budget_meter.begin_round()`, then the request. Rounds exist only for bounded roles: Event gets 24 with no renewal, Worker gets 64 with 2 renewals, Foreground has no round cap (`TurnBudget::for_role`, `runtime/budget.rs`). |
 | out_of_budget | Ready → Idle | 1 | fires only when call_model can't: Rounds is empty and the renewals are used up, giving `BudgetExceeded` |
 | reply_text / reply_tools | Streaming → Answered / ToolBatch | – | guard on the reply's content: does it have `tool_use` blocks? |
 | run_tools | ToolBatch → Ready | – | the whole of §4 |

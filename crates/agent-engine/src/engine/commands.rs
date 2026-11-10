@@ -635,7 +635,7 @@ pub fn trace_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
 
 /// `/memory on|recall|capture|once|status|off|index-history|why` (task A5,
 /// spec §7.3): the ONE deterministic engine entry point every frontend —
-/// TUI, headless chat, RPC, server, watcher, agent — shares via
+/// TUI, headless chat, RPC, server — shares via
 /// [`handle_engine_command`]. Frontends must not duplicate lease or budget
 /// logic.
 ///
@@ -1546,7 +1546,7 @@ mod tests {
             crate::Runtime::new_headless().turn_budget().max_elapsed,
             None
         );
-        for role in [TurnRole::Foreground, TurnRole::Worker, TurnRole::Autonomous] {
+        for role in [TurnRole::Foreground, TurnRole::Worker, TurnRole::Event] {
             assert_eq!(TurnBudget::for_role(role).max_elapsed, None);
         }
         assert!(crate::skills::BUILTIN_COMMANDS.contains(&"budget"));
