@@ -22,7 +22,6 @@ pub use core::config;
 pub use core::error;
 pub use core::logging;
 pub use core::models;
-pub use core::protocol;
 pub use core::reasoning;
 pub use core::session;
 

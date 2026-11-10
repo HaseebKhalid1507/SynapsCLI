@@ -41,7 +41,6 @@ to the independently built Axel sidecar; do not multiply parallel build jobs.
 - `synaps --no-extensions` — disable the extension system (skips plugin hook registration)
 - `synaps chat` — fully-featured headless mode (MCP, extensions, skills, sessions, compaction, event bus)
 - `synaps login` — OAuth flow
-- `synaps server` — WebSocket API server
 - `synaps send` — push events into a running session
 - `synaps status` — check account usage
 - `synaps auth-broker` — credential broker daemon for multi-machine shared auth
@@ -58,7 +57,7 @@ to the independently built Axel sidecar; do not multiply parallel build jobs.
 ```
 src/
 ├── main.rs               — CLI entry point, subcommand dispatch, --profile pinning
-└── cmd/                  — subcommand handlers (chat, server, login, send, status, rpc, daemon, attach, auth-broker, …)
+└── cmd/                  — subcommand handlers (chat, login, send, status, rpc, daemon, attach, auth-broker, …)
     ├── auth_accounts.rs  — `synaps auth list|use|remove|identify|plan`
     ├── quota_keeper.rs   — `synaps quota-keeper` (reset-window watcher, opt-in Codex activation)
     └── status.rs         — `synaps status` (per-account usage, --provider/--account/--all/--json)
@@ -78,7 +77,6 @@ crates/agent-core/src/    (crate: synaps-core)
 │   │   ├── auto_selection.rs — `auto` choice + its secret-free explanation (soonest reset)
 │   │   ├── quota_keeper.rs   — quota keeper engine (reset windows, activation ledger)
 │   │   └── muse.rs           — Meta Muse device-flow login + Model API key mint
-│   ├── protocol.rs       — WebSocket wire format (server/client)
 │   ├── error.rs          — SynapsError type
 │   └── logging.rs        — tracing subscriber setup
 ├── memory/               — session memory store (mod.rs, store.rs)
@@ -503,7 +501,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `telemetry` | string | off | Per-request API telemetry: `off`, `basic` (Anthropic streaming calls: turns, keep-warm, workers; timing incl. `ttft_ms`, usage, `cost_usd` estimated at API list prices, the persisted conversation `session_id` plus the request-trace `runtime_session_id`/`turn_id`/`trace_request_id`, worker identity on subagent records, plus the `cache_diag` verdict when `cache_diagnostics` is on), `full` (adds rate-limit headers). JSONL at `~/.cache/synaps/api-log.jsonl` (0600, O_NOFOLLOW); `basic`/`full` also write the metadata-only `~/.cache/synaps/request-trace.jsonl` ([docs/trace-schema.md](docs/trace-schema.md)) |
 | `telemetry_log_generations` | int | 1 | Rotated generations kept for `api-log.jsonl` and `request-trace.jsonl` (each rotates at 50 MB): `<log>.1` (newest) .. `<log>.N` (oldest), 1–100. `1` is the historical single `<log>.1`. Read when the session's telemetry writer starts |
 | `cache_diagnostics` | bool | false | Anthropic cache diagnostics: each turn sends `diagnostics.previous_message_id` and records the server's reason: how this request diverges from the previous request in the chain, not what the cache did (it can appear on a full cache hit — read it with `cache_read_input_tokens`). An unknown or nonexistent previous id returns 200 with `previous_message_not_found`. Written to `cache_diag` in `api-log.jsonl` (telemetry `basic`+) and `cache.server_diagnosis` in the request trace. Beta header `cache-diagnosis-2026-04-07` on API-key auth only; a rejection turns it off for the session and the request is re-sent without it |
-| `shell.*` / `server.*` / `bridge.*` | — | — | Namespaced config families parsed by `parse_shell_config_key` / `parse_server_config_key` / `parse_bridge_config_key` in `crates/agent-core/src/core/config.rs` — see those functions for the full key list |
+| `shell.*` / `server.*` | — | — | Namespaced config families parsed by `parse_shell_config_key` / `parse_server_config_key` in `crates/agent-core/src/core/config.rs` — see those functions for the full key list. `server.*` is only `server.auto_approve_confirms` now: the other keys of the removed `synaps server` (and the removed watcher's `bridge.*` keys) load with one deprecation warning and are ignored |
 
 ---
 
@@ -540,7 +538,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 - **`syntect` 5** — syntax highlighting. `default-themes + default-syntaxes + regex-onig`.
 - **`portable-pty` 0.9** — PTY for stateful shell tool.
 - **`notify` 6.1** — file-watching (event inbox, extension config).
-- **`axum` 0.7 + `tokio-tungstenite`** — WS server/client (auxiliary).
+- **`axum` 0.7 + `axum-server`** — the `synaps auth-broker` HTTP(S) server.
 - **`fs4` 0.13** — advisory file locks for auth.json.
 
 Release profile: `lto = true, codegen-units = 1, strip = true, panic = "abort"`. Slow compile, small binary.
@@ -788,7 +786,7 @@ No Axel note migration is implied. See
 [context-continuation spec](docs/specs/context-continuation.md) for bounds and
 the 140k/200k versus 250k–400k/1m policy.
 
-Resolution (`crates/agent-core/src/core/session.rs::resolve_session()`) tries **chain name → session name → partial ID** in that order. Used by `synaps --continue <NAME_OR_ID>`, `/resume`, and server `--continue`. The resolution path is surfaced to the user via a system message (e.g. `↳ resolved via chain 'foo'`).
+Resolution (`crates/agent-core/src/core/session.rs::resolve_session()`) tries **chain name → session name → partial ID** in that order. Used by `synaps --continue <NAME_OR_ID>`, `/resume`, and `synaps rpc --continue`. The resolution path is surfaced to the user via a system message (e.g. `↳ resolved via chain 'foo'`).
 
 ---
 

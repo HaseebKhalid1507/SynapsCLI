@@ -46,6 +46,30 @@ All notable changes to this project will be documented in this file.
   gone and `watch_inbox_gated` no longer takes a filter: every consumer
   took every file. Also gone: `TurnRole::Autonomous`, `BridgeConfig`, the
   `watcher_exit` tool and `ToolContext`/`Runtime` `watcher_exit_path`.
+- **Breaking: `synaps server` (the WebSocket API server) is gone.** It ran
+  its own copy of the engine loop on one session, outside the daemon. The
+  session daemon is the API now: `synaps daemon`, a line-JSON protocol on a
+  local socket ("Protocol summary" in
+  [docs/daemon-mode.md](docs/daemon-mode.md)), shared by every client of a
+  session. For a browser UI, use
+  [synaps-dash](https://github.com/HaseebKhalid1507/synaps-dash), a plain
+  extension that serves the browser over HTTP/WebSocket and attaches to the
+  daemon as an ordinary client. `synaps rpc` is unchanged. For this release
+  `synaps server` is a hidden stub, like `synaps agent`: with any arguments
+  it prints one line to stderr pointing at the daemon protocol doc and
+  synaps-dash, and exits 2; it is not in `--help` or shell completions.
+- **The `server.token`, `server.allowed_origins` and
+  `server.max_message_size` config keys are ignored.** A config that still
+  sets them loads, with one startup warning saying to remove the lines (it
+  names the keys, never their values). `server.auto_approve_confirms` keeps
+  its meaning: it still approves every extension confirm in every mode. The
+  token file the old server wrote, `~/.synaps-cli/server-token` (or
+  `~/.synaps-cli/<profile>/server-token` under `--profile`), is no longer
+  read or written; delete it.
+- **Engine API: `agent_core::protocol` removed.** The server's WebSocket
+  wire types (`ClientMessage`, `ServerMessage`, `HistoryEntry`) had no other
+  user. The daemon protocol (`session::wire`, and `ClientKind::Server`,
+  which synaps-dash attaches as) is unchanged.
 
 ### Fixed
 

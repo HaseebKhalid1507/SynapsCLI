@@ -425,7 +425,8 @@ mod tests {
         assert!(drained[0].formatted.contains("hello"));
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
-        assert!(messages[0]["content"].as_str().unwrap().contains("hello"));
+        // Byte-equal: the model sees exactly the canonical rendering.
+        assert_eq!(messages[0]["content"].as_str(), Some(drained[0].formatted.as_str()));
         assert!(pending.is_empty());
         assert!(q.is_empty());
     }

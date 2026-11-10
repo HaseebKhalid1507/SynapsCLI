@@ -10,7 +10,6 @@ pub(crate) mod removed;
 pub(crate) mod retention;
 pub(crate) mod rpc;
 pub(crate) mod send;
-pub(crate) mod server;
 pub(crate) mod status;
 pub(crate) mod tools;
 pub(crate) mod trace;
