@@ -1,9 +1,17 @@
+use super::unix_programs::{run_bounded, truncation_footer, BoundedRun};
 use super::util::path_arg_never_option;
 use super::{resolve_path_in, Tool, ToolContext};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::process::Command;
+
+/// How long one search may run.
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Directories find never descends into (each is still listed itself when
+/// it matches, as before).
+const EXCLUDED_DIRS: [&str; 3] = [".git", "node_modules", "target"];
 
 pub struct FindTool;
 
@@ -47,20 +55,49 @@ impl Tool for FindTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let mut cmd = build_command(&params, &ctx)?;
-        let output = tokio::time::timeout(Duration::from_secs(10), cmd.output())
-            .await
-            .map_err(|_| RuntimeError::Tool("Find timed out after 10s".to_string()))?
-            .map_err(|e| RuntimeError::Tool(format!("Failed to execute find: {}", e)))?;
+        let cmd = build_command(&params, &ctx)?;
+        let cap = ctx.limits.max_tool_buffer;
+        let run = run_bounded(cmd, "find", cap, TIMEOUT).await?;
+        render(run, cap, TIMEOUT)
+    }
+}
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+/// The tool result for a finished (or stopped) find run. find exits 0 when
+/// it could read everything and non-zero after any error (a missing path, an
+/// unreadable directory), still printing what it found.
+fn render(run: BoundedRun, cap: usize, timeout: Duration) -> Result<String> {
+    let (mut out, cut) = run.text(cap);
+    let secs = timeout.as_secs();
+    let notes = run.stderr.notes();
 
-        if stdout.is_empty() {
-            Ok("No files found.".to_string())
-        } else {
-            Ok(stdout.trim().to_string())
+    if out.trim().is_empty() {
+        if run.timed_out {
+            return Err(RuntimeError::Tool(format!(
+                "Find timed out after {secs}s before finding a match; partial results may be \
+                 missing. Narrow the path."
+            )));
+        }
+        let code = run.code;
+        if code != Some(0) {
+            return Err(RuntimeError::Tool(run.stderr.failure(code)));
+        }
+        out = "No files found.".to_string();
+    } else {
+        if cut {
+            out.push_str("\n\n");
+            out.push_str(&truncation_footer(cap));
+        }
+        if run.timed_out {
+            out.push_str(&format!(
+                "\n\n... (find timed out after {secs}s; results are partial, more files may be missing)"
+            ));
         }
     }
+    for note in notes {
+        out.push_str("\n\n");
+        out.push_str(&note);
+    }
+    Ok(out)
 }
 
 /// Build the `find` argv. Split out so the argv can be checked (and run in a temp
@@ -85,15 +122,29 @@ fn build_command(params: &Value, ctx: &ToolContext) -> Result<Command> {
     let mut cmd = super::unix_programs::unix_tool_command("find", ctx)?;
     cmd.arg(&path);
 
-    cmd.args(["-not", "-path", "*/.git/*"]);
-    cmd.args(["-not", "-path", "*/node_modules/*"]);
-    cmd.args(["-not", "-path", "*/target/*"]);
-
+    // POSIX only (GNU, BSD and Git for Windows' find):
+    //   ( -type d ( -name .git -o -name node_modules -o -name target ) -prune MATCH )
+    //   -o MATCH
+    // with MATCH = [-type T] -name PATTERN -print. An excluded directory is
+    // pruned (never walked) and still listed itself when it matches, as
+    // before; everything else is listed when it matches.
+    let mut matcher: Vec<&str> = Vec::new();
     if let Some(t) = file_type {
-        cmd.arg("-type").arg(t);
+        matcher.extend(["-type", t]);
     }
+    matcher.extend(["-name", pattern, "-print"]);
 
-    cmd.arg("-name").arg(pattern);
+    cmd.args(["(", "-type", "d", "("]);
+    for (i, dir) in EXCLUDED_DIRS.into_iter().enumerate() {
+        if i > 0 {
+            cmd.arg("-o");
+        }
+        cmd.args(["-name", dir]);
+    }
+    cmd.args([")", "-prune"]);
+    cmd.args(&matcher);
+    cmd.args([")", "-o"]);
+    cmd.args(matcher);
 
     Ok(cmd)
 }
@@ -247,5 +298,184 @@ mod tests {
                 "type {t:?} must be rejected"
             );
         }
+    }
+
+    /// The excluded directories are pruned, not filtered after the walk.
+    #[test]
+    fn excluded_dirs_are_pruned() {
+        let ctx = create_tool_context();
+        let cmd = build_command(
+            &json!({"pattern": "*.rs", "type": "f", "path": "src"}),
+            &ctx,
+        )
+        .unwrap();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let m = ["-type", "f", "-name", "*.rs", "-print"];
+        let mut want = vec![
+            "src", "(", "-type", "d", "(", "-name", ".git", "-o", "-name",
+        ];
+        want.extend(["node_modules", "-o", "-name", "target", ")", "-prune"]);
+        want.extend(m);
+        want.extend([")", "-o"]);
+        want.extend(m);
+        assert_eq!(args, want);
+    }
+
+    #[cfg(unix)]
+    fn tree(paths: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for p in paths {
+            let p = dir.path().join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "").unwrap();
+        }
+        dir
+    }
+
+    /// Make `dir` a directory nobody can read. False when permissions don't
+    /// apply to this user (root), so the test can't tell anything.
+    #[cfg(unix)]
+    fn lock(dir: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(dir).is_ok() {
+            eprintln!("skipped: permissions are not enforced for this user");
+            unlock(dir);
+            return false;
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    fn unlock(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    }
+
+    #[cfg(unix)]
+    async fn find_in(dir: &std::path::Path, params: Value) -> Result<String> {
+        let mut ctx = create_tool_context();
+        ctx.capabilities.cwd = Some(dir.to_path_buf());
+        FindTool.execute(params, ctx).await
+    }
+
+    /// Row 25: find never enters node_modules (or .git, target). An
+    /// unreadable directory deep inside one would be an error if it did.
+    /// The excluded directories themselves are still listed, as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_does_not_descend_into_excluded_dirs() {
+        let dir = tree(&[
+            "src/a.rs",
+            "node_modules/pkg/index.rs",
+            ".git/objects/x.rs",
+            "target/debug/build.rs",
+        ]);
+        let deep = dir.path().join("node_modules/pkg/deep/er");
+        if !lock(&deep) {
+            return;
+        }
+        let out = find_in(dir.path(), json!({"pattern": "*"})).await;
+        unlock(&deep);
+        // Relative to the temp dir, whose own path could hold any word.
+        let out = out.unwrap().replace(&dir.path().display().to_string(), "");
+        assert!(out.contains("src/a.rs"), "{out}");
+        for listed in ["/node_modules", "/.git", "/target"] {
+            assert!(
+                out.lines().any(|l| l.ends_with(listed)),
+                "{listed} missing: {out}"
+            );
+        }
+        for hidden in ["index.rs", "x.rs", "build.rs", "pkg", "objects", "debug"] {
+            assert!(!out.contains(hidden), "{hidden} listed: {out}");
+        }
+        assert!(!out.contains("error"), "find walked node_modules: {out}");
+    }
+
+    /// Only directories inside the search are pruned: a search rooted under
+    /// a `target` directory finds its files (the old `-not -path */target/*`
+    /// excluded everything there).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_search_under_a_target_dir_finds_files() {
+        let dir = tree(&["target/app/src/a.rs", "target/app/target/debug/b.rs"]);
+        let out = find_in(&dir.path().join("target/app"), json!({"pattern": "*.rs"}))
+            .await
+            .unwrap();
+        assert!(out.ends_with("/src/a.rs"), "{out}");
+        assert!(!out.contains("b.rs"), "{out}");
+    }
+
+    /// An unreadable directory outside the excludes is reported beside the
+    /// results.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_errors_are_surfaced_with_the_results() {
+        let dir = tree(&["src/a.rs"]);
+        let locked = dir.path().join("src/locked");
+        if !lock(&locked) {
+            return;
+        }
+        let out = find_in(dir.path(), json!({"pattern": "*.rs"})).await;
+        unlock(&locked);
+        let out = out.unwrap();
+        let a_rs = dir.path().join("./src/a.rs").display().to_string();
+        assert!(out.starts_with(&a_rs), "{out}");
+        assert!(
+            out.contains("[1 error while searching, results may be incomplete. First: find: "),
+            "{out}"
+        );
+        assert!(
+            out.contains("locked") && out.contains("Permission denied]"),
+            "{out}"
+        );
+    }
+
+    /// A missing path is an error, not "No files found.".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_missing_path_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = match find_in(dir.path(), json!({"pattern": "*", "path": "nope"})).await {
+            Err(RuntimeError::Tool(msg)) => msg,
+            other => panic!("expected a tool error, got {other:?}"),
+        };
+        assert!(
+            msg.starts_with("find: ") && msg.contains("No such file or directory"),
+            "{msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_no_match_says_no_files_found() {
+        let dir = tree(&["src/a.rs"]);
+        let out = find_in(dir.path(), json!({"pattern": "*.py"}))
+            .await
+            .unwrap();
+        assert_eq!(out, "No files found.");
+    }
+
+    /// Output past `max_tool_buffer` stops with grep's truncation footer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_output_is_capped() {
+        let names: Vec<String> = (0..400).map(|i| format!("f{i:03}.txt")).collect();
+        let dir = tree(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut ctx = create_tool_context();
+        ctx.capabilities.cwd = Some(dir.path().to_path_buf());
+        ctx.limits.max_tool_buffer = 2048;
+        let out = FindTool
+            .execute(json!({"pattern": "*.txt"}), ctx)
+            .await
+            .unwrap();
+        let (body, footer) = out.split_once("\n\n").unwrap();
+        assert!(body.len() <= 2048 && body.ends_with(".txt"), "{body}");
+        assert_eq!(footer, "... (output truncated, more than 2048 total bytes)");
     }
 }

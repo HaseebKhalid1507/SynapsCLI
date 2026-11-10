@@ -110,6 +110,34 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The `grep` tool understands `a|b`, and no longer reports errors as "No
+  matches found."** It ran grep in basic regex mode, where `a|b`, `+`, `?`,
+  `{n}` and `( )` are literal characters, and it ignored grep's exit status
+  and stderr. In local session history 336 of 448 grep tool calls (75%)
+  returned "No matches found."; replaying the 256 of those whose paths still
+  exist with `grep -E` finds matches in 222 (87%), mostly `|` alternations.
+  It now runs `grep -E` (extended regex), so those patterns work as written.
+  Escape `(` `[` `{` to match them literally: `fn main() {`, which used to
+  match, now reads `()` as an empty group and misses (write `fn main\(\)`).
+  `\|` matches a literal `|` with GNU grep; write `a|b`. An invalid pattern
+  or a missing path is a tool error with grep's message, plus a hint to
+  escape `(` `[` `{` for a bad pattern. Matches that come with errors (an
+  unreadable file) get a note with the error count, warnings such as "stray
+  \ before d" are passed on, and binary files that match are listed instead
+  of vanishing. Output stops at the 256 KiB buffer (grep is killed there
+  rather than read to the end), with the same truncation footer. A timeout
+  returns the matches found so far with a note, and a timed-out or cancelled
+  grep no longer keeps running.
+- **The `find` tool skips `node_modules`, `.git` and `target` instead of
+  walking them.** It filtered their contents out after walking every entry,
+  so a big `node_modules` was walked in full on every call, and a project
+  whose own path ran through a directory of one of those names (say
+  `~/target/app`) found nothing at all. They are now pruned; the directories
+  themselves are still listed when they match. A missing path is an error
+  instead of "No files found.", errors such as an unreadable directory are
+  reported beside the results, output is capped at the 256 KiB buffer, a
+  timeout keeps the results found so far, and a timed-out or cancelled find
+  is killed.
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
   program names: a stock Windows has no `grep` or `ls` ("program not
   found"), and `find` resolved to `System32\find.exe`, an unrelated string
