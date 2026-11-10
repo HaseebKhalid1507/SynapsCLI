@@ -235,7 +235,31 @@ mod tests {
         let out = find_in(dir.path(), json!({"pattern": "*.py"}))
             .await
             .unwrap();
+        assert_eq!(out, format!("No files found.\n\n{}", search::IGNORED_NOTE));
+        let out = find_in(dir.path(), json!({"pattern": "*.py", "no_ignore": true}))
+            .await
+            .unwrap();
         assert_eq!(out, "No files found.");
+    }
+
+    /// A file the ignore rules exclude (a `.env`, typically) isn't listed, the
+    /// miss says how to include it, and `no_ignore` lists it.
+    #[tokio::test]
+    async fn an_ignored_file_is_missed_with_a_note_and_no_ignore_lists_it() {
+        let dir = tree(&[".env"]);
+        std::fs::write(dir.path().join(".ignore"), ".env\n").unwrap();
+        let missed = find_in(dir.path(), json!({"pattern": ".env"}))
+            .await
+            .unwrap();
+        assert!(missed.starts_with("No files found."), "{missed}");
+        assert!(missed.contains("no_ignore: true"), "{missed}");
+        let found = find_in(dir.path(), json!({"pattern": ".env", "no_ignore": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            dir.path().join(".").join(".env").display().to_string()
+        );
     }
 
     /// A missing path is an error, not "No files found.".

@@ -311,6 +311,13 @@ pub(crate) fn stop_note(tool: &str, stop: Stop, timeout: Duration) -> String {
     }
 }
 
+/// Added to an empty result when ignore rules applied under a directory: a
+/// miss there doesn't mean the file doesn't exist (a `.env` is usually
+/// gitignored), so the result says what wasn't searched and how to include it.
+pub(crate) const IGNORED_NOTE: &str =
+    "Not searched: files excluded by .gitignore or .ignore, and node_modules and \
+     target directories. Set no_ignore: true to include them.";
+
 /// Appends `note` after a blank line.
 pub(crate) fn append_note(text: &mut String, note: &str) {
     if !text.is_empty() {

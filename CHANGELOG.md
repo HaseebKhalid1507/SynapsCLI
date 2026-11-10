@@ -110,6 +110,11 @@ All notable changes to this project will be documented in this file.
   - The `find` schema gained `no_ignore` and a new description; it ships
     with grep's schema change, so the prompt cache is rewritten once for
     both.
+  - When `grep` or `find` under a directory finds nothing and ignore rules
+    applied, the result adds one line: ignored files and `node_modules`/
+    `target` weren't searched, and `no_ignore: true` includes them. A
+    gitignored `.env` used to be found by GNU grep and find; without the
+    note, the empty result reads as "it doesn't exist".
 
 ### Removed
 

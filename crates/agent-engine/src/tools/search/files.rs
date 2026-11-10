@@ -78,6 +78,9 @@ pub(crate) struct FilesOutcome {
     /// directory has seen nothing).
     pub(crate) visited: usize,
     pub(crate) errors: Tally,
+    /// Ignore rules applied under a directory root (not `no_ignore`, not one
+    /// file), so an empty result gets [`super::IGNORED_NOTE`].
+    pub(crate) ignore_rules: bool,
 }
 
 /// Lists what under `req.root` matches. Errors only when the root doesn't
@@ -89,7 +92,9 @@ pub(crate) fn search(req: &FilesRequest, control: &Control) -> Result<FilesOutco
         cwd: req.cwd.clone(),
         types: None,
     };
-    Ok(collect(req, control, super::walk(&req.root, &opts)))
+    let mut out = collect(req, control, super::walk(&req.root, &opts));
+    out.ignore_rules = !req.no_ignore && req.root.is_dir();
+    Ok(out)
 }
 
 /// The listing for walk `entries` (split out so tests can stop a walk at a
@@ -217,6 +222,9 @@ pub(crate) fn render(out: FilesOutcome, cap: usize, timeout: Duration) -> crate:
         let mut text = "No files found.".to_string();
         if let Some(note) = out.errors.note() {
             append_note(&mut text, &note);
+        }
+        if out.ignore_rules {
+            append_note(&mut text, super::IGNORED_NOTE);
         }
         return Ok(text);
     }
@@ -743,12 +751,20 @@ mod tests {
         assert_eq!(err, format!("Path not found: {}", missing.display()));
     }
 
+    /// A miss under a directory is "No files found." and the ignored-files
+    /// note; with `no_ignore` it's exactly "No files found.".
     #[test]
     fn no_match_is_exactly_no_files_found() {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), "a.rs");
         let out = run(&request(dir.path(), "*.py"));
-        assert_eq!(render(out, 1 << 20, LONG).unwrap(), "No files found.");
+        assert_eq!(
+            render(out, 1 << 20, LONG).unwrap(),
+            format!("No files found.\n\n{}", super::super::IGNORED_NOTE)
+        );
+        let mut req = request(dir.path(), "*.py");
+        req.no_ignore = true;
+        assert_eq!(render(run(&req), 1 << 20, LONG).unwrap(), "No files found.");
     }
 
     /// An unreadable directory is listed (it matched) and counted in a note;

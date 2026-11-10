@@ -64,6 +64,9 @@ pub(crate) struct ContentOutcome {
     pub(crate) binary: Vec<String>,
     pub(crate) binary_count: usize,
     pub(crate) errors: Tally,
+    /// Ignore rules applied under a directory root (not `no_ignore`, not one
+    /// file), so an empty result gets [`super::IGNORED_NOTE`].
+    pub(crate) ignore_rules: bool,
 }
 
 /// Searches `req.root`, opening each regular file with `open`. Errors only
@@ -81,7 +84,10 @@ pub(crate) fn search<R: Read>(
         cwd: req.cwd.clone(),
         types: req.include.clone(),
     };
-    let mut out = ContentOutcome::default();
+    let mut out = ContentOutcome {
+        ignore_rules: !req.no_ignore && req.root.is_dir(),
+        ..Default::default()
+    };
     for item in super::walk(&req.root, &opts) {
         if let Some(stop) = control.stop() {
             out.stop = Some(stop);
@@ -311,6 +317,9 @@ pub(crate) fn render(out: ContentOutcome, cap: usize, timeout: Duration) -> crat
         let mut text = "No matches found.".to_string();
         if let Some(note) = out.errors.note() {
             append_note(&mut text, &note);
+        }
+        if out.ignore_rules {
+            append_note(&mut text, super::IGNORED_NOTE);
         }
         return Ok(text);
     }
@@ -668,12 +677,23 @@ mod tests {
         assert_eq!(err, format!("Path not found: {}", missing.display()));
     }
 
+    /// A miss under a directory is "No matches found." and the ignored-files
+    /// note; with `no_ignore` it's exactly "No matches found.".
     #[test]
     fn no_match_is_exactly_no_matches_found() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "a.txt", "nothing\n");
         let out = run(&request(dir.path(), "hit"));
-        assert_eq!(render(out, 1 << 20, LONG).unwrap(), "No matches found.");
+        assert_eq!(
+            render(out, 1 << 20, LONG).unwrap(),
+            format!("No matches found.\n\n{}", super::super::IGNORED_NOTE)
+        );
+        let mut req = request(dir.path(), "hit");
+        req.no_ignore = true;
+        assert_eq!(
+            render(run(&req), 1 << 20, LONG).unwrap(),
+            "No matches found."
+        );
     }
 
     /// `include` is a file-name glob (braces work); an explicit file is

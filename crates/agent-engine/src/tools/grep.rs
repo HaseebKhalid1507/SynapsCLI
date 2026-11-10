@@ -454,12 +454,49 @@ mod tests {
         assert!(!err.contains("No matches"), "{err}");
     }
 
-    /// A genuine miss is exactly "No matches found.".
+    /// A genuine miss under a directory is "No matches found." plus the note
+    /// that ignored files weren't searched.
     #[tokio::test]
     async fn genuine_no_match_says_no_matches_found() {
         let dir = text_dir();
         assert_eq!(
             grep_in(dir.path(), "zebra").await.unwrap(),
+            format!("No matches found.\n\n{}", search::IGNORED_NOTE)
+        );
+    }
+
+    /// A file the ignore rules exclude (a `.env`, typically) is missed, the
+    /// miss says how to include it, and `no_ignore` finds it.
+    #[tokio::test]
+    async fn an_ignored_file_is_missed_with_a_note_and_no_ignore_finds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".ignore", ".env\n");
+        write(dir.path(), ".env", "API_TOKEN=x\n");
+        let missed = grep_in(dir.path(), "API_TOKEN").await.unwrap();
+        assert!(missed.starts_with("No matches found."), "{missed}");
+        assert!(missed.contains("no_ignore: true"), "{missed}");
+        let params = json!({ "pattern": "API_TOKEN", "path": dir.path(), "no_ignore": true });
+        let found = GrepTool
+            .execute(params, create_tool_context())
+            .await
+            .unwrap();
+        assert!(found.contains("API_TOKEN=x"), "{found}");
+    }
+
+    /// No note when nothing was ignored: `no_ignore` set, or one file searched.
+    #[tokio::test]
+    async fn no_ignored_note_with_no_ignore_or_a_file_root() {
+        let dir = text_dir();
+        let params = json!({ "pattern": "zebra", "path": dir.path(), "no_ignore": true });
+        assert_eq!(
+            GrepTool
+                .execute(params, create_tool_context())
+                .await
+                .unwrap(),
+            "No matches found."
+        );
+        assert_eq!(
+            grep_in(&dir.path().join("t.txt"), "zebra").await.unwrap(),
             "No matches found."
         );
     }
