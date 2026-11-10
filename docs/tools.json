@@ -261,7 +261,7 @@
     }
   },
   {
-    "description": "Search file contents using regex patterns. Returns matching lines with file paths and line numbers. Supports file type filtering and context lines.",
+    "description": "Search file contents with a regex (Rust regex syntax, as in ripgrep). Returns matching lines with file paths and line numbers. Respects .gitignore (use no_ignore to include ignored files); hidden files are searched, binary files skipped.",
     "name": "grep",
     "parameters": {
       "properties": {
@@ -272,6 +272,10 @@
         "include": {
           "description": "Glob pattern to filter files (e.g. \"*.rs\", \"*.py\")",
           "type": "string"
+        },
+        "no_ignore": {
+          "description": "Also search files skipped by .gitignore/.ignore, node_modules and target (default false)",
+          "type": "boolean"
         },
         "path": {
           "description": "File or directory to search in (default: current directory)",

@@ -1,8 +1,9 @@
-//! The programs behind the `grep`, `find` and `ls` tools.
+//! The programs behind the `find` and `ls` tools. (`grep` no longer runs a
+//! program: it searches in-process, see `tools::search`.)
 //!
-//! Unix: `grep`, `find` and `ls` from PATH, as always.
+//! Unix: `find` and `ls` from PATH, as always.
 //!
-//! Windows has none of them on a stock install, and the `find` that PATH (and
+//! Windows has neither on a stock install, and the `find` that PATH (and
 //! the system search order) does give is `System32\find.exe`, an unrelated
 //! string search that answers "no files found" instead of failing. So the
 //! tools run a GNU build: from a PATH directory outside the Windows directory
@@ -16,8 +17,8 @@
 //! directory, which turns `-name "*.rs"` into file names. The child
 //! therefore gets `noglob` added to `MSYS`.
 //!
-//! [`run_bounded`] runs `grep` and `find`: stdout is read as it arrives and
-//! the child is killed once it passes the byte cap or the deadline, stderr is
+//! [`run_bounded`] runs `find`: stdout is read as it arrives and the child
+//! is killed once it passes the byte cap or the deadline, stderr is
 //! summarised (errors, warnings, binary-file matches) and the exit status is
 //! kept, so a failure is never mistaken for an empty result.
 
@@ -35,7 +36,7 @@ use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use super::ToolContext;
 use crate::{Result, RuntimeError};
 
-/// A `Command` for `name` (`grep`, `find` or `ls`) with the session's env
+/// A `Command` for `name` (`find` or `ls`) with the session's env
 /// snapshot applied, ready for the caller's arguments.
 pub(crate) fn unix_tool_command(name: &str, ctx: &ToolContext) -> Result<Command> {
     let env = ctx.capabilities.env.as_ref();
@@ -68,7 +69,7 @@ pub(crate) fn unix_tool_command(name: &str, ctx: &ToolContext) -> Result<Command
     Ok(cmd)
 }
 
-/// What one bounded run of `grep` or `find` produced.
+/// What one bounded run of `find` produced.
 pub(crate) struct BoundedRun {
     /// stdout as read: at most the cap plus one read.
     pub stdout: Vec<u8>,
@@ -80,12 +81,6 @@ pub(crate) struct BoundedRun {
     /// killed, by us or by a signal).
     pub code: Option<i32>,
     pub stderr: StderrSummary,
-}
-
-/// grep's truncation footer, for output stopped at `cap`. The wording is
-/// grep's old one; the total is now a lower bound, as the child is stopped.
-pub(crate) fn truncation_footer(cap: usize) -> String {
-    format!("... (output truncated, more than {cap} total bytes)")
 }
 
 impl BoundedRun {
@@ -496,13 +491,13 @@ mod tests {
     fn a_gnu_tool_on_path_outside_the_windows_dir_wins() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = tmp.path().join("gnu");
-        touch(&tools.join("grep.exe"));
+        touch(&tools.join("ls.exe"));
         let git = tmp.path().join("Git");
-        touch(&git.join("usr").join("bin").join("grep.exe"));
+        touch(&git.join("usr").join("bin").join("ls.exe"));
 
         let path = path_of(&[&tools]);
-        let found = resolve_windows("grep", Some(&path), None, &[git]);
-        assert_eq!(found, Some(tools.join("grep.exe")));
+        let found = resolve_windows("ls", Some(&path), None, &[git]);
+        assert_eq!(found, Some(tools.join("ls.exe")));
     }
 
     #[test]
@@ -712,7 +707,7 @@ mod tests {
     #[test]
     fn unix_command_is_the_plain_program_name() {
         let ctx = super::super::test_helpers::create_tool_context();
-        let cmd = unix_tool_command("grep", &ctx).unwrap();
-        assert_eq!(cmd.as_std().get_program(), OsStr::new("grep"));
+        let cmd = unix_tool_command("find", &ctx).unwrap();
+        assert_eq!(cmd.as_std().get_program(), OsStr::new("find"));
     }
 }

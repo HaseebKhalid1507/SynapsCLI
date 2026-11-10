@@ -119,6 +119,7 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── mod.rs            — Tool trait, ToolContext
 │   ├── registry.rs       — ToolRegistry::new() registers all built-ins
 │   ├── {bash,read,write,edit,grep,find,ls}.rs  — core filesystem/shell tools
+│   ├── search/           — grep's in-process engine (ripgrep's `ignore` + `grep-searcher`): walk, regex, output
 │   ├── multi_edit.rs     — anchored edits across files, all or nothing (docs/multi-edit.md)
 │   ├── powershell.rs     — PowerShell tool (Windows only; shares the bash tool's runner)
 │   ├── subagent/         — reactive lifecycle: start, status, steer, collect, resume, authorize_model, finalize + oneshot
@@ -538,6 +539,8 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 - **`syntect` 5** — syntax highlighting. `default-themes + default-syntaxes + regex-onig`.
 - **`portable-pty` 0.9** — PTY for stateful shell tool.
 - **`notify` 6.1** — file-watching (event inbox, extension config).
+- **`globset` 0.4** — glob matching.
+- **`ignore` 0.4 + `grep-regex`/`grep-searcher` 0.1** — ripgrep's walk and search, in-process, for the `grep` tool (`tools/search/`).
 - **`axum` 0.7 + `axum-server`** — the `synaps auth-broker` HTTP(S) server.
 - **`fs4` 0.13** — advisory file locks for auth.json.
 
@@ -648,20 +651,21 @@ Run a PowerShell command (`pwsh` if installed, else Windows PowerShell). Same ru
 | `command` (string, req) | `timeout` (integer) |
 
 ### `grep`
-Recursive regex search: `grep -rnE` (GNU grep on Linux, BSD grep on macOS, Git for Windows' GNU grep on Windows).
+Recursive regex search, run in-process with ripgrep's crates (`tools/search/`): no `grep` binary, so it works the same on Linux, macOS and Windows (no Git for Windows) and in the hardened build.
 
 | Parameter | Type | Req | Default | Notes |
 |---|---|---|---|---|
-| `pattern` | string | ✓ | — | POSIX extended regex (ERE) |
-| `path` | string | | `.` | |
-| `include` | string | | — | Glob filter on the file name (`--include`) |
-| `context` | integer | | — | Lines before/after |
+| `pattern` | string | ✓ | — | Rust regex (ripgrep syntax, see Dialect). Invalid → tool error with a hint |
+| `path` | string | | `.` | File or directory (session cwd for relative paths) |
+| `include` | string | | — | File-name glob (`*.rs`, `*.{ts,tsx}`), like `grep --include` |
+| `context` | integer | | — | Lines before/after; turns on `--` group separators |
+| `no_ignore` | boolean | | `false` | Also search what `.gitignore`/`.ignore`/git excludes, `node_modules` and `target` skip |
 
-- **Dialect:** ERE, as for `grep -E`: `a|b`, `+`, `?`, `{n}` and `( )` work as written. `\|` is **not** alternation: GNU grep reads it as a literal `|` (BSD grep may differ), so write `a|b`. `\d` and `(?i)` are not ERE: use `[0-9]` or `[[:digit:]]`; grep's warning about them comes back as a note. Escape `(` `[` `{` with a backslash to match them literally: `fn main() {` reads `()` as an empty group and misses `fn main() {` lines; write `fn main\(\)`.
-- **Result:** the exit status decides. Matches (exit 0); exactly `No matches found.` (exit 1); otherwise a tool error with grep's first stderr line (an invalid pattern gets `invalid regex: … — escape regex metacharacters …`). Matches that come with errors (an unreadable file) are kept, with a note giving the error count and the first error. Binary files that match are listed in a note (`[binary file matches, lines not shown: …]`).
-- **Size:** output stops at `max_tool_buffer` (256 KiB): grep is killed, the last partial line dropped, and `... (output truncated, more than N total bytes)` appended. The result then goes through tool output spill (`tool_output_spill_bytes`) like any other; with spill off, the `max_tool_output` cut applies.
-- **Time:** 15s timeout. Matches found by then are returned with a note that more may be missing; with none, a tool error. A timed-out or cancelled grep is killed.
-- Excludes `.git`, `node_modules`, `target` directories.
+- **Dialect:** Rust regex, as in ripgrep: `a|b`, `+`, `?`, `{n}`, `( )`, `\d`, `\b` and `(?i)` work as written. `\|` is a literal `|`, not alternation. No lookaround or backreferences. Escape `(` `)` `[` `{` and the other metacharacters with a backslash to match them literally: `fn main() {` is an invalid pattern; write `fn main\(\) \{`.
+- **Result:** `grep -rn`'s format: `path:line:text`, `path-line-text` for context, `--` between groups, no path for a file argument, sorted by path. Exactly `No matches found.` when nothing matched. An invalid pattern is a tool error (`invalid regex: …` and a `Hint:` line), as is a missing path (`Path not found: …`) or a search that could read nothing. Matches that come with errors (an unreadable file) are kept, with a note giving the error count and the first error. Binary files (a NUL byte) are skipped and the matching ones listed in a note (`[binary file matches, lines not shown: …]`).
+- **Walk:** respects `.gitignore` (in a git repo), `.ignore`, `.git/info/exclude` and global git excludes; always skips `node_modules` and `target` unless `no_ignore`; never enters `.git`, `.svn`, `.hg`, `.bzr`, `.jj`, `.sl`. Hidden files are searched; links inside the tree are not followed; only regular files are read (no FIFOs or devices).
+- **Size:** lines over 500 chars are cut. Output stops at `max_tool_buffer` (256 KiB) on a whole line, with `... (output truncated, more than N total bytes)` appended. The result then goes through tool output spill (`tool_output_spill_bytes`) like any other; with spill off, the `max_tool_output` cut applies.
+- **Time:** 15s deadline. Matches found by then come back with a note that more may be missing (also on cancel); with none, a tool error. A timed-out or cancelled search stops.
 
 ### `find`
 Glob-based file search: `find PATH … -name PATTERN`.
@@ -672,7 +676,7 @@ Glob-based file search: `find PATH … -name PATTERN`.
 | `path` | string | | `.` | |
 | `type` | string | | — | `"f"`, `"d"` or `"l"` (symlink) |
 
-- `.git`, `node_modules` and `target` directories are pruned: never walked, but still listed themselves when they match.
+- `.git`, `node_modules` and `target` directories are pruned: never walked, but still listed themselves when they match. `.gitignore` is not read (unlike grep).
 - `No files found.` when find ran cleanly and matched nothing. A missing path or other failure with no results is a tool error with find's first stderr line; results that come with errors (an unreadable directory) get a note with the error count and the first error.
 - Output capped at `max_tool_buffer` with the same footer as grep. 10s timeout, partial results kept as for grep; the process is killed on timeout or cancel.
 
@@ -724,7 +728,7 @@ Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shel
 | `edit` | path, old_string, new_string | — | Surgical editing |
 | `multi_edit` | edits | placeholders | Anchored multi-file edits, all or nothing |
 | `powershell`† | command | timeout | PowerShell execution |
-| `grep` | pattern | path, include, context | Regex search |
+| `grep` | pattern | path, include, context, no_ignore | Regex search (in-process) |
 | `find` | pattern | path, type | File discovery |
 | `ls` | — | path | Directory listing |
 | `subagent` | task | agent, system_prompt, model, timeout, thinking | Agent dispatch |

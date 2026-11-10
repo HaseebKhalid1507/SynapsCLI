@@ -39,7 +39,7 @@ On Windows:
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.ps1 | iex"
 ```
 
-This installs `synaps.exe` in `%USERPROFILE%\.cargo\bin` (`%CARGO_HOME%\bin` if set). On Windows the agent also gets a built-in `powershell` tool, and the default system prompt tells it to prefer it. Install [Git for Windows](https://git-scm.com/download/win) for the rest: the `bash` tool uses its Git Bash (or WSL's `bash.exe`), and `grep`, `find` and `ls` run its GNU tools from `usr\bin`. Without it those tools fail with a message pointing at `powershell`.
+This installs `synaps.exe` in `%USERPROFILE%\.cargo\bin` (`%CARGO_HOME%\bin` if set). On Windows the agent also gets a built-in `powershell` tool, and the default system prompt tells it to prefer it. Install [Git for Windows](https://git-scm.com/download/win) for the rest: the `bash` tool uses its Git Bash (or WSL's `bash.exe`), and `find` and `ls` run its GNU tools from `usr\bin`. Without it those tools fail with a message pointing at `powershell`. `grep` needs nothing: it searches in-process.
 
 <details>
 <summary>Other ways: cargo, AUR, .deb, .zip, source</summary>
