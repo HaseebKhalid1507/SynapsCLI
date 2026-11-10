@@ -49,6 +49,22 @@ All notable changes to this project will be documented in this file.
   that still sends them runs as before: they are ignored, not refused. A
   real read-only mode would have to restrict `bash` as well as the file
   tools; that is tracked separately.
+- **`search_tools` matches keywords, not one literal string.** The whole
+  query had to appear verbatim in a tool's id, summary or tags: over six
+  weeks of sessions 30% of searches came back empty, every multi-word one
+  among them ("web fetch", "subagent start", "shell session"), and the
+  model then searched again, fell back to bash or guessed ids such as
+  `ext.web-tools:fetch`. The query is now split into keywords at spaces
+  and at `_`, `-`, `:` and `.`, so `web fetch`, `web_fetch` and `web-fetch`
+  find the same tools, in any order. Results are ranked: an exact id or
+  name first, then tools containing the whole query (everything that
+  matched before still matches, ahead of the rest), then the most keywords
+  matched, id hits above summary hits. In a query of several words,
+  one-letter and filler words (`a`, `the`, `for`, `tool`, …) are not
+  keywords, so "read a file" doesn't match every tool with an `a` in its
+  summary. An empty result says to try one
+  shorter keyword and not to guess ids, and `activate_tools` given an
+  unknown id says it needs an exact id from `search_tools`.
 
 ## [0.11.1] — 2026-10-31
 

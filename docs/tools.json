@@ -629,12 +629,12 @@
     }
   },
   {
-    "description": "Search locally known tools by keyword. Returns bounded compact descriptors with stable tool ids (never full schemas). Use activate_tools with an exact returned id to request activation.",
+    "description": "Search locally known tools by keywords, in any order. Ranked: exact id or name first, then the whole query as a substring, then the most keywords matched. Returns compact descriptors with stable tool ids (never full schemas). Use activate_tools with an exact returned id to request activation.",
     "name": "search_tools",
     "parameters": {
       "properties": {
         "query": {
-          "description": "Case-insensitive keyword matched against tool ids, summaries, and tags.",
+          "description": "Case-insensitive keywords matched against tool ids, summaries and tags. _ - : . also separate words: web_fetch and web fetch both work.",
           "type": "string"
         }
       },
