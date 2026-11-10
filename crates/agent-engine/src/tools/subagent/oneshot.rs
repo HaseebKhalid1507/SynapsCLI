@@ -49,14 +49,6 @@ impl Tool for SubagentTool {
                     "description": "The task/prompt to send to the subagent."
                 },
                 "model": {"type": "string", "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices."},
-                "role": {"type": "string", "enum": ["planner", "implementer", "tester", "reviewer", "researcher", "debugger"]},
-                "write_policy": {
-                    "oneOf": [
-                        {"type": "object", "properties": {"mode": {"const": "read_only"}}, "required": ["mode"]},
-                        {"type": "object", "properties": {"mode": {"const": "isolated_worktree"}}, "required": ["mode"]},
-                        {"type": "object", "properties": {"mode": {"const": "non_overlapping_paths"}, "scopes": {"type": "array", "items": {"type": "string"}}}, "required": ["mode", "scopes"]}
-                    ]
-                },
                 "thinking": {
                     "type": "string",
                     "enum": ["low", "medium", "high", "xhigh", "max"],
@@ -619,5 +611,41 @@ mod tests {
             result.is_ok(),
             "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}"
         );
+    }
+
+    /// `role` and `write_policy` are no longer advertised (they were never
+    /// read). A caller that still sends them is not refused, and the worker
+    /// is dispatched exactly as without them: as an implementer.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn test_subagent_ignores_retired_role_and_write_policy() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let _offline = crate::test_env::OfflineProviderEnv::new();
+        let ctx = create_tool_context();
+        let orchestration = std::sync::Arc::clone(ctx.capabilities.orchestration.as_ref().unwrap());
+        let params = json!({
+            "system_prompt": "You are a concise test subagent. Reply with only: ok",
+            "task": "Say ok",
+            "model": "anthropic/claude-sonnet-4-6",
+            "timeout": 1,
+            "role": "reviewer",
+            "write_policy": {"mode": "read_only"}
+        });
+
+        let result = SubagentTool.execute(params, ctx).await;
+        assert!(
+            result.is_ok(),
+            "old params must be ignored, not refused: {result:?}"
+        );
+
+        let events: serde_json::Value =
+            serde_json::from_str(&orchestration.telemetry_json()).unwrap();
+        let dispatch = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["name"] == "worker.dispatch_allowed")
+            .expect("dispatch recorded");
+        assert_eq!(dispatch["worker_role"], "implementer");
     }
 }
