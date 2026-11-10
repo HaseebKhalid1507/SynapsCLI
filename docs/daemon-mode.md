@@ -162,6 +162,8 @@ Real systemd smoke tests require explicit `SYNAPS_TEST_REAL_SCOPES=1`; this does
 override an operator's `SYNAPS_PROCESS_SCOPES=off`.
 
 `synaps attach` is a thin line client: stdin lines → `Submit` (or `Steer` while streaming);
+any `/name` line that is none of the commands below is unknown and never sent (start a line with
+`//` to send text that begins with `/`: `//etc/hosts` sends `/etc/hosts`; the TUI reads `//` the same way);
 `/abort` → `Cancel`; `/detach`, `/quit` or **Ctrl-C → `Detach` + `Bye` — the turn keeps running**;
 `/close [force]` → engine command `close` (ends the session; see [Closing a session](#closing-a-session-close));
 `/model NAME`; `/cmd NAME [ARG]` (engine command); `/save`; `/new`; `/sessions` (status query);

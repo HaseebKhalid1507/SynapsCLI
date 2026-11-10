@@ -22,7 +22,11 @@
       "Guides",
       "  /help models    Models, providers, and routing",
       "  /help plugins   Plugins, skills, commands, and trust",
-      "  /help sessions  Sessions, resume, compact, and chains"
+      "  /help sessions  Sessions, resume, compact, and chains",
+      "",
+      "Typing",
+      "  /name           Runs a command; an unknown one is never sent",
+      "  //text          Sends text that starts with / (as /text)"
     ],
     "related": []
   },
