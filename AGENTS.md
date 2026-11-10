@@ -119,7 +119,7 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── mod.rs            — Tool trait, ToolContext
 │   ├── registry.rs       — ToolRegistry::new() registers all built-ins
 │   ├── {bash,read,write,edit,grep,find,ls}.rs  — core filesystem/shell tools
-│   ├── search/           — grep's in-process engine (ripgrep's `ignore` + `grep-searcher`): walk, regex, output
+│   ├── search/           — grep's and find's in-process engine (ripgrep's `ignore`, `globset`, `grep-searcher`): walk, regex, name glob, output
 │   ├── multi_edit.rs     — anchored edits across files, all or nothing (docs/multi-edit.md)
 │   ├── powershell.rs     — PowerShell tool (Windows only; shares the bash tool's runner)
 │   ├── subagent/         — reactive lifecycle: start, status, steer, collect, resume, authorize_model, finalize + oneshot
@@ -539,8 +539,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 - **`syntect` 5** — syntax highlighting. `default-themes + default-syntaxes + regex-onig`.
 - **`portable-pty` 0.9** — PTY for stateful shell tool.
 - **`notify` 6.1** — file-watching (event inbox, extension config).
-- **`globset` 0.4** — glob matching.
-- **`ignore` 0.4 + `grep-regex`/`grep-searcher` 0.1** — ripgrep's walk and search, in-process, for the `grep` tool (`tools/search/`).
+- **`ignore` 0.4 + `grep-regex`/`grep-searcher` 0.1 + `globset` 0.4** — ripgrep's walk and search, in-process, for the `grep` and `find` tools (`tools/search/`); `globset` builds the `find` tool's name glob.
 - **`axum` 0.7 + `axum-server`** — the `synaps auth-broker` HTTP(S) server.
 - **`fs4` 0.13** — advisory file locks for auth.json.
 
@@ -668,17 +667,19 @@ Recursive regex search, run in-process with ripgrep's crates (`tools/search/`): 
 - **Time:** 15s deadline. Matches found by then come back with a note that more may be missing (also on cancel); with none, a tool error. A timed-out or cancelled search stops.
 
 ### `find`
-Glob-based file search: `find PATH … -name PATTERN`.
+File-name search, run in-process on grep's walker (`tools/search/files.rs`): no `find` binary, so it works the same on Linux, macOS and Windows (no Git for Windows) and in the hardened build.
 
 | Parameter | Type | Req | Default | Notes |
 |---|---|---|---|---|
-| `pattern` | string | ✓ | — | Matched against the file name |
-| `path` | string | | `.` | |
-| `type` | string | | — | `"f"`, `"d"` or `"l"` (symlink) |
+| `pattern` | string | ✓ | — | Glob on the file name (`*.rs`, `Cargo.*`, `*.{rs,toml}`), case-sensitive. Invalid → tool error with the parse error. A path separator in it is a tool error too: names hold none, so put the directory in `path` |
+| `path` | string | | `.` | Directory or file (session cwd for relative paths) |
+| `type` | string | | — | `"f"`, `"d"` or `"l"` (symlink, never followed); anything else → tool error |
+| `no_ignore` | boolean | | `false` | Also list what `.gitignore`/`.ignore`/git excludes, `node_modules` and `target` skip |
 
-- `.git`, `node_modules` and `target` directories are pruned: never walked, but still listed themselves when they match. `.gitignore` is not read (unlike grep).
-- `No files found.` when find ran cleanly and matched nothing. A missing path or other failure with no results is a tool error with find's first stderr line; results that come with errors (an unreadable directory) get a note with the error count and the first error.
-- Output capped at `max_tool_buffer` with the same footer as grep. 10s timeout, partial results kept as for grep; the process is killed on timeout or cancel.
+- **Result:** one path per line, as `find PATH` printed it: the path joined with the entry below it (`<cwd>/./src/a.rs` for `.`; the TUI card shortens it), native separators. Sorted by name, a directory before its entries. The path itself comes first when its name matches (as `-name` takes it: `.` for the default path). Exactly `No files found.` when nothing matched. A missing path is a tool error (`Path not found: …`), as is a path that could not be read at all. Results that come with errors (an unreadable directory) are kept, with a note giving the error count and the first error.
+- **Walk:** grep's: respects `.gitignore` (in a git repo), `.ignore`, `.git/info/exclude` and global git excludes; `node_modules` and `target` are neither listed nor walked unless `no_ignore`; `.git`, `.svn`, `.hg`, `.bzr`, `.jj`, `.sl` are never listed or entered. Hidden entries are listed. An explicit `path` is always walked, even inside `node_modules`; a linked `path` is followed, links inside the tree are not. Nothing is opened, so a FIFO is listed like any entry.
+- **Size:** output stops at `max_tool_buffer` (256 KiB) on a whole line, with grep's truncation footer; then tool output spill as for grep.
+- **Time:** 10s deadline. Paths found by then come back with a note that more may be missing (also on cancel); with none, a tool error. A timed-out or cancelled walk stops.
 
 ### `ls`
 `ls -lah` output.
@@ -729,7 +730,7 @@ Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shel
 | `multi_edit` | edits | placeholders | Anchored multi-file edits, all or nothing |
 | `powershell`† | command | timeout | PowerShell execution |
 | `grep` | pattern | path, include, context, no_ignore | Regex search (in-process) |
-| `find` | pattern | path, type | File discovery |
+| `find` | pattern | path, type, no_ignore | File discovery (in-process) |
 | `ls` | — | path | Directory listing |
 | `subagent` | task | agent, system_prompt, model, timeout, thinking | Agent dispatch |
 | `connect_mcp_server` | server | — | MCP server connection |

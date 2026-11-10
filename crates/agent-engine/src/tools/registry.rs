@@ -1197,10 +1197,12 @@ mod tests {
         assert!(registry.get("shell_start").is_none());
         assert!(registry.get("shell_send").is_none());
         assert!(registry.get("shell_end").is_none());
-        // Non-exec built-ins are still present; grep searches in-process.
+        // Non-exec built-ins are still present; grep and find search
+        // in-process.
         assert!(registry.get("read").is_some());
         assert!(registry.get("ls").is_some());
         assert!(registry.get("grep").is_some());
+        assert!(registry.get("find").is_some());
         assert!(registry.get("subagent").is_some());
 
         let without_sub = ToolRegistry::without_subagent();

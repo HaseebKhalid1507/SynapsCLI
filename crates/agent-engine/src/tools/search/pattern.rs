@@ -1,6 +1,7 @@
 //! Patterns for the search tools: grep's regex and its `include` file-name
-//! glob.
+//! glob, and find's name glob.
 
+use globset::{GlobBuilder, GlobMatcher};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use ignore::types::{Types, TypesBuilder};
 
@@ -48,6 +49,31 @@ pub(crate) fn include_filter(glob: &str) -> Result<Types, String> {
     builder
         .build()
         .map_err(|err| format!("invalid include glob: {err}"))
+}
+
+/// find's `pattern`: a glob on the file name, as `find -name` took it
+/// (`*.rs`, `Cargo.*`, `[!.]*`), plus braces (`*.{rs,toml}`). Case-sensitive;
+/// `*` matches a leading `.`. A name never holds a path separator, so a
+/// pattern with one (`src/*.rs`, `**/x`) could never match: that is an error
+/// pointing at `path`, where `find -name` silently found nothing.
+pub(crate) fn name_glob(glob: &str) -> Result<GlobMatcher, String> {
+    if glob.len() > MAX_PATTERN_BYTES {
+        return Err(format!(
+            "pattern is {} bytes, over the {MAX_PATTERN_BYTES}-byte limit",
+            glob.len()
+        ));
+    }
+    if glob.chars().any(std::path::is_separator) {
+        return Err(format!(
+            "invalid pattern {glob:?}: it is matched against file names, which never contain \
+             a path separator. Put the directory in `path` and the name glob in `pattern` \
+             (path \"src\", pattern \"*.rs\" finds .rs files at any depth under src)."
+        ));
+    }
+    GlobBuilder::new(glob)
+        .build()
+        .map(|glob| glob.compile_matcher())
+        .map_err(|err| format!("invalid pattern: {err}"))
 }
 
 #[cfg(test)]
@@ -107,6 +133,49 @@ mod tests {
         let err = content_matcher(&"a".repeat(MAX_PATTERN_BYTES + 1)).unwrap_err();
         assert!(err.contains("byte limit"), "{err}");
         assert!(content_matcher(&"a".repeat(MAX_PATTERN_BYTES)).is_ok());
+    }
+
+    /// find's glob works on names: fnmatch-like wildcards and classes,
+    /// braces, case-sensitive, `*` matching a leading dot.
+    #[test]
+    fn name_glob_matches_file_names() {
+        let is = |glob: &str, name: &str| name_glob(glob).unwrap().is_match(name);
+        assert!(is("*.rs", "main.rs"));
+        assert!(is("*.rs", ".hidden.rs"));
+        assert!(!is("*.rs", "main.rs.bak"));
+        assert!(is("Cargo.*", "Cargo.toml"));
+        assert!(is("Cargo.*", "Cargo.lock"));
+        assert!(!is("Cargo.*", "cargo.toml"));
+        assert!(is("*.{rs,toml}", "a.toml"));
+        assert!(is("?.txt", "a.txt"));
+        assert!(!is("?.txt", "ab.txt"));
+        assert!(is("[!.]*", "x"));
+        assert!(!is("[!.]*", ".x"));
+        assert!(is("*", "."));
+        assert!(!is("", "a"));
+    }
+
+    /// A separator can't match a name: an error naming `path`, never a
+    /// silent "No files found.".
+    #[test]
+    fn name_glob_with_a_separator_is_an_error() {
+        for glob in ["src/*.rs", "**/*.rs", "/x", "a/"] {
+            let err = name_glob(glob).unwrap_err();
+            assert!(err.starts_with("invalid pattern "), "{glob}: {err}");
+            assert!(err.contains("`path`"), "{glob}: {err}");
+        }
+        #[cfg(windows)]
+        assert!(name_glob(r"src\*.rs").is_err());
+    }
+
+    #[test]
+    fn bad_name_glob_is_an_error_with_the_parse_message() {
+        let err = name_glob("[").unwrap_err();
+        assert!(err.starts_with("invalid pattern: "), "{err}");
+        assert!(err.contains("unclosed character class"), "{err}");
+        let err = name_glob("{a,b").unwrap_err();
+        assert!(err.starts_with("invalid pattern: "), "{err}");
+        assert!(name_glob(&"a".repeat(MAX_PATTERN_BYTES + 1)).is_err());
     }
 
     #[test]

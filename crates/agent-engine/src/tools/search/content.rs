@@ -73,12 +73,7 @@ pub(crate) fn search<R: Read>(
     control: &Control,
     mut open: impl FnMut(&Path) -> io::Result<R>,
 ) -> Result<ContentOutcome, String> {
-    if let Err(err) = std::fs::metadata(&req.root) {
-        return Err(match err.kind() {
-            io::ErrorKind::NotFound => format!("Path not found: {}", req.root.display()),
-            _ => format!("{}: {err}", req.root.display()),
-        });
-    }
+    super::check_root(&req.root)?;
     let mut searcher = build_searcher(req.context.unwrap_or(0));
     let separators = req.context.is_some();
     let opts = WalkOptions {
