@@ -1,0 +1,5095 @@
+{
+  "date_utc": "2026-11-05T13:42:35Z",
+  "machine": {
+    "cpu": "Intel(R) Core(TM) Ultra 9 275HX",
+    "cores": 24,
+    "mem_gb": 30.7,
+    "os": "CachyOS",
+    "kernel": "7.3.0-4-cachyos",
+    "arch": "x86_64"
+  },
+  "args": {
+    "sessions": [
+      500
+    ],
+    "tools": [
+      "synaps"
+    ],
+    "reps": 1,
+    "timeout": 10.0,
+    "settle": 3.0,
+    "json_out": "/tmp/synaps-bench-mem/mem-500-fast.json",
+    "hold": 0.0,
+    "max_psi": 1.0,
+    "quiet_wait": 900.0,
+    "max_attempts": 3
+  },
+  "versions": {
+    "synaps": "synaps 0.11.1"
+  },
+  "live_daemons_before": {
+    "1112": "/usr/bin/synaps daemon --foreground"
+  },
+  "summary": [
+    {
+      "tool": "synaps",
+      "sessions": 500,
+      "median_mem_mb": 2271.3,
+      "raw_mem_mb": [
+        2271.3
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "mem_mb": 2271.3,
+      "pss_mb": 2271.3,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 2250.6,
+      "pss_file_mb": 2.5,
+      "process_count": 501,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 964083,
+          "pss_mb": 1067.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 1067.9,
+          "pss_anon_mb": 1065.4,
+          "pss_file_mb": 2.5,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps daemon start"
+        },
+        {
+          "pid": 964094,
+          "pss_mb": 1.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 1.9,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964099,
+          "pss_mb": 1.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 1.9,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964106,
+          "pss_mb": 1.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 1.9,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964131,
+          "pss_mb": 1.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 1.9,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964162,
+          "pss_mb": 1.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 1.9,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964170,
+          "pss_mb": 1.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 1.9,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964177,
+          "pss_mb": 1.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 1.9,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964182,
+          "pss_mb": 1.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 1.9,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964192,
+          "pss_mb": 1.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 1.9,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964203,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964212,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964227,
+          "pss_mb": 1.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 1.9,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964240,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964257,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964262,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964299,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964304,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964309,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964314,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964319,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964345,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964361,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964385,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964390,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964395,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964400,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964413,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964421,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964426,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964439,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964448,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964492,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964531,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964536,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964548,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964553,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964558,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964563,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964568,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964580,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964601,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964625,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964630,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964635,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964675,
+          "pss_mb": 2.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.0,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964680,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964685,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964712,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964717,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964744,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964761,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964766,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964771,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964783,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964796,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964801,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964809,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964820,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964825,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964830,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964857,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964884,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.0,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964889,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964897,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964902,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964907,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964912,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964917,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964951,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964968,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964993,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 964998,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965018,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965023,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965028,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965033,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965038,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965077,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965090,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965120,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965125,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965130,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965143,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965148,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965155,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965160,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965165,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965170,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965187,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965214,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965219,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965231,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965239,
+          "pss_mb": 2.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.1,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965250,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965290,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965295,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965316,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965340,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965345,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965353,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965366,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965371,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965376,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965382,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965391,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965417,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965437,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965454,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965462,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.1,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965496,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965509,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965514,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965519,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965524,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965529,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965534,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965558,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965585,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965590,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965603,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965608,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965615,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965620,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965637,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965658,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965688,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965706,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965712,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965728,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965740,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965745,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965755,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965760,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965770,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965797,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965850,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965855,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965860,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965873,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965878,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965887,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965914,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965921,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965928,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965945,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965975,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965980,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965992,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 965997,
+          "pss_mb": 2.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.2,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966002,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966007,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966012,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966034,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966065,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966070,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966075,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966088,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966093,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.2,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966102,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966112,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966121,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966140,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966172,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966177,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966182,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966194,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966207,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966212,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966223,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966228,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966245,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966266,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966286,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966313,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966358,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966363,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966368,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966375,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966380,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966385,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966406,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966423,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966428,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966437,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966453,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966458,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966463,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966490,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966495,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966522,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966546,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966551,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966556,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966568,
+          "pss_mb": 2.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.3,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966577,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966587,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966592,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966597,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966602,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966619,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966634,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966670,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966682,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966687,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966692,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966697,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966704,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966717,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966747,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966765,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966770,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966775,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966795,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966800,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966805,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966810,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966827,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966866,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966893,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966903,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966933,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966946,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966951,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966956,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966961,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966966,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966984,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 966996,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967023,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967028,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967035,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967044,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967049,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967083,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967088,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.3,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967105,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967126,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967131,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967136,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967153,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967164,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967169,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967174,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967179,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967191,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967237,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967242,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967247,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967256,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967265,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967270,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967279,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967284,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967302,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967319,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967326,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967359,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967375,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967380,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967388,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967394,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967401,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967425,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967467,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967481,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967487,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967492,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967505,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967512,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967517,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967522,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967527,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967569,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967575,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967582,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967594,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967617,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967647,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967652,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967678,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967683,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967701,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967714,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967735,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967751,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967756,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967761,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967766,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967771,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967776,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967805,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967814,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967819,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967824,
+          "pss_mb": 2.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.4,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967837,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967849,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967854,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967859,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967864,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967875,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967917,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967930,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967938,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967956,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967963,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967968,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 967985,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968064,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968069,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968143,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968148,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968236,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968254,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968287,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.4,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968293,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968300,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968323,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968337,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968362,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968381,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968386,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968391,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968414,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968421,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968426,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968431,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968436,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968476,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968481,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968487,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968499,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968512,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968517,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968522,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968527,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968532,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968549,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968561,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968571,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968593,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968599,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968604,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968609,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968614,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968629,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968651,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968660,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968665,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968681,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968693,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968708,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968713,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968718,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968735,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968752,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968798,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968803,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968808,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968821,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968828,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968833,
+          "pss_mb": 2.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.5,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968838,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968843,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968863,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968868,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968873,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968900,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968934,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.5,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968939,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968944,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968949,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968962,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 968979,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969001,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969006,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969011,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969016,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969029,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969042,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969047,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969052,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969069,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969096,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969101,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969106,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969126,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969131,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969136,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969141,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969148,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969165,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969177,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969182,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969209,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969214,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969221,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969234,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969239,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969256,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969281,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969306,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969311,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969316,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969328,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969341,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969351,
+          "pss_mb": 2.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.6,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969360,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969366,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969383,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969417,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969422,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969427,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969442,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969467,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969472,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969477,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969482,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969499,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969504,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969509,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969534,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969548,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969553,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969558,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969563,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969574,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969599,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969619,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969624,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969629,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969634,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969647,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.6,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969652,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969657,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969662,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969679,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969706,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969711,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969716,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969736,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969741,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969748,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969756,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969778,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969795,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969819,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969824,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969834,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969856,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969862,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969868,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969873,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969882,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969907,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969920,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969925,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969930,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969943,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969977,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969982,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969987,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 969992,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970009,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970043,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970048,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.7,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970053,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970071,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970076,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970081,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970086,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970091,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970109,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970114,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970119,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970129,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970158,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970163,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970168,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970173,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970186,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970203,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970223,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970228,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970233,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970238,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970251,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.7,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970256,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970261,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970286,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970303,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970342,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970348,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970353,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970376,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970386,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970391,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970396,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970401,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970418,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 970430,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 2.8,
+          "pss_anon_mb": 2.8,
+          "pss_file_mb": 0.0,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        }
+      ],
+      "launch": {
+        "mem_mb": 2271.3,
+        "pss_mb": 2271.3,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 2250.6,
+        "pss_file_mb": 2.5,
+        "process_count": 501
+      },
+      "hold_s": 0.0,
+      "tool": "synaps",
+      "sessions": 500,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 19.1
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 18.7
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    }
+  ],
+  "live_daemons_after": {
+    "1112": "/usr/bin/synaps daemon --foreground"
+  }
+}
