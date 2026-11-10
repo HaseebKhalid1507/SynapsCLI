@@ -684,6 +684,7 @@ async fn reloaded_live_session(host: &Arc<agent_engine::EngineHost>) -> agent_en
             input_owner_kind: None,
             workers: Vec::new(),
             tool_activations: Vec::new(),
+            owner_token: None,
         }],
         expected_clients: 1,
         next_subagent_id: 0,

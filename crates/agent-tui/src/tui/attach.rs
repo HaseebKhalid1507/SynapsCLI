@@ -242,6 +242,7 @@ pub fn choose_attach(
             ..Default::default()
         },
         mode: opts.mode,
+        owned: None,
     };
     if opts.new_session && opts.id.is_some() {
         return Err("cannot combine --attach <ID> with --new: pick one".to_string());
@@ -328,6 +329,7 @@ pub(super) fn skew_notice_once(
 pub(super) fn session_ended_line(reason: EndReason, session: &str, has_history: bool) -> Option<String> {
     let what = match reason {
         EndReason::ClientQuit => "was closed",
+        EndReason::OwnerGone => "ended: the client that owned it disconnected",
         EndReason::HostShutdown => "ended: the daemon shut down",
         EndReason::Evicted => "was evicted from the daemon",
         EndReason::Error => "ended after an error",

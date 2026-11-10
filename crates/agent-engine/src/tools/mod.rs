@@ -191,7 +191,7 @@ pub struct ToolCapabilities {
     /// Per-session environment snapshot (session-identity T1). `None` =
     /// inherit process env. When `Some`, tools call `env_clear().envs()`
     /// so no daemon env leaks into session subprocesses.
-    pub env: Option<crate::session::types::SessionEnv>,
+    pub env: Option<crate::session::types::ToolEnv>,
     /// Names of env vars stripped as secrets (T5). Tools use this for
     /// loud notices when a command fails referencing a stripped var.
     pub env_stripped: Vec<String>,
@@ -206,6 +206,32 @@ pub struct ToolCapabilities {
     /// `params.session_id` so a daemon-shared plugin knows its caller.
     /// Not the lease scope (`tool_session_id`, a random runtime id).
     pub session_id: Option<String>,
+}
+
+impl ToolCapabilities {
+    /// T5: a notice for each stripped secret `pick` selects that this
+    /// session was not told about yet (once per name per session). `bash`
+    /// picks the names a failed command references; `shell_start` all of
+    /// them, up front (an interactive shell's commands never reach a tool
+    /// that could tell).
+    pub(crate) fn stripped_env_notices(&self, pick: impl Fn(&str) -> bool) -> String {
+        let mut notice = String::new();
+        if self.env_stripped.is_empty() {
+            return notice;
+        }
+        let mut warned = self.env_warned.lock().unwrap_or_else(|p| p.into_inner());
+        for name in self.env_stripped.iter().filter(|n| pick(n)) {
+            if warned.insert(name.clone()) {
+                notice.push_str(&format!(
+                    "\nnote: ${name} was stripped from the session env as a secret; \
+                     reattach from a shell that has it \
+                     (synaps --system … from that shell) \
+                     — the daemon never receives credentials."
+                ));
+            }
+        }
+        notice
+    }
 }
 
 /// Configuration limits and timeouts.
@@ -396,6 +422,24 @@ pub trait Tool: Send + Sync {
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
+
+#[cfg(test)]
+mod stripped_env_notice_tests {
+    /// One notice per picked stripped name, once per session (the shared
+    /// set), the same text `bash` and `shell_start` print.
+    #[test]
+    fn notices_name_each_picked_secret_once_per_session() {
+        let mut caps = super::test_helpers::create_tool_context().capabilities;
+        assert_eq!(caps.stripped_env_notices(|_| true), "", "nothing stripped: nothing to say");
+        caps.env_stripped = vec!["GH_TOKEN".into(), "AWS_SECRET_ACCESS_KEY".into()];
+        let first = caps.stripped_env_notices(|n| n == "GH_TOKEN");
+        assert!(first.contains("note: $GH_TOKEN was stripped from the session env as a secret"), "{first}");
+        assert!(!first.contains("AWS_SECRET_ACCESS_KEY"), "{first}");
+        let all = caps.stripped_env_notices(|_| true);
+        assert!(all.contains("$AWS_SECRET_ACCESS_KEY") && !all.contains("$GH_TOKEN"), "{all}");
+        assert_eq!(caps.stripped_env_notices(|_| true), "", "each name once");
+    }
+}
 
 #[cfg(test)]
 mod tool_output_tests {

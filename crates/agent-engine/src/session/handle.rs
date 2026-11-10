@@ -37,6 +37,10 @@ pub struct Presence {
     pub title: Option<String>,
     pub cost_usd: f64,
     pub messages: usize,
+    /// Owned sessions: the client bound as the owner (`None` while the
+    /// session waits for its owner to bind or re-bind). Always `None` for a
+    /// session that is not owned (`SessionHandle::is_owned`).
+    pub owning_client: Option<ClientId>,
 }
 
 /// The coarse state `Presence::state_since` dates.
@@ -94,6 +98,10 @@ pub struct SessionHandle {
     /// F23: only on a lock-held placeholder — the config to retry the real
     /// `create` with on the next attach. `None` for real actors.
     placeholder_config: Option<Arc<SessionConfig>>,
+    /// Owned sessions only: the owner token, fixed at create. Here so a
+    /// reload whose checkpoint did not confirm still records the session
+    /// as owned (it would otherwise come back unowned and never end).
+    owner_token: Option<super::types::OwnerToken>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -150,6 +158,7 @@ impl SessionHandle {
             cache_keepwarm: Arc::clone(&cache_keepwarm),
             memory_mode: Arc::clone(&memory_mode),
             placeholder_config: None,
+            owner_token: None,
         };
         (
             handle,
@@ -270,6 +279,22 @@ impl SessionHandle {
     pub(crate) fn with_placeholder_config(mut self, cfg: SessionConfig) -> Self {
         self.placeholder_config = Some(Arc::new(cfg));
         self
+    }
+
+    pub(crate) fn with_owner_token(mut self, token: Option<super::types::OwnerToken>) -> Self {
+        self.owner_token = token;
+        self
+    }
+
+    /// Whether this is an owned session (bound to its creating connection).
+    pub fn is_owned(&self) -> bool {
+        self.owner_token.is_some()
+    }
+
+    /// The owner token of an owned session (daemon-internal: the conn hands
+    /// it to the owner only, the reload record carries it).
+    pub fn owner_token(&self) -> Option<&super::types::OwnerToken> {
+        self.owner_token.as_ref()
     }
 
     pub fn meta(&self) -> &SessionMeta {
@@ -423,7 +448,7 @@ pub mod echo {
 
         fn handle(&mut self, cmd: SessionCommand) -> bool {
             match cmd {
-                SessionCommand::Attach { client, mode } => {
+                SessionCommand::Attach { client, mode, .. } => {
                     let cid = ClientId(self.next_client);
                     self.next_client += 1;
                     let kind = client.kind;
@@ -613,7 +638,9 @@ pub mod locked_placeholder {
         *ep.memory_mode
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = config.memory_mode;
-        let handle = handle.with_placeholder_config(config.clone());
+        let handle = handle
+            .with_placeholder_config(config.clone())
+            .with_owner_token(config.owned.as_ref().map(|o| o.token.clone()));
         // Start as Parked.
         ep.lifecycle.store(SessionLifecycle::Parked as u8, Ordering::Release);
         let task = tokio::spawn(run(id, ep, config, holder_desc));
@@ -623,9 +650,16 @@ pub mod locked_placeholder {
     async fn run(
         id: SessionId,
         mut ep: SessionEndpoints,
-        _config: SessionConfig,
+        config: SessionConfig,
         holder_desc: String,
     ) {
+        // An owned session's placeholder ends like the session would: its
+        // owner gets the re-bind grace (armed once the daemon accepts
+        // connections; the fallback deadline if that never arrives), then it
+        // is gone. Only a re-bind that finds the journal released replaces
+        // it with the real session.
+        let mut rebind_deadline: Option<tokio::time::Instant> =
+            config.owned.as_ref().map(|o| crate::session::owned::initial_rebind_deadline(o.restored));
         let mut seq: u64 = 0;
         let emit = |seq: &mut u64, events: &broadcast::Sender<Envelope>, event: SessionEventWire| {
             let env = Envelope {
@@ -638,8 +672,20 @@ pub mod locked_placeholder {
             let _ = events.send(env);
         };
 
-        while let Some(Addressed { cmd, .. }) = ep.cmd_rx.recv().await {
+        loop {
+            let next = tokio::select! {
+                c = ep.cmd_rx.recv() => c,
+                _ = crate::session::owned::rebind_timer(rebind_deadline) => {
+                    tracing::info!(session = %id, "owned session placeholder: the owner never re-bound; ending it");
+                    emit(&mut seq, &ep.events, SessionEventWire::Ended { reason: EndReason::OwnerGone });
+                    break;
+                }
+            };
+            let Some(Addressed { cmd, .. }) = next else { break };
             match cmd {
+                SessionCommand::ArmOwnerRebind if config.owned.is_some() => {
+                    rebind_deadline = Some(crate::session::owned::armed_rebind_deadline(rebind_deadline));
+                }
                 SessionCommand::Attach { .. } => {
                     let msg = format!(
                         "session {}: journal locked by {} \
