@@ -694,11 +694,7 @@ impl ArchiveStore {
         let (shelf, existing) = match self.locate(&shelves, &id, false)? {
             Some((shelf, record)) => (Some(shelf), Some(record)),
             // Sealed before shelves existed, under a random id.
-            None => {
-                let (legacy, _) = self.scan_legacy(false)?;
-                let mut legacy = legacy.into_iter().map(|(_, record)| record);
-                (None, legacy.find(|record| record.digest == digest))
-            }
+            None => (None, self.legacy_projection(&digest)),
         };
         if let Some(record) = existing {
             if record.digest != digest {
@@ -1078,6 +1074,34 @@ impl ArchiveStore {
             }
         }
         Ok(record)
+    }
+
+    /// The legacy slot that holds the projection `digest`, live or forgotten:
+    /// what a seal asks of the slots. A seal writes to none of them, so it
+    /// must not fail because of one. Unlike [`scan_legacy`](Self::scan_legacy),
+    /// which fetch, forget and export still use and which fails as a whole,
+    /// this passes over a slot that cannot be read (a link, a FIFO, a file
+    /// that is not ours alone or is over the size of a segment, an I/O error)
+    /// or that is not a valid record of this scope. A slot passed over is
+    /// left as it is: a link is not followed, and a file that is not ours
+    /// alone is neither read nor made private. One slot is in memory at a
+    /// time, so their total size is not bounded here.
+    ///
+    /// The price: if the slot passed over was the tombstone of this very
+    /// projection, the projection is sealed again.
+    fn legacy_projection(&self, digest: &str) -> Option<Record> {
+        (0..MAX_SEGMENTS).find_map(|slot| {
+            let name = slot_name(slot);
+            let raw = self.fs.read_with(&name, MAX_SEGMENT_BYTES, false);
+            match raw.and_then(|raw| raw.map(|raw| self.record(&name, &raw)).transpose()) {
+                Ok(record) => record.filter(|record| record.digest == digest),
+                Err(error) => {
+                    // The file name and the error only: never content.
+                    tracing::warn!(slot = %name, %error, "seal passed over a legacy archive slot");
+                    None
+                }
+            }
+        })
     }
 
     /// Every legacy slot, read and validated together as before shelves
@@ -4410,6 +4434,132 @@ mod tests {
         assert_eq!(cut(&window, &(1..3)), 2, "it cannot: the plain midpoint");
         let results = [call, result.clone(), result.clone(), result];
         assert_eq!(cut(&results, &(0..4)), 2, "nothing but results to the end");
+    }
+
+    /// A project directory from before shelves: a live segment in slot 0, a
+    /// forgotten one in slot 2, and slot 1 between them left to the test.
+    fn legacy_store() -> (tempfile::TempDir, ArchiveStore, ArchiveRef) {
+        let (tmp, store) = setup();
+        let live = seal_legacy_slot(&store, 0, &text("legacy live"), "first note");
+        let gone = seal_legacy_slot(&store, 2, &text("legacy forgotten"), "");
+        store.forget(&gone.id).unwrap();
+        (tmp, store, live)
+    }
+    /// With slot 1 unusable a seal works, and still finds what the slots on
+    /// either side of it hold; whatever reads the legacy slots as a whole
+    /// reports the error it always did.
+    fn assert_seal_passes_over_slot_1(
+        tmp: &tempfile::TempDir,
+        store: &ArchiveStore,
+        live: &ArchiveRef,
+        words: &str,
+    ) {
+        let new = store.seal(&text(words), "").unwrap();
+        assert_eq!(store.fetch(&new.id, 0, 1).unwrap(), text(words), "{words}");
+        let again = store.seal_with_note(&text("legacy live"), "second note");
+        assert_eq!(again.unwrap(), (live.clone(), "first note".to_owned()), "{words}");
+        let forgotten = store.seal(&text("legacy forgotten"), "").unwrap_err();
+        assert!(forgotten.to_string().contains("was forgotten"), "{words}");
+        assert!(store.fetch(&live.id, 0, 1).is_err(), "{words}");
+        assert!(store.fetch_note(&live.id).is_err(), "{words}");
+        assert!(store.forget(&live.id).is_err(), "{words}");
+        assert!(store.export_records().is_err(), "{words}");
+        assert!(export_in(tmp.path(), "synthetic-project").is_err(), "{words}");
+        assert!(archive_file(tmp.path(), "synthetic-project", &live.id).is_err(), "{words}");
+    }
+
+    #[test]
+    fn seal_passes_over_a_legacy_slot_that_is_not_a_valid_record() {
+        let (tmp, store, live) = legacy_store();
+        let dir = directory(&tmp, &store);
+        let slot = dir.join("001.json");
+        // A valid record of another project, and this project's own live
+        // record with a word of its content changed.
+        let foreign =
+            ArchiveStore::new(tmp.path(), "foreign-project", "synthetic-logical").unwrap();
+        seal_legacy_slot(&foreign, 0, &text("foreign words"), "");
+        let foreign = std::fs::read(directory(&tmp, &foreign).join("000.json")).unwrap();
+        let altered = std::fs::read_to_string(dir.join("000.json")).unwrap();
+        let altered = altered.replace("legacy live", "legacy LIVE");
+        let cases = [
+            ("bad JSON", b"{\"version\":1,".to_vec()),
+            ("empty", Vec::new()),
+            ("wrong scope", foreign),
+            ("digest mismatch", altered.into_bytes()),
+        ];
+        for (kind, bytes) in cases {
+            std::fs::write(&slot, &bytes).unwrap();
+            assert_seal_passes_over_slot_1(&tmp, &store, &live, kind);
+            assert_eq!(std::fs::read(&slot).unwrap(), bytes, "{kind}");
+            let error = store.fetch(&live.id, 0, 1).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{kind}");
+            // Search passed over such a file already.
+            assert_eq!(store.search("legacy", 2).unwrap()[0].id, live.id, "{kind}");
+        }
+        // Over the size of a segment: refused by its length, never read.
+        let large = MAX_SEGMENT_BYTES as u64 + 1;
+        std::fs::File::create(&slot).unwrap().set_len(large).unwrap();
+        assert_seal_passes_over_slot_1(&tmp, &store, &live, "over the size bound");
+        assert_eq!(std::fs::metadata(&slot).unwrap().len(), large);
+        let error = store.fetch(&live.id, 0, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // Five seals, five new files, and no other change to the directory.
+        assert_eq!(shelf_files(&dir).len(), 5);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 5, "lock, 3 slots, 1 shelf");
+    }
+
+    #[test]
+    fn seal_passes_over_a_legacy_slot_that_is_not_a_private_file() {
+        use std::os::unix::fs::FileTypeExt;
+        let (tmp, store, live) = legacy_store();
+        let slot = directory(&tmp, &store).join("001.json");
+        let kind = || std::fs::symlink_metadata(&slot).unwrap().file_type();
+        let victim = tmp.path().join("synthetic-victim");
+        std::fs::write(&victim, "do not change").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Nothing was read into, written through or made private by way of
+        // the slot, and reading the legacy slots still fails on it.
+        let passed_over = |words: &str| {
+            assert_seal_passes_over_slot_1(&tmp, &store, &live, words);
+            assert!(store.search("legacy", 2).is_err(), "{words}");
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not change");
+            assert_eq!(mode(&victim), 0o644, "{words}");
+        };
+        symlink(&victim, &slot).unwrap();
+        passed_over("past a symlink");
+        assert!(kind().is_symlink());
+        std::fs::remove_file(&slot).unwrap();
+        std::fs::hard_link(&victim, &slot).unwrap();
+        passed_over("past a hard link");
+        std::fs::remove_file(&slot).unwrap();
+        let fifo = std::ffi::CString::new(slot.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        passed_over("past a FIFO");
+        assert!(kind().is_fifo());
+        std::fs::remove_file(&slot).unwrap();
+        std::fs::create_dir(&slot).unwrap();
+        passed_over("past a directory");
+        assert!(kind().is_dir());
+    }
+
+    #[test]
+    fn a_legacy_tombstone_that_cannot_be_read_no_longer_forbids_its_projection() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let slot = dir.join("000.json");
+        let gone = seal_legacy_slot(&store, 0, &text("forgotten words"), "");
+        store.forget(&gone.id).unwrap();
+        let refused = store.seal(&text("forgotten words"), "").unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        // The price of passing over what cannot be read: with the tombstone
+        // torn, nothing says that this projection was forgotten.
+        let tombstone = std::fs::read(&slot).unwrap();
+        let torn = &tombstone[..tombstone.len() / 2];
+        std::fs::write(&slot, torn).unwrap();
+        let again = store.seal(&text("forgotten words"), "").unwrap();
+        assert_eq!(store.fetch(&again.id, 0, 1).unwrap(), text("forgotten words"));
+        assert_eq!(only_archive_file(&dir), dir.join("s000001").join(archive_name(&again.id)));
+        assert_eq!(std::fs::read(&slot).unwrap(), torn);
     }
 }
 
