@@ -892,9 +892,11 @@ fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle, chat: &str
 /// `folder` as saved, or `None` when it is gone, and the chat then runs in
 /// the daemon's folder and that folder's project.
 ///
-/// Gone means that the path does not exist or is not a directory. A folder
-/// that cannot be looked at for any other reason (no permission, a mount
-/// that is away for a moment, an I/O error) is kept: the chat stays in its
+/// Gone means that the path does not exist, is not a directory, or runs
+/// through something that is not a directory (a file where one of its
+/// parents was), which no folder can be under. A folder that cannot be
+/// looked at for a reason that can pass (no permission, a mount that is
+/// away for a moment, an I/O error) is kept: the chat stays in its
 /// own project, where its tools fail until the folder is back, rather than
 /// being moved to another project's files and memory without a word. Every
 /// drop is logged with the folder and the chat.
@@ -904,6 +906,9 @@ pub(super) fn restorable_folder(folder: Option<PathBuf>, chat: &str) -> Option<P
         Ok(found) if found.is_dir() => return Some(folder),
         Ok(_) => "it is not a directory",
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => "it does not exist",
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+            "its path runs through something that is not a directory"
+        }
         Err(error) => {
             tracing::warn!(
                 session = %chat,
@@ -1261,6 +1266,13 @@ mod tests {
         assert_eq!(restored(&at("absent")), None);
         std::fs::write(at("file"), b"").unwrap();
         assert_eq!(restored(&at("file")), None);
+        // A path under a file (ENOTDIR, not ENOENT): no folder can be
+        // there, so it is absent, whatever is asked for under it.
+        let under = at("file").join("project");
+        let not_a_directory = std::fs::metadata(&under).unwrap_err().kind();
+        assert_eq!(not_a_directory, std::io::ErrorKind::NotADirectory);
+        assert_eq!(restored(&under), None);
+        assert_eq!(restored(&under.join("deeper")), None);
         // A link to nothing is absent too.
         std::os::unix::fs::symlink(at("absent"), at("dangling")).unwrap();
         assert_eq!(restored(&at("dangling")), None);

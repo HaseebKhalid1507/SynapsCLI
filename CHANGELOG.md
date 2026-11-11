@@ -313,6 +313,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Daemon: a restored chat's folder under a file is dropped as absent.**
+  A saved folder whose path runs through something that is not a directory
+  (a file where one of its parents was) cannot exist, but looking at it
+  fails with "not a directory" and not with "not found", so the restore
+  kept it. It is now dropped like an absent folder, with the warning. Only
+  failures that can pass (permission, I/O, a mount that is away) keep the
+  folder.
 - **Daemon: a restored chat keeps a folder that cannot be looked at, and
   every dropped folder is logged.** A reload and the restore of a pinned
   session drop a chat's folder when it is gone; the chat then runs its
