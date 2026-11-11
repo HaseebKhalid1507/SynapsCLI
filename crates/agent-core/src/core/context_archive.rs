@@ -66,8 +66,17 @@
 //! returns PermissionDenied. A successful seal fsyncs data and directory before
 //! returning; callers MUST keep source history on any error (even if publication
 //! happened before a directory-fsync error). Advisory locks serialize cooperating
-//! processes, not malicious processes running as the same OS user; "created
-//! new, never replaced" holds under that lock.
+//! processes, not malicious processes running as the same OS user.
+//!
+//! What a seal promises does not rest on that lock (a lock file can be deleted
+//! while it is held, and some filesystems do not lock at all). Every write
+//! goes to a temporary file that no other write names, and a seal's rename
+//! cannot replace (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(RENAME_EXCL)`):
+//! two seals at once each end with their own whole file under their own id,
+//! or with an error. Only a kernel or filesystem without such a rename falls
+//! back to looking and then renaming, which the lock alone makes one step.
+//! Temporary files a crash left behind are removed by a later seal into the
+//! same shelf, once they are older than any write still running could be.
 //!
 //! Within one process, seals and forgets on the same archive directory wait for
 //! each other (not in FIFO order) and are admitted within [`LOCK_WAIT`] or fail
@@ -128,6 +137,10 @@ const ABORT_POLL: Duration = Duration::from_millis(20);
 pub const PROCESS_LOCK_WAIT: Duration = Duration::from_secs(5);
 /// How often that wait tries the lock again.
 const PROCESS_LOCK_POLL: Duration = Duration::from_millis(25);
+/// How long a temporary file is left to the write that made it. A write keeps
+/// its file for as long as writing one segment takes, so a file this old was
+/// left by a write that never finished.
+const STALE_TEMP: Duration = Duration::from_secs(60 * 60);
 const WITHHELD: &str = "[archive: withheld]";
 const BUSY: &str = "archive busy; retain source and retry";
 const BUSY_EXPORT: &str = "archive busy; retry export";
@@ -676,42 +689,34 @@ impl ArchiveStore {
     ) -> io::Result<(ArchiveRef, String, usize)> {
         let redactor = self.redactor.clone();
         let projection = project_hashed(&self.logical, messages, note, redactor, reduce)?;
-        let ArchiveProjection {
-            digest,
-            source_message_count,
-            messages: eligible,
-            note,
-            ..
-        } = projection;
-        let reduced = eligible
+        let reduced = projection
+            .messages
             .iter()
             .filter(|archived| archived.message.get(REDUCED_KEY).is_some())
             .count();
+        let _lock = self.exclusive()?;
+        let (reference, note) = self.store(projection)?;
+        Ok((reference, note, reduced))
+    }
+
+    /// What a seal does once it holds the lock: find `projection` stored, or
+    /// store it. The lock keeps two seals from doing this at once, but what
+    /// comes back does not depend on it: a segment is written to a file of
+    /// this call's own and renamed without replacing, so `Ok` always means
+    /// that the file under the returned id holds this projection, whole.
+    fn store(&self, projection: ArchiveProjection) -> io::Result<(ArchiveRef, String)> {
+        let ArchiveProjection {
+            digest,
+            source_message_count,
+            messages,
+            note,
+            ..
+        } = projection;
         // Same projection, same id, same file name.
         let id = digest[..32].to_owned();
-        let _lock = self.exclusive()?;
         let shelves = self.shelves()?;
-        let (shelf, existing) = match self.locate(&shelves, &id, false)? {
-            Some((shelf, record)) => (Some(shelf), Some(record)),
-            // Sealed before shelves existed, under a random id.
-            None => (None, self.legacy_projection(&digest)),
-        };
-        if let Some(record) = existing {
-            if record.digest != digest {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "archive id belongs to another projection",
-                ));
-            }
-            let Body::Live { note: stored, .. } = &record.body else {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "archive projection was forgotten",
-                ));
-            };
-            // A previous call may have failed AFTER rename but BEFORE fsync.
-            shelf.as_ref().unwrap_or(&self.fs).sync()?;
-            return Ok((record.reference()?, stored.clone(), reduced));
+        if let Some(sealed) = self.sealed(&shelves, &id, &digest)? {
+            return Ok(sealed);
         }
         let record = Record {
             version: 1,
@@ -721,15 +726,56 @@ impl ArchiveStore {
             digest,
             body: Body::Live {
                 source_message_count,
-                messages: eligible,
+                messages,
                 note: note.clone(),
             },
         };
         let bytes = bounded_json(&record, MAX_SEGMENT_BYTES)?;
         // Created new: a file that is already there is never renamed over.
-        self.writable_shelf(&shelves)?
-            .publish(&archive_name(&record.id), &bytes, true)?;
-        Ok((record.reference()?, note, reduced))
+        let shelf = self.writable_shelf(&shelves)?;
+        match shelf.publish(&archive_name(&record.id), &bytes, true) {
+            // The name was free a moment ago: another seal has stored
+            // something under it since, which the lock should have kept
+            // out. It is read like any file found there, never replaced.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => self
+                .sealed(&self.shelves()?, &record.id, &record.digest)?
+                .ok_or(error),
+            result => result.and_then(|()| Ok((record.reference()?, note))),
+        }
+    }
+
+    /// The reference and stored note of the projection `digest` if it is
+    /// already sealed, on a shelf under `id` or in a legacy slot. A forgotten
+    /// one, or another projection under that id, is an error.
+    fn sealed(
+        &self,
+        shelves: &[String],
+        id: &str,
+        digest: &str,
+    ) -> io::Result<Option<(ArchiveRef, String)>> {
+        let (shelf, record) = match self.locate(shelves, id, false)? {
+            Some((shelf, record)) => (Some(shelf), record),
+            // Sealed before shelves existed, under a random id.
+            None => match self.legacy_projection(digest) {
+                Some(record) => (None, record),
+                None => return Ok(None),
+            },
+        };
+        if record.digest != digest {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "archive id belongs to another projection",
+            ));
+        }
+        let Body::Live { note, .. } = &record.body else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "archive projection was forgotten",
+            ));
+        };
+        // A previous call may have failed AFTER rename but BEFORE fsync.
+        shelf.as_ref().unwrap_or(&self.fs).sync()?;
+        Ok(Some((record.reference()?, note.clone())))
     }
 
     pub fn fetch(&self, id: &str, start: usize, limit: usize) -> io::Result<Vec<SharedMessage>> {
@@ -979,6 +1025,7 @@ impl ArchiveStore {
             // `child` also makes the shelf's own directory entry durable.
             let shelf = self.fs.child(&shelf_name(number), true)?;
             let names = shelf.names()?;
+            sweep(&shelf, &names);
             if names.iter().filter(|(name, ..)| name.ends_with(".json")).count() < SHELF_FILES {
                 return Ok(shelf);
             }
@@ -1849,6 +1896,37 @@ fn shelf_number(name: &str) -> Option<u64> {
     let number = name.strip_prefix('s')?.parse().ok()?;
     (shelf_name(number) == name).then_some(number)
 }
+/// The name of one write's temporary file. No two writes have the same, so no
+/// write removes, reuses or renames the file of another. Readers open segment
+/// and slot names only, never this.
+#[cfg(unix)]
+fn temp_name() -> String {
+    format!("pending.{}.tmp", uuid::Uuid::new_v4().simple())
+}
+/// Whether `name` is a temporary file's: one of `temp_name`'s, or the one
+/// name (`pending.tmp`) every write shared before.
+fn is_temp_name(name: &str) -> bool {
+    name.starts_with("pending.") && name.ends_with(".tmp")
+}
+/// Remove what unfinished writes left in `dir`: of `names`, its listing, the
+/// temporary files last written more than [`STALE_TEMP`] ago. A younger one
+/// may belong to a write that is still running, here or in another process,
+/// and is left to it; so is anything under such a name that is not a plain
+/// file of ours. Called by a seal, under the lock, for the shelf it writes
+/// to. A leftover costs space and nothing else, so a failure is only logged.
+fn sweep(dir: &PrivateDir, names: &[(String, bool, i64)]) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as i128);
+    for (name, is_dir, modified) in names {
+        let stale = now - i128::from(*modified) > STALE_TEMP.as_nanos() as i128;
+        if is_temp_name(name) && !is_dir && stale {
+            if let Err(error) = dir.discard(name) {
+                tracing::warn!(file = %name, %error, "stale temporary archive file not removed");
+            }
+        }
+    }
+}
 fn prefix(text: &str, bytes: usize) -> &str {
     let mut end = bytes.min(text.len());
     while !text.is_char_boundary(end) {
@@ -2194,47 +2272,122 @@ impl PrivateDir {
         }
         Ok(bytes)
     }
-    /// Write `bytes` to a temporary file and rename it onto `name`. With
-    /// `create_new` an existing `name` is `AlreadyExists` and is left alone;
-    /// the check and the rename are two steps, made one by the caller's lock.
+    /// Write `bytes` to a temporary file of this call's own, sync it and
+    /// rename it onto `name`: a name only ever points at a whole file. With
+    /// `create_new` the rename cannot replace, so an existing `name` is
+    /// `AlreadyExists` and is left as it is, whatever it is. Without it
+    /// (forget) the file at `name` is replaced.
     fn publish(&self, name: &str, bytes: &[u8], create_new: bool) -> io::Result<()> {
         let target = c_name(name)?;
-        let tmp = c_name("pending.tmp")?;
-        // Under the lock, an old temporary file is an unpublished failed write.
-        // unlinkat never follows a link; existing content is never reused.
-        if unsafe { libc::unlinkat(self.fd(), tmp.as_ptr(), 0) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::NotFound {
-                return Err(error);
-            }
-        }
+        // Created new under a name no other write has: nothing else writes
+        // to this file, removes it while it is fresh or renames it.
+        let tmp = c_name(&temp_name())?;
+        let mut file = self.open(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
         let result = (|| {
-            let mut file = self.open(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
             file.write_all(bytes)?;
             file.sync_all()?;
-            // Refuse any target that appeared as a symlink or hardlink.
-            match self.open(&target, libc::O_RDONLY) {
-                Ok(_) if create_new => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "archive file already exists",
-                    ))
+            if create_new {
+                self.rename_new(&tmp, &target)?;
+            } else {
+                // Refuse a target that is a symlink or has a second link.
+                match self.open(&target, libc::O_RDONLY) {
+                    Ok(existing) => Self::check(&existing)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
                 }
-                Ok(existing) => Self::check(&existing)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            if unsafe { libc::renameat(self.fd(), tmp.as_ptr(), self.fd(), target.as_ptr()) } != 0 {
-                return Err(io::Error::last_os_error());
+                self.rename(&tmp, &target)?;
             }
             self.sync()
         })();
         if result.is_err() {
+            // This call's own file, or nothing if it was renamed already.
             unsafe {
                 libc::unlinkat(self.fd(), tmp.as_ptr(), 0);
             }
         }
         result
+    }
+    /// Rename `from` onto `to` unless there is a `to`, which is then
+    /// `AlreadyExists` whatever it is (a link is not followed): one step,
+    /// in the kernel, that holds with or without the archive lock.
+    fn rename_new(&self, from: &std::ffi::CStr, to: &std::ffi::CStr) -> io::Result<()> {
+        // The system call itself: libc declares the `renameat2` wrapper for
+        // glibc only (which has it from 2.28) and not for musl. Linux 3.15.
+        #[cfg(target_os = "linux")]
+        let code = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                self.fd(),
+                from.as_ptr(),
+                self.fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let code = unsafe {
+            libc::renameatx_np(
+                self.fd(),
+                from.as_ptr(),
+                self.fd(),
+                to.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if code == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            // A kernel without the call (ENOSYS) or a filesystem without the
+            // flag (EINVAL, ENOTSUP) is the only way on to the two steps.
+            let unsupported = [libc::ENOSYS, libc::EINVAL, libc::ENOTSUP];
+            if !error.raw_os_error().is_some_and(|code| unsupported.contains(&code)) {
+                return Err(error);
+            }
+        }
+        self.rename_probed(from, to)
+    }
+    /// `rename_new` where nothing renames without replacing: look, then
+    /// rename. Two steps, which only the caller's lock makes one.
+    fn rename_probed(&self, from: &std::ffi::CStr, to: &std::ffi::CStr) -> io::Result<()> {
+        match self.open(to, libc::O_RDONLY) {
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "archive file already exists",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => self.rename(from, to),
+            Err(error) => Err(error),
+        }
+    }
+    /// The plain rename, which replaces.
+    fn rename(&self, from: &std::ffi::CStr, to: &std::ffi::CStr) -> io::Result<()> {
+        match unsafe { libc::renameat(self.fd(), from.as_ptr(), self.fd(), to.as_ptr()) } {
+            0 => Ok(()),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+    /// Remove the file `name` if it is a plain file of ours with no other
+    /// name. A directory, a link or a FIFO under that name is left where it
+    /// is.
+    fn discard(&self, name: &str) -> io::Result<()> {
+        let name = c_name(name)?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let found = unsafe {
+            libc::fstatat(self.fd(), name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW)
+        };
+        if found != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let ours = stat.st_uid == unsafe { libc::geteuid() } && stat.st_nlink == 1;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || !ours {
+            return Ok(());
+        }
+        match unsafe { libc::unlinkat(self.fd(), name.as_ptr(), 0) } {
+            0 => Ok(()),
+            _ => Err(io::Error::last_os_error()),
+        }
     }
     fn sync(&self) -> io::Result<()> {
         self.0.sync_all()
@@ -2296,6 +2449,9 @@ impl PrivateDir {
         Self::unsupported()
     }
     fn publish(&self, _: &str, _: &[u8], _: bool) -> io::Result<()> {
+        Self::unsupported()
+    }
+    fn discard(&self, _: &str) -> io::Result<()> {
         Self::unsupported()
     }
     fn sync(&self) -> io::Result<()> {
@@ -2713,7 +2869,37 @@ mod tests {
     fn mode(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
-    /// Path -> SHA-256 of every file under a directory.
+    /// What tells a file from another one with the same bytes under the same
+    /// name: its device and inode.
+    fn identity(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    }
+    /// Every temporary file under a project directory.
+    fn temporary_files(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if is_temp_name(path.file_name().unwrap().to_str().unwrap()) {
+                    found.push(path);
+                } else if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        found
+    }
+    /// Make the plain file `path` one that was last written `age` ago.
+    fn written_ago(path: &Path, age: Duration) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age).unwrap();
+    }
+    /// Path -> SHA-256 and identity of every file under a directory: equal
+    /// only if no file was changed, added, removed or replaced, even by one
+    /// with the same bytes.
     fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, String> {
         let mut files = std::collections::BTreeMap::new();
         let mut pending = vec![dir.to_path_buf()];
@@ -2724,7 +2910,8 @@ mod tests {
                     pending.push(path);
                 } else {
                     let hash = digest_parts(&[&std::fs::read(&path).unwrap()]);
-                    files.insert(path, hash);
+                    let file = format!("{hash} {:?}", identity(&path));
+                    files.insert(path, file);
                 }
             }
         }
@@ -3167,6 +3354,7 @@ mod tests {
         let file = only_archive_file(&dir);
         let stale = dir.join("s000001").join("pending.tmp");
         std::fs::write(&stale, b"unpublished partial").unwrap();
+        written_ago(&stale, STALE_TEMP * 2);
         assert_eq!(store.search("", 2).unwrap().len(), 1);
         let other = store.seal(&text("another"), "").unwrap();
         assert!(!stale.exists());
@@ -3719,7 +3907,8 @@ mod tests {
         store.forget(&reference.id).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), tombstone);
         assert_eq!(file.metadata().unwrap().modified().unwrap(), written);
-        assert!(!dir.join("s000001").join("pending.tmp").exists());
+        assert!(temporary_files(&dir).is_empty());
+        assert_eq!(std::fs::read_dir(dir.join("s000001")).unwrap().count(), 2);
         assert_eq!(snapshot(&dir)[&neighbour], untouched);
         assert_eq!(store.fetch(&kept.id, 0, 1).unwrap(), text("keep me"));
         assert_eq!(
@@ -3880,18 +4069,178 @@ mod tests {
         let dir = directory(&tmp, &store);
         let first = store.seal(&text("before the crash"), "").unwrap();
         // A crash after mkdir and after writing the temporary file, before
-        // the rename; and a temporary file from a legacy-slot write.
+        // the rename: an empty newer shelf, and in it a temporary file of
+        // this version and one of the version before, both from long ago.
         let empty = dir.join("s000002");
         std::fs::create_dir(&empty).unwrap();
-        std::fs::write(empty.join("pending.tmp"), b"unpublished partial").unwrap();
-        std::fs::write(dir.join("pending.tmp"), b"unpublished partial").unwrap();
+        let stale = [empty.join(temp_name()), empty.join("pending.tmp")];
+        // Written a moment ago: perhaps by a write that is still running.
+        // And one a minute short of the age at which no write can be.
+        let fresh = [empty.join(temp_name()), empty.join(temp_name())];
+        for path in stale.iter().chain(&fresh) {
+            std::fs::write(path, b"unpublished partial").unwrap();
+        }
+        let minute = Duration::from_secs(60);
+        written_ago(&stale[0], STALE_TEMP + minute);
+        written_ago(&stale[1], STALE_TEMP * 24);
+        written_ago(&fresh[1], STALE_TEMP - minute);
+        // No reader sees any of them, before or after.
         assert_eq!(store.search("", 10).unwrap().len(), 1);
+        assert_eq!(store.export_records().unwrap().len(), 1);
+        assert_eq!(temporary_files(&dir).len(), 4);
         let next = store.seal(&text("after the crash"), "").unwrap();
         assert!(empty.join(archive_name(&next.id)).is_file());
-        assert!(!empty.join("pending.tmp").exists());
+        // The seal removed what no write can still be using, and only that.
+        assert!(stale.iter().all(|path| !path.exists()));
+        for path in &fresh {
+            assert_eq!(std::fs::read(path).unwrap(), b"unpublished partial");
+        }
+        assert_eq!(temporary_files(&dir).len(), 2);
         assert_eq!(store.fetch(&first.id, 0, 1).unwrap(), text("before the crash"));
         assert_eq!(store.fetch(&next.id, 0, 1).unwrap(), text("after the crash"));
         assert_eq!(store.search("", 10).unwrap().len(), 2);
+        assert_eq!(store.export_records().unwrap().len(), 2);
+        // A forget writes beside them too, and leaves nothing of its own.
+        store.forget(&next.id).unwrap();
+        assert_eq!(temporary_files(&dir).len(), 2);
+    }
+
+    /// The one temporary name every write used to share, taken by something
+    /// no write made. Each used to stop every seal into that directory (a
+    /// directory cannot be unlinked) or was removed without a look. Now no
+    /// write uses the name, and the sweep removes plain files only.
+    #[test]
+    fn a_temporary_name_that_is_a_directory_a_fifo_or_a_link_is_left_alone() {
+        use std::os::unix::fs::FileTypeExt;
+        /// As `written_ago`, for a path that cannot be opened for writing;
+        /// the time of a link itself, not of what it points to.
+        fn aged(path: &Path) {
+            let then = std::time::SystemTime::now() - STALE_TEMP * 2;
+            let since = then.duration_since(std::time::UNIX_EPOCH).unwrap();
+            let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+            time.tv_sec = since.as_secs() as libc::time_t;
+            let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let (times, flags) = ([time; 2], libc::AT_SYMLINK_NOFOLLOW);
+            let set = unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), flags) };
+            assert_eq!(set, 0);
+        }
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let first = store.seal(&text("first"), "").unwrap();
+        let legacy = seal_legacy_slot(&store, 0, &text("legacy"), "");
+        let victim = tmp.path().join("synthetic-victim");
+        std::fs::write(&victim, "do not change").unwrap();
+        written_ago(&victim, STALE_TEMP * 2);
+        let unchanged = snapshot(tmp.path());
+        // In the shelf a seal writes to, and in the project directory, where
+        // a forget of a legacy slot writes.
+        let places = [dir.join("s000001").join("pending.tmp"), dir.join("pending.tmp")];
+        let kind = |path: &Path| std::fs::symlink_metadata(path).unwrap().file_type();
+        for shape in ["directory", "FIFO", "symlink", "hard link"] {
+            for path in &places {
+                match shape {
+                    "directory" => std::fs::create_dir(path).unwrap(),
+                    "FIFO" => {
+                        let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                    }
+                    "symlink" => symlink(&victim, path).unwrap(),
+                    _ => std::fs::hard_link(&victim, path).unwrap(),
+                }
+                aged(path);
+            }
+            let words = format!("sealed beside a {shape}");
+            let sealed = store.seal(&text(&words), "").unwrap();
+            assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap(), text(&words), "{shape}");
+            assert_eq!(store.fetch(&first.id, 0, 1).unwrap(), text("first"), "{shape}");
+            assert_eq!(store.search(&words, 2).unwrap().len(), 1, "{shape}");
+            store.forget(&sealed.id).unwrap();
+            // A legacy slot is tombstoned in the project directory itself.
+            let old = seal_legacy_slot(&store, 1, &text(&words), "");
+            store.forget(&old.id).unwrap();
+            assert_eq!(store.fetch(&legacy.id, 0, 1).unwrap(), text("legacy"), "{shape}");
+            std::fs::remove_file(dir.join("001.json")).unwrap();
+            for path in &places {
+                let found = kind(path);
+                match shape {
+                    "directory" => assert!(found.is_dir()),
+                    "FIFO" => assert!(found.is_fifo()),
+                    "symlink" => assert!(found.is_symlink()),
+                    // A second name of a file that is not the store's alone
+                    // is not a leftover of the store's either.
+                    _ => assert_eq!(identity(path), identity(&victim)),
+                }
+                if found.is_dir() {
+                    std::fs::remove_dir(path).unwrap();
+                } else {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not change");
+        }
+        // Nothing but the four tombstones was added, changed or removed.
+        let after = snapshot(tmp.path());
+        assert!(unchanged.iter().all(|(path, file)| after.get(path) == Some(file)));
+        assert_eq!(after.len(), unchanged.len() + 4);
+        assert!(temporary_files(&dir).is_empty());
+    }
+
+    /// `create_new` is how a seal publishes. It never replaces what is under
+    /// the name, whatever that is and even when the bytes would be the same.
+    #[test]
+    fn publish_create_new_never_replaces() {
+        let (tmp, store) = setup();
+        let shelf_path = directory(&tmp, &store).join("s000001");
+        let shelf = store.fs.child("s000001", true).unwrap();
+        let name = archive_name(&"a".repeat(32));
+        let path = shelf_path.join(&name);
+        let victim = tmp.path().join("synthetic-victim");
+        std::fs::write(&victim, "do not change").unwrap();
+        shelf.publish(&name, b"first", true).unwrap();
+        let first = identity(&path);
+        let refused = |bytes: &[u8]| {
+            let error = shelf.publish(&name, bytes, true).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read_dir(&shelf_path).unwrap().count(), 1, "no temporary file");
+        };
+        for bytes in [&b"first"[..], b"second"] {
+            refused(bytes);
+            assert_eq!(std::fs::read(&path).unwrap(), b"first");
+            assert_eq!(identity(&path), first, "replaced by a file with the same bytes");
+        }
+        // Nor a link (which is not followed), a directory or a FIFO.
+        std::fs::remove_file(&path).unwrap();
+        for target in [victim.clone(), tmp.path().join("missing")] {
+            symlink(&target, &path).unwrap();
+            let link = identity(&path);
+            refused(b"through the link");
+            assert_eq!(identity(&path), link);
+            assert!(!tmp.path().join("missing").exists());
+            std::fs::remove_file(&path).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not change");
+        std::fs::create_dir(&path).unwrap();
+        refused(b"over the directory");
+        assert!(path.is_dir());
+        std::fs::remove_dir(&path).unwrap();
+        // The two steps taken where the kernel or the filesystem has no
+        // rename that cannot replace: the same answers, under the lock.
+        let from = c_name(&temp_name()).unwrap();
+        let to = c_name(&name).unwrap();
+        let temporary = shelf_path.join(from.to_str().unwrap());
+        std::fs::write(&temporary, b"probed").unwrap();
+        let written = identity(&temporary);
+        shelf.rename_probed(&from, &to).unwrap();
+        assert_eq!((identity(&path), temporary.exists()), (written, false));
+        std::fs::write(&temporary, b"probed again").unwrap();
+        let error = shelf.rename_probed(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(identity(&path), written);
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"probed again");
+        // Forget is the one caller that replaces, and it does.
+        shelf.publish(&name, b"tombstone", false).unwrap();
+        assert_ne!(identity(&path), written);
+        assert_eq!(std::fs::read(&path).unwrap(), b"tombstone");
     }
 
     #[test]
@@ -5350,6 +5699,139 @@ mod lock_tests {
             assert_eq!(fetcher.join().unwrap(), ids.len());
         });
         assert_eq!(store.shelves().unwrap().len(), 3);
+    }
+
+    /// Every file name in the shelves of `store`'s project directory.
+    fn shelved(tmp: &tempfile::TempDir, store: &ArchiveStore) -> Vec<String> {
+        let project = tmp.path().join("context-archives").join(&store.scope);
+        let mut names = Vec::new();
+        for shelf in store.shelves().unwrap() {
+            let entries = std::fs::read_dir(project.join(shelf)).unwrap();
+            names.extend(entries.map(|entry| entry.unwrap().file_name().into_string().unwrap()));
+        }
+        names
+    }
+
+    /// Writers inside `publish` at the same moment with no lock between them:
+    /// what is left of a seal when the lock file was deleted under it, or on
+    /// a filesystem that does not lock. Each write is a file of its own and
+    /// the rename cannot replace, so a writer told `Ok` has its bytes under
+    /// its name, whole, and a name is never given to two of them.
+    #[test]
+    fn writers_inside_publish_at_once_without_the_lock() {
+        const WRITERS: usize = 4;
+        const ROUNDS: usize = 150;
+        let (tmp, store) = setup();
+        let shelf = store.fs.child("s000001", true).unwrap();
+        // A writer's bytes are its own from the first to the last.
+        let bytes = |writer: usize, round: usize| {
+            format!("writer {writer} round {round};").repeat(4096).into_bytes()
+        };
+        let own = |writer: usize, round: usize| format!("{:032x}.json", writer * ROUNDS + round);
+        let wanted = |round: usize| format!("{:032x}.json", WRITERS * ROUNDS + round);
+        let start = std::sync::Barrier::new(WRITERS);
+        let won: Vec<Vec<usize>> = std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|writer| {
+                    let (shelf, start) = (&shelf, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        let mut won = Vec::new();
+                        for round in 0..ROUNDS {
+                            // A name of its own: always stored.
+                            let stored = shelf.publish(&own(writer, round), &bytes(writer, round), true);
+                            stored.unwrap();
+                            // A name every writer wants: stored by one.
+                            match shelf.publish(&wanted(round), &bytes(writer, round), true) {
+                                Ok(()) => won.push(round),
+                                Err(error) => assert_eq!(error.kind(), io::ErrorKind::AlreadyExists),
+                            }
+                        }
+                        won
+                    })
+                })
+                .collect();
+            writers.into_iter().map(|writer| writer.join().unwrap()).collect()
+        });
+        let read = |name: &str| shelf.read_with(name, MAX_SEGMENT_BYTES, true).unwrap().unwrap();
+        for round in 0..ROUNDS {
+            for writer in 0..WRITERS {
+                assert!(read(&own(writer, round)) == bytes(writer, round), "{writer} {round}");
+            }
+            let winners: Vec<_> = (0..WRITERS).filter(|writer| won[*writer].contains(&round)).collect();
+            assert_eq!(winners.len(), 1, "round {round}");
+            assert!(read(&wanted(round)) == bytes(winners[0], round), "round {round}");
+        }
+        // And no temporary file is left.
+        assert_eq!(shelved(&tmp, &store).len(), (WRITERS + 1) * ROUNDS);
+    }
+
+    /// The same one level up: what a seal does once it holds the lock, done
+    /// by writers that hold nothing. Every window is stored, and is what the
+    /// writer was told it is.
+    #[test]
+    fn seals_at_once_without_the_lock_each_store_their_window() {
+        const WRITERS: usize = 4;
+        let (tmp, store) = setup();
+        let window = |words: String| [msg("user", json!(words))];
+        let project = |messages: &[SharedMessage], note: &str| {
+            project_hashed(&store.logical, messages, note, None, Reduce::None).unwrap()
+        };
+        // `rounds` windows by each writer, at once: the same windows (with a
+        // note of the writer's own) or windows of its own.
+        let seal_all = |same: bool, rounds: usize| -> Vec<Vec<(ArchiveRef, String)>> {
+            let start = std::sync::Barrier::new(WRITERS);
+            std::thread::scope(|scope| {
+                let writers: Vec<_> = (0..WRITERS)
+                    .map(|writer| {
+                        let (store, start) = (&store, &start);
+                        scope.spawn(move || {
+                            start.wait();
+                            let note = format!("note of writer {writer}");
+                            let name = if same { "any".to_owned() } else { format!("writer {writer}") };
+                            let seal = |round| store.store(project(&window(format!("{name} window {round};")), &note));
+                            (0..rounds).map(|round| seal(round).unwrap()).collect()
+                        })
+                    })
+                    .collect();
+                writers.into_iter().map(|writer| writer.join().unwrap()).collect()
+            })
+        };
+        // One window sealed by all, within one shelf: one segment. Every
+        // writer is given its id and the note that is stored with it, which
+        // is the note of whichever writer's file it is.
+        let same = seal_all(true, 30);
+        for (round, (reference, note)) in same[0].iter().enumerate() {
+            let words = format!("any window {round};");
+            assert_eq!(store.fetch(&reference.id, 0, 2).unwrap(), window(words));
+            assert_eq!(&store.fetch_note(&reference.id).unwrap(), note);
+            assert!(note.starts_with("note of writer "));
+            for other in &same[1..] {
+                assert_eq!(other[round], (reference.clone(), note.clone()));
+            }
+        }
+        assert_eq!(shelved(&tmp, &store).len(), 30);
+        // Windows of their own, enough to start two more shelves while the
+        // writers race for them.
+        let own = seal_all(false, 80);
+        for (writer, sealed) in own.iter().enumerate() {
+            for (round, (reference, note)) in sealed.iter().enumerate() {
+                let words = format!("writer {writer} window {round};");
+                assert_eq!(store.fetch(&reference.id, 0, 2).unwrap(), window(words));
+                assert_eq!(note, &format!("note of writer {writer}"));
+            }
+        }
+        // One file each, nothing replaced, and no temporary file left.
+        let mut names = shelved(&tmp, &store);
+        assert_eq!(names.len(), 30 + WRITERS * 80);
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 30 + WRITERS * 80);
+        assert!(names.iter().all(|name| archive_id(name).is_some()));
+        assert!(store.shelves().unwrap().len() >= 3);
+        // The lock still works afterwards, and finds all of it.
+        let (reference, note) = store.seal_with_note(&window("any window 0;".into()), "").unwrap();
+        assert_eq!((&reference, &note), (&same[0][0].0, &same[0][0].1));
     }
 
     const SEAL_CHILD: &str = "SYNTHETIC_ARCHIVE_SEAL_CHILD";
