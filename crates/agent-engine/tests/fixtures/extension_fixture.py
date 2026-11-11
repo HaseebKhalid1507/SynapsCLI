@@ -243,6 +243,9 @@ while True:
                     # The project the host says the call is about (recall and
                     # capture inputs carry one; other tools' do not).
                     "project_id": (params.get("input") or {}).get("project_id"),
+                    # The run the host says makes the call (absent key: no run).
+                    "has_caller": "caller" in params,
+                    "caller": params.get("caller"),
                 }, f)
                 f.write("\n")
         except OSError:

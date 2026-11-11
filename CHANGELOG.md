@@ -337,6 +337,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Extensions: `caller` is tested on the three paths that had no test.**
+  A `tool.call` made from the deferred-tool lane, from a tool-backed
+  `/plugin:command` and from the tool loop of a model an extension provides
+  carried `caller`, but nothing checked it: a dropped argument on any of
+  them would have passed every test. Each now has a test that the
+  extension is told the calling chat's own author, the same on a later
+  call, and a different one for a second chat
+  (`tests/extension_lease_lifecycle.rs`,
+  `tests/session_actor_plugin_command_caller.rs`,
+  `runtime/openai/extension_route.rs`). Tests only.
 - **Extensions: the contract says what `caller` can be relied on for.**
   `docs/extensions/protocol.md` and `contract.json` told extension authors
   "Do not grant access because a call carries a given `caller`". That was

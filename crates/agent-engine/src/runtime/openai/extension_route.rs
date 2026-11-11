@@ -565,3 +565,219 @@ mod cancel_tests {
         assert_eq!(error, "operation canceled");
     }
 }
+
+/// `caller` in the extension model's tool loop: a tool the model of a
+/// `plugin:provider:model` chat asks for is called with the turn's own tool
+/// context, so an extension tool among them is told the author of that
+/// chat's binding.
+#[cfg(test)]
+mod caller_tests {
+    use super::*;
+    use crate::extensions::hooks::events::{HookEvent, HookResult};
+    use crate::extensions::runtime::process::{
+        ProviderCompleteParams, ProviderCompleteResult, RegisteredExtensionToolSpec,
+        RegisteredProviderModelSpec, RegisteredProviderSpec,
+    };
+    use crate::extensions::runtime::ExtensionHandler;
+    use crate::memory_backend::MemoryBinding;
+    use crate::tools::test_helpers::{create_tool_context, memory_binding};
+    use agent_core::config::MemoryBackendKind;
+    use agent_core::memory::forum::Author;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+
+    /// A model that asks for `whoami` once a turn, then answers.
+    #[derive(Default)]
+    struct AsksWhoOnce(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ExtensionHandler for AsksWhoOnce {
+        fn id(&self) -> &str {
+            "asks-who"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+        async fn provider_complete(
+            &self,
+            _params: ProviderCompleteParams,
+        ) -> Result<ProviderCompleteResult, String> {
+            let asks = self.0.fetch_add(1, Ordering::SeqCst) % 2 == 0;
+            Ok(ProviderCompleteResult {
+                content: vec![if asks {
+                    json!({"type": "tool_use", "id": "t1", "name": "whoami", "input": {}})
+                } else {
+                    json!({"type": "text", "text": "done"})
+                }],
+                stop_reason: Some(if asks { "tool_use" } else { "end_turn" }.to_string()),
+                usage: None,
+            })
+        }
+    }
+
+    /// The extension behind `whoami`: `(session_id, caller)` of each
+    /// `tool.call`, as `ProcessExtension` would put them on the wire.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(Option<String>, Option<Author>)>>);
+
+    #[async_trait::async_trait]
+    impl ExtensionHandler for Recorder {
+        fn id(&self) -> &str {
+            "caller-recorder"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Continue
+        }
+        async fn call_tool_as(
+            &self,
+            _name: &str,
+            _input: Value,
+            session_id: Option<&str>,
+            _cwd: Option<&std::path::Path>,
+            caller: Option<&Author>,
+        ) -> Result<Value, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((session_id.map(str::to_string), caller.cloned()));
+            Ok(json!("here"))
+        }
+        async fn shutdown(&self) {}
+    }
+
+    /// The real `ExtensionTool` under the name the model asks for, with a
+    /// built-in origin so the loop's default tool set admits it.
+    struct Admitted(crate::tools::ExtensionTool);
+
+    #[async_trait::async_trait]
+    impl crate::Tool for Admitted {
+        fn name(&self) -> &str {
+            "whoami"
+        }
+        fn description(&self) -> &str {
+            "asks the recording extension who is calling"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        async fn execute(&self, params: Value, ctx: crate::ToolContext) -> crate::Result<String> {
+            self.0.execute(params, ctx).await
+        }
+    }
+
+    async fn one_turn(
+        manager: Arc<tokio::sync::RwLock<ExtensionManager>>,
+        tools: &Arc<Vec<Value>>,
+        messages: &[crate::SharedMessage],
+        trace: &crate::runtime::trace::TraceContext,
+        chat: &str,
+        binding: MemoryBinding,
+    ) {
+        let mut capabilities = create_tool_context().capabilities;
+        capabilities.memory_backend = Some(binding);
+        capabilities.session_id = Some(chat.to_string());
+        let turn_tools =
+            TurnToolContext::new(capabilities, TurnToolContext::no_chat().limits().clone(), None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let routed = route_extension_provider(
+            manager,
+            "plug",
+            "prov",
+            "model-x",
+            "plug:prov:model-x",
+            tools,
+            &None,
+            messages,
+            &tx,
+            None,
+            None,
+            0,
+            &cancel,
+            None,
+            None,
+            Some(&turn_tools),
+            trace,
+        )
+        .await;
+        assert!(routed.is_ok(), "{chat}: {:?}", routed.err().map(|e| e.to_string()));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_tool_call_in_the_extension_loop_names_the_turns_own_author() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let recorder = Arc::new(Recorder::default());
+        let mut registry = crate::ToolRegistry::new();
+        registry.register(Arc::new(Admitted(crate::tools::ExtensionTool::new(
+            "caller-recorder",
+            RegisteredExtensionToolSpec {
+                name: "whoami".into(),
+                description: "records the caller".into(),
+                input_schema: json!({"type": "object"}),
+            },
+            recorder.clone(),
+        ))));
+        let mut manager = ExtensionManager::new_with_tools(
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            Arc::new(tokio::sync::RwLock::new(registry)),
+        );
+        manager
+            .register_provider_handler_for_tests(
+                "plug",
+                RegisteredProviderSpec {
+                    id: "prov".to_string(),
+                    display_name: "Fake".to_string(),
+                    description: "fake provider".to_string(),
+                    models: vec![RegisteredProviderModelSpec {
+                        id: "model-x".to_string(),
+                        display_name: None,
+                        capabilities: json!({"streaming": false, "tool_use": true}),
+                        context_window: None,
+                    }],
+                    config_schema: None,
+                },
+                Arc::new(AsksWhoOnce::default()),
+            )
+            .unwrap();
+        let manager = Arc::new(tokio::sync::RwLock::new(manager));
+        let tools = Arc::new(vec![json!({
+            "name": "whoami", "description": "who", "input_schema": {"type": "object"}
+        })]);
+        let messages: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role": "user", "content": "go"}))];
+        let trace = crate::runtime::trace::TraceContext::disabled();
+
+        // One turn of a chat with `binding`, on the extension's model.
+        let turn = |chat: &'static str, binding: MemoryBinding| {
+            one_turn(manager.clone(), &tools, &messages, &trace, chat, binding)
+        };
+        let dirs = [base.path().join("a"), base.path().join("b")];
+        let bindings = dirs
+            .each_ref()
+            .map(|dir| memory_binding(MemoryBackendKind::Legacy, dir));
+        turn("chat-a", bindings[0].clone()).await;
+        turn("chat-b", bindings[1].clone()).await;
+        turn("chat-a", bindings[0].clone()).await;
+
+        let calls = recorder.0.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        for ((session_id, caller), (chat, binding)) in
+            calls.iter().zip([("chat-a", &bindings[0]), ("chat-b", &bindings[1]), ("chat-a", &bindings[0])])
+        {
+            assert_eq!(session_id.as_deref(), Some(chat));
+            let caller = caller.as_ref().unwrap_or_else(|| panic!("{chat}: no caller"));
+            caller.validate().unwrap();
+            assert_eq!(caller, binding.forum_author(), "{chat}: its own binding's author");
+        }
+        let (of_a, of_b) = (calls[0].1.clone().unwrap(), calls[1].1.clone().unwrap());
+        assert_ne!(of_a.actor, of_b.actor);
+        assert_ne!(of_a.group, of_b.group);
+    }
+}
