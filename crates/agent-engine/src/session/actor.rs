@@ -705,27 +705,11 @@ fn release_fresh_lock(lock: Option<agent_core::session_lock::SessionLock>, conti
     }
 }
 
-// same rule as daemon/reload.rs
-/// The chat's folder as an unpark rebuilds it: dropped only when the path is
-/// gone or is not a folder (the chat then runs in the daemon's folder and
-/// its project); kept on any other error, which may pass.
-fn live_folder(cwd: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
-    let folder = cwd?;
-    let gone = match std::fs::metadata(&folder) {
-        Ok(meta) => !meta.is_dir(),
-        Err(e) => matches!(
-            e.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-        ),
-    };
-    if gone {
-        tracing::warn!(
-            folder = %folder.display(),
-            "the chat's folder is gone; it runs in the daemon's folder"
-        );
-        return None;
-    }
-    Some(folder)
+/// The chat's folder as an unpark rebuilds it: the rule of a reload and of
+/// a pinned session ([`crate::daemon::reload::restorable_folder`]), so that
+/// the three ways a chat comes back agree on what a gone folder is.
+fn live_folder(cwd: Option<std::path::PathBuf>, chat: &str) -> Option<std::path::PathBuf> {
+    crate::daemon::reload::restorable_folder(cwd, chat)
 }
 
 impl SessionActor {
@@ -2697,7 +2681,7 @@ impl SessionActor {
         // A folder deleted while the chat was parked is dropped, as reload
         // drops it: the chat wakes in the daemon's folder and its project,
         // not with a dead path that has no project at all.
-        self.config.cwd = live_folder(self.config.cwd.take());
+        self.config.cwd = live_folder(self.config.cwd.take(), &journal_id);
         let host = Arc::clone(&self.host);
         let cfg = self.config.clone();
         let queue = Arc::clone(&self.event_queue);
@@ -6007,11 +5991,11 @@ mod live_folder_tests {
         std::fs::create_dir(&folder).unwrap();
         let file = tmp.path().join("file");
         std::fs::write(&file, "").unwrap();
-        assert_eq!(live_folder(None), None);
-        assert_eq!(live_folder(Some(folder.clone())), Some(folder.clone()));
-        assert_eq!(live_folder(Some(file.clone())), None, "not a folder");
-        assert_eq!(live_folder(Some(file.join("below"))), None, "below a file");
-        assert_eq!(live_folder(Some(tmp.path().join("gone"))), None, "absent");
+        assert_eq!(live_folder(None, "chat"), None);
+        assert_eq!(live_folder(Some(folder.clone()), "chat"), Some(folder.clone()));
+        assert_eq!(live_folder(Some(file.clone()), "chat"), None, "not a folder");
+        assert_eq!(live_folder(Some(file.join("below")), "chat"), None, "below a file");
+        assert_eq!(live_folder(Some(tmp.path().join("gone")), "chat"), None, "absent");
     }
 
     /// A folder that cannot be looked at now (here: a parent without
@@ -6026,7 +6010,7 @@ mod live_folder_tests {
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let denied = std::fs::metadata(&folder).is_err();
-        let kept = live_folder(Some(folder.clone()));
+        let kept = live_folder(Some(folder.clone()), "chat");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         if denied {
             assert_eq!(kept, Some(folder));

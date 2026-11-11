@@ -888,7 +888,8 @@ fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle, chat: &str
     }
 }
 
-/// The folder a chat is restored in, by a reload or as a pinned session:
+/// The folder a chat is restored in, by a reload, as a pinned session or by
+/// an unpark (`session/actor.rs`):
 /// `folder` as saved, or `None` when it is gone, and the chat then runs in
 /// the daemon's folder and that folder's project.
 ///
@@ -900,7 +901,7 @@ fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle, chat: &str
 /// own project, where its tools fail until the folder is back, rather than
 /// being moved to another project's files and memory without a word. Every
 /// drop is logged with the folder and the chat.
-pub(super) fn restorable_folder(folder: Option<PathBuf>, chat: &str) -> Option<PathBuf> {
+pub(crate) fn restorable_folder(folder: Option<PathBuf>, chat: &str) -> Option<PathBuf> {
     let folder = folder?;
     let gone = match std::fs::metadata(&folder) {
         Ok(found) if found.is_dir() => return Some(folder),
