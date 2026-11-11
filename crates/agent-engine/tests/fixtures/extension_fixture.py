@@ -240,6 +240,9 @@ while True:
                     "session_id": params.get("session_id"),
                     "has_cwd": "cwd" in params,
                     "cwd": params.get("cwd"),
+                    # The project the host says the call is about (recall and
+                    # capture inputs carry one; other tools' do not).
+                    "project_id": (params.get("input") or {}).get("project_id"),
                 }, f)
                 f.write("\n")
         except OSError:

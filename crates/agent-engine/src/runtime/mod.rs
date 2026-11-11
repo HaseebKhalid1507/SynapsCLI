@@ -886,25 +886,6 @@ fn fresh_memory_context_state(
     ))
 }
 
-/// Host-derived project isolation identity (spec §5.2) recorded on
-/// command-granted memory leases: the stable scope discovered from the current
-/// working directory (or `SYNAPS_PROJECT_ROOT`).
-fn memory_project_scope() -> std::result::Result<agent_core::memory::store::ProjectScope, String> {
-    let cwd = std::env::current_dir()
-        .map_err(|error| format!("cannot resolve current project directory: {error}"))?;
-    agent_core::memory::store::ProjectScope::discover(&cwd)
-        .map_err(|error| format!("cannot resolve project scope: {error}"))
-}
-
-fn memory_project_id() -> memory_context::ProjectId {
-    match memory_project_scope() {
-        Ok(scope) => memory_context::ProjectId::parse(scope.key())
-            .expect("host project scope key is always a valid identifier"),
-        Err(_) => memory_context::ProjectId::parse("project-unresolved")
-            .expect("static fallback project id is valid"),
-    }
-}
-
 /// The spec-canonical continuous-memory provider identity (spec §17.3,
 /// Axel memory-manager). FALLBACK ONLY as of task A6: it is recorded on
 /// command-granted leases exclusively when NO extension subsystem is wired
@@ -2999,18 +2980,19 @@ impl Runtime {
         self.memory_backend.exclusive()
     }
 
+    /// The project isolation identity (spec §5.2) recorded on this chat's
+    /// memory leases and sent with its capture and recall requests: the key
+    /// of the chat's memory binding, whichever the backend. The binding is
+    /// made from the chat's folder (or `SYNAPS_PROJECT_ROOT`); the process
+    /// folder is the daemon's under the daemon, so it is never asked here.
     fn memory_context_project_id(&self) -> memory_context::ProjectId {
-        if self.memory_backend.exclusive() {
-            self.memory_backend
-                .scope()
-                .ok()
-                .and_then(|scope| memory_context::ProjectId::parse(scope.key()).ok())
-                .unwrap_or_else(|| {
-                    memory_context::ProjectId::parse("project-unresolved").expect("static id")
-                })
-        } else {
-            memory_project_id()
-        }
+        self.memory_backend
+            .scope()
+            .ok()
+            .and_then(|scope| memory_context::ProjectId::parse(scope.key()).ok())
+            .unwrap_or_else(|| {
+                memory_context::ProjectId::parse("project-unresolved").expect("static id")
+            })
     }
 
     pub fn memory_tool_capability(&self) -> Option<memory_context::MemoryContextCapability> {

@@ -27,6 +27,7 @@ use agent_engine::extensions::hooks::HookBus;
 use agent_engine::extensions::lease::{ExtensionLeaseCapability, ExtensionRuntimeManager};
 use agent_engine::extensions::manager::ExtensionManager;
 use agent_engine::extensions::manifest::ExtensionManifest;
+use agent_engine::memory_backend::MemoryBinding;
 use agent_engine::runtime::memory_context::{DurableStatus, OneShotStatus};
 use agent_engine::tools::catalog::SchemaDigest;
 use agent_engine::tools::ToolRegistry;
@@ -372,6 +373,81 @@ async fn recall_and_capture_tool_calls_carry_the_chats_folder() {
     fx.cleanup();
 }
 
+/// Recall and capture tell the memory extension which project the chat is
+/// in. With the plain-file backend that was the project of the folder the
+/// process runs in: under a daemon one id for every chat, in the same
+/// request that names each chat's own folder as `cwd`. Two chats in two
+/// projects, as a daemon builds them: each sends its own project's id, and
+/// neither sends the host's.
+#[tokio::test]
+#[serial_test::serial]
+async fn recall_and_capture_name_the_chats_project_not_the_hosts() {
+    std::env::remove_var("SYNAPS_PROJECT_ROOT");
+    let project_of = |dir: &Path| {
+        MemoryBinding::from_config_with_cwd(&Default::default(), Some(dir.to_path_buf()))
+            .scope()
+            .expect("a folder has a project")
+            .key()
+            .to_string()
+    };
+    let hosts_project = project_of(&std::env::current_dir().unwrap());
+
+    let mut projects = Vec::new();
+    for tag in ["project-a", "project-b"] {
+        let fx = fixture(tag, "memory-store");
+        let mut engine = engine(&fx).await;
+        let chat_dir = fx.dir.join("chat");
+        std::fs::create_dir_all(&chat_dir).unwrap();
+        // A project of its own, whatever lies above the temp directory.
+        std::fs::write(chat_dir.join(".synaps-project"), "").unwrap();
+        let chats_project = project_of(&chat_dir);
+        // As the host builds a daemon chat's runtime: its folder first, then
+        // the configuration, which makes the memory binding from the folder.
+        engine.runtime.set_cwd(Some(chat_dir.clone()));
+        engine
+            .runtime
+            .apply_memory_backend_config(&Default::default());
+        memory_command_ok(&engine.runtime, "on");
+        warm_lease(&engine).await;
+
+        let mut prompt = shared(vec![json!({"role": "user", "content": "Which project?"})]);
+        engine
+            .runtime
+            .apply_turn_memory_recall_for_harness(&mut prompt)
+            .await;
+        engine
+            .runtime
+            .capture_completed_turn_for_harness(
+                shared(vec![
+                    json!({"role": "user", "content": "Which project?"}),
+                    json!({"role": "assistant", "content": "The chat's own."}),
+                ]),
+                1,
+            )
+            .expect("completed turn enters bounded capture queue");
+        wait_for_capture_calls(&fx, 1).await;
+
+        let callers = fx.callers();
+        for tool in ["memory_recall", "memory_capture"] {
+            let calls: Vec<&Value> = callers.iter().filter(|c| c["name"] == tool).collect();
+            assert!(!calls.is_empty(), "no {tool} call recorded: {callers:?}");
+            for call in calls {
+                assert_eq!(
+                    call["project_id"],
+                    json!(chats_project),
+                    "{tool} in {tag}: the host's project is {hosts_project}"
+                );
+                // One request, one project: the folder it names is the chat's too.
+                assert_eq!(call["cwd"], json!(chat_dir.to_str().unwrap()), "{tool}: {call}");
+            }
+        }
+        projects.push(chats_project);
+        fx.cleanup();
+    }
+    assert_ne!(projects[0], projects[1], "two chats, two projects");
+    assert!(!projects.contains(&hosts_project), "neither is the host's");
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 /// (a) RecallEachPrompt + MODE=ok: the REAL child's contribution enters as
@@ -647,6 +723,11 @@ async fn fresh_second_session_has_no_inherited_lease_and_makes_zero_calls() {
 #[serial_test::serial]
 async fn continuous_memory_headless_lifecycle_captures_restarts_recalls_disables_and_imports() {
     let fx = fixture("continuous-memory", "memory-store");
+    // One project for the whole lifecycle, set before any runtime exists: a
+    // chat's project is the one of its memory binding, fixed when its
+    // runtime is built, and the history import at the end must be for the
+    // same project as the lease it imports under.
+    std::env::set_var("SYNAPS_PROJECT_ROOT", &fx.dir);
     let first = engine(&fx).await;
 
     // Spec §21 activation: off/default and status are dormant. The simulated
@@ -786,7 +867,6 @@ async fn continuous_memory_headless_lifecycle_captures_restarts_recalls_disables
     let sessions_dir = base.join("sessions");
     std::fs::create_dir_all(&sessions_dir).unwrap();
     std::env::set_var("SYNAPS_BASE_DIR", &base);
-    std::env::set_var("SYNAPS_PROJECT_ROOT", &fx.dir);
     let mut imported = Session::new("fixture-model", "brief", None);
     imported.id = "f1-history".into();
     imported.api_messages = shared(vec![

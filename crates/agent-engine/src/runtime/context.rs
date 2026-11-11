@@ -1142,7 +1142,8 @@ mod tests {
         mc::MemoryContextContribution {
             schema: mc::ContributionSchemaVersion::parse("contribution/1").expect("valid schema"),
             provider_id: mc::ContextProviderId::parse("axel-memory").expect("valid provider"),
-            project_id: crate::runtime::memory_project_id(),
+            // A headless runtime's: the project of the process folder.
+            project_id: crate::Runtime::new_headless().memory_context_project_id(),
             records: vec![mc::MemoryContributionRecord {
                 memory_id: mc::MemoryId::parse("mem-0001").expect("valid memory id"),
                 source: mc::MemorySource::ChatHistory,

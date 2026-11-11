@@ -395,6 +395,28 @@ All notable changes to this project will be documented in this file.
   now runs under the turn's usage meter like every other non-Anthropic
   model, but its transport reports no usage event, so, as before, its
   rounds are not counted against the turn's token and cost budgets.
+- **Daemon: automatic memory tells a memory extension the chat's project,
+  not the daemon's.** With the plain-file backend (`memory.backend` not
+  `axel`), the `project_id` in the capture and recall requests sent to a
+  memory extension was worked out from the folder the process runs in. Under
+  the daemon that is the daemon's folder: every chat's turns were captured
+  under one project id and a chat could be handed another project's
+  memories, while the same request named the chat's own folder as `cwd`.
+  The id is now the one of the chat's memory binding, made from the chat's
+  folder, as it already was with `memory.backend = axel`. What changes for
+  stored data: captures a memory extension took from daemon chats before
+  this are filed under the id of the folder the daemon was started in (a
+  `p` and 16 hex digits). Chats in other folders now ask under their own
+  project's id and no longer get them back; a chat in the daemon's own
+  folder still does. Synaps does not move them: they are in the extension's
+  store, and whether to re-file them by the folder each came from is the
+  extension's to offer. One more thing follows on the plain-file backend:
+  `/memory index-history` still previews the project of the daemon's
+  folder, and its `confirm` step, which used to import that project's
+  history from whichever chat asked, now refuses a chat in any other folder
+  ("history import identity is invalid"), because the chat's memory lease
+  is for the chat's project. Without the daemon nothing changes: the id was
+  already the one of the folder the chat runs in.
 - **Compaction on an extension-provided model runs no tools.** With
   `compaction_model` set to a non-streaming model an extension provides, a
   summary answer that contained a tool call had that call run, although a
