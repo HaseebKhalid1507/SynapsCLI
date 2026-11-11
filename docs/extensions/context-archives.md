@@ -751,8 +751,11 @@ What an import does with a record:
 The command prints one JSON document: the totals (`read`, `stored`,
 `already_present`, `forgotten`, `kept_forgotten`, `refused`), then one entry
 for each line with its id, its outcome and, when it was refused, the name of
-the check that failed. Nothing in the document is content. The exit code is
-0 when nothing was refused, 1 when something was, and 2 when the run
+the check that failed. Nothing in the document is content. A tombstone
+whose forget may not have reached every copy (see [Tombstones](#tombstones))
+has `unread` in its entry and its id in `forgets_not_complete`. The exit
+code is 0 when nothing was refused, 1 when something was or when a forget is
+in `forgets_not_complete`, and 2 when the run
 stopped (an input that cannot be read, a store that cannot be read or
 locked): what was imported before the stop is complete, and running the
 same command again continues. `--dry-run` writes nothing at all and prints

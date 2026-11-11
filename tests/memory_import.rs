@@ -639,6 +639,53 @@ fn a_store_that_cannot_answer_stops_the_run_at_that_record() {
     }
 }
 
+/// core-a5-review finding 2.
+#[test]
+fn a_forget_that_did_not_reach_every_copy_exits_1_and_is_named() {
+    let records = sealed("incomplete", 2);
+    let env = Env::new();
+    let file = env.file("records.jsonl", &lines(&records));
+    let run = env.run(&["import-archives", &file, "--project-key", KEY]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.doc["forgets_not_complete"], json!({"count": 0, "ids": []}));
+
+    // A file that names the first record's content and is not a record: it
+    // may be a damaged copy, and a forget leaves it as it is.
+    let record: Value = serde_json::from_str(&records[0].1).unwrap();
+    let shelf = env
+        .base()
+        .join("context-archives")
+        .join(project_scope(KEY).unwrap())
+        .join("s000001");
+    let stray = shelf.join(format!("{}.json", "f".repeat(32)));
+    std::fs::write(&stray, json!({"digest": record["digest"]}).to_string()).unwrap();
+    std::fs::set_permissions(&stray, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let forget = env.file("forget.jsonl", &[tombstone_of(&records[0].1), records[1].1.clone()]);
+    let run = env.run(&["import-archives", &forget, "--project-key", KEY]);
+    // Nothing was refused and the run did not stop: the exit code and
+    // `forgets_not_complete` are what say that it is not all done.
+    assert_eq!(run.totals(), [2, 0, 1, 1, 0, 0], "{}", run.stdout);
+    assert_eq!(run.doc["balanced"], true);
+    assert_eq!(run.doc["stopped"], Value::Null);
+    let entry = &run.doc["records"][0];
+    assert_eq!(entry["outcome"], "forgotten");
+    let unread = entry["unread"].as_str().unwrap();
+    assert!(unread.starts_with("1 place(s) could not be read"), "{unread}");
+    assert_eq!(run.doc["records"][1].get("unread"), None);
+    assert_eq!(
+        run.doc["forgets_not_complete"],
+        json!({"count": 1, "ids": [records[0].0]})
+    );
+    assert!(run.stderr.contains("may not have reached every copy"), "{}", run.stderr);
+    assert_eq!(run.code, 1, "{}{}", run.stdout, run.stderr);
+
+    // Notes have no such thing, and no such field.
+    let notes = env.file("notes.jsonl", &[note("mem-1", KEY, "one")]);
+    let run = env.run(&["import-notes", &notes, "--project-key", KEY, "--dry-run"]);
+    assert_eq!(run.doc.get("forgets_not_complete"), None);
+}
+
 #[test]
 fn a_refused_record_makes_no_project_directory() {
     let env = Env::new();

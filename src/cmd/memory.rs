@@ -11,8 +11,9 @@
 //! holds content of an archive or a note: a refusal reason is the store's
 //! name for the check that failed, or one of the fixed texts below.
 //!
-//! Exit codes: 0 nothing was refused, 1 something was, 2 the run stopped (or
-//! the command line could not be used). There is no other code.
+//! Exit codes: 0 nothing was refused, 1 something was (or a forget did not
+//! reach every copy), 2 the run stopped (or the command line could not be
+//! used). There is no other code.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -28,7 +29,8 @@ use sha2::{Digest, Sha256};
 
 /// Nothing was refused.
 const EXIT_OK: i32 = 0;
-/// At least one line was refused; every other line was handled.
+/// At least one line was refused, or a forget may not have reached every
+/// copy; every other line was handled.
 const EXIT_REFUSED: i32 = 1;
 /// The run stopped, or the command line could not be used.
 const EXIT_STOPPED: i32 = 2;
@@ -105,6 +107,11 @@ struct Report {
     /// they name were not forgotten by this run.
     #[serde(skip_serializing_if = "Option::is_none")]
     tombstones_not_applied: Option<NotApplied>,
+    /// `import-archives` only: tombstone records whose forget may not have
+    /// reached every copy of the content (the entries that have `unread`).
+    /// Their outcome is `forgotten`, so `total` does not show them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forgets_not_complete: Option<NotApplied>,
     projects: Vec<Project>,
     records: Vec<Entry>,
 }
@@ -724,6 +731,10 @@ fn import<I: Importer>(
             count: 0,
             ids: Vec::new(),
         }),
+        forgets_not_complete: (command == "import-archives").then_some(NotApplied {
+            count: 0,
+            ids: Vec::new(),
+        }),
         projects: Vec::new(),
         records: Vec::new(),
     };
@@ -793,6 +804,7 @@ fn import<I: Importer>(
             unapplied.ids.join(" ")
         );
     }
+    let incomplete = report.records.iter().any(|entry| entry.unread.is_some());
     for entry in report.records.iter().filter(|entry| entry.unread.is_some()) {
         eprintln!(
             "synaps memory {command}: the forget of {} may not have reached every copy",
@@ -801,7 +813,7 @@ fn import<I: Importer>(
     }
     if !print(&report) || report.stopped.is_some() {
         EXIT_STOPPED
-    } else if report.total.refused > 0 {
+    } else if report.total.refused > 0 || incomplete {
         EXIT_REFUSED
     } else {
         EXIT_OK
@@ -892,6 +904,12 @@ fn feed<I: Importer>(
                 if let Some(unapplied) = &mut report.tombstones_not_applied {
                     unapplied.count += 1;
                     unapplied.ids.extend(judged.id.clone());
+                }
+            }
+            if judged.unread.is_some() {
+                if let Some(incomplete) = &mut report.forgets_not_complete {
+                    incomplete.count += 1;
+                    incomplete.ids.extend(judged.id.clone());
                 }
             }
             report.records.push(Entry {

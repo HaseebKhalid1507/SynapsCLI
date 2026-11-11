@@ -22,8 +22,10 @@ All notable changes to this project will be documented in this file.
   `already_present`, `forgotten`, `kept_forgotten`, `refused`, `balanced`,
   `stopped`, a block for each project and an entry for each line with its
   id, outcome and, when refused, the name of the check. No field holds
-  content. Exit code 0 when nothing was refused, 1 when something was, 2
-  when the run stopped or the command line could not be used. `--dry-run`
+  content. Exit code 0 when nothing was refused, 1 when something was or
+  when an archive forget may not have reached every copy (those ids are in
+  `forgets_not_complete`), 2 when the run stopped or the command line could
+  not be used. `--dry-run`
   writes nothing (no directory, no lock file, no mode) and prints what the
   real run prints. A real `import-notes` holds `memory/.import.lock` for the
   whole run and a second one stops with "another import is running"; a
