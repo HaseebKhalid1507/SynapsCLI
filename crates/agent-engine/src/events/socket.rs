@@ -283,10 +283,28 @@ fn serve_session_socket_inner(
                     let queue = queue.clone();
                     tokio::spawn(async move {
                         // 5s timeout prevents slow-send DoS from parking tasks indefinitely
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            handle_connection(&mut connected, &queue),
-                        )
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            // Like the daemon pipe (`conn::serve`): the client
+                            // is identified once its first bytes are read (a
+                            // pipe carries the writer's security context with
+                            // the data), and a client of another account, below
+                            // this process's integrity level, or with a
+                            // restricted or AppContainer token is dropped. Its
+                            // event would reach the model as `<event>` data
+                            // from a process that has less than the user's rights.
+                            let mut head = vec![0u8; 8192];
+                            let n = match connected.read(&mut head).await {
+                                Ok(n) if n > 0 => n,
+                                _ => return,
+                            };
+                            let peer = crate::ipc::PeerHandle::of(&connected);
+                            if let Err(why) = crate::ipc::admit_client(peer, &crate::ipc::own_identity()) {
+                                tracing::warn!("socket: refused a client: {}", why);
+                                return;
+                            }
+                            head.truncate(n);
+                            handle_connection(&mut std::io::Cursor::new(head).chain(&mut connected), &queue).await;
+                        })
                         .await;
                     });
                 }
@@ -620,7 +638,84 @@ mod tests {
 mod windows_tests {
     use super::*;
     use crate::events::{Event, Severity};
+    use crate::ipc::security_tests::{open_raw, restricted_token, wearing, write_line};
     use std::sync::atomic::AtomicBool;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+
+    fn session_path(tmp: &tempfile::TempDir) -> String {
+        tmp.path().join("session.sock").to_string_lossy().into_owned()
+    }
+
+    async fn pop_within(queue: &EventQueue, ms: u64) -> Option<Event> {
+        for _ in 0..ms / 20 {
+            if let Some(e) = queue.pop() {
+                return Some(e);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// The listener identifies a client from its first bytes, and a client
+    /// that writes one payload and closes at once (`send_to_session_socket`,
+    /// so `synaps send`) must be admitted every time.
+    #[tokio::test]
+    async fn fast_clients_are_all_delivered_through_the_admit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = session_path(&tmp);
+        let queue = Arc::new(EventQueue::new(10));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = listen_session_socket(path.clone(), queue.clone(), shutdown.clone());
+        let mut lost = Vec::new();
+        for i in 0..50 {
+            let event = Event::simple("test", &format!("event {i}"), Some(Severity::High));
+            send_to_session_socket(&path, &serde_json::to_vec(&event).unwrap())
+                .await
+                .unwrap();
+            if pop_within(&queue, 500).await.is_none() {
+                lost.push(i);
+            }
+        }
+        assert!(lost.is_empty(), "events from a client that closed at once were dropped: {lost:?}");
+        shutdown.store(true, Ordering::Release);
+        handle.await.unwrap();
+    }
+
+    /// A client of this user whose token carries restricting SIDs passes the
+    /// pipe's DACL and label, so only the listener's admit stops it: its
+    /// event would reach the model as `<event>` data from a process that
+    /// has less than the user's rights (the same escape as on the daemon pipe).
+    #[tokio::test]
+    async fn a_restricted_token_client_cannot_push_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = session_path(&tmp);
+        let queue = Arc::new(EventQueue::new(10));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = listen_session_socket(path.clone(), queue.clone(), shutdown.clone());
+        let name = pipe_name_for(&path);
+        let payload = serde_json::to_vec(&Event::simple("test", "from a sandbox", Some(Severity::High))).unwrap();
+
+        // Held open until the listener has decided, so nothing but the
+        // token can be what stops it.
+        let held = wearing(restricted_token, || {
+            let client = open_raw(&name, GENERIC_READ | GENERIC_WRITE, 0).unwrap();
+            write_line(&client, &payload).unwrap();
+            client
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        drop(held);
+        assert!(
+            pop_within(&queue, 1000).await.is_none(),
+            "an event from a restricted-token client was queued"
+        );
+
+        // The same user, unrestricted: delivered.
+        send_to_session_socket(&path, &payload).await.unwrap();
+        assert_eq!(pop_within(&queue, 2000).await.expect("event delivered").content.text, "from a sandbox");
+
+        shutdown.store(true, Ordering::Release);
+        handle.await.unwrap();
+    }
 
     /// A session pipe takes events through its first and its recreated
     /// instances (both owner-only, `ipc::create_owner_only_pipe`), the client
