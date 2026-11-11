@@ -4479,6 +4479,8 @@ impl Runtime {
                 bash_max_timeout: self.bash_max_timeout,
                 subagent_timeout: self.subagent_timeout,
             },
+            // No frontend follows a `run_single`.
+            None,
         )
     }
 
@@ -4635,10 +4637,7 @@ impl Runtime {
                                     .await
                                     .runtime_name_for_api(tool_name)
                                     .to_string();
-                                let ctx = turn_tools.for_call(crate::tools::ToolChannels {
-                                    tx_delta: None,
-                                    tx_events: None,
-                                });
+                                let ctx = turn_tools.for_call(None);
                                 let decision = resolve_before_tool_call_decision(
                                     input.clone(),
                                     emit_before_tool_call(
@@ -4754,12 +4753,7 @@ impl Runtime {
                                             else {
                                                 unreachable!()
                                             };
-                                            let ctx = turn_tools_inner.for_call(
-                                                crate::tools::ToolChannels {
-                                                    tx_delta: None,
-                                                    tx_events: None,
-                                                },
-                                            );
+                                            let ctx = turn_tools_inner.for_call(None);
                                             let input_for_hook = input.clone();
                                             let (output, rich_blocks) =
                                                 match t.execute_rich(input, ctx).await {

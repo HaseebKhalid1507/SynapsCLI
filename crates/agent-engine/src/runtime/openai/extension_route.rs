@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::extensions::manager::ExtensionManager;
 use crate::runtime::trace::extension as trace_ext;
-use crate::tools::{ToolChannels, TurnToolContext};
+use crate::tools::TurnToolContext;
 
 type RouteResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -347,16 +347,13 @@ pub(crate) async fn route_extension_provider(
                 &session_tools,
                 &hook_bus,
                 // A call's context is made from the turn's, like a call of
-                // the caller's own loop, with the turn's event channel (a
-                // worker started here is shown like any other). No delta
-                // lane: these calls are not announced to the frontend, so
-                // partial output would have no tool call to belong to.
-                || {
-                    turn_tools.for_call(ToolChannels {
-                        tx_delta: None,
-                        tx_events: Some(tx.clone()),
-                    })
-                },
+                // the caller's own loop, the turn's event channel included
+                // (never this route's `tx`: under usage metering that is a
+                // relay which ends with the round, and a worker started
+                // here reports for longer). No delta lane: these calls are
+                // not announced to the frontend, so partial output would
+                // have no tool call to belong to.
+                || turn_tools.for_call(None),
                 turn_tools.limits().max_tool_output,
                 8,
                 &mut tools_requested,

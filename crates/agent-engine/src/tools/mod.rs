@@ -291,6 +291,10 @@ pub struct ToolContext {
 /// fixed for the whole provider round, so a tool activated inside it could
 /// not be offered or called there, and nothing would drain a registration.
 ///
+/// The event channel is the turn's too (`tx_events` of every call): the
+/// stream's own sender, which outlives a provider round. Only the delta
+/// lane is made per call.
+///
 /// One pointer wide: it rides in `ApiOptions` and in the stream loop's
 /// state, where a copy of every capability per clone is stack the loop does
 /// not have to spare in a debug build.
@@ -300,18 +304,25 @@ pub struct TurnToolContext(Arc<TurnTools>);
 struct TurnTools {
     capabilities: ToolCapabilities,
     limits: ToolLimits,
+    events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
 }
 
 impl TurnToolContext {
     /// `capabilities` as the host has them for this turn. Its
     /// `tool_activation` and `tool_register_tx` are per dispatch
-    /// ([`Self::for_dispatch`]) and are dropped here.
-    pub fn new(mut capabilities: ToolCapabilities, limits: ToolLimits) -> Self {
+    /// ([`Self::for_dispatch`]) and are dropped here. `events` is the
+    /// turn's event channel (`None`: the turn has no frontend to tell).
+    pub fn new(
+        mut capabilities: ToolCapabilities,
+        limits: ToolLimits,
+        events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    ) -> Self {
         capabilities.tool_activation = None;
         capabilities.tool_register_tx = None;
         Self(Arc::new(TurnTools {
             capabilities,
             limits,
+            events,
         }))
     }
 
@@ -329,6 +340,7 @@ impl TurnToolContext {
                 bash_max_timeout: 300,
                 subagent_timeout: 300,
             },
+            events: None,
         }))
     }
 
@@ -345,13 +357,18 @@ impl TurnToolContext {
         Self(Arc::new(TurnTools {
             capabilities,
             limits: self.0.limits.clone(),
+            events: self.0.events.clone(),
         }))
     }
 
-    /// The context of one tool call. `channels` are the call's own.
-    pub fn for_call(&self, channels: ToolChannels) -> ToolContext {
+    /// The context of one tool call. `tx_delta` is the call's own lane for
+    /// partial output (`None` where the call is not shown as it runs).
+    pub fn for_call(&self, tx_delta: Option<crate::tools::output::DeltaSender>) -> ToolContext {
         ToolContext {
-            channels,
+            channels: ToolChannels {
+                tx_delta,
+                tx_events: self.0.events.clone(),
+            },
             capabilities: self.0.capabilities.clone(),
             limits: self.0.limits.clone(),
         }
@@ -588,6 +605,7 @@ mod turn_tool_context_tests {
     #[test]
     fn dispatch_capabilities_never_reach_the_turns_context() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
         let turn = TurnToolContext::new(
             ToolCapabilities {
                 tool_register_tx: Some(tx.clone()),
@@ -596,6 +614,7 @@ mod turn_tool_context_tests {
                 ..Default::default()
             },
             TurnToolContext::no_chat().limits().clone(),
+            Some(events.clone()),
         );
         assert!(turn.capabilities().tool_register_tx.is_none());
 
@@ -611,11 +630,7 @@ mod turn_tool_context_tests {
                 crate::tools::activation::ActivationAuthority::ModelConfirmed,
             ),
         );
-        let channels = || ToolChannels {
-            tx_delta: None,
-            tx_events: None,
-        };
-        let (of_turn, of_dispatch) = (turn.for_call(channels()), dispatch.for_call(channels()));
+        let (of_turn, of_dispatch) = (turn.for_call(None), dispatch.for_call(None));
         assert!(of_turn.capabilities.tool_register_tx.is_none());
         assert!(of_turn.capabilities.tool_activation.is_none());
         assert!(of_dispatch.capabilities.tool_register_tx.is_some());
@@ -623,8 +638,16 @@ mod turn_tool_context_tests {
         for ctx in [&of_turn, &of_dispatch] {
             assert_eq!(ctx.capabilities.session_id.as_deref(), Some("chat-A"));
             assert_eq!(ctx.capabilities.env_stripped, ["SECRET"]);
+            // The turn's event channel, whichever loop makes the call.
+            assert!(ctx
+                .channels
+                .tx_events
+                .as_ref()
+                .is_some_and(|tx| tx.same_channel(&events)));
+            assert!(ctx.channels.tx_delta.is_none());
         }
-        let none = TurnToolContext::no_chat().for_call(channels());
+        let none = TurnToolContext::no_chat().for_call(None);
+        assert!(none.channels.tx_events.is_none());
         assert!(none.capabilities.session_id.is_none() && none.capabilities.env.is_none());
         assert!(none.capabilities.memory_backend.is_none());
     }

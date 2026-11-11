@@ -374,6 +374,24 @@ All notable changes to this project will be documented in this file.
   is new; so does the line `memory_forget` appends, and an extension's
   `memory.append`. A save costs one file sync more than before. The file
   format is unchanged, and older versions read the files as before.
+- **A chat switched to an extension-provided model sends that extension no
+  keep-warm request, and needs no Anthropic credential.** The check for "is
+  this model Anthropic's" asked only for a route, and every model id
+  without a `/` routes to Anthropic; `plugin:provider:model` has none. So a
+  chat with a keep-warm period on a Claude model that was switched with
+  `/model` to an extension's model kept its period, and each keep-warm
+  probe (documented as sending nothing) and each ping was a full request to
+  that extension, with the chat's tool list, for no chat: a tool call in the
+  answer ran in the daemon's folder. The period now ends at its next check
+  ("model … is not on the native Anthropic transport") and nothing is sent.
+  The same check made every turn on an extension's model refresh the
+  Anthropic credential first, at turn start and before each round: with a
+  credential broker that has no Anthropic account, or an OAuth login that
+  could not be refreshed, the turn failed although the extension needs no
+  Anthropic token. It is no longer asked for. Usage: an extension's model
+  now runs under the turn's usage meter like every other non-Anthropic
+  model, but its transport reports no usage event, so, as before, its
+  rounds are not counted against the turn's token and cost budgets.
 - **Daemon: commands run by an extension-provided model get the chat's
   environment, and its tools everything else a chat's tools get.** A model
   served by an extension (`plugin:provider:model`) runs its tool calls in a

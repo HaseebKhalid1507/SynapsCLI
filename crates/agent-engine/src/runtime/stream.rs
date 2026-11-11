@@ -959,6 +959,9 @@ impl StreamMethods {
                 bash_max_timeout,
                 subagent_timeout,
             },
+            // The stream's own sender: a tool may keep it past the round
+            // that ran the call (a worker reporting as it goes).
+            Some(tx.clone()),
         );
         options.tool_context = Some(turn_tools.clone());
         let options = options;
@@ -2277,9 +2280,7 @@ impl StreamMethods {
                                         &input,
                                         cwd.as_deref(),
                                     );
-                                    match await_tool_call(&cancel, tool.execute_rich(input, dispatch_tools.for_call(
-                                            crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                        ))).await {
+                                    match await_tool_call(&cancel, tool.execute_rich(input, dispatch_tools.for_call(Some(tx_d)))).await {
                                         (Some(res), _) => {
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks) = match res {
@@ -2723,9 +2724,7 @@ impl StreamMethods {
                                     );
                                     let tx_d = delta_channel.sender;
 
-                                    match await_tool_call(&cancel_token, t.execute_rich(input, dispatch_tools_inner.for_call(
-                                            crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                        ))).await {
+                                    match await_tool_call(&cancel_token, t.execute_rich(input, dispatch_tools_inner.for_call(Some(tx_d)))).await {
                                         (Some(res), _) => {
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks, errored) = match res {
@@ -7892,6 +7891,64 @@ mod rich_output_tests {
                     delta: true,
                     ..extension.clone()
                 }
+            );
+        }
+
+        /// Keeps the event channel its context was given.
+        type EventChannel = Option<mpsc::UnboundedSender<StreamEvent>>;
+        struct EventsProbe(Arc<std::sync::Mutex<Option<EventChannel>>>);
+        #[async_trait::async_trait]
+        impl Tool for EventsProbe {
+            fn name(&self) -> &str {
+                "events_probe"
+            }
+            fn description(&self) -> &str {
+                "keeps the event channel it was given"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object","properties":{}})
+            }
+            fn origin(&self) -> crate::tools::ToolOrigin {
+                crate::tools::ToolOrigin::Builtin
+            }
+            fn effect(&self) -> crate::tools::catalog::ToolEffect {
+                crate::tools::catalog::ToolEffect::ReadOnly
+            }
+            async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+                *self.0.lock().unwrap() = Some(ctx.channels.tx_events.clone());
+                Ok("probed".to_string())
+            }
+        }
+
+        /// A tool in that loop reports on the stream's own event channel,
+        /// as a tool of the stream loop does. Not on the channel the
+        /// provider route was handed: an extension's model is not
+        /// Anthropic's, so its route runs under usage metering, whose
+        /// channel is a relay that ends with the provider round, and a
+        /// worker started there would go silent.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn its_tools_report_on_the_streams_event_channel() {
+            let _base = BaseDirGuard::new();
+            let given = Arc::new(std::sync::Mutex::new(None));
+            let streams = Arc::new(std::sync::Mutex::new(None));
+            let streams_in = streams.clone();
+            turn(
+                vec![call("call-1", "events_probe", json!({}))],
+                vec![Arc::new(EventsProbe(given.clone()))],
+                Arc::new(HookBus::new()),
+                move |session| {
+                    session.session_id = Some("chat-A".into());
+                    *streams_in.lock().unwrap() = Some(session.tx.clone());
+                },
+            )
+            .await;
+            let given = given.lock().unwrap().take().expect("the probe ran");
+            let given = given.expect("its context has an event channel");
+            let streams = streams.lock().unwrap().take().unwrap();
+            assert!(
+                given.same_channel(&streams),
+                "the tool was given a channel that is not the stream's"
             );
         }
 

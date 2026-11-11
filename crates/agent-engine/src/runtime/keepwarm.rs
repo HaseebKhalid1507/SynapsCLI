@@ -1948,6 +1948,118 @@ mod tests {
         );
     }
 
+    /// An extension's provider that counts the requests it is sent.
+    struct CountingProvider(AtomicUsize);
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for CountingProvider {
+        fn id(&self) -> &str {
+            "plug"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+        async fn provider_complete(
+            &self,
+            _params: crate::extensions::runtime::process::ProviderCompleteParams,
+        ) -> std::result::Result<
+            crate::extensions::runtime::process::ProviderCompleteResult,
+            String,
+        > {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::extensions::runtime::process::ProviderCompleteResult {
+                content: vec![json!({"type": "text", "text": "hi"})],
+                stop_reason: None,
+                usage: None,
+            })
+        }
+    }
+
+    /// A chat with a keep-warm period on a Claude model that is switched to
+    /// a model an extension provides (`/model`): the period's next probe and
+    /// ping are refused before anything is built, and the extension is sent
+    /// nothing. (Its id has no `/`, so it used to count as Anthropic's: the
+    /// probe, documented as "no network I/O", was a full request to the
+    /// extension, with the chat's tools, for no chat.) The same chat on the
+    /// Claude model probes as before, and no request reaches the extension
+    /// then either.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir, extension_routing)]
+    async fn a_chat_switched_to_an_extension_model_sends_the_extension_no_keepwarm_request() {
+        use crate::extensions::manager::ExtensionManager;
+        use crate::extensions::runtime::process::{
+            RegisteredProviderModelSpec, RegisteredProviderSpec,
+        };
+        const EXTENSION_MODEL: &str = "plug:prov:model-x";
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus(CacheTtl::OneHour);
+        let provider = Arc::new(CountingProvider(AtomicUsize::new(0)));
+        let mut manager = ExtensionManager::new_with_tools(rt.hook_bus.clone(), rt.tools.clone());
+        manager
+            .register_provider_handler_for_tests(
+                "plug",
+                RegisteredProviderSpec {
+                    id: "prov".into(),
+                    display_name: "Counting".into(),
+                    description: "counts its requests".into(),
+                    models: vec![RegisteredProviderModelSpec {
+                        id: "model-x".into(),
+                        display_name: None,
+                        capabilities: json!({"streaming": false, "tool_use": true}),
+                        context_window: None,
+                    }],
+                    config_schema: None,
+                },
+                provider.clone(),
+            )
+            .unwrap();
+        crate::runtime::openai::set_extension_manager_for_routing(Arc::new(
+            tokio::sync::RwLock::new(manager),
+        ));
+        let history = vec![
+            user("hello"),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
+        ];
+
+        // On the Claude model: eligible, and a probe sends nothing anywhere.
+        let fingerprint = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+        assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+        assert!(mock.bodies.lock().unwrap().is_empty());
+
+        rt.set_model(EXTENSION_MODEL.to_string());
+        assert_eq!(rt.model(), EXTENSION_MODEL);
+        let ineligible = rt.cache_keepwarm_ineligibility();
+        let probe = rt.cache_keepwarm_probe(&history).await;
+        let tap = PingTap::default();
+        let ping = rt
+            .cache_keepwarm_ping(&history, fingerprint, &CancellationToken::new(), &tap)
+            .await
+            .result;
+        crate::runtime::openai::clear_extension_manager_for_routing();
+
+        assert_eq!(
+            provider.0.load(Ordering::SeqCst),
+            0,
+            "the extension was sent a request for a probe or a ping"
+        );
+        assert!(mock.bodies.lock().unwrap().is_empty(), "nor was Anthropic");
+        assert!(
+            ineligible
+                .as_deref()
+                .is_some_and(|why| why.contains("not on the native Anthropic transport")),
+            "{ineligible:?}"
+        );
+        let refused = probe.expect_err("no probe for an extension's model").to_string();
+        assert!(refused.contains("keep-warm skipped"), "{refused}");
+        assert!(
+            matches!(ping, Err(PingFailure::Fatal(ref m)) if m.contains("keep-warm skipped")),
+            "{ping:?}"
+        );
+        assert!(!tap.was_sent());
+    }
+
     #[test]
     fn anchor_cell_only_moves_forward() {
         let cell = CacheAnchorCell::default();
