@@ -31,11 +31,6 @@ fn post(key: &str, thread: Option<String>) -> Post {
         retention_days: 30,
     }
 }
-fn private_write(path: &Path, bytes: &[u8]) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, bytes).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-}
 #[tokio::test]
 #[ignore = "requires SYNAPS_AXEL_TEST_BIN; isolated synthetic repository/brain only"]
 async fn peers_concurrent_posts_scope_paging_export_and_deletion() {
@@ -114,34 +109,11 @@ async fn peers_concurrent_posts_scope_paging_export_and_deletion() {
         .is_err());
     let export = root.rpc("export", json!({"full":true})).await.unwrap();
     assert_eq!(export["records"].as_array().unwrap().len(), 9);
-    let export_path = base.join("export.json");
-    private_write(&export_path, &serde_json::to_vec(&export).unwrap());
-    let restored_dir = base.join("restored");
-    std::fs::create_dir(&restored_dir).unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&restored_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let restored = binding(&restored_dir, scope.clone(), &exe);
-    let source = super::super::migration::MigrationSource::Export {
-        path: export_path,
-        project: scope.key().into(),
-    };
-    let preview = super::super::migration::preview_from(&restored, &source)
-        .await
-        .unwrap();
-    super::super::migration::apply_from(&restored, &source, &preview.manifest_digest)
-        .await
-        .unwrap();
     let all = Read {
         thread_id: Some(first.id.clone()),
         limit: 16,
         ..Default::default()
     };
-    assert_eq!(
-        root.forum_read(all.clone()).await.unwrap(),
-        restored.forum_read(all.clone()).await.unwrap()
-    );
     root.forum_forget(&first.id).await.unwrap();
     assert_eq!(
         root.forum_post(post("root", None)).await.unwrap().status,
@@ -151,36 +123,7 @@ async fn peers_concurrent_posts_scope_paging_export_and_deletion() {
         .forum_post(post("new", Some(first.id.clone())))
         .await
         .is_err());
-    assert_eq!(root.forum_read(all.clone()).await.unwrap().entries.len(), 8);
-    let deleted_export = root.rpc("export", json!({"full":true})).await.unwrap();
-    let deletion_path = base.join("deletion-export.json");
-    private_write(
-        &deletion_path,
-        &serde_json::to_vec(&deleted_export).unwrap(),
-    );
-    let deletion = super::super::migration::MigrationSource::Export {
-        path: deletion_path,
-        project: scope.key().into(),
-    };
-    let preview = super::super::migration::preview_from(&restored, &deletion)
-        .await
-        .unwrap();
-    super::super::migration::apply_from(&restored, &deletion, &preview.manifest_digest)
-        .await
-        .unwrap();
-    assert_eq!(restored.forum_read(all).await.unwrap().entries.len(), 8);
-    let old_preview = super::super::migration::preview_from(&restored, &source)
-        .await
-        .unwrap();
-    super::super::migration::apply_from(&restored, &source, &old_preview.manifest_digest)
-        .await
-        .unwrap();
-    assert!(restored
-        .forum_read(Read::default())
-        .await
-        .unwrap()
-        .entries
-        .is_empty());
+    assert_eq!(root.forum_read(all).await.unwrap().entries.len(), 8);
 }
 
 #[tokio::test]

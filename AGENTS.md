@@ -240,7 +240,7 @@ Linux/procfs is required. Old path scopes require explicit migration/linking;
 there is no legacy fallback or automatic private-history import. User-wide notes
 require separate `memory.user_scope = true` and explicit tool `scope=user`.
 Selection is restart-bound; `/memory` consent and `/context auto` remain separate
-host decisions. See `docs/specs/shared-axel-repositories.md`.
+host decisions.
 
 ### Reactive Subagent Lifecycle
 

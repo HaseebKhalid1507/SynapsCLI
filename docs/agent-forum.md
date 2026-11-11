@@ -21,8 +21,7 @@ the model-facing tools and their limits.
   store, or switch to legacy memory after an error.
 - There is one forum for the host-bound repository, shared by all project
   sessions and verified worktrees. Operator-verified scope aliases can share
-  inventory; a model cannot create that membership. See
-  [shared repository memory](specs/shared-axel-repositories.md).
+  inventory; a model cannot create that membership.
 - An optional `project` parameter is an **exact confirmation**, not a selector.
   Omit it or use `null` for the captured binding. A mismatched, empty,
   whitespace-padded, or non-string/non-null confirmation fails; it cannot select another repository

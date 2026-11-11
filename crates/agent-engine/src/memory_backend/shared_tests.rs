@@ -114,46 +114,6 @@ async fn shared_brain_worktrees_moves_aliases_user_notes_and_foreign_isolation()
         saved.meta.as_ref().unwrap()["_synaps_repository"]["source_worktree_project"].is_string()
     );
 
-    // Round-trip actual production metadata (including worktree provenance) and TTL.
-    let inventory = main.rpc("export", json!({"full":true})).await.unwrap();
-    let export_file = base.join("production-export.json");
-    std::fs::write(&export_file, serde_json::to_vec(&inventory).unwrap()).unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&export_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
-    let restore_dir = base.join("restore");
-    std::fs::create_dir(&restore_dir).unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&restore_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let restore = MemoryBinding::new(
-        base.clone(),
-        Ok(main.scope().unwrap().clone()),
-        &MemoryBackendConfig {
-            kind: MemoryBackendKind::Axel,
-            executable: Some(exe.clone()),
-            brain: Some(restore_dir.join("restore.r8")),
-            user_scope: false,
-        },
-    );
-    let source = migration::MigrationSource::Export {
-        path: export_file,
-        project: main.scope().unwrap().key().into(),
-    };
-    let preview = migration::preview_from(&restore, &source).await.unwrap();
-    migration::apply_from(&restore, &source, &preview.manifest_digest)
-        .await
-        .unwrap();
-    let recovered = restore.fetch(&[id]).await.unwrap().remove(0);
-    assert_eq!(recovered.content, saved.content);
-    assert_eq!(recovered.id, saved.id);
-    assert_eq!(
-        recovered.meta.as_ref().unwrap()["_synaps_repository"],
-        saved.meta.as_ref().unwrap()["_synaps_repository"]
-    );
-
     // Existing path-key records remain under their original identities. Explicit
     // operator linking exposes them, never copies or rewrites their provenance.
     let legacy = main.with_scope(ProjectScope::for_root(&worktree).unwrap());

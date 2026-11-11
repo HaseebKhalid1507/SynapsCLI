@@ -522,12 +522,11 @@ that the shelves did not fill, take it when such files exist.
 **Shared-repository update:** the host now uses one shared brain with durable Git
 repository scopes. Worktrees share repository memory; migration of existing path
 scopes is explicit. Context-head durability and capture consent remain independent.
-See [shared Axel repositories](shared-axel-repositories.md).
 
 
 The unified host service now covers explicit notes, eligible source archives,
 consented capture/recall, prior-session import, atomic legacy migration and memory
-retention. See [unified Axel backend](axel-host-backend.md). In Axel mode rollover
+retention. In Axel mode rollover
 projects source in memory and persists it directly in the same `.r8` database;
 short history tools never fall back to the legacy archive. The durable frontend
 head acknowledgement still gates further inference. Independent plugin/MCP memory
@@ -620,7 +619,7 @@ persistence and no second request at all after a failed save. This is not a new
 large live-context or cost/quality benchmark.
 
 The subsequent full backend integration resolves the independent notes/history/
-capture routing gaps; see [unified Axel backend](axel-host-backend.md). The earlier
+capture routing gaps. The earlier
 [source audit](../reviews/context-resume-axel-boundary.md) is historical, not the
 current implementation status. No global
 configuration, installed binary, plugin, external checkout or stored memories

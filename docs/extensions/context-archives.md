@@ -72,7 +72,7 @@ What this page covers:
   a project directory, a shelf or a file that is a link is refused by
   Synaps, and a reader must not follow one either. This is true of the
   archive store only. Other parts of Synaps that keep files under `<base>`
-  (the session journal, saved drafts, the source of a memory migration) do
+  (the session journal, saved drafts) do
   not follow a link on the way to their files and refuse such a base, so
   with a linked base archives are saved while those are not. And a base
   that is a link to a directory that is not there (a disk that is not
