@@ -277,6 +277,35 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **The automatic-memory config keys and extension context providers.**
+  The eleven keys `memory.default_mode`, `memory.default_mode_confirmed`,
+  `memory.recall_max_records`, `memory.recall_max_tokens`,
+  `memory.recall_timeout_ms`, `memory.capture_tools`,
+  `memory.capture_assistant`, `memory.capture_user`,
+  `memory.auto_consolidate`, `memory.local_embeddings` and `memory.gliner`
+  are removed keys now. A config that has any of them, with any value,
+  starts as before and gets one warning per start: `memory.default_mode,
+  memory.recall_* and memory.capture_* (and memory.auto_consolidate,
+  memory.local_embeddings, memory.gliner) are ignored: built-in automatic
+  memory was removed in 0.12.0; an extension provides capture and recall
+  through hooks. Remove these lines`. The old warning that asked for
+  `memory.default_mode_confirmed = true` is gone, and `/settings` refuses
+  to write one of these keys. `memory.backend`, `memory.user_scope` and
+  `memory.axel.*` are unchanged.
+  An extension manifest that declares `deferred.context_providers` or asks
+  for the permission `context_providers.register` still loads, and its
+  tools and hooks work; the declaration is not validated, grants nothing
+  and no longer decides when the extension starts (a manifest that
+  declared only a context provider used to wait for `/memory on`, which no
+  longer exists; it now starts like a manifest with an empty `deferred`
+  block). Loading it logs `extension <id> declares a context provider;
+  built-in automatic memory was removed in 0.12.0, the declaration is
+  ignored`. The host's context-provider catalog
+  (`extensions/context_provider.rs`) and the continuous-memory review
+  documents under `docs/reviews/` and `docs/decisions/` are deleted.
+  `/memory` now answers `/memory was removed in 0.12.0: automatic memory is
+  not built into Synaps any more; an extension provides it (Axel). Synaps
+  itself records nothing.`
 - **Built-in automatic memory (capture and recall) is out of the engine.**
   The runtime no longer holds a memory lease, asks a context provider for
   recalled text before a turn, or sends a finished turn or a compaction
@@ -303,9 +332,9 @@ All notable changes to this project will be documented in this file.
   unless switched on by hand. The model no longer has a `memory_context`
   tool (29 builtins; `docs/tools.json` regenerated). `/memory`, with any
   argument, now answers one line: `/memory was removed in 0.12.0: automatic
-  memory is provided by an extension now (Axel). Nothing was recording.`
-  `/settings` has no `memory.default_mode` row; the config key is still read
-  as before until the automatic-memory keys are removed.
+  memory is not built into Synaps any more; an extension provides it (Axel).
+  Synaps itself records nothing.` `/settings` has no `memory.default_mode`
+  row.
 
 - **Breaking: `synaps agent` and `synaps watcher` are gone.** The watcher
   supervisor and the headless agents it started (`~/.synaps-cli/watcher/<name>/`

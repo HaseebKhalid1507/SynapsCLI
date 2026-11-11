@@ -1,9 +1,11 @@
-//! Task F2 — consolidated host adversarial oracle suite (spec §20.5).
+//! Two host oracles that outlived built-in automatic memory: a note id from
+//! another project is indistinguishable from an unknown one, and a crashed
+//! host or plugin leaves no extension lease and no child process.
 //!
-//! This file names every §20.5 host threat. Where a resource-heavy or
-//! cross-repository oracle already exists, the corresponding test below is a
-//! lightweight cross-reference so the capped host run does not duplicate a
-//! 1 GiB allocation or weaken an existing assertion.
+//! The fixture manifest still declares a context provider and asks for
+//! `context_providers.register`: both are accepted and ignored, and the
+//! lease test below is the proof that such an extension still loads and
+//! that its tools still run.
 
 #[path = "support/hermetic_base_dir.rs"]
 mod hermetic_base_dir;
@@ -12,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_core::config::load_config_from_str;
 use agent_core::memory::store::{
     fetch_exact_in, store_record_in, MemoryProvenance, MemoryRetention, MemorySensitivity,
     NewMemoryRecord, ProjectScope,
@@ -155,16 +156,6 @@ fn foreign_project_id_probe_has_same_error_as_unknown_id() {
         foreign_probe,
         format!("memory record not found in this project scope: {foreign_id}")
     );
-}
-
-/// §20.5 bullet 3: a model cannot alter the durable config default: an
-/// unconfirmed setting is normalized back to `off`.
-#[tokio::test]
-async fn model_cannot_enable_durable_default_without_consent_session_only_remains_safe() {
-    hermetic_base_dir::pin();
-    let config = load_config_from_str("memory.default_mode = capture_and_recall\n");
-    assert_eq!(config.memory.default_mode, "off");
-    assert!(!config.memory.default_mode_confirmed);
 }
 
 /// §20.5 bullet 7: simulated host/plugin crash cleanup uses the production

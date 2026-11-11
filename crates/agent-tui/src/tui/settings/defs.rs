@@ -32,8 +32,7 @@ pub(crate) const TYPED_CYCLERS: &[&str] = &["cache_keepwarm"];
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     // Dead config: parsed by `load_config` but read by nothing (the shell
-    // tool is built from `ShellConfig::default()`; no runtime consumer of
-    // the continuous-memory policy fields). No row until a PR wires the key
+    // tool is built from `ShellConfig::default()`). No row until a PR wires the key
     // up — that PR must move it back to a row in `define_settings!`.
     ("shell.default_cols", NOT_READ_YET),
     ("shell.default_rows", NOT_READ_YET),
@@ -43,20 +42,9 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("shell.readiness_strategy", NOT_READ_YET),
     ("shell.readiness_timeout_ms", NOT_READ_YET),
     ("shell.max_readiness_timeout_ms", NOT_READ_YET),
-    ("memory.capture_user", NOT_READ_YET),
-    ("memory.capture_assistant", NOT_READ_YET),
-    ("memory.capture_tools", NOT_READ_YET),
-    ("memory.recall_max_records", NOT_READ_YET),
-    ("memory.recall_max_tokens", NOT_READ_YET),
-    ("memory.recall_timeout_ms", NOT_READ_YET),
-    ("memory.auto_consolidate", NOT_READ_YET),
-    ("memory.local_embeddings", NOT_READ_YET),
-    ("memory.gliner", NOT_READ_YET),
     ("auth.machine_token", "secret: never echoed in a TUI"),
     ("auth.remote_endpoint", "credential-broker wiring set by deployment, not a preference"),
     ("server.auto_approve_confirms", "security-sensitive: approves every extension confirm unasked"),
-    ("memory.default_mode", "built-in automatic memory is being removed: no row, the parser still reads it until the key goes"),
-    ("memory.default_mode_confirmed", "operator consent marker: must be set by hand"),
     ("subagent_max_concurrent", "legacy flat alias of subagent.max_concurrent (edit that row)"),
     ("subagent_max_total", "legacy flat alias of subagent.max_total (edit that row)"),
     ("favorite_models", "owned by the model picker (/models favorites)"),

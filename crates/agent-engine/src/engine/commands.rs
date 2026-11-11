@@ -638,7 +638,7 @@ pub fn trace_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
 /// sends it) gets this line instead of "unknown command".
 fn memory_removed_line() -> String {
     format!(
-        "/memory was removed in {}: automatic memory is provided by an extension now (Axel). Nothing was recording.",
+        "/memory was removed in {}: automatic memory is not built into Synaps any more; an extension provides it (Axel). Synaps itself records nothing.",
         agent_core::AXEL_BACKEND_REMOVED_IN
     )
 }
@@ -1508,7 +1508,7 @@ mod tests {
                 Some(CommandResult::Output(text)) => assert_eq!(
                     text,
                     format!(
-                        "/memory was removed in {}: automatic memory is provided by an extension now (Axel). Nothing was recording.",
+                        "/memory was removed in {}: automatic memory is not built into Synaps any more; an extension provides it (Axel). Synaps itself records nothing.",
                         agent_core::AXEL_BACKEND_REMOVED_IN
                     )
                 ),
