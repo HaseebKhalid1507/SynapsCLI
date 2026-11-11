@@ -252,8 +252,13 @@ What it means, and what it does not:
   window that names them is saved, and the chat has gone on in it. A
   rollover that is given up before that (the seal failed, the turn was
   cancelled, the new window could not be saved) sends nothing, so you are
-  not told about a window and then told again by the attempt that follows:
-  a `(session_id, window)` is announced by the one rollover that completed.
+  not told about a window and then told again by the attempt that follows.
+- **Key on `archive_id`, not on `(session_id, window)`.** While a chat
+  stays open, a `(session_id, window)` is announced by the one rollover
+  that completed. Across a resume it is not unique: a chat resumed in
+  another project, or while the archive its saved window names could not
+  be read, goes on at window 1, and its next rollover announces window 2
+  again, for other archives.
 - **The same `archive_id` can still arrive more than once:** two parts with
   identical content are one archive, an event is sent again if your process
   died while handling it, and a session file put back from a backup can

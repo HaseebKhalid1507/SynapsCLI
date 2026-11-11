@@ -313,6 +313,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context rollover: a resume whose archive lookup keeps failing is
+  settled by the next rollover, and is looked up once per turn.** A resumed
+  chat whose saved window names an archive that cannot be read (a damaged
+  file, not a missing one) goes on at window 1 and looks again at the next
+  turn. It looked twice at every turn start, and went on doing so after the
+  chat had rolled over, with a warning each time. A committed rollover now
+  settles the state, and the second lookup of a turn start, which repeated
+  the first for the same store, is gone. `docs/extensions/hooks.md` now
+  says that `(session_id, window)` is not unique across a resume (such a
+  chat announces window 2 again, for other archives): key on `archive_id`.
 - **Daemon: a restored chat's folder under a file is dropped as absent.**
   A saved folder whose path runs through something that is not a directory
   (a file where one of its parents was) cannot exist, but looking at it

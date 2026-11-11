@@ -1036,6 +1036,10 @@ impl PreparedRollover {
         }
         s.window = self.window;
         s.latest_archive = self.parts.last().map(|part| part.archive.id.clone());
+        // The state is now what this rollover made it, and nothing of a
+        // resumed head is left to restore: a lookup for one that kept
+        // failing ([`restore_window`]) is not made again.
+        s.initialized = true;
         s.policy.reset();
         s.note.clear();
         s.last_advisory = None;
@@ -1492,7 +1496,11 @@ fn look_up(binding: &MemoryBinding, id: &str) -> Lookup {
 ///   three it was.
 /// - The lookup failed for another reason (a busy store, something that
 ///   could not be read): nothing is settled. A warning says why, the chat
-///   goes on, and the next call looks again.
+///   goes on at window 1, and the next call looks again. That is once at
+///   each turn start, until a lookup answers or the chat rolls over: a
+///   committed rollover settles the state by itself
+///   ([`PreparedRollover::commit`]), with the window it made, numbered
+///   from where the chat then was.
 ///
 /// The lookup reads a file and can wait for a busy store, so the state lock
 /// is not held across it. A head that lists several parts
@@ -6713,6 +6721,49 @@ mod resume_tests {
         restore_window(&head, &state, &binding);
         assert_eq!(restored(&state), (Some(id), 2, true));
         assert_eq!(log.lines().len(), 2, "found: nothing more to say");
+    }
+
+    /// A lookup that fails for good (here something that is not a file under
+    /// the archive's name) was made again at every turn start for as long as
+    /// the chat lived, with a warning each time, also after the chat had
+    /// rolled over: the rollover wrote the window and the archive link into
+    /// the state and left it "not restored yet". A committed rollover now
+    /// settles it. The state is what the rollover made it, and no later call
+    /// looks anything up, whatever the new head names.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_committed_rollover_settles_a_resume_whose_lookup_kept_failing() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let _unreadable = make_unreadable(&binding, &parts[0].archive.id);
+
+        let log = Log::default();
+        let _capture = log.capture();
+        let state = chat_state();
+        restore_window(&head, &state, &binding);
+        assert_eq!(restored(&state), (None, 1, false), "nothing is settled");
+        assert_eq!(log.lines().len(), 1);
+
+        // The chat goes on at window 1 and rolls over.
+        let mut next = vec![head[0].clone()];
+        next.extend(window());
+        next.insert(2, Arc::new(json!({"role":"user","content":"And one more request."})));
+        let prepared = seal(&binding, &state, &next).await;
+        let sealed = prepared.parts.last().unwrap().archive.id.clone();
+        assert_ne!(sealed, parts[0].archive.id);
+        let new_head = prepared.commit(&state).unwrap();
+        let settled = (Some(sealed.clone()), 2, true);
+        assert_eq!(restored(&state), settled, "the rollover settles it");
+
+        // Nothing is looked up after that: not for the old head, and not
+        // for the new one, whose archive cannot be read either.
+        let _unreadable_too = make_unreadable(&binding, &sealed);
+        for head in [&head, &new_head, &new_head] {
+            restore_window(head, &state, &binding);
+            assert_eq!(restored(&state), settled);
+        }
+        assert_eq!(log.lines().len(), 1, "no lookup, so nothing more is said: {:?}", log.lines());
     }
 
     /// A head that lists the parts of a split window tells the model each of
