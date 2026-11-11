@@ -667,7 +667,7 @@ mod windows_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = listen_session_socket(path.clone(), queue.clone(), shutdown.clone());
         let mut lost = Vec::new();
-        for i in 0..50 {
+        for i in 0..200 {
             let event = Event::simple("test", &format!("event {i}"), Some(Severity::High));
             send_to_session_socket(&path, &serde_json::to_vec(&event).unwrap())
                 .await
