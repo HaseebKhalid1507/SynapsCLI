@@ -247,6 +247,9 @@ pub async fn try_route(
         tool_session_id,
         session_tool_set,
         None,
+        None,
+        None,
+        None,
         trace,
         suppress_stream_deltas,
     )
@@ -268,7 +271,9 @@ pub(crate) fn routed_wire_messages(
     super::continuation::wire_messages(messages)
 }
 
-/// Runtime route retaining the host's immutable memory binding. The public
+/// Runtime route retaining the host's immutable memory binding and the chat
+/// an extension-provided model's tool loop runs for (`conversation_id`,
+/// `cwd`, `hook_bus`; see [`crate::runtime::api::ApiOptions`]). The public
 /// compatibility facade above has no runtime capability and cannot mint one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_route_with_memory_backend(
@@ -290,6 +295,9 @@ pub(crate) async fn try_route_with_memory_backend(
     tool_session_id: Option<&crate::tools::activation::SessionId>,
     session_tool_set: Option<&crate::tools::activation::SharedSessionToolSet>,
     memory_backend: Option<&crate::memory_backend::MemoryBinding>,
+    conversation_id: Option<&str>,
+    cwd: Option<&std::path::Path>,
+    hook_bus: Option<&Arc<crate::extensions::hooks::HookBus>>,
     trace: &crate::runtime::trace::TraceContext,
     suppress_stream_deltas: bool,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
@@ -330,6 +338,9 @@ pub(crate) async fn try_route_with_memory_backend(
                     tool_session_id,
                     session_tool_set,
                     memory_backend,
+                    conversation_id,
+                    cwd,
+                    hook_bus,
                     trace,
                 )
                 .await,

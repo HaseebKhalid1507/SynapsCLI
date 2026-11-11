@@ -903,10 +903,14 @@ impl StreamMethods {
         // minting a fresh set.
         let mut options = options;
         options.session_tool_set = Some(std::sync::Arc::clone(&session_tool_set));
-        // That loop's tools are this chat's: they get the binding this
-        // stream's own tools get, so a memory tool there acts on the chat's
-        // project.
+        // That loop's tools are this chat's: they get the binding, folder,
+        // conversation id and hook bus this stream's own tools get, so they
+        // run in the chat's folder and act on the chat's project, and their
+        // hook events and `tool.call`s name the chat.
         options.memory_backend = Some(memory_backend.clone());
+        options.conversation_id = session_id.clone();
+        options.cwd = cwd.clone();
+        options.hook_bus = Some(hook_bus.clone());
         let options = options;
         // Host activation policy for MODEL-INITIATED `activate_tools`:
         // confirmation authority comes exclusively from host configuration
@@ -7560,6 +7564,96 @@ mod rich_output_tests {
                 hosts.search(query()).await.unwrap().is_empty(),
                 "nothing written to the host's project"
             );
+        }
+
+        /// What a tool's context says about who called it: the conversation,
+        /// its folder, and whether it was given a hook bus.
+        type Caller = (Option<String>, Option<PathBuf>, bool);
+        struct CallerProbe(Arc<std::sync::Mutex<Vec<Caller>>>);
+        #[async_trait::async_trait]
+        impl Tool for CallerProbe {
+            fn name(&self) -> &str {
+                "caller_probe"
+            }
+            fn description(&self) -> &str {
+                "records who its context says called it"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object","properties":{}})
+            }
+            fn origin(&self) -> crate::tools::ToolOrigin {
+                crate::tools::ToolOrigin::Builtin
+            }
+            fn effect(&self) -> crate::tools::catalog::ToolEffect {
+                crate::tools::catalog::ToolEffect::ReadOnly
+            }
+            async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+                self.0.lock().unwrap().push((
+                    ctx.capabilities.session_id.clone(),
+                    ctx.capabilities.cwd.clone(),
+                    ctx.capabilities.hook_bus.is_some(),
+                ));
+                Ok("probed".to_string())
+            }
+        }
+
+        /// The loop's tools run in the chat's folder (a relative path names
+        /// the chat's file), their context names the chat, and so do the
+        /// hooks around them. None of it is the host process's folder.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn its_tools_run_in_the_chats_folder_and_its_hooks_name_the_chat() {
+            let _base = BaseDirGuard::new();
+            let chat = tempfile::tempdir().unwrap();
+            let process = std::env::current_dir().unwrap();
+            assert_ne!(chat.path(), process.as_path());
+            // Only the chat's folder holds this file.
+            std::fs::write(chat.path().join("where.txt"), "IN_THE_CHATS_FOLDER").unwrap();
+            assert!(!process.join("where.txt").exists());
+
+            let bus = Arc::new(HookBus::new());
+            let hooks = Arc::new(WhoProbe(Default::default()));
+            for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
+                let mut perms = PermissionSet::new();
+                perms.grant(kind.required_permission());
+                bus.subscribe(kind, hooks.clone(), None, None, perms)
+                    .await
+                    .unwrap();
+            }
+            let callers = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let results = turn(
+                vec![
+                    call("call-1", "read", json!({"path": "where.txt"})),
+                    call("call-2", "caller_probe", json!({})),
+                ],
+                vec![Arc::new(CallerProbe(callers.clone()))],
+                bus,
+                |session| {
+                    session.session_id = Some("chat-A".into());
+                    session.cwd = Some(chat.path().to_path_buf());
+                },
+            )
+            .await;
+
+            assert_eq!(results.len(), 2, "{results:?}");
+            assert_eq!(results[0].get("is_error"), None, "{results:?}");
+            assert!(
+                results[0]["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("IN_THE_CHATS_FOLDER")),
+                "read ran in the chat's folder: {results:?}"
+            );
+            assert_eq!(
+                *callers.lock().unwrap(),
+                vec![(Some("chat-A".to_string()), Some(chat.path().to_path_buf()), true)]
+            );
+            let folder = chat.path().to_str().map(str::to_string);
+            let events = hooks.0.lock().unwrap().clone();
+            assert_eq!(events.len(), 4, "before and after, for both calls: {events:?}");
+            for (kind, session_id, cwd) in events {
+                assert_eq!(session_id.as_deref(), Some("chat-A"), "{kind:?}");
+                assert_eq!(cwd, folder, "{kind:?}: the process folder is {process:?}");
+            }
         }
     }
 

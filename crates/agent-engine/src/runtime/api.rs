@@ -838,6 +838,15 @@ pub struct ApiOptions {
     /// sets the runtime's. `None` (keep-warm pings, compaction, tests): the
     /// memory tools in that loop refuse rather than guess a project.
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
+    /// The chat that loop's tool calls belong to: its conversation id
+    /// (`ToolCapabilities.session_id`; `None` for a worker), the folder its
+    /// tools run in (`None` = the process folder, which under the daemon is
+    /// the daemon's) and its hook bus. Installed with `memory_backend`, from
+    /// the same sources, and `None` wherever it is: that loop's tools then
+    /// run in the process folder, for no conversation.
+    pub conversation_id: Option<String>,
+    pub cwd: Option<std::path::PathBuf>,
+    pub hook_bus: Option<Arc<crate::extensions::hooks::HookBus>>,
     /// Opt into the 1M context window beta header.
     pub use_1m_context: bool,
     /// Configured prompt-cache TTL (spec: cache-ttl). Resolved to a wire
@@ -1286,6 +1295,9 @@ impl ApiMethods {
                     options.tool_session_id.as_ref(),
                     options.session_tool_set.as_ref(),
                     options.memory_backend.as_ref(),
+                    options.conversation_id.as_deref(),
+                    options.cwd.as_deref(),
+                    options.hook_bus.as_ref(),
                     &options.trace,
                     options.suppress_stream_deltas,
                 )

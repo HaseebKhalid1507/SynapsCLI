@@ -132,6 +132,9 @@ impl ApiMethods {
             options.tool_session_id.as_ref(),
             options.session_tool_set.as_ref(),
             options.memory_backend.as_ref(),
+            options.conversation_id.as_deref(),
+            options.cwd.as_deref(),
+            options.hook_bus.as_ref(),
             &options.trace,
             options.suppress_stream_deltas,
         )
@@ -632,6 +635,9 @@ impl ApiMethods {
             None,
             None,
             options.memory_backend.as_ref(),
+            options.conversation_id.as_deref(),
+            options.cwd.as_deref(),
+            options.hook_bus.as_ref(),
             &options.trace,
             options.suppress_stream_deltas,
         )

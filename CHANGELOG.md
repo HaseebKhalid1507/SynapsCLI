@@ -69,8 +69,8 @@ All notable changes to this project will be documented in this file.
   `cwd`. Ids only, no content. Notify-only like `on_context_archived`: the
   tool's result and timing never depend on an extension, and a forget that
   failed is not announced. Sent with both memory backends. Not sent for a
-  forget made by a subagent worker, by an extension-provided model's tool
-  loop or by `synaps retention`; the tombstone on disk is the record.
+  forget made by a subagent worker or by `synaps retention`; the tombstone
+  on disk is the record.
 
 ### Changed
 
@@ -302,6 +302,16 @@ All notable changes to this project will be documented in this file.
   memory backend. With `memory.backend = axel` the `forum_*` tools, which
   refused there for want of a project, work for the same reason. A memory
   tool run with no project at all now refuses instead of guessing one.
+- **Daemon: tools called by an extension-provided model run in the chat's
+  folder.** A model served by an extension (`plugin:provider:model`) runs its
+  tool calls in a loop of its own, and that loop did not know the chat. In a
+  daemon-hosted chat its tools resolved relative paths and started commands
+  in the daemon's folder, and the `before_tool_call` / `after_tool_call`
+  events and `tool.call` requests they caused carried `session_id: null` and
+  the daemon's folder as `cwd`. They now run in the chat's folder and name
+  the chat and its folder, and a `memory_forget` there is announced with
+  `on_memory_forgotten`. Without the daemon the folders were already the
+  same; there only `session_id` changes, from `null` to the chat's id.
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
   program names: a stock Windows has no `grep` or `ls` ("program not
   found"), and `find` resolved to `System32\find.exe`, an unrelated string

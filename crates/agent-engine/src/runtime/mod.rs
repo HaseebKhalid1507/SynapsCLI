@@ -4446,8 +4446,12 @@ impl Runtime {
                 self.api_retries,
                 &api::ApiOptions {
                     // An extension-provided model's own tool loop acts on
-                    // this runtime's project, like the tool calls below.
+                    // this runtime's project and runs for its conversation
+                    // and folder, like the tool calls below.
                     memory_backend: Some(self.memory_backend.clone()),
+                    conversation_id: self.session_id.clone(),
+                    cwd: self.cwd.clone(),
+                    hook_bus: Some(self.hook_bus.clone()),
                     use_1m_context: self.context_window_override == Some(1_000_000),
                     cache_ttl: self.cache_ttl,
                     ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
@@ -5032,9 +5036,13 @@ impl Runtime {
         let capture_state = self.memory_context_state.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
-            // Placeholder: the stream loop installs the binding its own
-            // tools get before the first provider round.
+            // Placeholders: the stream loop installs the binding, conversation
+            // id, folder and hook bus its own tools get before the first
+            // provider round.
             memory_backend: None,
+            conversation_id: None,
+            cwd: None,
+            hook_bus: None,
             use_1m_context: self.context_window_override == Some(1_000_000),
             cache_ttl: self.cache_ttl,
             ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),

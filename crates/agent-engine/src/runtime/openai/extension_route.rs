@@ -48,6 +48,13 @@ fn local_gate_session() -> crate::tools::activation::SessionId {
 /// identity (Task 16) scoping the execution gate inside the interior tool
 /// loop; `None` (internal/sync callers) fails closed to a locally minted
 /// identity with the same default-core policy.
+///
+/// `memory_backend`, `conversation_id`, `cwd` and `tool_hook_bus` are the
+/// chat that loop's tool calls belong to, as the stream loop hands them to
+/// its own tools: the tools run in `cwd` and act on that binding's project,
+/// and the hook events and `tool.call`s they cause name the conversation and
+/// the folder. `None` (internal callers) = no conversation, the process
+/// folder, no notify-only events.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn route_extension_provider(
     manager: Arc<tokio::sync::RwLock<ExtensionManager>>,
@@ -66,6 +73,9 @@ pub(crate) async fn route_extension_provider(
     tool_session_id: Option<&crate::tools::activation::SessionId>,
     session_tool_set: Option<&crate::tools::activation::SharedSessionToolSet>,
     memory_backend: Option<&crate::memory_backend::MemoryBinding>,
+    conversation_id: Option<&str>,
+    cwd: Option<&std::path::Path>,
+    tool_hook_bus: Option<&Arc<crate::extensions::hooks::HookBus>>,
     trace: &crate::runtime::trace::TraceContext,
 ) -> RouteResult {
     let provider_runtime_id = format!("{}:{}", plugin_id, provider_id);
@@ -355,14 +365,16 @@ pub(crate) async fn route_extension_provider(
                         mcp_leases: None,
                         extension_leases: None,
                         memory_context: None,
-                        cwd: None,
+                        // The chat's folder: where these tools resolve paths
+                        // and start commands.
+                        cwd: cwd.map(std::path::Path::to_path_buf),
                         env: None,
                         env_stripped: Vec::new(),
                         env_warned: Default::default(),
-                        session_id: None,
-                        // This loop knows neither the chat nor its folder, so
-                        // a tool's notify-only event would name the host's.
-                        hook_bus: None,
+                        session_id: conversation_id.map(str::to_string),
+                        // The chat's bus, not the manager's: a worker's view
+                        // sends no notify-only event, here as in its stream.
+                        hook_bus: tool_hook_bus.cloned(),
                     },
                     limits: ToolLimits {
                         max_tool_output: 30000,

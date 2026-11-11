@@ -255,7 +255,9 @@ pub async fn execute_provider_tool_use(
 
     let runtime_name = authorized.runtime_name().to_string();
     let input = registry.translate_input_for_api_tool(&tool_name, input);
-    // The folder this call runs in, kept for the hook after `ctx` is spent.
+    // Whose call this is and the folder it runs in, kept for the hook after
+    // `ctx` is spent.
+    let session_id = ctx.capabilities.session_id.clone();
     let cwd = ctx.capabilities.cwd.clone();
     let decision = crate::runtime::resolve_before_tool_call_decision(
         input.clone(),
@@ -264,9 +266,9 @@ pub async fn execute_provider_tool_use(
             &tool_name,
             Some(&runtime_name),
             input.clone(),
-            // Extension-originated tool.invoke: no owning conversation on this
-            // path (ToolContext carries none) → `null`, as before.
-            None,
+            // The conversation the extension-provided model answers for
+            // (`null` for a worker, or a context that names none).
+            session_id.as_deref(),
             cwd.as_deref(),
         )
         .await,
@@ -302,7 +304,7 @@ pub async fn execute_provider_tool_use(
         input_for_hook,
         result,
         max_tool_output,
-        None,
+        session_id.as_deref(),
         cwd.as_deref(),
     )
     .await;

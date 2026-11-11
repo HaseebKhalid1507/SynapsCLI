@@ -108,6 +108,12 @@ pub struct HandlerRegistration {
     pub permissions: PermissionSet,
 }
 
+impl std::fmt::Debug for HookBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookBus").finish_non_exhaustive()
+    }
+}
+
 /// The central hook dispatcher.
 ///
 /// Thread-safe: uses `RwLock` so multiple concurrent emitters can read
