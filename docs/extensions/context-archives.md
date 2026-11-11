@@ -774,6 +774,10 @@ What to know before you rely on it:
 - **A record that names another project is moved, not shared.** Chats find
   an archive by project: after `--cwd` or `--project-key`, only chats of
   that project can fetch it, under the same `ctx-<id>`.
+- **The base directory must be there.** It is `SYNAPS_BASE_DIR`, or
+  `~/.synaps-cli`, and the document prints it as `base`. The command stops
+  (exit code 2) when it is not an absolute path, and a real run stops when
+  it does not exist: an import does not create a base.
 - **A refused record leaves no directory behind:** a project directory is
   made when the first record for it is stored.
 - **The longest line is 16 MiB and 4 KiB.** A longer one is refused without

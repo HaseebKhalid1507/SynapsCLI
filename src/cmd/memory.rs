@@ -693,6 +693,40 @@ fn print<T: Serialize>(document: &T) -> bool {
     out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_ok()
 }
 
+/// The base an import files under: `SYNAPS_BASE_DIR`, or `.synaps-cli` in
+/// the home folder. It must be an absolute path: an empty variable, or no
+/// home folder, would otherwise file notes under the folder the command
+/// happens to run in. A real run creates no base: a mistyped one is not
+/// made and filled. A dry run goes on without one and says so.
+fn import_base(dry_run: bool) -> Result<PathBuf, String> {
+    if std::env::var_os("SYNAPS_BASE_DIR").is_some_and(|value| value.to_str().is_none()) {
+        return Err("SYNAPS_BASE_DIR is not UTF-8; nothing was imported".to_owned());
+    }
+    let base = agent_core::config::base_dir();
+    if !base.is_absolute() {
+        return Err(format!(
+            "the base directory \"{}\" is not an absolute path (is SYNAPS_BASE_DIR empty or \
+             relative, or HOME not set?); nothing was imported",
+            base.display()
+        ));
+    }
+    if !base.is_dir() {
+        if !dry_run {
+            return Err(format!(
+                "the base directory {} does not exist or is not a directory, and an import \
+                 does not create it; nothing was imported",
+                base.display()
+            ));
+        }
+        eprintln!(
+            "synaps memory: the base directory {} does not exist or is not a directory; \
+             the real run would stop",
+            base.display()
+        );
+    }
+    Ok(base)
+}
+
 fn import<I: Importer>(
     command: &'static str,
     args: ImportArgs,
@@ -705,7 +739,10 @@ fn import<I: Importer>(
     if args.files.iter().filter(|path| path.as_os_str() == "-").count() > 1 {
         return usage("standard input (-) can be named once");
     }
-    let base = agent_core::config::base_dir();
+    let base = match import_base(args.dry_run) {
+        Ok(base) => base,
+        Err(message) => return usage(&message),
+    };
     let mut report = Report {
         command,
         dry_run: args.dry_run,

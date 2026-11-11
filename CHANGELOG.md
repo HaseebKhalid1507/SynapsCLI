@@ -27,7 +27,9 @@ All notable changes to this project will be documented in this file.
   `forgets_not_complete`), 2 when the run stopped or the command line could
   not be used. `--dry-run`
   writes nothing (no directory, no lock file, no mode) and prints what the
-  real run prints. A real `import-notes` holds `memory/.import.lock` for the
+  real run prints. The base (`SYNAPS_BASE_DIR`, or `~/.synaps-cli`) must be
+  an absolute path, and a real run does not create it: an empty
+  `SYNAPS_BASE_DIR` or a base that is not there is exit code 2. A real `import-notes` holds `memory/.import.lock` for the
   whole run and a second one stops with "another import is running"; a
   note tombstone that could not be applied is counted and named
   (`tombstones_not_applied`); under `--as-recorded` its id is looked for in

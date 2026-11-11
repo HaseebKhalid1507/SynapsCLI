@@ -40,12 +40,18 @@ struct Env {
 impl Env {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        for dir in ["home", "work"] {
+        for dir in ["home", "work", "base"] {
             std::fs::create_dir(tmp.path().join(dir)).unwrap();
         }
         Self { tmp }
     }
-    /// Not created: a run that makes it is seen.
+    /// With no base directory: a run that makes it is seen.
+    fn without_base() -> Self {
+        let env = Self::new();
+        std::fs::remove_dir(env.base()).unwrap();
+        env
+    }
+    /// Empty until a real run: whatever a run makes in it is seen.
     fn base(&self) -> PathBuf {
         self.tmp.path().join("base")
     }
@@ -245,7 +251,6 @@ fn t_a11_the_command() {
     let dry = env.run(&["import-archives", &file, "--as-recorded", "--dry-run"]);
     assert_eq!(dry.code, 0, "{}{}", dry.stdout, dry.stderr);
     assert_eq!(env.listing(), before, "a dry run wrote something");
-    assert!(!env.base().exists());
     assert_eq!(dry.doc["dry_run"], true);
 
     let real = env.run(&["import-archives", &file, "--as-recorded"]);
@@ -534,6 +539,78 @@ fn t_a15_the_destination() {
     );
 }
 
+/// core-a5-review finding 3.
+#[test]
+fn the_base_is_an_absolute_path_and_a_real_run_does_not_create_it() {
+    let env = Env::new();
+    let archives = env.file("records.jsonl", &lines(&sealed("base", 1)));
+    let notes = env.file("notes.jsonl", &[note("mem-1", KEY, "one")]);
+    let before = env.listing();
+    // The command runs in `work`: a relative base would land there.
+    type Change = fn(&mut Command);
+    let cases: [(&str, Change); 4] = [
+        ("an empty SYNAPS_BASE_DIR", |command| {
+            command.env("SYNAPS_BASE_DIR", "");
+        }),
+        ("a relative SYNAPS_BASE_DIR", |command| {
+            command.env("SYNAPS_BASE_DIR", "base");
+        }),
+        ("no SYNAPS_BASE_DIR and no HOME", |command| {
+            command.env_remove("SYNAPS_BASE_DIR").env_remove("HOME").env_remove("USERPROFILE");
+        }),
+        ("a SYNAPS_BASE_DIR that is not UTF-8", |command| {
+            use std::os::unix::ffi::OsStrExt;
+            command.env("SYNAPS_BASE_DIR", std::ffi::OsStr::from_bytes(b"/tmp/\xff"));
+        }),
+    ];
+    for (name, change) in cases {
+        for (action, file) in [("import-archives", &archives), ("import-notes", &notes)] {
+            for dry_run in [true, false] {
+                let mut args = vec![action, file.as_str(), "--project-key", KEY];
+                if dry_run {
+                    args.push("--dry-run");
+                }
+                let mut command = env.command(&args);
+                change(&mut command);
+                let run = finish(command, None);
+                assert_eq!(run.code, 2, "{name}, {action}: {}{}", run.stdout, run.stderr);
+                assert!(run.stdout.is_empty(), "{name}, {action}: {}", run.stdout);
+                assert!(run.stderr.contains("nothing was imported"), "{name}: {}", run.stderr);
+                assert_eq!(env.listing(), before, "{name}, {action}: something was written");
+            }
+        }
+    }
+
+    // A base that is not there, and one that is a file: the dry run reports
+    // what it would do and says that the real run would stop; the real run
+    // stops and makes nothing.
+    let no_base = Env::without_base();
+    let a_file = Env::without_base();
+    std::fs::write(a_file.base(), "").unwrap();
+    for env in [&no_base, &a_file] {
+        let archives = env.file("records.jsonl", &lines(&sealed("base", 1)));
+        let notes = env.file("notes.jsonl", &[note("mem-1", KEY, "one")]);
+        let before = env.listing();
+        for (action, file) in [("import-archives", &archives), ("import-notes", &notes)] {
+            let real = env.run(&[action, file, "--project-key", KEY]);
+            assert_eq!(real.code, 2, "{action}: {}{}", real.stdout, real.stderr);
+            assert!(real.stdout.is_empty(), "{}", real.stdout);
+            assert!(real.stderr.contains("does not create it"), "{}", real.stderr);
+            assert_eq!(env.listing(), before, "{action}: a real run made the base");
+        }
+    }
+    for (action, file) in [("import-archives", &archives), ("import-notes", &notes)] {
+        let file = no_base.work().join(Path::new(file).file_name().unwrap());
+        let before = no_base.listing();
+        let dry = no_base.run(&[action, file.to_str().unwrap(), "--project-key", KEY, "--dry-run"]);
+        assert_eq!(dry.code, 0, "{action}: {}{}", dry.stdout, dry.stderr);
+        assert_eq!(dry.totals(), [1, 1, 0, 0, 0, 0]);
+        assert_eq!(dry.doc["base"], no_base.base().to_str().unwrap());
+        assert!(dry.stderr.contains("the real run would stop"), "{}", dry.stderr);
+        assert_eq!(no_base.listing(), before, "{action}: a dry run made something");
+    }
+}
+
 #[test]
 fn a_line_over_the_size_limit_is_refused_and_the_run_goes_on() {
     let records = sealed("long", 2);
@@ -725,7 +802,6 @@ fn notes_a_dry_run_then_the_real_run_then_the_same_again() {
     let dry = env.run(&["import-notes", file, "--project-key", KEY, "--dry-run"]);
     assert_eq!(dry.code, 0, "{}{}", dry.stdout, dry.stderr);
     assert_eq!(env.listing(), before, "a dry run wrote something");
-    assert!(!env.base().exists());
 
     let real = env.run(&["import-notes", file, "--project-key", KEY]);
     assert_eq!(real.code, 0, "{}{}", real.stdout, real.stderr);
