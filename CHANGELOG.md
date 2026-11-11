@@ -86,6 +86,12 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Context archives: the store's record check names the check that
+  failed** (version, scope, id, logical, digest, a per-archive limit,
+  `source_index` order, digest of the content, a tombstone with
+  `created_ms`), for the archive import that is built on it. Internal: a
+  read still answers `invalid archive record` for every one of them, and
+  what is read and refused is unchanged.
 - **`synaps retention sweep --max-disk-bytes N` no longer deletes saved notes
   unless `--include-notes` is given (plain-file memory).** When the budget
   was still exceeded after the derived indexes and the oldest sessions,

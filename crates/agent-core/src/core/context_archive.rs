@@ -694,6 +694,91 @@ impl Unread {
     }
 }
 
+/// The check a record failed ([`ArchiveStore::check`]). A read does not say
+/// which: every one of them is `invalid archive record` to it
+/// ([`Fault::into_read_error`]). It prints as a reason that names the check
+/// and holds nothing of the record but its version number and digests.
+#[derive(Debug)]
+enum Fault {
+    /// Not JSON, or not exactly a record: a field missing, unknown or of
+    /// the wrong type.
+    Parse(serde_json::Error),
+    Version(u32),
+    /// Not the scope of the directory it is in.
+    Scope,
+    Id,
+    Logical,
+    Digest,
+    /// On a shelf, under a file name that is not its id.
+    Name,
+    /// More messages, a higher source count or a longer note than one
+    /// archive holds.
+    Limit,
+    /// A `source_index` that does not grow, or is not below the count.
+    Order,
+    /// The digest in the record is not the digest of its content.
+    Mismatch { record: String, content: String },
+    /// A tombstone that says when it was written.
+    TombstoneCreated,
+    /// The messages do not serialize within a segment's size.
+    Size(io::Error),
+}
+
+impl Fault {
+    /// What a read reports: one error for every failed check, as before the
+    /// checks had names. The messages being over a segment's size is the
+    /// error it always was.
+    fn into_read_error(self) -> io::Error {
+        match self {
+            Fault::Size(error) => error,
+            _ => corrupt(),
+        }
+    }
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // serde's own text can quote what it read: only the kind of
+            // failure and where it is are taken from it.
+            Fault::Parse(error) => {
+                let text = error.to_string();
+                let what = match error.classify() {
+                    serde_json::error::Category::Data if text.starts_with("unknown field") => {
+                        "an unknown field"
+                    }
+                    serde_json::error::Category::Data if text.starts_with("missing field") => {
+                        "a field is missing"
+                    }
+                    serde_json::error::Category::Data if text.starts_with("duplicate field") => {
+                        "a field is there twice"
+                    }
+                    serde_json::error::Category::Data if text.starts_with("unknown variant") => {
+                        "an unknown state"
+                    }
+                    serde_json::error::Category::Data => "a field of the wrong type",
+                    serde_json::error::Category::Eof => "the JSON ends early",
+                    _ => "not JSON",
+                };
+                write!(f, "not an archive record: {what} (column {})", error.column())
+            }
+            Fault::Version(version) => write!(f, "version {version} is not supported"),
+            Fault::Scope => f.write_str("scope is not this project's"),
+            Fault::Id => f.write_str("invalid id"),
+            Fault::Logical => f.write_str("invalid logical"),
+            Fault::Digest => f.write_str("invalid digest"),
+            Fault::Name => f.write_str("file name is not the record's id"),
+            Fault::Limit => f.write_str("over a per-archive limit"),
+            Fault::Order => f.write_str("source_index out of order"),
+            Fault::Mismatch { record, content } => {
+                write!(f, "digest does not match content (record {record}, content {content})")
+            }
+            Fault::TombstoneCreated => f.write_str("a tombstone carries no created_ms"),
+            Fault::Size(_) => f.write_str("over the 16 MiB archive size"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
@@ -1868,45 +1953,75 @@ impl ArchiveStore {
     }
 
     /// Parse and validate the contents of the segment file `name`. Anything
-    /// that is not a whole record of this scope is `InvalidData`.
+    /// that is not a whole record of this scope is `InvalidData`, whichever
+    /// check it failed ([`Fault`]): a reader is told that much and no more.
     fn record(&self, name: &str, raw: &[u8]) -> io::Result<Record> {
-        let record: Record = serde_json::from_slice(raw).map_err(|_| corrupt())?;
-        if record.version != 1
-            || record.scope != self.scope
-            || record.logical.len() != 64
-            || !record.logical.bytes().all(|b| b.is_ascii_hexdigit())
-            || validate_id(&record.id).is_err()
-            || record.digest.len() != 64
-            || !record.digest.bytes().all(|b| b.is_ascii_hexdigit())
-            // A shelf file is named by its id; only a legacy slot is not.
-            || (name != archive_name(&record.id) && slot_number(name).is_none())
-            // A tombstone is what names the record and nothing else.
-            || (matches!(record.body, Body::Tombstone) && record.created_ms.is_some())
-        {
-            return Err(corrupt());
+        Self::parsed(&self.scope, name, raw).map_err(Fault::into_read_error)
+    }
+
+    /// [`record`](Self::record), saying which check failed.
+    fn parsed(scope: &str, name: &str, raw: &[u8]) -> Result<Record, Fault> {
+        let record: Record = serde_json::from_slice(raw).map_err(Fault::Parse)?;
+        Self::check(scope, &record, name)?;
+        Ok(record)
+    }
+
+    /// Whether `record`, read from the file `name` of the project directory
+    /// `scope`, is one the store reads, and if not, the first check it
+    /// fails. The one place that decides it.
+    fn check(scope: &str, record: &Record, name: &str) -> Result<(), Fault> {
+        let hex = |text: &str| text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit());
+        if record.version != 1 {
+            return Err(Fault::Version(record.version));
         }
-        if let Body::Live {
+        if record.scope != scope {
+            return Err(Fault::Scope);
+        }
+        if validate_id(&record.id).is_err() {
+            return Err(Fault::Id);
+        }
+        if !hex(&record.logical) {
+            return Err(Fault::Logical);
+        }
+        if !hex(&record.digest) {
+            return Err(Fault::Digest);
+        }
+        // A shelf file is named by its id; only a legacy slot is not.
+        if name != archive_name(&record.id) && slot_number(name).is_none() {
+            return Err(Fault::Name);
+        }
+        let Body::Live {
             messages,
             source_message_count,
             note,
         } = &record.body
+        else {
+            // A tombstone is what names the record and nothing else.
+            return match record.created_ms {
+                Some(_) => Err(Fault::TombstoneCreated),
+                None => Ok(()),
+            };
+        };
+        if messages.len() > MAX_MESSAGES
+            || *source_message_count > MAX_MESSAGES
+            || note.len() > MAX_NOTE_BYTES
         {
-            if messages.len() > MAX_MESSAGES
-                || *source_message_count > MAX_MESSAGES
-                || note.len() > MAX_NOTE_BYTES
-                || messages
-                    .iter()
-                    .any(|m| m.source_index >= *source_message_count)
-                || messages
-                    .windows(2)
-                    .any(|m| m[0].source_index >= m[1].source_index)
-                || projection_digest(&record.logical, *source_message_count, messages)?
-                    != record.digest
-            {
-                return Err(corrupt());
-            }
+            return Err(Fault::Limit);
         }
-        Ok(record)
+        if messages.iter().any(|m| m.source_index >= *source_message_count)
+            || messages.windows(2).any(|m| m[0].source_index >= m[1].source_index)
+        {
+            return Err(Fault::Order);
+        }
+        let content = projection_digest(&record.logical, *source_message_count, messages)
+            .map_err(Fault::Size)?;
+        if content != record.digest {
+            return Err(Fault::Mismatch {
+                record: record.digest.clone(),
+                content,
+            });
+        }
+        Ok(())
     }
 
     /// The legacy slot that holds the projection `digest`, live or forgotten:
@@ -8122,6 +8237,84 @@ mod tests {
         for stray in strays {
             assert_eq!(std::fs::read(&stray).unwrap(), b"stray", "{stray:?}");
         }
+    }
+
+    /// A-1: validation says which check a record failed, and a read still
+    /// says `invalid archive record` for every one of them.
+    #[test]
+    fn a_failed_check_has_a_name_and_a_read_does_not_say_it() {
+        let (_tmp, store) = setup();
+        let id = "0123456789abcdef0123456789abcdef";
+        let name = archive_name(id);
+        let bytes = |change: &dyn Fn(&mut Record)| {
+            record_bytes(&store, id, &[msg("user", json!("a")), msg("user", json!("b"))], change)
+        };
+        let swap = |record: &mut Record| {
+            if let Body::Live { messages, .. } = &mut record.body {
+                messages.swap(0, 1);
+            }
+        };
+        let many = |record: &mut Record| {
+            if let Body::Live { source_message_count, .. } = &mut record.body {
+                *source_message_count = MAX_MESSAGES + 1;
+            }
+        };
+        let long = |record: &mut Record| {
+            if let Body::Live { note, .. } = &mut record.body {
+                *note = "n".repeat(MAX_NOTE_BYTES + 1);
+            }
+        };
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (bytes(&|record| record.version = 2), "version 2 is not supported"),
+            (bytes(&|record| record.scope = "0".repeat(64)), "scope is not this project's"),
+            (bytes(&|record| record.id = id.to_uppercase()), "invalid id"),
+            (bytes(&|record| record.logical = "z".repeat(64)), "invalid logical"),
+            (bytes(&|record| record.digest.truncate(63)), "invalid digest"),
+            (bytes(&|record| record.id = "f".repeat(32)), "file name is not the record's id"),
+            (bytes(&many), "over a per-archive limit"),
+            (bytes(&long), "over a per-archive limit"),
+            (bytes(&swap), "source_index out of order"),
+            (
+                bytes(&|record| {
+                    record.body = Body::Tombstone;
+                    record.created_ms = Some(1);
+                }),
+                "a tombstone carries no created_ms",
+            ),
+            (b"{\"version\":1".to_vec(), "not an archive record: the JSON ends early (column 12)"),
+            (b"not json".to_vec(), "not an archive record: not JSON (column 2)"),
+        ];
+        for (raw, reason) in cases {
+            let fault = ArchiveStore::parsed(&store.scope, &name, &raw).err().expect(reason);
+            assert_eq!(fault.to_string(), reason);
+            let error = store.record(&name, &raw).err().expect(reason);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{reason}");
+            assert_eq!(error.to_string(), "invalid archive record", "{reason}");
+        }
+        // The digests of a mismatch are named, and nothing else of the record.
+        let other = digest_of("something else");
+        let raw = bytes(&|record| record.digest = other.clone());
+        let reason = ArchiveStore::parsed(&store.scope, &name, &raw).err().unwrap().to_string();
+        let prefix = format!("digest does not match content (record {other}, content ");
+        assert!(reason.starts_with(&prefix), "{reason}");
+        assert_eq!(reason.len(), prefix.len() + 64 + 1);
+        assert_eq!(store.record(&name, &raw).err().unwrap().to_string(), "invalid archive record");
+        // What serde read is never quoted: an unknown field's name, a value.
+        let mut unknown: Value = serde_json::from_slice(&bytes(&|_| {})).unwrap();
+        unknown["private words"] = json!("more private words");
+        let raw = serde_json::to_vec(&unknown).unwrap();
+        let reason = ArchiveStore::parsed(&store.scope, &name, &raw).err().unwrap().to_string();
+        assert!(reason.starts_with("not an archive record: an unknown field (column "), "{reason}");
+        assert!(!reason.contains("private"), "{reason}");
+        let mut wrong: Value = serde_json::from_slice(&bytes(&|_| {})).unwrap();
+        wrong["version"] = json!("private words");
+        let raw = serde_json::to_vec(&wrong).unwrap();
+        let reason = ArchiveStore::parsed(&store.scope, &name, &raw).err().unwrap().to_string();
+        assert!(reason.starts_with("not an archive record: a field of the wrong type"), "{reason}");
+        assert!(!reason.contains("private"), "{reason}");
+        // A valid record passes, on a shelf name and in a slot.
+        assert!(ArchiveStore::parsed(&store.scope, &name, &bytes(&|_| {})).is_ok());
+        assert!(ArchiveStore::parsed(&store.scope, "000.json", &bytes(&|_| {})).is_ok());
     }
 }
 
