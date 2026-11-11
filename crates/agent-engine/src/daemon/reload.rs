@@ -873,18 +873,53 @@ pub(crate) async fn send_reload_aborted(h: &SessionHandle, budget: Duration) -> 
 /// while the socket waits. A session restored Parked runs it only once it
 /// is unparked.
 ///
-/// A folder that is no longer there is dropped, as the pinned restore drops
-/// it (`pins::restore_one`): the chat then runs in the daemon's folder and
-/// its project. Kept, the dead path gave the chat no project at all:
-/// discovery fails on a path it cannot resolve, the memory tools answer
-/// "host project scope unavailable" and the next rollover cannot seal.
-fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle) -> SessionConfig {
+/// A folder that is no longer there is dropped ([`restorable_folder`]), as
+/// the pinned restore drops it (`pins::restore_one`): the chat `chat` then
+/// runs in the daemon's folder and its project. Kept, the dead path gave
+/// the chat no project at all: discovery fails on a path it cannot resolve,
+/// the memory tools answer "host project scope unavailable" and the next
+/// rollover cannot seal.
+fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle, chat: &str) -> SessionConfig {
     SessionConfig {
         await_extensions: false,
         restore_parked: matches!(lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking),
-        cwd: saved.cwd.clone().filter(|folder| folder.is_dir()),
+        cwd: restorable_folder(saved.cwd.clone(), chat),
         ..saved.clone()
     }
+}
+
+/// The folder a chat is restored in, by a reload or as a pinned session:
+/// `folder` as saved, or `None` when it is gone, and the chat then runs in
+/// the daemon's folder and that folder's project.
+///
+/// Gone means that the path does not exist or is not a directory. A folder
+/// that cannot be looked at for any other reason (no permission, a mount
+/// that is away for a moment, an I/O error) is kept: the chat stays in its
+/// own project, where its tools fail until the folder is back, rather than
+/// being moved to another project's files and memory without a word. Every
+/// drop is logged with the folder and the chat.
+pub(super) fn restorable_folder(folder: Option<PathBuf>, chat: &str) -> Option<PathBuf> {
+    let folder = folder?;
+    let gone = match std::fs::metadata(&folder) {
+        Ok(found) if found.is_dir() => return Some(folder),
+        Ok(_) => "it is not a directory",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "it does not exist",
+        Err(error) => {
+            tracing::warn!(
+                session = %chat,
+                folder = %folder.display(),
+                error = %error,
+                "daemon: the chat's folder cannot be looked at; restored with it all the same"
+            );
+            return Some(folder);
+        }
+    };
+    tracing::warn!(
+        session = %chat,
+        folder = %folder.display(),
+        "daemon: the chat's folder is gone ({gone}); it is restored in the daemon's folder and that folder's project"
+    );
+    None
 }
 
 pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
@@ -896,7 +931,7 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
         // accepts connections (`Daemon::start`), its autonomous work held
         // until the owner re-binds.
         let owned = s.owner_token.clone().map(|token| crate::session::OwnedConfig { token, restored: true });
-        let config = SessionConfig { owned, ..restore_config(&s.config, s.lifecycle) };
+        let config = SessionConfig { owned, ..restore_config(&s.config, s.lifecycle, &s.id) };
         let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
@@ -1150,7 +1185,7 @@ mod tests {
             await_extensions: true,
             ..Default::default()
         };
-        let restored = restore_config(&saved, SessionLifecycle::Live);
+        let restored = restore_config(&saved, SessionLifecycle::Live, "chat");
         assert!(!restored.await_extensions);
         assert!(!restored.restore_parked);
         let as_saved = SessionConfig {
@@ -1162,7 +1197,7 @@ mod tests {
             serde_json::to_value(&saved).unwrap()
         );
         for parked in [SessionLifecycle::Parked, SessionLifecycle::Parking] {
-            let restored = restore_config(&saved, parked);
+            let restored = restore_config(&saved, parked, "chat");
             assert!(restored.restore_parked, "{parked:?}");
             assert!(!restored.await_extensions);
             let wire = serde_json::to_value(&restored).unwrap();
@@ -1171,8 +1206,8 @@ mod tests {
     }
 
     /// A chat whose folder was deleted while the daemon held it. The pinned
-    /// restore drops such a folder (`pins::restore_one`: `cwd:
-    /// entry.cwd.clone().filter(|c| c.is_dir())`) and the chat runs in the
+    /// restore drops such a folder (`pins::restore_one`, by the same
+    /// [`restorable_folder`]) and the chat runs in the
     /// daemon's folder: a runtime without a folder of its own takes the
     /// process's. A reload kept the dead path. The chat's memory binding was
     /// then built on a path project discovery cannot resolve, so it had no
@@ -1199,14 +1234,65 @@ mod tests {
         assert!(binding.scope().is_ok());
 
         for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked] {
-            assert_eq!(restore_config(&saved(&kept), lifecycle).cwd, Some(kept.clone()));
-            assert_eq!(restore_config(&saved(&gone), lifecycle).cwd, None, "{lifecycle:?}");
+            assert_eq!(restore_config(&saved(&kept), lifecycle, "chat").cwd, Some(kept.clone()));
+            assert_eq!(restore_config(&saved(&gone), lifecycle, "chat").cwd, None, "{lifecycle:?}");
         }
         // A file where the folder was is not a folder to run in either.
         std::fs::write(&gone, b"").unwrap();
-        assert_eq!(restore_config(&saved(&gone), SessionLifecycle::Live).cwd, None);
+        assert_eq!(restore_config(&saved(&gone), SessionLifecycle::Live, "chat").cwd, None);
         // No folder saved: nothing to drop.
-        assert_eq!(restore_config(&SessionConfig::default(), SessionLifecycle::Live).cwd, None);
+        assert_eq!(restore_config(&SessionConfig::default(), SessionLifecycle::Live, "chat").cwd, None);
+    }
+
+    /// The rule a reload and the pinned restore share. A folder is dropped,
+    /// and the chat moved to the daemon's folder and project, only when it
+    /// is known to be gone. `is_dir()` said "gone" for every failure, so a
+    /// folder that could not be looked at for a moment (a mount that was
+    /// away, a permission) moved the chat as well, without a log line.
+    #[test]
+    fn a_folder_is_dropped_only_when_it_is_absent_or_not_a_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let at = |name: &str| parent.path().join(name);
+        let restored = |folder: &Path| restorable_folder(Some(folder.to_path_buf()), "chat");
+        assert_eq!(restorable_folder(None, "chat"), None);
+
+        // Absent, and a file: dropped.
+        assert_eq!(restored(&at("absent")), None);
+        std::fs::write(at("file"), b"").unwrap();
+        assert_eq!(restored(&at("file")), None);
+        // A link to nothing is absent too.
+        std::os::unix::fs::symlink(at("absent"), at("dangling")).unwrap();
+        assert_eq!(restored(&at("dangling")), None);
+
+        // A directory, and a link to one: kept, as saved.
+        std::fs::create_dir(at("dir")).unwrap();
+        assert_eq!(restored(&at("dir")), Some(at("dir")));
+        std::os::unix::fs::symlink(at("dir"), at("link")).unwrap();
+        assert_eq!(restored(&at("link")), Some(at("link")));
+
+        // A folder that is there and cannot be looked at: kept. The same
+        // answer whether or not it exists behind the closed directory, which
+        // is the point: nobody can tell from here.
+        let closed = at("closed");
+        std::fs::create_dir_all(closed.join("project")).unwrap();
+        let mode = |mode: u32| {
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(0o000);
+        let denied = |path: &Path| {
+            std::fs::metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+        };
+        // Root reads through any mode: nothing to test there.
+        if denied(&closed.join("project")) {
+            assert!(!closed.join("project").is_dir(), "what the old rule went by");
+            for hidden in [closed.join("project"), closed.join("nothing")] {
+                assert_eq!(restored(&hidden), Some(hidden.clone()));
+            }
+        }
+        mode(0o700);
+        assert_eq!(restored(&closed.join("project")), Some(closed.join("project")));
+        assert_eq!(restored(&closed.join("nothing")), None);
     }
 
     #[test]
@@ -1296,7 +1382,7 @@ mod tests {
                 ..Default::default()
             };
             for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked, SessionLifecycle::Parking] {
-                let restored = restore_config(&saved, lifecycle);
+                let restored = restore_config(&saved, lifecycle, "chat");
                 assert_eq!(restored.memory_mode, mode, "{lifecycle:?}");
                 assert!(!restored.await_extensions, "{lifecycle:?}");
             }

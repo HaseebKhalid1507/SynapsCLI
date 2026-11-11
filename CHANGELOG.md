@@ -313,6 +313,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Daemon: a restored chat keeps a folder that cannot be looked at, and
+  every dropped folder is logged.** A reload and the restore of a pinned
+  session drop a chat's folder when it is gone; the chat then runs its
+  tools and keeps its memory in the daemon's folder and project. "Gone" was
+  `is_dir()` being false, which it is for any failure, so a folder on a
+  mount that was away for a moment, or one the daemon had no permission to
+  look at, moved the chat as well, with no log line. Both restores now use
+  one rule: the folder is dropped only when its path does not exist or is
+  not a directory, and kept on any other error. Each drop, and each folder
+  kept although it could not be looked at, is a warning that names the
+  folder and the chat.
 - **Context rollover: a rollover that cannot be recorded writes no
   archives.** The size of the new window is estimated before the seal, when
   the archives it will name are not known. A window sealed as several
