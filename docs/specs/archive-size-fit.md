@@ -1,5 +1,8 @@
 # Archive capacity fit: rollover must never fail on a full history inventory
 
+> **Status (2026-11-10): the bounded-ring decision is SUPERSEDED** by
+> [Current rule](#current-rule-keep-every-chats-archives). Seals no longer evict.
+
 ## Problem (evidence)
 
 Session error during automatic context rollover:
@@ -17,7 +20,53 @@ The SynapsCLI project scope (`p192650875bccb6ca`) holds exactly 128 live history
 rows, so every further rollover seal fails and the session stays under pressure.
 CONTRACT.md line 84 currently states "No rollover/pruning/automatic archive deletion".
 
-## Decision
+## Current rule: keep every chat's archives
+
+**Why the ring was wrong.** Rollover seals the old window into Axel; the session
+keeps only `_synaps_context.archive = <id>`, a note and its recent messages, and
+`validate_restored_history` (crates/agent-engine/src/runtime/continuation.rs)
+refuses to resume when that archive is missing. The archive is the only copy of
+the older conversation. All daemon sessions share one scope (daemon cwd = home),
+so busy chats evicted other saved chats' archives: on one machine 8 of 24 saved
+sessions pointed at archives that no longer existed, with the home scope pinned
+at 128 rows.
+
+**Rule.**
+
+1. `history_seal` never deletes or evicts a history row, live or tombstoned.
+   Tombstones are body-free (`messages='[]'`, `note=''`) and are kept, so export
+   inventories and suppression are unchanged.
+2. There is no per-scope history count or byte cap. Nothing refuses a seal, an
+   import or a `scope_alias` union because the target already holds many rows.
+   Rollover never fails on capacity.
+3. Per-request limits still fail `size_limit`: one seal > 16 MiB messages+note,
+   > 4096 source messages/rows, note > 8192 bytes.
+4. `migration_apply` bounds the incoming batch, not the target: <= 128 histories
+   (`MAX_HISTORY_IMPORT`) inside the 24 MiB request frame, in one atomic
+   transaction.
+5. Search/fetch output stays bounded (search cap 32 descriptors with 256-byte
+   snippets; fetch cap 128 rows within the 24 MiB reply). `history_search` scans
+   every live row in the scope (`instr(synaps_lower(messages), q)` ordered by
+   `created_ms`), so its latency grows with total archived bytes.
+6. Removing the archives of chats that no longer exist is a future, explicit
+   operator action (`history_forget` per ID exists today). Nothing does it
+   implicitly.
+
+The legacy file `ArchiveStore` (crates/agent-core/src/core/context_archive.rs,
+128 slots including tombstones, 256 MiB) is unchanged: at capacity it fails the
+seal closed ("archive segment budget exhausted" / "archive storage byte budget
+exhausted"), never deletes a segment, and the host keeps the source history. The
+ring's follow-up to add eviction there is cancelled.
+
+Tests (sidecar): 200+ seals in one scope are all live and fetchable, the oldest
+included; tombstones beside > 128 live rows never cost a live row; a > 16 MiB seal
+still fails in a large scope; an in-bound import into a > 128-row scope succeeds
+while a 129-history or > 24 MiB batch fails atomically; an alias union past 128
+rows succeeds.
+
+## Superseded decision: bounded ring (2026-09-10)
+
+Kept for history. Do not implement: it deleted saved chats' only archives.
 
 Treat the history inventory as a **bounded ring**: a `history_seal` that would exceed
 the per-scope record or byte cap evicts the oldest entries until the new seal fits,
@@ -54,7 +103,7 @@ Update `sidecars/axel-memory-service/CONTRACT.md` line 84: "128 history IDs incl
 tombstones; seal evicts oldest tombstoned then oldest live rows to fit; imports do not
 evict." Bump nothing else (payload/reply shapes unchanged).
 
-## Tests (sidecar)
+### Tests (sidecar)
 
 - Seal 129 distinct archives -> success, count stays 128, oldest live row gone, newest
   fetchable, forgotten fingerprints untouched.
@@ -62,7 +111,7 @@ evict." Bump nothing else (payload/reply shapes unchanged).
 - A single seal above 16 MiB still fails `TooLarge`.
 - `migration_apply` with > 128 histories still fails.
 
-## Rollout
+### Rollout
 
 Rebuild + install sidecar (`cargo install --path sidecars/axel-memory-service`), rerun
 a rollover in this project to confirm the seal succeeds.

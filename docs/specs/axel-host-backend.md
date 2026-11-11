@@ -161,10 +161,13 @@ media erasure and external effects are not exactly-once across process death.
 
 - Ordinary RPC frames: 1 MiB; history/migration/operator exports: at most 24 MiB.
 - Note body: 16 KiB; fetch: 25 IDs; search: 25 descriptors, 400-byte snippets.
-- History: 128 segments including tombstones, 16 MiB/segment, 256 MiB/project,
-  4,096 source messages, 8 KiB working note. No implicit source eviction.
-- Atomic migration: 24 MiB, 16,384 note/tombstone entries, 128 histories. Larger
-  inventories refuse without partial import; no unbounded or streaming claim.
+- History: no per-scope segment count or byte cap; every archive is kept, because
+  a saved chat's archive is its only copy of the older conversation. Per segment:
+  16 MiB, 4,096 source messages, 8 KiB working note. No implicit source eviction:
+  seals never delete or evict archives ([archive-size-fit](archive-size-fit.md)).
+- Atomic migration: 24 MiB, 16,384 note/tombstone entries, 128 histories per
+  batch (the target scope's existing inventory is not counted). Larger batches
+  refuse without partial import; no unbounded or streaming claim.
 - One operation per process; shared bindings serialize operations; a directory
   lock excludes competing service writers. Default operation deadline: 15 seconds.
 
