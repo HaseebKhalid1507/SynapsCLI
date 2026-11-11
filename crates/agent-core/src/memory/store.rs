@@ -217,7 +217,7 @@ fn append_record(base: &Path, record: &MemoryRecord, sync_now: bool) -> Result<(
 ///
 /// With `sync_now` false nothing is synced here: the caller is an import
 /// run, which syncs each file and its directory once, at its end
-/// ([`ImportRun::sync`]).
+/// ([`ImportRun::finish`]).
 ///
 /// An error means the save is NOT acknowledged. It does not mean nothing was
 /// written: after a short write or a failed sync, part or all of the line can
@@ -1053,9 +1053,24 @@ pub struct ImportedLine {
 /// once and kept in step with what the run has stored since, in a dry run
 /// too. That is what makes the lines of one run be judged against each
 /// other, and a dry run report what the real run then does.
-#[derive(Debug, Default)]
+///
+/// A run is a dry run or a real one from [`ImportRun::new`] to its end, so
+/// what a dry run remembers as stored can never be taken for stored by a
+/// real one: a preview and the import after it are two runs.
+///
+/// End a run with [`ImportRun::finish`], on an early stop too: nothing a
+/// real run stored is durable before it returns `Ok`. The compiler cannot
+/// tell a run that was dropped on an early return from one that was
+/// finished (`#[must_use]` only catches a run that is never bound). So a
+/// real run that is dropped unfinished syncs what it appended as it goes,
+/// and logs it if that fails; only the caller's chance to see the error is
+/// lost.
+#[derive(Debug)]
+#[must_use = "end an import run with `finish()`: nothing it stored is durable before that"]
 pub struct ImportRun {
+    dry_run: bool,
     files: std::collections::HashMap<PathBuf, ImportFile>,
+    finished: bool,
 }
 
 #[derive(Debug)]
@@ -1069,8 +1084,19 @@ struct ImportFile {
 }
 
 impl ImportRun {
-    pub fn new() -> Self {
-        Self::default()
+    /// A run that writes (`dry_run` false), or one that writes, creates and
+    /// syncs nothing and gives the outcomes the real run would give from the
+    /// same files.
+    pub fn new(dry_run: bool) -> Self {
+        Self {
+            dry_run,
+            files: std::collections::HashMap::new(),
+            finished: false,
+        }
+    }
+
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run
     }
 
     /// The file of project `key`, read the first time the run needs it.
@@ -1099,12 +1125,19 @@ impl ImportRun {
         }
     }
 
-    /// Sync every file this run appended to, then the directory of each: the
-    /// end of a run. An import's appends are not synced one by one, so
-    /// nothing the run stored is durable until this returns `Ok`; call it
-    /// when the run stops early too. Returns the files synced, sorted. A dry
-    /// run has none.
-    pub fn sync(&self) -> Result<Vec<PathBuf>, MemoryError> {
+    /// End the run: sync every file it appended to, then the directory of
+    /// each. An import's appends are not synced one by one, so nothing the
+    /// run stored is durable until this returns `Ok`; call it when the run
+    /// stops early too. Returns the files synced, sorted. A dry run has
+    /// none.
+    #[must_use = "an import is not durable unless `finish` returned Ok"]
+    pub fn finish(mut self) -> Result<Vec<PathBuf>, MemoryError> {
+        // Whatever the sync says, it was tried and the caller is told.
+        self.finished = true;
+        self.sync()
+    }
+
+    fn sync(&self) -> Result<Vec<PathBuf>, MemoryError> {
         let mut synced: Vec<PathBuf> = self
             .files
             .iter()
@@ -1123,6 +1156,19 @@ impl ImportRun {
             sync_dir(dir)?;
         }
         Ok(synced)
+    }
+}
+
+impl Drop for ImportRun {
+    /// The net under a run that was not finished (an early return, a `?`):
+    /// what it appended is synced all the same.
+    fn drop(&mut self) {
+        if self.finished || !self.files.values().any(|file| file.appended) {
+            return;
+        }
+        if let Err(error) = self.sync() {
+            tracing::warn!("an import run was dropped unfinished and its sync failed: {error}");
+        }
     }
 }
 
@@ -1147,9 +1193,9 @@ impl ImportRun {
 /// live, [`ImportOutcome::Stored`] if the file did not have it (a later
 /// import of that note then stays forgotten).
 ///
-/// With `dry_run` nothing is written, created or synced, and the outcomes
-/// are the ones the real run gives from the same files. `run` is the state
-/// of one run; finish the run with [`ImportRun::sync`].
+/// In a dry run ([`ImportRun::new`]) nothing is written, created or synced,
+/// and the outcomes are the ones the real run gives from the same files.
+/// `run` is the state of one run; end the run with [`ImportRun::finish`].
 ///
 /// `Err` is for what is not the line's fault and should stop the run: an
 /// I/O error, or a target that is not a project key (the user-wide key is
@@ -1158,7 +1204,6 @@ pub fn import_line_in(
     base: &Path,
     line: &str,
     target: ImportTarget<'_>,
-    dry_run: bool,
     run: &mut ImportRun,
 ) -> Result<ImportedLine, MemoryError> {
     if let ImportTarget::Project(key) = target {
@@ -1174,9 +1219,9 @@ pub fn import_line_in(
         Err(reason) => ImportOutcome::Refused(reason),
         Ok(ImportLine::Tombstone(tombstone)) => {
             about.tombstone = true;
-            import_tombstone(base, tombstone, target, dry_run, run, &mut about)?
+            import_tombstone(base, tombstone, target, run, &mut about)?
         }
-        Ok(ImportLine::Note(note)) => import_note(base, *note, target, dry_run, run, &mut about)?,
+        Ok(ImportLine::Note(note)) => import_note(base, *note, target, run, &mut about)?,
     };
     about.outcome = outcome;
     Ok(about)
@@ -1190,7 +1235,6 @@ fn import_note(
     base: &Path,
     mut note: MemoryRecord,
     target: ImportTarget<'_>,
-    dry_run: bool,
     run: &mut ImportRun,
     about: &mut ImportedLine,
 ) -> Result<ImportOutcome, MemoryError> {
@@ -1225,6 +1269,7 @@ fn import_note(
         ImportTarget::AsRecorded => recorded,
     };
     about.project = Some(key.clone());
+    let dry_run = run.dry_run;
     let file = run.file(base, &key)?;
     if file.tombstoned.contains(&id) {
         return Ok(ImportOutcome::KeptForgotten);
@@ -1247,7 +1292,6 @@ fn import_tombstone(
     base: &Path,
     tombstone: TombstoneLine,
     target: ImportTarget<'_>,
-    dry_run: bool,
     run: &mut ImportRun,
     about: &mut ImportedLine,
 ) -> Result<ImportOutcome, MemoryError> {
@@ -1259,6 +1303,7 @@ fn import_tombstone(
         return refused("a tombstone line names no project; pass --cwd or --project-key");
     };
     about.project = Some(key.to_string());
+    let dry_run = run.dry_run;
     let file = run.file(base, key)?;
     if file.tombstoned.contains(&tombstone.tombstone) {
         return Ok(ImportOutcome::AlreadyPresent);
@@ -2005,7 +2050,7 @@ mod tests {
         target: ImportTarget<'_>,
         run: &mut ImportRun,
     ) -> ImportedLine {
-        import_line_in(base, line, target, false, run).unwrap()
+        import_line_in(base, line, target, run).unwrap()
     }
 
     fn refusal(imported: &ImportedLine) -> &str {
@@ -2035,7 +2080,7 @@ mod tests {
         let lines: Vec<String> = (0..8u64)
             .map(|i| exported(&format!("mem-new-{i}"), &key, 1_000 + i, &format!("new note {i}")))
             .collect();
-        let mut run = ImportRun::new();
+        let mut run = ImportRun::new(false);
         for (i, line) in lines.iter().enumerate() {
             assert_eq!(
                 import(base, line, ImportTarget::AsRecorded, &mut run),
@@ -2047,7 +2092,7 @@ mod tests {
                 }
             );
         }
-        assert_eq!(run.sync().unwrap(), std::slice::from_ref(&path));
+        assert_eq!(run.finish().unwrap(), std::slice::from_ref(&path));
 
         // 11 live; search and fetch find old and new.
         assert_eq!(load_live_project_records(base, &scope).unwrap().len(), 11);
@@ -2078,27 +2123,26 @@ mod tests {
 
         // Import again: 8 already_present, file bytes unchanged.
         let before = fs::read(&path).unwrap();
-        let mut again = ImportRun::new();
+        let mut again = ImportRun::new(false);
         for line in &lines {
             assert_eq!(
                 import(base, line, ImportTarget::AsRecorded, &mut again).outcome,
                 ImportOutcome::AlreadyPresent
             );
         }
-        assert!(again.sync().unwrap().is_empty());
-        assert_eq!(fs::read(&path).unwrap(), before);
-
         // A line with a known id and other content is refused.
         let changed = exported("mem-new-3", &key, 1_003, "another text");
         assert_eq!(
             refusal(&import(base, &changed, here, &mut again)),
             "id already holds a different note"
         );
+        assert!(again.finish().unwrap().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), before);
 
         // A tombstoned id is kept_forgotten.
         forget_in(base, &scope, "mem-new-5").unwrap();
         let before = fs::read(&path).unwrap();
-        let mut run = ImportRun::new();
+        let mut run = ImportRun::new(false);
         assert_eq!(
             import(base, &lines[5], here, &mut run).outcome,
             ImportOutcome::KeptForgotten
@@ -2119,12 +2163,13 @@ mod tests {
             "user-wide note; pass --cwd to file it under a project"
         );
         let to_user_wide = ImportTarget::Project(USER_WIDE_KEY);
-        let err = import_line_in(base, &lines[0], to_user_wide, false, &mut run).unwrap_err();
+        let err = import_line_in(base, &lines[0], to_user_wide, &mut run).unwrap_err();
         assert!(matches!(err, MemoryError::InvalidProjectRoot(_)), "{err}");
 
-        assert!(run.sync().unwrap().is_empty());
+        assert!(run.finish().unwrap().is_empty());
         assert_eq!(fs::read(&path).unwrap(), before, "none of these wrote");
         assert_eq!(list_namespaces_in(base).unwrap(), [scope.namespace()]);
+        let mut run = ImportRun::new(false);
 
         // A tombstone line before its note keeps the note out.
         let tombstone = r#"{"tombstone":"mem-late","timestamp_ms":77}"#;
@@ -2138,7 +2183,8 @@ mod tests {
             import(base, &late, here, &mut run).outcome,
             ImportOutcome::KeptForgotten
         );
-        run.sync().unwrap();
+        run.finish().unwrap();
+        let mut run = ImportRun::new(false);
         assert_eq!(
             fs::read_to_string(&path).unwrap().lines().last(),
             Some(tombstone),
@@ -2150,7 +2196,7 @@ mod tests {
         ));
         // In a later run too.
         assert_eq!(
-            import(base, &late, here, &mut ImportRun::new()).outcome,
+            import(base, &late, here, &mut ImportRun::new(false)).outcome,
             ImportOutcome::KeptForgotten
         );
 
@@ -2177,6 +2223,7 @@ mod tests {
         let filed = fetch_exact_in(base, &scope, &["mem-user"]).unwrap().remove(0);
         assert_eq!(filed.project.as_deref(), Some(key.as_str()));
         assert_eq!(filed.namespace, scope.namespace());
+        run.finish().unwrap();
     }
 
     /// What this shows: with `dry_run` no byte of the store changes and no
@@ -2193,11 +2240,11 @@ mod tests {
         let path = namespace_file(base, &scope.namespace());
 
         // In the file: a live note and a forgotten one.
-        let mut setup = ImportRun::new();
+        let mut setup = ImportRun::new(false);
         for id in ["mem-live", "mem-gone"] {
             import(base, &exported(id, &key, 10, "there before"), here, &mut setup);
         }
-        setup.sync().unwrap();
+        setup.finish().unwrap();
         forget_in(base, &scope, "mem-gone").unwrap();
         let before = fs::read(&path).unwrap();
 
@@ -2228,12 +2275,13 @@ mod tests {
             "refused",
         ];
         let run_all = |dry_run: bool| -> Vec<ImportedLine> {
-            let mut run = ImportRun::new();
+            let mut run = ImportRun::new(dry_run);
+            assert_eq!(run.is_dry_run(), dry_run);
             let all: Vec<ImportedLine> = lines
                 .iter()
-                .map(|line| import_line_in(base, line, here, dry_run, &mut run).unwrap())
+                .map(|line| import_line_in(base, line, here, &mut run).unwrap())
                 .collect();
-            assert_eq!(run.sync().unwrap().is_empty(), dry_run);
+            assert_eq!(run.finish().unwrap().is_empty(), dry_run);
             all
         };
 
@@ -2253,11 +2301,62 @@ mod tests {
 
         // Where there is no store yet, a dry run makes none.
         let empty = TempDir::new().unwrap();
-        let mut run = ImportRun::new();
-        let imported = import_line_in(empty.path(), &lines[0], here, true, &mut run).unwrap();
+        let mut run = ImportRun::new(true);
+        let imported = import_line_in(empty.path(), &lines[0], here, &mut run).unwrap();
         assert_eq!(imported.outcome, ImportOutcome::Stored);
-        assert!(run.sync().unwrap().is_empty());
+        assert!(run.finish().unwrap().is_empty());
         assert_eq!(fs::read_dir(empty.path()).unwrap().count(), 0);
+    }
+
+    /// A run cannot be a preview and then an import: the mode is fixed when
+    /// the run is made, so the import after a preview is a new run, reads
+    /// the files again and stores what the preview only said it would.
+    #[test]
+    fn a_preview_and_the_import_after_it_are_two_runs() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let key = "p1111111111111111";
+        let line = exported("mem-a", key, 1, "x");
+        for dry_run in [true, true, false] {
+            let mut run = ImportRun::new(dry_run);
+            let first = import(base, &line, ImportTarget::AsRecorded, &mut run);
+            assert_eq!(first.outcome, ImportOutcome::Stored, "dry_run {dry_run}");
+            // Within one run the line is known, in a dry run too.
+            let again = import(base, &line, ImportTarget::AsRecorded, &mut run);
+            assert_eq!(again.outcome, ImportOutcome::AlreadyPresent);
+            assert_eq!(run.finish().unwrap().len(), usize::from(!dry_run));
+        }
+        let text = fs::read_to_string(namespace_file(base, &project_namespace(key))).unwrap();
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    /// A real run that is dropped without `finish` (an early return) still
+    /// syncs what it appended; a dry run and a run that stored nothing sync
+    /// nothing.
+    #[test]
+    fn a_run_dropped_unfinished_still_syncs_what_it_appended() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let key = "p1111111111111111";
+        take_steps();
+        {
+            let mut run = ImportRun::new(false);
+            import(base, &exported("mem-a", key, 1, "x"), ImportTarget::AsRecorded, &mut run);
+            assert_eq!(take_steps(), ["sync dir", "write"]);
+        }
+        assert_eq!(take_steps(), ["sync file", "sync dir"], "synced on drop");
+        {
+            let mut run = ImportRun::new(false);
+            import(base, &exported("mem-a", key, 1, "x"), ImportTarget::AsRecorded, &mut run);
+            let mut dry = ImportRun::new(true);
+            import(base, &exported("mem-b", key, 1, "x"), ImportTarget::AsRecorded, &mut dry);
+        }
+        assert!(take_steps().is_empty(), "nothing appended, nothing synced");
+        // A finished run is not synced a second time when it goes.
+        let mut run = ImportRun::new(false);
+        import(base, &exported("mem-c", key, 1, "x"), ImportTarget::AsRecorded, &mut run);
+        run.finish().unwrap();
+        assert_eq!(take_steps(), ["write", "sync file", "sync dir"]);
     }
 
     /// What this shows: the order of calls. An import's lines are written
@@ -2269,7 +2368,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
         let (a, b) = ("p1111111111111111", "p2222222222222222");
-        let mut run = ImportRun::new();
+        let mut run = ImportRun::new(false);
         take_steps();
         for (i, project) in [a, a, b, a].into_iter().enumerate() {
             let line = exported(&format!("mem-{i}"), project, i as u64, "x");
@@ -2290,7 +2389,7 @@ mod tests {
         );
 
         let files = [a, b].map(|key| namespace_file(base, &project_namespace(key)));
-        assert_eq!(run.sync().unwrap(), files);
+        assert_eq!(run.finish().unwrap(), files);
         assert_eq!(take_steps(), ["sync file", "sync file", "sync dir"]);
     }
 
@@ -2351,7 +2450,7 @@ mod tests {
                 "a tombstone line names no project; pass --cwd or --project-key",
             ),
         ];
-        let mut run = ImportRun::new();
+        let mut run = ImportRun::new(false);
         for (line, expected) in &cases {
             let imported = import(base, line, ImportTarget::AsRecorded, &mut run);
             let reason = refusal(&imported);
@@ -2362,7 +2461,6 @@ mod tests {
             );
             assert!(!reason.contains("secret"), "a reason quotes nothing: {reason}");
         }
-        assert!(run.sync().unwrap().is_empty());
         assert!(!memory_dir_in(base).exists(), "a refused line writes nothing");
 
         // The line they were all made from is a good one.
@@ -2370,6 +2468,7 @@ mod tests {
             import(base, &good, ImportTarget::AsRecorded, &mut run).outcome,
             ImportOutcome::Stored
         );
+        assert_eq!(run.finish().unwrap().len(), 1);
     }
 
     /// A `null` and an absent field say the same, and absent `tags` are no
@@ -2383,7 +2482,7 @@ mod tests {
         let line = format!(
             r#"{{"namespace":"project-{key}","timestamp_ms":7,"content":"c","id":"mem-n","project":"{key}","meta":null,"provenance":{{"source":"model","session":null}}}}"#
         );
-        let mut run = ImportRun::new();
+        let mut run = ImportRun::new(false);
         assert_eq!(
             import(tmp.path(), &line, ImportTarget::AsRecorded, &mut run).outcome,
             ImportOutcome::Stored

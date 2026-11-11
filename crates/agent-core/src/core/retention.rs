@@ -1366,8 +1366,7 @@ mod tests {
                 &roots.base_dir,
                 &exported,
                 ImportTarget::AsRecorded,
-                false,
-                &mut ImportRun::new(),
+                &mut ImportRun::new(false),
             )
             .unwrap();
             assert_eq!(imported.outcome.name(), ImportOutcome::KeptForgotten.name());
