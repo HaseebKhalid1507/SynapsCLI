@@ -304,8 +304,11 @@ All notable changes to this project will be documented in this file.
   which take the conversation id and the folder. A call that belongs to no
   chat is spelled `call_tool_no_chat` / `call_exact_no_chat`; both exist for
   tests only (the `testing` feature). Also changed for the same reason:
-  `skills::commands::execute_plugin_command_with_tools` takes the chat's id
-  and folder, `runtime::continuation::restore_window` takes the memory
+  `skills::commands::execute_plugin_command_with_tools` takes the chat it
+  is run for (`skills::commands::CommandChat`: id, folder, memory binding
+  and environment; a runtime's own is `Runtime::command_chat()`),
+  `skills::commands::execute_plugin_command` takes the environment to
+  spawn with, `runtime::continuation::restore_window` takes the memory
   binding, and `runtime::continuation::archive_store` is gone.
 
 ### Fixed
@@ -392,6 +395,21 @@ All notable changes to this project will be documented in this file.
   now runs under the turn's usage meter like every other non-Anthropic
   model, but its transport reports no usage event, so, as before, its
   rounds are not counted against the turn's token and cost budgets.
+- **Daemon: a plugin's shell slash command gets the chat's environment,
+  and a tool-backed one the chat's memory binding.** A plugin slash command
+  backed by a shell command (`"command": …` in the plugin manifest) was
+  spawned with the daemon's whole environment, whichever chat it was typed
+  in: the daemon's `PATH`, `HOME` and virtualenv, and any variable the
+  client had stripped as a secret, if the daemon's own environment had it.
+  It is now spawned with the session's environment, the one the chat's
+  `bash` gets. It still runs from the plugin's own folder. A slash command
+  backed by an extension tool ran that tool with no memory binding, so the
+  tool worked one out for itself from the daemon's folder (a config read,
+  and with `memory.backend = axel` a repository lookup there, on every
+  command); it is handed the chat's. Nothing a user sees changes in the
+  second case: only whether the host's memory backend is exclusive was read
+  from it, and that does not depend on the folder. Without the daemon the
+  environment and the folder were already the chat's.
 - **Daemon: commands run by an extension-provided model get the chat's
   environment, and its tools everything else a chat's tools get.** A model
   served by an extension (`plugin:provider:model`) runs its tool calls in a

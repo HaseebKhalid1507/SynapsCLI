@@ -2023,6 +2023,18 @@ impl Runtime {
         self.env.as_ref().map(|e| &e.vars)
     }
 
+    /// What a slash command typed in this chat is run with: this runtime's
+    /// own id, folder, memory binding and tool environment. The one place a
+    /// command gets them from, so it cannot be handed the host's.
+    pub fn command_chat(&self) -> crate::skills::commands::CommandChat<'_> {
+        crate::skills::commands::CommandChat {
+            session_id: self.session_id(),
+            cwd: self.cwd(),
+            memory_backend: &self.memory_backend,
+            env: self.env.as_ref(),
+        }
+    }
+
     pub fn env_stripped(&self) -> &[String] {
         &self.env_stripped
     }

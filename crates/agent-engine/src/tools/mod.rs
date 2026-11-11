@@ -139,10 +139,12 @@ pub struct ToolCapabilities {
     /// grants no `activate_tools` authority. None is for contexts without a
     /// parent session.
     pub session_allow_all: Option<Arc<SessionConfirmLatch>>,
-    /// Host-owned note storage binding. Runtime contexts always provide the
-    /// same binding; `None` is reserved for manually constructed contexts,
-    /// where the memory and forum tools refuse (they never derive a project
-    /// from the process folder).
+    /// Host-owned note storage binding. Every context made for a chat has
+    /// its chat's: a turn's ([`TurnToolContext`]) and a slash command's
+    /// (`skills::commands::CommandChat`). `None` is left for a context made
+    /// for no chat ([`TurnToolContext::no_chat`]) and for the ones tests
+    /// build by hand; there the memory and forum tools refuse (they never
+    /// derive a project from the process folder).
     /// A present binding is exclusive: errors never permit legacy fallback.
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     /// Parent-session telemetry for the subagents this context spawns: they
