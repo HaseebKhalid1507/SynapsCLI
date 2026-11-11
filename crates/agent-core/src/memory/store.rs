@@ -351,7 +351,16 @@ pub(crate) fn lock_notes_file(
     let lock_path = notes_lock_path(path);
     let wait = notes_lock_wait();
     crate::core::lock_file::lock_within(wait, NOTES_LOCK_POLL, || {
-        crate::core::lock_file::try_lock(open_lock_file(&lock_path)?)
+        let file = open_lock_file(&lock_path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot open the notes lock file {}: {e}; nothing was written",
+                    lock_path.display()
+                ),
+            )
+        })?;
+        crate::core::lock_file::try_lock(file)
     })?
     .ok_or_else(|| {
         std::io::Error::new(
@@ -460,25 +469,10 @@ fn sync_file(file: &fs::File) -> std::io::Result<()> {
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     step("sync dir");
     failing("sync dir")?;
-    // A file system that cannot sync a directory at all says so with EINVAL
-    // or ENOTSUP. That is not a failed save: now that every save syncs the
-    // directory, it would fail every save there, each with its line already
-    // in the file.
-    #[cfg(unix)]
-    {
-        use std::io::ErrorKind::{InvalidInput, Unsupported};
-        match fs::File::open(dir)?.sync_all() {
-            Err(e) if matches!(e.kind(), InvalidInput | Unsupported) => Ok(()),
-            result => result,
-        }
-    }
-    // Windows cannot open a directory to flush it, and NTFS journals the new
-    // name itself: the choice `session_journal::sync_sessions_dir` makes.
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
+    // Every save syncs the directory, so a directory that cannot be synced
+    // at all must not fail every save, each with its line already in the
+    // file. Which errors say that is `private_fs::sync_dir`'s one rule.
+    crate::core::private_fs::sync_dir(dir)
 }
 
 #[cfg(test)]
@@ -3002,6 +2996,29 @@ mod tests {
                 "",
                 "no bytes may be written through the planted symlink"
             );
+        }
+
+        /// A lock file that cannot be opened (here a symlink, refused by
+        /// `O_NOFOLLOW`) fails the save, the error names the lock file, and
+        /// nothing is written.
+        #[test]
+        fn a_lock_file_that_cannot_be_opened_is_named_in_the_error() {
+            let tmp = TempDir::new().unwrap();
+            let dir = memory_dir_in(tmp.path());
+            fs::create_dir_all(&dir).unwrap();
+            let victim = tmp.path().join("victim.txt");
+            fs::write(&victim, "").unwrap();
+            let lock = dir.join("ns.jsonl.lock");
+            std::os::unix::fs::symlink(&victim, &lock).unwrap();
+            let error = append_to(tmp.path(), &rec("ns", 1, "x", vec![])).unwrap_err();
+            assert!(matches!(error, MemoryError::Io(_)), "{error}");
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("cannot open the notes lock file {}", lock.display())),
+                "{message}"
+            );
+            assert!(!dir.join("ns.jsonl").exists());
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "");
         }
 
         #[test]

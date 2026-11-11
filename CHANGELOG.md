@@ -326,6 +326,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Notes: one rule for a directory that cannot be synced, and a lock file
+  that cannot be opened is named.** The notes store tolerated `EINVAL` and
+  `ENOTSUP` from a directory sync, and `write_atomic_private` also
+  `PermissionDenied` (a directory that can be written but not opened for
+  reading). Both now call `private_fs::sync_dir`, which tolerates all three,
+  so such a directory no longer makes every save answer "written, not
+  confirmed". A notes lock file that cannot be opened (a symlink, another
+  owner) fails the save with "cannot open the notes lock file <path>"
+  instead of the bare OS error; nothing is written, as before.
 - **Notes: "written, not confirmed" names the note.** When the sync after a
   save or a forget failed, `memory_store` and `memory_forget` told the model
   to search, with nothing exact to search for. The error
