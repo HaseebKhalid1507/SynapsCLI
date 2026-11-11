@@ -151,12 +151,7 @@ pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
             Err(e) if e.kind() == PermissionDenied => {
                 // Left as it is, but not in silence: after a power cut a
                 // name newly made in this directory may be missing.
-                tracing::warn!(
-                    directory = %dir.display(),
-                    error = %e,
-                    "a directory could not be opened to be synced; what was written into it \
-                     stays, but a new name in it is not confirmed to be on disk"
-                );
+                warn_unsynced(dir, &e);
                 Ok(())
             }
             Err(e) if matches!(e.kind(), InvalidInput | Unsupported) => Ok(()),
@@ -168,6 +163,30 @@ pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
         let _ = dir;
         Ok(())
     }
+}
+
+/// The one warning for a directory [`sync_dir`] leaves unsynced because it
+/// may not be opened: which directory, and the error.
+#[cfg(unix)]
+fn warn_unsynced(dir: &Path, error: &std::io::Error) {
+    tracing::warn!(
+        directory = %dir.display(),
+        error = %error,
+        "a directory could not be opened to be synced; what was written into it stays, \
+         but a new name in it is not confirmed to be on disk"
+    );
+    #[cfg(test)]
+    UNSYNCED.with(|seen| seen.borrow_mut().push((dir.to_path_buf(), error.kind())));
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// The warnings [`warn_unsynced`] gave on this thread. A test reads
+    /// these and not a captured log: a log captured on one test thread
+    /// loses lines to tracing's callsite cache when another test reaches
+    /// the same line first.
+    static UNSYNCED: std::cell::RefCell<Vec<(std::path::PathBuf, std::io::ErrorKind)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Atomically replace `path` with `data`: the temp file is created in the
@@ -430,43 +449,16 @@ mod tests {
             File::open(&gate).unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
-        // Tolerated, and said: one warning with the directory and the error.
-        #[derive(Clone, Default)]
-        struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Log {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let log = Log::default();
-        let sink = log.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || sink.clone())
-            .with_ansi(false)
-            .finish();
-        let lines = |log: &Log| {
-            let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
-            text.lines().map(str::to_owned).collect::<Vec<_>>()
-        };
-        {
-            let _capture = tracing::subscriber::set_default(subscriber);
-            sync_dir(&gate).unwrap();
-            let said = lines(&log);
-            assert_eq!(said.len(), 1, "{said:?}");
-            assert!(said[0].contains("WARN"), "{said:?}");
-            assert!(said[0].contains(&gate.display().to_string()), "{said:?}");
-            assert!(said[0].contains("Permission denied"), "{said:?}");
-            // A directory that syncs says nothing; one that is missing is
-            // an error, not a warning.
-            sync_dir(tmp.path()).unwrap();
-            sync_dir(&tmp.path().join("missing")).unwrap_err();
-            assert_eq!(lines(&log).len(), 1);
-        }
+        // Tolerated, and said: one warning, with the directory and the
+        // error. A directory that syncs says nothing; one that is missing
+        // is an error, not a warning.
+        let warned = || UNSYNCED.with(|seen| seen.borrow().clone());
+        UNSYNCED.with(|seen| seen.borrow_mut().clear());
+        sync_dir(&gate).unwrap();
+        assert_eq!(warned(), [(gate.clone(), std::io::ErrorKind::PermissionDenied)]);
+        sync_dir(tmp.path()).unwrap();
+        sync_dir(&tmp.path().join("missing")).unwrap_err();
+        assert_eq!(warned().len(), 1);
     }
 
     #[cfg(target_os = "linux")]
