@@ -1309,7 +1309,12 @@ impl ProcessExtension {
                 };
                 let record = store::new_record(namespace, content, tags, meta);
                 let timestamp_ms = record.timestamp_ms;
-                store::append(&record).map_err(|e| (-32000, e.to_string()))?;
+                // On a blocking thread: the append waits for the notes file's
+                // lock (up to 5 seconds, sleeping) and syncs the file.
+                tokio::task::spawn_blocking(move || store::append(&record))
+                    .await
+                    .map_err(|_| (-32000, "memory append worker failed".to_string()))?
+                    .map_err(|e| (-32000, e.to_string()))?;
                 Ok(serde_json::json!({"ok": true, "timestamp_ms": timestamp_ms}))
             }
             "memory.query" => {
