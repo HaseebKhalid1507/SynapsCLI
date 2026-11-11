@@ -968,6 +968,32 @@ fn a_real_notes_import_holds_one_lock_and_a_second_one_stops() {
     assert_eq!(mode(&memory.join(".import.lock")), 0o600);
 }
 
+/// core-a5-review finding 6.
+#[test]
+fn the_import_lock_is_never_opened_through_a_link() {
+    let env = Env::new();
+    let file = env.file("notes.jsonl", &[note("mem-1", KEY, "one")]);
+    let memory = env.base().join("memory");
+    std::fs::create_dir(&memory).unwrap();
+    let lock = memory.join(".import.lock");
+    let dangling = env.work().join("made-through-the-link");
+    let existing = env.work().join("somebody-elses-file");
+    std::fs::write(&existing, "").unwrap();
+    for target in [&dangling, &existing] {
+        std::os::unix::fs::symlink(target, &lock).unwrap();
+        let before = env.listing();
+        let run = env.run(&["import-notes", &file, "--project-key", KEY]);
+        assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+        let error = run.doc["stopped"]["error"].as_str().unwrap();
+        assert!(error.starts_with("cannot open the import lock"), "{error}");
+        assert!(error.ends_with("nothing was written"), "{error}");
+        assert_eq!(run.totals(), [0; 6]);
+        assert_eq!(env.listing(), before, "the link was followed, or a note was written");
+        assert!(!dangling.exists());
+        std::fs::remove_file(&lock).unwrap();
+    }
+}
+
 #[test]
 fn a_note_tombstone_that_is_not_applied_is_counted_named_and_exits_1() {
     let env = Env::new();

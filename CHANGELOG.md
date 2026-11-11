@@ -41,7 +41,8 @@ All notable changes to this project will be documented in this file.
   folder's project key, archive directory and notes file, and whether
   `SYNAPS_PROJECT_ROOT` is overriding the folder; it creates nothing. The
   command never reads `memory.backend` and sends no hook. New in the store:
-  `memory::store::project_notes_file`. See "Moving archives between
+  `memory::store::project_notes_file`, and `open_lock_file` is public (the
+  import lock is opened with it, never through a link). See "Moving archives between
   machines or projects" in `docs/extensions/context-archives.md`.
 - **Context archives: `ArchiveStore::import`**, the store side of moving
   archives into the plain-file store from somewhere else. It takes one

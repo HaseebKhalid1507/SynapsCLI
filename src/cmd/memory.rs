@@ -611,24 +611,21 @@ fn lock_notes_import(base: &Path) -> Result<ExclusiveLock, String> {
     let cannot = |e: &dyn std::fmt::Display| {
         format!("cannot open the import lock {}: {e}; nothing was written", path.display())
     };
-    let open = |create: bool| -> io::Result<File> {
-        if path.symlink_metadata().is_ok_and(|meta| !meta.is_file()) {
+    // The store's own opener: it creates the file private and never opens
+    // through a link, so no check of the name beforehand can be raced.
+    let open = || -> io::Result<File> {
+        let file = notes::open_lock_file(&path)?;
+        if !file.metadata()?.is_file() {
             return Err(io::Error::other("it is not a regular file"));
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(create).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(private_fs::FILE_MODE);
-        }
-        options.open(&path)
+        Ok(file)
     };
-    let file = match open(false) {
+    let file = match open() {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // No memory folder yet.
             private_fs::ensure_private_dir(&dir).map_err(|e| cannot(&e))?;
-            open(true).map_err(|e| cannot(&e))?
+            open().map_err(|e| cannot(&e))?
         }
         Err(error) => return Err(cannot(&error)),
     };

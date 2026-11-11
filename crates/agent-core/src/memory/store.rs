@@ -376,7 +376,9 @@ pub(crate) fn lock_notes_file(
 
 /// Open (creating it, mode 0600, never through a symlink) a lock file. Read
 /// and write access: Windows locks only a handle that has one of them.
-fn open_lock_file(path: &Path) -> std::io::Result<fs::File> {
+/// The folder is not created. Public for `synaps memory import-notes`, whose
+/// one lock for a whole run is opened as a notes file's lock is.
+pub fn open_lock_file(path: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
