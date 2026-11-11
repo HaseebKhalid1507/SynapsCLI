@@ -747,8 +747,8 @@ mod imp {
         use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GENERIC_WRITE};
         use windows_sys::Win32::Security::{
             CreateRestrictedToken, ImpersonateAnonymousToken, DuplicateTokenEx, GetLengthSid, SetTokenInformation, SecurityImpersonation, TokenImpersonation,
-            TokenIntegrityLevel, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
-            TOKEN_MANDATORY_LABEL,
+            TokenIntegrityLevel, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+            TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL,
         };
         use windows_sys::Win32::Storage::FileSystem::{SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT};
         use windows_sys::Win32::System::Threading::{
@@ -1188,8 +1188,9 @@ mod imp {
         /// Chrome-style launchers) build, and needs no privilege.
         fn restricted_primary(groups: &[&str]) -> io::Result<OwnedHandle> {
             let mut process_token: HANDLE = null_mut();
-            // SAFETY: the pseudo-handle and an out-pointer.
-            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut process_token) } == 0 {
+            // SAFETY: the pseudo-handle and an out-pointer. The new token's handle has the access
+            // this one has, and `CreateProcessAsUserW` wants TOKEN_ASSIGN_PRIMARY on it.
+            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY, &mut process_token) } == 0 {
                 return Err(io::Error::last_os_error());
             }
             // SAFETY: a token handle we own.
@@ -1398,7 +1399,7 @@ mod imp {
         #[test]
         fn restricted_token_server_child() {
             let arg = |key: &str| std::env::args().find_map(|a| a.strip_prefix(key).map(str::to_owned));
-            let (Some(endpoint), Some(sid), Some(il)) = (arg("W1UENDPOINT:"), arg("W1USID:"), arg("W1UIL:")) else {
+            let (Some(endpoint), Some(sid), Some(il)) = (arg("SERVER_ENDPOINT:"), arg("SERVER_SID:"), arg("SERVER_IL:")) else {
                 return;
             };
             let il: u32 = il.parse().unwrap();
@@ -1442,7 +1443,7 @@ mod imp {
             };
             let exe = std::env::current_exe().unwrap();
             let mut cmd: Vec<u16> = format!(
-                "\"{}\" --exact ipc::imp::security_tests::restricted_token_server_child --nocapture \"W1UENDPOINT:{}\" W1USID:{} W1UIL:{}",
+                "\"{}\" --exact ipc::imp::security_tests::restricted_token_server_child --nocapture \"SERVER_ENDPOINT:{}\" SERVER_SID:{} SERVER_IL:{}",
                 exe.display(),
                 path.display(),
                 me.sid,
