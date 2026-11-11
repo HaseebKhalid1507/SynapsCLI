@@ -1984,11 +1984,21 @@ impl ArchiveStore {
             if is_dir || archive_id(&name).is_none() || names.contains(&name) {
                 continue;
             }
-            // A file under another name that cannot be read, or holds
-            // no digest, says nothing about this content: passed over.
-            let Ok(Some(raw)) = dir.read_with(&name, MAX_SEGMENT_BYTES, readonly) else {
-                continue;
+            let raw = match dir.read_with(&name, MAX_SEGMENT_BYTES, readonly) {
+                Ok(Some(raw)) => raw,
+                // Gone since it was listed, or not a file the store reads
+                // (a link, a FIFO, closed to us, too large): no fetch gives
+                // out what is in it. Passed over.
+                Ok(None) => continue,
+                Err(error) if PrivateDir::not_a_segment(&error) => continue,
+                // A read that failed says nothing about what the file is:
+                // it may be a live copy.
+                Err(error) => {
+                    unread.pass(&format!("{shelf}/{name}"), error);
+                    continue;
+                }
             };
+            // A file that holds another digest, or none, is not a copy.
             if !names_digest(&raw, digest) {
                 continue;
             }
@@ -9997,6 +10007,62 @@ mod tests {
             assert_eq!(refused.reason, "this content was forgotten in this store");
         }
         assert_eq!(store.fetch(&a, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A file under another id that a forget fails to read may be a live
+    /// copy: the forget is "not complete" and names it, and an imported
+    /// tombstone of that content stops. What the file is (a link, closed to
+    /// its owner) is not such a failure and is passed over.
+    #[test]
+    fn a_forget_is_not_complete_over_a_file_under_another_id_it_failed_to_read() {
+        let words = "a twin that is not read";
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let sealed = store.seal(&text(words), "").unwrap();
+        let twin = random_id();
+        let line = record_bytes(&store, &twin, &text(words), |_| {});
+        assert_eq!(import(&store, &line).unwrap().outcome, ImportOutcome::Stored);
+        let name = archive_name(&twin);
+        let dead = record_bytes(&store, &random_id(), &text("only the twin"), tombstone);
+        let lone_id = random_id();
+        let lone = record_bytes(&store, &lone_id, &text("only the twin"), |_| {});
+        assert_eq!(import(&store, &lone).unwrap().outcome, ImportOutcome::Stored);
+        for code in [libc::EIO, libc::EMFILE, libc::ENOMEM] {
+            let failing = Fault::on("open", &twin, code);
+            let done = store.forget(&sealed.id).unwrap();
+            let unread = done.unread.expect("not complete");
+            let start = format!("1 place(s) could not be read, first s000001/{name}: ");
+            assert!(unread.starts_with(&start), "{unread}");
+            drop(failing);
+            assert_eq!(store.fetch(&twin, 0, 1).unwrap(), text(words), "error {code}");
+            // The import's scan is the same one: it does not answer "none".
+            let failing = Fault::on("open", &lone_id, code);
+            let before = snapshot(&dir);
+            let stopped = store.import(&dead, false, false, &mut ImportSeen::default());
+            let error = stopped.expect_err("the run stops").to_string();
+            assert!(error.starts_with("a tombstone is not imported while"), "{error}");
+            drop(failing);
+            assert_eq!(snapshot(&dir), before);
+        }
+        // Read again, the twin is reached.
+        let done = store.forget(&sealed.id).unwrap();
+        assert_eq!((done.ids, done.unread), (vec![twin.clone()], None));
+        assert_eq!(store.fetch(&twin, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
+
+        // A link under another id is no file of the store's.
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let sealed = store.seal(&text(words), "").unwrap();
+        let link = dir.join("s000001").join(archive_name(&random_id()));
+        std::os::unix::fs::symlink(only_archive_file(&dir), &link).unwrap();
+        // So is one that is closed to its owner (nothing is closed to root).
+        let closed = dir.join("s000001").join(archive_name(&random_id()));
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::write(&closed, record_bytes(&store, &random_id(), &text("x"), |_| {})).unwrap();
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let done = store.forget(&sealed.id).unwrap();
+        assert_eq!((done.ids, done.unread), (vec![sealed.id.clone()], None));
     }
 }
 

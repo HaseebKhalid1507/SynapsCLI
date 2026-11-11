@@ -374,6 +374,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: forget is not "complete" over a copy it failed to
+  read.** When a forget read the other archive files of a project for the
+  window's digest, any file it could not read was passed over in silence.
+  That is right for a file the store never reads (a link, a FIFO, a file
+  closed to its owner, one too large to be an archive). A read that failed
+  for a passing reason (an I/O error, no descriptor or memory left) said
+  nothing about the file, which could be a live copy. Such a file now
+  counts as not reached: the forget answers "not complete" and names it.
 - **Context archives: an imported tombstone is refused while its content is
   live under any other id.** A tombstone line whose own id held nothing was
   checked only where a save looks for its content (the two ids cut from the
