@@ -313,6 +313,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: the store checks a projection it is handed before it
+  writes it.** The entry an import will use (`seal_projection`) took the
+  projection's digest as given and wrote the record under the store's own
+  chat whatever chat the projection named. A projection of another chat, or
+  one with a digest that is not the digest of its content, was stored as a
+  file no read accepts, under a name that was then taken for good; a digest
+  that is not 64 ASCII characters panicked. All of these are now refused
+  with an error before the lock is taken, and nothing is written. Nothing
+  calls this entry with such a projection today; a normal save is unchanged.
 - **Context archives: forget is not "complete" over a damaged copy.** A file
   under one of the window's own names that could be read but is not a valid
   record (a copy cut short, say) can still hold the window's text.

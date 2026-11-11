@@ -1029,13 +1029,41 @@ impl ArchiveStore {
     /// its place, and a `created_ms` of `None` stores a record without the
     /// field. Content that is already stored is the answer either way and is
     /// left as it is, its `created_ms` and the time of its file included.
+    ///
+    /// The projection is not taken on trust ([`Self::admit`]): one of
+    /// another chat, or one whose digest is not the digest of its content,
+    /// is refused as `InvalidInput` before the lock is taken, so a refusal
+    /// writes nothing at all.
     pub(crate) fn seal_projection(
         &self,
         projection: ArchiveProjection,
         written: Option<Written>,
     ) -> io::Result<(ArchiveRef, String)> {
+        self.admit(&projection)?;
         let _lock = self.exclusive()?;
         self.store(projection, written.unwrap_or_else(Written::now))
+    }
+
+    /// Whether `projection` is one this store may write: of this chat, and
+    /// with the digest of its own content. A projection has public fields
+    /// and can be deserialized, so neither is a given. Stored unchecked, a
+    /// record of another chat or with a digest that is not its content's is
+    /// a file no read accepts, under a name that is then taken for good.
+    /// The digest is looked at as text first: it is sliced into the two ids
+    /// later, and only 64 ASCII characters can be.
+    fn admit(&self, projection: &ArchiveProjection) -> io::Result<()> {
+        let digest = projection.digest.as_str();
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(invalid("archive projection digest is not 64 hex characters"));
+        }
+        if projection.logical_id != self.logical {
+            return Err(invalid("archive projection is of another chat"));
+        }
+        let count = projection.source_message_count;
+        if projection_digest(&projection.logical_id, count, &projection.messages)? != digest {
+            return Err(invalid("archive projection digest is not the digest of its content"));
+        }
+        Ok(())
     }
 
     /// What a seal does once it holds the lock: find `projection` stored, or
@@ -1050,6 +1078,9 @@ impl ArchiveStore {
     /// the other name holds. Only then is it written, under the first half
     /// if that name is free and under the second if something else has the
     /// first. Nothing else in the directory refuses it.
+    ///
+    /// `projection` has passed [`Self::admit`]: its digest is 64 ASCII
+    /// characters, which the slices below rely on.
     fn store(
         &self,
         projection: ArchiveProjection,
@@ -7079,6 +7110,87 @@ mod tests {
         assert_eq!(store.seal_window(&messages, "").unwrap().parts[0].archive, sealed);
         assert_eq!(snapshot(&dir), snapshot_before);
         assert_eq!(json_of(&file)["created_ms"], created);
+    }
+
+    /// `seal_projection` does not trust the projection it is handed: one of
+    /// another chat, or with a digest that is not its content's, is refused,
+    /// no digest panics, and a refusal writes nothing.
+    #[test]
+    fn a_projection_of_another_chat_or_with_a_wrong_digest_is_refused_and_nothing_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Every path under the base, directories too, and every file's bytes.
+        let state = || {
+            let mut paths = Vec::new();
+            let mut pending = vec![tmp.path().to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(&directory).unwrap() {
+                    let path = entry.unwrap().path();
+                    if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                        pending.push(path.clone());
+                    }
+                    paths.push(path);
+                }
+            }
+            paths.sort();
+            (paths, snapshot(tmp.path()))
+        };
+        let store = setup_in(tmp.path(), "synthetic-project");
+        let words = "handed to the store";
+        let project = |logical: &str, words: &str| {
+            project_hashed(logical, &text(words), "", None, Reduce::None).unwrap()
+        };
+        let good = || project(&store.logical, words);
+        let with_digest = |digest: &str| ArchiveProjection {
+            digest: digest.to_owned(),
+            ..good()
+        };
+        let other_chat = digest_parts(&[b"another-chat"]);
+        assert_ne!(other_chat, store.logical);
+        let half_way = format!("{}é{}", "a".repeat(31), "a".repeat(31));
+        assert!(half_way.len() == 64 && !half_way.is_char_boundary(32));
+        let refused = [
+            // Whole and consistent, of another chat.
+            ("another chat", project(&other_chat, words)),
+            // This chat's name on another chat's content and digest.
+            ("renamed", ArchiveProjection {
+                logical_id: store.logical.clone(),
+                ..project(&other_chat, words)
+            }),
+            ("another digest", with_digest(&project(&store.logical, "other words").digest)),
+            ("other messages", ArchiveProjection {
+                messages: project(&store.logical, "other words").messages,
+                ..good()
+            }),
+            ("another count", ArchiveProjection {
+                source_message_count: 2,
+                ..good()
+            }),
+            ("upper case", with_digest(&good().digest.to_uppercase())),
+            ("ten characters", with_digest("0123456789")),
+            ("empty", with_digest("")),
+            ("not hex", with_digest(&"z".repeat(64))),
+            ("not ASCII", with_digest(&"é".repeat(32))),
+            ("not ASCII, cut at the half", with_digest(&half_way)),
+        ];
+        // On a store that has written nothing yet, then on one that has.
+        for sealed_before in [false, true] {
+            if sealed_before {
+                store.seal(&text("a shelf to begin with"), "").unwrap();
+            }
+            let before = state();
+            for (what, projection) in &refused {
+                for written in [None, Some(Written { created_ms: Some(1), modified: None })] {
+                    let error = store.seal_projection(projection.clone(), written).unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{what}: {error}");
+                    assert_eq!(state(), before, "{what}");
+                }
+            }
+        }
+        // The projection as it was made is stored, as a seal stores it.
+        let (sealed, _) = store.seal_projection(good(), None).unwrap();
+        assert_eq!(sealed.id, good().digest[..32]);
+        assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap(), text(words));
+        assert_eq!(store.seal(&text(words), "").unwrap(), sealed);
     }
 
     /// What an import gives is what is stored: the record's `created_ms` and
