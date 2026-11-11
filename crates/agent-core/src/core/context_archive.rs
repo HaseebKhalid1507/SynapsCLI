@@ -584,6 +584,17 @@ impl Drop for FlockGuard {
     }
 }
 
+/// What a lookup by id found on the shelves: the newest valid record under
+/// the id.
+struct Located {
+    /// The name of the shelf it is on.
+    shelf: String,
+    record: Record,
+    /// A newer shelf has a file under the id that is not a valid record and
+    /// still says this record's content was forgotten.
+    forgotten: bool,
+}
+
 /// What a seal finds under the id it would store a projection as.
 enum Shelved {
     Nothing,
@@ -1410,8 +1421,11 @@ impl ArchiveStore {
     /// A shelf that cannot be opened, and a legacy slot or a file under one
     /// of the names that cannot be read or is not a valid record (and does
     /// not say "forgotten" for this projection), may hold a copy that was
-    /// not reached: a damaged copy can still have the window's text in it. That is never silent: [`Forgotten::unread`]
-    /// says so, and forgetting again when the place can be read reaches it.
+    /// not reached: a damaged copy can still have the window's text in it.
+    /// That is never silent: [`Forgotten::unread`] says so, and forgetting
+    /// again when the place can be read reaches it. A file under `id` on a
+    /// newer shelf that is not a valid record is such a place too: the valid
+    /// record under `id` on an older shelf is still found and forgotten.
     pub fn forget(&self, id: &str) -> io::Result<Forgotten> {
         validate_id(id)?;
         let _lock = self.exclusive()?;
@@ -1419,7 +1433,7 @@ impl ArchiveStore {
         // The record asked for says which content to forget.
         let mut unread = Unread::default();
         let asked = match self.locate(&shelves, id, false, &mut unread)? {
-            Some((.., record)) => record,
+            Some(found) => found.record,
             None => match self.legacy_segment(&slots, id, false, &mut unread) {
                 Some((_, record)) => record,
                 None => return Err(unread.not_found()),
@@ -1695,16 +1709,30 @@ impl ArchiveStore {
     /// The shelf that holds segment `id`, by name and opened, and its
     /// record: one `openat` per shelf, newest first, and one file read. Never
     /// a scan. A shelf name that is not a directory that can be opened is
-    /// passed over and noted in `unread`: the segment may be in it. An error
-    /// is the segment's own file, there and not readable as its record.
+    /// passed over and noted in `unread`: the segment may be in it.
+    ///
+    /// A file under the name that is not a valid record, or is not a file
+    /// the store reads ([`PrivateDir::not_a_segment`]), is passed over too,
+    /// as a seal passes over it: the segment is the valid record under the
+    /// name on an older shelf, if there is one. If there is none, the error
+    /// is that of the newest such file: there, and not readable as its
+    /// record. A read that fails for any other reason says nothing about
+    /// what the file is and is the error at once.
+    ///
+    /// A passed-over file may be a damaged tombstone of the very content the
+    /// older record holds. [`Located::forgotten`] says so, and a caller that
+    /// would hand out that record's content must not.
     fn locate(
         &self,
         shelves: &[String],
         id: &str,
         readonly: bool,
         unread: &mut Unread,
-    ) -> io::Result<Option<(String, PrivateDir, Record)>> {
+    ) -> io::Result<Option<Located>> {
         let name = archive_name(id);
+        // The error of the newest file passed over, and what was read of
+        // each one that could be read.
+        let (mut first, mut passed) = (None, Vec::<Vec<u8>>::new());
         for shelf in shelves {
             let dir = match self.fs.open_child(shelf, readonly) {
                 Ok(Some(dir)) => dir,
@@ -1714,11 +1742,30 @@ impl ArchiveStore {
                     continue;
                 }
             };
-            if let Some(record) = self.read_record(&dir, &name, readonly)? {
-                return Ok(Some((shelf.clone(), dir, record)));
-            }
+            let error = match dir.read_with(&name, MAX_SEGMENT_BYTES, readonly) {
+                Ok(None) => continue,
+                Ok(Some(raw)) => match self.record(&name, &raw) {
+                    Ok(record) => {
+                        let forgotten =
+                            passed.iter().any(|raw| says_forgotten(raw, &record.digest));
+                        return Ok(Some(Located {
+                            shelf: shelf.clone(),
+                            record,
+                            forgotten,
+                        }));
+                    }
+                    Err(error) => {
+                        passed.push(raw);
+                        error
+                    }
+                },
+                Err(error) if PrivateDir::not_a_segment(&error) => error,
+                Err(error) => return Err(error),
+            };
+            tracing::warn!(%shelf, file = %name, %error, "archive lookup passed over a file under its id");
+            first.get_or_insert(error);
         }
-        Ok(None)
+        first.map_or(Ok(None), Err)
     }
 
     /// The record of segment `id`, for a caller that holds no lock: one file
@@ -1730,8 +1777,9 @@ impl ArchiveStore {
         self.check_abort()?;
         let (shelves, slots) = self.layout()?;
         let mut unread = Unread::default();
-        if let Some((.., record)) = self.locate(&shelves, id, true, &mut unread)? {
-            return Ok(record);
+        if let Some(found) = self.locate(&shelves, id, true, &mut unread)? {
+            // Forgotten, by a file that no longer validates: not handed out.
+            return if found.forgotten { Err(not_found()) } else { Ok(found.record) };
         }
         if !slots.is_empty() {
             let _lock = self.shared()?;
@@ -1765,17 +1813,6 @@ impl ArchiveStore {
             }
         }
         None
-    }
-
-    fn read_record(
-        &self,
-        dir: &PrivateDir,
-        name: &str,
-        readonly: bool,
-    ) -> io::Result<Option<Record>> {
-        dir.read_with(name, MAX_SEGMENT_BYTES, readonly)?
-            .map(|raw| self.record(name, &raw))
-            .transpose()
     }
 
     /// Parse and validate the contents of the segment file `name`. Anything
@@ -2228,8 +2265,12 @@ pub fn archive_file(base: &Path, scope_key: &str, id: &str) -> io::Result<Option
     let directory = base.join("context-archives").join(&store.scope);
     let mut unread = Unread::default();
     let (shelves, slots) = store.layout()?;
-    if let Some((shelf, ..)) = store.locate(&shelves, id, true, &mut unread)? {
-        return Ok(Some(directory.join(shelf).join(archive_name(id))));
+    if let Some(found) = store.locate(&shelves, id, true, &mut unread)? {
+        if found.forgotten {
+            // A newer file under the id says so and is not a valid record.
+            return Err(corrupt());
+        }
+        return Ok(Some(directory.join(found.shelf).join(archive_name(id))));
     }
     match store.legacy_segment(&slots, id, true, &mut unread) {
         Some((slot, _)) => Ok(Some(directory.join(slot))),
@@ -5293,6 +5334,93 @@ mod tests {
         let place = format!("first s000002/{}: ", archive_name(&digest[32..]));
         assert!(done.unread.unwrap().contains(&place));
         assert_eq!(std::fs::read(&linked).unwrap(), b"x");
+    }
+
+    /// A file under the id on a newer shelf that is not a valid record does
+    /// not hide the valid record under the id on an older shelf: a fetch
+    /// returns it, and a forget by that id forgets it and names the odd file
+    /// as not reached.
+    #[test]
+    fn a_lookup_by_id_passes_over_a_file_that_is_not_a_record_to_an_older_shelf() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let (older, newer) = (dir.join("s000001"), dir.join("s000002"));
+        std::fs::create_dir(&older).unwrap();
+        std::fs::create_dir(&newer).unwrap();
+        std::fs::write(tmp.path().join("elsewhere"), b"not in the store").unwrap();
+        let base = tmp.path();
+        for link in [false, true] {
+            let words = format!("behind an odd file of its name, link {link}");
+            let digest = digest_of(&words);
+            let sealed = store.seal_with_note(&text(&words), "its note").unwrap().0;
+            let name = archive_name(&sealed.id);
+            assert_eq!(sealed.id, digest[..32]);
+            std::fs::rename(newer.join(&name), older.join(&name)).unwrap();
+            if link {
+                symlink(tmp.path().join("elsewhere"), newer.join(&name)).unwrap();
+            } else {
+                std::fs::write(newer.join(&name), b"not a record").unwrap();
+            }
+            // Read by id: the valid copy.
+            assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap(), text(&words));
+            assert_eq!(store.fetch_note(&sealed.id).unwrap(), "its note");
+            let file = archive_file(base, "synthetic-project", &sealed.id).unwrap();
+            assert_eq!(file, Some(older.join(&name)));
+            // Forgotten by that id: the valid copy, and never a plain "done".
+            let done = store.forget(&sealed.id).unwrap();
+            assert_eq!(done.ids, std::slice::from_ref(&sealed.id));
+            let unread = done.unread.unwrap();
+            let place = format!("1 place(s) could not be read, first s000002/{name}: ");
+            assert!(unread.starts_with(&place), "{unread}");
+            assert!(is_tombstone_of(&store, &older.join(&name), &digest));
+            let kind = std::fs::symlink_metadata(newer.join(&name)).unwrap().file_type();
+            assert_eq!(kind.is_symlink(), link, "the odd file is left as it is");
+            let error = store.fetch(&sealed.id, 0, 1).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            let before = snapshot(&dir);
+            let refused = store.seal(&text(&words), "").unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(snapshot(&dir), before);
+            assert!(store.search(&words, 8).unwrap().is_empty());
+        }
+
+        // With no valid record under the id on any shelf, the error is the
+        // odd file's, as it was.
+        let lone = "0123456789abcdef0123456789abcdef";
+        std::fs::write(newer.join(archive_name(lone)), b"not a record").unwrap();
+        std::fs::write(older.join(archive_name(lone)), b"{}").unwrap();
+        for error in [store.fetch(lone, 0, 1).unwrap_err(), store.forget(lone).unwrap_err()] {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+        assert!(archive_file(base, "synthetic-project", lone).is_err());
+        // A read that failed says nothing about the file: still the error.
+        let words = "behind a file that cannot be read now";
+        let sealed = store.seal(&text(words), "").unwrap();
+        let name = archive_name(&sealed.id);
+        std::fs::copy(newer.join(&name), older.join(&name)).unwrap();
+        let failing = Fault::on("open", &sealed.id, libc::EIO);
+        assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap_err().raw_os_error(), Some(libc::EIO));
+        assert_eq!(store.forget(&sealed.id).unwrap_err().raw_os_error(), Some(libc::EIO));
+        drop(failing);
+
+        // The odd file is a tombstone of this very window that no longer
+        // validates: the older copy is not handed out, and a forget by the
+        // id still reaches it.
+        let words = "behind a damaged tombstone";
+        let digest = digest_of(words);
+        let sealed = store.seal(&text(words), "").unwrap();
+        let name = archive_name(&sealed.id);
+        std::fs::rename(newer.join(&name), older.join(&name)).unwrap();
+        let damaged = record_bytes(&store, &sealed.id, &text(words), |record| {
+            record.body = Body::Tombstone;
+            record.version = 2;
+        });
+        std::fs::write(newer.join(&name), damaged).unwrap();
+        assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(store.fetch_note(&sealed.id).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(archive_file(base, "synthetic-project", &sealed.id).is_err());
+        assert_eq!(store.forget(&sealed.id).unwrap(), forgotten(&[&sealed.id]));
+        assert!(is_tombstone_of(&store, &older.join(&name), &digest));
     }
 
     /// A file under one of the window's own names that was read and is not

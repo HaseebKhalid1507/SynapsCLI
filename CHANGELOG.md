@@ -313,6 +313,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: a fetch and a forget by id look past a file of that
+  name that is not a record.** A lookup by id stopped at the newest shelf
+  that had any file under the id. If that file was not a valid record (a
+  damaged copy, a stray file, a link), the fetch failed, and so did
+  `memory_forget` of that id, while the valid archive on an older shelf
+  kept its text. A lookup now goes on to the older shelves: a fetch returns
+  the valid archive, and a forget turns it into a tombstone and answers
+  "NOT COMPLETE", naming the file it passed over. When no shelf has a valid
+  record under the id, the error is the same as before. When the file
+  passed over is a damaged tombstone of the same content, the older copy is
+  not returned ("not found") and a forget still reaches it.
 - **Context archives: the store checks a projection it is handed before it
   writes it.** The entry an import will use (`seal_projection`) took the
   projection's digest as given and wrote the record under the store's own
