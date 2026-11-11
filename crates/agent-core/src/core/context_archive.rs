@@ -5278,7 +5278,11 @@ mod tests {
         let mut other = setup_in(tmp.path(), "synthetic-project");
         other.process_wait = Duration::ZERO;
         store.seal(&text("first"), "").unwrap();
+        // A fetch of a legacy slot takes the lock shared, from a lock file
+        // it only opens: the same lock file, the same answers.
+        let legacy = seal_legacy_slot(&store, 0, &text("sealed long ago"), "");
         let works = |words: &str| {
+            assert_eq!(store.fetch(&legacy.id, 0, 1).unwrap(), text("sealed long ago"), "{words}");
             let sealed = store.seal(&text(words), "").unwrap();
             assert_eq!(store.forget(&sealed.id).unwrap(), forgotten(&[&sealed.id]));
             // And it still excludes: a save by another store is busy while
@@ -5326,6 +5330,7 @@ mod tests {
             let errors = [
                 store.seal(&text("refused"), "").unwrap_err(),
                 store.forget(&sealed.id).unwrap_err(),
+                store.fetch(&legacy.id, 0, 1).unwrap_err(),
             ];
             for error in errors {
                 assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{what}: {error}");
@@ -5335,7 +5340,7 @@ mod tests {
                 assert!(message.contains(&format!("rm '{}'", lock.display())), "{message}");
             }
             assert_eq!(snapshot(&dir.join("s000001")), before, "{what}");
-            // A read by id needs no lock.
+            // A read by id of a shelved archive needs no lock.
             assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap(), text("to forget later"));
         };
         std::fs::remove_file(&lock).unwrap();
