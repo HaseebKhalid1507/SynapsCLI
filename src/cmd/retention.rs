@@ -415,6 +415,48 @@ mod tests {
             assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand, "{removed}");
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn scope_info_accepts_one_exact_membership_and_refuses_the_rest() {
+        const CANONICAL: &str = "p0123456789abcdef";
+        const REQUESTED: &str = "pfedcba9876543210";
+        let reply = |edit: &dyn Fn(&mut Value)| {
+            let mut value = json!({
+                "canonical_project": CANONICAL,
+                "members": [CANONICAL, REQUESTED],
+                "mode": "multi_project",
+                "user_scope": false,
+            });
+            edit(&mut value);
+            value
+        };
+        let info = parse_scope_info(reply(&|_| {}), REQUESTED).unwrap();
+        assert_eq!(info.canonical_project, CANONICAL);
+        assert_eq!(info.members, [CANONICAL, REQUESTED]);
+        let refused: [(&str, Value, &str); 6] = [
+            ("user scope", reply(&|v| v["user_scope"] = json!(true)), REQUESTED),
+            ("requested not a member", reply(&|_| {}), "p1111111111111111"),
+            (
+                "canonical not a member",
+                reply(&|v| v["canonical_project"] = json!("p2222222222222222")),
+                REQUESTED,
+            ),
+            (
+                "duplicate member",
+                reply(&|v| v["members"] = json!([CANONICAL, REQUESTED, REQUESTED])),
+                REQUESTED,
+            ),
+            (
+                "the zero project",
+                reply(&|v| v["members"] = json!([CANONICAL, REQUESTED, "p0000000000000000"])),
+                REQUESTED,
+            ),
+            ("unknown field", reply(&|v| v["extra"] = json!(1)), REQUESTED),
+        ];
+        for (case, value, requested) in refused {
+            assert!(parse_scope_info(value, requested).is_err(), "{case}");
+        }
+    }
     #[test]
     fn exact_scope_prefix_never_converted() {
         assert_eq!(
