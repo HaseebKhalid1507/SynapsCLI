@@ -374,6 +374,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: an imported tombstone is refused while its content is
+  live under any other id.** A tombstone line whose own id held nothing was
+  checked only where a save looks for its content (the two ids cut from the
+  digest, and the legacy slots). The same content, live under another
+  imported id, was not seen: the tombstone was stored and that copy was
+  still fetched and searched. The import now reads every archive file of
+  the project for the digest, as a forget does, and refuses the line with
+  the id of the live copy; a dry run answers the same. If a file that may
+  hold such a copy cannot be read, the import stops instead of guessing.
 - **Context archives: a forgotten archive stays forgotten whatever id it is
   stored under.** An archive brought in by `ArchiveStore::import` keeps the
   id it had, which is not one of the two ids a seal derives from the

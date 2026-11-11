@@ -1903,32 +1903,8 @@ impl ArchiveStore {
             // can be here under any number of those. No name says which
             // files they are, so every segment file of the shelf is read
             // for its digest.
-            let listed = match dir.names() {
-                Ok(listed) => listed,
-                Err(error) => {
-                    unread.pass(shelf, error);
-                    continue;
-                }
-            };
-            for (name, is_dir, _) in listed {
-                if is_dir || archive_id(&name).is_none() || names.contains(&name) {
-                    continue;
-                }
-                // A file under another name that cannot be read, or holds
-                // no digest, says nothing about this content: passed over.
-                let Ok(Some(raw)) = dir.read_with(&name, MAX_SEGMENT_BYTES, false) else {
-                    continue;
-                };
-                if !names_digest(&raw, digest) {
-                    continue;
-                }
-                match self.record(&name, &raw) {
-                    Ok(record) => copies.push((Some(shelf), name, record)),
-                    Err(_) if says_forgotten(&raw, digest) => {}
-                    // It names this content and is not a record: it may be
-                    // a damaged copy.
-                    Err(error) => unread.pass(&format!("{shelf}/{name}"), error),
-                }
+            for (name, record) in self.twins(&dir, shelf, digest, &names, false, &mut unread) {
+                copies.push((Some(shelf), name, record));
             }
         }
         for slot in &slots {
@@ -1980,6 +1956,88 @@ impl ArchiveStore {
             ids,
             unread: unread.notice(),
         })
+    }
+
+    /// The records of `digest` on the shelf `dir` under file names other
+    /// than `names`, each with its file name: every segment file of the
+    /// shelf is read for its digest. What may be such a record and could
+    /// not be read as one goes to `unread`. `readonly` changes nothing on
+    /// disk.
+    fn twins(
+        &self,
+        dir: &PrivateDir,
+        shelf: &str,
+        digest: &str,
+        names: &[String],
+        readonly: bool,
+        unread: &mut Unread,
+    ) -> Vec<(String, Record)> {
+        let listed = match dir.names() {
+            Ok(listed) => listed,
+            Err(error) => {
+                unread.pass(shelf, error);
+                return Vec::new();
+            }
+        };
+        let mut twins = Vec::new();
+        for (name, is_dir, _) in listed {
+            if is_dir || archive_id(&name).is_none() || names.contains(&name) {
+                continue;
+            }
+            // A file under another name that cannot be read, or holds
+            // no digest, says nothing about this content: passed over.
+            let Ok(Some(raw)) = dir.read_with(&name, MAX_SEGMENT_BYTES, readonly) else {
+                continue;
+            };
+            if !names_digest(&raw, digest) {
+                continue;
+            }
+            match self.record(&name, &raw) {
+                Ok(record) => twins.push((name, record)),
+                Err(_) if says_forgotten(&raw, digest) => {}
+                // It names this content and is not a record: it may be
+                // a damaged copy.
+                Err(error) => unread.pass(&format!("{shelf}/{name}"), error),
+            }
+        }
+        twins
+    }
+
+    /// The id of a live record of `digest` on a shelf under an id that is
+    /// not one of `names`, found by the scan a forget uses
+    /// ([`Self::twins`]). A shelf or a file that may hold one and could not
+    /// be read is an error: "none" would be a guess.
+    fn live_twin(
+        &self,
+        shelves: &[String],
+        digest: &str,
+        names: &[String],
+        readonly: bool,
+    ) -> io::Result<Option<String>> {
+        let mut unread = Unread::default();
+        let mut live = None;
+        for shelf in shelves {
+            let dir = match self.fs.open_child(shelf, readonly) {
+                Ok(Some(dir)) => dir,
+                Ok(None) => continue,
+                Err(error) => {
+                    unread.pass(shelf, error);
+                    continue;
+                }
+            };
+            for (_, record) in self.twins(&dir, shelf, digest, names, readonly, &mut unread) {
+                if matches!(record.body, Body::Live { .. }) {
+                    live.get_or_insert(record.id);
+                }
+            }
+        }
+        match (live, unread.notice()) {
+            (Some(id), _) => Ok(Some(id)),
+            (None, None) => Ok(None),
+            (None, Some(notice)) => Err(io::Error::other(format!(
+                "a tombstone is not imported while a file that may hold its content live                  cannot be read: {notice}"
+            ))),
+        }
     }
 
     /// Migration-only export of validated eligible evidence and permanent
@@ -2335,7 +2393,9 @@ impl ArchiveStore {
                 return refuse("this content was forgotten in this store".to_owned(), id);
             }
             same_content_as = probe.live.take();
-        } else if let Some(other) = &probe.live {
+        } else if let Some(other) =
+            Self::live_copy(store, plan.as_deref(), &probe, &shelves, &record, dry_run)?
+        {
             // A tombstone for content that is live here under another id.
             // Publishing it would leave that copy readable beside it, and
             // forgetting a record the line does not name is not this
@@ -2386,6 +2446,39 @@ impl ArchiveStore {
             (None, None) => return Err(invalid("an import that writes needs a store")),
         };
         imported(ImportOutcome::Stored, Some(shelf), same_content_as, None)
+    }
+
+    /// The id of a live copy of the content of the tombstone `record`,
+    /// whose own id holds nothing: where a seal would look (`probe`), then
+    /// what the run would have written (`plan`), then every archive file on
+    /// the shelves, as a forget looks ([`Self::live_twin`]).
+    fn live_copy(
+        store: Option<&Self>,
+        plan: Option<&Planned>,
+        probe: &Probe,
+        shelves: &[String],
+        record: &Record,
+        readonly: bool,
+    ) -> io::Result<Option<String>> {
+        let digest = record.digest.as_str();
+        if probe.live.is_some() {
+            return Ok(probe.live.clone());
+        }
+        if let Some(plan) = plan {
+            if plan.forgotten.contains(digest) {
+                // The run would have forgotten every copy by now.
+                return Ok(None);
+            }
+            let live = |(_, held): &(&String, &Held)| held.digest == digest && held.note.is_some();
+            if let Some((id, _)) = plan.ids.iter().filter(live).min_by_key(|(id, _)| *id) {
+                return Ok(Some(id.clone()));
+            }
+        }
+        let Some(store) = store else {
+            return Ok(None);
+        };
+        let names = [&digest[..32], &digest[32..], &record.id].map(archive_name);
+        store.live_twin(shelves, digest, &names, readonly)
     }
 
     /// What is where a seal would look for `digest`, by the lookups a seal
@@ -9493,7 +9586,7 @@ mod tests {
     /// The lines of a run that meets every outcome, for a dry run and the
     /// real run to agree on.
     fn a_run(chat: &ArchiveStore, scope: &str) -> Vec<Vec<u8>> {
-        let ids: Vec<_> = (0..5).map(|_| random_id()).collect();
+        let ids: Vec<_> = (0..7).map(|_| random_id()).collect();
         let line = |id: &String, words: &str, change: fn(&mut Record)| {
             record_bytes(chat, id, &text(words), |record| {
                 scope.clone_into(&mut record.scope);
@@ -9513,6 +9606,8 @@ mod tests {
             line(&ids[2], "third", tombstone),
             line(&ids[3], "fourth", tombstone),
             line(&ids[4], "fourth", live),
+            line(&ids[5], "fifth", live),
+            line(&ids[6], "fifth", tombstone),
             b"not a record".to_vec(),
         ]
     }
@@ -9579,7 +9674,10 @@ mod tests {
         assert_eq!(outcomes[9], "Stored");
         // The tombstone before it forgot the content under any id.
         assert_eq!(outcomes[10], "this content was forgotten in this store");
-        assert!(outcomes[11].starts_with("not an archive record"));
+        // A tombstone of content that is live under another imported id.
+        assert_eq!(outcomes[11], "Stored");
+        assert!(outcomes[12].starts_with("a tombstone of content that is live in this store as"));
+        assert!(outcomes[13].starts_with("not an archive record"));
 
         // A dry run over a store that exists: the same answers as running
         // it for real again, no mode changed, no lock file made, no byte
@@ -9841,6 +9939,64 @@ mod tests {
         let name = twin.file_name().unwrap().to_str().unwrap();
         assert!(unread.starts_with(&format!("1 place(s) could not be read, first s000001/{name}: ")), "{unread}");
         assert_eq!(std::fs::read(&stray).unwrap(), b"not json at all");
+    }
+
+    /// A tombstone line whose id holds nothing is refused while its content
+    /// is live under any other id, also one a seal does not look under: the
+    /// scan a forget uses finds it. In either order of the two lines, and
+    /// the dry run says the same.
+    #[test]
+    fn a_tombstone_line_is_refused_while_its_content_is_live_under_another_imported_id() {
+        let words = "live under an imported id";
+        let (a, b) = (random_id(), random_id());
+        let refusal = format!(
+            "a tombstone of content that is live in this store as {a}: forget that archive \
+             here, then import again"
+        );
+        for dry_first in [false, true] {
+            let (tmp, store) = setup();
+            let dir = directory(&tmp, &store);
+            let live = record_bytes(&store, &a, &text(words), |_| {});
+            let dead = record_bytes(&store, &b, &text(words), tombstone);
+            let mut seen = ImportSeen::default();
+            if dry_first {
+                // Both lines in one dry run: the live copy is in the plan.
+                let planned = store.import(&live, false, true, &mut seen).unwrap().unwrap();
+                assert_eq!(planned.outcome, ImportOutcome::Stored);
+                let refused = store.import(&dead, false, true, &mut seen).unwrap().unwrap_err();
+                assert_eq!(refused.reason, refusal);
+                assert_eq!(shelf_files(&dir), Vec::<PathBuf>::new());
+            }
+            assert_eq!(import(&store, &live).unwrap().outcome, ImportOutcome::Stored);
+            let before = snapshot(&dir);
+            // The live copy is on disk: a dry run and the real run find it.
+            for dry_run in [true, false] {
+                let mut seen = ImportSeen::default();
+                let refused = store.import(&dead, false, dry_run, &mut seen).unwrap().unwrap_err();
+                assert_eq!((refused.reason.as_str(), refused.id.as_deref()), (&*refusal, Some(&*b)));
+                assert_eq!(snapshot(&dir), before);
+            }
+            assert_eq!(store.fetch(&a, 0, 1).unwrap(), text(words));
+            // Also from a shelf that is not the newest.
+            std::fs::create_dir(dir.join("s000002")).unwrap();
+            assert_eq!(reason(&store, &dead), refusal);
+            assert_eq!(store.fetch(&a, 0, 1).unwrap(), text(words));
+        }
+        // The other order: the tombstone is stored, the live line is not.
+        let (_tmp, store) = setup();
+        let live = record_bytes(&store, &a, &text(words), |_| {});
+        let dead = record_bytes(&store, &b, &text(words), tombstone);
+        for dry_run in [true, false] {
+            let mut seen = ImportSeen::default();
+            let stored = store.import(&dead, false, dry_run, &mut seen).unwrap().unwrap();
+            assert_eq!(stored.outcome, ImportOutcome::Stored);
+            let refused = match dry_run {
+                true => store.import(&live, false, true, &mut seen).unwrap().unwrap_err(),
+                false => import(&store, &live).unwrap_err(),
+            };
+            assert_eq!(refused.reason, "this content was forgotten in this store");
+        }
+        assert_eq!(store.fetch(&a, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 }
 
