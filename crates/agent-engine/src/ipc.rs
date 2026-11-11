@@ -298,7 +298,7 @@ mod imp {
             }
         }
 
-        fn sid_string(sid: PSID) -> io::Result<String> {
+        pub(super) fn sid_string(sid: PSID) -> io::Result<String> {
             let mut s: *mut u16 = null_mut();
             // SAFETY: valid SID; s receives a LocalAlloc'd string.
             if unsafe { ConvertSidToStringSidW(sid, &mut s) } == 0 {
@@ -353,8 +353,21 @@ mod imp {
             }
         }
 
+        /// This process's user SID as `S-1-5-…`.
+        #[cfg(test)]
+        pub fn current_user_sid() -> io::Result<String> {
+            sid_string(TokenUserBuf::current()?.sid())
+        }
+
         /// Refuse a pipe whose server process runs as another account.
         pub fn verify_server_is_current_user(pipe: std::os::windows::io::RawHandle) -> io::Result<()> {
+            let ours = TokenUserBuf::current()?;
+            verify_server_user(pipe, ours.sid())
+        }
+
+        /// Refuse a pipe whose server process does not run as `ours`. Split
+        /// out so a test can play "another account" without a second one.
+        pub fn verify_server_user(pipe: std::os::windows::io::RawHandle, ours: PSID) -> io::Result<()> {
             let mut pid = 0u32;
             // SAFETY: a connected client pipe handle.
             if unsafe { GetNamedPipeServerProcessId(pipe as HANDLE, &mut pid) } == 0 {
@@ -373,12 +386,215 @@ mod imp {
             }
             let process = Handle(process);
             let theirs = TokenUserBuf::of(process.0).map_err(|e| refuse(format!("whose owner cannot be read ({e})")))?;
-            let ours = TokenUserBuf::current()?;
             // SAFETY: two valid SIDs.
-            if unsafe { EqualSid(ours.sid(), theirs.sid()) } == 0 {
+            if unsafe { EqualSid(ours, theirs.sid()) } == 0 {
                 return Err(refuse("which runs as another user".into()));
             }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod security_tests {
+        use super::*;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use std::ptr::{null, null_mut};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use windows_sys::Win32::Foundation::{LocalFree, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1,
+            SE_KERNEL_OBJECT,
+        };
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, RevertToSelf, SecurityIdentification, TokenImpersonationLevel, DACL_SECURITY_INFORMATION,
+            LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING, READ_CONTROL};
+        use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+        fn endpoint() -> (tempfile::TempDir, std::path::PathBuf) {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("daemon.sock");
+            (d, p)
+        }
+
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain([0]).collect()
+        }
+
+        /// A raw, synchronous client open (no tokio), what any local program
+        /// can do. `flags` 0 is "no SQOS" (.NET's default, libuv);
+        /// `SECURITY_SQOS_PRESENT | …` picks an impersonation level.
+        fn open_raw(name: &str, access: u32, flags: u32) -> io::Result<OwnedHandle> {
+            let n = wide(name);
+            // SAFETY: NUL-terminated name; no security attributes or template.
+            let h = unsafe { CreateFileW(n.as_ptr(), access, 0, null(), OPEN_EXISTING, flags, null_mut()) };
+            if h == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: a handle we just opened and now own.
+            Ok(unsafe { OwnedHandle::from_raw_handle(h) })
+        }
+
+        /// A SID from its string form (aliases such as `SY`, `LA`, `HI` too).
+        struct Sid(PSID);
+        impl Sid {
+            fn parse(s: &str) -> Self {
+                let w = wide(s);
+                let mut p: PSID = null_mut();
+                // SAFETY: NUL-terminated string; p receives a LocalAlloc'd SID.
+                assert_ne!(unsafe { ConvertStringSidToSidW(w.as_ptr(), &mut p) }, 0, "{s}: {}", io::Error::last_os_error());
+                Self(p)
+            }
+        }
+        impl Drop for Sid {
+            fn drop(&mut self) {
+                // SAFETY: allocated by ConvertStringSidToSidW.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+
+        /// `S-1-…` for a SID string or an SDDL alias.
+        fn canon(s: &str) -> String {
+            win::sid_string(Sid::parse(s).0).unwrap()
+        }
+
+        /// The pipe name's DACL and mandatory label (NPFS keeps one
+        /// descriptor per name), read through a client handle, as SDDL.
+        fn sddl_of(h: &OwnedHandle) -> String {
+            let info = DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+            let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+            // SAFETY: a handle opened with READ_CONTROL; sd receives a LocalAlloc'd descriptor.
+            let rc = unsafe {
+                GetSecurityInfo(h.as_raw_handle() as HANDLE, SE_KERNEL_OBJECT, info, null_mut(), null_mut(), null_mut(), null_mut(), &mut sd)
+            };
+            assert_eq!(rc, 0, "GetSecurityInfo: {}", io::Error::from_raw_os_error(rc as i32));
+            let mut s: *mut u16 = null_mut();
+            // SAFETY: a valid descriptor; s receives a LocalAlloc'd string.
+            let ok = unsafe { ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, info, &mut s, null_mut()) };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            // SAFETY: the NUL-terminated wide string from the call above.
+            let out = unsafe {
+                let len = (0..).take_while(|&i| *s.add(i) != 0).count();
+                String::from_utf16_lossy(std::slice::from_raw_parts(s, len))
+            };
+            // SAFETY: both were LocalAlloc'd above.
+            unsafe {
+                LocalFree(s.cast());
+                LocalFree(sd);
+            }
+            out
+        }
+
+        /// `D:P`, exactly two allow ACEs, for SYSTEM and this user.
+        fn assert_owner_only_dacl(sddl: &str) {
+            let dacl = sddl.split("S:").next().unwrap();
+            assert!(dacl.starts_with("D:P"), "protected DACL: {sddl}");
+            let aces: Vec<&str> = dacl.split('(').skip(1).map(|a| a.trim_end_matches(')')).collect();
+            assert_eq!(aces.len(), 2, "exactly two ACEs: {sddl}");
+            assert!(aces.iter().all(|a| a.starts_with("A;")), "allow ACEs only: {sddl}");
+            let mut trustees: Vec<String> = aces.iter().map(|a| canon(a.rsplit(';').next().unwrap())).collect();
+            trustees.sort();
+            let mut want = vec!["S-1-5-18".to_string(), win::current_user_sid().unwrap()];
+            want.sort();
+            assert_eq!(trustees, want, "{sddl}");
+        }
+
+        /// §5 row 1: the name's owner-only DACL, read through the first
+        /// instance and again through its replacement after one accept.
+        #[tokio::test]
+        async fn the_owner_only_dacl_persists_while_instances_are_replaced() {
+            let (_d, path) = endpoint();
+            let name = pipe_name(&path);
+            let mut l = Listener::bind(&path).unwrap();
+            let first = open_raw(&name, GENERIC_READ | READ_CONTROL, 0).unwrap();
+            assert_owner_only_dacl(&sddl_of(&first));
+            // Accepting puts the replacement instance up (`Listener::instance`).
+            let _served = l.accept().await.unwrap();
+            let second = open_raw(&name, GENERIC_READ | READ_CONTROL, 0).unwrap();
+            assert_owner_only_dacl(&sddl_of(&second));
+        }
+
+        /// §5 row 2: a client refuses a server that runs as another account.
+        /// SYSTEM plays "ours", so this process's own server is the stranger.
+        /// The accepted end stays alive during the checks (else ERROR_NO_DATA).
+        #[tokio::test]
+        async fn a_server_of_another_account_is_refused() {
+            let (_d, path) = endpoint();
+            let mut l = Listener::bind(&path).unwrap();
+            let client = ClientOptions::new().open(pipe_name(&path)).unwrap();
+            let _served = l.accept().await.unwrap();
+            let system = Sid::parse("S-1-5-18");
+            let e = win::verify_server_user(client.as_raw_handle(), system.0).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            assert!(e.to_string().contains("runs as another user"), "{e}");
+            win::verify_server_is_current_user(client.as_raw_handle()).unwrap();
+        }
+
+        /// §5 row 4: `reject_remote_clients`. The SMB loopback counts as remote.
+        #[tokio::test]
+        async fn a_remote_client_is_refused() {
+            let remote = |local: &str| local.replacen(r"\\.\", r"\\127.0.0.1\", 1);
+            // Positive control: a pipe that accepts remote clients opens through the loopback.
+            let (_c, control) = endpoint();
+            let control = pipe_name(&control);
+            let _open = ServerOptions::new().first_pipe_instance(true).reject_remote_clients(false).create(&control).unwrap();
+            if let Err(e) = ClientOptions::new().open(remote(&control)) {
+                eprintln!("skipped: no SMB loopback to \\\\127.0.0.1\\pipe ({e}); is the Server service (LanmanServer) running?");
+                return;
+            }
+            let (_d, path) = endpoint();
+            let _l = Listener::bind(&path).unwrap();
+            let local = pipe_name(&path);
+            assert!(ClientOptions::new().open(remote(&local)).is_err(), "a remote open of {local} must fail");
+            ClientOptions::new().open(&local).unwrap();
+        }
+
+        /// Impersonate the pipe's client on this thread, read the thread
+        /// token's impersonation level, revert. Nothing awaits in between.
+        fn client_impersonation_level(server: &NamedPipeServer) -> io::Result<i32> {
+            // SAFETY: a connected server pipe handle.
+            if unsafe { ImpersonateNamedPipeClient(server.as_raw_handle() as HANDLE) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let level = (|| {
+                let mut token: HANDLE = null_mut();
+                // SAFETY: OpenAsSelf = TRUE: an Identification token can't open itself as the client.
+                if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: a token handle we own.
+                let token = unsafe { OwnedHandle::from_raw_handle(token) };
+                let (mut level, mut len) = (0i32, 0u32);
+                // SAFETY: level is a SECURITY_IMPERSONATION_LEVEL (an i32).
+                if unsafe { GetTokenInformation(token.as_raw_handle() as HANDLE, TokenImpersonationLevel, (&mut level as *mut i32).cast(), 4, &mut len) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(level)
+            })();
+            // SAFETY: ends the impersonation started above.
+            if unsafe { RevertToSelf() } == 0 {
+                std::process::abort();
+            }
+            level
+        }
+
+        /// §5 row 5: tokio's client lets the daemon identify it, never act as
+        /// it. Runs on the test's own thread (current-thread runtime), with
+        /// no await between impersonating and reverting.
+        #[tokio::test]
+        async fn the_server_can_identify_but_not_impersonate_a_client() {
+            let (_d, path) = endpoint();
+            let mut l = Listener::bind(&path).unwrap();
+            let client = connect(&path).await.unwrap();
+            let mut server = l.accept().await.unwrap();
+            let (_cr, mut cw) = split_client(client);
+            cw.write_all(b"x").await.unwrap();
+            let mut b = [0u8; 1];
+            server.read_exact(&mut b).await.unwrap();
+            assert_eq!(client_impersonation_level(&server).unwrap(), SecurityIdentification);
         }
     }
 }
