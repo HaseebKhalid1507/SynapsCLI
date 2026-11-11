@@ -347,7 +347,12 @@ pub(crate) fn context_band_str(band: ContextBand) -> &'static str {
     }
 }
 
-pub fn archive_store() -> std::io::Result<ArchiveStore> {
+/// Tests only: the file store of the project the process folder is in.
+/// Production opens a chat's store through its [`MemoryBinding`]
+/// ([`archive_store_in`]): under the daemon the process folder is the
+/// daemon's, not the chat's.
+#[cfg(test)]
+pub(crate) fn archive_store() -> std::io::Result<ArchiveStore> {
     let cwd = std::env::current_dir()?;
     let scope = agent_core::memory::store::ProjectScope::discover(&cwd)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -1196,7 +1201,16 @@ pub(crate) fn notify_archived(
 
 /// Resume restores only window metadata from a verified source reference. It
 /// never enables mode or reconstructs capability/consent from model text.
-pub fn restore_window(messages: &[SharedMessage], state: &SharedContinuation) {
+///
+/// The reference is verified in the file store of `binding`, the one the
+/// chat's rollover sealed it into (`MemoryBinding::history_seal`): the
+/// project of the chat's folder, which under the daemon is not the project
+/// of the process folder.
+pub fn restore_window(
+    messages: &[SharedMessage],
+    state: &SharedContinuation,
+    binding: &MemoryBinding,
+) {
     let mut s = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1213,10 +1227,12 @@ pub fn restore_window(messages: &[SharedMessage], state: &SharedContinuation) {
     let Some(id) = marker["archive"].as_str() else {
         return;
     };
-    if archive_store()
-        .and_then(|store| store.fetch(id, 0, 1))
-        .is_ok()
-    {
+    let found = binding
+        .scope()
+        .map_err(|e| std::io::Error::other(e.to_string()))
+        .and_then(|scope| archive_store_in(binding.base(), scope))
+        .and_then(|store| store.fetch(id, 0, 1));
+    if found.is_ok() {
         s.latest_archive = Some(id.into());
         s.window = marker["window"].as_u64().unwrap_or(1);
     }
@@ -1254,7 +1270,7 @@ pub async fn validate_restored_history(
     binding: &MemoryBinding,
 ) -> Result<()> {
     if !binding.exclusive() {
-        restore_window(messages, state);
+        restore_window(messages, state, binding);
         return Ok(());
     }
     // Inspect this actual request even if reset/another request initialized the
@@ -1330,7 +1346,7 @@ impl crate::Runtime {
         if self.memory_backend_exclusive() {
             restore_window_syntactic(messages, &self.continuation);
         } else {
-            restore_window(messages, &self.continuation);
+            restore_window(messages, &self.continuation, &self.memory_backend);
         }
     }
     pub fn context_management_enabled(&self) -> bool {
@@ -1885,7 +1901,7 @@ mod tests {
         assert_eq!(source.len(), messages.len());
         assert_eq!(source[1], messages[1]);
         let restored = Arc::new(Mutex::new(ContinuationState::default()));
-        restore_window(&next, &restored);
+        restore_window(&next, &restored, &MemoryBinding::legacy_current());
         let s = restored.lock().unwrap();
         assert_eq!(s.window, 2);
         assert!(!s.enabled());
@@ -2345,6 +2361,70 @@ mod command_tests {
         );
         assert_eq!(rt.continuation.lock().unwrap().window, 1);
         assert!(rt.continuation.lock().unwrap().latest_archive.is_none());
+    }
+
+    /// A chat the daemon hosts runs in its own folder, and its windows are
+    /// archived under that folder's project (`MemoryBinding::history_seal`).
+    /// Resuming it looks for the archive there, through the runtime's own
+    /// binding, not in the project of the folder the process runs in.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_resumed_chat_looks_for_its_archive_in_its_own_project_not_the_hosts() {
+        let _env = crate::test_env::BaseDirGuard::new();
+        let _root = crate::test_env::EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        // The chat's folder is a project of its own, apart from the host's.
+        let chat = tempfile::tempdir().unwrap();
+        std::fs::write(chat.path().join(".synaps-project"), "").unwrap();
+        let files = agent_core::config::MemoryBackendConfig::default();
+        // A session runtime as the host builds it: folder first, then config.
+        let runtime_in = |folder: Option<&std::path::Path>| {
+            let mut rt = crate::Runtime::new_headless();
+            rt.set_cwd(folder.map(std::path::Path::to_path_buf));
+            rt.apply_memory_backend_config(&files);
+            rt
+        };
+        let window = |text: &str| vec![Arc::new(json!({"role":"assistant","content":text}))];
+        let head = |archive: &str| {
+            vec![Arc::new(json!({"role":"user","content":"carry on",
+                "_synaps_context":{"schema":MARKER,"archive":archive,"window":4}}))]
+        };
+        let restored = |rt: &crate::Runtime| {
+            let s = rt.continuation.lock().unwrap();
+            (s.latest_archive.clone(), s.window)
+        };
+
+        let (chats, hosts) = (runtime_in(Some(chat.path())), runtime_in(None));
+        assert_ne!(
+            chats.memory_backend.scope().unwrap().key(),
+            hosts.memory_backend.scope().unwrap().key(),
+            "the chat's folder and the process folder are different projects"
+        );
+        // The chat's rollover seals a window through its binding.
+        let (sealed, _) = chats
+            .memory_backend
+            .history_seal("chat", &window("the chat's window"), "note")
+            .await
+            .unwrap();
+
+        // Resumed in its folder (a new runtime, as `--continue` or a daemon
+        // restart builds): its window bookkeeping carries on.
+        let resumed = runtime_in(Some(chat.path()));
+        resumed.reset_context_continuation("chat", &head(&sealed.id));
+        assert_eq!(
+            restored(&resumed),
+            (Some(sealed.id.clone()), 4),
+            "not restarted at window 1 for want of an archive in the host's project"
+        );
+
+        // An archive only the host's project holds is not this chat's.
+        let (foreign, _) = hosts
+            .memory_backend
+            .history_seal("other", &window("the host project's window"), "note")
+            .await
+            .unwrap();
+        let resumed = runtime_in(Some(chat.path()));
+        resumed.reset_context_continuation("chat", &head(&foreign.id));
+        assert_eq!(restored(&resumed), (None, 1));
     }
 
     #[tokio::test]

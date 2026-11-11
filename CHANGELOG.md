@@ -284,6 +284,14 @@ All notable changes to this project will be documented in this file.
   its `tool.call` with `session_id: null` and the daemon's folder as `cwd`.
   It now carries the chat's id and the chat's folder, like a tool call in a
   turn.
+- **Daemon: a resumed chat keeps its context-window count.** With the
+  plain-file memory backend and context management on, a daemon-hosted chat
+  that was resumed (`--continue`, a daemon reload or restart, waking a
+  parked chat) checked for its last archived window in the project of the
+  daemon's folder instead of its own. The archive is not there, so the chat
+  silently started counting windows from 1 again and reported no archive.
+  The check now uses the chat's project, where its rollover wrote the
+  archive. No file moves; in-process hosts are unchanged.
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
   program names: a stock Windows has no `grep` or `ls` ("program not
   found"), and `find` resolved to `System32\find.exe`, an unrelated string

@@ -810,7 +810,7 @@ impl StreamMethods {
         }
         if context_enabled {
             if !memory_backend.exclusive() {
-                super::continuation::restore_window(&messages, &continuation);
+                super::continuation::restore_window(&messages, &continuation, &memory_backend);
             }
             let mut registry = prepare_or_cancel!(tools.write());
             registry.register(Arc::new(
