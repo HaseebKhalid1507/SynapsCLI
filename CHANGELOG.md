@@ -56,7 +56,12 @@ All notable changes to this project will be documented in this file.
   cannot delay, fail or change a rollover. Best effort and unordered; one
   archive can be announced more than once. Plain-file memory backend only.
   Additive: existing extensions are unaffected, and an extension that names
-  the hook does not load on an older Synaps. See `docs/extensions/hooks.md`.
+  the hook does not load on an older Synaps. A window sealed as several
+  archives (see "An oversized context window no longer fails rollover"
+  below) sends one event per archive, first part first, with `part`, `parts`,
+  `first_source_index` and `reduced_messages` saying where each belongs; a
+  window that fits one archive is one event with `part` 1 of `parts` 1. See
+  `docs/extensions/hooks.md`.
 - **Extensions: `on_memory_forgotten` hook.** After the `memory_forget` tool
   has forgotten an archived context window or a note, extensions that
   subscribe (`session.lifecycle`) are told its id, whether it was an archive
@@ -87,6 +92,27 @@ All notable changes to this project will be documented in this file.
   **Downgrading:** an older Synaps pointed at the same directory sees only
   the old slot files. Archives sealed by this version stay on disk but it
   cannot fetch them, and a chat resumed there restarts its window count.
+- **An oversized context window no longer fails rollover.** With
+  `memory.backend = legacy`, a window over what one archive may hold (4,096
+  messages, 16 MiB, 65,536 visited nodes, or a tool input nested more than
+  about 29 levels deep) failed the seal with "archive commit failed; history
+  retained"; the turn ended, and the same window failed again on every
+  later attempt, so the chat could never roll over. Such a window is now
+  sealed as several consecutive archives. The first message of the new
+  window lists every part in order with the range of the old window it
+  covers and the number of messages stored, for example `ctx-<id> (source
+  messages #0-#2499, 2431 archived), ctx-<id> (#2500-#4999, 2402 archived)`,
+  and `memory_fetch` works on each part by its id; inside a part
+  `source_index` starts again at 0. A single message that is too large for
+  one archive by itself is stored with its oversized payloads left out,
+  each marked in place, and the new window says so: the one case where an
+  archive is not exact. Up to 32 parts are listed by id (the newest); earlier
+  ones are counted with their range and found with `memory_search`. If sealing stops between two parts the
+  rollover fails with the history kept, as before, and the next attempt
+  reuses the parts already written. A window that fits one archive is
+  unchanged: the same archive, the same message, the same saved session.
+  The limits on one archive are unchanged, and `memory.backend = axel` still
+  fails on an oversized window. See `docs/specs/context-continuation.md`.
 - **A rollover waits for a busy archive store instead of failing, and reading
   history takes no lock.** With `memory.backend = legacy`, a rollover whose
   project archive was locked by another Synaps process failed at once with

@@ -373,7 +373,10 @@ messages compacted.
 a chat into an archive file. It requires `privacy.llm_content` and is
 notify-only: the host does not wait for the response and discards it, so the
 handler can neither delay nor change the rollover. Delivery is best effort,
-unordered, and one archive can be announced more than once. See
+unordered, and one archive can be announced more than once. A window over
+what one archive may hold is sealed as several, and then one event is sent
+per archive, first part first, with `data.part` of `data.parts` and
+`data.first_source_index` saying where it belongs. See
 [hooks.md](hooks.md#notify-only-hooks) for the rules and for every field.
 
 ```json

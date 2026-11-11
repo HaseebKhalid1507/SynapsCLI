@@ -417,10 +417,10 @@ impl HookEvent {
     /// when the file could not be located, or its path is not UTF-8).
     /// `window` is the window that starts after the archive.
     ///
-    /// One window is one archive today, so the event is always part 1 of 1,
-    /// starting at source message 0, with nothing reduced. Those four fields
-    /// are there now so the shape stays the same once an oversized window is
-    /// sealed as several archives, one event per part.
+    /// A window is one archive unless it was over a per-archive limit, so
+    /// the event is built as part 1 of 1, starting at source message 0, with
+    /// nothing reduced. An oversized window is sealed as several archives,
+    /// one event each: [`HookEvent::with_part`] then says which one this is.
     pub fn on_context_archived(
         session_id: &str,
         archive_id: &str,
@@ -453,6 +453,31 @@ impl HookEvent {
                 "reduced_messages": 0,
             }),
         }
+    }
+
+    /// Say which of its window's archives an `on_context_archived` event is
+    /// for (builder): archive `part` of `parts`, counting from 1, covering
+    /// the window's source messages from `first_source_index`, with
+    /// `reduced_messages` of them stored with an oversized payload left out.
+    /// The fields are already in `data`; on any other event this does nothing.
+    pub fn with_part(
+        mut self,
+        part: usize,
+        parts: usize,
+        first_source_index: usize,
+        reduced_messages: usize,
+    ) -> Self {
+        if let (HookKind::OnContextArchived, Some(data)) = (self.kind, self.data.as_object_mut()) {
+            for (field, value) in [
+                ("part", part),
+                ("parts", parts),
+                ("first_source_index", first_source_index),
+                ("reduced_messages", reduced_messages),
+            ] {
+                data.insert(field.to_owned(), value.into());
+            }
+        }
+        self
     }
 
     /// Construct an `on_memory_forgotten` event: `memory_forget` forgot the
@@ -966,6 +991,34 @@ mod tests {
         let lost = HookEvent::on_context_archived("chat-1", &id, None, "p0", 1, 1, 2);
         assert_eq!(lost.data["path"], Value::Null);
         assert_eq!(lost.data["archive_id"], json!(id));
+    }
+
+    /// One archive of a window sealed as several: `with_part` changes the
+    /// four part fields and nothing else, and the values of a whole window
+    /// leave the event exactly as it was built, key order included.
+    #[test]
+    fn hook_event_on_context_archived_for_one_part_of_several() {
+        let id = "9f2c".repeat(8);
+        let whole = || HookEvent::on_context_archived("chat-1", &id, None, "p0", 212, 240, 4);
+        let wire = |ev: &HookEvent| serde_json::to_string(ev).unwrap();
+        assert_eq!(wire(&whole().with_part(1, 1, 0, 0)), wire(&whole()));
+
+        let second = whole().with_part(2, 3, 240, 1);
+        let mut expected = serde_json::to_value(whole()).unwrap();
+        expected["data"]["part"] = json!(2);
+        expected["data"]["parts"] = json!(3);
+        expected["data"]["first_source_index"] = json!(240);
+        expected["data"]["reduced_messages"] = json!(1);
+        assert_eq!(serde_json::to_value(&second).unwrap(), expected);
+        assert_eq!(
+            second.data.as_object().unwrap().len(),
+            whole().data.as_object().unwrap().len(),
+            "no field is added"
+        );
+
+        // Not an archive event: untouched, whatever its data is.
+        let other = HookEvent::on_session_start("chat-1");
+        assert_eq!(wire(&other.clone().with_part(2, 3, 240, 1)), wire(&other));
     }
 
     /// The wire shape of `on_memory_forgotten`: ids only, in `data`.

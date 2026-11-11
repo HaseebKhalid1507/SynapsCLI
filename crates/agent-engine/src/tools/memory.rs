@@ -1131,6 +1131,59 @@ mod tests {
         );
     }
 
+    /// A window sealed as several archives. `memory_fetch` reads each part
+    /// by its own id with `start` and `limit`, and a message's index in the
+    /// window is the part's first index plus the `source_index` printed with
+    /// it: what the continuation message tells the model to add.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn history_fetch_pages_every_part_of_a_split_window() {
+        let _env = BaseDirGuard::new();
+        let binding = crate::memory_backend::MemoryBinding::legacy_current();
+        let count = agent_core::context_archive::MAX_MESSAGES + 4;
+        let window: Vec<crate::SharedMessage> = (0..count)
+            .map(|i| std::sync::Arc::new(json!({"role":"user","content":format!("line {i}.")})))
+            .collect();
+        let (parts, _) = binding
+            .history_seal_window("synthetic-split", &window, "")
+            .await
+            .unwrap();
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        let context = || {
+            let mut ctx = create_tool_context();
+            ctx.capabilities.memory_backend = Some(binding.clone());
+            ctx
+        };
+        for part in &parts {
+            let id = format!("ctx-{}", part.archive.id);
+            // The last three messages of this part.
+            let start = part.archive.message_count - 3;
+            let out = MemoryFetchTool
+                .execute(json!({"ids":[id],"start":start,"limit":3}), context())
+                .await
+                .unwrap();
+            assert_eq!(out.matches("[eligible_index=").count(), 3, "{out}");
+            for index in start..start + 3 {
+                // Every message here is archived, so the two indices agree.
+                let row = format!("\n[eligible_index={index} source_index={index} bytes=");
+                assert!(out.contains(&row), "{out}");
+                let in_window = part.first_source_index + index;
+                assert!(out.contains(&format!("\"line {in_window}.\"")), "{out}");
+            }
+            // Past the end of a part is empty; it does not run on into the next.
+            let past = MemoryFetchTool
+                .execute(
+                    json!({"ids":[id],"start":part.archive.message_count,"limit":3}),
+                    context(),
+                )
+                .await
+                .unwrap();
+            assert!(!past.contains("[eligible_index="), "{past}");
+        }
+        let last = &parts[1];
+        assert_eq!(last.first_source_index + last.archive.message_count, count);
+    }
+
     #[test]
     fn memory_search_and_fetch_descriptions_teach_literal_sequential_exact_id_workflow() {
         let search = MemorySearchTool;

@@ -3,7 +3,8 @@
 use super::{error, MemoryBinding, Result};
 use crate::SharedMessage;
 use agent_core::context_archive::{
-    self, ArchiveDescriptor, ArchiveRedactor, ArchiveRef, ArchiveStore, ArchivedMessage,
+    self, ArchiveDescriptor, ArchivePart, ArchiveRedactor, ArchiveRef, ArchiveStore,
+    ArchivedMessage,
 };
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,6 +102,50 @@ impl MemoryBinding {
             return Err(error("history commit acknowledgement mismatch"));
         }
         Ok((r, stored))
+    }
+    /// [`history_seal`](Self::history_seal) for a whole window, as rollover
+    /// needs it: the archives the window was sealed as ("parts", in source
+    /// order, never empty) and the note stored with the last one.
+    ///
+    /// The file store never fails this for a window over a per-archive limit
+    /// ([`ArchiveStore::seal_window`]): it cuts the window into several
+    /// archives, and a window that fits is the one archive `history_seal`
+    /// makes. The archives record nothing about each other, so the returned
+    /// list is the only record of a split. Parts are sealed one at a time: a
+    /// failure, or a caller dropped between two of them, leaves the earlier
+    /// ones on disk and returns no list; sealing the same window again finds
+    /// them and returns the same list.
+    ///
+    /// The Axel backend seals one archive exactly as `history_seal` does, so
+    /// an oversized window still fails there.
+    pub async fn history_seal_window(
+        &self,
+        logical_id: &str,
+        messages: &[SharedMessage],
+        note: &str,
+    ) -> Result<(Vec<ArchivePart>, String)> {
+        if self.exclusive() {
+            let (archive, stored) = self.history_seal(logical_id, messages, note).await?;
+            let whole = ArchivePart {
+                archive,
+                first_source_index: 0,
+                reduced_messages: 0,
+            };
+            return Ok((vec![whole], stored));
+        }
+        let scope = self.scope()?.clone();
+        let base = self.base().to_owned();
+        let logical = logical_id.to_owned();
+        let source = messages.to_vec();
+        let note = note.to_owned();
+        archive_worker(move |abort| {
+            let window = ArchiveStore::new(&base, scope.key(), &logical)?
+                .with_redactor(redactor())
+                .with_abort(abort)
+                .seal_window(&source, &note)?;
+            Ok((window.parts, window.note))
+        })
+        .await
     }
     pub async fn history_search(
         &self,
@@ -379,6 +424,101 @@ mod budget_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("input byte budget exceeded"));
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    fn lines(count: usize) -> Vec<SharedMessage> {
+        (0..count)
+            .map(|index| Arc::new(json!({"role":"user","content":format!("line {index}.")})))
+            .collect()
+    }
+
+    /// The file store through `history_seal_window`: a window within the
+    /// limits of one archive is the archive `history_seal` makes, and a
+    /// window over them, which `history_seal` still refuses, is several.
+    #[tokio::test]
+    async fn legacy_history_seal_window_splits_what_history_seal_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = binding(temp.path(), MemoryBackendKind::Legacy, None);
+        let small = lines(3);
+        let (parts, note) = binding
+            .history_seal_window("window-session", &small, "the note")
+            .await
+            .unwrap();
+        let (reference, stored) = binding
+            .history_seal("window-session", &small, "another note")
+            .await
+            .unwrap();
+        let whole = ArchivePart {
+            archive: reference,
+            first_source_index: 0,
+            reduced_messages: 0,
+        };
+        assert_eq!(parts, [whole]);
+        assert_eq!((note.as_str(), stored.as_str()), ("the note", "the note"));
+        assert_eq!(binding.history_search("", 8).await.unwrap().len(), 1);
+
+        let large = lines(context_archive::MAX_MESSAGES + 1);
+        let refused = binding
+            .history_seal("window-session", &large, "")
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("budget exceeded"), "{refused}");
+        assert_eq!(binding.history_search("", 8).await.unwrap().len(), 1);
+        let (parts, note) = binding
+            .history_seal_window("window-session", &large, "the note")
+            .await
+            .unwrap();
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(note, "the note");
+        let mut covered = 0;
+        for part in &parts {
+            assert_eq!(part.first_source_index, covered);
+            assert_eq!(part.reduced_messages, 0);
+            // Inside a part, source indices start again at 0.
+            let first = binding.history_fetch(&part.archive.id, 0, 1).await.unwrap();
+            assert_eq!(first[0].source_index, 0);
+            assert_eq!(first[0].message, large[covered]);
+            covered += part.archive.source_message_count;
+        }
+        assert_eq!(covered, large.len());
+        // The note is with the last part, and the same window again is the
+        // same list, with the note that was stored.
+        assert_eq!(binding.history_note(&parts[0].archive.id).await.unwrap(), "");
+        assert_eq!(binding.history_note(&parts[1].archive.id).await.unwrap(), "the note");
+        let again = binding
+            .history_seal_window("window-session", &large, "a later note")
+            .await
+            .unwrap();
+        assert_eq!(again, (parts, "the note".to_owned()));
+        assert_eq!(binding.history_search("", 8).await.unwrap().len(), 3);
+    }
+
+    /// Decision 6.2: the Axel backend is unchanged. A window over a
+    /// per-archive limit is still refused there, before the service is
+    /// started or anything is stored, through the rollover's entry point too.
+    #[tokio::test]
+    async fn axel_oversized_window_still_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let b = binding(
+            temp.path(),
+            MemoryBackendKind::Axel,
+            Some(temp.path().join("never-started")),
+        );
+        let too_big = vec![Arc::new(
+            json!({"role":"user", "content":"x".repeat(context_archive::MAX_INPUT_BYTES + 1)}),
+        )];
+        let err = b
+            .history_seal_window("budget-session", &too_big, "")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("input byte budget exceeded"), "{err}");
+        let too_many = lines(context_archive::MAX_MESSAGES + 1);
+        let err = b
+            .history_seal_window("budget-session", &too_many, "")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("message/note budget exceeded"), "{err}");
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 

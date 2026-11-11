@@ -111,13 +111,18 @@ you:
   else is ignored.
 - **Best effort.** An event is sent once and not retried. It is lost when
   your process is down and cannot be started within the call, when the call
-  takes longer than 5 s, when 64 notify-only events are already being
-  delivered (a handler that is slow while events keep coming does not build
+  takes longer than 5 s, when 64 notify-only deliveries are already in
+  flight (a handler that is slow while events keep coming does not build
   a queue in the host; the extra events are dropped and logged), and when
-  the host exits first.
+  the host exits first. The events for the parts of one window (below) are
+  one delivery however many they are, so a window in many parts cannot use
+  up the 64 by itself.
 - **Unordered, and sometimes twice.** Events are delivered independently, so
-  two of them can arrive in either order. If your process dies mid-call it is
-  restarted and sent the event again. Make the handler idempotent.
+  two of them can arrive in either order. The one exception is the parts of
+  one window, which are sent one after another, first part first; an event
+  that timed out may still overlap the next, so go by `data.part`, not by
+  arrival. If your process dies mid-call it is restarted and sent the event
+  again. Make the handler idempotent.
 - **Answer at once and do the work afterwards.** Calls to one extension are
   made one at a time, so while your handler sits on a notify-only event your
   other hooks (a `before_tool_call`, say) wait behind it, each for up to its
@@ -135,9 +140,15 @@ a plugin that subscribes needs a new enough host.
 
 When a chat gets too long, automatic context management (`/context auto`)
 seals the older messages into an archive file and the chat continues in a
-fresh window. This hook fires each time such a file has been written.
-Requires `privacy.llm_content`: the event carries no conversation text, but
-its `path` leads to it.
+fresh window. This hook fires for each archive file of a window, once every
+file of that window has been written. Requires `privacy.llm_content`: the
+event carries no conversation text, but its `path` leads to it.
+
+A window is normally one archive and one event (`part` 1 of `parts` 1). A
+window over what one archive may hold (4,096 messages, 16 MiB, 65,536 visited
+nodes, or a tool input nested too deep) is sealed as several archives,
+"parts", and you get one event per part: see [A window in several
+parts](#a-window-in-several-parts).
 
 ```json
 {
@@ -172,29 +183,75 @@ its `path` leads to it.
 | `data.archive_id` | 32 lowercase hex characters. The model sees it as `ctx-<archive_id>` in `memory_search` and `memory_fetch`. |
 | `data.path` | Absolute path of the file that holds the archive, or `null` if it could not be located or is not valid UTF-8. |
 | `data.project_key` | The project the archive belongs to (`p` and 16 hex characters). |
-| `data.message_count` | Messages stored in the archive. |
-| `data.source_message_count` | Messages in the window before filtering; system messages, reasoning and restricted content are not archived. |
-| `data.window` | Number of the window that starts after this archive. |
-| `data.part`, `data.parts` | Which archive of the window this is, counting from 1, and how many there are. A window is one archive today, so both are `1`. A later version may seal an oversized window as several archives and then sends one event per part, with the same `window`, in any order. |
-| `data.first_source_index` | Index in the window of the first message this archive covers. `0` today. |
-| `data.reduced_messages` | Messages stored with an oversized payload left out. `0` today. |
+| `data.message_count` | Messages stored in this archive. |
+| `data.source_message_count` | Messages of the window this archive covers, before filtering; system messages, reasoning and restricted content are not archived. For a window in one archive that is the whole window. |
+| `data.window` | Number of the window that starts after this archive. The same on every part of one window. |
+| `data.part`, `data.parts` | Which archive of the window this is, counting from 1, and how many there are. Both are `1` for a window that fits one archive. |
+| `data.first_source_index` | Index in the window of the first message this archive covers; it covers `source_message_count` messages from there. `0` for the first part. |
+| `data.reduced_messages` | Messages in this archive that are stored with an oversized payload left out. `0` unless a single message was too large for one archive by itself. |
+
+#### A window in several parts
+
+For a window sealed as several archives the host sends one event per part,
+all after the last part is on disk, as one delivery: first part first, each
+handed to your handler before the next is sent. Every event has the same
+`session_id`, `cwd`, `project_key`, `window` and `parts`, and its own
+`archive_id`, `path`, counts, `part` and `first_source_index`.
+
+- **The parts are consecutive and cover the window.** Part `n + 1` starts
+  where part `n` ends: its `first_source_index` is the previous part's
+  `first_source_index + source_message_count`. Inside an archive file each
+  message's `source_index` counts from that part's first message, so the
+  message's index in the window is `first_source_index + source_index`.
+- **The archive files do not say they belong together.** Each part is an
+  ordinary archive, and nothing in the file names the others or its place in
+  the window. These events, and the chat's saved session (below), are the
+  only record of how a window was cut. If you need to put a window back
+  together later, keep `part`, `parts` and `first_source_index` when you get
+  them.
+- **A missing part is visible.** Delivery is still best effort, so check that
+  you have `parts` events for a `(session_id, window)` if it matters.
+- **Two parts can be the same archive.** Parts with identical content (the
+  same messages repeated) have the same `archive_id` and `path`; you get one
+  event per part, with different `part` and `first_source_index`.
+- **A reduced message is marked in the file.** `reduced_messages` counts
+  messages that were too large for an archive by themselves and are stored
+  with the oversized payloads left out. In the file such a message carries
+  the key `_archive_reduced`, and each omission is replaced by a marker that
+  says how large it was. Everything else in the window is stored exactly.
+- **A window is announced whole or not at all.** If sealing stops between
+  two parts (a full disk, a store that stays locked, a cancelled turn) no
+  event is sent. The parts already written stay on disk as ordinary
+  archives; the next attempt finds them, writes the rest and announces
+  every part.
+
+The chat's saved session holds the same list. The first message of the new
+window carries host metadata, `_synaps_context`, in which `archive` is the
+id of the last part and, for a window in several parts or with a reduced
+message, `archives` lists every part in order as
+`{"id", "first", "count", "messages"}` (plus `"reduced"` when it is not 0):
+the archive id, `first_source_index`, `source_message_count` and
+`message_count` of the events above. That list is replaced when the chat
+next rolls over.
 
 What it means, and what it does not:
 
-- **"This archive file now exists."** It is sent once the file is written and
-  synced. It does not promise the chat went on in the new window: saving the
-  new window can still fail or be cancelled, and a later attempt seals the
-  window again.
+- **"This archive file now exists."** It is sent once every archive file of
+  the window is written and synced. It does not promise the chat went on in
+  the new window: saving the new window can still fail or be cancelled, and
+  a later attempt seals the window again.
 - **The same `archive_id` can be announced more than once.** Sealing the same
   window again finds the archive already written, writes nothing, and
   announces it again. Key your work on `archive_id`.
 - **An archive can exist that was never announced:** the rollover was
-  cancelled just after the file was written, the event was dropped, or no
-  extension was listening. List the store when you start.
+  cancelled just after the file was written, sealing stopped between two
+  parts of a window, the event was dropped, or no extension was listening.
+  List the store when you start.
 - **Not sent when the seal fails.** The chat keeps its history and no event
   goes out.
 - **Plain-file memory backend only.** With `memory.backend = axel` there is
-  no archive file and no event.
+  no archive file and no event (and an oversized window still fails to roll
+  over there).
 - **Not for subagent workers**, whose windows are saved beside their own
   transcripts, and not for `/compact`, which is `on_compaction`.
 - **Treat the file as read-only.** It is written once and never changed,

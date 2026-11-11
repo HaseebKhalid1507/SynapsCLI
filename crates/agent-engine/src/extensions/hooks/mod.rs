@@ -754,14 +754,23 @@ impl HookBus {
         self.notify_with(event.kind, async move { Some(event) });
     }
 
-    /// [`Self::notify`] for an event that costs something to build (a file
-    /// lookup): `event` runs on the detached task, inside the same in-flight
-    /// limit, and is not polled at all when the event would be dropped.
-    /// `None`, or an event of another kind, sends nothing. The build is not
-    /// under the handler timeout, so it must end on its own.
-    pub fn notify_with<F>(self: &Arc<Self>, kind: HookKind, event: F)
+    /// [`Self::notify`] for events that cost something to build (a file
+    /// lookup): `events` runs on the detached task, inside the same in-flight
+    /// limit, and is not polled at all when the delivery would be dropped.
+    /// The build is not under the handler timeout, so it must end on its own.
+    ///
+    /// What it yields is `None`, `Some(event)` or a `Vec` of events. Several
+    /// are one delivery: sent in that order on the one task, each to every
+    /// handler (under [`HANDLER_TIMEOUT`]) before the next. So a caller with
+    /// many events to send takes one in-flight slot, not one each, and cannot
+    /// have its later events dropped because its earlier ones are still in
+    /// flight; the task ends within the timeout for each event. An event of
+    /// another kind than `kind` is not sent.
+    pub fn notify_with<F, I>(self: &Arc<Self>, kind: HookKind, events: F)
     where
-        F: std::future::Future<Output = Option<HookEvent>> + Send + 'static,
+        F: std::future::Future<Output = I> + Send + 'static,
+        I: IntoIterator<Item = HookEvent> + Send,
+        I::IntoIter: Send,
     {
         if !kind.is_notification() {
             // A hook whose answer matters must be awaited (`emit`).
@@ -785,11 +794,10 @@ impl HookBus {
         let bus = Arc::clone(self);
         runtime.spawn(async move {
             let _slot = slot;
-            match event.await {
-                Some(event) if event.kind == kind => {
+            for event in events.await {
+                if event.kind == kind {
                     let _ = bus.emit_concurrent(&event).await;
                 }
-                _ => {}
             }
         });
     }
@@ -2836,6 +2844,47 @@ mod notify_tests {
         settle().await;
         assert_eq!(listener.calls(), (1, 1));
         assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    /// Several events from one build are one delivery: one slot, sent in
+    /// order, each to every handler before the next, and each with its own
+    /// handler timeout. More of them than the in-flight limit lose none.
+    #[tokio::test(start_paused = true)]
+    async fn notify_with_sends_several_events_in_order_as_one_delivery() {
+        let numbered = |n: usize| event().with_part(n, NOTIFY_MAX_IN_FLIGHT + 6, 0, 0);
+        let parts_seen = |listener: &Listener| -> Vec<u64> {
+            let events = listener.events();
+            events.iter().map(|event| event.data["part"].as_u64().unwrap()).collect()
+        };
+        let listener = Listener::prompt("listener");
+        let bus = bus_with(&[&listener]).await;
+        let count = NOTIFY_MAX_IN_FLIGHT + 6;
+        bus.notify_with(KIND, async move {
+            let mut events: Vec<_> = (1..=count).map(numbered).collect();
+            // One of another kind in the middle is skipped, not a stop.
+            events.insert(3, HookEvent::on_session_start("chat"));
+            events
+        });
+        assert_eq!(bus.notifies_in_flight(), 1);
+        settle().await;
+        assert_eq!(parts_seen(&listener), (1..=count as u64).collect::<Vec<_>>());
+        assert_eq!(bus.notifies_in_flight(), 0);
+
+        // A handler that never answers: the next event waits for the first
+        // one's timeout and is then sent all the same.
+        let hung = Listener::hanging("hung");
+        let bus = bus_with(&[&hung]).await;
+        bus.notify_with(KIND, async move { vec![numbered(1), numbered(2)] });
+        settle().await;
+        assert_eq!(parts_seen(&hung), [1]);
+        tokio::time::sleep(HANDLER_TIMEOUT).await;
+        settle().await;
+        assert_eq!(parts_seen(&hung), [1, 2]);
+        assert_eq!(bus.notifies_in_flight(), 1);
+        tokio::time::sleep(HANDLER_TIMEOUT).await;
+        settle().await;
+        assert_eq!(bus.notifies_in_flight(), 0);
+        assert_eq!(hung.calls(), (2, 0));
     }
 
     /// A hook whose answer matters cannot be sent this way.

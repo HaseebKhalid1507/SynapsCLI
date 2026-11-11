@@ -326,6 +326,8 @@ struct RolloverRun {
     elapsed: Duration,
     /// The id in the new window's context marker, when the window rolled.
     archive_id: Option<String>,
+    /// That marker (`_synaps_context`); `null` when the window did not roll.
+    marker: serde_json::Value,
     /// What the fixture extension logged, read after it was shut down.
     hook_events: Vec<serde_json::Value>,
 }
@@ -341,6 +343,38 @@ async fn rollover_turn(
     hook_mode: Option<&str>,
     expect_events: usize,
     break_store: bool,
+) -> RolloverRun {
+    rollover_turn_over(home, chat_folder, hook_mode, expect_events, break_store, Vec::new()).await
+}
+
+/// A tool call whose input is nested deeper than one archive admits, and its
+/// result. A window holding them is over a per-archive limit however small
+/// it is, so it is sealed as several archives.
+fn deep_tool_call() -> Vec<SharedMessage> {
+    let mut input = json!("leaf");
+    for _ in 0..40 {
+        input = json!({"nested": input});
+    }
+    vec![
+        Arc::new(json!({"role":"assistant", "content":[
+            {"type":"tool_use", "id":"deep", "name":"plot", "input":input}
+        ]})),
+        Arc::new(json!({"role":"user", "content":[
+            {"type":"tool_result", "tool_use_id":"deep", "content":"plotted"}
+        ]})),
+    ]
+}
+
+/// [`rollover_turn`] with `older` between the archivable evidence and the
+/// current request, where a rollover drops it. `expect_events` is per
+/// archive of the sealed window.
+async fn rollover_turn_over(
+    home: &HomeGuard,
+    chat_folder: &std::path::Path,
+    hook_mode: Option<&str>,
+    expect_events: usize,
+    break_store: bool,
+    older: Vec<SharedMessage>,
 ) -> RolloverRun {
     use synaps_cli::extensions::manager::ExtensionManager;
     let (url, hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
@@ -365,7 +399,7 @@ async fn rollover_turn(
     let rollover = pressure + 10_000;
     rt.context_management_command(&format!("auto {pressure} {rollover}"))
         .unwrap();
-    let history = vec![
+    let mut history = vec![
         user("Do not deploy.".into()),
         Arc::new(
             json!({"role":"assistant", "content":"Archivable prior evidence. ".repeat(rollover as usize / 10)}),
@@ -373,6 +407,9 @@ async fn rollover_turn(
         user("Continue only remaining work.".into()),
         Arc::new(json!({"role":"assistant", "content":"Last bounded result."})),
     ];
+    let current = history.split_off(2);
+    history.extend(older);
+    history.extend(current);
     rt.reset_context_continuation(CHAT_ID, &history);
 
     let started = std::time::Instant::now();
@@ -397,8 +434,15 @@ async fn rollover_turn(
     }
     let elapsed = started.elapsed();
 
+    // A window sealed as several archives sends one event for each.
+    let marker = final_history(&events)
+        .iter()
+        .find_map(|message| message.get("_synaps_context"))
+        .cloned()
+        .unwrap_or_default();
+    let archives = marker["archives"].as_array().map_or(1, Vec::len);
     if let Some(log) = &log {
-        notify_hooks::wait_for(log, expect_events).await;
+        notify_hooks::wait_for(log, expect_events * archives).await;
     }
     // Stops the extension; a delivery still in flight ends with it.
     extensions.shutdown_all().await;
@@ -446,6 +490,7 @@ async fn rollover_turn(
         },
         elapsed,
         archive_id,
+        marker,
         hook_events,
     }
 }
@@ -560,4 +605,79 @@ async fn a_failed_seal_announces_nothing() {
     assert_eq!(run.archive_id, None);
     // The extension was up for the whole turn and through its shutdown.
     assert_eq!(run.hook_events, Vec::<serde_json::Value>::new());
+}
+
+/// End to end for a window over what one archive holds, which used to end
+/// the turn with "archive commit failed; history retained" on every attempt.
+/// The turn goes on in window 2; the new window tells the model where each
+/// part is and the host records them; and a real extension process is sent
+/// one event per part, in order, each with the file that holds that part.
+#[tokio::test]
+#[serial]
+async fn a_split_rollover_announces_every_part_to_an_extension() {
+    let home = HomeGuard::new();
+    let chat = tempfile::tempdir().unwrap();
+    let run =
+        rollover_turn_over(&home, chat.path(), Some("record"), 1, false, deep_tool_call()).await;
+    assert_eq!(run.rolled.errors, Vec::<String>::new());
+    assert_eq!((run.rolled.provider_requests, run.rolled.head_saves), (1, 1));
+    assert_eq!(run.rolled.window, "window 2");
+
+    let archives = run.marker["archives"].as_array().expect("the marker records the parts");
+    assert!(archives.len() > 1, "{}", run.marker);
+    assert_eq!(run.marker["archive"], archives.last().unwrap()["id"], "resume reads the last part");
+    assert_eq!(run.archive_id.as_deref(), run.marker["archive"].as_str());
+    assert_eq!(run.hook_events.len(), archives.len(), "one event per part: {:?}", run.hook_events);
+
+    let mut covered = 0;
+    let mut reduced = 0;
+    let mut files = std::collections::HashSet::new();
+    for (index, (event, recorded)) in run.hook_events.iter().zip(archives).enumerate() {
+        let params = &event["params"];
+        assert_eq!(params["kind"], ARCHIVED);
+        assert_eq!(params["session_id"], CHAT_ID);
+        assert_eq!(params["cwd"], json!(chat.path().to_str().unwrap()));
+        let data = &params["data"];
+        assert_eq!((&data["part"], &data["parts"]), (&json!(index + 1), &json!(archives.len())));
+        assert_eq!(data["window"], json!(2));
+        assert_eq!(data["archive_id"], recorded["id"]);
+        assert_eq!(data["first_source_index"], json!(covered));
+        assert_eq!(data["first_source_index"], recorded["first"]);
+        assert_eq!(data["source_message_count"], recorded["count"]);
+        assert_eq!(data["message_count"], recorded["messages"]);
+        assert_eq!(data["reduced_messages"], recorded.get("reduced").cloned().unwrap_or(json!(0)));
+        covered += data["source_message_count"].as_u64().unwrap();
+        reduced += data["reduced_messages"].as_u64().unwrap();
+
+        // Its own file: a live record of that archive, where the store has it.
+        let id = data["archive_id"].as_str().unwrap();
+        let path = std::path::PathBuf::from(data["path"].as_str().expect("a path"));
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["id"], json!(id));
+        assert_eq!(record["body"]["state"], "live");
+        assert_eq!(record["body"]["source_message_count"], data["source_message_count"]);
+        let located = agent_core::context_archive::archive_file(
+            &home.base_dir(),
+            data["project_key"].as_str().unwrap(),
+            id,
+        )
+        .unwrap();
+        assert_eq!(located.as_deref(), Some(path.as_path()));
+        assert!(files.insert(path), "each part has its own file");
+    }
+    assert_eq!(covered, 6, "the parts cover the six messages of the window");
+    assert_eq!(reduced, 1, "the call with the deep input is stored reduced");
+
+    // The model is told every part, in order, and that one message is reduced.
+    let text = &run.rolled.retained;
+    let mut from = 0;
+    for recorded in archives {
+        let id = recorded["id"].as_str().unwrap();
+        let listed = if id == run.archive_id.as_deref().unwrap() { "<archive>" } else { id };
+        let at = text[from..].find(&format!("ctx-{listed} (")).expect("every part is listed, in order");
+        from += at + 1;
+    }
+    assert!(text.contains("Earlier eligible source evidence, in source order: ctx-"), "{text}");
+    assert!(text.contains("1 message was too large for one archive"), "{text}");
 }

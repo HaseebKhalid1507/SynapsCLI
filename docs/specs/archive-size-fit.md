@@ -51,6 +51,10 @@ must remain allowed. Eviction is scoped to the authorized scope group only.
   in numbered shelf directories with no count or byte cap (see "Archives live
   under" in [context continuation](context-continuation.md)). Only its migration
   export keeps the 128 archives / 256 MiB bound, to match `migration_apply` below.
+  The per-request limits above (a single seal over 16 MiB or 4,096 messages) no
+  longer fail a rollover on the file store either: such a window is sealed as
+  several archives (see "A window over the limits of one archive" there). They
+  still fail on the Axel backend.
 
 ### Contract/docs
 
