@@ -558,6 +558,19 @@ pub trait Tool: Send + Sync {
     fn concurrency_key(&self, _validated_input: &Value) -> Option<ConcurrencyKey> {
         None
     }
+
+    /// [`Self::concurrency_key`] for a call made in `cwd`, the chat's folder
+    /// (`None`: the process folder). The scheduler asks this one. A tool
+    /// whose key is a path resolves a relative one against `cwd`, as its
+    /// `execute` does, so the key names the file the call will touch; a
+    /// tool whose key does not depend on the folder has nothing to add.
+    fn concurrency_key_in(
+        &self,
+        validated_input: &Value,
+        _cwd: Option<&std::path::Path>,
+    ) -> Option<ConcurrencyKey> {
+        self.concurrency_key(validated_input)
+    }
 }
 
 #[cfg(test)]

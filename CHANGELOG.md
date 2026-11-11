@@ -395,6 +395,17 @@ All notable changes to this project will be documented in this file.
   now runs under the turn's usage meter like every other non-Anthropic
   model, but its transport reports no usage event, so, as before, its
   rounds are not counted against the turn's token and cost budgets.
+- **Daemon: two writes of one file in one tool round no longer run at
+  once when one names it by a relative path.** `write` and `edit` calls of
+  one round that target the same file run one after the other, in the
+  model's order. Which file a relative path names was worked out in the
+  folder the process runs in, so in a daemon chat `notes.md` and
+  `/the/chat/notes.md` counted as two files and could be written at the
+  same time. It is now worked out in the chat's folder, the way the write
+  itself is. Without the daemon nothing changes. `Tool` gains
+  `concurrency_key_in(input, cwd)`, which the scheduler calls; its default
+  is the existing `concurrency_key(input)`, so a tool that does not
+  implement it behaves as before.
 - **Daemon: automatic memory tells a memory extension the chat's project,
   not the daemon's.** With the plain-file backend (`memory.backend` not
   `axel`), the `project_id` in the capture and recall requests sent to a

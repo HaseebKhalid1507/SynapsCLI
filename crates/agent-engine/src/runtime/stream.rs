@@ -2533,7 +2533,8 @@ impl StreamMethods {
                                                     LaneKind::Concurrent
                                                 }
                                                 crate::tools::catalog::ToolEffect::IdempotentWrite => {
-                                                    match implementation.concurrency_key(input) {
+                                                    // In the chat's folder, where the call will run.
+                                                    match implementation.concurrency_key_in(input, cwd.as_deref()) {
                                                         Some(crate::tools::ConcurrencyKey::Key(key)) => LaneKind::Keyed(key),
                                                         Some(crate::tools::ConcurrencyKey::Serialize) | None => LaneKind::Serial,
                                                     }
@@ -5748,6 +5749,99 @@ mod rich_output_tests {
             ],
             "queued before any result, started right after the call ahead finished"
         );
+    }
+
+    /// `write`, as the scheduler and the disk see it, to one fixed path: the
+    /// harness's tool calls carry no input. The lane key, the effect and the
+    /// write itself are the production tool's.
+    struct WriteTo {
+        name: &'static str,
+        path: String,
+    }
+    impl WriteTo {
+        fn input(&self) -> Value {
+            json!({"path": self.path, "content": self.name})
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for WriteTo {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "writes its own name to its path"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::WriteTool.effect()
+        }
+        fn concurrency_key(&self, _input: &Value) -> Option<crate::tools::ConcurrencyKey> {
+            crate::tools::WriteTool.concurrency_key(&self.input())
+        }
+        fn concurrency_key_in(
+            &self,
+            _input: &Value,
+            cwd: Option<&std::path::Path>,
+        ) -> Option<crate::tools::ConcurrencyKey> {
+            crate::tools::WriteTool.concurrency_key_in(&self.input(), cwd)
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            crate::tools::WriteTool.execute(self.input(), ctx).await
+        }
+    }
+
+    /// One round writes a file of the chat's folder twice, once by a
+    /// relative path and once by its absolute one. They are one file, so
+    /// they share a lane: the second is queued behind the first and its
+    /// content is what the file ends with. The lane key of the relative
+    /// path used to be made in the folder the process runs in (the daemon's,
+    /// for a daemon chat), a different key from the absolute path's, and
+    /// the two writes ran at once.
+    #[tokio::test]
+    async fn a_relative_and_an_absolute_write_of_one_file_share_a_lane() {
+        let chat = tempfile::tempdir().unwrap();
+        let file = chat.path().join("notes.md");
+        assert_ne!(
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            chat.path().canonicalize().unwrap(),
+            "the chat's folder is not the process's"
+        );
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        let d = drive_configured(
+            "claude-sonnet-4-6",
+            initial,
+            vec![
+                Arc::new(WriteTo {
+                    name: "write_relative",
+                    path: "notes.md".into(),
+                }),
+                Arc::new(WriteTo {
+                    name: "write_absolute",
+                    path: file.to_str().unwrap().into(),
+                }),
+            ],
+            &[("toolu_1", "write_relative"), ("toolu_2", "write_absolute")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            std::time::Duration::from_secs(20),
+            |session| session.cwd = Some(chat.path().to_path_buf()),
+        )
+        .await;
+        assert_eq!(
+            d.tool_signals,
+            vec![
+                "queued:toolu_2",
+                "result:toolu_1",
+                "started:toolu_2",
+                "result:toolu_2",
+            ],
+            "one file, one lane: the second write waits for the first"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "write_absolute");
     }
 
     /// Calls that never wait get no queue signal at all: reads before the
