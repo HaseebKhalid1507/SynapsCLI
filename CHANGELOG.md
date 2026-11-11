@@ -252,6 +252,16 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **The `memory_context` tool, `/memory` and the "Default memory mode"
+  settings row.** Built-in automatic memory (capture and recall) is leaving
+  core for an extension, and these were its outermost users; it was off
+  unless switched on by hand. The model no longer has a `memory_context`
+  tool (29 builtins; `docs/tools.json` regenerated). `/memory`, with any
+  argument, now answers one line: `/memory was removed in 0.12.0: automatic
+  memory is provided by an extension now (Axel). Nothing was recording.`
+  `/settings` has no `memory.default_mode` row; the config key is still read
+  as before until the automatic-memory keys are removed.
+
 - **Breaking: `synaps agent` and `synaps watcher` are gone.** The watcher
   supervisor and the headless agents it started (`~/.synaps-cli/watcher/<name>/`
   with `config.toml`, `soul.md`, `handoff.json`; `manual`/`always`/`watch`

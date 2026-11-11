@@ -172,7 +172,6 @@ fn ctx_with(cap: Option<McpLeaseCapability>) -> ToolContext {
             tool_activation: None,
             mcp_leases: cap,
             extension_leases: None,
-            memory_context: None,
             cwd: None,
             env: None,
             env_stripped: Vec::new(),

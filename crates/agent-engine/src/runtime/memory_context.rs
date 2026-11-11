@@ -1110,13 +1110,16 @@ pub struct MemoryContextCapability {
     state: Arc<Mutex<SessionMemoryState>>,
     /// Project isolation boundary leases minted through this handle are
     /// scoped to (spec §5.2).
+    #[allow(dead_code)] // read by the removed `memory_context` tool; the module goes next
     project_id: ProjectId,
     /// Exact context provider one-shot leases activate (spec §7.1).
+    #[allow(dead_code)] // read by the removed `memory_context` tool; the module goes next
     provider_id: ContextProviderId,
     /// Host-attributed provenance recorded on locally-safe one-shot grants.
     /// Supplied by host wiring at construction — never by model JSON. Task
     /// A5 replaces this with per-request `ExplicitCommand` /
     /// `ExactCurrentRequest` proof plumbing.
+    #[allow(dead_code)] // read by the removed `memory_context` tool; the module goes next
     one_shot_proof: Option<UserIntentProof>,
     disable_host: Option<Arc<dyn Fn() -> MemoryContextStatus + Send + Sync>>,
 }
@@ -1195,6 +1198,7 @@ impl MemoryContextCapability {
     /// most one eligible prompt and revocable via [`Self::disable`]. Fails
     /// typed when a one-shot is already pending or the expiry is invalid —
     /// on failure no lease is installed.
+    #[allow(dead_code)] // its caller, the `memory_context` tool, is gone; the module goes next
     pub(crate) fn recall_once(
         &self,
         expires_minutes: Option<u32>,

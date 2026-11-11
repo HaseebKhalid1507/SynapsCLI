@@ -57,11 +57,6 @@ impl ToolRegistry {
             Arc::new(crate::tools::subagent::steer::SubagentSteerTool),
             Arc::new(crate::tools::subagent::collect::SubagentCollectTool),
             Arc::new(crate::tools::subagent::resume::SubagentResumeTool),
-            // Task A4 continuous-memory control tool (spec §7.2). Like the
-            // authorization gateways above, primary-registry only: recursive
-            // subagent registries exclude it so a delegated model can never
-            // steer the session's memory-context leases.
-            Arc::new(crate::tools::memory_context::MemoryContextTool),
             // Task 17 discovery/authorization gateways (spec §7.2). Present
             // in the primary runtime registry only; subagent registries
             // (`without_subagent*`) deliberately exclude them so recursive
@@ -867,10 +862,6 @@ fn is_recursive_subagent_tool_name(name: &str) -> bool {
             | "subagent_resume"
             | "subagent_model_authorize"
             | "subagent_models"
-            // Task A4: the continuous-memory control tool follows the exact
-            // subagent_model_authorize precedent — recursive subagents must
-            // never see it (nor an extension tool squatting on its name).
-            | "memory_context"
     )
 }
 /// Result of [`ToolRegistry::deferred_tool_split`].
@@ -1132,12 +1123,11 @@ mod tests {
         let registry = ToolRegistry::new();
 
         // Includes model discovery/authorization, project memory primitives,
-        // memory-context control, the three explicit forum tools and
-        // `context_checkpoint`. Forum tools remain outside the progressive
-        // essential foreground core.
+        // the three explicit forum tools and `context_checkpoint`. Forum
+        // tools remain outside the progressive essential foreground core.
         assert_eq!(
             registry.tools_schema().len(),
-            30 + usize::from(cfg!(windows))
+            29 + usize::from(cfg!(windows))
         );
         for name in ["forum_post", "forum_read", "forum_forget", "context_checkpoint"] {
             assert!(registry.get(name).is_some(), "missing {name}");
@@ -1466,7 +1456,6 @@ mod tests {
                 "subagent_models",
                 "search_tools",
                 "activate_tools",
-                "memory_context",
                 "memory_store",
                 "memory_search",
                 "memory_fetch",
@@ -1522,7 +1511,6 @@ mod tests {
             "subagent_resume",
             "subagent_model_authorize",
             "subagent_models",
-            "memory_context",
         ] {
             other.register(Arc::new(OwnedTool(name, Some("malicious-extension"))));
         }
@@ -1537,7 +1525,6 @@ mod tests {
             "subagent_resume",
             "subagent_model_authorize",
             "subagent_models",
-            "memory_context",
         ] {
             assert!(merged.get(name).is_none(), "{name} must stay unavailable");
         }
@@ -1554,7 +1541,6 @@ mod tests {
             "subagent:resume",
             "subagent:model:authorize",
             "subagent:models",
-            "memory:context",
         ] {
             other.register(Arc::new(OwnedTool(runtime_name, Some("subagent"))));
         }
@@ -1568,30 +1554,12 @@ mod tests {
             "subagent_resume",
             "subagent_model_authorize",
             "subagent_models",
-            "memory_context",
         ] {
             assert!(
                 merged.get(api_name).is_none(),
                 "API-safe recursive name {api_name} must stay unavailable"
             );
         }
-    }
-
-    /// Task A4: `memory_context` mirrors the `subagent_model_authorize`
-    /// precedent — present in the primary registry, absent from every
-    /// recursive subagent registry.
-    #[test]
-    fn memory_context_present_in_primary_registry_absent_in_recursive_ones() {
-        assert!(ToolRegistry::new().get("memory_context").is_some());
-        assert!(ToolRegistry::without_subagent()
-            .get("memory_context")
-            .is_none());
-
-        let merged = ToolRegistry::without_subagent_with_extensions(&ToolRegistry::new());
-        assert!(
-            merged.get("memory_context").is_none(),
-            "recursive registries must never expose memory_context"
-        );
     }
 
     #[test]

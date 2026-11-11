@@ -114,7 +114,6 @@ fn ctx(cap: ExtensionLeaseCapability) -> ToolContext {
             tool_activation: None,
             mcp_leases: None,
             extension_leases: Some(cap),
-            memory_context: None,
             cwd: None,
             env: None,
             env_stripped: Vec::new(),

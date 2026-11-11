@@ -3993,6 +3993,7 @@ impl Runtime {
     /// Bind the pending, already-presented history preview to an explicit
     /// frontend command. D1 returns only a typed plan; D2 owns all content
     /// streaming.
+    #[allow(dead_code)] // its caller `/memory` is gone; the module goes next
     pub(crate) fn memory_history_confirm(
         &self,
     ) -> std::result::Result<memory_history::HistoryImportReport, memory_history::HistoryImportError>
@@ -4044,6 +4045,7 @@ impl Runtime {
     }
 
     /// Decline and clear a pending preview without any content reads or writes.
+    #[allow(dead_code)] // its caller `/memory` is gone; the module goes next
     pub(crate) fn memory_history_decline(&self) -> bool {
         self.pending_history_import_preview
             .lock()
@@ -4474,7 +4476,6 @@ impl Runtime {
                 tool_activation: None,
                 mcp_leases: None,
                 extension_leases: None,
-                memory_context: self.memory_tool_capability(),
                 cwd: self.cwd.clone(),
                 env: self.env.clone(),
                 env_stripped: self.env_stripped.clone(),
@@ -5067,7 +5068,6 @@ impl Runtime {
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
         let session = crate::runtime::stream::StreamSession {
             memory_backend: self.memory_backend.clone(),
-            memory_context: self.memory_tool_capability(),
             final_capture_history: final_capture_history.clone(),
             turn_completion: completion,
             context_window: self.context_window(),

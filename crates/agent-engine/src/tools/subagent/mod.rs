@@ -1510,7 +1510,6 @@ mod forum_worker_tests {
             "subagent_models",
             "search_tools",
             "activate_tools",
-            "memory_context",
         ] {
             assert!(registry.get(name).is_none(), "must not grant {name}");
         }
