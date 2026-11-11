@@ -1,7 +1,7 @@
 use crate::{
     contract::*,
     database::{hash_parts, hex},
-    history::HistoryImport,
+    history::{HistoryImport, MAX_HISTORY_IMPORT},
     service::{acknowledge_commit, Service},
 };
 use rusqlite::{params, OptionalExtension};
@@ -72,7 +72,7 @@ impl Service {
             return Err(Error::Invalid);
         }
         if q.records.len() + q.tombstones.len() > 16384
-            || q.histories.len() > 128
+            || q.histories.len() > MAX_HISTORY_IMPORT
             || q.captures.len() > 16384
             || q.fingerprints.len() > 32768
         {

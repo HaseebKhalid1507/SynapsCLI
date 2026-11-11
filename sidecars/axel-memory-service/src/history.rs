@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const MAX_HISTORY_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_HISTORY_RECORDS: usize = 128;
+/// Per-`migration_apply` batch bound. There is deliberately no per-scope
+/// history count or byte cap: a sealed archive may be the only copy of a saved
+/// chat's older conversation (docs/specs/archive-size-fit.md).
+pub const MAX_HISTORY_IMPORT: usize = 128;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArchivedMessage {
@@ -142,8 +145,7 @@ impl Service {
                     if !c.query_row("SELECT EXISTS(SELECT 1 FROM synaps_history WHERE id=?1)",[&candidate],|r|r.get::<_,bool>(0))?{id=candidate;break}
                 }
                 if id.is_empty(){return Err(Error::Conflict)}
-                // Seals evict for capacity (bounded ring); imports stay strict.
-                self.evict_history_for(c,&q)?;
+                // Never evict to make room: only per-request limits apply.
                 self.insert_history(c,&HistoryImport{id:id.clone(),logical_id:q.logical_id.clone(),digest:q.digest.clone(),source_message_count:q.source_message_count,messages:q.messages.clone(),note:q.note.clone(),tombstone:false})?;
                 id
             };
@@ -152,30 +154,6 @@ impl Service {
         })?;
         acknowledge_commit(self.durable())?;
         Ok(result)
-    }
-    /// Make room for one incoming seal (docs/specs/archive-size-fit.md).
-    /// Oldest tombstoned rows go first (their suppression already lives in
-    /// synaps_fingerprints), then oldest live rows. Evicted rows are deleted,
-    /// never tombstoned or fingerprinted: capacity reclamation is not a forget.
-    /// A seal that cannot fit alone still fails closed via history_bounds.
-    fn evict_history_for(&self, c: &Connection, q: &Seal) -> Result<()> {
-        let incoming = serde_json::to_vec(&q.messages)?.len() + q.note.len();
-        loop {
-            let (count,bytes):(usize,usize)=c.query_row("SELECT count(*),coalesce(sum(length(CAST(messages AS BLOB))+length(CAST(note AS BLOB))),0) FROM synaps_history WHERE project_key IN (SELECT member FROM synaps_scope_members WHERE canonical=(SELECT canonical FROM synaps_scope_members WHERE member=?1))",[&self.project],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            if count + 1 <= MAX_HISTORY_RECORDS && bytes + incoming <= 256 * 1024 * 1024 {
-                return Ok(());
-            }
-            let victim:Option<String>=c.query_row("SELECT id FROM synaps_history WHERE project_key IN (SELECT member FROM synaps_scope_members WHERE canonical=(SELECT canonical FROM synaps_scope_members WHERE member=?1)) ORDER BY tombstoned DESC,created_ms ASC,id ASC LIMIT 1",[&self.project],|r|r.get(0)).optional()?;
-            let Some(victim) = victim else { return Ok(()) };
-            c.execute("DELETE FROM synaps_history WHERE id=?1", [&victim])?;
-        }
-    }
-    pub(crate) fn history_bounds(&self, c: &Connection) -> Result<()> {
-        let (count,bytes):(usize,usize)=c.query_row("SELECT count(*),coalesce(sum(length(CAST(messages AS BLOB))+length(CAST(note AS BLOB))),0) FROM synaps_history WHERE project_key IN (SELECT member FROM synaps_scope_members WHERE canonical=(SELECT canonical FROM synaps_scope_members WHERE member=?1))",[&self.project],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        if count > MAX_HISTORY_RECORDS || bytes > 256 * 1024 * 1024 {
-            return Err(Error::TooLarge);
-        }
-        Ok(())
     }
     fn history_suppressed(
         &self,
@@ -256,7 +234,6 @@ impl Service {
         // Distinct imported IDs with the same projection are preserved. Lookup for
         // seal retries is deterministic; imported tombstones always take priority.
         c.execute("INSERT INTO synaps_history(project_key,id,logical,digest,fingerprint,source_count,message_count,messages,note,created_ms,tombstoned) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![self.project,r.id,r.logical_id,r.digest,fingerprint,r.source_message_count,r.messages.len(),messages,note,chrono::Utc::now().timestamp_millis(),tombstone])?;
-        self.history_bounds(c)?;
         Ok(true)
     }
     pub(crate) fn delete_history(&self, c: &Connection, id: &str) -> Result<bool> {
@@ -454,4 +431,74 @@ fn eligible_json(v: &Value, depth: usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    fn seal(n: usize) -> Seal {
+        let logical_id = hash_parts(&[format!("chat-{n}").as_bytes()]);
+        let messages = vec![ArchivedMessage {
+            source_index: 0,
+            block_indices: vec![],
+            message: json!({"role":"user","content":format!("evidence {n}")}),
+        }];
+        let digest = hash_parts(&[
+            logical_id.as_bytes(),
+            &1u64.to_be_bytes(),
+            &serde_json::to_vec(&messages).unwrap(),
+        ]);
+        Seal {
+            logical_id,
+            source_message_count: 1,
+            messages,
+            note: String::new(),
+            digest,
+        }
+    }
+    #[test]
+    fn seals_never_delete_live_or_tombstoned_rows() {
+        use std::os::unix::fs::PermissionsExt;
+        // The service binary sets this umask before SQLite creates any file.
+        unsafe { libc::umask(0o077) };
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let service =
+            Service::open(&root.path().join("synthetic.r8"), "p0123456789abcdef").unwrap();
+        let id = |n| {
+            service.history_seal(seal(n)).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let mut ids: Vec<String> = (0..200).map(id).collect();
+        let forgotten = [0, 5, 129];
+        for n in forgotten {
+            assert!(service.history_forget(&ids[n]).unwrap());
+        }
+        ids.extend((200..210).map(id));
+        let (rows, tombstones): (usize, usize) = service
+            .brain
+            .conn()
+            .query_row(
+                "SELECT count(*),sum(tombstoned) FROM synaps_history",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, tombstones), (210, 3));
+        for (n, id) in ids.iter().enumerate() {
+            let fetched = service.history_fetch(HistoryFetch {
+                id: id.clone(),
+                start: 0,
+                limit: None,
+                offset_bytes: 0,
+            });
+            if forgotten.contains(&n) {
+                assert_eq!(fetched.err(), Some(Error::NotFound));
+            } else {
+                assert_eq!(fetched.unwrap()[0].message, seal(n).messages[0].message);
+            }
+        }
+    }
 }

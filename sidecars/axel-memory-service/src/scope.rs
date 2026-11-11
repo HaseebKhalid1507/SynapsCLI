@@ -116,7 +116,6 @@ impl Service {
             // Deletion fingerprints become group-wide atomically, without editing
             // any surviving record, archive projection or capture payload.
             self.apply_suppression(c)?;
-            self.history_bounds(c)?;
             Ok(())
         })?;
         (self.shared, self.canonical, self.members) = initialize(self.brain.conn(), &self.project)?;

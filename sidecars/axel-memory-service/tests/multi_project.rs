@@ -78,6 +78,9 @@ fn capture(p: &str) -> Value {
     json!({"schema":"chat_turn_capture/1","capture_id":"a".repeat(64),"project_id":p,"session_id":"synthetic","turn_id":"turn","turn_ordinal":1,"source_digest":"b".repeat(64),"user":"synthetic user","assistant":"synthetic assistant","tools":[]})
 }
 fn seal() -> Value {
+    seal_with(&"d".repeat(64), "synthetic archive")
+}
+fn seal_with(logical: &str, content: &str) -> Value {
     #[derive(serde::Serialize)]
     struct Row {
         source_index: usize,
@@ -87,9 +90,8 @@ fn seal() -> Value {
     let rows = vec![Row {
         source_index: 0,
         block_indices: vec![],
-        message: json!({"role":"user","content":"synthetic archive"}),
+        message: json!({"role":"user","content":content}),
     }];
-    let logical = "d".repeat(64);
     let digest = hash(&[
         logical.as_bytes(),
         &1u64.to_be_bytes(),
@@ -1139,4 +1141,31 @@ fn forum_alias_worktrees_keep_original_envelope_and_shared_tombstones() {
     let old = ok(call(&p, &b, "export", json!({"full":true})));
     assert_eq!(old["tombstones"], json!([root["id"]]));
     assert_eq!(old["records"], json!([]));
+}
+#[test]
+fn alias_union_past_128_histories_keeps_every_archive() {
+    // docs/specs/archive-size-fit.md: no group inventory cap refuses a link.
+    let (d, p) = temp();
+    let (main, wt, a, b) = repo(d.path());
+    let ids: Vec<Value> = (0..130)
+        .map(|i| {
+            let scope = if i % 2 == 0 { &a } else { &b };
+            let q = seal_with(
+                &hash(&[format!("chat-{i}").as_bytes()]),
+                &format!("archive {i}"),
+            );
+            ok(call(&p, scope, "history_seal", q))["id"].clone()
+        })
+        .collect();
+    ok(alias(&p, &a, &main, &b, &wt));
+    assert_eq!(ok(call(&p, &a, "stats", json!({})))["history"], 130);
+    for id in [&ids[0], &ids[1], &ids[129]] {
+        assert_eq!(
+            ok(call(&p, &a, "history_fetch", json!({"id":id})))
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }
