@@ -628,6 +628,14 @@ impl Tool for DeferredExtensionTool {
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> crate::Result<String> {
         // Runs strictly AFTER the ExecutionGate authorized this exact call.
+        // Who calls: the author of the binding the context came with, the
+        // one `forum_post` records for this run. No binding, no caller: the
+        // stand-in made below is the process's, not a run's.
+        let caller = ctx
+            .capabilities
+            .memory_backend
+            .as_ref()
+            .map(|binding| binding.forum_author().clone());
         let binding = ctx
             .capabilities
             .memory_backend
@@ -646,13 +654,14 @@ impl Tool for DeferredExtensionTool {
             )));
         };
         match leases
-            .call_exact_for(
+            .call_exact_as(
                 &self.plugin_id,
                 &self.tool_name,
                 &self.expected_digest,
                 params,
                 ctx.capabilities.session_id.as_deref(),
                 ctx.capabilities.cwd.as_deref(),
+                caller.as_ref(),
             )
             .await
         {
