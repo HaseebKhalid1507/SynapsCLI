@@ -672,6 +672,13 @@ impl Unread {
         Some(format!("{places} place(s) could not be read, first {place}: {error}"))
     }
 
+    /// [`notice`](Self::notice) with the project's `directory`, which the
+    /// places are in: for a caller who has to go and look at the file.
+    fn notice_in(&self, directory: &Path) -> Option<String> {
+        let notice = self.notice()?;
+        Some(format!("{notice} (in {})", directory.display()))
+    }
+
     /// The error of a lookup that did not find its segment: "not found" when
     /// everything could be read, otherwise what could not be, with the kind
     /// of the first failure and never `NotFound`.
@@ -1958,7 +1965,7 @@ impl ArchiveStore {
         ids.sort_by_key(|forgotten| forgotten != id);
         Ok(Forgotten {
             ids,
-            unread: unread.notice(),
+            unread: unread.notice_in(&self.directory),
         })
     }
 
@@ -4152,8 +4159,8 @@ impl PrivateDir {
     /// Only ever locked: never written, truncated or read, so neither a
     /// second name nor its mode matters. With `create` it is made if it is
     /// missing and opened read-write, or for reading if its mode refuses
-    /// that; a group or other bit in its mode is cleared. Without `create`
-    /// nothing is changed. A link is not followed.
+    /// that; a group or other bit in its mode is cleared, unless the file
+    /// has a second name. Without `create` nothing is changed. A link is not followed.
     fn lock_file(&self, create: bool) -> io::Result<Option<std::fs::File>> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let refused = |what| io::Error::new(io::ErrorKind::PermissionDenied, LockRefused(what));
@@ -4191,7 +4198,10 @@ impl PrivateDir {
             return Err(refused("is owned by another user"));
         }
         let mode = meta.permissions().mode() & 0o7777;
-        if create && mode & 0o077 != 0 {
+        // A file with a second name is someone's copy of it too (a
+        // hard-link backup): its mode is theirs as much as ours. It is
+        // only ever locked, so it is used as it is.
+        if create && mode & 0o077 != 0 && meta.nlink() == 1 {
             file.set_permissions(std::fs::Permissions::from_mode(mode & 0o700))?;
         }
         Ok(Some(file))
@@ -5582,6 +5592,11 @@ mod tests {
         let second = tmp.path().join("a-backup-of-the-lock");
         std::fs::hard_link(&lock, &second).unwrap();
         works("with two names");
+        // Open to others and with two names: the mode is the other name's
+        // too, and is left.
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        works("loosened, with two names");
+        assert_eq!((mode(&lock), mode(&second)), (0o644, 0o644));
         // Read-only, with the second name still there and then without.
         for links in [2, 1] {
             std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o400)).unwrap();
@@ -10004,6 +10019,8 @@ mod tests {
         let unread = done.unread.expect("not complete");
         let name = twin.file_name().unwrap().to_str().unwrap();
         assert!(unread.starts_with(&format!("1 place(s) could not be read, first s000001/{name}: ")), "{unread}");
+        // With the folder the place is in: the file can be gone to.
+        assert!(unread.ends_with(&format!(" (in {})", dir.display())), "{unread}");
         assert_eq!(std::fs::read(&stray).unwrap(), b"not json at all");
     }
 

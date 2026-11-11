@@ -374,6 +374,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: a lock file with a second name keeps its mode, and
+  `memory_forget` says what to do about a file it could not use.** A lock
+  file open to group or others was closed to them even when it had a
+  second name (a hard-link backup), which changed the backup's file too;
+  such a file is now used as it is. And when a forget is "NOT COMPLETE",
+  the tool said to call it again "once it can be read", which never comes
+  true for a file that is not a valid record. It now names the project
+  folder the file is in and says to remove or repair the file first.
 - **Context archives: a base that links to a folder that is away is an
   error, not a project with no archives.** With the Synaps folder a link to
   a disk that was not mounted, a search answered nothing, a fetch "not
