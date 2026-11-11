@@ -194,6 +194,7 @@ fn age_sweep_never_leaves_named_chains_dangling() {
         &RetentionPolicy {
             max_age_days: Some(30),
             max_disk_bytes: None,
+            include_notes: false,
         },
         now,
     )
@@ -226,8 +227,8 @@ fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
     write_session(&h.roots, "old-parent", 10 * DAY_MS, Some("fresh-successor"));
     write_session(&h.roots, "fresh-successor", 99 * DAY_MS, None);
 
-    // Memory: an expired record (per-record retention), an old record under
-    // the global age, a fresh record, and a tombstoned one.
+    // Memory: an expired record (per-record retention), a record older than
+    // the global age, a newer record, and a tombstoned one.
     let memory = h.roots.base_dir.join("memory").join("project-p11.jsonl");
     let lines = [
         format!(
@@ -271,10 +272,42 @@ fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
         &RetentionPolicy {
             max_age_days: Some(30),
             max_disk_bytes: None,
+            include_notes: false,
         },
         sweep_clock,
     )
     .unwrap();
+
+    // The age given to the sweep is for sessions, traces and logs. It does
+    // not reach notes: of the four, the sweep drops the one past its OWN
+    // retention class and the forgotten one, and keeps the two `Standard`
+    // notes however old they are.
+    let rewritten = std::fs::read_to_string(&memory).unwrap();
+    assert!(!rewritten.contains("expired by record retention"));
+    assert!(
+        !rewritten.contains("tombstoned body"),
+        "a forgotten note's line is purged physically"
+    );
+    assert_eq!(
+        rewritten,
+        format!("{}\n{}\n{}\n", lines[1], lines[2], lines[4]),
+        "both notes without an expiry of their own, and the tombstone"
+    );
+    assert_eq!(outcome.memory_records_dropped, 2);
+
+    // With `include_notes` the age applies to notes as well (what every
+    // age sweep did before).
+    let with_notes = sweep_at(
+        &h.roots,
+        &RetentionPolicy {
+            max_age_days: Some(30),
+            max_disk_bytes: None,
+            include_notes: true,
+        },
+        sweep_clock,
+    )
+    .unwrap();
+    assert_eq!(with_notes.memory_records_dropped, 2);
 
     assert!(
         !session_exists(&h.roots, "old-parent"),
@@ -285,13 +318,8 @@ fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
     assert!(!session_exists(&h.roots, "fresh-successor"));
 
     let rewritten = std::fs::read_to_string(&memory).unwrap();
-    assert!(!rewritten.contains("expired by record retention"));
     assert!(!rewritten.contains("expired by global age"));
-    assert!(
-        !rewritten.contains("tombstoned body"),
-        "a forgotten note's line is purged physically"
-    );
-    // Its tombstone line stays (an id and a time, no content): it is what
+    // The forgotten note's tombstone line stays (an id and a time, no content): it is what
     // keeps the note forgotten if an export that still holds it is imported.
     assert_eq!(
         rewritten,
@@ -301,7 +329,6 @@ fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
     // mem-new is 99d old at sweep time (now+40d) minus ts 99d → 41d → also
     // aged out under the 30-day budget.
     assert!(!rewritten.contains("fresh survivor"));
-    assert!(outcome.memory_records_dropped >= 4);
 
     assert!(
         !index_dir.exists(),
@@ -335,6 +362,7 @@ fn memory_survivors_and_recent_artifacts_are_kept() {
         &RetentionPolicy {
             max_age_days: Some(30),
             max_disk_bytes: None,
+            include_notes: false,
         },
         now,
     )
@@ -362,6 +390,7 @@ fn disk_budget_deletes_oldest_first_but_never_chain_heads() {
         &RetentionPolicy {
             max_age_days: None,
             max_disk_bytes: Some(total - 10),
+            include_notes: false,
         },
         now,
     )
@@ -453,6 +482,7 @@ fn sessions_take_their_tool_output_spill_dirs_with_them() {
     let policy = RetentionPolicy {
         max_age_days: Some(30),
         max_disk_bytes: None,
+        include_notes: false,
     };
     write_session(&h.roots, "old", 10 * DAY_MS, None);
     write_session(&h.roots, "fresh", 99 * DAY_MS, None);
@@ -478,6 +508,7 @@ fn worker_spill_dirs_age_out_by_mtime_against_the_same_cutoff() {
     let policy = RetentionPolicy {
         max_age_days: Some(30),
         max_disk_bytes: None,
+        include_notes: false,
     };
     // Workers have no session file: only the age pass removes their dir.
     let worker = write_spill(&h.roots, "session-4242-1700000000000-0");
@@ -607,6 +638,7 @@ fn disk_budget_evicts_derived_indexes_and_oldest_memory_records() {
         &RetentionPolicy {
             max_age_days: None,
             max_disk_bytes: Some(700),
+            include_notes: false,
         },
         now,
     )
@@ -641,6 +673,7 @@ fn unsatisfiable_disk_budget_returns_a_typed_unmet_error() {
         &RetentionPolicy {
             max_age_days: None,
             max_disk_bytes: Some(10),
+            include_notes: false,
         },
         now,
     )
@@ -670,6 +703,7 @@ fn malformed_chain_files_fail_closed_without_destructive_sweep() {
         &RetentionPolicy {
             max_age_days: Some(30),
             max_disk_bytes: None,
+            include_notes: false,
         },
         now,
     )
@@ -793,6 +827,7 @@ fn cache_retention_is_recursive_and_confined() {
         &RetentionPolicy {
             max_age_days: Some(30),
             max_disk_bytes: None,
+            include_notes: false,
         },
         agent_core::epoch_millis() + 40 * DAY_MS,
     )

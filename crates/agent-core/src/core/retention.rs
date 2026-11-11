@@ -8,9 +8,10 @@
 //! - CHAIN INTEGRITY: a session that is the head of a named chain is never
 //!   deleted by any sweep or forget — retention cannot leave a named chain
 //!   pointing at a deleted session.
-//! - Sessions age by their EMBEDDED `updated_at` (mtime fallback); memory
-//!   records age by their embedded timestamps plus per-record retention;
-//!   traces/logs age by file mtime.
+//! - Sessions age by their EMBEDDED `updated_at` (mtime fallback);
+//!   traces/logs age by file mtime. Memory records age by their embedded
+//!   timestamp against their OWN retention class; the policy's global age
+//!   reaches them only with `include_notes`.
 //! - Memory files are compacted by atomic rewrite (expired + tombstoned
 //!   records physically removed) rather than whole-file deletion; their
 //!   derived index directories are dropped alongside (rebuildable state).
@@ -127,8 +128,16 @@ pub enum RetentionDomain {
 /// Unified policy: maximum artifact age and total disk budget.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RetentionPolicy {
+    /// Sessions, traces, logs and spill folders older than this are
+    /// deleted. Notes are not, unless `include_notes` is set.
     pub max_age_days: Option<u32>,
     pub max_disk_bytes: Option<u64>,
+    /// Apply `max_age_days` to notes as well. Off by default: a note is
+    /// something a person or the model chose to keep, and one of class
+    /// `Standard` is "kept until explicitly forgotten or swept by disk
+    /// budget". A note with an expiry of its own (`max_age_days` in its
+    /// retention class) expires by that on every sweep, whatever this says.
+    pub include_notes: bool,
 }
 
 const DAY_MS: u64 = 86_400_000;
@@ -384,14 +393,15 @@ pub fn sweep_at(
     }
 
     // ── Memory: atomic rewrite dropping tombstoned records, records past
-    // their OWN retention class, and (when a global age policy is set)
-    // records past the global cutoff. Runs on every sweep so per-record
-    // retention holds even without a global max age. ──
+    // their OWN retention class, and (only when the policy says
+    // `include_notes`) records past the global cutoff. Runs on every sweep
+    // so per-record retention holds even without a global max age. ──
+    let notes_cutoff = age_cutoff.filter(|_| policy.include_notes);
     for path in list_files(&roots.memory_dir()) {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let dropped = compact_memory_file(&path, now_ms, age_cutoff)?;
+        let dropped = compact_memory_file(&path, now_ms, notes_cutoff)?;
         if dropped > 0 {
             outcome.memory_records_dropped += dropped;
             // The derived index for a rewritten namespace is stale by
@@ -1134,9 +1144,11 @@ mod tests {
             .collect()
     }
 
+    /// An age sweep that takes notes too.
     const AGE: RetentionPolicy = RetentionPolicy {
         max_age_days: Some(1),
         max_disk_bytes: None,
+        include_notes: true,
     };
 
     /// Put a save of note `id` in the way of this thread's next rewrite: it
@@ -1479,6 +1491,66 @@ mod tests {
         assert_eq!(notes_lines(b"").count(), 0);
         assert_eq!(notes_lines(b"a\n").collect::<Vec<_>>(), [Some("a")]);
         assert_eq!(notes_lines(b"\n").collect::<Vec<_>>(), [Some("")]);
+    }
+
+    /// An age sweep is for sessions, traces and logs. A `Standard` note
+    /// survives it however old it is; a note with an expiry of its own goes
+    /// when that is past; `include_notes` makes the age apply to notes; and
+    /// the disk budget evicts notes as before.
+    #[test]
+    fn an_age_sweep_keeps_saved_notes_unless_it_is_told_to_include_them() {
+        use crate::memory::store::MemoryRetention;
+        let tmp = TempDir::new().unwrap();
+        let roots = roots(&tmp);
+        let now = 1_000 * DAY_MS;
+        let with_class = |id: &str, timestamp_ms: u64, class: MemoryRetention| {
+            let mut record = note("ns", id, timestamp_ms);
+            record.retention = Some(class);
+            store::append_to(&roots.base_dir, &record).unwrap();
+        };
+        with_class("mem-standard-old", DAY_MS, MemoryRetention::Standard);
+        save(&roots, "ns", "mem-classless-old", 2 * DAY_MS);
+        with_class("mem-expired", 900 * DAY_MS, MemoryRetention::MaxAgeDays(30));
+        with_class("mem-not-expired", 990 * DAY_MS, MemoryRetention::MaxAgeDays(30));
+        with_class("mem-standard-new", 999 * DAY_MS, MemoryRetention::Standard);
+        let path = notes_file(&roots, "ns");
+        let age = |include_notes| RetentionPolicy {
+            max_age_days: Some(5),
+            max_disk_bytes: None,
+            include_notes,
+        };
+
+        let outcome = sweep_at(&roots, &age(false), now).unwrap();
+        assert_eq!(outcome.memory_records_dropped, 1, "the note past its own expiry");
+        assert_eq!(
+            ids(&path),
+            ["mem-standard-old", "mem-classless-old", "mem-not-expired", "mem-standard-new"]
+        );
+        // Again: nothing to drop.
+        assert_eq!(sweep_at(&roots, &age(false), now).unwrap().memory_records_dropped, 0);
+
+        // `include_notes`: every note older than the age goes, whatever its
+        // class (mem-not-expired is 10 days old, inside its own 30).
+        let outcome = sweep_at(&roots, &age(true), now).unwrap();
+        assert_eq!(outcome.memory_records_dropped, 3);
+        assert_eq!(ids(&path), ["mem-standard-new"]);
+
+        // `include_notes` without an age is no cutoff.
+        let none = RetentionPolicy {
+            include_notes: true,
+            ..Default::default()
+        };
+        assert_eq!(sweep_at(&roots, &none, now).unwrap().memory_records_dropped, 0);
+
+        // The disk budget is as it was: it evicts notes, oldest first.
+        with_class("mem-standard-newer", now, MemoryRetention::Standard);
+        let total = inspect(&roots).unwrap().total_bytes;
+        let budget = RetentionPolicy {
+            max_disk_bytes: Some(total - 1),
+            ..Default::default()
+        };
+        assert_eq!(sweep_at(&roots, &budget, now).unwrap().memory_records_dropped, 1);
+        assert_eq!(ids(&path), ["mem-standard-newer"]);
     }
 
     /// The lock file sits in `memory/` beside the notes file and is not one:

@@ -802,6 +802,7 @@ fn s9_8_retention_cannot_leave_named_chains_pointing_to_deleted_sessions() {
         &RetentionPolicy {
             max_age_days: Some(30),
             max_disk_bytes: None,
+            include_notes: false,
         },
         1_800_000_000_000,
     )

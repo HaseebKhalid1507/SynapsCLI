@@ -18,12 +18,21 @@ pub enum RetentionAction {
     Inspect,
     /// Apply age/disk policy. Axel: notes only, preserving history/tombstones.
     Sweep {
-        /// Delete artifacts older than this many days.
+        /// Delete sessions, traces and logs older than this many days. Plain-file
+        /// memory: saved notes are NOT deleted by age unless --include-notes is
+        /// given; a note saved with its own expiry still expires by that.
+        /// Axel: the age applies to notes.
         #[arg(long)]
         max_age_days: Option<u32>,
-        /// Requested disk budget; protected content can leave this unmet.
+        /// Requested disk budget; protected content can leave this unmet. With
+        /// plain-file memory the budget can evict notes, oldest first.
         #[arg(long)]
         max_disk_bytes: Option<u64>,
+        /// Plain-file memory: apply --max-age-days to saved notes too, deleting
+        /// every note older than that. No effect with Axel, whose sweep is
+        /// notes only.
+        #[arg(long, requires = "max_age_days")]
+        include_notes: bool,
     },
     /// Export privately. Axel: every linked original scope, including secrets.
     /// Stop writers first; per-scope files plus a final index are not a DB snapshot.
@@ -299,7 +308,7 @@ async fn run_memory_action(action: RetentionAction, config: &MemoryBackendConfig
             let stats = binding.rpc("stats", json!({})).await?;
             print_json(&selected_report(&binding, stats)?)?;
         }
-        RetentionAction::Sweep { max_age_days, max_disk_bytes } => {
+        RetentionAction::Sweep { max_age_days, max_disk_bytes, include_notes: _ } => {
             require_policy(max_age_days, max_disk_bytes)?;
             let stats = binding.rpc("sweep", json!({"max_age_days":max_age_days,"max_disk_bytes":max_disk_bytes})).await?;
             let budget_met = max_disk_bytes.map(|limit| stats["bytes"].as_u64().is_some_and(|bytes| bytes <= limit));
@@ -517,6 +526,7 @@ fn run_legacy(action: RetentionAction, roots: &RetentionRoots) -> Result<()> {
         RetentionAction::Sweep {
             max_age_days,
             max_disk_bytes,
+            include_notes,
         } => {
             require_policy(max_age_days, max_disk_bytes)?;
             print_json(&serde_json::to_value(retention::sweep(
@@ -524,6 +534,7 @@ fn run_legacy(action: RetentionAction, roots: &RetentionRoots) -> Result<()> {
                 &RetentionPolicy {
                     max_age_days,
                     max_disk_bytes,
+                    include_notes,
                 },
             )?)?)?;
         }

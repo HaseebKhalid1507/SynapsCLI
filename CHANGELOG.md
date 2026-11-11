@@ -77,6 +77,16 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **`synaps retention sweep --max-age-days N` no longer deletes saved notes
+  (plain-file memory).** An age sweep, run to prune sessions, traces and
+  logs, also deleted every note older than N days, whatever its retention
+  class, although a `standard` note is documented as "kept until explicitly
+  forgotten or swept by disk budget". The age now applies to sessions,
+  traces, logs and tool-output spill only. A note saved with an expiry of
+  its own (`max_age_days`) still expires by that on every sweep, a
+  forgotten note is still removed, and `--max-disk-bytes` still evicts
+  notes, oldest first. `--include-notes` (with `--max-age-days`) restores
+  the old behaviour. The Axel backend's sweep is unchanged.
 - **The file archive store never refuses a rollover for being full, and never
   deletes or replaces an archive.** With `memory.backend = legacy`, a project
   could hold 128 context archives (forgotten ones included) and 256 MiB, for
