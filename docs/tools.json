@@ -744,7 +744,7 @@
           "type": "string"
         },
         "model": {
-          "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices.",
+          "description": "Omit for the session default: config `subagent_model` when set, otherwise the foreground model. Explicit values must be one of subagent_models' listed exact choices.",
           "type": "string"
         },
         "name": {
@@ -821,7 +821,7 @@
     }
   },
   {
-    "description": "List this session's exact trusted worker model choices. Omit model on delegation to inherit the foreground identity.",
+    "description": "List this session's exact trusted worker model choices. Omitting model on delegation uses the session default: config `subagent_model` when set, otherwise the foreground identity.",
     "name": "subagent_models",
     "parameters": {
       "additionalProperties": false,
@@ -883,7 +883,7 @@
           "type": "string"
         },
         "model": {
-          "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices.",
+          "description": "Omit for the session default: config `subagent_model` when set, otherwise the foreground model. Explicit values must be one of subagent_models' listed exact choices.",
           "type": "string"
         },
         "name": {

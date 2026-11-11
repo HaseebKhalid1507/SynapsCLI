@@ -72,14 +72,40 @@ pub struct AuthorizedWorkerModel {
 pub enum SelectionSource {
     ForegroundInheritance,
     ExplicitRequest,
+    /// The call omitted `model`; config `subagent_model` chose it.
+    ConfiguredDefault,
 }
 impl SelectionSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ForegroundInheritance => "foreground_inheritance",
             Self::ExplicitRequest => "explicit_request",
+            Self::ConfiguredDefault => "configured_default",
         }
     }
+}
+
+/// Remediation for a configured default (`subagent_model`) the session may
+/// not dispatch: omitting `model` cannot succeed until the call names one.
+const CONFIGURED_DEFAULT_REMEDIATION: &str = "The user's config key subagent_model names a model this session cannot use (unknown or unroutable); tell the user to correct it. To continue now, pass model explicitly: one of subagent_models' exact choices, or the foreground model id.";
+
+/// Canonicalize the configured worker default (`subagent_model`) and trust
+/// it for workers. The key is the user's own config, the same source as
+/// `favorite_models`, so naming a model there trusts it the way a favorite
+/// does (`Runtime::apply_config` -> `grant_worker_model`). It is applied here,
+/// at use, not in `apply_config`: the key is re-read on every spawn, so a
+/// `/settings` edit works without a restart. Only the one configured id is
+/// granted, and only when it is a known routable model; an invented id is
+/// returned ungranted and authorization denies it.
+fn trust_configured_default(inner: &mut Inner, raw: &str) -> Result<QualifiedModelId, String> {
+    let model = canonical_foreground_identity(raw.trim())?;
+    if validate_user_authorizable_model(model.as_str()).is_ok()
+        && inner.registry.policy().authorize(&model).is_err()
+    {
+        // A failed grant leaves the policy as it was; authorization denies.
+        let _ = inner.registry.grant_worker_model(model.clone());
+    }
+    Ok(model)
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct DispatchDenial {
@@ -393,6 +419,13 @@ impl OrchestrationRuntime {
         Ok((policy.max_concurrent_workers, policy.max_total_workers))
     }
 
+    /// The configured worker default (`subagent_model`) as a dispatch sees
+    /// it: canonicalized and, when it is a known routable model, trusted.
+    /// `Err` only for a value that does not resolve to a qualified id.
+    pub fn configured_default_model(&self, raw: &str) -> Result<QualifiedModelId, String> {
+        trust_configured_default(&mut self.inner.lock().unwrap(), raw)
+    }
+
     /// Single parse/resolve/catalog/policy/limits decision point used by every
     /// public spawn path. No credential or provider object is reachable here.
     pub fn resolve_and_authorize(
@@ -400,15 +433,31 @@ impl OrchestrationRuntime {
         runtime_handle: &str,
         requested: Option<&str>,
     ) -> Result<AuthorizedWorkerModel, DispatchDenial> {
+        self.resolve_and_authorize_with_default(runtime_handle, requested, None)
+    }
+
+    /// [`Self::resolve_and_authorize`] with the user's configured worker
+    /// default (`subagent_model`). Precedence: explicit `requested`, then
+    /// `configured_default`, then the foreground. The configured value is
+    /// canonicalized like the foreground's own config `model`
+    /// ([`canonical_foreground_identity`]) and then authorized exactly like
+    /// an explicit request; a value this session may not use is denied, never
+    /// silently replaced by the foreground.
+    pub fn resolve_and_authorize_with_default(
+        &self,
+        runtime_handle: &str,
+        requested: Option<&str>,
+        configured_default: Option<&str>,
+    ) -> Result<AuthorizedWorkerModel, DispatchDenial> {
         let mut inner = self.inner.lock().unwrap();
         let foreground = inner.registry.foreground_model().clone();
-        let selection_source = if requested.is_some() {
-            SelectionSource::ExplicitRequest
-        } else {
-            SelectionSource::ForegroundInheritance
+        let selection_source = match (requested, configured_default) {
+            (Some(_), _) => SelectionSource::ExplicitRequest,
+            (None, Some(_)) => SelectionSource::ConfiguredDefault,
+            (None, None) => SelectionSource::ForegroundInheritance,
         };
-        let model = match requested {
-            Some(value) => QualifiedModelId::parse(value).map_err(|_| DispatchDenial {
+        let model = match (requested, configured_default) {
+            (Some(value), _) => QualifiedModelId::parse(value).map_err(|_| DispatchDenial {
                 kind: "dispatch_denied",
                 code: "invalid_qualified_model",
                 requested_model: None,
@@ -417,7 +466,18 @@ impl OrchestrationRuntime {
                 network_attempted: false,
                 remediation: "Omit model to inherit foreground or select an exact session choice.",
             })?,
-            None => foreground.clone(),
+            (None, Some(value)) => {
+                trust_configured_default(&mut inner, value).map_err(|_| DispatchDenial {
+                    kind: "dispatch_denied",
+                    code: "invalid_qualified_model",
+                    requested_model: None,
+                    foreground_model: foreground.as_str().into(),
+                    selection_source,
+                    network_attempted: false,
+                    remediation: CONFIGURED_DEFAULT_REMEDIATION,
+                })?
+            }
+            (None, None) => foreground.clone(),
         };
         if inner.handles.contains_key(runtime_handle) {
             return Err(DispatchDenial {
@@ -463,6 +523,8 @@ impl OrchestrationRuntime {
                         } else {
                             "The explicit delegation policy cumulative worker budget is exhausted. Changing model or collecting workers does not renew it."
                         },
+                    _ if matches!(selection_source, SelectionSource::ConfiguredDefault) =>
+                        CONFIGURED_DEFAULT_REMEDIATION,
                     _ => "Omit model to inherit foreground, select an exact session choice, or trust the model mid-session (favorite it in the models picker).",
                 },
             })?;
@@ -826,6 +888,124 @@ mod tests {
         assert!(!authorized.network_attempted);
         rt.rollback("sa_granted");
         assert_eq!(rt.completion_gate(), CompletionGate::Allowed);
+    }
+
+    /// `subagent_model`: explicit beats configured, configured beats the
+    /// foreground, unset is the foreground; each decision says which.
+    #[test]
+    fn configured_default_precedence_and_selection_source() {
+        let foreground = model("anthropic/claude-fable-5");
+        let configured = "openai-codex/gpt-5.6-sol";
+        let rt = OrchestrationRuntime::baseline(foreground.clone(), 8, 16).unwrap();
+
+        let unset = rt
+            .resolve_and_authorize_with_default("sa_unset", None, None)
+            .unwrap();
+        assert_eq!(unset.model, foreground);
+        assert_eq!(unset.selection_source.as_str(), "foreground_inheritance");
+
+        let explicit = rt
+            .resolve_and_authorize_with_default(
+                "sa_explicit",
+                Some(foreground.as_str()),
+                Some(configured),
+            )
+            .unwrap();
+        assert_eq!(explicit.model, foreground);
+        assert_eq!(explicit.selection_source.as_str(), "explicit_request");
+        assert!(
+            !rt.effective_choices().contains(&configured.to_owned()),
+            "an explicit request does not consult (or trust) the configured default"
+        );
+
+        // Another provider, never granted: the configured default trusts it.
+        let chosen = rt
+            .resolve_and_authorize_with_default("sa_configured", None, Some(configured))
+            .unwrap();
+        assert_eq!(chosen.model.as_str(), configured);
+        assert_eq!(chosen.selection_source.as_str(), "configured_default");
+        assert_eq!(
+            serde_json::to_value(chosen.selection_source).unwrap(),
+            "configured_default"
+        );
+        assert_eq!(
+            chosen.cross_provider_grant_id.as_deref(),
+            Some("session-user-grant-openai-codex/gpt-5.6-sol")
+        );
+
+        // The bare legacy form the foreground `model` key accepts.
+        let bare = rt
+            .resolve_and_authorize_with_default("sa_bare", None, Some(" claude-fable-5 "))
+            .unwrap();
+        assert_eq!(bare.model, foreground);
+        assert_eq!(bare.selection_source.as_str(), "configured_default");
+    }
+
+    /// A known same-provider model that is neither the foreground nor
+    /// granted dispatches through the configured default; the trust covers
+    /// that one id only, never an explicit request for another model.
+    #[test]
+    fn configured_default_trusts_only_the_model_it_names() {
+        let foreground = model("anthropic/claude-opus-4-6");
+        let configured = "claude-sonnet-4-6";
+        let rt = OrchestrationRuntime::baseline(foreground.clone(), 8, 16).unwrap();
+        assert!(rt.preflight("anthropic/claude-sonnet-4-6").is_err());
+
+        let chosen = rt
+            .resolve_and_authorize_with_default("sa_sonnet", None, Some(configured))
+            .unwrap();
+        assert_eq!(chosen.model.as_str(), "anthropic/claude-sonnet-4-6");
+        assert_eq!(chosen.selection_source.as_str(), "configured_default");
+        assert!(chosen.cross_provider_grant_id.is_none());
+
+        for other in ["anthropic/claude-fable-5", "openai-codex/gpt-5.6-sol"] {
+            let denied = rt
+                .resolve_and_authorize_with_default("sa_other", Some(other), Some(configured))
+                .unwrap_err();
+            assert_eq!(denied.selection_source.as_str(), "explicit_request", "{other}");
+            assert!(matches!(
+                denied.code,
+                "model_not_allowed" | "provider_not_allowed" | "catalog_model_unknown"
+            ));
+        }
+    }
+
+    /// A configured default this session cannot use (invented or
+    /// unroutable) is denied, never run on the foreground.
+    #[test]
+    fn configured_default_not_allowed_is_denied_not_inherited() {
+        let foreground = model("anthropic/claude-fable-5");
+        let rt = OrchestrationRuntime::baseline(foreground.clone(), 3, 8).unwrap();
+        let before = rt.effective_choices();
+        for (handle, configured) in [
+            ("sa_unknown", "anthropic/claude-invented-99"),
+            ("sa_unroutable", "foo/"),
+        ] {
+            let denied = rt
+                .resolve_and_authorize_with_default(handle, None, Some(configured))
+                .unwrap_err();
+            assert_eq!(denied.selection_source.as_str(), "configured_default", "{configured}");
+            assert_eq!(denied.remediation, CONFIGURED_DEFAULT_REMEDIATION, "{configured}");
+            assert!(!denied.network_attempted);
+            assert!(denied
+                .to_string()
+                .contains(r#""selection_source":"configured_default""#));
+        }
+        for phrase in ["subagent_model", "tell the user", "pass model explicitly"] {
+            assert!(CONFIGURED_DEFAULT_REMEDIATION.contains(phrase), "{phrase}");
+        }
+        assert_eq!(rt.effective_choices(), before, "nothing granted");
+        assert!(rt.unreconciled_runtime_handles().is_empty(), "nothing dispatched");
+        assert_eq!(rt.completion_gate(), CompletionGate::Allowed);
+        // An explicit foreground id still dispatches.
+        let inherited = rt
+            .resolve_and_authorize_with_default(
+                "sa_explicit",
+                Some(foreground.as_str()),
+                Some("anthropic/claude-invented-99"),
+            )
+            .unwrap();
+        assert_eq!(inherited.model, foreground);
     }
 
     /// A grant for a malformed identity fails closed and changes nothing.

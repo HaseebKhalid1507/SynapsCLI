@@ -2438,3 +2438,119 @@ mod worker_inherit_wire_tests {
         }
     }
 }
+
+/// `subagent_model`: a dispatch that omits `model` runs on the configured
+/// default (not the foreground, and with no prior grant) on both public
+/// spawn paths, and an invented one is denied before anything launches.
+#[cfg(test)]
+mod configured_default_model_tests {
+    use super::worker_wire::{self, Seen};
+    use crate::runtime::subagent::{SubagentRegistry, SubagentStatus};
+    use crate::test_env::{BaseDirGuard, EnvVarGuard};
+    use crate::tools::Tool;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    const FOREGROUND: &str = "anthropic/claude-opus-4-6";
+    const CONFIGURED: &str = "anthropic/claude-sonnet-4-6";
+
+    /// Foreground opus; sonnet is neither the foreground nor granted.
+    fn ctx(registry: &Arc<Mutex<SubagentRegistry>>) -> crate::tools::ToolContext {
+        let mut ctx = crate::tools::test_helpers::create_tool_context();
+        let foreground = agent_core::prompt::QualifiedModelId::parse(FOREGROUND).unwrap();
+        let policy =
+            crate::orchestration::OrchestrationRuntime::baseline(foreground, 8, 64).unwrap();
+        assert!(policy.preflight(CONFIGURED).is_err());
+        ctx.capabilities.orchestration = Some(Arc::new(policy));
+        ctx.capabilities.subagent_registry = Some(registry.clone());
+        ctx
+    }
+
+    fn take(seen: &Arc<Mutex<Vec<Seen>>>) -> Vec<Seen> {
+        std::mem::take(&mut *seen.lock().unwrap())
+    }
+
+    async fn finish(registry: &Arc<Mutex<SubagentRegistry>>, handle_id: &str) {
+        for _ in 0..600 {
+            let done = registry
+                .lock()
+                .unwrap()
+                .get(handle_id)
+                .is_none_or(|h| h.status() != SubagentStatus::Running);
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let thread = registry.lock().unwrap().get_mut(handle_id).and_then(|h| h.thread_handle.take());
+        if let Some(thread) = thread {
+            tokio::task::spawn_blocking(move || thread.join()).await.unwrap().unwrap();
+        }
+        let status = registry.lock().unwrap().get(handle_id).map(|h| h.status());
+        assert_eq!(status, Some(SubagentStatus::Completed), "{handle_id}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn omitted_model_runs_on_the_configured_default_or_is_denied() {
+        let base = BaseDirGuard::new();
+        std::fs::write(base.path().join("auth.json"), worker_wire::OAUTH_AUTH_JSON).unwrap();
+        // The bare form a foreground `model = ` line takes.
+        std::fs::write(base.path().join("config"), "subagent_model = claude-sonnet-4-6\n").unwrap();
+        let marker = base.path().join("bash-ran");
+        let (url, seen) = worker_wire::spawn_provider(&marker, false).await;
+        let _env = [
+            EnvVarGuard::remove("SYNAPS_AUTH_ENDPOINT"),
+            EnvVarGuard::remove("SYNAPS_MACHINE_TOKEN"),
+            EnvVarGuard::remove("SYNAPS_SUBAGENT_FRESH_RUNTIME"),
+            EnvVarGuard::remove("SYNAPS_GZIP_REQUEST_BODIES"),
+            EnvVarGuard::remove("ANTHROPIC_API_KEY"),
+            EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url),
+        ];
+        let task = json!({"system_prompt": "test worker", "task": "run it", "timeout": 60});
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+
+        let out = super::SubagentTool
+            .execute(task.clone(), ctx(&registry))
+            .await
+            .expect("subagent");
+        assert!(out.contains("done"), "{out}");
+        let oneshot = take(&seen);
+        let out = super::SubagentStartTool
+            .execute(task.clone(), ctx(&registry))
+            .await
+            .expect("subagent_start");
+        let handle = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &handle).await;
+        let start = take(&seen);
+        for (path, requests) in [("oneshot", &oneshot), ("start", &start)] {
+            assert!(!requests.is_empty(), "{path}: no request");
+            for request in requests {
+                assert_eq!(request.body["model"], "claude-sonnet-4-6", "{path}");
+            }
+        }
+        {
+            let registry = registry.lock().unwrap();
+            let started = registry.get(&handle).unwrap();
+            assert_eq!(started.model, CONFIGURED);
+            let source = &started.authorization.as_ref().unwrap().selection_source;
+            assert_eq!(source, "configured_default");
+        }
+
+        // An invented id: denied, never run on the foreground.
+        std::fs::write(base.path().join("config"), "subagent_model = anthropic/claude-invented-99\n").unwrap();
+        let denied_registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        for tool in [&super::SubagentTool as &dyn Tool, &super::SubagentStartTool] {
+            let tool_ctx = ctx(&denied_registry);
+            let policy = Arc::clone(tool_ctx.capabilities.orchestration.as_ref().unwrap());
+            let error = tool.execute(task.clone(), tool_ctx).await.unwrap_err().to_string();
+            assert!(error.contains(r#""selection_source":"configured_default""#), "{error}");
+            assert!(error.contains("subagent_model"), "{error}");
+            assert!(error.contains("tell the user"), "{error}");
+            assert!(policy.unreconciled_runtime_handles().is_empty(), "{error}");
+            assert_eq!(policy.delegation_descendants(), 0, "{error}");
+        }
+        assert_eq!(denied_registry.lock().unwrap().iter_mut_handles().count(), 0);
+        assert!(take(&seen).is_empty(), "nothing reached the provider");
+    }
+}

@@ -476,6 +476,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `bash_max_timeout` | int | 300 | Max allowed bash timeout |
 | `subagent_timeout` | int | 300 | Default subagent timeout (seconds; 0 = no limit) |
 | `subagent_thinking` | string | xhigh | Worker thinking default (`low`, `medium`, `high`, `xhigh`, `max`), independent of `thinking`; a per-call `thinking` argument wins ([docs/subagent-thinking.md](docs/subagent-thinking.md)) |
+| `subagent_model` | string | inherit | Worker model when a `subagent`/`subagent_start` call omits `model` (e.g. `claude-sonnet-4-6` or `openai-codex/gpt-5.6-sol`, same forms as `model`); `inherit` or empty = the foreground model. A per-call `model` wins; resume keeps the worker's own model. Naming a model here trusts it for workers the way a favorite does; an unknown id is denied rather than replaced by the foreground model |
 | `subagent_context_management` | string | auto | `auto` or `off`: workers roll their context over instead of filling the window ([docs/design/subagent-rollover.md](docs/design/subagent-rollover.md)) |
 | `subagent_rollover_tokens` | int | 200000 | Estimated footprint at which a worker rolls over (at least 20000; a lower window band wins) |
 | `subagent_cold_resume_compact_tokens` | int | 100000 | `subagent_resume` of a worker whose cache has expired replays a compact context once history is at least this big; `0` = off |
@@ -694,7 +695,7 @@ Dispatch a specialist. **Not available to subagents.**
 | `task` | string | ✓ | — | |
 | `agent` | string | * | — | Loads `~/.synaps-cli/agents/{name}.md` |
 | `system_prompt` | string | * | — | Inline alternative to `agent` |
-| `model` | string | | sonnet | Override |
+| `model` | string | | `subagent_model`, else the foreground model | Exact qualified id from `subagent_models` |
 | `timeout` | integer | | 300 | Seconds |
 | `thinking` | string | | `subagent_thinking` (xhigh) | `low`, `medium`, `high`, `xhigh`, `max` |
 

@@ -831,6 +831,9 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             .and_then(|v| agent_core::reasoning::parse_subagent_thinking(&v))
             .unwrap_or(agent_core::reasoning::ReasoningLevel::XHigh)
             .as_str().to_string(),
+        "subagent_model" => raw_config(key)
+            .filter(|v| !v.eq_ignore_ascii_case("inherit"))
+            .unwrap_or_else(|| "inherit".to_string()),
         "subagent.max_concurrent" => ranged_config_display(key, 1..=u64::MAX, 16),
         "subagent.max_total" => ranged_config_display(key, 1..=u64::MAX, 64),
         "subagent.max_depth" => ranged_config_display(key, 1..=u64::from(u16::MAX), 4),
