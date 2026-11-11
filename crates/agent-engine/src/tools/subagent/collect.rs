@@ -128,11 +128,10 @@ impl Tool for SubagentCollectTool {
         let terminal = handle.terminal_diagnostic();
         let authorization = handle.authorization.clone();
         let archive_error = handle.archive_error();
-        let context = handle
-            .state
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .context_summary();
+        let (context, usage) = {
+            let s = handle.state.read().unwrap_or_else(|p| p.into_inner());
+            (s.context_summary(), s.usage.clone())
+        };
 
         // Mark collected on any terminal read so the reaper knows it's safe to GC.
         let already_collected = handle.is_collected();
@@ -153,7 +152,8 @@ impl Tool for SubagentCollectTool {
                 "handle_id":    handle_id,
                 "status":       "running",
                 "elapsed_secs": (elapsed * 10.0).round() / 10.0,
-                "output_so_far": output_so_far
+                "output_so_far": output_so_far,
+                "usage":        usage
             })
             .to_string());
         }
@@ -199,6 +199,7 @@ impl Tool for SubagentCollectTool {
             "terminal_cause": terminal,
             "authorization": authorization,
             "collected": already_collected,
+            "usage":     usage,
         });
         // Present only once the worker's context has rolled over.
         if let Some(context) = context {
@@ -380,6 +381,51 @@ mod tests {
         assert_eq!(body["error"], "worker timed out");
         assert_eq!(body["output"], "[TIMED OUT after 60s] latest progress");
         assert_eq!(body["archive_path"], json!(path));
+    }
+
+    /// A timed-out worker still reports what it used, and so does a read
+    /// while it runs.
+    #[tokio::test]
+    async fn collect_reports_usage_for_a_timed_out_and_a_running_worker() {
+        let mut usage = crate::runtime::subagent::WorkerUsage::default();
+        usage.add(
+            &crate::SessionEvent::Usage {
+                input_tokens: 3,
+                output_tokens: 1_200,
+                cache_read_input_tokens: 90_000,
+                cache_creation_input_tokens: 4_000,
+                cache_creation_5m: Some(4_000),
+                cache_creation_1h: None,
+                model: None,
+            },
+            "claude-sonnet-4-6",
+        );
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        for (id, status) in [("sa_slow", SubagentStatus::TimedOut), ("sa_busy", SubagentStatus::Running)] {
+            let h = make_finished_handle(id, "partial");
+            {
+                let mut s = h.state.write().unwrap();
+                s.status = status;
+                s.usage = usage.clone();
+            }
+            registry.lock().unwrap().register(h);
+        }
+        let want = json!({
+            "requests": 1, "input_tokens": 3, "output_tokens": 1200,
+            "cache_read_tokens": 90000, "cache_write_tokens": 4000,
+            "cache_write_5m_tokens": 4000, "context_tokens": 94003, "cost_usd": 0.06
+        });
+        for (id, status) in [("sa_slow", "timed_out"), ("sa_busy", "running")] {
+            let body: Value = serde_json::from_str(
+                &SubagentCollectTool
+                    .execute(json!({"handle_id": id}), make_ctx_with_registry(registry.clone()))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["status"], status);
+            assert_eq!(body["usage"], want, "{id}");
+        }
     }
 
     // U5: collect marks collected on first read; second read shows collected=true

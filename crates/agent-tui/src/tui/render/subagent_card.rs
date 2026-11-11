@@ -53,12 +53,15 @@ pub(crate) struct Completion<'a> {
     pub(crate) status: &'a str,
     pub(crate) secs: f64,
     pub(crate) reason: Option<&'a str>,
+    /// "Used N requests, … tokens[, about $X at list prices]."
+    pub(crate) usage: Option<&'a str>,
     pub(crate) preview: &'a str,
 }
 
 /// Parse "Subagent '{name}' ({handle}) finished with status '{status}' after
-/// {secs}s.[ Reason: {r}] Call subagent_collect with handle_id "{handle}" to
-/// retrieve the full result.[ Preview: {p}]". `None` for anything else —
+/// {secs}s.[ Reason: {r}][ Used {n} request…] Call subagent_collect with
+/// handle_id "{handle}" to retrieve the full result.[ Preview: {p}]". `None`
+/// for anything else —
 /// callers then show the text verbatim.
 pub(crate) fn parse_completion(text: &str) -> Option<Completion<'_>> {
     let rest = text.strip_prefix("Subagent '")?;
@@ -70,11 +73,20 @@ pub(crate) fn parse_completion(text: &str) -> Option<Completion<'_>> {
     let call =
         format!(" Call subagent_collect with handle_id \"{handle}\" to retrieve the full result.");
     let at = rest.find(&call)?;
-    let reason = rest[..at]
+    let mut head = &rest[..at];
+    let mut usage = None;
+    if let Some(u) = head.rfind(" Used ") {
+        let sentence = &head[u + 1..];
+        if sentence["Used ".len()..].starts_with(|c: char| c.is_ascii_digit()) && sentence.ends_with('.') {
+            usage = Some(sentence);
+            head = &head[..u];
+        }
+    }
+    let reason = head
         .strip_prefix(" Reason: ")
         .map(str::trim)
         .filter(|r| !r.is_empty());
-    if reason.is_none() && !rest[..at].trim().is_empty() {
+    if reason.is_none() && !head.trim().is_empty() {
         return None;
     }
     let tail = &rest[at + call.len()..];
@@ -89,6 +101,7 @@ pub(crate) fn parse_completion(text: &str) -> Option<Completion<'_>> {
         status,
         secs,
         reason,
+        usage,
         preview,
     })
 }
@@ -271,9 +284,22 @@ mod tests {
                 status: "completed",
                 secs: 3.4,
                 reason: None,
+                usage: None,
                 preview: "This repo has no git tags.",
             }
         );
+        let used = "Subagent 'x' (sa_9) finished with status 'failed' after 61.0s. Reason: boom \
+             Used 3 requests, 1.2k input and 370k output tokens, about $5.55 at list prices. \
+             Call subagent_collect with handle_id \"sa_9\" to retrieve the full result. Preview: p";
+        let c = parse_completion(used).unwrap();
+        assert_eq!(c.reason, Some("boom"));
+        assert_eq!(
+            c.usage,
+            Some("Used 3 requests, 1.2k input and 370k output tokens, about $5.55 at list prices.")
+        );
+        let no_reason = used.replace("Reason: boom ", "");
+        let c = parse_completion(&no_reason).unwrap();
+        assert_eq!((c.reason, c.usage.is_some(), c.preview), (None, true, "p"));
         let failed = "Subagent 'x' (sa_9) finished with status 'failed' after 61.0s. Reason: boom \
              Call subagent_collect with handle_id \"sa_9\" to retrieve the full result. Preview: ";
         let c = parse_completion(failed).unwrap();

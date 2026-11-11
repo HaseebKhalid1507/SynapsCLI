@@ -758,6 +758,18 @@ subagent_collect(handle_id)             → {"status": "completed", "output": "f
 subagent_resume(handle_id, instructions) → new handle_id; the worker continues its archived conversation
 ```
 
+`subagent_status`, `subagent_collect` (running and terminal) and the completion
+event's `data` carry `usage`, what this run used so far: `requests` (provider
+responses that reported usage, keep-warm pings included), `input_tokens`,
+`output_tokens`, `cache_read_tokens`, `cache_write_tokens` (plus
+`cache_write_5m_tokens`/`cache_write_1h_tokens` when split), `context_tokens`
+(the latest prompt) and `cost_usd` (list-price estimate from
+`agent_core::pricing`, 4 decimals; absent when nothing was used or the model has
+no list price). The completion text adds one "Used N requests, … tokens, about
+$X at list prices." sentence before "Call subagent_collect". A resumed worker
+counts its own run only; a reaped worker read back from its archive has no
+`usage`.
+
 Use `subagent` for simple sequential delegation (blocks until done).
 Use `subagent_start` for parallel execution or when you want to continue working while the subagent runs.
 Use `subagent_resume` on finished/timed-out/failed handles to continue with new instructions — the original handle stays readable.

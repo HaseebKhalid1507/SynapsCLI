@@ -4,7 +4,9 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
 mod reload;
+mod usage;
 pub use reload::{handle_number, CarriedWorker, MAX_CARRIED_ARCHIVES};
+pub use usage::WorkerUsage;
 
 // ── SubagentResult ───────────────────────────────────────────────────────────────
 
@@ -120,6 +122,9 @@ pub struct SubagentState {
     pub step: String,
     /// Tool calls started so far (the "tool #N" in `step`).
     pub tools: u32,
+    /// What this run used so far (requests, tokens, estimated cost), kept
+    /// live by the worker's event loop; `usage` in status/collect output.
+    pub usage: WorkerUsage,
     /// The worker's real message history, from the runtime's last
     /// `SessionEvent::MessageHistory`. Written to the resume archive by the
     /// finalizer and then released, so finished handles stay small.
@@ -197,6 +202,7 @@ impl SubagentState {
             terminal: None,
             step: String::new(),
             tools: 0,
+            usage: WorkerUsage::default(),
             history: None,
             last_response_start: 0,
             archive_meta: None,
