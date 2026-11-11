@@ -183,6 +183,10 @@ fn spawn_writer(mut w: ServerWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::ta
 }
 
 pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: CancellationToken) {
+    // Windows: keep the pipe's handle, to identify the client after `Hello`
+    // (the halves keep the pipe open).
+    #[cfg(windows)]
+    let peer = crate::ipc::PeerHandle::of(&stream);
     let (r, w) = crate::ipc::split_server(stream);
     let mut reader = BufReader::new(r);
     let (tx, writer) = spawn_writer(w);
@@ -210,6 +214,16 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             return;
         }
     };
+    // The Windows `admit` (Unix checks the peer's uid on accept,
+    // `listener.rs`): whoever wrote `Hello` must be the daemon's user, at its
+    // integrity level or higher. Refused: no frame, the client sees EOF.
+    #[cfg(windows)]
+    if let Err(why) = crate::ipc::admit_client(peer, &crate::ipc::own_identity()) {
+        tracing::warn!("daemon: refused connection: {why}");
+        drop(tx);
+        let _ = writer.await;
+        return;
+    }
     if hello.protocol_version < PROTOCOL_MIN || hello.protocol_version > PROTOCOL_MAX {
         tracing::warn!(client = hello.protocol_version, daemon = PROTOCOL_VERSION, "daemon: refusing protocol version");
         let _ = tx
