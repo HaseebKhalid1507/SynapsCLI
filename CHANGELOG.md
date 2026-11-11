@@ -447,6 +447,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`on_message_complete` fires for a reply that crosses a usage budget, and
+  for a rejected `context_checkpoint` batch.** Both replies are kept in
+  history, but the turn stopped (`max_cost_usd`, `max_context_tokens`) or
+  asked the model again without the event, so an extension never saw that
+  message end, text included. Each now gets exactly one event;
+  `has_tool_use` says whether the message asked for tools (always `true`
+  for the rejected batch). Nothing else about either path changes.
 - **Extensions: the context archive format page says where a linked base
   works, and what an import changes.** A base that is a symbolic link works
   for the archive store only; the session journal, drafts and the source of

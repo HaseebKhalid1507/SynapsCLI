@@ -514,7 +514,12 @@ pub(super) fn rebuild_stale_tool_set(
 
 /// Fire `on_message_complete` for one finished assistant message and apply
 /// an advisory work phase the extension reports back. The one place the
-/// event is built: every path that ends an assistant message calls this.
+/// event is built. Called once for every assistant message the stream loop
+/// keeps (pushed to history, or the empty reply after a tool round, which
+/// is not pushed): the normal path, the empty reply, the usage-budget stop
+/// and the batched `context_checkpoint` rejection. A response the loop
+/// drops (an empty reply that is an error, a cancel or over a usage
+/// budget) gets no event.
 ///
 /// An extension may report an advisory work phase; it is applied exactly
 /// like the model's own `context_checkpoint` (no note) and is never
@@ -1976,6 +1981,17 @@ impl StreamMethods {
 
                 if let Some(dimension) = usage_exhausted {
                     // Keep the paid-for response; none of its calls run.
+                    // It is in history, so extensions see it end.
+                    emit_message_complete(
+                        &hook_bus,
+                        &continuation,
+                        context_enabled,
+                        session_id.as_deref(),
+                        cwd.as_deref(),
+                        content,
+                        !tool_uses.is_empty(),
+                    )
+                    .await;
                     if !tool_uses.is_empty() {
                         let content = format!(
                             "{}: turn {} budget exhausted",
@@ -2010,6 +2026,18 @@ impl StreamMethods {
                     && tool_uses.len() > 1
                     && tool_uses.iter().any(|t| t["name"] == "context_checkpoint")
                 {
+                    // The message asked for tools (none run); it is in
+                    // history, so extensions see it end.
+                    emit_message_complete(
+                        &hook_bus,
+                        &continuation,
+                        context_enabled,
+                        session_id.as_deref(),
+                        cwd.as_deref(),
+                        content,
+                        true,
+                    )
+                    .await;
                     messages.push(Arc::new(json!({"role":"user","content":tool_uses.iter().map(|t|json!({"type":"tool_result","tool_use_id":t["id"],"is_error":true,"content":"No tools executed: context_checkpoint must be called alone so the host can assess rollover before more work."})).collect::<Vec<_>>()})));
                     continue;
                 }
@@ -6623,6 +6651,157 @@ mod rich_output_tests {
         assert_eq!(seen[1]["content_block_count"], 0);
         assert_eq!(messages[0].as_deref(), Some("pre-tool text"));
         assert_eq!(messages[1].as_deref(), Some(""));
+    }
+
+    /// One provider round: a text block (when `text` is not empty), then
+    /// `tool_uses` with empty input. Ends `tool_use` if it has tools.
+    fn sse_text_and_tools(text: &str, tool_uses: &[(&str, &str)]) -> String {
+        let usage = json!({"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0});
+        let mut events = vec![json!({"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":usage}})];
+        let mut index = 0;
+        if !text.is_empty() {
+            events.push(json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}));
+            events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}));
+            events.push(json!({"type":"content_block_stop","index":index}));
+            index += 1;
+        }
+        for (id, name) in tool_uses {
+            events.push(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name}}));
+            events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":"{}"}}));
+            events.push(json!({"type":"content_block_stop","index":index}));
+            index += 1;
+        }
+        let stop = if tool_uses.is_empty() { "end_turn" } else { "tool_use" };
+        events.push(json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":null},"usage":usage}));
+        events.push(json!({"type":"message_stop"}));
+        events.iter().map(|ev| format!("data: {ev}\n\n")).collect()
+    }
+
+    struct EndedTurn {
+        hook: Arc<PhaseHook>,
+        provider_calls: usize,
+        history: Vec<SharedMessage>,
+        errors: usize,
+    }
+
+    /// Run one turn whose first round is `first_round` (later rounds answer
+    /// "done"), with an `on_message_complete` recorder subscribed.
+    async fn run_turn_recording_messages(
+        first_round: String,
+        configure: impl FnOnce(&mut StreamSession),
+    ) -> EndedTurn {
+        let (base_url, mock) = spawn_mock(first_round).await;
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TextTool));
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let (hook_bus, hook) = phase_hook_bus(false).await;
+        let mut session = harness_session(
+            base_url,
+            Arc::new(RwLock::new(registry)),
+            tx,
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default()),
+            hook_bus,
+            tool_session_id,
+            Default::default(),
+            false,
+            "claude-sonnet-4-6",
+        );
+        configure(&mut session);
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            StreamMethods::run_stream_internal(session, initial),
+        )
+        .await
+        .expect("stream loop must finish")
+        .expect("the turn ends Ok");
+        let mut history = Vec::new();
+        let mut errors = 0;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
+                StreamEvent::Session(SessionEvent::Error(_)) => errors += 1,
+                _ => {}
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        EndedTurn {
+            hook,
+            provider_calls: mock.calls.load(Ordering::SeqCst),
+            history,
+            errors,
+        }
+    }
+
+    /// A reply that crosses a usage budget is kept in history and ends the
+    /// turn; extensions are told it ended, once, with its text.
+    #[tokio::test]
+    async fn a_reply_over_the_usage_budget_fires_on_message_complete_once() {
+        let over_budget = |s: &mut StreamSession| s.turn_budget.max_context_tokens = Some(5);
+
+        // A final text reply: it asked for no tools.
+        let ended =
+            run_turn_recording_messages(sse_text_and_tools("over budget", &[]), over_budget).await;
+        assert_eq!(ended.provider_calls, 1, "the budget ends the turn after one round");
+        assert!(ended.errors > 0, "the turn ends on the budget error");
+        assert_eq!(ended.history.last().unwrap()["role"], "assistant", "kept in history");
+        let seen = ended.hook.seen.lock().unwrap().clone();
+        let messages = ended.hook.messages.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "exactly one event: {seen:?}");
+        assert_eq!(seen[0]["has_tool_use"], false);
+        assert_eq!(messages[0].as_deref(), Some("over budget"));
+
+        // A reply that asked for a tool: the call never runs, the event
+        // still says the message asked for one.
+        let ended = run_turn_recording_messages(
+            sse_text_and_tools("calling a tool", &[("toolu_1", "text_stub")]),
+            over_budget,
+        )
+        .await;
+        assert_eq!(ended.provider_calls, 1);
+        let seen = ended.hook.seen.lock().unwrap().clone();
+        let messages = ended.hook.messages.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "exactly one event: {seen:?}");
+        assert_eq!(seen[0]["has_tool_use"], true);
+        assert_eq!(messages[0].as_deref(), Some("calling a tool"));
+    }
+
+    /// A batch that calls `context_checkpoint` next to another tool is
+    /// rejected, but the message is in history: extensions see it end, once,
+    /// with `has_tool_use: true`, and then the turn's next reply.
+    #[tokio::test]
+    async fn a_rejected_checkpoint_batch_fires_on_message_complete_once() {
+        let ended = run_turn_recording_messages(
+            sse_text_and_tools(
+                "checkpoint and work",
+                &[("toolu_1", "context_checkpoint"), ("toolu_2", "text_stub")],
+            ),
+            |s| s.continuation = auto_continuation(),
+        )
+        .await;
+        assert_eq!(ended.provider_calls, 2, "rejected, then the model answers again");
+        assert_eq!(ended.errors, 0);
+        assert!(
+            ended
+                .history
+                .iter()
+                .any(|m| m.to_string().contains("context_checkpoint must be called alone")),
+            "the batch was rejected"
+        );
+        let seen = ended.hook.seen.lock().unwrap().clone();
+        let messages = ended.hook.messages.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one event per assistant message: {seen:?}");
+        assert_eq!(seen[0]["has_tool_use"], true);
+        assert_eq!(seen[0]["content_block_count"], 3);
+        assert_eq!(messages[0].as_deref(), Some("checkpoint and work"));
+        assert_eq!(seen[1]["has_tool_use"], false);
+        assert_eq!(messages[1].as_deref(), Some("done"));
     }
 
     // ── Tool output virtualisation, through the real tool-result → history
