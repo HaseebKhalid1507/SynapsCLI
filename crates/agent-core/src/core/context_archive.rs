@@ -2404,6 +2404,20 @@ impl ArchiveStore {
                     ImportOutcome::Forgotten
                 }
             };
+            if let (false, Some(store)) = (dry_run, store) {
+                if outcome != ImportOutcome::Forgotten {
+                    // "It is here already" is an answer about the disk. An
+                    // earlier run may have been cut after its rename and
+                    // before the directory was synced: confirmed now, as a
+                    // forget confirms a tombstone it finds.
+                    match &held.shelf {
+                        Some(shelf) => {
+                            store.fs.open_child(shelf, false)?.ok_or_else(not_found)?.sync()?;
+                        }
+                        None => store.fs.sync()?,
+                    }
+                }
+            }
             return imported(outcome, held.shelf, None, unread);
         }
 
@@ -4372,6 +4386,10 @@ impl PrivateDir {
         }
     }
     fn sync(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(error) = fault("sync", c"") {
+            return Err(error);
+        }
         self.0.sync_all()
     }
 }
@@ -10145,6 +10163,32 @@ mod tests {
         assert_eq!(import(&store, &line).unwrap().outcome, ImportOutcome::Stored);
         let file = dir.join("s000001").join(archive_name(&other));
         assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), at_ms(1_600_000_000_000));
+    }
+
+    /// A real run that answers "already here" syncs the shelf the file is
+    /// on first: a run before it may have been cut between its rename and
+    /// the sync. A dry run touches nothing, so it does not.
+    #[test]
+    fn an_import_that_finds_its_record_confirms_it_on_disk() {
+        let (_tmp, store) = setup();
+        let id = random_id();
+        let live = record_bytes(&store, &id, &text("found and confirmed"), |_| {});
+        let gone = random_id();
+        let dead = record_bytes(&store, &gone, &text("kept forgotten"), tombstone);
+        let kept = record_bytes(&store, &gone, &text("kept forgotten"), |_| {});
+        assert_eq!(import(&store, &live).unwrap().outcome, ImportOutcome::Stored);
+        assert_eq!(import(&store, &dead).unwrap().outcome, ImportOutcome::Stored);
+        let present = ImportOutcome::Present { note_differs: false };
+        for (line, outcome) in [(&live, present), (&kept, ImportOutcome::KeptForgotten)] {
+            let failing = Fault::on("sync", "", libc::EIO);
+            let mut seen = ImportSeen::default();
+            let stopped = store.import(line, false, false, &mut seen);
+            assert_eq!(stopped.expect_err("synced").raw_os_error(), Some(libc::EIO));
+            let dry = store.import(line, false, true, &mut seen).unwrap().unwrap();
+            assert_eq!(dry.outcome, outcome);
+            drop(failing);
+            assert_eq!(import(&store, line).unwrap().outcome, outcome);
+        }
     }
 }
 

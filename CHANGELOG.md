@@ -374,6 +374,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: an import that finds its record already stored
+  confirms it on disk.** A run cut by a power loss after a file was renamed
+  into place and before its directory was synced left a record the next
+  run answered "present" for, without the sync a forget does in the same
+  case. A real run now syncs the shelf (or the project directory, for a
+  legacy slot) before it answers that a record or its tombstone is already
+  there. A dry run still touches nothing.
 - **Context archives: an import refuses a `created_ms` that has not come,
   and dates the file after it has its name.** A record dated more than a
   day after this machine's clock is refused (`created_ms is more than a day
