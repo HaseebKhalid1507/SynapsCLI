@@ -212,8 +212,10 @@ mod imp {
         /// high (elevated), 0x4000 system.
         pub integrity: u32,
         /// A restricted token (restricting SIDs) or an AppContainer token: a
-        /// sandboxed process that carries its user's SID and integrity level
-        /// but acts with less than that user's rights.
+        /// sandboxed process that carries its user's SID and integrity level.
+        /// Refusing it is defence in depth, not a rights boundary: a restricted
+        /// token that passes the pipe's DACL has the user's SID among its
+        /// restricting SIDs.
         pub confined: bool,
     }
 
@@ -406,9 +408,9 @@ mod imp {
 
         /// Security descriptor for daemon pipes: a protected DACL granting
         /// full access to this user and SYSTEM only (the default pipe DACL
-        /// also grants Everyone read), and a no-write-up label at this
-        /// process's integrity level. NPFS keeps the first instance's
-        /// descriptor for the whole pipe name.
+        /// also grants Everyone read), and a no-write-up, no-read-up (`NWNR`)
+        /// label at this process's integrity level. NPFS keeps the first
+        /// instance's descriptor for the whole pipe name.
         pub struct PipeSecurity(PSECURITY_DESCRIPTOR);
 
         // SAFETY: an immutable, self-contained LocalAlloc'd descriptor.
@@ -499,10 +501,15 @@ mod imp {
                     if unsafe { GetAce(sacl, i, &mut ace) } == 0 {
                         return Err(io::Error::last_os_error());
                     }
-                    // SAFETY: every ACE starts with an ACE_HEADER.
+                    // The bytes left in the ACL from this ACE on; the 4-byte ACE_HEADER must fit before it is read.
+                    let left = acl_end.saturating_sub(ace as usize);
+                    if left < std::mem::size_of::<ACE_HEADER>() {
+                        return Err(io::Error::other("malformed integrity label ACE: runs past the end of the ACL"));
+                    }
+                    // SAFETY: every ACE starts with an ACE_HEADER, and 4 bytes remain.
                     let size = usize::from(unsafe { (*(ace as *const ACE_HEADER)).AceSize });
                     // The ACE's bytes, never past the end of the ACL.
-                    let len = size.min(acl_end.saturating_sub(ace as usize));
+                    let len = size.min(left);
                     // SAFETY: `len` bytes from an ACE inside the ACL, which sd owns.
                     let bytes = unsafe { std::slice::from_raw_parts(ace as *const u8, len) };
                     if let Some(rid) = label_rid(bytes)? {
