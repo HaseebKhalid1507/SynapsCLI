@@ -342,6 +342,13 @@ All notable changes to this project will be documented in this file.
   away.** It skipped every read error, and a lasting one comes back on
   every read, so the query never returned. It now skips only a line that
   is not UTF-8 and returns any other read error.
+- **Notes: `memory_store` and `memory_forget` say when a note was written but
+  not confirmed on disk.** If the sync after the write failed, the tool
+  reported a plain error although the note (or the forget) was already in
+  the file; a retry then made a second note, or answered "not found". The
+  tools now say that it was written and tell the model to search before
+  saving again. An extension's `memory.append` gets the same distinct
+  message ("written, but not confirmed on disk").
 - **Notes: a saved note is on disk before `memory_store` says it is saved.**
   With the plain-file memory backend a note was written to
   `memory/project-<key>.jsonl` but not synced, so a crash or a power cut

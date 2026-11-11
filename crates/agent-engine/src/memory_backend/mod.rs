@@ -66,6 +66,27 @@ fn error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::Tool(format!("memory: {}", message.into()))
 }
 
+/// What `memory_store` (`what` = "note") and `memory_forget` ("forget") say
+/// for an error of the plain-file store. When the line was written and only
+/// its sync failed, the model must not take it for a failed call: a second
+/// `memory_store` makes a second note, and a second `memory_forget` answers
+/// "not found".
+fn legacy_write_error(e: store::MemoryError, what: &str) -> RuntimeError {
+    match (&e, what) {
+        (store::MemoryError::WrittenUnconfirmed(cause), "forget") => error(format!(
+            "the forget was written but the disk did not confirm it ({cause}). The note is \
+             forgotten now and searches no longer return it. Do not call memory_forget for it \
+             again (it would answer not found); use memory_search if you need to check."
+        )),
+        (store::MemoryError::WrittenUnconfirmed(cause), _) => error(format!(
+            "the note was written but the disk did not confirm it ({cause}). It is in memory \
+             now. Do NOT save it again: use memory_search to find it first, and call \
+             memory_store again only if the search does not return it."
+        )),
+        _ => error(e.to_string()),
+    }
+}
+
 impl MemoryBinding {
     /// Production bootstrap without a Runtime capability (legacy extensions).
     /// Selection is captured before any subprocess starts; never flips to legacy
@@ -412,7 +433,7 @@ impl MemoryBinding {
             return tokio::task::spawn_blocking(move || store::store_record_in(&base, &scope, new))
                 .await
                 .map_err(|_| error("legacy store worker failed"))?
-                .map_err(|e| error(e.to_string()));
+                .map_err(|e| legacy_write_error(e, "note"));
         }
         let record = MemoryRecord {
             namespace: scope.namespace(),
@@ -472,7 +493,7 @@ impl MemoryBinding {
             return tokio::task::spawn_blocking(move || store::forget_in(&base, &scope, &id))
                 .await
                 .map_err(|_| error("legacy forget worker failed"))?
-                .map_err(|e| error(e.to_string()));
+                .map_err(|e| legacy_write_error(e, "forget"));
         }
         match self.call("forget", json!({"id":id})).await? {
             Value::Bool(true) => Ok(()),
@@ -523,6 +544,24 @@ struct Descriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_write_that_was_not_confirmed_tells_the_model_to_search_before_saving_again() {
+        let unconfirmed = || store::MemoryError::WrittenUnconfirmed("EIO".into());
+        let stored = legacy_write_error(unconfirmed(), "note").to_string();
+        assert!(stored.contains("memory: the note was written"), "{stored}");
+        assert!(stored.contains("EIO"), "{stored}");
+        assert!(stored.contains("Do NOT save it again: use memory_search"), "{stored}");
+        let forgotten = legacy_write_error(unconfirmed(), "forget").to_string();
+        assert!(forgotten.contains("memory: the forget was written"), "{forgotten}");
+        assert!(forgotten.contains("Do not call memory_forget for it again"), "{forgotten}");
+        // Any other store error is passed on as it was.
+        let other = legacy_write_error(store::MemoryError::NotFound("mem-1".into()), "forget");
+        assert_eq!(
+            other.to_string(),
+            error(store::MemoryError::NotFound("mem-1".into()).to_string()).to_string()
+        );
+    }
 
     fn assert_same_storage(parent: &MemoryBinding, child: &MemoryBinding) {
         assert_eq!(child.0.base, parent.0.base);

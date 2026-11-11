@@ -103,6 +103,12 @@ pub enum MemoryError {
     NotFound(String),
     /// The project root could not be canonicalized.
     InvalidProjectRoot(String),
+    /// The line (a note, or the tombstone of a forget) IS in the file, whole,
+    /// and every reader sees it, but a sync after the write failed, so it is
+    /// not confirmed to be on disk. Not a failed save: doing it again makes
+    /// a second note under a new id, and a second forget answers
+    /// [`MemoryError::NotFound`]. Holds the sync's error.
+    WrittenUnconfirmed(String),
 }
 
 impl std::fmt::Display for MemoryError {
@@ -118,6 +124,11 @@ impl std::fmt::Display for MemoryError {
                 write!(f, "memory record not found in this project scope: {id}")
             }
             MemoryError::InvalidProjectRoot(s) => write!(f, "invalid project root: {s}"),
+            MemoryError::WrittenUnconfirmed(s) => write!(
+                f,
+                "written, but not confirmed on disk (the sync failed: {s}); \
+                 it is in the store now, so look before doing it again"
+            ),
         }
     }
 }
@@ -220,8 +231,10 @@ fn append_record(base: &Path, record: &MemoryRecord, sync_now: bool) -> Result<(
 /// ([`ImportRun::finish`]).
 ///
 /// An error means the save is NOT acknowledged. It does not mean nothing was
-/// written: after a short write or a failed sync, part or all of the line can
-/// be in the file.
+/// written. [`MemoryError::WrittenUnconfirmed`] says the whole line is in
+/// the file and a sync after it failed; a caller must not treat that as "try
+/// again". After any other error at most a fragment of the line is in the
+/// file (a short write), which readers skip.
 ///
 /// Torn-tail healing: if a previous writer died mid-line (the file does not
 /// end in a newline), a leading newline isolates the torn fragment on its
@@ -252,10 +265,12 @@ fn append_jsonl_line(path: &Path, line: &str, sync_now: bool) -> Result<(), Memo
     let mut f = crate::core::private_fs::open_private_append(path).map_err(std::io::Error::from)?;
     write_whole_line(&mut f, line, needs_heal)?;
     if sync_now {
-        sync_file(&f)?;
-        if let Some(dir) = path.parent() {
-            sync_dir(dir)?;
-        }
+        // From here on the line is in the file.
+        let synced = sync_file(&f).and_then(|()| match path.parent() {
+            Some(dir) => sync_dir(dir),
+            None => Ok(()),
+        });
+        synced.map_err(|e| MemoryError::WrittenUnconfirmed(e.to_string()))?;
     }
     Ok(())
 }
@@ -397,6 +412,7 @@ fn write_whole_line<W: Write>(
 /// Sync a notes file: its bytes and its length.
 fn sync_file(file: &fs::File) -> std::io::Result<()> {
     step("sync file");
+    failing("sync file")?;
     file.sync_all()
 }
 
@@ -404,6 +420,7 @@ fn sync_file(file: &fs::File) -> std::io::Result<()> {
 /// into it, is on disk.
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     step("sync dir");
+    failing("sync dir")?;
     // A file system that cannot sync a directory at all says so with EINVAL
     // or ENOTSUP. That is not a failed save: now that every save syncs the
     // directory, it would fail every save there, each with its line already
@@ -440,6 +457,28 @@ fn step(name: &'static str) {
 
 #[cfg(not(test))]
 fn step(_name: &'static str) {}
+
+#[cfg(test)]
+thread_local! {
+    /// The sync step that fails on this thread, for the tests of what a
+    /// caller is told then.
+    static FAILING_STEP: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// An error if a test made this step fail.
+#[cfg(test)]
+fn failing(name: &'static str) -> std::io::Result<()> {
+    if FAILING_STEP.with(|step| step.get()) == Some(name) {
+        return Err(std::io::Error::other(format!("{name} failed (test)")));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn failing(_name: &'static str) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Query records in a namespace, applying filters, returning most-recent-first up to limit.
 pub fn query(namespace: &str, q: &MemoryQuery) -> Result<Vec<MemoryRecord>, MemoryError> {
@@ -1153,14 +1192,18 @@ impl ImportRun {
     /// run stored is durable until this returns `Ok`; call it when the run
     /// stops early too. Returns the files synced, sorted. A dry run has
     /// none.
+    ///
+    /// An error is [`MemoryError::WrittenUnconfirmed`]: the lines the run
+    /// reported as stored are in their files, and a sync failed.
     #[must_use = "an import is not durable unless `finish` returned Ok"]
     pub fn finish(mut self) -> Result<Vec<PathBuf>, MemoryError> {
         // Whatever the sync says, it was tried and the caller is told.
         self.finished = true;
         self.sync()
+            .map_err(|e| MemoryError::WrittenUnconfirmed(e.to_string()))
     }
 
-    fn sync(&self) -> Result<Vec<PathBuf>, MemoryError> {
+    fn sync(&self) -> std::io::Result<Vec<PathBuf>> {
         let mut synced: Vec<PathBuf> = self
             .files
             .iter()
@@ -1767,6 +1810,83 @@ mod tests {
         fs::write(memory_dir_in(tmp.path()).join("empty.jsonl"), "").unwrap();
         append_to(tmp.path(), &rec("empty", 1, "x", vec![])).unwrap();
         assert_eq!(take_steps(), ["write", "sync file", "sync dir"]);
+    }
+
+    /// When a sync fails after the line went in, the caller is told exactly
+    /// that, not "the save failed": the note (or the forget) is in the file
+    /// and every reader sees it. An error from before the write is not this
+    /// one.
+    #[test]
+    fn a_sync_that_fails_after_the_write_is_written_unconfirmed() {
+        struct Failing;
+        impl Failing {
+            fn step(name: &'static str) -> Self {
+                FAILING_STEP.with(|step| step.set(Some(name)));
+                Failing
+            }
+        }
+        impl Drop for Failing {
+            fn drop(&mut self) {
+                FAILING_STEP.with(|step| step.set(None));
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let scope = project_scope(&tmp);
+        let kept = store_record_in(base, &scope, note("kept")).unwrap();
+        let contents = || -> Vec<String> {
+            let live = load_live_project_records(base, &scope).unwrap();
+            live.into_iter().map(|record| record.content).collect()
+        };
+
+        for step in ["sync file", "sync dir"] {
+            let failing = Failing::step(step);
+            let error = store_record_in(base, &scope, note(step)).unwrap_err();
+            drop(failing);
+            assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+            let message = error.to_string();
+            assert!(message.starts_with("written, but not confirmed on disk"), "{message}");
+            assert!(message.contains(&format!("{step} failed")), "{message}");
+        }
+        assert_eq!(contents(), ["kept", "sync file", "sync dir"], "both notes are there");
+
+        // A forget: the tombstone is in the file, and a second forget says
+        // not found, which is why the caller must be told.
+        let id = kept.id.as_deref().unwrap();
+        let failing = Failing::step("sync file");
+        let error = forget_in(base, &scope, id).unwrap_err();
+        drop(failing);
+        assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+        assert_eq!(contents(), ["sync file", "sync dir"]);
+        assert!(matches!(forget_in(base, &scope, id), Err(MemoryError::NotFound(_))));
+
+        // The plain namespace path (an extension's `memory.append`).
+        let failing = Failing::step("sync dir");
+        let error = append_to(base, &rec("ns", 1, "x", vec![])).unwrap_err();
+        drop(failing);
+        assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+        assert_eq!(query_in(base, "ns", &MemoryQuery::default()).unwrap().len(), 1);
+
+        // An import: its lines are written, and `finish` is where the sync
+        // fails.
+        let mut run = ImportRun::new(false);
+        let line = exported("mem-i", scope.key(), 1, "imported");
+        import(base, &line, ImportTarget::AsRecorded, &mut run);
+        let failing = Failing::step("sync file");
+        let error = run.finish().unwrap_err();
+        drop(failing);
+        assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+        assert_eq!(contents(), ["sync file", "sync dir", "imported"]);
+
+        // Before the write: the sync of the folder a new `memory/` is in,
+        // and a lock that is not had. Nothing was written, and the error
+        // does not say otherwise.
+        let fresh = TempDir::new().unwrap();
+        let failing = Failing::step("sync dir");
+        let error = append_to(fresh.path(), &rec("ns", 1, "x", vec![])).unwrap_err();
+        drop(failing);
+        assert!(matches!(error, MemoryError::Io(_)), "{error}");
+        assert!(!namespace_file(fresh.path(), "ns").exists());
     }
 
     /// A save that cannot get the file's lock in time fails and writes
