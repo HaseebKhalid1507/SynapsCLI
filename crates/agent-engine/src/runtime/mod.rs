@@ -4467,6 +4467,7 @@ impl Runtime {
                     // The non-stream transport never sends diagnostics.
                     cache_diagnosis: None,
                     context_rollover: None,
+                    round_signal: None,
                 },
             )
             .await?;
@@ -5041,6 +5042,8 @@ impl Runtime {
             // `diagnostics.previous_message_id`.
             cache_diagnosis: self.cache_diagnosis(),
             context_rollover: None,
+            // Placeholder: the stream loop installs one per provider round.
+            round_signal: None,
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));

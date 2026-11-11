@@ -489,7 +489,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `disabled_skills` | comma list | — | Skills to skip on boot |
 | `disabled_tools` | comma list | — | Built-in tools to remove from the registry at boot (by runtime name, e.g. `bash, ls`); subagent workers don't get them either |
 | `cache_ttl` | string | auto | Prompt-cache TTL: `auto` (1h on an Anthropic subscription/OAuth login, 5m on an API key), `5m`, `1h` or `hybrid`. Other providers ignore it; workers always use 5m |
-| `cache_keepwarm_tools` | bool | on | Keep the prompt cache warm while a long tool round runs (foreground and workers) |
+| `cache_keepwarm_tools` | bool | on | Keep the prompt cache warm while a long round runs: a response that streams past the cache TTL, or tools that run past it (foreground and workers) |
 | `cache_keepwarm_headless` | bool | off | Let idle keep-warm (`cache_keepwarm`) run for daemon sessions driven only by non-interactive clients |
 | `request_compression` | string | auto | gzip Anthropic request bodies: `auto` (16 KiB+ bodies sent straight to api.anthropic.com), `on`, `off`. `SYNAPS_GZIP_REQUEST_BODIES=0` turns it off |
 | `request_compression_level` | int | 1 | gzip level, 1–9 |

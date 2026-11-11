@@ -185,6 +185,20 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Keep-warm now covers a response that streams past the cache TTL**
+  (`cache_keepwarm_tools`). The TTL runs from the start of a request, and
+  the keep-warm for long rounds only started once the tools did. A worker
+  that thought for more than five minutes before a tool call had lost its
+  5m cache before the tool ran, and the next request rewrote the whole
+  prefix at 1.25×: four such requests in one night's logs rewrote 674k
+  tokens, with nothing in the cache diagnostics to show for it (tools,
+  system and messages were unchanged). The round's keep-warm now starts
+  when its request is sent and pings while the response streams, on the
+  same schedule, guards and booking as while tools run. A long final
+  answer is pinged too (when a ping falls due nothing says it is the last
+  word; the prefix would otherwise be dead for a resume or the next
+  message), and nothing is sent once it ends. Nothing changes on a 1h TTL
+  short of a 55-minute response.
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
   program names: a stock Windows has no `grep` or `ls` ("program not
   found"), and `find` resolved to `System32\find.exe`, an unrelated string
