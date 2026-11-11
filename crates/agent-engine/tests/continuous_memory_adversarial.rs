@@ -343,7 +343,7 @@ async fn host_or_plugin_crash_does_not_leak_lease_or_child_process() {
     let digest = SchemaDigest::of_schema(&json!({"type": "object", "properties": {}}));
 
     capability
-        .call_exact(PLUGIN, "memory_ping", &digest, json!({}))
+        .call_exact_no_chat(PLUGIN, "memory_ping", &digest, json!({}))
         .await
         .unwrap();
     assert_eq!(runtime.lease_count(), 1);

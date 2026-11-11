@@ -277,6 +277,19 @@ All notable changes to this project will be documented in this file.
   user. The daemon protocol (`session::wire`, and `ClientKind::Server`,
   which synaps-dash attaches as) is unchanged.
 
+- **Engine API: an extension tool call says who it is for.**
+  `ExtensionHandler::call_tool`, `ExtensionRuntimeManager::call_exact` and
+  `ExtensionLeaseCapability::call_exact` are gone. They sent `session_id:
+  null` and the process folder, which under the daemon is the daemon's, and
+  nothing in the engine called them. Use `call_tool_for` (now the trait's
+  only tool-call method; its default serves no tools) and `call_exact_for`,
+  which take the conversation id and the folder. A call that belongs to no
+  chat is spelled `call_tool_no_chat` / `call_exact_no_chat`; both exist for
+  tests only (the `testing` feature). Also changed for the same reason:
+  `skills::commands::execute_plugin_command_with_tools` takes the chat's id
+  and folder, `runtime::continuation::restore_window` takes the memory
+  binding, and `runtime::continuation::archive_store` is gone.
+
 ### Fixed
 
 - **Daemon: an extension tool run by a plugin slash command is told the

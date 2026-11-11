@@ -109,7 +109,13 @@ mod tests {
             HookResult::Continue
         }
         async fn shutdown(&self) {}
-        async fn call_tool(&self, _name: &str, _input: Value) -> std::result::Result<Value, String> {
+        async fn call_tool_for(
+            &self,
+            _name: &str,
+            _input: Value,
+            _session_id: Option<&str>,
+            _cwd: Option<&std::path::Path>,
+        ) -> std::result::Result<Value, String> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(json!("extension result"))
         }

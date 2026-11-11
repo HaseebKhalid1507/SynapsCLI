@@ -1674,7 +1674,7 @@ pub const RECALL_HARD_TIMEOUT: Duration = std::time::Duration::from_millis(150);
 
 /// Canonical deferred-tool name a context-provider extension declares for
 /// recall dispatch (Axel memory-manager, spec §17.3). The host addresses it
-/// through the same exact-digest `call_exact` gate as every extension tool.
+/// through the same exact-digest `call_exact_for` gate as every extension tool.
 pub(crate) const MEMORY_RECALL_TOOL_NAME: &str = "memory_recall";
 
 /// Canonical deferred-tool name for idempotent terminal capture dispatch.

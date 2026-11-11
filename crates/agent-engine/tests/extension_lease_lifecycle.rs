@@ -246,6 +246,31 @@ async fn zero_spawn_during_load_search_and_exact_activation() {
     fx.cleanup();
 }
 
+/// A deferred extension's generic handler serves no tool call, whoever the
+/// call is for: the exact lease call, which pins the declaration, is the
+/// only way in.
+#[tokio::test]
+async fn the_deferred_handler_refuses_a_tool_call_and_starts_nothing() {
+    use agent_engine::extensions::runtime::ExtensionHandler;
+    hermetic_base_dir::pin();
+    let fx = fixture("handler-refuses", "ok", advertised_tools());
+    let (mgr, _registry) = deferred_manager(&fx).await;
+    let runtime = mgr.extension_runtime();
+    let handler =
+        agent_engine::extensions::lease::LazyExtensionHandler::new(PLUGIN, Arc::clone(&runtime));
+
+    for (session_id, cwd) in [(Some("chat-A"), Some(fx.dir.as_path())), (None, None)] {
+        let err = handler
+            .call_tool_for("search", json!({"q": "a"}), session_id, cwd)
+            .await
+            .unwrap_err();
+        assert!(err.contains("is deferred"), "{err}");
+    }
+    assert!(fx.events().is_empty(), "no process was started");
+    assert_eq!(runtime.lease_count(), 0);
+    fx.cleanup();
+}
+
 #[tokio::test]
 async fn exact_execute_starts_once_reuses_and_calls_only_exact_tool() {
     hermetic_base_dir::pin();
@@ -289,8 +314,8 @@ async fn concurrent_first_calls_are_single_flight() {
     let digest = SchemaDigest::of_schema(&search_schema());
 
     let session = sid();
-    let a = runtime.call_exact(&session, PLUGIN, "search", &digest, json!({"q":"a"}));
-    let b = runtime.call_exact(&session, PLUGIN, "search", &digest, json!({"q":"b"}));
+    let a = runtime.call_exact_no_chat(&session, PLUGIN, "search", &digest, json!({"q":"a"}));
+    let b = runtime.call_exact_no_chat(&session, PLUGIN, "search", &digest, json!({"q":"b"}));
     // Outer timeout guards against a lost-wakeup hang regression.
     let (ra, rb) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(a, b) })
         .await
@@ -584,7 +609,7 @@ async fn session_end_guard_revocation_and_idle_reap_kill_children() {
 
     // 1. RAII session-end guard kills the child on drop.
     runtime
-        .call_exact(&sid(), PLUGIN, "search", &digest, json!({"q":"a"}))
+        .call_exact_no_chat(&sid(), PLUGIN, "search", &digest, json!({"q":"a"}))
         .await
         .unwrap();
     let weak = runtime.lease_liveness_for_tests(&sid(), PLUGIN).unwrap();
@@ -600,7 +625,7 @@ async fn session_end_guard_revocation_and_idle_reap_kill_children() {
     // 2. Re-acquire (idle reap already proved by ZERO idle_max: the
     // manager reaps on acquisition), then exact revocation kills again.
     runtime
-        .call_exact(&sid(), PLUGIN, "search", &digest, json!({"q":"b"}))
+        .call_exact_no_chat(&sid(), PLUGIN, "search", &digest, json!({"q":"b"}))
         .await
         .unwrap();
     assert_eq!(fx.count("spawn"), 2, "second lease respawned");
@@ -613,7 +638,7 @@ async fn session_end_guard_revocation_and_idle_reap_kill_children() {
 
     // 3. No leaked child on runtime-manager drop.
     runtime
-        .call_exact(&sid(), PLUGIN, "search", &digest, json!({"q":"c"}))
+        .call_exact_no_chat(&sid(), PLUGIN, "search", &digest, json!({"q":"c"}))
         .await
         .unwrap();
     assert_eq!(fx.count("spawn"), 3);
@@ -637,7 +662,7 @@ async fn unload_removes_record_dormant_batch_and_live_lease() {
     let digest = SchemaDigest::of_schema(&search_schema());
 
     runtime
-        .call_exact(&sid(), PLUGIN, "search", &digest, json!({"q":"a"}))
+        .call_exact_no_chat(&sid(), PLUGIN, "search", &digest, json!({"q":"a"}))
         .await
         .unwrap();
     let weak = runtime.lease_liveness_for_tests(&sid(), PLUGIN).unwrap();
@@ -746,7 +771,7 @@ async fn durable_shared_scope_survives_turns_and_only_last_owner_terminates() {
     ));
 
     runtime
-        .call_exact(&session, PLUGIN, "search", &digest, json!({"q":"turn1"}))
+        .call_exact_no_chat(&session, PLUGIN, "search", &digest, json!({"q":"turn1"}))
         .await
         .unwrap();
 
@@ -755,7 +780,7 @@ async fn durable_shared_scope_survives_turns_and_only_last_owner_terminates() {
     drop(turn1_hold);
     assert_eq!(runtime.lease_count(), 1, "lease survives a turn ending");
     runtime
-        .call_exact(&session, PLUGIN, "search", &digest, json!({"q":"turn2"}))
+        .call_exact_no_chat(&session, PLUGIN, "search", &digest, json!({"q":"turn2"}))
         .await
         .unwrap();
     assert_eq!(fx.count("spawn"), 1, "turn 2 reuses the retained lease");

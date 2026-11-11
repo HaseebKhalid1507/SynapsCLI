@@ -129,19 +129,14 @@ pub trait ExtensionHandler: Send + Sync {
         self.handle(event).await
     }
 
-    /// Call an extension-provided tool.
-    async fn call_tool(&self, _name: &str, _input: Value) -> Result<Value, String> {
-        Err("extension runtime does not support tool.call".to_string())
-    }
-
-    /// Call an extension-provided tool on behalf of a conversation.
+    /// Call an extension-provided tool on behalf of a conversation. The
+    /// only way to call a tool: every caller says who the call is for.
     ///
     /// `session_id` is the owning conversation id (`None` = worker/subagent
     /// or no conversation); `cwd` is the folder the caller runs in (`None` =
-    /// the process folder). Runtimes that put them on the wire override
-    /// this; the default drops both and calls [`Self::call_tool`], so
-    /// handlers that predate the fields (and wrappers that fail closed) keep
-    /// their exact behaviour.
+    /// the process folder, which under the daemon is the daemon's, so a
+    /// call made for a chat passes the chat's). Default: this runtime
+    /// serves no tools.
     async fn call_tool_for(
         &self,
         name: &str,
@@ -149,8 +144,20 @@ pub trait ExtensionHandler: Send + Sync {
         session_id: Option<&str>,
         cwd: Option<&std::path::Path>,
     ) -> Result<Value, String> {
-        let _ = (session_id, cwd);
-        self.call_tool(name, input).await
+        let _ = (name, input, session_id, cwd);
+        Err("extension runtime does not support tool.call".to_string())
+    }
+
+    /// [`Self::call_tool_for`] for a call that belongs to no chat: on the
+    /// wire `session_id` is `null` and `cwd` is the process folder.
+    ///
+    /// Tests only (the `testing` feature). Production has no such call:
+    /// each one is made for a chat or a worker and says which folder. Should
+    /// a genuine one appear, un-gate this and call it by name instead of
+    /// passing `None, None`, so every no-chat call can be found by grep.
+    #[cfg(any(test, feature = "testing"))]
+    async fn call_tool_no_chat(&self, name: &str, input: Value) -> Result<Value, String> {
+        self.call_tool_for(name, input, None, None).await
     }
 
     /// Complete a chat request through an extension-provided model provider.
@@ -291,6 +298,69 @@ mod lifecycle_tests {
     fn default_lifecycle_snapshot_is_unavailable_through_trait_object() {
         let handler: &dyn ExtensionHandler = &UnsupportedHandler;
         assert_eq!(handler.lifecycle_snapshot(), None);
+    }
+
+    /// A runtime that implements no tool call serves none, whoever the call
+    /// is for.
+    #[tokio::test]
+    async fn default_call_tool_for_serves_no_tool() {
+        let handler: &dyn ExtensionHandler = &UnsupportedHandler;
+        let chat = std::env::temp_dir().join("chat-folder");
+        for (session_id, cwd) in [(Some("chat-A"), Some(chat.as_path())), (None, None)] {
+            let err = handler
+                .call_tool_for("any", serde_json::json!({}), session_id, cwd)
+                .await
+                .unwrap_err();
+            assert!(err.contains("does not support tool.call"), "{err}");
+        }
+    }
+
+    /// Who each tool call said it was for.
+    #[derive(Default)]
+    struct Callers(std::sync::Mutex<Vec<(Option<String>, Option<std::path::PathBuf>)>>);
+
+    #[async_trait]
+    impl ExtensionHandler for Callers {
+        fn id(&self) -> &str {
+            "callers"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::default()
+        }
+        async fn shutdown(&self) {}
+        async fn call_tool_for(
+            &self,
+            _name: &str,
+            _input: Value,
+            session_id: Option<&str>,
+            cwd: Option<&std::path::Path>,
+        ) -> Result<Value, String> {
+            self.0.lock().unwrap().push((
+                session_id.map(str::to_string),
+                cwd.map(std::path::Path::to_path_buf),
+            ));
+            Ok(Value::Null)
+        }
+    }
+
+    /// The one named way to call for no chat sends no conversation and no
+    /// folder; every other call carries what its caller passed.
+    #[tokio::test]
+    async fn only_the_named_no_chat_call_omits_the_caller() {
+        let handler = Callers::default();
+        let chat = std::env::temp_dir().join("chat-folder");
+        handler
+            .call_tool_for("t", serde_json::json!({}), Some("chat-A"), Some(&chat))
+            .await
+            .unwrap();
+        handler
+            .call_tool_no_chat("t", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            *handler.0.lock().unwrap(),
+            vec![(Some("chat-A".to_string()), Some(chat)), (None, None)]
+        );
     }
 }
 

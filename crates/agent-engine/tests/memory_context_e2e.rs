@@ -236,7 +236,7 @@ async fn warm_lease(engine: &Engine) {
         Arc::clone(&engine.mgr_runtime),
     );
     let out = cap
-        .call_exact(PLUGIN, "memory_ping", &digest, json!({}))
+        .call_exact_no_chat(PLUGIN, "memory_ping", &digest, json!({}))
         .await
         .expect("warm ping succeeds");
     assert_eq!(out["content"], json!("called:memory_ping"));
@@ -290,7 +290,7 @@ async fn cancellation_releases_memory_extension_lease_and_blocked_capture_call()
         Arc::clone(&engine.mgr_runtime),
     );
     let blocked = tokio::spawn(async move {
-        cap.call_exact(
+        cap.call_exact_no_chat(
             PLUGIN,
             "memory_capture",
             &digest,

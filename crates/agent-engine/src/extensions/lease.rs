@@ -293,7 +293,7 @@ impl ExtensionRuntimeManager {
     /// Task B4: pinned schema digest of one plugin's CURRENTLY declared
     /// deferred tool — a pure launch-record read that never spawns. The
     /// memory recall dispatch uses it to address the provider's declared
-    /// recall tool through the same exact-digest [`Self::call_exact`] gate
+    /// recall tool through the same exact-digest [`Self::call_exact_for`] gate
     /// as every other extension call (drift still re-checked there).
     pub(crate) fn declared_tool_digest(
         &self,
@@ -689,11 +689,16 @@ impl ExtensionRuntimeManager {
         Ok((record, validated))
     }
 
-    /// Execute one EXACT already-gate-authorized extension tool call. See
-    /// module docs for the lease/single-flight/validation contract.
-    /// Host-originated with no chat: the wire `session_id` is `null` and
-    /// `cwd` is the process folder.
-    pub async fn call_exact(
+    /// [`Self::call_exact_for`] for a call that belongs to no chat: on the
+    /// wire `session_id` is `null` and `cwd` is the process folder.
+    ///
+    /// Tests only (the `testing` feature). Production has no such call:
+    /// each one is made for a chat or a worker and says which folder (the
+    /// host's memory capture/recall calls pass their runtime's). Should a
+    /// genuine one appear, un-gate this and call it by name instead of
+    /// passing `None, None`, so every no-chat call can be found by grep.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn call_exact_no_chat(
         &self,
         session: &SessionId,
         plugin: &str,
@@ -705,10 +710,15 @@ impl ExtensionRuntimeManager {
             .await
     }
 
-    /// [`Self::call_exact`] on behalf of a conversation: `conversation_id`
-    /// is forwarded as `tool.call` `params.session_id` (the owning
-    /// conversation, not the lease scope `session`) and `cwd`, the folder
-    /// that conversation runs in, as `params.cwd`.
+    /// Execute one EXACT already-gate-authorized extension tool call. See
+    /// module docs for the lease/single-flight/validation contract.
+    ///
+    /// The call is made on behalf of a conversation: `conversation_id` is
+    /// forwarded as `tool.call` `params.session_id` (the owning
+    /// conversation, not the lease scope `session`; `None` = a worker or
+    /// host-originated) and `cwd`, the folder the caller runs in, as
+    /// `params.cwd` (`None` = the process folder, which under the daemon is
+    /// the daemon's).
     #[allow(clippy::too_many_arguments)] // the exact call plus who it is for
     pub async fn call_exact_for(
         &self,
@@ -937,7 +947,10 @@ impl ExtensionLeaseCapability {
         &self.session
     }
 
-    pub async fn call_exact(
+    /// A call that belongs to no chat (tests only); see
+    /// [`ExtensionRuntimeManager::call_exact_no_chat`].
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn call_exact_no_chat(
         &self,
         plugin: &str,
         tool_name: &str,
@@ -945,12 +958,12 @@ impl ExtensionLeaseCapability {
         params: Value,
     ) -> Result<Value, ExtensionLeaseError> {
         self.manager
-            .call_exact(&self.session, plugin, tool_name, expected_digest, params)
+            .call_exact_no_chat(&self.session, plugin, tool_name, expected_digest, params)
             .await
     }
 
-    /// [`Self::call_exact`] on behalf of a conversation; see
-    /// [`ExtensionRuntimeManager::call_exact_for`].
+    /// One exact call on behalf of a conversation, in this capability's
+    /// session; see [`ExtensionRuntimeManager::call_exact_for`].
     pub async fn call_exact_for(
         &self,
         plugin: &str,
@@ -1103,10 +1116,16 @@ impl ExtensionHandler for LazyExtensionHandler {
         }
     }
 
-    async fn call_tool(&self, _name: &str, _input: Value) -> Result<Value, String> {
+    async fn call_tool_for(
+        &self,
+        _name: &str,
+        _input: Value,
+        _session_id: Option<&str>,
+        _cwd: Option<&Path>,
+    ) -> Result<Value, String> {
         // FAIL CLOSED: deferred extension tool execution flows ONLY
         // through the gate-authorized exact lease path
-        // (`ExtensionRuntimeManager::call_exact`, which pins and checks
+        // (`ExtensionRuntimeManager::call_exact_for`, which pins and checks
         // the declared name + canonical schema digest). A generic handler
         // call with an arbitrary tool name would bypass those checks.
         Err(format!(

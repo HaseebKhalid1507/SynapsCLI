@@ -2252,10 +2252,6 @@ impl ExtensionHandler for ProcessExtension {
         lifecycle.snapshot(self.total_restarts.load(Ordering::Relaxed) > 0)
     }
 
-    async fn call_tool(&self, name: &str, input: Value) -> Result<Value, String> {
-        self.call_tool_for(name, input, None, None).await
-    }
-
     async fn call_tool_for(
         &self,
         name: &str,

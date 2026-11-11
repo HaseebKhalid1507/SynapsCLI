@@ -2697,7 +2697,7 @@ impl Runtime {
     ///   the assessment are byte-identical to the pre-task behavior.
     ///
     /// Dispatch routes through the granted provider's
-    /// [`crate::extensions::lease::ExtensionLeaseCapability::call_exact`]
+    /// [`crate::extensions::lease::ExtensionLeaseCapability::call_exact_for`]
     /// (task A6 wiring): the lease's composed `extension:<plugin>:<id>`
     /// address plus the plugin's declared recall tool digest — an unroutable
     /// provider fails open as `provider_unavailable` without ever spawning.
@@ -3557,7 +3557,7 @@ impl Runtime {
     /// headless unit runtimes) the A5 spec-canonical identity is kept:
     /// there is no catalog to validate against, Phase A grants are inert
     /// metadata, and Phase B activation independently re-validates through
-    /// `ExtensionLeaseCapability::call_exact` against retained launch
+    /// `ExtensionLeaseCapability::call_exact_for` against retained launch
     /// records — an unbacked identity can never start a process.
     fn resolve_memory_provider(
         &self,
