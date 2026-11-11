@@ -487,16 +487,31 @@ See [hooks.md](hooks.md#on_memory_forgotten).
 ### `on_message_complete`
 
 `on_message_complete` is emitted after an assistant response is completed and
-added to session history. It requires `privacy.llm_content` and supports
-`continue` plus the advisory [`context_phase`](#context_phase) result. It can
-never block, modify, or inject. `message` contains concatenated assistant text
+added to session history (an empty reply is not). It requires
+`privacy.llm_content` and supports `continue` plus the advisory
+[`context_phase`](#context_phase) result. It can never block, modify, or
+inject. `message` contains concatenated assistant text
 blocks when present; tool-use blocks are summarized in `data` instead of being
 serialized into `message`.
 
-A turn fires one event per assistant message, and the turn's last one is the
-one with `has_tool_use: false`. Its `message` may be empty: a model that has
-nothing to add after its tool calls ends the turn on an empty reply, and that
-reply is still reported (`message: ""`, `content_block_count: 0`).
+A turn fires one event per assistant message. `has_tool_use: false` marks an
+assistant message that asked for no tools; `has_tool_use: true`, one that asked
+for tools, whether or not they ran (a usage budget or a rejected
+`context_checkpoint` batch can stop them). The `message` may be empty: a model
+that has nothing to add after its tool calls ends the turn on an empty reply,
+and that reply is still reported (`message: ""`, `content_block_count: 0`).
+
+The event with `has_tool_use: false` is not "the turn is done":
+
+- A turn can have more than one. A steering message that arrives after a reply
+  without tools, or the Muse nudge after a reply that announced an action
+  without doing it, continues the turn, and the next reply gets its own event.
+- A turn can end without one. A turn that stops after a tool round, because it
+  was cancelled, ran out of a turn budget (tool calls, tool-result bytes,
+  provider rounds, wall clock) or failed, ends on an event with
+  `has_tool_use: true`.
+- An empty reply that is an error, a cancel or over a usage budget is not
+  reported at all.
 
 ```json
 {
@@ -905,9 +920,12 @@ Reserved future permissions are rejected if declared today: `tools.override`.
 
 `context_providers.register` and the manifest key `deferred.context_providers`
 are accepted and ignored. They declared a provider for built-in automatic
-memory, which was removed in 0.12.0; a manifest that still has them loads,
-its tools and hooks work, the declaration decides nothing about when the
-extension starts, and the host logs one line saying it is ignored. An
+memory, which was removed in 0.12.0. A manifest that still has them loads as
+its other parts say, its tools and hooks work, the declaration decides
+nothing about when the extension starts, and the host logs one line saying it
+is ignored. A manifest that declares only a context provider starts at load
+like one with an empty `deferred` block, and fails to load like one if its
+command does not start. An
 extension that provides capture and recall does it through hooks.
 
 Permissions are enforced before hook subscriptions are installed. Unknown permission strings are rejected, reserved permission strings are rejected, and a hook subscription without its required permission fails manifest loading.

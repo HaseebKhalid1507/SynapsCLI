@@ -332,19 +332,21 @@ All notable changes to this project will be documented in this file.
   to write one of these keys. `memory.backend`, `memory.user_scope` and
   `memory.axel.*` are unchanged.
   An extension manifest that declares `deferred.context_providers` or asks
-  for the permission `context_providers.register` still loads, and its
-  tools and hooks work; the declaration is not validated, grants nothing
-  and no longer decides when the extension starts (a manifest that
-  declared only a context provider used to wait for `/memory on`, which no
-  longer exists; it now starts like a manifest with an empty `deferred`
-  block). Loading it logs `extension <id> declares a context provider;
+  for the permission `context_providers.register` loads as its other parts
+  say, and its tools and hooks work; the declaration is not validated,
+  grants nothing and no longer decides when the extension starts. A
+  manifest that declared only a context provider used to wait for
+  `/memory on`, which no longer exists, so it never started; it now starts
+  at load like a manifest with an empty `deferred` block, and, like one,
+  fails to load if its command does not start (the other extensions still
+  load). Loading it logs `extension <id> declares a context provider;
   built-in automatic memory was removed in 0.12.0, the declaration is
   ignored`. The host's context-provider catalog
   (`extensions/context_provider.rs`) and the continuous-memory review
   documents under `docs/reviews/` and `docs/decisions/` are deleted.
   `/memory` now answers `/memory was removed in 0.12.0: automatic memory is
   not built into Synaps any more; an extension provides it (Axel). Synaps
-  itself records nothing.`
+  itself captures nothing automatically.`
 - **Built-in automatic memory (capture and recall) is out of the engine.**
   The runtime no longer holds a memory lease, asks a context provider for
   recalled text before a turn, or sends a finished turn or a compaction
@@ -354,11 +356,9 @@ All notable changes to this project will be documented in this file.
   since `/memory` and the `memory_context` tool were removed, so a turn
   behaves as before. An extension does this work now, on the hook bus: no
   hook kind, hook event field or protocol method changed. Unchanged too:
-  context rollover and the archive store, the four memory tools, the
-  memory backend setting, context-provider declarations in a manifest
-  (still loaded, no longer consulted) and the `memory.*` config keys
-  (still parsed; the automatic-memory ones have no effect). The context
-  budget's memory lane is always empty.
+  context rollover and the archive store, the four memory tools and the
+  memory backend setting. The context budget's memory lane is always
+  empty.
 - **The per-session memory mode.** A session no longer records a memory
   choice (`SessionConfig::memory_mode`), a rebuilt runtime (unpark, daemon
   reload) no longer restores one, and no session runtime applies
@@ -372,7 +372,8 @@ All notable changes to this project will be documented in this file.
   tool (29 builtins; `docs/tools.json` regenerated). `/memory`, with any
   argument, now answers one line: `/memory was removed in 0.12.0: automatic
   memory is not built into Synaps any more; an extension provides it (Axel).
-  Synaps itself records nothing.` `/settings` has no `memory.default_mode`
+  Synaps itself captures nothing automatically.` `/settings` has no
+  `memory.default_mode`
   row.
 
 - **Breaking: `synaps agent` and `synaps watcher` are gone.** The watcher
@@ -458,6 +459,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Extensions: the `on_message_complete` pages say what `has_tool_use: false`
+  means.** It marks an assistant message that asked for no tools, not the end
+  of a turn: steering or the Muse nudge can continue a turn after one, and a
+  turn that stops after a tool round (a cancel, a turn budget, an error) ends
+  on an event with `has_tool_use: true`. `protocol.md` also says an empty
+  reply is not added to history. Documentation only.
+- **`on_message_complete` fires for a reply that crosses a usage budget, and
+  for a rejected `context_checkpoint` batch.** Both replies are kept in
+  history, but the turn stopped (`max_cost_usd`, `max_context_tokens`) or
+  asked the model again without the event, so an extension never saw that
+  message end, text included. Each now gets exactly one event;
+  `has_tool_use` says whether the message asked for tools (always `true`
+  for the rejected batch). Nothing else about either path changes.
 - **Extensions: the context archive format page says where a linked base
   works, and what an import changes.** A base that is a symbolic link works
   for the archive store only; the session journal, drafts and the source of
