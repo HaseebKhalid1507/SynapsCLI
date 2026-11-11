@@ -4635,6 +4635,54 @@ mod tests {
         assert_eq!(store.fetch(&ids[0], 0, 1).unwrap(), text("needle oldest-only"));
     }
 
+    /// Inside a shelf a search reads newest first by modification time,
+    /// which a coarse filesystem clock gives to a whole burst of seals at
+    /// once. Files with the same time are read in the order of their names,
+    /// so the order, and with it what a short page holds, is the same every
+    /// time and does not depend on how the directory lists them.
+    #[test]
+    fn search_reads_files_with_the_same_modification_time_in_name_order() {
+        let (tmp, store) = setup();
+        let shelf = directory(&tmp, &store).join("s000001");
+        let ids: Vec<_> = (0..8)
+            .map(|index| store.seal(&text(&format!("tied {index}")), "").unwrap().id)
+            .collect();
+        let epoch = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let written = |id: &str, seconds: u64| {
+            let path = shelf.join(archive_name(id));
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(epoch + Duration::from_secs(seconds)).unwrap();
+        };
+        // Six in the same instant, one before it and one after.
+        for id in &ids[2..] {
+            written(id, 100);
+        }
+        written(&ids[0], 50);
+        written(&ids[1], 200);
+        let mut tied = ids[2..].to_vec();
+        tied.sort();
+        assert_ne!(tied, ids[2..], "the order of sealing is not the order of names");
+        let mut expected = vec![ids[1].clone()];
+        expected.extend(tied);
+        expected.push(ids[0].clone());
+        let order = |limit: usize| -> Vec<String> {
+            let rows = store.search("tied", limit).unwrap();
+            rows.into_iter().map(|row| row.id).collect()
+        };
+        assert_eq!(order(8), expected);
+        // A shorter page is the beginning of the same order, every time.
+        for limit in 1..8 {
+            assert_eq!(order(limit), expected[..limit]);
+            assert_eq!(order(limit), expected[..limit]);
+        }
+        // A file added in the same instant takes its place by name; the
+        // others keep theirs.
+        let late = store.seal(&text("tied late"), "").unwrap().id;
+        written(&late, 100);
+        expected.insert(1 + expected[1..7].partition_point(|id| *id < late), late);
+        assert_eq!(order(9), expected);
+    }
+
     #[test]
     fn search_skips_a_corrupt_file() {
         let (tmp, store) = setup();
@@ -6537,6 +6585,55 @@ mod lock_tests {
         assert_eq!((&reference, &note), (&same[0][0].0, &same[0][0].1));
     }
 
+    /// Seals from several threads, each through its own store, the gate and
+    /// the lock, into shelves that fill up while they run. Whoever crosses
+    /// from one shelf to the next, each shelf is filled exactly and every
+    /// window is stored once.
+    #[test]
+    fn concurrent_seals_across_shelf_boundaries_fill_each_shelf_exactly() {
+        const WRITERS: usize = 4;
+        const EACH: usize = 80;
+        let (tmp, store) = setup();
+        let window = |writer: usize, round: usize| {
+            [msg("user", json!(format!("writer {writer} window {round};")))]
+        };
+        let start = std::sync::Barrier::new(WRITERS);
+        let sealed: Vec<Vec<String>> = std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|writer| {
+                    let (tmp, start) = (&tmp, &start);
+                    scope.spawn(move || {
+                        let name = format!("writer-{writer}");
+                        let store = ArchiveStore::new(tmp.path(), "synthetic-project", &name);
+                        let store = store.unwrap();
+                        start.wait();
+                        let seal = |round| store.seal(&window(writer, round), "note").unwrap().id;
+                        (0..EACH).map(seal).collect()
+                    })
+                })
+                .collect();
+            writers.into_iter().map(|writer| writer.join().unwrap()).collect()
+        });
+        assert_eq!(store.shelves().unwrap(), ["s000003", "s000002", "s000001"]);
+        let project = tmp.path().join("context-archives").join(&store.scope);
+        let held = |shelf: &str| std::fs::read_dir(project.join(shelf)).unwrap().count();
+        let rest = WRITERS * EACH - 2 * SHELF_FILES;
+        assert_eq!(
+            (held("s000001"), held("s000002"), held("s000003")),
+            (SHELF_FILES, SHELF_FILES, rest)
+        );
+        for (writer, ids) in sealed.iter().enumerate() {
+            for (round, id) in ids.iter().enumerate() {
+                assert_eq!(store.fetch(id, 0, 2).unwrap(), window(writer, round));
+            }
+        }
+        let mut names = shelved(&tmp, &store);
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), WRITERS * EACH);
+        assert!(names.iter().all(|name| archive_id(name).is_some()));
+    }
+
     const SEAL_CHILD: &str = "SYNTHETIC_ARCHIVE_SEAL_CHILD";
     const CHILD_SEALS: usize = 100;
 
@@ -6586,14 +6683,27 @@ mod lock_tests {
         }
         let store = ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-reader").unwrap();
         let project = tmp.path().join("context-archives").join(&store.scope);
-        let sealed: usize = ["s000001", "s000002"]
-            .iter()
-            .map(|shelf| std::fs::read_dir(project.join(shelf)).unwrap().count())
-            .sum();
-        assert_eq!(sealed, 2 * CHILD_SEALS);
+        // Together they seal more than a shelf holds (200), so they cross
+        // from the first shelf to the second. Whichever of them did, the
+        // first is exactly full, the rest is in the second, and neither left
+        // a temporary file.
+        let held = |shelf: &str| std::fs::read_dir(project.join(shelf)).unwrap().count();
+        assert_eq!(
+            (held("s000001"), held("s000002")),
+            (SHELF_FILES, 2 * CHILD_SEALS - SHELF_FILES)
+        );
+        assert_eq!(store.shelves().unwrap().len(), 2);
+        // Every window of both, under the id its content gives it.
         for child in &children {
+            let name = format!("child-{}", child.id());
+            for round in 0..CHILD_SEALS {
+                let window = [msg("user", json!(format!("{name} round {round};")))];
+                let projection = project_archive(&name, &window, "", None).unwrap();
+                let found = store.fetch(&projection.digest[..32], 0, 2);
+                assert_eq!(found.unwrap(), window, "{name} round {round}");
+            }
             for round in [0, CHILD_SEALS - 1] {
-                let words = format!("child-{} round {round};", child.id());
+                let words = format!("{name} round {round};");
                 assert_eq!(store.search(&words, 2).unwrap().len(), 1, "{words}");
             }
         }

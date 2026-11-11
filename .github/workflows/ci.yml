@@ -58,6 +58,14 @@ jobs:
         with:
           save-if: ${{ github.event_name == 'push' }}
       - run: bash scripts/dirty-home.sh --workspace --locked --no-fail-fast
+      # The file archive store's two `#[ignore]`d tests: byte_cap_is_gone
+      # (a project holds more than the 256 MiB it used to stop at) and
+      # seal_10000_succeed (and more than 128 archives, by far). They are
+      # ignored for what they cost, about 280 MiB written and 30,000
+      # fsyncs, not because they are optional, and nothing else ran them.
+      # Through cargo-test-nonzero.sh, so the step goes red if they are
+      # renamed or compiled out instead of running nothing.
+      - run: bash scripts/cargo-test-nonzero.sh -p synaps-core --locked --lib context_archive -- --ignored
 
   feature-gate:
     runs-on: ubuntu-24.04
