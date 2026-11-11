@@ -326,6 +326,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Notes: the end of an import syncs every file, and says which one
+  failed.** `ImportRun::finish` stopped at the first file or directory
+  whose sync failed, so the files after it were not synced, and the error
+  did not say which file it was. It now tries every file and every
+  directory and returns the first failure as before
+  (`WrittenUnconfirmed`), with the path that failed.
 - **Notes: a save made while a notes file is rewritten is no longer lost.**
   `synaps retention sweep` and `synaps retention forget memory` rewrite
   `memory/<ns>.jsonl` and rename the new file over the old one. A note saved

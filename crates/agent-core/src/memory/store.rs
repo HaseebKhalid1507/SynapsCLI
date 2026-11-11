@@ -1199,17 +1199,22 @@ impl ImportRun {
     /// stops early too. Returns the files synced, sorted. A dry run has
     /// none.
     ///
-    /// An error is [`MemoryError::WrittenUnconfirmed`]: the lines the run
-    /// reported as stored are in their files, and a sync failed.
+    /// Every file and every directory is tried, also after one failed.
+    /// An error is [`MemoryError::WrittenUnconfirmed`] for the first sync
+    /// that failed, naming its file: the lines the run reported as stored
+    /// are in their files, and that sync failed.
     #[must_use = "an import is not durable unless `finish` returned Ok"]
     pub fn finish(mut self) -> Result<Vec<PathBuf>, MemoryError> {
         // Whatever the sync says, it was tried and the caller is told.
         self.finished = true;
-        self.sync()
-            .map_err(|e| MemoryError::WrittenUnconfirmed(e.to_string()))
+        self.sync().map_err(|(path, e)| {
+            MemoryError::WrittenUnconfirmed(format!("{}: {e}", path.display()))
+        })
     }
 
-    fn sync(&self) -> std::io::Result<Vec<PathBuf>> {
+    /// Sync every appended file, then every directory of one, trying all of
+    /// them. The first failure, with the path that failed.
+    fn sync(&self) -> Result<Vec<PathBuf>, (PathBuf, std::io::Error)> {
         let mut synced: Vec<PathBuf> = self
             .files
             .iter()
@@ -1217,17 +1222,29 @@ impl ImportRun {
             .map(|(path, _)| path.clone())
             .collect();
         synced.sort();
+        let mut first_error: Option<(PathBuf, std::io::Error)> = None;
         let mut dirs: std::collections::BTreeSet<&Path> = std::collections::BTreeSet::new();
         for path in &synced {
             // Opened for append, not for reading: Windows flushes only a
             // handle that may write.
-            sync_file(&fs::OpenOptions::new().append(true).open(path)?)?;
+            let result = fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .and_then(|file| sync_file(&file));
+            if let Err(e) = result {
+                first_error.get_or_insert((path.clone(), e));
+            }
             dirs.extend(path.parent());
         }
         for dir in dirs {
-            sync_dir(dir)?;
+            if let Err(e) = sync_dir(dir) {
+                first_error.get_or_insert((dir.to_path_buf(), e));
+            }
         }
-        Ok(synced)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(synced),
+        }
     }
 }
 
@@ -1238,8 +1255,11 @@ impl Drop for ImportRun {
         if self.finished || !self.files.values().any(|file| file.appended) {
             return;
         }
-        if let Err(error) = self.sync() {
-            tracing::warn!("an import run was dropped unfinished and its sync failed: {error}");
+        if let Err((path, error)) = self.sync() {
+            tracing::warn!(
+                "an import run was dropped unfinished and its sync of {} failed: {error}",
+                path.display()
+            );
         }
     }
 }
@@ -1904,6 +1924,44 @@ mod tests {
         drop(failing);
         assert!(matches!(error, MemoryError::Io(_)), "{error}");
         assert!(!namespace_file(fresh.path(), "ns").exists());
+    }
+
+    /// `finish` tries every file and every directory even after a sync has
+    /// failed, and the error names the file whose sync failed first.
+    #[test]
+    fn finish_syncs_every_file_and_names_the_one_that_failed() {
+        let tmp = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let base = tmp.path();
+        let keys = [
+            project_scope(&tmp).key().to_string(),
+            project_scope(&other).key().to_string(),
+        ];
+        let mut run = ImportRun::new(false);
+        for (n, key) in keys.iter().enumerate() {
+            let line = exported(&format!("mem-{n}"), key, 1, "imported");
+            let imported = import(base, &line, ImportTarget::AsRecorded, &mut run);
+            assert_eq!(imported.outcome, ImportOutcome::Stored);
+        }
+        let mut paths: Vec<PathBuf> = keys
+            .iter()
+            .map(|key| namespace_file(base, &project_namespace(key)))
+            .collect();
+        paths.sort();
+
+        take_steps();
+        FAILING_STEP.with(|step| step.set(Some("sync file")));
+        let error = run.finish().unwrap_err();
+        FAILING_STEP.with(|step| step.set(None));
+        let syncs: Vec<&str> = take_steps()
+            .into_iter()
+            .filter(|step| step.starts_with("sync"))
+            .collect();
+        assert_eq!(syncs, ["sync file", "sync file", "sync dir"], "all tried");
+        assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains(&paths[0].display().to_string()), "{message}");
+        assert!(!message.contains(&paths[1].display().to_string()), "{message}");
     }
 
     /// A save that cannot get the file's lock in time fails and writes
