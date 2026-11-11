@@ -4550,17 +4550,30 @@ mod rollover_path_tests {
         assert_eq!(expected.parts.len(), 2);
         let (first, second) = (&expected.parts[0].archive.id, &expected.parts[1].archive.id);
 
-        // Something that is not a file sits where the second part belongs.
+        // Something that is not a file sits where the second part belongs,
+        // under both names a seal can give it. One such thing does not stop
+        // a seal: it stores the part under its second id, the other half of
+        // the digest. With both names taken the part cannot be stored.
         // (Another chat's archive shows which directory that is.)
         let file_of =
             |id: &str| agent_core::context_archive::archive_file(binding.base(), scope.key(), id);
+        let digest = {
+            let file = agent_core::context_archive::archive_file(elsewhere.path(), scope.key(), second)
+                .unwrap()
+                .unwrap();
+            let record: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+            record["digest"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(digest[..32], **second);
         let (other, _) = binding
             .history_seal("another-chat", &[user("another chat")], "")
             .await
             .unwrap();
         let shelf = file_of(&other.id).unwrap().unwrap().parent().unwrap().to_owned();
-        let obstacle = shelf.join(format!("{second}.json"));
-        std::fs::create_dir(&obstacle).unwrap();
+        let obstacles = [&digest[..32], &digest[32..]].map(|id| shelf.join(format!("{id}.json")));
+        for obstacle in &obstacles {
+            std::fs::create_dir(obstacle).unwrap();
+        }
 
         let error = match roll(&messages, &state, SMALL_TARGET).await {
             Err(error) => error.to_string(),
@@ -4583,8 +4596,10 @@ mod rollover_path_tests {
         let page = binding.history_fetch(first, 0, 1).await.unwrap();
         assert_eq!(page[0].message, messages[1]);
 
-        // The same rollover once the obstacle is gone.
-        std::fs::remove_dir(&obstacle).unwrap();
+        // The same rollover once the obstacles are gone.
+        for obstacle in &obstacles {
+            std::fs::remove_dir(obstacle).unwrap();
+        }
         let prepared = ready(roll(&messages, &state, SMALL_TARGET).await);
         assert_eq!(prepared.parts, expected.parts);
         assert!(stamp(&first_file) == written, "the first part was found, not written again");
