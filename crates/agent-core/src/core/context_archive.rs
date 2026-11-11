@@ -450,7 +450,7 @@ impl ArchiveStore {
         if used + bytes.len() > MAX_STORE_BYTES {
             return Err(invalid("archive storage byte budget exhausted"));
         }
-        self.fs.publish(slot, &bytes)?;
+        self.fs.publish(&slot_name(slot), &bytes, false)?;
         Ok((record.reference()?, note))
     }
 
@@ -557,8 +557,11 @@ impl ArchiveStore {
             return self.fs.sync();
         }
         record.body = Body::Tombstone;
-        self.fs
-            .publish(slot, &bounded_json(&record, MAX_SEGMENT_BYTES)?)
+        self.fs.publish(
+            &slot_name(slot),
+            &bounded_json(&record, MAX_SEGMENT_BYTES)?,
+            false,
+        )
     }
 
     /// Migration-only export of validated eligible evidence and permanent
@@ -602,7 +605,10 @@ impl ArchiveStore {
         let mut records = Vec::new();
         let mut used = 0;
         for slot in 0..MAX_SEGMENTS {
-            let Some(bytes) = self.fs.read_with(slot, MAX_STORE_BYTES - used, readonly)? else {
+            let Some(bytes) =
+                self.fs
+                    .read_with(&slot_name(slot), MAX_STORE_BYTES - used, readonly)?
+            else {
                 continue;
             };
             used += bytes.len();
@@ -1167,6 +1173,10 @@ fn find_record(records: Vec<(usize, Record)>, id: &str) -> io::Result<Record> {
         .map(|(_, r)| r)
         .ok_or_else(not_found)
 }
+/// File name of a numbered slot in the project directory.
+fn slot_name(slot: usize) -> String {
+    format!("{slot:03}.json")
+}
 fn prefix(text: &str, bytes: usize) -> &str {
     let mut end = bytes.min(text.len());
     while !text.is_char_boundary(end) {
@@ -1361,11 +1371,11 @@ impl PrivateDir {
     }
     fn read_with(
         &self,
-        slot: usize,
+        name: &str,
         remaining: usize,
         readonly: bool,
     ) -> io::Result<Option<Vec<u8>>> {
-        let file = match self.open(&c_name(&format!("{slot:03}.json"))?, libc::O_RDONLY) {
+        let file = match self.open(&c_name(name)?, libc::O_RDONLY) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -1386,8 +1396,11 @@ impl PrivateDir {
         }
         Ok(Some(bytes))
     }
-    fn publish(&self, slot: usize, bytes: &[u8]) -> io::Result<()> {
-        let target = c_name(&format!("{slot:03}.json"))?;
+    /// Write `bytes` to a temporary file and rename it onto `name`. With
+    /// `create_new` an existing `name` is `AlreadyExists` and is left alone;
+    /// the check and the rename are two steps, made one by the caller's lock.
+    fn publish(&self, name: &str, bytes: &[u8], create_new: bool) -> io::Result<()> {
+        let target = c_name(name)?;
         let tmp = c_name("pending.tmp")?;
         // Under the lock, an old temporary file is an unpublished failed write.
         // unlinkat never follows a link; existing content is never reused.
@@ -1403,6 +1416,12 @@ impl PrivateDir {
             file.sync_all()?;
             // Refuse any target that appeared as a symlink or hardlink.
             match self.open(&target, libc::O_RDONLY) {
+                Ok(_) if create_new => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "archive file already exists",
+                    ))
+                }
                 Ok(existing) => Self::check(&existing)?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -1456,10 +1475,10 @@ impl PrivateDir {
     fn lock_existing(&self) -> io::Result<Option<FlockGuard>> {
         Self::unsupported()
     }
-    fn read_with(&self, _: usize, _: usize, _: bool) -> io::Result<Option<Vec<u8>>> {
+    fn read_with(&self, _: &str, _: usize, _: bool) -> io::Result<Option<Vec<u8>>> {
         Self::unsupported()
     }
-    fn publish(&self, _: usize, _: &[u8]) -> io::Result<()> {
+    fn publish(&self, _: &str, _: &[u8], _: bool) -> io::Result<()> {
         Self::unsupported()
     }
     fn sync(&self) -> io::Result<()> {
