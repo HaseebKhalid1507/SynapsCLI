@@ -13,8 +13,10 @@ All notable changes to this project will be documented in this file.
   started them as `parent`; a chat has no `parent` key), so an extension
   can tell them apart. The key is absent when the call has no memory
   binding behind it and for the host's own memory calls; the host never
-  invents one. An identity, not a secret or a proof. Additive: an extension
-  that ignores it is unaffected. See `docs/extensions/protocol.md`.
+  invents one. The host writes it beside `input`, never from it, so an
+  extension may go by it; its values are not secret, and it names one life
+  of a run (`session_id` is what stays the same for a chat). Additive: an
+  extension that ignores it is unaffected. See `docs/extensions/protocol.md`.
 - **Extensions: the context archive file format is a documented contract.**
   With the built-in file store (`memory.backend = legacy`), an extension may
   read the files under `context-archives/` directly.
@@ -335,6 +337,21 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Extensions: the contract says what `caller` can be relied on for.**
+  `docs/extensions/protocol.md` and `contract.json` told extension authors
+  "Do not grant access because a call carries a given `caller`". That was
+  wrong: the host writes `caller` beside `input` and never from it, a model
+  cannot set it, and no run is given another's, so it is exactly what an
+  extension can go by. The pages now say that, and what is true instead:
+  the values are not secret (models read them in forum posts), so an
+  extension must never accept an author from tool input; a call with no
+  `caller` (the host's own calls, an older host) must get no access that
+  depends on who is calling; and `caller` identifies one life of a run.
+  After a park and wake, a daemon reload or restart, or `--continue`, the
+  same chat has a new `actor` and `group`; `session_id` is what stays the
+  same for a chat, and a worker's call has none, so `group` ties a worker
+  to its chat only within one life. No code changed; a new test in
+  `tests/extensions_contract.rs` holds the two pages to these statements.
 - **A directory that cannot be opened for its sync is logged.** A save into
   a directory that may be written but not opened for reading (mode `0300`,
   for example) succeeds without the directory being synced, for notes and
