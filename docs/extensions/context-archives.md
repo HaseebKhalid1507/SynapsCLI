@@ -442,7 +442,8 @@ that content again.
 **A forget goes by content, not by file.** A project can hold the same
 content (the same `digest`) in more than one file. Forgetting one id replaces
 every file with that `digest` that Synaps can read at that moment, each
-under its own name and with its own `id`. A copy in a shelf or a file that
+under its own name and with its own `id`, whatever that id is: it reads
+every archive file on the shelves for its `digest`. A copy in a shelf or a file that
 Synaps cannot read then is not replaced; the tool says that the forget is
 not complete, and forgetting the same id again reaches it once it can be
 read.
@@ -474,7 +475,9 @@ the `digest`, or the last 32. That is where Synaps looks before it stores
 the same content again. If no file with that `digest` was under one of
 those names (the forgotten archive was a legacy slot file, whose id is
 random), Synaps writes that tombstone as a new file in the newest shelf,
-before it replaces anything. Its `id` is the file's name, and no archive was
+before it replaces anything. Forgetting an archive whose id is not derived
+from its digest (one that was brought in from another store and kept the id
+it had) also leaves a tombstone under the digest's own id, in the same way. Its `id` is the file's name, and no archive was
 ever announced with it. It uses the first of the two names that no shelf
 has a file under; when other files have both, it writes none, and Synaps
 then has no name to store that content under either.

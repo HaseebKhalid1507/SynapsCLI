@@ -1720,6 +1720,97 @@ mod tests {
         );
     }
 
+    /// T-A14: an archive that was imported keeps an id that is not derived
+    /// from its digest. The tools fetch, find and forget it by that id, and
+    /// the forget leaves the tombstone a later seal finds.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn an_imported_archive_with_a_foreign_id_goes_through_the_tools() {
+        use agent_core::context_archive::{
+            archive_file, project_archive, project_scope, ArchiveStore, ImportOutcome, ImportSeen,
+        };
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let key = binding.scope().unwrap().key().to_owned();
+        let listener = Listener::prompt("indexer");
+        let bus = forget_bus(&listener).await;
+        let window = [std::sync::Arc::new(
+            json!({"role":"assistant","content":"FOREIGN_NEEDLE first message of an import"}),
+        )];
+        let projection = project_archive("a-chat-of-another-store", &window, "", None).unwrap();
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let digest = projection.digest.clone();
+        assert!(id != digest[..32] && id != digest[32..]);
+        let scope = project_scope(&key).unwrap();
+        let line = json!({
+            "version": 1,
+            "scope": scope,
+            "logical": projection.logical_id,
+            "id": id,
+            "digest": digest,
+            "created_ms": 1_600_000_000_000u64,
+            "body": {
+                "state": "live",
+                "source_message_count": projection.source_message_count,
+                "messages": projection.messages,
+                "note": "",
+            },
+        });
+        let store = ArchiveStore::for_scope(binding.base(), &scope).unwrap();
+        let line = serde_json::to_vec(&line).unwrap();
+        let done = store.import(&line, false, false, &mut ImportSeen::default()).unwrap().unwrap();
+        assert_eq!(done.outcome, ImportOutcome::Stored);
+        assert_eq!(done.id, id);
+
+        let ctx_id = format!("ctx-{id}");
+        let fetched = MemoryFetchTool
+            .execute(json!({"ids":[ctx_id]}), context_with_binding(&binding))
+            .await
+            .unwrap();
+        assert!(fetched.contains("FOREIGN_NEEDLE first message of an import"), "{fetched}");
+        let found = MemorySearchTool
+            .execute(
+                json!({"source":"history","query":"FOREIGN_NEEDLE first message"}),
+                context_with_binding(&binding),
+            )
+            .await
+            .unwrap();
+        assert!(found.contains(&ctx_id), "{found}");
+
+        let out = MemoryForgetTool
+            .execute(json!({"id": ctx_id}), chat_context(&binding, Some(&bus), env.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "Forgot this archived context window. Tombstone retained; other sessions/notes are not erased."
+        );
+        let events = listener.wait_for(1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(listener.events().len(), 1, "one event, for the id that was asked for");
+        assert_eq!(
+            events[0].data,
+            json!({"id": id, "kind": "archive", "project_key": key, "scope": "repository"})
+        );
+        // The file is a tombstone, and so is the one under the digest's id.
+        let state = |id: &str| {
+            let file = archive_file(binding.base(), &key, id).unwrap().expect("a file");
+            let record: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+            assert_eq!(record["digest"], digest);
+            assert!(record.get("created_ms").is_none());
+            record["body"].clone()
+        };
+        assert_eq!(state(&id), json!({"state": "tombstone"}));
+        assert_eq!(state(&digest[..32]), json!({"state": "tombstone"}));
+        assert!(MemoryFetchTool
+            .execute(json!({"ids":[ctx_id]}), context_with_binding(&binding))
+            .await
+            .is_err());
+        // The chat it came from cannot seal the window again here.
+        let again = binding.history_seal("a-chat-of-another-store", &window, "").await;
+        assert!(again.is_err(), "sealed again after a forget");
+    }
+
     /// Nothing is announced unless the forget happened: an id that does not
     /// exist, one already forgotten, a malformed one, a `project` argument
     /// for another project. No delivery is even started.

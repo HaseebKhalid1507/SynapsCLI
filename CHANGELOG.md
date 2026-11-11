@@ -358,6 +358,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: a forgotten archive stays forgotten whatever id it is
+  stored under.** An archive brought in by `ArchiveStore::import` keeps the
+  id it had, which is not one of the two ids a seal derives from the
+  digest. Forgetting such an archive already left a tombstone under the
+  digest's own id, so the same window is not sealed again (now tested for
+  it); an imported tombstone is now written with that tombstone first, by
+  the same step; and a forget now reads every archive file on the shelves
+  for its digest, so forgetting the copy a chat sealed also forgets a copy
+  of the same content under an imported id (it used to stay readable, and
+  the forget said it was complete). A file under another id that names the
+  content and is not a valid record makes the forget "not complete". The
+  format page says so in "Tombstones". A forget is slower by one read of
+  each archive file in the project.
 - **Context archives: nothing is written that a read would refuse.** The
   store checked a projection it was handed for its digest and its chat, and
   not for what a read also checks: a note over 8,192 bytes, more than 4,096

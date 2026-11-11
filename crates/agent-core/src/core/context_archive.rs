@@ -948,8 +948,19 @@ struct Probe {
     /// A shelf has the digest, live or forgotten, under one of the halves:
     /// what a forget takes for "a seal already finds it".
     held: bool,
-    /// The first of the two halves no shelf has a file under.
-    free: Option<String>,
+    /// Which of the two halves a shelf (or a dry run's plan) has a file
+    /// under, whatever it is.
+    taken: [bool; 2],
+}
+
+impl Probe {
+    /// The id the tombstone a seal will find would be written under
+    /// ([`ArchiveStore::write_guard`]), or `None` when none is written: one
+    /// is there, or both names are taken.
+    fn guard(&self, digest: &str) -> Option<String> {
+        let free = self.taken.iter().position(|taken| !taken)?;
+        (!self.held).then(|| digest[free * 32..(free + 1) * 32].to_owned())
+    }
 }
 
 impl Planned {
@@ -1779,6 +1790,50 @@ impl ArchiveStore {
         self.forget_locked(id)
     }
 
+    /// The tombstone a seal of `digest` will find: written, create-new, on
+    /// the newest shelf, under the first of the digest's two ids that no
+    /// shelf has a file under (`taken` says which have one). For content
+    /// that is forgotten while it is stored under neither of those ids: a
+    /// legacy slot, an archive that was imported with the id it had, or a
+    /// tombstone that an import brings. With both names taken by other
+    /// files there is none to write and none is needed, because a seal has
+    /// no name to store under. The caller holds the lock, has found no
+    /// tombstone or copy of the digest under either id, and writes this
+    /// BEFORE the forget it belongs to: stopped in between, the content is
+    /// still there and already refused to a seal, and the forget is run
+    /// again.
+    fn write_guard(
+        &self,
+        shelves: &[String],
+        logical: &str,
+        digest: &str,
+        taken: [bool; 2],
+    ) -> io::Result<()> {
+        for (index, id) in [&digest[..32], &digest[32..]].into_iter().enumerate() {
+            if taken[index] {
+                continue;
+            }
+            let guard = Record {
+                version: 1,
+                scope: self.scope.clone(),
+                logical: logical.to_owned(),
+                id: id.to_owned(),
+                digest: digest.to_owned(),
+                created_ms: None,
+                body: Body::Tombstone,
+            };
+            let bytes = bounded_json(&guard, MAX_SEGMENT_BYTES)?;
+            let name = archive_name(id);
+            self.readable(&name, &bytes)?;
+            let (shelf, _) = self.writable_shelf(shelves)?;
+            match shelf.publish(&name, &bytes, true) {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                result => return result,
+            }
+        }
+        Ok(())
+    }
+
     /// [`forget`](Self::forget) for a caller that holds the lock: an import
     /// that was given a tombstone for an archive the store holds live.
     fn forget_locked(&self, id: &str) -> io::Result<Forgotten> {
@@ -1843,6 +1898,38 @@ impl ArchiveStore {
                     Err(error) => unread.pass(&format!("{shelf}/{name}"), error),
                 }
             }
+            // A copy under an id that is none of the three: an archive that
+            // was imported keeps the id it came with, and the same content
+            // can be here under any number of those. No name says which
+            // files they are, so every segment file of the shelf is read
+            // for its digest.
+            let listed = match dir.names() {
+                Ok(listed) => listed,
+                Err(error) => {
+                    unread.pass(shelf, error);
+                    continue;
+                }
+            };
+            for (name, is_dir, _) in listed {
+                if is_dir || archive_id(&name).is_none() || names.contains(&name) {
+                    continue;
+                }
+                // A file under another name that cannot be read, or holds
+                // no digest, says nothing about this content: passed over.
+                let Ok(Some(raw)) = dir.read_with(&name, MAX_SEGMENT_BYTES, false) else {
+                    continue;
+                };
+                if !names_digest(&raw, digest) {
+                    continue;
+                }
+                match self.record(&name, &raw) {
+                    Ok(record) => copies.push((Some(shelf), name, record)),
+                    Err(_) if says_forgotten(&raw, digest) => {}
+                    // It names this content and is not a record: it may be
+                    // a damaged copy.
+                    Err(error) => unread.pass(&format!("{shelf}/{name}"), error),
+                }
+            }
         }
         for slot in &slots {
             let raw = self.fs.read_with(slot, MAX_SEGMENT_BYTES, false);
@@ -1863,32 +1950,8 @@ impl ArchiveStore {
         guarded |= copies.first().is_some_and(seen_by_a_seal);
         if !guarded {
             // Stored under no name a seal looks under: the tombstone it will
-            // find, on the newest shelf, before anything is replaced. With
-            // both names taken by other files there is none to write and
-            // none is needed, because a seal has no name to store under.
-            for (index, id) in derived.into_iter().enumerate() {
-                if taken[index] {
-                    continue;
-                }
-                let guard = Record {
-                    version: 1,
-                    scope: self.scope.clone(),
-                    logical: asked.logical.clone(),
-                    id: id.to_owned(),
-                    digest: digest.to_owned(),
-                    created_ms: None,
-                    body: Body::Tombstone,
-                };
-                let bytes = bounded_json(&guard, MAX_SEGMENT_BYTES)?;
-                let (shelf, _) = self.writable_shelf(&shelves)?;
-                match shelf.publish(&archive_name(id), &bytes, true) {
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    result => {
-                        result?;
-                        break;
-                    }
-                }
-            }
+            // find, before anything is replaced.
+            self.write_guard(&shelves, &asked.logical, digest, taken)?;
         }
         let mut ids = Vec::new();
         for (shelf, name, mut record) in copies {
@@ -2239,7 +2302,7 @@ impl ArchiveStore {
                             // tombstone a seal finds, if none is there.
                             let probe =
                                 Self::probe(store, Some(&**plan), &shelves, digest, true)?;
-                            if let (false, Some(free)) = (probe.held, probe.free) {
+                            if let Some(free) = probe.guard(digest) {
                                 let shelf = Some(plan.shelve(store, &shelves));
                                 let guard = Held {
                                     digest: digest.to_owned(),
@@ -2265,14 +2328,14 @@ impl ArchiveStore {
         }
 
         // Nothing under the id. Where a seal would look for the content:
-        let probe = Self::probe(store, plan.as_deref(), &shelves, digest, dry_run)?;
+        let mut probe = Self::probe(store, plan.as_deref(), &shelves, digest, dry_run)?;
         let mut same_content_as = None;
         if incoming.is_some() {
             if probe.forgotten {
                 return refuse("this content was forgotten in this store".to_owned(), id);
             }
-            same_content_as = probe.live;
-        } else if let Some(other) = probe.live {
+            same_content_as = probe.live.take();
+        } else if let Some(other) = &probe.live {
             // A tombstone for content that is live here under another id.
             // Publishing it would leave that copy readable beside it, and
             // forgetting a record the line does not name is not this
@@ -2283,8 +2346,23 @@ impl ArchiveStore {
             );
             return refuse(reason, id);
         }
+        // A tombstone under an id a seal does not look under: the one it
+        // will find comes first, by the step a forget uses.
+        let derived = record.id == digest[..32] || record.id == digest[32..];
+        let guard = match incoming.is_none() && !derived {
+            true => probe.guard(digest),
+            false => None,
+        };
         let shelf = match (plan, store) {
             (Some(plan), _) => {
+                if let Some(guard) = guard {
+                    let held = Held {
+                        digest: digest.to_owned(),
+                        note: None,
+                        shelf: Some(plan.shelve(store, &shelves)),
+                    };
+                    plan.ids.insert(guard, held);
+                }
                 let shelf = plan.shelve(store, &shelves);
                 let held = Held {
                     digest: digest.to_owned(),
@@ -2295,6 +2373,11 @@ impl ArchiveStore {
                 shelf
             }
             (None, Some(store)) => {
+                let mut shelves = shelves;
+                if guard.is_some() {
+                    store.write_guard(&shelves, &record.logical, digest, probe.taken)?;
+                    shelves = store.shelves()?;
+                }
                 // Created new, under its own id: never renamed over a file.
                 let (dir, shelf) = store.writable_shelf(&shelves)?;
                 dir.publish_dated(&name, &bytes, true, modified)?;
@@ -2316,8 +2399,9 @@ impl ArchiveStore {
         readonly: bool,
     ) -> io::Result<Probe> {
         let mut probe = Probe::default();
-        for half in [0..32, 32..64] {
+        for (index, half) in [0..32, 32..64].into_iter().enumerate() {
             let id = &digest[half];
+            probe.taken[index] = true;
             let shelved = match store {
                 Some(store) => store.shelved(shelves, id, digest, readonly),
                 None => Ok(Shelved::Nothing),
@@ -2344,9 +2428,7 @@ impl ArchiveStore {
                         }
                     }
                     Some(_) => {}
-                    None => {
-                        probe.free.get_or_insert_with(|| id.to_owned());
-                    }
+                    None => probe.taken[index] = false,
                 },
                 Err(error) if is_forgotten(&error) => {
                     probe.held = true;
@@ -3511,6 +3593,15 @@ fn says_forgotten(raw: &[u8], digest: &str) -> bool {
     }
     serde_json::from_slice::<Marked>(raw)
         .is_ok_and(|marked| marked.digest == digest && marked.body.state == "tombstone")
+}
+/// Whether `raw` reads as JSON whose `digest` is `digest`: all a forget
+/// asks of a file under another id before it reads it as a record.
+fn names_digest(raw: &[u8], digest: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Named {
+        digest: String,
+    }
+    serde_json::from_slice::<Named>(raw).is_ok_and(|named| named.digest == digest)
 }
 /// The name of one write's temporary file. No two writes have the same, so no
 /// write removes, reuses or renames the file of another. Readers open segment
@@ -9486,6 +9577,8 @@ mod tests {
             ]
         );
         assert_eq!(outcomes[9], "Stored");
+        // The tombstone before it forgot the content under any id.
+        assert_eq!(outcomes[10], "this content was forgotten in this store");
         assert!(outcomes[11].starts_with("not an archive record"));
 
         // A dry run over a store that exists: the same answers as running
@@ -9584,6 +9677,170 @@ mod tests {
         let sealed = chat.seal(&text("sealed after the import"), "").unwrap();
         assert!(dir.join("s000002").join(archive_name(&sealed.id)).is_file());
         assert_eq!(on("s000002").len(), 3);
+    }
+
+    /// T-A9: a tombstone stays, also for an archive whose id is not derived
+    /// from its digest. Forgotten, its content is refused to a later seal by
+    /// a tombstone under the digest's own id, on the newest shelf.
+    #[test]
+    fn t_a9_a_forgotten_import_cannot_be_sealed_again() {
+        let words = "imported and then forgotten";
+        let digest = digest_of(words);
+        let refused = |store: &ArchiveStore| {
+            let error = store.seal(&text(words), "").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+            assert!(error.to_string().contains("was forgotten"), "{error}");
+        };
+
+        // A live import, on a shelf that is no longer the newest.
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let id = random_id();
+        let line = record_bytes(&store, &id, &text(words), |_| {});
+        assert_eq!(import(&store, &line).unwrap().outcome, ImportOutcome::Stored);
+        std::fs::create_dir(dir.join("s000002")).unwrap();
+        std::fs::set_permissions(dir.join("s000002"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert_eq!(store.forget(&id).unwrap(), forgotten(&[&id]));
+        let guard = dir.join("s000002").join(archive_name(&digest[..32]));
+        let file = dir.join("s000001").join(archive_name(&id));
+        assert_eq!(shelf_files(&dir), [file.clone(), guard.clone()]);
+        assert!(is_tombstone_of(&store, &guard, &digest));
+        assert!(is_tombstone_of(&store, &file, &digest));
+        refused(&store);
+        // Importing the line again does not bring it back either.
+        assert_eq!(import(&store, &line).unwrap().outcome, ImportOutcome::KeptForgotten);
+        let other = record_bytes(&store, &random_id(), &text(words), |_| {});
+        assert_eq!(reason(&store, &other), "this content was forgotten in this store");
+        assert_eq!(shelf_files(&dir).len(), 2);
+
+        // A tombstone with a foreign id into an empty store: the one a seal
+        // finds is written with it, first.
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let dead = record_bytes(&store, &id, &text(words), tombstone);
+        let done = import(&store, &dead).unwrap();
+        assert_eq!((done.outcome, done.shelf.as_deref()), (ImportOutcome::Stored, Some("s000001")));
+        let guard = dir.join("s000001").join(archive_name(&digest[..32]));
+        let file = dir.join("s000001").join(archive_name(&id));
+        let mut both = [file.clone(), guard.clone()];
+        both.sort();
+        assert_eq!(shelf_files(&dir), both);
+        assert!(is_tombstone_of(&store, &guard, &digest));
+        assert_eq!(std::fs::read(&file).unwrap(), dead);
+        refused(&store);
+        assert_eq!(reason(&store, &other), "this content was forgotten in this store");
+        // The same line again, and a tombstone of it under one more id: no
+        // second guard.
+        assert_eq!(import(&store, &dead).unwrap().outcome, ImportOutcome::Present { note_differs: false });
+        let again = record_bytes(&store, &random_id(), &text(words), tombstone);
+        assert_eq!(import(&store, &again).unwrap().outcome, ImportOutcome::Stored);
+        assert_eq!(shelf_files(&dir).len(), 3);
+        // A tombstone under the digest's own id is the one a seal finds.
+        let (tmp, store) = setup();
+        let own = record_bytes(&store, &digest[32..], &text(words), tombstone);
+        assert_eq!(import(&store, &own).unwrap().outcome, ImportOutcome::Stored);
+        assert_eq!(shelf_files(&directory(&tmp, &store)).len(), 1);
+        refused(&store);
+
+        // A foreign-id tombstone written by hand, with nothing under either
+        // derived id: forgetting it again writes the one a seal finds.
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        store.seal(&text("a shelf to begin with"), "").unwrap();
+        let file = dir.join("s000001").join(archive_name(&id));
+        std::fs::write(&file, &dead).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(store.seal(&text(words), "").unwrap().id, digest[..32], "not seen by a seal");
+        let (tmp, store) = (drop(tmp), setup()).1;
+        let dir = directory(&tmp, &store);
+        store.seal(&text("a shelf to begin with"), "").unwrap();
+        let file = dir.join("s000001").join(archive_name(&id));
+        std::fs::write(&file, &dead).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(store.forget(&id).unwrap(), forgotten(&[]));
+        assert!(is_tombstone_of(&store, &dir.join("s000001").join(archive_name(&digest[..32])), &digest));
+        refused(&store);
+
+        // An archive its chat sealed: forgotten, it is its own tombstone.
+        let (tmp, store) = setup();
+        let sealed = store.seal(&text(words), "").unwrap();
+        store.forget(&sealed.id).unwrap();
+        assert_eq!(shelf_files(&directory(&tmp, &store)).len(), 1);
+        refused(&store);
+    }
+
+    /// T-A9, the pair an import makes on purpose (`same_content_as`): the
+    /// content under the id its chat's seal gave it and under an imported
+    /// id. Forgetting either id forgets both, and writes no third file.
+    #[test]
+    fn t_a9_forgetting_either_of_a_native_and_an_imported_copy_forgets_both() {
+        let words = "sealed here and imported too";
+        for forget_the_import in [true, false] {
+            let (tmp, store) = setup();
+            let dir = directory(&tmp, &store);
+            let sealed = store.seal(&text(words), "").unwrap();
+            // The import is on a newer shelf than the native copy, with
+            // other archives around it.
+            for index in 0..SHELF_FILES {
+                store.seal(&text(&format!("filler {index}")), "").unwrap();
+            }
+            let id = random_id();
+            let done = import(&store, &record_bytes(&store, &id, &text(words), |_| {})).unwrap();
+            assert_eq!(done.same_content_as.as_deref(), Some(sealed.id.as_str()));
+            assert_eq!(done.shelf.as_deref(), Some("s000002"));
+            let before = shelf_files(&dir);
+            let asked = if forget_the_import { &id } else { &sealed.id };
+            let done = store.forget(asked).unwrap();
+            let mut ids = done.ids.clone();
+            ids.sort();
+            let mut expected = [id.clone(), sealed.id.clone()];
+            expected.sort();
+            assert_eq!(ids, expected, "forgetting {asked}");
+            assert_eq!(done.ids[0], *asked);
+            assert_eq!(done.unread, None);
+            assert_eq!(shelf_files(&dir), before, "no third file");
+            let digest = digest_of(words);
+            assert!(is_tombstone_of(&store, &dir.join("s000001").join(archive_name(&sealed.id)), &digest));
+            assert!(is_tombstone_of(&store, &dir.join("s000002").join(archive_name(&id)), &digest));
+            for gone in [&id, &sealed.id] {
+                assert_eq!(store.fetch(gone, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
+            }
+            assert!(store.search("imported too", 8).unwrap().is_empty());
+            assert_eq!(
+                store.seal(&text(words), "").unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            // Nothing else was touched.
+            assert_eq!(store.fetch(&store.seal(&text("filler 0"), "").unwrap().id, 0, 1).unwrap(), text("filler 0"));
+            // Forgetting again: nothing left to do, and it says so.
+            assert_eq!(store.forget(asked).unwrap(), forgotten(&[]));
+        }
+    }
+
+    /// A forget reads other files for their digest only: a file under
+    /// another id that names this content and is not a record makes the
+    /// forget "not complete"; any other file there is none of its business.
+    #[test]
+    fn a_forget_says_when_a_file_under_another_id_names_its_content_and_is_no_record() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let sealed = store.seal(&text("with a damaged twin"), "").unwrap();
+        let shelf = dir.join("s000001");
+        let private = std::fs::Permissions::from_mode(0o600);
+        let stray = shelf.join(archive_name(&random_id()));
+        std::fs::write(&stray, b"not json at all").unwrap();
+        std::fs::set_permissions(&stray, private.clone()).unwrap();
+        let twin = shelf.join(archive_name(&random_id()));
+        let damaged = format!("{{\"digest\":\"{}\",\"body\":\"cut\"}}", digest_of("with a damaged twin"));
+        std::fs::write(&twin, damaged).unwrap();
+        std::fs::set_permissions(&twin, private).unwrap();
+        let done = store.forget(&sealed.id).unwrap();
+        assert_eq!(done.ids, std::slice::from_ref(&sealed.id));
+        let unread = done.unread.expect("not complete");
+        let name = twin.file_name().unwrap().to_str().unwrap();
+        assert!(unread.starts_with(&format!("1 place(s) could not be read, first s000001/{name}: ")), "{unread}");
+        assert_eq!(std::fs::read(&stray).unwrap(), b"not json at all");
     }
 }
 
