@@ -16,7 +16,9 @@
 //!   records physically removed) rather than whole-file deletion; their
 //!   derived index directories are dropped alongside (rebuildable state).
 //! - The disk budget deletes oldest-first across whole-file artifacts
-//!   (sessions/traces/logs/indexes), skipping protected chain heads.
+//!   (sessions/traces/logs/indexes), skipping protected chain heads. It
+//!   evicts notes only with `include_notes`; without it an unmet budget is
+//!   `BudgetUnmet` with every note untouched.
 
 use std::fs;
 use std::io;
@@ -37,6 +39,8 @@ pub enum RetentionError {
         budget: u64,
         remaining: u64,
         protected_chain_heads: usize,
+        /// The policy did not say `include_notes`, so no note was evicted.
+        notes_kept: bool,
     },
 }
 
@@ -54,12 +58,23 @@ impl std::fmt::Display for RetentionError {
                 budget,
                 remaining,
                 protected_chain_heads,
-            } => write!(
-                f,
-                "disk budget unmet: {remaining} bytes remain against a budget of \
-                 {budget} after evicting every unprotected artifact \
-                 ({protected_chain_heads} protected chain head(s) retained)"
-            ),
+                notes_kept,
+            } => {
+                write!(
+                    f,
+                    "disk budget unmet: {remaining} bytes remain against a budget of \
+                     {budget} after evicting every unprotected artifact \
+                     ({protected_chain_heads} protected chain head(s) retained)"
+                )?;
+                if *notes_kept {
+                    write!(
+                        f,
+                        "; no note was deleted: the budget evicts notes only with \
+                         --include-notes"
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -131,12 +146,13 @@ pub struct RetentionPolicy {
     /// Sessions, traces, logs and spill folders older than this are
     /// deleted. Notes are not, unless `include_notes` is set.
     pub max_age_days: Option<u32>,
+    /// Total disk budget. Notes are evicted for it only with `include_notes`.
     pub max_disk_bytes: Option<u64>,
-    /// Apply `max_age_days` to notes as well. Off by default: a note is
-    /// something a person or the model chose to keep, and one of class
-    /// `Standard` is "kept until explicitly forgotten or swept by disk
-    /// budget". A note with an expiry of its own (`max_age_days` in its
-    /// retention class) expires by that on every sweep, whatever this says.
+    /// Let the sweep delete saved notes: apply `max_age_days` to notes, and
+    /// let `max_disk_bytes` evict notes oldest first. Off by default: a note
+    /// is something a person or the model chose to keep. A note with an
+    /// expiry of its own (`max_age_days` in its retention class) expires by
+    /// that on every sweep, whatever this says.
     pub include_notes: bool,
 }
 
@@ -420,7 +436,8 @@ pub fn sweep_at(
     // total actually fits, or a typed unmet error. Stage order minimizes
     // data loss: (1) derived index dirs (rebuildable — free win), (2)
     // whole-file artifacts oldest-first (never protected chain heads),
-    // (3) memory records oldest-first via atomic rewrite. ──
+    // (3) memory records oldest-first via atomic rewrite, only with
+    // `include_notes`. ──
     if let Some(budget) = policy.max_disk_bytes {
         let total_now = |roots: &RetentionRoots| -> u64 {
             inspect(roots).map(|r| r.total_bytes).unwrap_or(u64::MAX)
@@ -479,8 +496,9 @@ pub fn sweep_at(
             }
         }
 
-        // Stage 3: memory records, globally oldest-first.
-        if total_now(roots) > budget {
+        // Stage 3: memory records, globally oldest-first. Only when asked:
+        // without `include_notes` the budget never deletes a note.
+        if policy.include_notes && total_now(roots) > budget {
             let over = total_now(roots) - budget;
             let dropped = evict_oldest_memory_records(roots, over)?;
             outcome.memory_records_dropped += dropped;
@@ -493,6 +511,7 @@ pub fn sweep_at(
                 budget,
                 remaining,
                 protected_chain_heads: protected.len(),
+                notes_kept: !policy.include_notes,
             });
         }
     }
@@ -1498,7 +1517,7 @@ mod tests {
     /// An age sweep is for sessions, traces and logs. A `Standard` note
     /// survives it however old it is; a note with an expiry of its own goes
     /// when that is past; `include_notes` makes the age apply to notes; and
-    /// the disk budget evicts notes as before.
+    /// the disk budget evicts notes only with `include_notes`.
     #[test]
     fn an_age_sweep_keeps_saved_notes_unless_it_is_told_to_include_them() {
         use crate::memory::store::MemoryRetention;
@@ -1544,14 +1563,20 @@ mod tests {
         };
         assert_eq!(sweep_at(&roots, &none, now).unwrap().memory_records_dropped, 0);
 
-        // The disk budget is as it was: it evicts notes, oldest first.
+        // The disk budget evicts notes, oldest first, only with `include_notes`.
         with_class("mem-standard-newer", now, MemoryRetention::Standard);
         let total = inspect(&roots).unwrap().total_bytes;
-        let budget = RetentionPolicy {
+        let budget = |include_notes| RetentionPolicy {
             max_disk_bytes: Some(total - 1),
+            include_notes,
             ..Default::default()
         };
-        assert_eq!(sweep_at(&roots, &budget, now).unwrap().memory_records_dropped, 1);
+        assert!(matches!(
+            sweep_at(&roots, &budget(false), now),
+            Err(RetentionError::BudgetUnmet { notes_kept: true, .. })
+        ));
+        assert_eq!(ids(&path), ["mem-standard-new", "mem-standard-newer"]);
+        assert_eq!(sweep_at(&roots, &budget(true), now).unwrap().memory_records_dropped, 1);
         assert_eq!(ids(&path), ["mem-standard-newer"]);
     }
 
