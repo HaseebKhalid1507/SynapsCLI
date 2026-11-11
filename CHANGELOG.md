@@ -313,6 +313,18 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Extensions: a handler that times out on an archive event is not sent
+  the rest of that rollover's events.** A window sealed as `n` archives
+  sends `n` `on_context_archived` events to each handler, one after the
+  other. A handler that did not answer one within 5 s was sent the next all
+  the same, so a slow extension had `n` requests in its input and was busy
+  for `n` times its own time; calls to one extension are made one at a
+  time, so every `before_tool_call` sent to it meanwhile timed out and the
+  tool ran. A handler's sequence now ends at its first timeout (logged
+  once, with the number of events not sent); other handlers still get every
+  event, undelayed. An extension that needs every archive must be able to
+  catch up by listing the store (`docs/extensions/hooks.md`). Not changed:
+  a `before_tool_call` that times out still lets the tool run.
 - **Notes: a save made while a notes file is rewritten is no longer lost.**
   `synaps retention sweep` and `synaps retention forget memory` rewrite
   `memory/<ns>.jsonl` and rename the new file over the old one. A note saved

@@ -119,10 +119,14 @@ you:
   up the 64 by itself.
 - **Unordered, and sometimes twice.** Events are delivered independently, so
   two of them can arrive in either order. The one exception is the parts of
-  one window, which are sent one after another, first part first; an event
-  that timed out may still overlap the next, so go by `data.part`, not by
-  arrival. If your process dies mid-call it is restarted and sent the event
-  again. Make the handler idempotent.
+  one window, which are sent one after another, first part first. If your
+  process dies mid-call it is restarted and sent the event again. Make the
+  handler idempotent.
+- **One timeout ends the delivery for you.** When your handler does not
+  answer an event within 5 s, the remaining events of that delivery (the
+  later parts of that rollover's window) are not sent to you; the host logs
+  how many. Other extensions still get all of them. Nothing sends them
+  later, so you must be able to catch up by listing the store.
 - **Answer at once and do the work afterwards.** Calls to one extension are
   made one at a time, so while your handler sits on a notify-only event your
   other hooks (a `before_tool_call`, say) wait behind it, each for up to its
@@ -196,8 +200,9 @@ parts](#a-window-in-several-parts).
 
 For a window sealed as several archives the host sends one event per part,
 all after the chat has moved to the new window, as one delivery: first part
-first, each handed to your handler once it has answered the one before or
-used up its 5 s for it. Each extension gets that sequence on its own, so
+first, each handed to your handler once it has answered the one before. If
+it does not answer one within 5 s, the parts after it are not sent to you
+(see above). Each extension gets that sequence on its own, so
 another extension that is slow, stuck or failing does not delay yours.
 Every event has the same `session_id`, `cwd`, `project_key`, `window` and
 `parts`, and its own `archive_id`, `path`, counts, `part` and
