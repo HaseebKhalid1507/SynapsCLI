@@ -445,10 +445,16 @@ fn open_input(path: &Path) -> io::Result<Box<dyn BufRead>> {
 
 // ─── The two stores ─────────────────────────────────────────────────────────
 
+/// Why a run stops at a line, and the line's id when it is known.
+struct Stop {
+    id: Option<String>,
+    error: String,
+}
+
 /// One store's side of a run. `Err` from `line` is the machine's fault and
 /// stops the run; a refusal is an `Ok`.
 trait Importer {
-    fn line(&mut self, line: &[u8]) -> Result<Judged, String>;
+    fn line(&mut self, line: &[u8]) -> Result<Judged, Stop>;
     /// An empty block for a project of this store.
     fn block(&self, project: &str) -> Project;
     /// End the run, on an early stop too.
@@ -486,8 +492,36 @@ impl Archives {
     }
 }
 
+/// A store error at `line`, with what the store's own words leave out: the
+/// id the line names and the project directory. The store may say only
+/// `invalid archive record` of a file under that id; the file is then
+/// `<id>.json` on a shelf of that directory. The id is printed only when it
+/// has the form of one (32 lowercase hex characters): nothing else of the
+/// line is.
+fn in_project(base: &Path, scope: &str, line: &[u8], error: io::Error) -> Stop {
+    #[derive(serde::Deserialize)]
+    struct Named {
+        id: String,
+    }
+    let id = serde_json::from_slice::<Named>(line)
+        .ok()
+        .map(|named| named.id)
+        .filter(|id| {
+            id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        });
+    let dir = base.join("context-archives").join(scope);
+    let error = match &id {
+        Some(id) => format!(
+            "{error} (importing {id}: see {id}.json on the shelves of the project directory {})",
+            dir.display()
+        ),
+        None => format!("{error} (in the project directory {})", dir.display()),
+    };
+    Stop { id, error }
+}
+
 impl Importer for Archives {
-    fn line(&mut self, line: &[u8]) -> Result<Judged, String> {
+    fn line(&mut self, line: &[u8]) -> Result<Judged, Stop> {
         let scope = match &self.target {
             Some((_, scope)) => scope.clone(),
             None => match archive::record_scope(line) {
@@ -497,8 +531,8 @@ impl Importer for Archives {
         };
         let rehome = self.target.is_some();
         if !self.stores.contains_key(&scope) {
-            let existing =
-                ArchiveStore::existing_scope(&self.base, &scope).map_err(|e| e.to_string())?;
+            let existing = ArchiveStore::existing_scope(&self.base, &scope)
+                .map_err(|e| in_project(&self.base, &scope, line, e))?;
             self.stores.insert(scope.clone(), existing);
         }
         let answer = match self.stores.get(&scope).and_then(Option::as_ref) {
@@ -514,7 +548,7 @@ impl Importer for Archives {
                 match ArchiveStore::import_dry_absent(&scope, line, rehome, &mut alone) {
                     Ok(Ok(_)) => {
                         let store = ArchiveStore::for_scope(&self.base, &scope)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| in_project(&self.base, &scope, line, e))?;
                         let answer = store.import(line, rehome, false, &mut self.seen);
                         self.stores.insert(scope.clone(), Some(store));
                         answer
@@ -523,7 +557,8 @@ impl Importer for Archives {
                 }
             }
         };
-        Ok(match answer.map_err(|e| e.to_string())? {
+        let answer = answer.map_err(|e| in_project(&self.base, &scope, line, e))?;
+        Ok(match answer {
             Err(refused) => Judged::refused(refused.id, refused.reason, Some(scope)),
             Ok(imported) => {
                 let (outcome, note_differs) = match imported.outcome {
@@ -637,7 +672,7 @@ fn lock_notes_import(base: &Path) -> Result<ExclusiveLock, String> {
 }
 
 impl Importer for Notes {
-    fn line(&mut self, line: &[u8]) -> Result<Judged, String> {
+    fn line(&mut self, line: &[u8]) -> Result<Judged, Stop> {
         let Ok(text) = std::str::from_utf8(line) else {
             return Ok(Judged::refused(None, "not UTF-8".to_owned(), None));
         };
@@ -646,7 +681,10 @@ impl Importer for Notes {
             None => ImportTarget::AsRecorded,
         };
         let imported = notes::import_line_in(&self.base, text, target, &mut self.run)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Stop {
+                id: None,
+                error: e.to_string(),
+            })?;
         let reason = match &imported.outcome {
             notes::ImportOutcome::Refused(reason) => Some(reason.clone()),
             _ => None,
@@ -922,12 +960,12 @@ fn feed<I: Importer>(
                 ),
                 Line::Text(_) => match importer.line(trimmed) {
                     Ok(judged) => judged,
-                    Err(error) => {
+                    Err(stop) => {
                         return Some(Stopped {
                             input: Some(input),
                             line: Some(lines.number),
-                            id: None,
-                            error,
+                            id: stop.id,
+                            error: stop.error,
                         })
                     }
                 },

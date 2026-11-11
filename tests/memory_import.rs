@@ -754,7 +754,13 @@ fn a_store_that_cannot_answer_stops_the_run_at_that_record() {
         assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
         assert_eq!(run.doc["stopped"]["input"], 0);
         assert_eq!(run.doc["stopped"]["line"], 2);
-        assert!(run.doc["stopped"]["error"].is_string());
+        // The store's error does not name the file. The command adds the
+        // id and the project directory: the file is <id>.json on a shelf
+        // of that directory (core-a5-review finding 7).
+        let error = run.doc["stopped"]["error"].as_str().unwrap();
+        assert!(error.contains(&format!("{}.json", records[1].0)), "{error}");
+        assert!(error.contains(shelf.parent().unwrap().to_str().unwrap()), "{error}");
+        assert_eq!(run.doc["stopped"]["id"], records[1].0.as_str());
         // The line the run stopped at was read and has no outcome.
         assert_eq!(run.totals(), [2, 0, 1, 0, 0, 0]);
         assert_eq!(run.doc["balanced"], false);

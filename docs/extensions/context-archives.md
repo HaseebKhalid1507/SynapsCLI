@@ -761,7 +761,10 @@ code is 0 when nothing was refused, 1 when something was or when a forget is
 in `forgets_not_complete`, and 2 when the run
 stopped (an input that cannot be read, a store that cannot be read or
 locked): what was imported before the stop is complete, and running the
-same command again continues. `--dry-run` writes nothing at all and prints
+same command again continues. When a store stops at a record, `stopped`
+names the line, the record's id and the project directory: a file under
+that id that is not a record (`<id>.json` on one of its shelves) stops
+every run there until it is moved away. `--dry-run` writes nothing at all and prints
 what the real run would print.
 
 What to know before you rely on it:

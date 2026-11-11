@@ -28,7 +28,8 @@ All notable changes to this project will be documented in this file.
   content. Exit code 0 when nothing was refused, 1 when something was or
   when an archive forget may not have reached every copy (those ids are in
   `forgets_not_complete`), 2 when the run stopped or the command line could
-  not be used. `--dry-run`
+  not be used; a store that stops at a record is named in `stopped` with
+  the record's id and the project directory. `--dry-run`
   writes nothing (no directory, no lock file, no mode) and prints what the
   real run prints. The base (`SYNAPS_BASE_DIR`, or `~/.synaps-cli`) must be
   an absolute path, and a real run does not create it: an empty
