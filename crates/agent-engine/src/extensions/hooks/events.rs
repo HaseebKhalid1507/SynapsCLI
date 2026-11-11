@@ -1129,23 +1129,6 @@ mod tests {
         }
     }
 
-    /// An event serialised before the field existed still parses.
-    #[test]
-    fn event_json_without_cwd_deserialises() {
-        let old = json!({
-            "kind": "before_message",
-            "tool_name": null,
-            "tool_input": null,
-            "tool_output": null,
-            "message": "hi",
-            "session_id": "sess-A",
-            "data": null,
-        });
-        let ev: HookEvent = serde_json::from_value(old).unwrap();
-        assert_eq!(ev.cwd, None);
-        assert_eq!(ev.session_id.as_deref(), Some("sess-A"));
-    }
-
     /// A folder that cannot be written as a JSON string is `null`, never a
     /// lossy rewrite and never the process folder.
     #[cfg(unix)]

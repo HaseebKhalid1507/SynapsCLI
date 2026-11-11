@@ -1991,19 +1991,12 @@ async fn hook_json_carries_session_id() {
         Some(chat_b.path()),
     )
     .await;
+    // Built here, not by their emitter (the stream loop): no folder.
     let _ = hook_bus
-        .emit(
-            &HookEvent::before_message("hi")
-                .with_session(Some("sess-A"))
-                .with_cwd(Some(chat_a.path())),
-        )
+        .emit(&HookEvent::before_message("hi").with_session(Some("sess-A")))
         .await;
     let _ = hook_bus
-        .emit(
-            &HookEvent::on_message_complete("done", json!({}))
-                .with_session(Some("sess-B"))
-                .with_cwd(Some(chat_b.path())),
-        )
+        .emit(&HookEvent::on_message_complete("done", json!({})).with_session(Some("sess-B")))
         .await;
     // Worker path: no owning conversation → still null.
     let _ = synaps_cli::runtime::emit_before_tool_call(
@@ -2045,15 +2038,18 @@ async fn hook_json_carries_session_id() {
         ],
         "hook JSON must carry the owning session id (log: {seen:?})"
     );
-    // ... and the folder: each session's own, the process folder for the
-    // call with none, and the key present even on an event nobody stamped.
+    // ... and the folder the tool-hook emitters were given: each session's
+    // own, and the process folder for the call with none. The key is on
+    // the wire for every event, `null` on the ones no emitter stamped (the
+    // stream loop's and the session actor's emitters are covered where
+    // they run: `stream_hooks_carry_the_streams_cwd`, `session_actor_hook_cwd`).
     assert!(seen.iter().all(|e| e["has_cwd"] == json!(true)), "{seen:?}");
     let folders: Vec<Value> = seen.iter().map(|e| e["cwd"].clone()).collect();
     let (a, b) = (chat_a.path().to_str().unwrap(), chat_b.path().to_str().unwrap());
     assert_eq!(
         folders,
-        vec![json!(a), json!(b), json!(a), json!(b), json!(process.to_str().unwrap()), Value::Null],
-        "hook JSON must carry the session's folder (log: {seen:?})"
+        vec![json!(a), json!(b), Value::Null, Value::Null, json!(process.to_str().unwrap()), Value::Null],
+        "hook JSON must carry the folder its emitter was given (log: {seen:?})"
     );
 
     manager.shutdown_all().await;
