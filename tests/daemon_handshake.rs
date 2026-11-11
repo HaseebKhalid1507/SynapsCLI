@@ -161,6 +161,38 @@ async fn an_unidentifiable_client_gets_eof_instead_of_welcome() {
     d.wait().await;
 }
 
+/// The `admit` comes before every reply, not only the `Welcome`: a client
+/// that can't be identified and writes something that is not a `Hello`
+/// (a malformed line, a frame out of order) gets EOF, not the `Refused` or
+/// `Error` frame the daemon sends a client it has admitted.
+#[cfg(windows)]
+#[tokio::test]
+#[serial]
+async fn an_unidentifiable_client_gets_no_reply_frame_of_any_kind() {
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+
+    for first in ["this is not json", "{\"type\":\"nope\"}"] {
+        let anonymous = tokio::net::windows::named_pipe::ClientOptions::new()
+            .security_qos_flags(0)
+            .open(agent_engine::ipc::pipe_name(&sock))
+            .unwrap();
+        let (r, w) = agent_engine::ipc::split_client(anonymous);
+        let mut c = Raw { r: BufReader::new(r), w };
+        c.send_line(first).await;
+        assert!(c.recv().await.is_none(), "{first:?}: EOF, no Refused or Error frame");
+    }
+
+    // An admitted client still gets the protocol refusal for the same input.
+    let mut c = Raw::connect(&sock).await;
+    c.send_line("this is not json").await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::Refused { .. })), "an admitted client is told why");
+
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
 #[tokio::test]
 #[serial]
 async fn control_fast_path_allocates_no_session() {

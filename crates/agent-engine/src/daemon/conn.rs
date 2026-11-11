@@ -193,7 +193,22 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     let mut line = String::new();
 
     // ── handshake: first frame MUST be Hello ──
-    let hello = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader, &mut line)).await {
+    let first = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader, &mut line)).await;
+    // The Windows `admit` (Unix checks the peer's uid on accept,
+    // `listener.rs`): whoever wrote the first bytes must be the daemon's user,
+    // at its integrity level or higher, and unconfined. It runs before any
+    // reply, whatever the frame was (a refusal or an error frame is a reply
+    // too). Refused: no frame, the client sees EOF.
+    #[cfg(windows)]
+    if matches!(first, Ok(Ok(Read::Frame(_) | Read::Bad(_) | Read::Oversize))) {
+        if let Err(why) = crate::ipc::admit_client(peer, &crate::ipc::own_identity()) {
+            tracing::warn!("daemon: refused connection: {why}");
+            drop(tx);
+            let _ = writer.await;
+            return;
+        }
+    }
+    let hello = match first {
         Ok(Ok(Read::Frame(ClientFrame::Hello(h)))) => h,
         Ok(Ok(Read::Frame(_))) | Ok(Ok(Read::Bad(_))) => {
             let _ = tx
@@ -214,16 +229,6 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             return;
         }
     };
-    // The Windows `admit` (Unix checks the peer's uid on accept,
-    // `listener.rs`): whoever wrote `Hello` must be the daemon's user, at its
-    // integrity level or higher. Refused: no frame, the client sees EOF.
-    #[cfg(windows)]
-    if let Err(why) = crate::ipc::admit_client(peer, &crate::ipc::own_identity()) {
-        tracing::warn!("daemon: refused connection: {why}");
-        drop(tx);
-        let _ = writer.await;
-        return;
-    }
     if hello.protocol_version < PROTOCOL_MIN || hello.protocol_version > PROTOCOL_MAX {
         tracing::warn!(client = hello.protocol_version, daemon = PROTOCOL_VERSION, "daemon: refusing protocol version");
         let _ = tx
