@@ -612,9 +612,33 @@ fn part_containing(parts: &[ArchivePart], index: usize) -> Option<&ArchiveRef> {
 /// Most parts of one window that the continuation message lists by id: the
 /// last ones, which hold the newest messages and the ones the list of dropped
 /// requests points at. Earlier parts are counted, with the range they cover.
-/// The bound is on the message, whose size is estimated before the parts are
-/// known; the host metadata lists every part.
+/// The bound is on the message. Its size is estimated before the parts are
+/// known, so a rollover lists fewer than this when naming them all would
+/// fail one of the two checks it made on the estimate
+/// ([`rollover_for_boundary`]); the host metadata lists every part.
 const LISTED_PARTS: usize = 32;
+
+/// What a window of `len` messages is taken to be sealed as before it is
+/// sealed, for the size estimate: the fewest parts the message limit allows,
+/// one for a window within it.
+fn assumed_parts(len: usize) -> Vec<ArchivePart> {
+    let limit = agent_core::context_archive::MAX_MESSAGES;
+    (0..len.div_ceil(limit).max(1))
+        .map(|part| {
+            let first = part * limit;
+            let count = (len - first).min(limit);
+            ArchivePart {
+                archive: ArchiveRef {
+                    id: "0".repeat(32),
+                    message_count: count,
+                    source_message_count: count,
+                },
+                first_source_index: first,
+                reduced_messages: 0,
+            }
+        })
+        .collect()
+}
 
 /// Where the window that was just archived is: the sentence the continuation
 /// message says it in, and the host's record of the parts (`archives` in the
@@ -626,8 +650,9 @@ const LISTED_PARTS: usize = 32;
 /// parts lists them in source order, each with its range of the window's
 /// source messages and the number of messages stored, because inside a part
 /// `memory_fetch` counts `source_index` from that part's first message. A
-/// part holding a message that was stored reduced says so.
-fn archived_evidence(parts: &[ArchivePart]) -> (String, Option<Value>) {
+/// part holding a message that was stored reduced says so. At most `listed`
+/// parts, the last ones, are named by id; the record has every part.
+fn archived_evidence(parts: &[ArchivePart], listed: usize) -> (String, Option<Value>) {
     const VIA: &str = "available via memory_search(source=history) and memory_fetch if a specific needed fact is missing";
     let last_index = |part: &ArchivePart| {
         part.first_source_index + part.archive.source_message_count.saturating_sub(1)
@@ -639,7 +664,7 @@ fn archived_evidence(parts: &[ArchivePart]) -> (String, Option<Value>) {
             whole.archive.id, whole.archive.message_count
         ),
         _ => {
-            let unlisted = parts.len().saturating_sub(LISTED_PARTS);
+            let unlisted = parts.len().saturating_sub(listed);
             let mut listed: Vec<String> = Vec::new();
             // The first range says what the numbers are.
             let mut label = "source messages ";
@@ -917,7 +942,7 @@ fn successor_from_parts(
         )
     });
 
-    let (evidence, archives) = archived_evidence(parts);
+    let (evidence, archives) = archived_evidence(parts, LISTED_PARTS);
     let latest = parts.last().map(|part| part.archive.id.as_str());
     let mut metadata = json!({"schema":MARKER,"archive":latest,"window":window});
     if let Some(archives) = archives {
@@ -1098,29 +1123,12 @@ pub(crate) async fn rollover_for_boundary(
     // Validate candidate BEFORE writing. A giant latest request/tail cannot be
     // fixed by repeatedly rolling over; retain original history and stop instead.
     // The parts are not known before the seal: assume the fewest the message
-    // limit allows, one for a window within it. A split made by another limit
-    // lists more parts, about 25 tokens each, that this estimate does not see;
-    // the list is capped (`LISTED_PARTS`) and nothing is re-checked after the
-    // seal, when the archives are already written.
-    let limit = agent_core::context_archive::MAX_MESSAGES;
-    let placeholder: Vec<ArchivePart> = (0..messages.len().div_ceil(limit).max(1))
-        .map(|part| {
-            let first = part * limit;
-            let count = (messages.len() - first).min(limit);
-            ArchivePart {
-                archive: ArchiveRef {
-                    id: "0".repeat(32),
-                    message_count: count,
-                    source_message_count: count,
-                },
-                first_source_index: first,
-                reduced_messages: 0,
-            }
-        })
-        .collect();
+    // limit allows (`assumed_parts`). A split made by another limit gives
+    // more parts, about 30 tokens for each one listed, that this estimate
+    // does not see; the head is measured again after the seal, below.
     let candidate = successor_from_parts(
         messages,
-        &placeholder,
+        &assumed_parts(messages.len()),
         &note,
         window,
         target,
@@ -1153,21 +1161,68 @@ pub(crate) async fn rollover_for_boundary(
             "rollover canceled; history retained".into(),
         ));
     }
+    let mut next = successor_from_parts(
+        messages,
+        &parts,
+        &stored_note,
+        window,
+        target,
+        turn_start.as_deref(),
+        workers,
+    );
+    // The two checks above were made on an estimate: a head that lists the
+    // parts assumed before the seal. A window cut into more parts than that
+    // has a longer list, about 30 tokens a part, which neither check saw.
+    // Both are made again here on the real head, and while it fails one the
+    // list names one part fewer, the earliest first: that part stays
+    // counted, with the range it covers, and every part stays in the head's
+    // metadata. Nothing is sealed again. A window sealed as one archive is
+    // never touched here.
+    if parts.len() > 1 {
+        let passes = |real: u64| {
+            (time_checkpoint || real.saturating_add(1024) < original) && real < budget
+        };
+        let mut listed = LISTED_PARTS.min(parts.len());
+        let mut real = super::context::estimate_history(&next);
+        while !passes(real) && listed > 1 {
+            next[0] = relisted(&next[0], &parts, listed, listed - 1);
+            listed -= 1;
+            real = super::context::estimate_history(&next);
+        }
+        // With one part listed the list cannot get shorter. That head can
+        // still be longer than the estimate, by fixed wording whatever the
+        // number of parts: the sentence of a split window where one archive
+        // was assumed, and the one about reduced messages (under 200 tokens
+        // together). The shrink check's 1,024 tokens are a margin, and a
+        // rollover that saves that little less is still made. The budget is
+        // a limit, so the head is held to it.
+        if real >= budget {
+            return Err(RuntimeError::Config(format!(
+                "context rollover retained history exceeds the safe request budget (estimated {real} tokens, budget {budget}); history retained"
+            )));
+        }
+    }
     Ok(RolloverPreparation::Ready(PreparedRollover {
-        messages: successor_from_parts(
-            messages,
-            &parts,
-            &stored_note,
-            window,
-            target,
-            turn_start.as_deref(),
-            workers,
-        ),
+        messages: next,
         logical_id,
         epoch,
         window,
         parts,
     }))
+}
+
+/// `head`, the continuation message of a window sealed as `parts`, naming
+/// `to` of them by id where it names `from`. Nothing else in it changes:
+/// the sentence that lists the parts is the first thing in the message.
+fn relisted(head: &SharedMessage, parts: &[ArchivePart], from: usize, to: usize) -> SharedMessage {
+    let mut message = (**head).clone();
+    let text = message["content"].as_str().unwrap_or_default().replacen(
+        &archived_evidence(parts, from).0,
+        &archived_evidence(parts, to).0,
+        1,
+    );
+    message["content"] = Value::String(text);
+    Arc::new(message)
 }
 
 /// Tell extensions which archives a window was sealed as
@@ -4449,6 +4504,182 @@ mod rollover_path_tests {
         restore_window(&next, &restored, &binding);
         let s = restored.lock().unwrap();
         assert_eq!((s.window, s.latest_archive.as_ref()), (2, Some(&last.archive.id)));
+    }
+
+    /// `n` tool calls, each with its result, whose inputs are 40,000 nodes
+    /// each. One archive admits 65,536, so no two of the calls share an
+    /// archive: a window holding them is sealed as at least `n` parts,
+    /// however the store cuts it.
+    fn wide_calls(n: usize) -> Vec<SharedMessage> {
+        let wide = json!(vec![0; 40_000]);
+        let pair = |n: usize| {
+            let id = format!("wide-{n}");
+            let call = json!([{"type":"tool_use","id":id,"name":"plot","input":wide}]);
+            let result = json!([{"type":"tool_result","tool_use_id":id,"content":"plotted"}]);
+            [
+                msg(json!({"role":"assistant","content":call})),
+                msg(json!({"role":"user","content":result})),
+            ]
+        };
+        (0..n).flat_map(pair).collect()
+    }
+
+    /// The size of the head that rollover checks before it seals `messages`
+    /// (no note, no workers, window 2): the one built for the assumed parts.
+    fn checked_size(messages: &[SharedMessage]) -> u64 {
+        let assumed = assumed_parts(messages.len());
+        let candidate = successor_from_parts(messages, &assumed, "", 2, SMALL_TARGET, None, "");
+        estimate_history(&candidate)
+    }
+
+    /// A rollover of `messages` that must fit `budget`.
+    async fn roll_within(
+        messages: &[SharedMessage],
+        state: &SharedContinuation,
+        budget: u64,
+    ) -> Result<RolloverPreparation> {
+        let binding = MemoryBinding::legacy_current();
+        let none = Default::default();
+        rollover_for_boundary(messages, state, &binding, budget, SMALL_TARGET, &none, false, "").await
+    }
+
+    /// How many parts the continuation message of `head` names by id.
+    fn named_in(head: &[SharedMessage]) -> usize {
+        let text = head[0]["content"].as_str().unwrap();
+        let list = text.split(", available via").next().unwrap();
+        list.matches("ctx-").count()
+    }
+
+    /// The shrink check and the budget check are made before the seal, on a
+    /// head that lists as many parts as the message limit alone implies:
+    /// two for this window. It is sealed as at least six, and the head that
+    /// names them all is larger than the one that was checked, by about 30
+    /// tokens a part, which neither check saw: under a budget the checked
+    /// head just fitted, the new window was over it. Both checks are now
+    /// made again on the real head, which names only as many of the last
+    /// parts as pass them.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_window_cut_into_more_parts_than_estimated_names_as_many_as_the_budget_admits() {
+        let _env = BaseDirGuard::new();
+        let mut messages = long_window(4_200);
+        messages.splice(10..10, wide_calls(6));
+        assert_eq!(assumed_parts(messages.len()).len(), 2);
+        let checked = checked_size(&messages);
+        let state = auto_state();
+
+        // With room in the budget every part is named, up to the bound.
+        let roomy = ready(roll_within(&messages, &state, 1_000_000).await);
+        let parts = roomy.parts.clone();
+        assert!(parts.len() >= 6, "the six wide inputs cannot share an archive: {parts:?}");
+        let all = LISTED_PARTS.min(parts.len());
+        assert_eq!(named_in(&roomy.messages), all);
+
+        // A budget the checked head is 40 tokens under, and that head is
+        // not: it is what was checked plus the parts nobody had counted.
+        let budget = checked + 40;
+        let unchecked = estimate_history(&roomy.messages);
+        assert!(unchecked >= budget, "{unchecked} tokens with every part named; {checked} checked");
+        let prepared = ready(roll_within(&messages, &state, budget).await);
+        assert_eq!(prepared.parts, parts);
+        let real = estimate_history(&prepared.messages);
+        assert!(real < budget, "the head is {real} tokens; the budget is {budget}");
+        // Fewer parts are named, and they are the last ones; the others are
+        // counted, with the range they cover.
+        let text = prepared.messages[0]["content"].as_str().unwrap();
+        let listed = named_in(&prepared.messages);
+        assert!((1..all).contains(&listed), "{listed} of {all}: {text}");
+        let (unlisted, named) = parts.split_at(parts.len() - listed);
+        let summary = format!(
+            "in source order: {} earlier archives not listed here (source messages #0-#{}), ctx-{} (#{}-#",
+            unlisted.len(),
+            named[0].first_source_index - 1,
+            named[0].archive.id,
+            named[0].first_source_index,
+        );
+        assert!(text.contains(&summary), "{summary}\n{text}");
+        let mut from = 0;
+        for part in named {
+            let at = text[from..].find(&format!("ctx-{} (", part.archive.id));
+            from += at.expect("the last parts are listed, in order") + 1;
+        }
+        // No more were taken off than had to be: one more does not fit.
+        let mut longer = prepared.messages.clone();
+        longer[0] = relisted(&longer[0], &parts, listed, listed + 1);
+        assert_eq!(named_in(&longer), listed + 1);
+        assert!(estimate_history(&longer) >= budget);
+
+        // The host's record is not shortened: every part, and the last one
+        // as the archive resume reads.
+        let marker = &prepared.messages[0]["_synaps_context"];
+        assert_eq!(marker["archives"].as_array().unwrap().len(), parts.len());
+        assert_eq!(marker["archive"], parts.last().unwrap().archive.id);
+        prepared.commit(&state).unwrap();
+        assert_eq!(state.lock().unwrap().window, 2);
+    }
+
+    /// A window within the message limit is estimated as one archive, with
+    /// the one-archive sentence, and can be sealed as several. Naming one
+    /// part and counting the rest is as short as its list gets, and that
+    /// head is still longer than the estimate, by the wording of the
+    /// split-window sentence: the same however many parts there are. The
+    /// request budget is a limit, so a rollover whose shortest head is not
+    /// under it fails with the history kept, as it does before the seal.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_split_that_was_estimated_as_one_archive_is_held_to_the_budget_with_one_part_named() {
+        let _env = BaseDirGuard::new();
+        let mut messages = vec![user("charter")];
+        messages.extend(wide_calls(6));
+        messages.extend((0..40).map(|i| event(i, 1_100)));
+        messages.extend(tail("t", 200));
+        assert_eq!(assumed_parts(messages.len()).len(), 1);
+        let checked = checked_size(&messages);
+        let state = auto_state();
+
+        // With room in the budget every part is named.
+        let roomy = ready(roll_within(&messages, &state, 1_000_000).await);
+        let parts = roomy.parts.clone();
+        assert!(parts.len() >= 6, "{parts:?}");
+        let all = LISTED_PARTS.min(parts.len());
+        assert_eq!(named_in(&roomy.messages), all);
+        // The shortest head names one part. It is over what was checked by
+        // wording alone.
+        let mut shortest = roomy.messages.clone();
+        shortest[0] = relisted(&shortest[0], &parts, all, 1);
+        let floor = estimate_history(&shortest);
+        let over = floor.saturating_sub(checked);
+        assert!((1..200).contains(&over), "the longer sentence, and no list: {over} tokens");
+
+        // A budget the checked head is under and the shortest real one is
+        // not: the rollover fails and nothing is recorded.
+        for budget in [checked + 1, floor] {
+            let refused = match roll_within(&messages, &state, budget).await {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("budget {budget}: the real head is not under it"),
+            };
+            assert!(refused.contains("exceeds the safe request budget"), "{refused}");
+            assert!(refused.contains("history retained"), "{refused}");
+            let s = state.lock().unwrap();
+            assert_eq!((s.window, s.latest_archive.as_ref()), (1, None));
+        }
+
+        // One token more and it rolls over, one part named.
+        let prepared = ready(roll_within(&messages, &state, floor + 1).await);
+        assert_eq!(prepared.parts, parts);
+        assert_eq!(named_in(&prepared.messages), 1);
+        let text = prepared.messages[0]["content"].as_str().unwrap();
+        let last = parts.last().unwrap();
+        let named = format!(
+            "in source order: {} earlier archives not listed here (source messages #0-#{}), ctx-{} (#{}-#{}, ",
+            parts.len() - 1,
+            last.first_source_index - 1,
+            last.archive.id,
+            last.first_source_index,
+            messages.len() - 1,
+        );
+        assert!(text.contains(&named), "{named}\n{text}");
+        assert_eq!(estimate_history(&prepared.messages), floor);
     }
 
     /// One chat, rolled over once over `window` and saved: the new head goes

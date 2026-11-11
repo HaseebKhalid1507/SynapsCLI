@@ -259,16 +259,27 @@ Earlier eligible source evidence, in source order: ctx-<id A> (source messages #
 - A `#i` in the list of dropped requests is an index in the window. The part
   whose range contains `i` holds that message, as `source_index = i - first`.
 - Two parts with identical content are one archive, listed once per range.
-- At most 32 parts are listed by id: the last 32, which hold the newest
-  messages and the ones the list of dropped requests points at. Earlier parts
-  are counted with the range they cover (`5 earlier archives not listed here
-  (source messages #0-#49), ctx-<id> (#50-#59, 10 archived), ...`) and are
-  found with `memory_search(source=history)`. The bound keeps the message
-  small however a window was cut: each listed part costs about 25 tokens, and
-  the size estimate made before sealing sees only as many parts as the
-  message limit alone implies. More than 32 parts takes several messages that
-  are each over a limit by themselves (each is a part of its own and cuts the
-  messages around it into more parts).
+- At most 32 parts are listed by id, always the last ones, which hold the
+  newest messages. Earlier parts are counted with the range they cover (`5
+  earlier archives not listed here (source messages #0-#49), ctx-<id>
+  (#50-#59, 10 archived), ...`) and are found with
+  `memory_search(source=history)`.
+- Fewer are listed when naming them all would fail a check. The new window's
+  size is estimated before the seal, when the parts are not known, and the
+  estimate assumes as many parts as the message limit alone implies: one for
+  a window of up to 4,096 messages. Both checks (does the rollover make the
+  window more than 1,024 tokens smaller, is the new window under the request
+  budget) are made on that estimate. After the seal both are made again on
+  the real message, and while it fails one, a part is taken off the list,
+  earliest first, down to one. A listed part costs about 30 tokens. Nothing
+  is sealed again, and every part stays in the marker (below).
+- With one part listed the list cannot get shorter. A window that was taken
+  for one archive and sealed as several is then still longer than the
+  estimate, by the wording of the longer sentence: under 200 tokens whatever
+  the number of parts. The 1,024 tokens of the first check are a margin, and
+  a rollover that saves that little less is still made. The request budget
+  is a limit: a rollover whose message is not under it with one part listed
+  fails with the history kept, as it does before the seal.
 - A stub for a first request too large to keep names the part that holds it.
 
 **The marker.** `_synaps_context.archive` is the id of the last part, the one
