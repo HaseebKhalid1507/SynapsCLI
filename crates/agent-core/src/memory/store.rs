@@ -1043,7 +1043,8 @@ pub struct ImportedLine {
     /// The line's id, if the line was read far enough to have one.
     pub id: Option<String>,
     /// The key of the project whose file the line was judged against, if it
-    /// got that far.
+    /// got that far. For a tombstone line as recorded that was applied to
+    /// more than one project, the first of them by key.
     pub project: Option<String>,
     /// Whether the line is a tombstone line rather than a note.
     pub tombstone: bool,
@@ -1070,11 +1071,17 @@ pub struct ImportedLine {
 pub struct ImportRun {
     dry_run: bool,
     files: std::collections::HashMap<PathBuf, ImportFile>,
+    /// Ids of tombstone lines this run refused because no project could be
+    /// found for them. A note with such an id is refused for the rest of
+    /// the run: storing it would bring a forgotten note back.
+    unfiled_tombstones: std::collections::HashSet<String>,
     finished: bool,
 }
 
 #[derive(Debug)]
 struct ImportFile {
+    /// The key of the project whose file this is.
+    key: String,
     /// The file's records by id, by the reader's rule. A file can hold an id
     /// more than once.
     notes: std::collections::HashMap<String, Vec<MemoryRecord>>,
@@ -1091,6 +1098,7 @@ impl ImportRun {
         Self {
             dry_run,
             files: std::collections::HashMap::new(),
+            unfiled_tombstones: std::collections::HashSet::new(),
             finished: false,
         }
     }
@@ -1117,12 +1125,27 @@ impl ImportRun {
                     }
                 }
                 Ok(vacant.insert(ImportFile {
+                    key: key.to_string(),
                     notes,
                     tombstoned: lines.tombstoned,
                     appended: false,
                 }))
             }
         }
+    }
+
+    /// The projects in whose files this run has seen `id`, as a note or as a
+    /// tombstone, sorted. Only files the run has read: those a line of the
+    /// run was filed in or judged against.
+    fn projects_holding(&self, id: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .files
+            .values()
+            .filter(|file| file.notes.contains_key(id) || file.tombstoned.contains(id))
+            .map(|file| file.key.clone())
+            .collect();
+        keys.sort();
+        keys
     }
 
     /// End the run: sync every file it appended to, then the directory of
@@ -1193,6 +1216,13 @@ impl Drop for ImportRun {
 /// live, [`ImportOutcome::Stored`] if the file did not have it (a later
 /// import of that note then stays forgotten).
 ///
+/// A tombstone line names no project. Under [`ImportTarget::AsRecorded`] it
+/// is applied to the project in whose file this run has seen its id (to
+/// each, if the run has seen the id in more than one), and refused only
+/// when there is none. A note with the id of a tombstone line that was
+/// refused that way is then refused too, for the rest of the run, whatever
+/// its target: a forgotten note never comes out of an import live.
+///
 /// In a dry run ([`ImportRun::new`]) nothing is written, created or synced,
 /// and the outcomes are the ones the real run gives from the same files.
 /// `run` is the state of one run; end the run with [`ImportRun::finish`].
@@ -1227,6 +1257,9 @@ pub fn import_line_in(
     Ok(about)
 }
 
+/// Why a note is refused after its tombstone line was.
+const UNFILED_TOMBSTONE: &str = "its tombstone in this run could not be filed";
+
 fn refused(reason: &str) -> Result<ImportOutcome, MemoryError> {
     Ok(ImportOutcome::Refused(reason.to_string()))
 }
@@ -1245,6 +1278,9 @@ fn import_note(
         return refused("invalid id");
     }
     about.id = Some(id.clone());
+    if run.unfiled_tombstones.contains(&id) {
+        return refused(UNFILED_TOMBSTONE);
+    }
     let Some(recorded) = note.project.clone() else {
         return refused("missing field project");
     };
@@ -1299,25 +1335,42 @@ fn import_tombstone(
         return refused("invalid id");
     }
     about.id = Some(tombstone.tombstone.clone());
-    let ImportTarget::Project(key) = target else {
-        return refused("a tombstone line names no project; pass --cwd or --project-key");
+    let keys = match target {
+        ImportTarget::Project(key) => vec![key.to_string()],
+        ImportTarget::AsRecorded => run.projects_holding(&tombstone.tombstone),
     };
-    about.project = Some(key.to_string());
+    if keys.is_empty() {
+        run.unfiled_tombstones.insert(tombstone.tombstone);
+        return refused(
+            "a tombstone line names no project and this run has not seen its id; \
+             pass --cwd or --project-key",
+        );
+    }
+    about.project = keys.first().cloned();
     let dry_run = run.dry_run;
-    let file = run.file(base, key)?;
-    if file.tombstoned.contains(&tombstone.tombstone) {
-        return Ok(ImportOutcome::AlreadyPresent);
+    let (mut forgot, mut stored) = (false, false);
+    for key in &keys {
+        let file = run.file(base, key)?;
+        if file.tombstoned.contains(&tombstone.tombstone) {
+            continue;
+        }
+        if !dry_run {
+            append_tombstone(base, &project_namespace(key), &tombstone, false)?;
+            file.appended = true;
+        }
+        if file.notes.contains_key(&tombstone.tombstone) {
+            forgot = true;
+        } else {
+            stored = true;
+        }
+        file.tombstoned.insert(tombstone.tombstone.clone());
     }
-    if !dry_run {
-        append_tombstone(base, &project_namespace(key), &tombstone, false)?;
-        file.appended = true;
-    }
-    let was_live = file.notes.contains_key(&tombstone.tombstone);
-    file.tombstoned.insert(tombstone.tombstone);
-    Ok(if was_live {
+    Ok(if forgot {
         ImportOutcome::Forgotten
-    } else {
+    } else if stored {
         ImportOutcome::Stored
+    } else {
+        ImportOutcome::AlreadyPresent
     })
 }
 
@@ -2446,8 +2499,9 @@ mod tests {
             ),
             (r#"{"tombstone":"mem-x"}"#.to_string(), "missing field timestamp_ms"),
             (
-                r#"{"tombstone":"mem-x","timestamp_ms":1}"#.to_string(),
-                "a tombstone line names no project; pass --cwd or --project-key",
+                r#"{"tombstone":"mem-gone","timestamp_ms":1}"#.to_string(),
+                "a tombstone line names no project and this run has not seen its id; \
+                 pass --cwd or --project-key",
             ),
         ];
         let mut run = ImportRun::new(false);
@@ -2469,6 +2523,145 @@ mod tests {
             ImportOutcome::Stored
         );
         assert_eq!(run.finish().unwrap().len(), 1);
+    }
+
+    /// A tombstone line as recorded, in both orders, and the refused case
+    /// (cut-spec A3, "The one change to the built code").
+    #[test]
+    fn a_tombstone_as_recorded_is_filed_where_the_run_saw_its_id_or_keeps_its_note_out() {
+        let (a, b) = ("p1111111111111111", "p2222222222222222");
+        let as_recorded = ImportTarget::AsRecorded;
+        let tombstone = |id: &str| format!(r#"{{"tombstone":"{id}","timestamp_ms":9}}"#);
+        let file = |base: &Path, key: &str| namespace_file(base, &project_namespace(key));
+        let live = |base: &Path, key: &str| -> Vec<String> {
+            let scanned = scan_project_file(base, key).unwrap();
+            let mut ids: Vec<String> = scanned
+                .records
+                .iter()
+                .filter_map(|record| record.id.clone())
+                .filter(|id| !scanned.tombstoned.contains(id))
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        for dry_run in [true, false] {
+            // Note before tombstone: the run has seen the id in project a's
+            // file, so the tombstone is filed there.
+            let tmp = TempDir::new().unwrap();
+            let base = tmp.path();
+            let mut run = ImportRun::new(dry_run);
+            for (id, key) in [("mem-1", a), ("mem-2", a), ("mem-3", b)] {
+                import(base, &exported(id, key, 1, "x"), as_recorded, &mut run);
+            }
+            let forgotten = import(base, &tombstone("mem-1"), as_recorded, &mut run);
+            assert_eq!(
+                forgotten,
+                ImportedLine {
+                    outcome: ImportOutcome::Forgotten,
+                    id: Some("mem-1".into()),
+                    project: Some(a.into()),
+                    tombstone: true,
+                }
+            );
+            // The same tombstone again, and the note again.
+            assert_eq!(
+                import(base, &tombstone("mem-1"), as_recorded, &mut run).outcome,
+                ImportOutcome::AlreadyPresent
+            );
+            assert_eq!(
+                import(base, &exported("mem-1", a, 1, "x"), as_recorded, &mut run).outcome,
+                ImportOutcome::KeptForgotten
+            );
+
+            // Tombstone before note: the run has not seen the id, so there
+            // is no project to file it under. Both lines are refused.
+            let refused = import(base, &tombstone("mem-9"), as_recorded, &mut run);
+            assert_eq!(
+                refusal(&refused),
+                "a tombstone line names no project and this run has not seen its id; \
+                 pass --cwd or --project-key"
+            );
+            assert_eq!((refused.id.as_deref(), refused.project), (Some("mem-9"), None));
+            let late = import(base, &exported("mem-9", a, 1, "x"), as_recorded, &mut run);
+            assert_eq!(refusal(&late), "its tombstone in this run could not be filed");
+            // Under a named project too: the run cannot tell that this is
+            // not the note the tombstone forgot.
+            let late = import(base, &exported("mem-9", a, 1, "x"), ImportTarget::Project(b), &mut run);
+            assert_eq!(refusal(&late), "its tombstone in this run could not be filed");
+            // Other notes go on as before.
+            assert_eq!(
+                import(base, &exported("mem-4", b, 1, "x"), as_recorded, &mut run).outcome,
+                ImportOutcome::Stored
+            );
+
+            let files = run.finish().unwrap();
+            if dry_run {
+                assert!(files.is_empty());
+                assert!(!memory_dir_in(base).exists(), "a dry run writes nothing");
+                continue;
+            }
+            assert_eq!(files, [file(base, a), file(base, b)]);
+            assert_eq!(live(base, a), ["mem-2"]);
+            assert_eq!(live(base, b), ["mem-3", "mem-4"]);
+            let text = fs::read_to_string(file(base, a)).unwrap();
+            assert_eq!(text.lines().last(), Some(tombstone("mem-1").as_str()));
+            assert_eq!(text.matches("tombstone").count(), 1);
+            assert!(!text.contains("mem-9"));
+            assert!(!fs::read_to_string(file(base, b)).unwrap().contains("mem-9"));
+        }
+
+        // Tombstone then note, as recorded, in a store with nothing in it:
+        // both refused, nothing written (the spec's one test).
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let mut run = ImportRun::new(false);
+        let first = import(base, &tombstone("mem-1"), as_recorded, &mut run);
+        let second = import(base, &exported("mem-1", a, 1, "x"), as_recorded, &mut run);
+        assert_eq!(first.outcome.name(), "refused");
+        assert_eq!(refusal(&second), "its tombstone in this run could not be filed");
+        assert!(run.finish().unwrap().is_empty());
+        assert!(!memory_dir_in(base).exists());
+        // The refusal belongs to the run: a new run stores the note.
+        let mut run = ImportRun::new(false);
+        assert_eq!(
+            import(base, &exported("mem-1", a, 1, "x"), as_recorded, &mut run).outcome,
+            ImportOutcome::Stored
+        );
+
+        // An id the run has seen in two projects' files (a note filed twice)
+        // is forgotten in both.
+        let again = exported("mem-1", a, 1, "x");
+        assert_eq!(
+            import(base, &again, ImportTarget::Project(b), &mut run).outcome,
+            ImportOutcome::Stored
+        );
+        let both = import(base, &tombstone("mem-1"), as_recorded, &mut run);
+        assert_eq!(
+            (both.outcome, both.project.as_deref()),
+            (ImportOutcome::Forgotten, Some(a))
+        );
+        run.finish().unwrap();
+        assert!(live(base, a).is_empty() && live(base, b).is_empty());
+
+        // A note that is in a file from an earlier run is seen once a line
+        // of this run is judged against that file.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let mut earlier = ImportRun::new(false);
+        import(base, &exported("mem-1", a, 1, "x"), as_recorded, &mut earlier);
+        earlier.finish().unwrap();
+        let mut run = ImportRun::new(false);
+        assert_eq!(
+            import(base, &exported("mem-1", a, 1, "x"), as_recorded, &mut run).outcome,
+            ImportOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            import(base, &tombstone("mem-1"), as_recorded, &mut run).outcome,
+            ImportOutcome::Forgotten
+        );
+        run.finish().unwrap();
+        assert!(live(base, a).is_empty());
     }
 
     /// A `null` and an absent field say the same, and absent `tags` are no
