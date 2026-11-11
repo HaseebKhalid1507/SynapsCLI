@@ -858,6 +858,161 @@ impl Record {
     }
 }
 
+/// What [`ArchiveStore::import`] did with one record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportOutcome {
+    /// Written, as a new file under the record's own id.
+    Stored,
+    /// The store already holds this content under this id, in the same
+    /// state (live, or a tombstone). Nothing was written; the stored note,
+    /// `created_ms` and file time stay. `note_differs`: both are live and
+    /// the stored note is not the record's.
+    Present { note_differs: bool },
+    /// The record is a tombstone and the store held the archive live: it
+    /// was forgotten, by the store's own forget.
+    Forgotten,
+    /// The record is live and the store holds its tombstone. Nothing was
+    /// written: an import does not undo a forget.
+    KeptForgotten,
+}
+
+/// One record an import accepted. Nothing in it is content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Imported {
+    pub outcome: ImportOutcome,
+    /// The record's id, which is the id it is stored under.
+    pub id: String,
+    /// Whether the record that came in is live (not a tombstone).
+    pub live: bool,
+    /// The messages in the record that came in; 0 for a tombstone.
+    pub message_count: usize,
+    /// The shelf the record's file is on, or in a dry run would be written
+    /// to. `None` when the store holds it in a legacy slot file.
+    pub shelf: Option<String>,
+    /// The id of another live archive of this store with the same content
+    /// (the same digest), found where a seal looks. The record is stored
+    /// under its own id all the same.
+    pub same_content_as: Option<String>,
+    /// For [`ImportOutcome::Forgotten`]: [`Forgotten::unread`] of the
+    /// forget. `Some` means a copy of the content may not have been reached.
+    pub unread: Option<String>,
+}
+
+/// Why an import refused one record: the record's fault, not the machine's.
+/// Nothing was written for it, and the next record can be tried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRefused {
+    /// The check that failed. Never content: at most a version number, a
+    /// column, digests and ids.
+    pub reason: String,
+    /// The record's id, when the line got far enough to have a valid one.
+    pub id: Option<String>,
+}
+
+/// What a dry run of an import has "written" so far, so that a later line
+/// of the same run is judged as the real run would judge it. One for a whole
+/// run, over every file and project of it. A real run does not use it.
+#[derive(Default)]
+pub struct ImportSeen {
+    projects: HashMap<String, Planned>,
+}
+
+/// One project directory of a dry run.
+#[derive(Default)]
+struct Planned {
+    /// The files the run would have written, by id.
+    ids: HashMap<String, Held>,
+    /// The digests the run would have forgotten: every copy is a tombstone.
+    forgotten: std::collections::HashSet<String>,
+    /// The newest shelf's number and how many segment files it holds.
+    shelf: Option<(u64, usize)>,
+}
+
+/// What is under an id: in the store, or in a dry run's plan.
+#[derive(Clone)]
+struct Held {
+    digest: String,
+    /// The note of a live record; `None` for a tombstone.
+    note: Option<String>,
+    shelf: Option<String>,
+}
+
+/// What is where a seal would look for a digest: under its two halves on
+/// the shelves and, by digest, in the legacy slots.
+#[derive(Default)]
+struct Probe {
+    /// A tombstone of the digest, or a damaged file that still says so.
+    forgotten: bool,
+    /// The id of a live record of the digest.
+    live: Option<String>,
+    /// A shelf has the digest, live or forgotten, under one of the halves:
+    /// what a forget takes for "a seal already finds it".
+    held: bool,
+    /// The first of the two halves no shelf has a file under.
+    free: Option<String>,
+}
+
+impl Planned {
+    /// The shelf the next file of the dry run would go to, as
+    /// [`ArchiveStore::writable_shelf`] chooses it for a store whose
+    /// shelves can all be opened, counting that file.
+    fn shelve(&mut self, store: Option<&ArchiveStore>, shelves: &[String]) -> String {
+        let (number, held) = self.shelf.get_or_insert_with(|| {
+            let newest = shelves.first().and_then(|name| Some((shelf_number(name)?, name)));
+            let Some((number, name)) = newest else {
+                return (0, SHELF_FILES);
+            };
+            let names = store
+                .and_then(|store| store.fs.open_child(name, true).ok().flatten())
+                .and_then(|shelf| shelf.names().ok());
+            // A shelf that cannot be read is not written to either.
+            let held = names.map_or(SHELF_FILES, |names| {
+                names.iter().filter(|(name, ..)| name.ends_with(".json")).count()
+            });
+            (number, held)
+        });
+        if *held >= SHELF_FILES {
+            *number += 1;
+            *held = 0;
+        }
+        *held += 1;
+        shelf_name(*number)
+    }
+}
+
+/// The directory name of a project: what `scope` is in its records.
+pub fn project_scope(scope_key: &str) -> io::Result<String> {
+    validate_key(scope_key)?;
+    Ok(digest_parts(&[scope_key.as_bytes()]))
+}
+
+/// The `scope` of a record line: the project directory it says it is of,
+/// for an import that files each record where it was. Nothing else of the
+/// line is looked at, so `Ok` does not say the line is a record. A line
+/// that is not JSON with a `scope` of 64 lowercase hex characters is
+/// refused, with the reason and never the line.
+pub fn record_scope(line: &[u8]) -> Result<String, ImportRefused> {
+    #[derive(Deserialize)]
+    struct Scoped {
+        scope: String,
+    }
+    let refused = |reason: String| ImportRefused { reason, id: None };
+    let scoped: Scoped =
+        serde_json::from_slice(line).map_err(|error| refused(Fault::Parse(error).to_string()))?;
+    if !is_scope(&scoped.scope) {
+        return Err(refused("invalid scope".to_owned()));
+    }
+    Ok(scoped.scope)
+}
+
+/// A project directory's name: 64 lowercase hex characters.
+fn is_scope(scope: &str) -> bool {
+    scope.len() == 64 && lower_hex(scope)
+}
+fn lower_hex(text: &str) -> bool {
+    text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 impl ArchiveStore {
     /// Open a project's archive for a seal or a forget. Creates the base,
     /// `context-archives` and project directories if they are missing, makes
@@ -1200,15 +1355,39 @@ impl ArchiveStore {
     /// The digest is looked at as text first: it is sliced into the two ids
     /// later, and only 64 ASCII characters can be.
     fn admit(&self, projection: &ArchiveProjection) -> io::Result<()> {
-        let digest = projection.digest.as_str();
+        // A store opened by its directory ([`Self::for_scope`]) is of no
+        // chat: it imports and reads, and has nothing to seal as.
+        if self.logical.is_empty() {
+            return Err(invalid("archive store was opened for a project, not a chat: no seal"));
+        }
+        let count = projection.source_message_count;
+        Self::admit_content(
+            &self.logical,
+            &projection.logical_id,
+            count,
+            &projection.messages,
+            &projection.digest,
+        )
+    }
+
+    /// The checks of [`Self::admit`], which an import is put through too,
+    /// as the chat its record names: the digest is 64 hex characters, the
+    /// content is of the chat `chat`, and `digest` is the digest of this
+    /// content, computed here and never taken from where it came from.
+    fn admit_content(
+        chat: &str,
+        logical: &str,
+        count: usize,
+        messages: &[ArchivedMessage],
+        digest: &str,
+    ) -> io::Result<()> {
         if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(invalid("archive projection digest is not 64 hex characters"));
         }
-        if projection.logical_id != self.logical {
+        if logical != chat {
             return Err(invalid("archive projection is of another chat"));
         }
-        let count = projection.source_message_count;
-        if projection_digest(&projection.logical_id, count, &projection.messages)? != digest {
+        if projection_digest(logical, count, messages)? != digest {
             return Err(invalid("archive projection digest is not the digest of its content"));
         }
         Ok(())
@@ -1265,7 +1444,7 @@ impl ArchiveStore {
             // Same projection, same names in the same order.
             for half in [0..32, 32..64] {
                 let id = &record.digest[half];
-                match self.shelved(&shelves, id, &record.digest)? {
+                match self.shelved(&shelves, id, &record.digest, false)? {
                     Shelved::This(_, found) if matches!(found.body, Body::Tombstone) => {
                         return Err(forgotten());
                     }
@@ -1283,7 +1462,7 @@ impl ArchiveStore {
             }
             if !legacy_read {
                 // Sealed before shelves existed, under a random id.
-                if let Some(found) = self.legacy_projection(&record.digest)? {
+                if let Some(found) = self.legacy_projection(&record.digest, false)? {
                     return Self::already(&self.fs, &found);
                 }
                 legacy_read = true;
@@ -1297,7 +1476,7 @@ impl ArchiveStore {
             // What is about to be written is what a read must accept.
             self.readable(&name, &bytes)?;
             // Created new: a file that is already there is never renamed over.
-            let shelf = self.writable_shelf(&shelves)?;
+            let (shelf, _) = self.writable_shelf(&shelves)?;
             match shelf.publish_dated(&name, &bytes, true, written.modified) {
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 result => return result.and_then(|()| Ok((record.reference()?, note))),
@@ -1338,6 +1517,9 @@ impl ArchiveStore {
     /// that will pass ([`PrivateDir::passing`]) fails the seal instead: the
     /// shelf is healthy, and what it holds must be seen first.
     ///
+    /// `readonly`, for a dry run of an import: no shelf or file is made
+    /// private on the way.
+    ///
     /// A file under the name that is not this projection, or is not a file
     /// the store reads (a link, a FIFO, a directory, a file that is not ours
     /// alone or is too large), has the name taken, and it is left exactly as
@@ -1348,11 +1530,17 @@ impl ArchiveStore {
     /// and it may be this very segment: that error fails the seal, which the
     /// caller retries, instead of sending the projection to its other name
     /// as a second copy.
-    fn shelved(&self, shelves: &[String], id: &str, digest: &str) -> io::Result<Shelved> {
+    fn shelved(
+        &self,
+        shelves: &[String],
+        id: &str,
+        digest: &str,
+        readonly: bool,
+    ) -> io::Result<Shelved> {
         let name = archive_name(id);
         let mut taken = false;
         for shelf in shelves {
-            let dir = match self.fs.open_child(shelf, false) {
+            let dir = match self.fs.open_child(shelf, readonly) {
                 Ok(Some(dir)) => dir,
                 Ok(None) => continue,
                 Err(error) if PrivateDir::passing(&error) => return Err(error),
@@ -1361,7 +1549,7 @@ impl ArchiveStore {
                     continue;
                 }
             };
-            let raw = match dir.read_with(&name, MAX_SEGMENT_BYTES, false) {
+            let raw = match dir.read_with(&name, MAX_SEGMENT_BYTES, readonly) {
                 Ok(Some(raw)) => raw,
                 Ok(None) => continue,
                 Err(error) if PrivateDir::not_a_segment(&error) => {
@@ -1588,6 +1776,12 @@ impl ArchiveStore {
     pub fn forget(&self, id: &str) -> io::Result<Forgotten> {
         validate_id(id)?;
         let _lock = self.exclusive()?;
+        self.forget_locked(id)
+    }
+
+    /// [`forget`](Self::forget) for a caller that holds the lock: an import
+    /// that was given a tombstone for an archive the store holds live.
+    fn forget_locked(&self, id: &str) -> io::Result<Forgotten> {
         let (shelves, slots) = self.layout()?;
         // The record asked for says which content to forget.
         let mut unread = Unread::default();
@@ -1686,7 +1880,7 @@ impl ArchiveStore {
                     body: Body::Tombstone,
                 };
                 let bytes = bounded_json(&guard, MAX_SEGMENT_BYTES)?;
-                let shelf = self.writable_shelf(&shelves)?;
+                let (shelf, _) = self.writable_shelf(&shelves)?;
                 match shelf.publish(&archive_name(id), &bytes, true) {
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     result => {
@@ -1795,6 +1989,392 @@ impl ArchiveStore {
             .collect())
     }
 
+    /// Open the project directory named `scope` (64 lowercase hex
+    /// characters, what a record's `scope` is), for an import. Creates what
+    /// is missing and makes it private, as [`new`](Self::new) does. The
+    /// store is of no chat: it imports, reads and forgets, and a seal
+    /// through it is refused.
+    pub fn for_scope(base: &Path, scope: &str) -> io::Result<Self> {
+        if !is_scope(scope) {
+            return Err(invalid("archive scope must be 64 lowercase hex characters"));
+        }
+        let fs = PrivateDir::new(base, scope)?;
+        Ok(Self::opened(fs, base, scope.to_owned(), String::new()))
+    }
+
+    /// [`for_scope`](Self::for_scope) that creates and changes nothing, as
+    /// [`open_existing`](Self::open_existing): `None` when the project has
+    /// no directory. What a dry run of an import opens.
+    pub fn existing_scope(base: &Path, scope: &str) -> io::Result<Option<Self>> {
+        if !is_scope(scope) {
+            return Err(invalid("archive scope must be 64 lowercase hex characters"));
+        }
+        match PrivateDir::open_existing(base, scope) {
+            Ok(fs) => Ok(Some(Self::opened(fs, base, scope.to_owned(), String::new()))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The project directory's name: the `scope` of every record in it.
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    /// Bring one archive record into this project, as it is: `line` is the
+    /// JSON object an archive file holds. It is stored under its own id
+    /// with its own `logical`, `digest`, `created_ms`, messages and note;
+    /// nothing is recomputed to make it fit. The one field an import may
+    /// change is `scope`: with `rehome` it is set to this project's,
+    /// whatever the line says (the scope is not in the digest); without,
+    /// a record of another project is refused.
+    ///
+    /// The outer error is the machine's (I/O, the lock held too long, a
+    /// file under the id that cannot be read as a record, a shelf or slot
+    /// that cannot be read and may hold the id): stop, and run again
+    /// later. The inner one is the record's ([`ImportRefused`]): nothing was
+    /// written for it. What is refused: a line that is not exactly a
+    /// record; whatever a read of the store refuses, by the store's own
+    /// check on the bytes that would be written, with the check's name; a
+    /// digest that is not the digest of the content, computed here; a
+    /// `message` that is not an object; an id that holds other content;
+    /// live content that was forgotten in this store; a tombstone of
+    /// content this store holds live under another id.
+    ///
+    /// An id is looked up as a fetch looks it up (every shelf, then the
+    /// legacy slots), a digest as a seal does (its two halves on every
+    /// shelf, then the slots). Importing a line a second time is
+    /// [`ImportOutcome::Present`] and changes nothing. No file is ever
+    /// replaced, except by the forget of [`ImportOutcome::Forgotten`]. A
+    /// live record with `created_ms` gets that as its file's time.
+    ///
+    /// `dry_run` writes nothing at all (no file, shelf, lock file or mode)
+    /// and answers what the real run would, given `seen`, which carries
+    /// what the earlier lines of the run would have written. For a project
+    /// that has no directory yet, see [`Self::import_dry_absent`].
+    pub fn import(
+        &self,
+        line: &[u8],
+        rehome: bool,
+        dry_run: bool,
+        seen: &mut ImportSeen,
+    ) -> io::Result<Result<Imported, ImportRefused>> {
+        Self::import_in(Some(self), &self.scope, line, rehome, dry_run, seen)
+    }
+
+    /// The dry run of [`import`](Self::import) into the project directory
+    /// `scope` when it does not exist ([`existing_scope`](Self::existing_scope)
+    /// is `None`): an empty store, and nothing is created.
+    pub fn import_dry_absent(
+        scope: &str,
+        line: &[u8],
+        rehome: bool,
+        seen: &mut ImportSeen,
+    ) -> io::Result<Result<Imported, ImportRefused>> {
+        if !is_scope(scope) {
+            return Err(invalid("archive scope must be 64 lowercase hex characters"));
+        }
+        Self::import_in(None, scope, line, rehome, true, seen)
+    }
+
+    fn import_in(
+        store: Option<&Self>,
+        scope: &str,
+        line: &[u8],
+        rehome: bool,
+        dry_run: bool,
+        seen: &mut ImportSeen,
+    ) -> io::Result<Result<Imported, ImportRefused>> {
+        let refuse = |reason: String, id: Option<&str>| {
+            Ok(Err(ImportRefused {
+                reason,
+                id: id.map(str::to_owned),
+            }))
+        };
+        let mut record: Record = match serde_json::from_slice(line) {
+            Ok(record) => record,
+            Err(error) => return refuse(Fault::Parse(error).to_string(), None),
+        };
+        let id = validate_id(&record.id).is_ok().then(|| record.id.clone());
+        let id = id.as_deref();
+        if !is_scope(&record.scope) {
+            return refuse("invalid scope".to_owned(), id);
+        }
+        if rehome {
+            scope.clone_into(&mut record.scope);
+        }
+        // The bytes that will be the file, and the store's own check of
+        // them: what is validated is what is written.
+        let Ok(bytes) = bounded_json(&record, MAX_SEGMENT_BYTES) else {
+            return refuse("over the 16 MiB archive size".to_owned(), id);
+        };
+        let name = archive_name(&record.id);
+        let record = match Self::parsed(scope, &name, &bytes) {
+            Ok(record) => record,
+            Err(fault) => return refuse(fault.to_string(), id),
+        };
+        // A seal's digest is lowercase, and so are the two ids cut from it.
+        if !lower_hex(&record.digest) {
+            return refuse(Fault::Digest.to_string(), id);
+        }
+        let mut modified = None;
+        if let Body::Live {
+            source_message_count,
+            messages,
+            ..
+        } = &record.body
+        {
+            if !messages.iter().all(|archived| archived.message.is_object()) {
+                return refuse("message is not an object".to_owned(), id);
+            }
+            // As a seal is admitted, as the chat the record names.
+            let (logical, digest) = (&record.logical, &record.digest);
+            let admitted =
+                Self::admit_content(logical, logical, *source_message_count, messages, digest);
+            if let Err(error) = admitted {
+                return refuse(error.to_string(), id);
+            }
+            if let Some(created_ms) = record.created_ms {
+                let time = std::time::UNIX_EPOCH.checked_add(Duration::from_millis(created_ms));
+                let Some(time) = time else {
+                    return refuse("created_ms is not a time a file can have".to_owned(), id);
+                };
+                modified = Some(time);
+            }
+        }
+        let incoming = match &record.body {
+            Body::Live { note, .. } => Some(note.as_str()),
+            Body::Tombstone => None,
+        };
+        let message_count = match &record.body {
+            Body::Live { messages, .. } => messages.len(),
+            Body::Tombstone => 0,
+        };
+        let digest = record.digest.as_str();
+        let mut plan = match dry_run {
+            true => Some(seen.projects.entry(scope.to_owned()).or_default()),
+            false => None,
+        };
+        // A real run holds the lock from here to the end. A dry run reads
+        // as a fetch reads: the lock shared, and only for the legacy slots.
+        let mut _lock = None;
+        let (shelves, slots) = match (store, dry_run) {
+            (Some(store), false) => {
+                _lock = Some(store.exclusive()?);
+                store.layout()?
+            }
+            (Some(store), true) => {
+                store.check_abort()?;
+                let layout = store.layout()?;
+                if !layout.1.is_empty() {
+                    _lock = Some(store.shared()?);
+                }
+                layout
+            }
+            (None, true) => Default::default(),
+            (None, false) => return Err(invalid("an import that writes needs a store")),
+        };
+
+        // What is under the id, looked up as a fetch and a forget do.
+        let mut found = plan.as_ref().and_then(|plan| plan.ids.get(&record.id).cloned());
+        if let (None, Some(store)) = (&found, store) {
+            let mut unread = Unread::default();
+            let located = match store.locate(&shelves, &record.id, dry_run, &mut unread)? {
+                Some(located) if located.forgotten => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "a damaged file under this archive id says its content was forgotten, \
+                         over a valid record on an older shelf",
+                    ));
+                }
+                Some(located) => Some((Some(located.shelf), located.record)),
+                None => store
+                    .legacy_segment(&slots, &record.id, dry_run, &mut unread)
+                    .map(|(_, record)| (None, record)),
+            };
+            if located.is_none() && unread.places > 0 {
+                // The id may be in what could not be read.
+                return Err(unread.not_found());
+            }
+            found = located.map(|(shelf, held)| Held {
+                digest: held.digest,
+                note: match held.body {
+                    Body::Live { note, .. } => Some(note),
+                    Body::Tombstone => None,
+                },
+                shelf,
+            });
+        }
+        if let (Some(held), Some(plan)) = (&mut found, &plan) {
+            if plan.forgotten.contains(&held.digest) {
+                held.note = None;
+            }
+        }
+        let imported = |outcome, shelf, same_content_as, unread| {
+            Ok(Ok(Imported {
+                outcome,
+                id: record.id.clone(),
+                live: incoming.is_some(),
+                message_count,
+                shelf,
+                same_content_as,
+                unread,
+            }))
+        };
+        if let Some(held) = found {
+            if held.digest != digest {
+                return refuse("id already holds different content".to_owned(), id);
+            }
+            let mut unread = None;
+            let outcome = match (held.note.as_deref(), incoming) {
+                (Some(stored), Some(note)) => ImportOutcome::Present {
+                    note_differs: stored != note,
+                },
+                (None, None) => ImportOutcome::Present { note_differs: false },
+                (None, Some(_)) => ImportOutcome::KeptForgotten,
+                (Some(_), None) => {
+                    match (&mut plan, store) {
+                        (Some(plan), _) => {
+                            // What the store's forget would write: the
+                            // tombstone a seal finds, if none is there.
+                            let probe =
+                                Self::probe(store, Some(&**plan), &shelves, digest, true)?;
+                            if let (false, Some(free)) = (probe.held, probe.free) {
+                                let shelf = Some(plan.shelve(store, &shelves));
+                                let guard = Held {
+                                    digest: digest.to_owned(),
+                                    note: None,
+                                    shelf,
+                                };
+                                plan.ids.insert(free, guard);
+                            }
+                            plan.forgotten.insert(digest.to_owned());
+                            for planned in plan.ids.values_mut() {
+                                if planned.digest == digest {
+                                    planned.note = None;
+                                }
+                            }
+                        }
+                        (None, Some(store)) => unread = store.forget_locked(&record.id)?.unread,
+                        (None, None) => {}
+                    }
+                    ImportOutcome::Forgotten
+                }
+            };
+            return imported(outcome, held.shelf, None, unread);
+        }
+
+        // Nothing under the id. Where a seal would look for the content:
+        let probe = Self::probe(store, plan.as_deref(), &shelves, digest, dry_run)?;
+        let mut same_content_as = None;
+        if incoming.is_some() {
+            if probe.forgotten {
+                return refuse("this content was forgotten in this store".to_owned(), id);
+            }
+            same_content_as = probe.live;
+        } else if let Some(other) = probe.live {
+            // A tombstone for content that is live here under another id.
+            // Publishing it would leave that copy readable beside it, and
+            // forgetting a record the line does not name is not this
+            // line's to decide.
+            let reason = format!(
+                "a tombstone of content that is live in this store as {other}: forget that \
+                 archive here, then import again"
+            );
+            return refuse(reason, id);
+        }
+        let shelf = match (plan, store) {
+            (Some(plan), _) => {
+                let shelf = plan.shelve(store, &shelves);
+                let held = Held {
+                    digest: digest.to_owned(),
+                    note: incoming.map(str::to_owned),
+                    shelf: Some(shelf.clone()),
+                };
+                plan.ids.insert(record.id.clone(), held);
+                shelf
+            }
+            (None, Some(store)) => {
+                // Created new, under its own id: never renamed over a file.
+                let (dir, shelf) = store.writable_shelf(&shelves)?;
+                dir.publish_dated(&name, &bytes, true, modified)?;
+                shelf
+            }
+            (None, None) => return Err(invalid("an import that writes needs a store")),
+        };
+        imported(ImportOutcome::Stored, Some(shelf), same_content_as, None)
+    }
+
+    /// What is where a seal would look for `digest`, by the lookups a seal
+    /// uses ([`Self::shelved`], [`Self::legacy_projection`]), and in a dry
+    /// run also what the run would have written (`plan`).
+    fn probe(
+        store: Option<&Self>,
+        plan: Option<&Planned>,
+        shelves: &[String],
+        digest: &str,
+        readonly: bool,
+    ) -> io::Result<Probe> {
+        let mut probe = Probe::default();
+        for half in [0..32, 32..64] {
+            let id = &digest[half];
+            let shelved = match store {
+                Some(store) => store.shelved(shelves, id, digest, readonly),
+                None => Ok(Shelved::Nothing),
+            };
+            match shelved {
+                Ok(Shelved::This(_, record)) => {
+                    probe.held = true;
+                    match record.body {
+                        Body::Tombstone => probe.forgotten = true,
+                        Body::Live { .. } => {
+                            probe.live.get_or_insert(record.id);
+                        }
+                    }
+                }
+                Ok(Shelved::Other) => {}
+                Ok(Shelved::Nothing) => match plan.and_then(|plan| plan.ids.get(id)) {
+                    Some(planned) if planned.digest == digest => {
+                        probe.held = true;
+                        match planned.note {
+                            None => probe.forgotten = true,
+                            Some(_) => {
+                                probe.live.get_or_insert_with(|| id.to_owned());
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        probe.free.get_or_insert_with(|| id.to_owned());
+                    }
+                },
+                Err(error) if is_forgotten(&error) => {
+                    probe.held = true;
+                    probe.forgotten = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(store) = store {
+            match store.legacy_projection(digest, readonly) {
+                Ok(Some(record)) => match record.body {
+                    Body::Tombstone => probe.forgotten = true,
+                    Body::Live { .. } => {
+                        probe.live.get_or_insert(record.id);
+                    }
+                },
+                Ok(None) => {}
+                Err(error) if is_forgotten(&error) => probe.forgotten = true,
+                Err(error) => return Err(error),
+            }
+        }
+        if plan.is_some_and(|plan| plan.forgotten.contains(digest)) {
+            probe.forgotten = true;
+            probe.live = None;
+        }
+        Ok(probe)
+    }
+
     /// Shelf names in the project directory, newest first.
     fn shelves(&self) -> io::Result<Vec<String>> {
         Ok(self.layout()?.0)
@@ -1826,11 +2406,12 @@ impl ArchiveStore {
     /// it once it holds [`SHELF_FILES`]. An empty shelf left by a crash is
     /// used. When the newest shelf name is not a directory that can be
     /// opened and made private, nothing is written to it and the segment
-    /// goes to a new shelf, numbered after it. An error that will pass
+    /// goes to a new shelf, numbered after it. The shelf comes with its
+    /// name. An error that will pass
     /// fails the seal instead of starting a shelf. A new shelf that was made
     /// and then could not be opened stays, empty, and is the newest shelf of
     /// the next seal: one failed attempt after another leaves that one.
-    fn writable_shelf(&self, shelves: &[String]) -> io::Result<PrivateDir> {
+    fn writable_shelf(&self, shelves: &[String]) -> io::Result<(PrivateDir, String)> {
         let highest = shelves.first().and_then(|name| shelf_number(name));
         let highest = highest.unwrap_or(0);
         // With no number left for a new shelf, the newest shelf that can be
@@ -1844,7 +2425,7 @@ impl ArchiveStore {
                     sweep(&shelf, &names);
                     let held = names.iter().filter(|(name, ..)| name.ends_with(".json"));
                     if last || (index == 0 && held.count() < SHELF_FILES) {
-                        return Ok(shelf);
+                        return Ok((shelf, name.clone()));
                     }
                     break;
                 }
@@ -1862,7 +2443,8 @@ impl ArchiveStore {
         if last {
             return Err(invalid("archive shelf numbers exhausted"));
         }
-        self.fs.child(&shelf_name(highest + 1), true)
+        let name = shelf_name(highest + 1);
+        Ok((self.fs.child(&name, true)?, name))
     }
 
     /// The shelf that holds segment `id`, by name and opened, and its
@@ -2065,10 +2647,12 @@ impl ArchiveStore {
     /// The price: if the slot passed over was the tombstone of this very
     /// projection and can no longer be read as that much, the projection is
     /// sealed again.
-    fn legacy_projection(&self, digest: &str) -> io::Result<Option<Record>> {
+    ///
+    /// `readonly`, for a dry run of an import: no mode is changed.
+    fn legacy_projection(&self, digest: &str, readonly: bool) -> io::Result<Option<Record>> {
         for slot in 0..MAX_SEGMENTS {
             let name = slot_name(slot);
-            let record = match self.fs.read_with(&name, MAX_SEGMENT_BYTES, false) {
+            let record = match self.fs.read_with(&name, MAX_SEGMENT_BYTES, readonly) {
                 Ok(Some(raw)) => match self.record(&name, &raw) {
                     Err(_) if says_forgotten(&raw, digest) => return Err(forgotten()),
                     record => record,
@@ -2993,11 +3577,15 @@ fn corrupt() -> io::Error {
 fn not_found() -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, NOT_FOUND)
 }
+const FORGOTTEN: &str = "archive projection was forgotten";
 fn forgotten() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "archive projection was forgotten",
-    )
+    io::Error::new(io::ErrorKind::PermissionDenied, FORGOTTEN)
+}
+/// Whether `error` is [`forgotten`]: a lookup's refusal, not its failure.
+fn is_forgotten(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
+        && error.raw_os_error().is_none()
+        && error.to_string() == FORGOTTEN
 }
 fn canceled() -> io::Error {
     io::Error::new(
@@ -8385,6 +8973,617 @@ mod tests {
         assert_eq!(sealed.id, digest_of("ordinary")[..32]);
         assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap(), text("ordinary"));
         assert_eq!(store.fetch_note(&sealed.id).unwrap(), "a note");
+    }
+
+    // ---- The import (A-2) ----
+
+    fn random_id() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+    /// One import of a real run; the machine did not fail.
+    fn import(store: &ArchiveStore, line: &[u8]) -> Result<Imported, ImportRefused> {
+        store.import(line, false, false, &mut ImportSeen::default()).unwrap()
+    }
+    fn reason(store: &ArchiveStore, line: &[u8]) -> String {
+        import(store, line).expect_err("refused").reason
+    }
+    fn tombstone(record: &mut Record) {
+        record.body = Body::Tombstone;
+    }
+    /// A record line whose messages are given as they are, with the digest
+    /// the store computes for them: what no projection of a chat produces.
+    fn raw_line(store: &ArchiveStore, id: &str, messages: Vec<Value>, note: &str) -> Vec<u8> {
+        let messages: Vec<_> = messages
+            .into_iter()
+            .enumerate()
+            .map(|(source_index, message)| ArchivedMessage {
+                source_index,
+                block_indices: Vec::new(),
+                message: Arc::new(message),
+            })
+            .collect();
+        let record = Record {
+            version: 1,
+            scope: store.scope.clone(),
+            logical: store.logical.clone(),
+            id: id.to_owned(),
+            digest: projection_digest(&store.logical, messages.len(), &messages).unwrap(),
+            created_ms: None,
+            body: Body::Live {
+                source_message_count: messages.len(),
+                messages,
+                note: note.to_owned(),
+            },
+        };
+        serde_json::to_vec(&record).unwrap()
+    }
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+    fn at_ms(ms: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    /// T-A1: a record sealed in one store and imported into another is the
+    /// same file, byte for byte, with `created_ms` as its file's time, and
+    /// reads the same. Imported in any order within a second, records come
+    /// back from a search in the order of their `created_ms`.
+    #[test]
+    fn t_a1_an_imported_record_is_the_file_it_was() {
+        let (tmp, first) = setup();
+        let sealed = first.seal_with_note(&text("round trip words"), "a hidden note").unwrap();
+        let source = only_archive_file(&directory(&tmp, &first));
+        let line = std::fs::read(&source).unwrap();
+        let created_ms = json_of(&source)["created_ms"].as_u64().unwrap();
+
+        let other = tempfile::tempdir().unwrap();
+        let second = ArchiveStore::for_scope(other.path(), &first.scope).unwrap();
+        assert_eq!(second.scope(), first.scope);
+        assert_eq!(record_scope(&line).unwrap(), first.scope);
+        let done = import(&second, &line).unwrap();
+        assert_eq!(
+            done,
+            Imported {
+                outcome: ImportOutcome::Stored,
+                id: sealed.0.id.clone(),
+                live: true,
+                message_count: 1,
+                shelf: Some("s000001".to_owned()),
+                same_content_as: None,
+                unread: None,
+            }
+        );
+        let copy = only_archive_file(&other.path().join("context-archives").join(&first.scope));
+        // Before the file is read here, which may move its time of access.
+        let metadata = std::fs::metadata(&copy).unwrap();
+        assert_eq!(metadata.modified().unwrap(), at_ms(created_ms));
+        assert_eq!(metadata.accessed().unwrap(), at_ms(created_ms));
+        assert_eq!(copy.file_name(), source.file_name());
+        assert_eq!(std::fs::read(&copy).unwrap(), line);
+        assert_eq!(mode(&copy), 0o600);
+        let id = &sealed.0.id;
+        assert_eq!(second.fetch(id, 0, 8).unwrap(), first.fetch(id, 0, 8).unwrap());
+        assert_eq!(second.fetch_note(id).unwrap(), "a hidden note");
+        assert_eq!(second.search("round", 8).unwrap(), first.search("round", 8).unwrap());
+        assert_eq!(second.search("round", 8).unwrap().len(), 1);
+
+        // Three records a day apart, not imported in that order.
+        let day = 24 * 60 * 60 * 1000;
+        let ids = [random_id(), random_id(), random_id()];
+        for index in [1, 2, 0] {
+            let words = format!("daily entry {index}");
+            let line = record_bytes(&first, &ids[index], &text(&words), |record| {
+                record.created_ms = Some(1_600_000_000_000 + index as u64 * day);
+            });
+            assert_eq!(import(&second, &line).unwrap().outcome, ImportOutcome::Stored);
+        }
+        let found = second.search("daily entry", 8).unwrap();
+        let found: Vec<_> = found.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(found, [&ids[2], &ids[1], &ids[0]], "newest first");
+    }
+
+    /// T-A2: a record keeps an id that is not derived from its digest, and
+    /// one without `created_ms` is stored without it, at the time of the
+    /// write.
+    #[test]
+    fn t_a2_a_foreign_id_is_kept_and_no_time_is_invented() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let id = random_id();
+        let digest = digest_of("kept under its own id");
+        assert!(id != digest[..32] && id != digest[32..]);
+        let line = record_bytes(&store, &id, &text("kept under its own id"), |_| {});
+        let started = std::time::SystemTime::now() - Duration::from_secs(5);
+        let done = import(&store, &line).unwrap();
+        assert_eq!((done.outcome, done.id.as_str()), (ImportOutcome::Stored, id.as_str()));
+        let file = dir.join("s000001").join(archive_name(&id));
+        assert_eq!(shelf_files(&dir), std::slice::from_ref(&file));
+        assert!(std::fs::metadata(&file).unwrap().modified().unwrap() >= started);
+        assert_eq!(std::fs::read(&file).unwrap(), line);
+        let fields = ["body", "digest", "id", "logical", "scope", "version"];
+        assert_eq!(top_level(&json_of(&file)), fields);
+        assert_eq!(store.fetch(&id, 0, 8).unwrap(), text("kept under its own id"));
+        let found = store.search("its own id", 8).unwrap();
+        assert_eq!(found.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), [id.as_str()]);
+        // A project store reads it too, and seals nothing.
+        let project = ArchiveStore::for_scope(tmp.path(), &store.scope).unwrap();
+        assert_eq!(project.fetch(&id, 0, 8).unwrap(), text("kept under its own id"));
+        let error = project.seal(&text("a project store has no chat"), "").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(shelf_files(&dir), [file]);
+        // The same content sealed by its chat afterwards: stored a second
+        // time under the digest's id, and the import of the line says so.
+        let sealed = store.seal(&text("kept under its own id"), "").unwrap();
+        assert_eq!(sealed.id, digest[..32]);
+        let other = record_bytes(&store, &random_id(), &text("kept under its own id"), |_| {});
+        let done = import(&store, &other).unwrap();
+        assert_eq!(done.outcome, ImportOutcome::Stored);
+        assert_eq!(done.same_content_as, Some(sealed.id));
+    }
+
+    /// T-A3: the same line a second time changes nothing and says so.
+    #[test]
+    fn t_a3_the_same_line_twice_changes_nothing() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let id = random_id();
+        let line = record_bytes(&store, &id, &text("imported twice"), |record| {
+            record.created_ms = Some(1_600_000_000_000);
+        });
+        assert_eq!(import(&store, &line).unwrap().outcome, ImportOutcome::Stored);
+        let file = dir.join("s000001").join(archive_name(&id));
+        let state = || (snapshot(&dir), std::fs::metadata(&file).unwrap().modified().unwrap());
+        let before = state();
+        assert_eq!(before.1, at_ms(1_600_000_000_000));
+        let again = import(&store, &line).unwrap();
+        assert_eq!(again.outcome, ImportOutcome::Present { note_differs: false });
+        assert_eq!(again.shelf.as_deref(), Some("s000001"));
+        assert_eq!(state(), before);
+        // Another note and another time for the same content: the stored
+        // ones stay, and the answer says the note differs.
+        let noted = record_bytes(&store, &id, &text("imported twice"), |record| {
+            record.created_ms = Some(5);
+            if let Body::Live { note, .. } = &mut record.body {
+                *note = "another note".to_owned();
+            }
+        });
+        let again = import(&store, &noted).unwrap();
+        assert_eq!(again.outcome, ImportOutcome::Present { note_differs: true });
+        assert_eq!(state(), before);
+        assert_eq!(store.fetch_note(&id).unwrap(), "");
+    }
+
+    /// T-A4: content that is not what its digest says is refused with both
+    /// digests, and nothing at all is written.
+    #[test]
+    fn t_a4_a_digest_that_is_not_the_contents_is_refused() {
+        let (tmp, chat) = setup();
+        let line = record_bytes(&chat, &random_id(), &text("one byte of this changes"), |_| {});
+        let text_of = String::from_utf8(line.clone()).unwrap();
+        let changed = text_of.replace("one byte of this changes", "one byte of this chanGes");
+        assert_ne!(changed, text_of);
+        let other = tempfile::tempdir().unwrap();
+        let store = ArchiveStore::for_scope(other.path(), &chat.scope).unwrap();
+        let dir = other.path().join("context-archives").join(&chat.scope);
+        let refused = import(&store, changed.as_bytes()).unwrap_err();
+        let recorded = digest_of("one byte of this changes");
+        let content = digest_of("one byte of this chanGes");
+        assert_eq!(
+            refused.reason,
+            format!("digest does not match content (record {recorded}, content {content})")
+        );
+        assert!(refused.id.is_some());
+        // No file, no shelf, no temporary file, no lock file.
+        assert_eq!(entries(&dir), Vec::<String>::new());
+        // The line as it was is stored.
+        assert_eq!(import(&store, &line).unwrap().outcome, ImportOutcome::Stored);
+        drop(tmp);
+    }
+
+    /// T-A5: every refusal has its own reason and writes nothing. What the
+    /// store's reader accepts is not refused (a `system` role).
+    #[test]
+    fn t_a5_each_refusal_has_its_reason_and_writes_nothing() {
+        let (_tmp, chat) = setup();
+        let other = tempfile::tempdir().unwrap();
+        let store = ArchiveStore::for_scope(other.path(), &chat.scope).unwrap();
+        let dir = other.path().join("context-archives").join(&chat.scope);
+        let id = random_id();
+        let two = [msg("user", json!("a")), msg("user", json!("b"))];
+        let line = |change: &dyn Fn(&mut Record)| record_bytes(&chat, &id, &two, change);
+        let with = |key: &str, value: Value| {
+            let mut record: Value = serde_json::from_slice(&line(&|_| {})).unwrap();
+            record[key] = value;
+            serde_json::to_vec(&record).unwrap()
+        };
+        let note = |length: usize| {
+            line(&move |record: &mut Record| {
+                if let Body::Live { note, .. } = &mut record.body {
+                    *note = "n".repeat(length);
+                }
+            })
+        };
+        let many = vec![json!({"role": "user", "content": "m"}); MAX_MESSAGES + 1];
+        // Refused for its size before its digest is looked at.
+        let mut huge: Value = serde_json::from_slice(&line(&|_| {})).unwrap();
+        huge["body"]["messages"][0]["message"]["content"] = json!("x".repeat(MAX_SEGMENT_BYTES));
+        let huge = serde_json::to_vec(&huge).unwrap();
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("version", line(&|record| record.version = 2), "version 2 is not supported"),
+            ("unknown field", with("extra", json!(1)), "not an archive record: an unknown field"),
+            ("a missing field", b"{\"version\":1}".to_vec(), "not an archive record: a field is"),
+            ("not JSON", b"not json".to_vec(), "not an archive record: not JSON"),
+            ("uppercase id", line(&|record| record.id = id.to_uppercase()), "invalid id"),
+            ("logical", line(&|record| record.logical = "z".repeat(64)), "invalid logical"),
+            ("digest", line(&|record| record.digest.truncate(60)), "invalid digest"),
+            (
+                "an uppercase digest on a tombstone",
+                line(&|record| {
+                    record.digest = record.digest.to_uppercase();
+                    record.body = Body::Tombstone;
+                }),
+                "invalid digest",
+            ),
+            ("scope shape", line(&|record| record.scope = "Z".repeat(64)), "invalid scope"),
+            (
+                "another project",
+                line(&|record| record.scope = "0".repeat(64)),
+                "scope is not this project's",
+            ),
+            ("4,097 messages", raw_line(&chat, &id, many, ""), "over a per-archive limit"),
+            ("a note of 8,193 bytes", note(MAX_NOTE_BYTES + 1), "over a per-archive limit"),
+            (
+                "source_index out of order",
+                line(&|record| {
+                    if let Body::Live { messages, .. } = &mut record.body {
+                        messages.swap(0, 1);
+                    }
+                }),
+                "source_index out of order",
+            ),
+            (
+                "a message that is a string",
+                raw_line(&chat, &id, vec![json!("just text")], ""),
+                "message is not an object",
+            ),
+            (
+                "a tombstone with created_ms",
+                line(&|record| {
+                    record.body = Body::Tombstone;
+                    record.created_ms = Some(1);
+                }),
+                "a tombstone carries no created_ms",
+            ),
+            (
+                "over 16 MiB",
+                huge,
+                "over the 16 MiB archive size",
+            ),
+            (
+                "a note tombstone line",
+                b"{\"tombstone\":\"mem-0123\",\"timestamp_ms\":1}".to_vec(),
+                "not an archive record: an unknown field",
+            ),
+        ];
+        for (what, line, expected) in &cases {
+            let reason = reason(&store, line);
+            assert!(reason.starts_with(expected), "{what}: {reason}");
+            // The same in a dry run.
+            let mut seen = ImportSeen::default();
+            let dry = store.import(line, false, true, &mut seen).unwrap().unwrap_err();
+            assert_eq!(dry.reason, reason, "{what}");
+            assert_eq!(entries(&dir), Vec::<String>::new(), "{what}");
+        }
+        // A note of exactly the limit is not over it.
+        assert_eq!(import(&store, &note(MAX_NOTE_BYTES)).unwrap().outcome, ImportOutcome::Stored);
+        // The importer is no stricter than the reader about a role.
+        let system = random_id();
+        let line = raw_line(&chat, &system, vec![json!({"role": "system", "content": "s"})], "");
+        assert_eq!(import(&store, &line).unwrap().outcome, ImportOutcome::Stored);
+        assert_eq!(store.fetch(&system, 0, 1).unwrap(), [msg("system", json!("s"))]);
+        // Routing by the line's own scope refuses what has none.
+        let routed = record_scope(b"{\"tombstone\":\"mem-0123\",\"timestamp_ms\":1}").unwrap_err();
+        assert_eq!(routed.reason, "not an archive record: a field is missing (column 41)");
+        let routed = record_scope(&with("scope", json!("../../etc"))).unwrap_err();
+        assert_eq!(routed.reason, "invalid scope");
+        for scope in ["../../etc", "", &"A".repeat(64)] {
+            assert!(ArchiveStore::for_scope(other.path(), scope).is_err());
+            assert!(ArchiveStore::existing_scope(other.path(), scope).is_err());
+        }
+        assert_eq!(project_scope("synthetic-project").unwrap(), chat.scope);
+    }
+
+    /// T-A6: an id that holds other content is refused and left alone; a
+    /// file under the id that is not a record stops the run.
+    #[test]
+    fn t_a6_an_id_that_is_taken_is_never_written_over() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let id = random_id();
+        assert_eq!(
+            import(&store, &record_bytes(&store, &id, &text("first content"), |_| {}))
+                .unwrap()
+                .outcome,
+            ImportOutcome::Stored
+        );
+        let before = snapshot(&dir);
+        for change in [(|_: &mut Record| {}) as fn(&mut Record), tombstone] {
+            let other = record_bytes(&store, &id, &text("second content"), change);
+            let refused = import(&store, &other).unwrap_err();
+            assert_eq!(refused.reason, "id already holds different content");
+            assert_eq!(refused.id.as_deref(), Some(id.as_str()));
+            assert_eq!(snapshot(&dir), before);
+        }
+        assert_eq!(store.fetch(&id, 0, 1).unwrap(), text("first content"));
+
+        // Not a record under the id: the lookup cannot say what it is.
+        let odd = random_id();
+        let file = dir.join("s000001").join(archive_name(&odd));
+        std::fs::write(&file, b"{\"cut\": \"short").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = snapshot(&dir);
+        let line = record_bytes(&store, &odd, &text("under a damaged name"), |_| {});
+        for dry_run in [true, false] {
+            let stopped = store.import(&line, false, dry_run, &mut ImportSeen::default());
+            let error = stopped.expect_err("the run stops");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+            assert_eq!(snapshot(&dir), before);
+        }
+        // A shelf that cannot be opened may hold the id: the run stops too.
+        std::fs::write(dir.join("s000002"), b"not a directory").unwrap();
+        let line = record_bytes(&store, &random_id(), &text("behind an odd shelf"), |_| {});
+        let stopped = store.import(&line, false, false, &mut ImportSeen::default());
+        assert!(stopped.is_err());
+        assert_eq!(shelf_files(&dir).len(), 2);
+    }
+
+    /// T-A7: a tombstone that comes in forgets, a forget that is here is
+    /// kept, and a tombstone of nothing that is here is stored.
+    #[test]
+    fn t_a7_tombstones_win_in_both_directions() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let id = random_id();
+        let live = record_bytes(&store, &id, &text("to be forgotten"), |record| {
+            record.created_ms = Some(1_600_000_000_000);
+        });
+        let dead = record_bytes(&store, &id, &text("to be forgotten"), tombstone);
+        assert_eq!(import(&store, &live).unwrap().outcome, ImportOutcome::Stored);
+        let done = import(&store, &dead).unwrap();
+        assert_eq!((done.outcome, done.live, done.message_count), (ImportOutcome::Forgotten, false, 0));
+        assert_eq!(done.unread, None);
+        let file = dir.join("s000001").join(archive_name(&id));
+        assert!(is_tombstone_of(&store, &file, &digest_of("to be forgotten")));
+        let fields = ["body", "digest", "id", "logical", "scope", "version"];
+        assert_eq!(top_level(&json_of(&file)), fields);
+        assert_eq!(store.fetch(&id, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
+        // The forget is not undone, and a second tombstone changes nothing.
+        let before = snapshot(&dir);
+        let kept = import(&store, &live).unwrap();
+        assert_eq!((kept.outcome, kept.live), (ImportOutcome::KeptForgotten, true));
+        let again = import(&store, &dead).unwrap();
+        assert_eq!(again.outcome, ImportOutcome::Present { note_differs: false });
+        assert_eq!(snapshot(&dir), before);
+
+        // Into a store that has nothing of it.
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let done = import(&store, &dead).unwrap();
+        assert_eq!((done.outcome, done.shelf.as_deref()), (ImportOutcome::Stored, Some("s000001")));
+        let file = dir.join("s000001").join(archive_name(&id));
+        assert_eq!(std::fs::read(&file).unwrap(), dead);
+        assert_eq!(store.fetch(&id, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(import(&store, &live).unwrap().outcome, ImportOutcome::KeptForgotten);
+
+        // Content forgotten here under the id a seal gave it is not
+        // brought back under another id.
+        let sealed = store.seal(&text("sealed and forgotten"), "").unwrap();
+        store.forget(&sealed.id).unwrap();
+        let before = snapshot(&dir);
+        let line = record_bytes(&store, &random_id(), &text("sealed and forgotten"), |_| {});
+        assert_eq!(reason(&store, &line), "this content was forgotten in this store");
+        assert_eq!(snapshot(&dir), before);
+        // A tombstone for content that is live here under another id is
+        // refused, and names the id.
+        let sealed = store.seal(&text("live under its own id"), "").unwrap();
+        let before = snapshot(&dir);
+        let line = record_bytes(&store, &random_id(), &text("live under its own id"), tombstone);
+        let refused = reason(&store, &line);
+        assert!(refused.contains(&sealed.id) && refused.starts_with("a tombstone of content"));
+        assert_eq!(snapshot(&dir), before);
+        assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap(), text("live under its own id"));
+    }
+
+    /// The lines of a run that meets every outcome, for a dry run and the
+    /// real run to agree on.
+    fn a_run(chat: &ArchiveStore, scope: &str) -> Vec<Vec<u8>> {
+        let ids: Vec<_> = (0..5).map(|_| random_id()).collect();
+        let line = |id: &String, words: &str, change: fn(&mut Record)| {
+            record_bytes(chat, id, &text(words), |record| {
+                scope.clone_into(&mut record.scope);
+                change(record);
+            })
+        };
+        let live = |_: &mut Record| {};
+        vec![
+            line(&ids[0], "first", live),
+            line(&ids[0], "first", live),
+            line(&ids[0], "other content under the first id", live),
+            line(&ids[1], "second", live),
+            line(&ids[1], "second", tombstone),
+            line(&ids[1], "second", live),
+            line(&ids[2], "third", tombstone),
+            line(&ids[2], "third", live),
+            line(&ids[2], "third", tombstone),
+            line(&ids[3], "fourth", tombstone),
+            line(&ids[4], "fourth", live),
+            b"not a record".to_vec(),
+        ]
+    }
+
+    /// T-A8: a record can be filed under another project, and a dry run
+    /// writes nothing, anywhere, and answers what the real run then does.
+    #[test]
+    fn t_a8_rehoming_and_a_dry_run_that_writes_nothing() {
+        let (tmp, chat) = setup();
+        let target = project_scope("another-project").unwrap();
+        assert_ne!(target, chat.scope);
+        let line = record_bytes(&chat, &random_id(), &text("moved between projects"), |_| {});
+        let id = serde_json::from_slice::<Value>(&line).unwrap()["id"].as_str().unwrap().to_owned();
+        let store = ArchiveStore::for_scope(tmp.path(), &target).unwrap();
+        let mut seen = ImportSeen::default();
+        let refused = store.import(&line, false, false, &mut seen).unwrap().unwrap_err();
+        assert_eq!(refused.reason, "scope is not this project's");
+        let done = store.import(&line, true, false, &mut seen).unwrap().unwrap();
+        assert_eq!(done.outcome, ImportOutcome::Stored);
+        let dir = tmp.path().join("context-archives").join(&target);
+        let file = only_archive_file(&dir);
+        let mut expected: Value = serde_json::from_slice(&line).unwrap();
+        expected["scope"] = json!(target);
+        assert_eq!(json_of(&file), expected, "only the scope changed");
+        assert_eq!(store.fetch(&id, 0, 1).unwrap(), text("moved between projects"));
+        assert_eq!(shelf_files(&directory(&tmp, &chat)), Vec::<PathBuf>::new());
+
+        // A base that does not exist: nothing is created by the dry run.
+        let base = tmp.path().join("no such base");
+        let lines = a_run(&chat, &chat.scope);
+        assert!(ArchiveStore::existing_scope(&base, &chat.scope).unwrap().is_none());
+        let mut seen = ImportSeen::default();
+        let dry: Vec<_> = lines
+            .iter()
+            .map(|line| ArchiveStore::import_dry_absent(&chat.scope, line, false, &mut seen).unwrap())
+            .collect();
+        assert!(!base.exists());
+        let store = ArchiveStore::for_scope(&base, &chat.scope).unwrap();
+        let mut unused = ImportSeen::default();
+        let real: Vec<_> =
+            lines.iter().map(|line| store.import(line, false, false, &mut unused).unwrap()).collect();
+        assert_eq!(dry, real);
+        let outcomes: Vec<_> = real
+            .iter()
+            .map(|done| match done {
+                Ok(done) => format!("{:?}", done.outcome),
+                Err(refused) => refused.reason.clone(),
+            })
+            .collect();
+        assert_eq!(
+            outcomes[..9],
+            [
+                "Stored",
+                "Present { note_differs: false }",
+                "id already holds different content",
+                "Stored",
+                "Forgotten",
+                "KeptForgotten",
+                "Stored",
+                "KeptForgotten",
+                "Present { note_differs: false }",
+            ]
+        );
+        assert_eq!(outcomes[9], "Stored");
+        assert!(outcomes[11].starts_with("not an archive record"));
+
+        // A dry run over a store that exists: the same answers as running
+        // it for real again, no mode changed, no lock file made, no byte
+        // or file changed.
+        let dir = base.join("context-archives").join(&chat.scope);
+        std::fs::remove_file(dir.join("lock")).unwrap();
+        let open = std::fs::Permissions::from_mode(0o755);
+        let files = shelf_files(&dir);
+        for path in [dir.clone(), dir.join("s000001")] {
+            std::fs::set_permissions(&path, open.clone()).unwrap();
+        }
+        for file in &files {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let before = (snapshot(&dir), entries(&dir));
+        let existing = ArchiveStore::existing_scope(&base, &chat.scope).unwrap().unwrap();
+        let mut seen = ImportSeen::default();
+        let dry: Vec<_> =
+            lines.iter().map(|line| existing.import(line, false, true, &mut seen).unwrap()).collect();
+        assert_eq!((snapshot(&dir), entries(&dir)), before);
+        assert!(!dir.join("lock").exists());
+        assert_eq!(mode(&dir), 0o755);
+        assert_eq!(mode(&dir.join("s000001")), 0o755);
+        for file in &files {
+            assert_eq!(mode(file), 0o640);
+        }
+        for file in &files {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let real: Vec<_> =
+            lines.iter().map(|line| store.import(line, false, false, &mut unused).unwrap()).collect();
+        assert_eq!(dry, real);
+        assert!(real[..2].iter().all(|done| {
+            done.as_ref().unwrap().outcome == ImportOutcome::Present { note_differs: false }
+        }));
+    }
+
+    /// T-A-shelves: an import fills a shelf and goes on in the next, in the
+    /// order of its lines, and a dry run names the same shelves.
+    #[test]
+    fn t_a_shelves_an_import_goes_on_in_the_next_shelf() {
+        let (tmp, chat) = setup();
+        let dir = directory(&tmp, &chat);
+        let store = ArchiveStore::for_scope(tmp.path(), &chat.scope).unwrap();
+        let total = SHELF_FILES + 2;
+        let ids: Vec<_> = (0..total).map(|_| random_id()).collect();
+        let lines: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                record_bytes(&chat, id, &text(&format!("archive {index}")), |record| {
+                    record.created_ms = Some(1_600_000_000_000 + index as u64);
+                })
+            })
+            .collect();
+        let mut seen = ImportSeen::default();
+        let run = |dry_run: bool, seen: &mut ImportSeen| -> Vec<String> {
+            let mut shelves = Vec::new();
+            for line in &lines {
+                let done = store.import(line, false, dry_run, seen).unwrap().unwrap();
+                shelves.push(done.shelf.unwrap());
+            }
+            shelves
+        };
+        let before = (snapshot(&dir), entries(&dir));
+        let dry = run(true, &mut seen);
+        assert_eq!((snapshot(&dir), entries(&dir)), before);
+        let real = run(false, &mut seen);
+        assert_eq!(dry, real);
+        assert!(real[..SHELF_FILES].iter().all(|shelf| shelf == "s000001"));
+        assert_eq!(real[SHELF_FILES..], ["s000002", "s000002"]);
+        let on = |shelf: &str| {
+            let mut names = entries(&dir.join(shelf));
+            names.retain(|name| name.ends_with(".json"));
+            names
+        };
+        let mut first: Vec<_> = ids[..SHELF_FILES].iter().map(|id| archive_name(id)).collect();
+        let mut second: Vec<_> = ids[SHELF_FILES..].iter().map(|id| archive_name(id)).collect();
+        first.sort();
+        second.sort();
+        assert_eq!(on("s000001"), first);
+        assert_eq!(on("s000002"), second);
+        // Every one of them is read, on either shelf.
+        for (index, id) in ids.iter().enumerate() {
+            assert_eq!(store.fetch(id, 0, 1).unwrap(), text(&format!("archive {index}")));
+        }
+        // A second run finds them all, and a dry run of it starts counting
+        // from what the newest shelf holds.
+        assert!(run(false, &mut seen).iter().zip(&real).all(|(again, first)| again == first));
+        let more = record_bytes(&chat, &random_id(), &text("one more"), |_| {});
+        let mut seen = ImportSeen::default();
+        let planned = store.import(&more, false, true, &mut seen).unwrap().unwrap();
+        assert_eq!(planned.shelf.as_deref(), Some("s000002"));
+        // A seal afterwards goes to the newest shelf.
+        let sealed = chat.seal(&text("sealed after the import"), "").unwrap();
+        assert!(dir.join("s000002").join(archive_name(&sealed.id)).is_file());
+        assert_eq!(on("s000002").len(), 3);
     }
 }
 

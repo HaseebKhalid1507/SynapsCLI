@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Context archives: `ArchiveStore::import`**, the store side of moving
+  archives into the plain-file store from somewhere else. It takes one
+  archive record (the JSON object an archive file holds) and stores it as
+  it is, under its own id, with its own `created_ms` as the file's time;
+  nothing is recomputed to make a record fit, and the only field an import
+  may change is `scope` (`rehome`). An id is looked up as a fetch looks it
+  up and a digest as a seal does, so the same line a second time changes
+  nothing and says so (`Present`); a tombstone that comes in forgets
+  (`Forgotten`), and a forget that is already here is kept
+  (`KeptForgotten`). A record is refused, with the name of the check and
+  nothing written, when a read of the store would refuse it, when its
+  content does not hash to its digest, when its scope is not the store's,
+  when its id holds other content, or when its content was forgotten here.
+  A dry run writes nothing at all (no file, shelf, lock file or mode) and
+  answers what the real run would. With `ArchiveStore::for_scope` and
+  `existing_scope` (a project directory by its name), `record_scope` and
+  `project_scope`. Nothing calls it yet; no command, no format change.
 - **Extensions: `tool.call` carries `caller`**, the run that makes the call:
   `{"actor", "group", "parent"}`, the author the host records when the same
   run posts to the project forum. A chat and each of its workers is a run
