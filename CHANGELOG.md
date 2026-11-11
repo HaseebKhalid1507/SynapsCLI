@@ -335,6 +335,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`synaps retention sweep --max-disk-bytes`: a budget that cannot be met
+  deletes nothing (plain-file memory).** A budget smaller than what the
+  sweep may not delete (the sessions named chains point at, and saved notes
+  when `--include-notes` is not given) can never be met. The sweep still
+  deleted every other session, trace and log, oldest first, and only then
+  answered "disk budget unmet". It now adds up what it may not delete
+  before its first deletion and, when the budget is below that, stops
+  there: no file is removed or rewritten (an age given with the same
+  command is not applied either), and the error says how many bytes are
+  protected. A budget that can be met is met as before.
 - **Extensions: the context archive format page says what the store does.**
   `docs/extensions/context-archives.md` was wrong or silent in several
   places. It now states: a shelf is `s` and exactly six digits (`s000001` to

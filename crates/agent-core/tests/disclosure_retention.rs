@@ -690,9 +690,10 @@ fn unsatisfiable_disk_budget_returns_a_typed_unmet_error() {
     );
 }
 
-/// A budget far below the protected sessions' size cannot be met. Without
-/// `include_notes` the notes files are not touched, byte for byte; with it
-/// the notes are evicted, oldest first, and the budget is still unmet.
+/// Without `include_notes` the notes files are not touched by a budget, byte
+/// for byte. With it they are evicted, oldest first, for a budget that can
+/// be met; a budget below the protected session cannot be, and then no note
+/// is deleted either.
 #[test]
 fn disk_budget_deletes_notes_only_with_include_notes() {
     let h = harness();
@@ -718,33 +719,206 @@ fn disk_budget_deletes_notes_only_with_include_notes() {
     for (path, text) in &files {
         std::fs::write(path, text).unwrap();
     }
-    let policy = |include_notes| RetentionPolicy {
+    let policy = |include_notes, budget| RetentionPolicy {
         max_age_days: None,
-        max_disk_bytes: Some(10),
+        max_disk_bytes: Some(budget),
         include_notes,
     };
+    let untouched = || {
+        for (path, text) in &files {
+            assert_eq!(std::fs::read(path).unwrap(), text.as_bytes(), "{}", path.display());
+        }
+    };
 
-    let err = sweep_at(&h.roots, &policy(false), now).unwrap_err();
+    let err = sweep_at(&h.roots, &policy(false, 10), now).unwrap_err();
     assert!(
         matches!(err, RetentionError::BudgetUnmet { notes_kept: true, .. }),
         "{err}"
     );
     assert!(err.to_string().contains("no note was deleted"), "{err}");
-    for (path, text) in &files {
-        assert_eq!(std::fs::read(path).unwrap(), text.as_bytes(), "{}", path.display());
-    }
+    untouched();
     assert!(session_exists(&h.roots, "pinned"));
 
-    let err = sweep_at(&h.roots, &policy(true), now).unwrap_err();
+    // Below the protected session: unmet whatever is evicted, so nothing is.
+    let err = sweep_at(&h.roots, &policy(true, 10), now).unwrap_err();
     assert!(
-        matches!(err, RetentionError::BudgetUnmet { notes_kept: false, .. }),
+        matches!(
+            err,
+            RetentionError::BudgetUnmet { notes_kept: false, nothing_deleted: true, .. }
+        ),
         "{err}"
     );
+    untouched();
+
+    // Room for the protected session and nothing else: every note goes.
+    let pinned = std::fs::metadata(h.roots.config_dir.join("sessions/pinned.json"))
+        .unwrap()
+        .len();
+    let outcome = sweep_at(&h.roots, &policy(true, pinned), now).unwrap();
+    assert_eq!(outcome.memory_records_dropped, 3);
     for (path, _) in &files {
         let left = std::fs::read_to_string(path).unwrap();
         assert!(!left.contains("mem-"), "every note evicted: {left}");
     }
     assert!(session_exists(&h.roots, "pinned"));
+}
+
+/// Every file and folder under the harness, with each file's bytes.
+fn tree(h: &Harness) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    fn walk(
+        dir: &std::path::Path,
+        out: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.insert(path.clone(), None);
+                walk(&path, out);
+            } else {
+                out.insert(path.clone(), Some(std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Default::default();
+    walk(h._tmp.path(), &mut out);
+    out
+}
+
+fn note_line(id: &str, ts: u64) -> String {
+    format!(
+        r#"{{"namespace":"project-a","timestamp_ms":{ts},"content":"note {id}","tags":[],"id":"{id}","project":"p"}}"#
+    )
+}
+
+/// A budget below what the sweep may not delete can never be met. The sweep
+/// used to delete every unprotected session, trace and log on the way to
+/// saying so. It now says so first: every file is where it was, with the
+/// bytes it had, and the error names how much is protected.
+#[test]
+fn a_budget_below_what_is_protected_deletes_nothing() {
+    let h = harness();
+    let now = 100 * DAY_MS;
+    let sessions = h.roots.config_dir.join("sessions");
+    write_session(&h.roots, "pinned", 10 * DAY_MS, None);
+    write_chain(&h.roots, "keep", "pinned");
+    std::fs::write(sessions.join("pinned.journal"), "journal of the head\n").unwrap();
+    // What a sweep deletes when it runs: old sessions (by age and by
+    // budget), a journal with no session, a trace, a log, a derived index,
+    // and a forgotten note's line.
+    write_session(&h.roots, "old-a", 10 * DAY_MS, None);
+    write_session(&h.roots, "old-b", 20 * DAY_MS, None);
+    std::fs::write(sessions.join("ghost.journal"), "no session\n").unwrap();
+    std::fs::write(h.roots.cache_dir.join("trace.jsonl"), "t".repeat(300)).unwrap();
+    std::fs::write(h.roots.config_dir.join("synaps.log"), "l".repeat(300)).unwrap();
+    let index = h.roots.base_dir.join("memory/index/project-a");
+    std::fs::create_dir_all(&index).unwrap();
+    std::fs::write(index.join("seg-000000.jsonl"), "z".repeat(300)).unwrap();
+    let (gone, live) = (note_line("mem-gone", DAY_MS), note_line("mem-live", 2 * DAY_MS));
+    let tombstone = r#"{"tombstone":"mem-gone"}"#;
+    std::fs::write(
+        h.roots.base_dir.join("memory/project-a.jsonl"),
+        format!("{gone}\n{live}\n{tombstone}\n"),
+    )
+    .unwrap();
+
+    let len = |name: &str| std::fs::metadata(sessions.join(name)).unwrap().len();
+    let head = len("pinned.json") + len("pinned.journal");
+    // The notes as this sweep would leave them: the forgotten one is not
+    // protected, its tombstone and the live note are.
+    let notes = (live.len() + 1 + tombstone.len() + 1) as u64;
+    let before = tree(&h);
+
+    for (include_notes, protected) in [(false, head + notes), (true, head)] {
+        let err = sweep_at(
+            &h.roots,
+            &RetentionPolicy {
+                max_age_days: Some(1),
+                max_disk_bytes: Some(protected - 1),
+                include_notes,
+            },
+            now,
+        )
+        .unwrap_err();
+        let (protected_bytes, budget, remaining) = match &err {
+            RetentionError::BudgetUnmet {
+                nothing_deleted: true,
+                protected_chain_heads: 1,
+                notes_kept,
+                protected_bytes,
+                budget,
+                remaining,
+            } if *notes_kept != include_notes => (*protected_bytes, *budget, *remaining),
+            other => panic!("include_notes {include_notes}: {other}"),
+        };
+        assert_eq!((protected_bytes, budget), (protected, protected - 1));
+        assert_eq!(remaining, inspect(&h.roots).unwrap().total_bytes);
+        let said = err.to_string();
+        assert!(said.contains("nothing was deleted"), "{said}");
+        assert!(said.contains(&format!("{protected} bytes this sweep may not delete")), "{said}");
+        assert_eq!(said.contains("every saved note"), !include_notes, "{said}");
+        assert_eq!(tree(&h), before, "include_notes {include_notes}: {said}");
+    }
+}
+
+/// A budget that can be met is met as before: the oldest unprotected
+/// session goes first and the sweep stops when the total fits. A budget of
+/// exactly what is protected can be met, and is.
+#[test]
+fn a_budget_that_can_be_met_still_deletes_the_oldest_sessions_first() {
+    let h = harness();
+    let now = 100 * DAY_MS;
+    write_session(&h.roots, "pinned", 5 * DAY_MS, None);
+    write_chain(&h.roots, "keep", "pinned");
+    write_session(&h.roots, "older", 10 * DAY_MS, None);
+    write_session(&h.roots, "newer", 90 * DAY_MS, None);
+    let notes = h.roots.base_dir.join("memory/project-a.jsonl");
+    let text = note_line("mem-live", DAY_MS) + "\n";
+    std::fs::write(&notes, &text).unwrap();
+    let budget = |bytes| RetentionPolicy {
+        max_age_days: None,
+        max_disk_bytes: Some(bytes),
+        include_notes: false,
+    };
+    let total = || inspect(&h.roots).unwrap().total_bytes;
+
+    let outcome = sweep_at(&h.roots, &budget(total() - 1), now).unwrap();
+    assert_eq!(outcome.deleted_files, 1);
+    assert!(!session_exists(&h.roots, "older"), "the oldest goes first");
+    assert!(session_exists(&h.roots, "newer") && session_exists(&h.roots, "pinned"));
+
+    let pinned = std::fs::metadata(h.roots.config_dir.join("sessions/pinned.json"))
+        .unwrap()
+        .len();
+    let protected = pinned + text.len() as u64;
+    let outcome = sweep_at(&h.roots, &budget(protected), now).unwrap();
+    assert_eq!(outcome.deleted_files, 1);
+    assert!(!session_exists(&h.roots, "newer"));
+    assert!(session_exists(&h.roots, "pinned"));
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), text);
+    assert_eq!(total(), protected);
+
+    // Notes may go, but a tombstone line never does: with a budget the
+    // head alone fits, everything that can be evicted is, and the answer
+    // is still "unmet", after the fact this time.
+    std::fs::write(&notes, format!("{text}{{\"tombstone\":\"mem-other\"}}\n")).unwrap();
+    let err = sweep_at(
+        &h.roots,
+        &RetentionPolicy {
+            include_notes: true,
+            ..budget(pinned)
+        },
+        now,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RetentionError::BudgetUnmet { nothing_deleted: false, notes_kept: false, .. }
+        ),
+        "{err}"
+    );
+    assert!(!err.to_string().contains("nothing was deleted"), "{err}");
+    assert!(!std::fs::read_to_string(&notes).unwrap().contains("mem-live"));
 }
 
 #[test]

@@ -19,6 +19,9 @@
 //!   (sessions/traces/logs/indexes), skipping protected chain heads. It
 //!   evicts notes only with `include_notes`; without it an unmet budget is
 //!   `BudgetUnmet` with every note untouched.
+//! - A budget below what the sweep may not delete (protected chain heads,
+//!   and notes without `include_notes`) can never be met: the sweep answers
+//!   `BudgetUnmet` before its first deletion, with nothing deleted.
 
 use std::fs;
 use std::io;
@@ -33,14 +36,22 @@ pub enum RetentionError {
     /// A named-chain file could not be read or parsed: its head is UNKNOWN,
     /// so every destructive session operation fails closed.
     UnreadableChain(PathBuf),
-    /// The disk budget could not be met after evicting every unprotected
-    /// artifact (typed instead of a silent overshoot).
+    /// The disk budget could not be met (typed instead of a silent
+    /// overshoot): either it is below what the sweep may not delete, and
+    /// then nothing was deleted (`nothing_deleted`), or it was still unmet
+    /// after evicting every unprotected artifact.
     BudgetUnmet {
         budget: u64,
         remaining: u64,
         protected_chain_heads: usize,
         /// The policy did not say `include_notes`, so no note was evicted.
         notes_kept: bool,
+        /// What this sweep may not delete, added up before its first
+        /// deletion (the `protected_bytes` function).
+        protected_bytes: u64,
+        /// The budget is below `protected_bytes`: the sweep stopped before
+        /// its first deletion, and every file is as it was.
+        nothing_deleted: bool,
     },
 }
 
@@ -59,13 +70,28 @@ impl std::fmt::Display for RetentionError {
                 remaining,
                 protected_chain_heads,
                 notes_kept,
+                protected_bytes,
+                nothing_deleted,
             } => {
-                write!(
-                    f,
-                    "disk budget unmet: {remaining} bytes remain against a budget of \
-                     {budget} after evicting every unprotected artifact \
-                     ({protected_chain_heads} protected chain head(s) retained)"
-                )?;
+                if *nothing_deleted {
+                    write!(
+                        f,
+                        "disk budget unmet: nothing was deleted, because the budget of \
+                         {budget} bytes is below the {protected_bytes} bytes this sweep \
+                         may not delete ({protected_chain_heads} protected chain head(s)"
+                    )?;
+                    if *notes_kept {
+                        write!(f, " and every saved note")?;
+                    }
+                    write!(f, "); {remaining} bytes are in use")?;
+                } else {
+                    write!(
+                        f,
+                        "disk budget unmet: {remaining} bytes remain against a budget of \
+                         {budget} after evicting every unprotected artifact \
+                         ({protected_chain_heads} protected chain head(s) retained)"
+                    )?;
+                }
                 if *notes_kept {
                     write!(
                         f,
@@ -323,9 +349,49 @@ pub fn inspect(roots: &RetentionRoots) -> io::Result<RetentionReport> {
     })
 }
 
+/// What a sweep with `policy` may not delete, in bytes as [`inspect`] counts
+/// them: every file in `sessions/` that belongs to a protected chain head
+/// (its snapshot, journal and turn draft), and, without `include_notes`,
+/// what the notes files hold once this sweep has compacted them (forgotten
+/// notes, notes past their own expiry and torn lines go on every sweep and
+/// are not counted). With `include_notes` notes count as nothing, though
+/// their tombstone lines stay: the sum is never more than what must remain,
+/// so a budget below it cannot be met. Reads only.
+fn protected_bytes(
+    roots: &RetentionRoots,
+    protected: &[String],
+    policy: &RetentionPolicy,
+    now_ms: u64,
+) -> io::Result<u64> {
+    let mut total = 0u64;
+    for path in list_files(&roots.sessions_dir()) {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        if protected.iter().any(|id| id == stem) {
+            total += fs::metadata(&path)?.len();
+        }
+    }
+    if !policy.include_notes {
+        for path in list_files(&roots.memory_dir()) {
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let raw = fs::read(&path)?;
+            let (dropped, kept) = compacted_lines(&raw, now_ms, None);
+            total += if dropped == 0 {
+                raw.len() as u64 // not rewritten: the file as it is
+            } else {
+                kept.iter().map(|line| line.len() as u64 + 1).sum()
+            };
+        }
+    }
+    Ok(total)
+}
+
 /// Unified sweep at an explicit clock (tests inject `now_ms`; production
 /// uses [`sweep`]). Applies max-age per domain, compacts memory files, then
-/// enforces the disk budget oldest-first — never touching chain heads.
+/// enforces the disk budget oldest-first — never touching chain heads. A
+/// budget below what the sweep may not delete ([`protected_bytes`]) is
+/// refused before anything is deleted, the age pass included.
 pub fn sweep_at(
     roots: &RetentionRoots,
     policy: &RetentionPolicy,
@@ -335,6 +401,23 @@ pub fn sweep_at(
     // Chain protection resolves FIRST and fails closed — nothing is
     // deleted while any chain head is unknown.
     let protected: Vec<String> = chain_heads(roots)?;
+    // A budget that cannot be met is refused HERE, before the first
+    // deletion: evicting every unprotected session, trace and log on the
+    // way to an error would destroy them for nothing.
+    let mut may_not_delete = 0;
+    if let Some(budget) = policy.max_disk_bytes {
+        may_not_delete = protected_bytes(roots, &protected, policy, now_ms)?;
+        if budget < may_not_delete {
+            return Err(RetentionError::BudgetUnmet {
+                budget,
+                remaining: inspect(roots)?.total_bytes,
+                protected_chain_heads: protected.len(),
+                notes_kept: !policy.include_notes,
+                protected_bytes: may_not_delete,
+                nothing_deleted: true,
+            });
+        }
+    }
     let age_cutoff = policy
         .max_age_days
         .map(|days| now_ms.saturating_sub(days as u64 * DAY_MS));
@@ -512,6 +595,8 @@ pub fn sweep_at(
                 remaining,
                 protected_chain_heads: protected.len(),
                 notes_kept: !policy.include_notes,
+                protected_bytes: may_not_delete,
+                nothing_deleted: false,
             });
         }
     }
@@ -764,6 +849,26 @@ fn compact_memory_file(
     let _lock = lock_notes(path)?;
     let raw = fs::read(path)?;
     rewrite_read_done();
+    let (dropped, kept) = compacted_lines(&raw, now_ms, global_cutoff_ms);
+    if dropped > 0 {
+        let mut body = kept.join("\n");
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        crate::core::private_fs::write_atomic_private(path, body.as_bytes())
+            .map_err(io::Error::from)?;
+    }
+    Ok(dropped)
+}
+
+/// What [`compact_memory_file`] makes of a notes file's bytes: how many
+/// lines it drops, and the lines it keeps, in order. The one rule of what a
+/// compaction keeps, for the rewrite and for [`protected_bytes`].
+fn compacted_lines(
+    raw: &[u8],
+    now_ms: u64,
+    global_cutoff_ms: Option<u64>,
+) -> (usize, Vec<String>) {
     /// A line of the file: a tombstone, or a record with what decides
     /// whether it stays.
     enum Line {
@@ -774,7 +879,7 @@ fn compact_memory_file(
     let mut lines: Vec<Line> = Vec::new();
     let mut dropped = 0usize;
 
-    for line in notes_lines(&raw) {
+    for line in notes_lines(raw) {
         let Some(line) = line else {
             dropped += 1; // not UTF-8: a torn line, dropped like one
             continue;
@@ -831,16 +936,7 @@ fn compact_memory_file(
         }
         kept.push(line);
     }
-
-    if dropped > 0 {
-        let mut body = kept.join("\n");
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        crate::core::private_fs::write_atomic_private(path, body.as_bytes())
-            .map_err(io::Error::from)?;
-    }
-    Ok(dropped)
+    (dropped, kept)
 }
 
 /// Headless export: copy sessions, memory, traces (recursive), and logs
