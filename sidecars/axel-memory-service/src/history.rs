@@ -463,8 +463,14 @@ mod retention_tests {
         unsafe { libc::umask(0o077) };
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let service = Service::open(&root.path().join("synthetic.r8"), "p0123456789abcdef").unwrap();
-        let id = |n| service.history_seal(seal(n)).unwrap()["id"].as_str().unwrap().to_owned();
+        let service =
+            Service::open(&root.path().join("synthetic.r8"), "p0123456789abcdef").unwrap();
+        let id = |n| {
+            service.history_seal(seal(n)).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
         let mut ids: Vec<String> = (0..200).map(id).collect();
         let forgotten = [0, 5, 129];
         for n in forgotten {
@@ -474,9 +480,11 @@ mod retention_tests {
         let (rows, tombstones): (usize, usize) = service
             .brain
             .conn()
-            .query_row("SELECT count(*),sum(tombstoned) FROM synaps_history", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT count(*),sum(tombstoned) FROM synaps_history",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!((rows, tombstones), (210, 3));
         for (n, id) in ids.iter().enumerate() {

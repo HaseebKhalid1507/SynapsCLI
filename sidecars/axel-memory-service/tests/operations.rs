@@ -847,21 +847,39 @@ fn history_seal_keeps_every_live_archive() {
     let (_d, p) = temp();
     let sealed = seal_many(&p, "session", 200);
     let stats = ok(call(&p, "stats", json!({})));
-    assert_eq!((stats["history"].as_u64(), stats["tombstones"].as_u64()), (Some(200), Some(0)));
+    assert_eq!(
+        (stats["history"].as_u64(), stats["tombstones"].as_u64()),
+        (Some(200), Some(0))
+    );
     for (id, q) in &sealed {
         assert_eq!(
-            ok(call(&p, "history_fetch", json!({"id":id,"start":0,"limit":1}))),
+            ok(call(
+                &p,
+                "history_fetch",
+                json!({"id":id,"start":0,"limit":1})
+            )),
             q["messages"]
         );
     }
     // Search output stays bounded however large the inventory is.
-    let hits = ok(call(&p, "history_search", json!({"query":"session evidence","limit":99})));
+    let hits = ok(call(
+        &p,
+        "history_search",
+        json!({"query":"session evidence","limit":99}),
+    ));
     assert_eq!(hits.as_array().unwrap().len(), 32);
-    let oldest = ok(call(&p, "history_search", json!({"query":"session evidence 0","limit":8})));
+    let oldest = ok(call(
+        &p,
+        "history_search",
+        json!({"query":"session evidence 0","limit":8}),
+    ));
     assert_eq!(oldest.as_array().unwrap().len(), 1);
     assert_eq!(oldest[0]["id"], sealed[0].0);
     // Per-request limit still applies in a large scope: messages+note > 16 MiB.
-    let big = seal("big", json!({"role":"user","content":"x".repeat(16 * 1024 * 1024 + 1)}));
+    let big = seal(
+        "big",
+        json!({"role":"user","content":"x".repeat(16 * 1024 * 1024 + 1)}),
+    );
     assert_eq!(call(&p, "history_seal", big)["error"]["code"], "size_limit");
     assert_eq!(ok(call(&p, "stats", json!({})))["history"], 200);
 }
@@ -871,14 +889,24 @@ fn history_seal_never_deletes_live_rows_beside_tombstones() {
     let mut sealed = seal_many(&p, "session", 130);
     let forgotten = [0, 5, 129];
     for i in forgotten {
-        assert_eq!(ok(call(&p, "history_forget", json!({"id":sealed[i].0}))), true);
+        assert_eq!(
+            ok(call(&p, "history_forget", json!({"id":sealed[i].0}))),
+            true
+        );
     }
     sealed.extend(seal_many(&p, "later", 10));
     // Live count proves nothing was deleted: 140 sealed - 3 forgotten.
     let stats = ok(call(&p, "stats", json!({})));
-    assert_eq!((stats["history"].as_u64(), stats["tombstones"].as_u64()), (Some(137), Some(3)));
+    assert_eq!(
+        (stats["history"].as_u64(), stats["tombstones"].as_u64()),
+        (Some(137), Some(3))
+    );
     for i in [0, 1, 4, 5, 6, 127, 128, 129, 130, 139] {
-        let fetched = call(&p, "history_fetch", json!({"id":sealed[i].0,"start":0,"limit":1}));
+        let fetched = call(
+            &p,
+            "history_fetch",
+            json!({"id":sealed[i].0,"start":0,"limit":1}),
+        );
         if forgotten.contains(&i) {
             assert_eq!(fetched["error"]["code"], "not_found");
         } else {
@@ -886,8 +914,14 @@ fn history_seal_never_deletes_live_rows_beside_tombstones() {
         }
     }
     // Tombstones are retained, so forgotten evidence stays suppressed.
-    let again = seal("session-5", json!({"role":"user","content":"session evidence 5"}));
-    assert_eq!(call(&p, "history_seal", again)["error"]["code"], "id_conflict");
+    let again = seal(
+        "session-5",
+        json!({"role":"user","content":"session evidence 5"}),
+    );
+    assert_eq!(
+        call(&p, "history_seal", again)["error"]["code"],
+        "id_conflict"
+    );
 }
 #[test]
 fn import_into_large_scope_bounds_only_the_incoming_batch() {
@@ -904,22 +938,40 @@ fn import_into_large_scope_bounds_only_the_incoming_batch() {
     ));
     assert_eq!(counts["histories"], 128);
     let stats = ok(call(&target, "stats", json!({})));
-    assert_eq!((stats["history"].as_u64(), stats["tombstones"].as_u64()), (Some(256), Some(1)));
     assert_eq!(
-        ok(call(&target, "history_fetch", json!({"id":kept[0].0,"start":0,"limit":1}))),
+        (stats["history"].as_u64(), stats["tombstones"].as_u64()),
+        (Some(256), Some(1))
+    );
+    assert_eq!(
+        ok(call(
+            &target,
+            "history_fetch",
+            json!({"id":kept[0].0,"start":0,"limit":1})
+        )),
         kept[0].1["messages"]
     );
     assert_eq!(
-        ok(call(&target, "history_fetch", json!({"id":batch[0].0,"start":0,"limit":1}))),
+        ok(call(
+            &target,
+            "history_fetch",
+            json!({"id":batch[0].0,"start":0,"limit":1})
+        )),
         batch[0].1["messages"]
     );
     // An over-bound batch (129 histories) still fails atomically: its note is absent.
     let (_d3, over) = temp();
     let rejected = seal_many(&over, "over", 129);
-    ok(call(&over, "store", record("mem-over", "over-bound batch note")));
+    ok(call(
+        &over,
+        "store",
+        record("mem-over", "over-bound batch note"),
+    ));
     let mut inventory = apply(ok(call(&over, "export", json!({"full":true}))));
     inventory["migration_id"] = json!("a".repeat(64));
-    assert_eq!(call(&target, "migration_apply", inventory)["error"]["code"], "size_limit");
+    assert_eq!(
+        call(&target, "migration_apply", inventory)["error"]["code"],
+        "size_limit"
+    );
     // So does a 2-history batch whose frame exceeds 24 MiB.
     let wide: Vec<Value> = (0..2)
         .map(|i| {
@@ -932,16 +984,25 @@ fn import_into_large_scope_bounds_only_the_incoming_batch() {
         })
         .collect();
     let inventory = json!({"migration_id":"b".repeat(64),"manifest_digest":"f".repeat(64),"records":[record("mem-wide","wide batch note")],"histories":wide});
-    assert_eq!(call(&target, "migration_apply", inventory)["error"]["code"], "size_limit");
+    assert_eq!(
+        call(&target, "migration_apply", inventory)["error"]["code"],
+        "size_limit"
+    );
     for id in ["mem-over", "mem-wide"] {
-        assert_eq!(call(&target, "fetch", json!({"ids":[id]}))["error"]["code"], "not_found");
+        assert_eq!(
+            call(&target, "fetch", json!({"ids":[id]}))["error"]["code"],
+            "not_found"
+        );
     }
     assert_eq!(
         call(&target, "history_fetch", json!({"id":rejected[0].0}))["error"]["code"],
         "not_found"
     );
     let stats = ok(call(&target, "stats", json!({})));
-    assert_eq!((stats["history"].as_u64(), stats["notes"].as_u64()), (Some(256), Some(0)));
+    assert_eq!(
+        (stats["history"].as_u64(), stats["notes"].as_u64()),
+        (Some(256), Some(0))
+    );
 }
 /// Latency probe, not a gate. Run explicitly in release:
 /// `cargo test --release --test operations -- --ignored history_search_latency_probe --nocapture`
@@ -964,7 +1025,11 @@ fn history_search_latency_probe() {
     ];
     let mut sizes: Vec<usize> = (0..394)
         .map(|_| {
-            let z = ((0..4).map(|_| (next() % 10_000) as f64 / 10_000.0).sum::<f64>() - 2.0) * 3f64.sqrt();
+            let z = ((0..4)
+                .map(|_| (next() % 10_000) as f64 / 10_000.0)
+                .sum::<f64>()
+                - 2.0)
+                * 3f64.sqrt();
             ((512.0 * 1024.0 * (0.8 * z).exp()) as usize).clamp(32 * 1024, 4 * 1024 * 1024)
         })
         .collect();
@@ -977,7 +1042,11 @@ fn history_search_latency_probe() {
         let mut rows = Vec::new();
         let mut bytes = 0;
         while bytes < *size {
-            let mut text = if rows.is_empty() { format!("probe-marker-{n:04} ") } else { String::new() };
+            let mut text = if rows.is_empty() {
+                format!("probe-marker-{n:04} ")
+            } else {
+                String::new()
+            };
             while text.len() < per {
                 text.push_str(WORDS[(next() % 16) as usize]);
                 text.push(' ');
@@ -987,21 +1056,36 @@ fn history_search_latency_probe() {
             let (block_indices, message) = if i % 2 == 0 {
                 (vec![], json!({"role":"user","content":text}))
             } else {
-                (vec![0], json!({"role":"assistant","content":[{"type":"text","text":text}]}))
+                (
+                    vec![0],
+                    json!({"role":"assistant","content":[{"type":"text","text":text}]}),
+                )
             };
-            rows.push(Row { source_index: i, block_indices, message });
+            rows.push(Row {
+                source_index: i,
+                block_indices,
+                message,
+            });
         }
         let body = serde_json::to_vec(&rows).unwrap();
         total += body.len();
         let count = rows.len() as u64;
         let digest = hash(&[logical.as_bytes(), &count.to_be_bytes(), &body]);
-        ok(call(&p, "history_seal", json!({"logical_id":logical,"source_message_count":count,"messages":rows,"note":"probe","digest":digest})));
+        ok(call(
+            &p,
+            "history_seal",
+            json!({"logical_id":logical,"source_message_count":count,"messages":rows,"note":"probe","digest":digest}),
+        ));
     }
     println!(
         "probe: {} archives, {:.1} MiB messages, median {:.2} MiB, built in {:.1?}",
         sizes.len(),
         total as f64 / 1048576.0,
-        { let mut s = sizes.clone(); s.sort(); s[s.len() / 2] as f64 / 1048576.0 },
+        {
+            let mut s = sizes.clone();
+            s.sort();
+            s[s.len() / 2] as f64 / 1048576.0
+        },
         started.elapsed()
     );
     // Real process per operation, as the host runs it; scope_info is the
@@ -1022,12 +1106,36 @@ fn history_search_latency_probe() {
         );
     };
     time("scope_info (spawn+open baseline)", "scope_info", json!({}));
-    time("history_search no match", "history_search", json!({"query":"zzqv-absent-needle","limit":25}));
-    time("history_search common word (25 hits)", "history_search", json!({"query":"rollover","limit":25}));
-    time("history_search oldest-only marker", "history_search", json!({"query":"probe-marker-0000 ","limit":25}));
+    time(
+        "history_search no match",
+        "history_search",
+        json!({"query":"zzqv-absent-needle","limit":25}),
+    );
+    time(
+        "history_search common word (25 hits)",
+        "history_search",
+        json!({"query":"rollover","limit":25}),
+    );
+    time(
+        "history_search oldest-only marker",
+        "history_search",
+        json!({"query":"probe-marker-0000 ","limit":25}),
+    );
     time("stats", "stats", json!({}));
-    let oldest = ok(call(&p, "history_search", json!({"query":"probe-marker-0000 ","limit":25})));
+    let oldest = ok(call(
+        &p,
+        "history_search",
+        json!({"query":"probe-marker-0000 ","limit":25}),
+    ));
     assert_eq!(oldest.as_array().unwrap().len(), 1);
-    time("history_fetch oldest (128 rows)", "history_fetch", json!({"id":oldest[0]["id"],"limit":128}));
-    time("history_seal small, scope >= 400 rows", "history_seal", seal("probe-extra", json!({"role":"user","content":"one more"})));
+    time(
+        "history_fetch oldest (128 rows)",
+        "history_fetch",
+        json!({"id":oldest[0]["id"],"limit":128}),
+    );
+    time(
+        "history_seal small, scope >= 400 rows",
+        "history_seal",
+        seal("probe-extra", json!({"role":"user","content":"one more"})),
+    );
 }

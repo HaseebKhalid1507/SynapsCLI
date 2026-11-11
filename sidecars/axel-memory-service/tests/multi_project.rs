@@ -1150,13 +1150,22 @@ fn alias_union_past_128_histories_keeps_every_archive() {
     let ids: Vec<Value> = (0..130)
         .map(|i| {
             let scope = if i % 2 == 0 { &a } else { &b };
-            let q = seal_with(&hash(&[format!("chat-{i}").as_bytes()]), &format!("archive {i}"));
+            let q = seal_with(
+                &hash(&[format!("chat-{i}").as_bytes()]),
+                &format!("archive {i}"),
+            );
             ok(call(&p, scope, "history_seal", q))["id"].clone()
         })
         .collect();
     ok(alias(&p, &a, &main, &b, &wt));
     assert_eq!(ok(call(&p, &a, "stats", json!({})))["history"], 130);
     for id in [&ids[0], &ids[1], &ids[129]] {
-        assert_eq!(ok(call(&p, &a, "history_fetch", json!({"id":id}))).as_array().unwrap().len(), 1);
+        assert_eq!(
+            ok(call(&p, &a, "history_fetch", json!({"id":id})))
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
