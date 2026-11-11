@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`synaps memory import-archives | import-notes | project`**, the command
+  for moving saved archives and notes into the plain-file stores from
+  somewhere else. The input is JSON Lines (`-` is standard input; blank
+  lines are skipped; a line over 16 MiB and 4 KiB is refused without being
+  read into memory): for archives one archive record per line, the object
+  an archive file holds; for notes a note line or a tombstone line. There
+  is no default destination: exactly one of `--as-recorded` (each line
+  under the project it names), `--cwd DIR` (the project of that folder, as
+  for a chat started there) or `--project-key KEY` is required. Every
+  decision about a line is the store's own (`ArchiveStore::import`,
+  `import_line_in`), so a second run of the same input stores nothing and a
+  forget is never undone. Each run prints one JSON document: the inputs
+  with their line counts and SHA-256, the totals `read`, `stored`,
+  `already_present`, `forgotten`, `kept_forgotten`, `refused`, `balanced`,
+  `stopped`, a block for each project and an entry for each line with its
+  id, outcome and, when refused, the name of the check. No field holds
+  content. Exit code 0 when nothing was refused, 1 when something was, 2
+  when the run stopped or the command line could not be used. `--dry-run`
+  writes nothing (no directory, no lock file, no mode) and prints what the
+  real run prints. A real `import-notes` holds `memory/.import.lock` for the
+  whole run and a second one stops with "another import is running"; a
+  note tombstone that could not be applied is counted and named
+  (`tombstones_not_applied`). `synaps memory project [--cwd DIR]` prints a
+  folder's project key, archive directory and notes file, and whether
+  `SYNAPS_PROJECT_ROOT` is overriding the folder; it creates nothing. The
+  command never reads `memory.backend` and sends no hook. New in the store:
+  `memory::store::project_notes_file`. See "Moving archives between
+  machines or projects" in `docs/extensions/context-archives.md`.
 - **Context archives: `ArchiveStore::import`**, the store side of moving
   archives into the plain-file store from somewhere else. It takes one
   archive record (the JSON object an archive file holds) and stores it as

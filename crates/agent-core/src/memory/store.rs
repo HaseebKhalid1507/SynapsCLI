@@ -1048,6 +1048,13 @@ pub(crate) fn namespace_file(base: &Path, namespace: &str) -> PathBuf {
     namespace_path(&memory_dir_in(base), namespace)
 }
 
+/// The notes file of the project with this key under `base`: where a save,
+/// a forget and an import of that project's notes write. Only the path:
+/// nothing is created, and the key is not checked.
+pub fn project_notes_file(base: &Path, key: &str) -> PathBuf {
+    namespace_file(base, &project_namespace(key))
+}
+
 // ─── Import from another store ──────────────────────────────────────────────
 
 /// The reserved key of user-wide notes, which have no project file to go to.

@@ -314,6 +314,13 @@ enum Command {
         #[command(subcommand)]
         action: cmd::retention::RetentionAction,
     },
+    /// Bring archives and notes into the plain-file stores from JSON Lines,
+    /// and print where a folder's memory lives. Prints one JSON document.
+    /// Exit code 0: nothing refused; 1: something refused; 2: the run stopped.
+    Memory {
+        #[command(subcommand)]
+        action: cmd::memory::MemoryAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -796,6 +803,14 @@ async fn async_main() -> anyhow::Result<()> {
         }
         unreachable!();
     }
+    // Before the profile, the config and anything that could start a daemon
+    // or a log: a dry run and `memory project` must create nothing.
+    if matches!(cli.command, Some(Command::Memory { .. })) {
+        if let Some(Command::Memory { action }) = cli.command {
+            std::process::exit(cmd::memory::run(action));
+        }
+        unreachable!();
+    }
     if let Some(ref prof) = cli.profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
@@ -979,8 +994,8 @@ async fn async_main() -> anyhow::Result<()> {
             let name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
-        Some(Command::Prompt { .. }) => {
-            unreachable!("prompt dispatched before profile initialization")
+        Some(Command::Prompt { .. }) | Some(Command::Memory { .. }) => {
+            unreachable!("prompt and memory are dispatched before profile initialization")
         }
         Some(Command::Tools { action }) => {
             cmd::tools::run(action).await?;
