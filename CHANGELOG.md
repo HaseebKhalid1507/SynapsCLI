@@ -313,6 +313,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: a forgotten window stays forgotten when a newer shelf
+  has another file under its name.** A save looks for the window under its
+  id on every shelf, newest first, and used to stop at the first shelf that
+  had any file under that name. If that file was not the window (a damaged
+  copy, a stray file, a link), the tombstone on an older shelf was not seen
+  and the window was stored again, live, under its second id. A save now
+  looks in the older shelves too: a tombstone there refuses the save, and a
+  live copy there is returned instead of a second copy being written. The
+  name counts as taken only when no shelf holds the window or its tombstone.
 - **Notes: a save made while a notes file is rewritten is no longer lost.**
   `synaps retention sweep` and `synaps retention forget memory` rewrite
   `memory/<ns>.jsonl` and rename the new file over the old one. A note saved

@@ -1139,13 +1139,17 @@ impl ArchiveStore {
     ///
     /// A file under the name that is not this projection, or is not a file
     /// the store reads (a link, a FIFO, a directory, a file that is not ours
-    /// alone or is too large), has the name taken: `Other`, and it is left
-    /// exactly as it is. A read that fails for any other reason says nothing
-    /// about what the file is, and it may be this very segment: that error
-    /// fails the seal, which the caller retries, instead of sending the
-    /// projection to its other name as a second copy.
+    /// alone or is too large), has the name taken, and it is left exactly as
+    /// it is. It does not end the search: an older shelf may hold the
+    /// projection or its tombstone under the same name, and that is the
+    /// answer. `Other` is the answer only when no shelf holds either. A read
+    /// that fails for any other reason says nothing about what the file is,
+    /// and it may be this very segment: that error fails the seal, which the
+    /// caller retries, instead of sending the projection to its other name
+    /// as a second copy.
     fn shelved(&self, shelves: &[String], id: &str, digest: &str) -> io::Result<Shelved> {
         let name = archive_name(id);
+        let mut taken = false;
         for shelf in shelves {
             let dir = match self.fs.open_child(shelf, false) {
                 Ok(Some(dir)) => dir,
@@ -1161,21 +1165,23 @@ impl ArchiveStore {
                 Ok(None) => continue,
                 Err(error) if PrivateDir::not_a_segment(&error) => {
                     tracing::warn!(%shelf, file = %name, %error, "seal found its archive id taken");
-                    return Ok(Shelved::Other);
+                    taken = true;
+                    continue;
                 }
                 Err(error) => return Err(error),
             };
-            return match self.record(&name, &raw) {
-                Ok(record) if record.digest == digest => Ok(Shelved::This(dir, record)),
-                Err(_) if says_forgotten(&raw, digest) => Err(forgotten()),
-                // Another projection, or not a record: never replaced.
+            match self.record(&name, &raw) {
+                Ok(record) if record.digest == digest => return Ok(Shelved::This(dir, record)),
+                Err(_) if says_forgotten(&raw, digest) => return Err(forgotten()),
+                // Another projection, or not a record: never replaced. An
+                // older shelf is still looked in.
                 _ => {
                     tracing::warn!(%shelf, file = %name, "seal found its archive id taken");
-                    Ok(Shelved::Other)
+                    taken = true;
                 }
-            };
+            }
         }
-        Ok(Shelved::Nothing)
+        Ok(if taken { Shelved::Other } else { Shelved::Nothing })
     }
 
     /// What a seal returns for a projection that is already stored, as
@@ -4947,6 +4953,87 @@ mod tests {
             assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{words}");
             assert_eq!(snapshot(&dir), before, "{words}");
         }
+    }
+
+    /// A newer shelf with something else under the window's name does not
+    /// hide what an older shelf holds under it: a tombstone there still
+    /// refuses the seal, and a live copy there is still the answer.
+    #[test]
+    fn a_file_under_the_name_on_a_newer_shelf_does_not_hide_an_older_tombstone_or_copy() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let (older, newer) = (dir.join("s000001"), dir.join("s000002"));
+        store.seal(&text("a shelf to begin with"), "").unwrap();
+        std::fs::create_dir(&newer).unwrap();
+        std::fs::write(tmp.path().join("elsewhere"), b"not in the store").unwrap();
+        // What has the name on the newer shelf: a file that is not a record,
+        // or one the store does not read at all.
+        let odd = |name: &str, link: bool| {
+            if link {
+                symlink(tmp.path().join("elsewhere"), newer.join(name)).unwrap();
+            } else {
+                std::fs::write(newer.join(name), b"not a record").unwrap();
+            }
+        };
+        let refused = |words: &str| {
+            let before = snapshot(&dir);
+            let error = store.seal(&text(words), "").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{words}: {error}");
+            assert_eq!(snapshot(&dir), before, "{words}");
+            assert!(store.search(words, 8).unwrap().is_empty(), "{words}");
+        };
+        let imported = ["0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"];
+        for (link, imported) in [false, true].into_iter().zip(imported) {
+            // Forgotten with the odd file already there. The forget goes by
+            // another id of the window, as a forget of an imported copy does.
+            let words = format!("forgotten behind an odd file, link {link}");
+            let sealed = store.seal(&text(&words), "").unwrap();
+            let name = archive_name(&sealed.id);
+            assert_eq!(sealed.id, digest_of(&words)[..32]);
+            std::fs::rename(newer.join(&name), older.join(&name)).unwrap();
+            let copy = record_bytes(&store, imported, &text(&words), |_| {});
+            std::fs::write(older.join(archive_name(imported)), copy).unwrap();
+            odd(&name, link);
+            let mut ids = store.forget(imported).unwrap().ids;
+            ids.sort_unstable();
+            let mut expected = [imported.to_owned(), sealed.id.clone()];
+            expected.sort_unstable();
+            assert_eq!(ids, expected);
+            assert!(is_tombstone_of(&store, &older.join(&name), &digest_of(&words)));
+            refused(&words);
+
+            // No forget in between: an older tombstone, whole or one that no
+            // longer validates, behind a newer odd file of the same name.
+            for whole in [true, false] {
+                let words = format!("an older tombstone, link {link}, whole {whole}");
+                let digest = digest_of(&words);
+                let id = &digest[..32];
+                let bytes = record_bytes(&store, id, &text(&words), |record| {
+                    record.body = Body::Tombstone;
+                    if !whole {
+                        record.version = 2;
+                    }
+                });
+                std::fs::write(older.join(archive_name(id)), bytes).unwrap();
+                odd(&archive_name(id), link);
+                refused(&words);
+            }
+
+            // A live copy on the older shelf is the segment: no second copy.
+            let words = format!("an older copy, link {link}");
+            let sealed = store.seal_with_note(&text(&words), "first note").unwrap();
+            let name = archive_name(&sealed.0.id);
+            std::fs::rename(newer.join(&name), older.join(&name)).unwrap();
+            odd(&name, link);
+            let before = snapshot(&dir);
+            assert_eq!(store.seal_with_note(&text(&words), "a later note").unwrap(), sealed);
+            assert_eq!(snapshot(&dir), before);
+        }
+        // With nothing of the window on any shelf, the name is only taken.
+        let words = "only an odd file";
+        let digest = digest_of(words);
+        odd(&archive_name(&digest[..32]), false);
+        assert_eq!(store.seal(&text(words), "").unwrap().id, digest[32..]);
     }
 
     /// A read of the file under the id that fails says nothing about what
