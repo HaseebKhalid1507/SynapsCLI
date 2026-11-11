@@ -37,6 +37,23 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **The file archive store never refuses a rollover for being full, and never
+  deletes or replaces an archive.** With `memory.backend = legacy`, a project
+  could hold 128 context archives (forgotten ones included) and 256 MiB, for
+  good; after that every rollover failed with "archive segment budget
+  exhausted" and the turn ended. New archives now go to numbered shelf
+  directories under `context-archives/<project hash>/` (`s000001/`,
+  `s000002/`, ..., 128 archives each, one `<archive id>.json` per archive)
+  with no cap on count or total size. Fetching an archive opens one file
+  instead of reading the whole store. History search returns the newest
+  matches first (it was oldest first) and reads at most 1,024 archives or
+  256 MiB. Existing `000.json` to `127.json` files keep working where they
+  are, with no migration. The limits on a single archive (16 MiB, 4,096
+  messages) are unchanged, and the files-to-Axel migration still carries at
+  most 128 archives / 256 MiB: it refuses a larger store.
+  **Downgrading:** an older Synaps pointed at the same directory sees only
+  the old slot files. Archives sealed by this version stay on disk but it
+  cannot fetch them, and a chat resumed there restarts its window count.
 - **Daemon sessions: the interactive shell (`shell_start`) starts from the
   session's env**, like `bash`, instead of the daemon's own. It no longer
   sees the env the daemon inherited, nor the secrets the daemon strips from

@@ -16,25 +16,39 @@
 //! text is otherwise exact: no truncation, whitespace rewriting or summarizing.
 //! `fetch_with_provenance` reports indices into the original `seal` slice.
 //!
-//! Fixed slots avoid unbounded directory enumeration/indexes: at most 128
-//! segments (including permanent tombstones), 256 MiB total, 16 MiB per file.
-//! Input is limited to 4096 messages, 16 MiB of eligible strings/structure,
-//! 65536 visited nodes and depth 32; excluded payload descendants are opaque.
-//! Notes are limited to 8 KiB. Fetch returns <=128 messages and <=16 MiB;
-//! search queries <=512 bytes, results <=32 with <=256-byte snippets. Every
-//! operation scans at most 128 files / 256 MiB; the cross-process lock never waits.
-//! Budget exhaustion and corruption fail closed, never silently truncate seal.
+//! The store keeps every segment: there is no cap on how many a project holds
+//! or on their total size, and no seal deletes, moves or replaces another
+//! segment. A project directory holds numbered shelf directories (`s000001`,
+//! `s000002`, ...) of at most 128 segments each; a full shelf is followed by a
+//! new one and shelves are never merged, renumbered or removed. A segment's
+//! file name is its id (the first 32 hex characters of its digest), so finding
+//! one is one `openat` per shelf and one file read, never a scan. Directories
+//! written before shelves existed keep their numbered slot files (`000.json`
+//! to `127.json`); those are read and tombstoned in place and never added to.
+//!
+//! One segment is limited to 4096 messages, 16 MiB of eligible
+//! strings/structure, 65536 visited nodes and depth 32 on input (excluded
+//! payload descendants are opaque), an 8 KiB note and a 16 MiB file. Fetch
+//! returns <=128 messages and <=16 MiB; search queries <=512 bytes, results
+//! <=32 with <=256-byte snippets. Search reads newest first, one file in
+//! memory at a time, and stops once it has read 1024 files or 256 MiB
+//! ([`ArchiveStore::search_scan`] says when that left older segments unread).
+//! The migration export carries at most 128 segments / 256 MiB and refuses a
+//! larger store. The cross-process lock never waits. Budget exhaustion and
+//! corruption fail closed, never silently truncate seal.
 //!
 //! Unix-only private, handle-relative no-symlink filesystem; other platforms
 //! fail Unsupported. Live records are immutable; forget atomically replaces a
-//! record with a content-free id/digest/scope tombstone. The digest covers ONLY
+//! record with a content-free id/digest/scope tombstone, and is the only
+//! operation that replaces a file. The digest covers ONLY
 //! the eligible projection and source indices, not the note or forbidden data.
 //! Identical projections in one logical conversation deduplicate permanently;
 //! a changed note does not create a new segment. Retrying a tombstoned projection
 //! returns PermissionDenied. A successful seal fsyncs data and directory before
 //! returning; callers MUST keep source history on any error (even if publication
 //! happened before a directory-fsync error). Advisory locks serialize cooperating
-//! processes, not malicious processes running as the same OS user.
+//! processes, not malicious processes running as the same OS user; "created
+//! new, never replaced" holds under that lock.
 //!
 //! Within one process, operations on the same archive directory wait for each
 //! other (not in FIFO order) and are admitted within [`LOCK_WAIT`] or fail as
@@ -53,14 +67,23 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-pub const MAX_SEGMENTS: usize = 128;
+/// Segments per shelf directory. Not a store limit: a full shelf is followed
+/// by a new one.
+pub const SHELF_FILES: usize = 128;
+/// The number of legacy slots, and the most segments a migration export carries.
+pub const MAX_SEGMENTS: usize = SHELF_FILES;
 pub const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_STORE_BYTES: usize = 256 * 1024 * 1024;
+/// A search stops once it has read this many segment files...
+pub const SEARCH_SCAN_FILES: usize = 1024;
+/// ...or this many bytes, whichever comes first.
+pub const SEARCH_SCAN_BYTES: usize = 256 * 1024 * 1024;
+/// The most bytes the legacy slots hold, and a migration export carries.
+pub const MAX_STORE_BYTES: usize = SEARCH_SCAN_BYTES;
 pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_MESSAGES: usize = 4096;
 pub const MAX_NOTE_BYTES: usize = 8192;
@@ -418,9 +441,26 @@ impl ArchiveStore {
             note,
             ..
         } = projection;
+        // Same projection, same id, same file name.
+        let id = digest[..32].to_owned();
         let _lock = self.exclusive()?;
-        let (records, used) = self.scan()?;
-        if let Some((_, record)) = records.iter().find(|(_, r)| r.digest == digest) {
+        let shelves = self.shelves()?;
+        let (shelf, existing) = match self.locate(&shelves, &id, false)? {
+            Some((shelf, record)) => (Some(shelf), Some(record)),
+            // Sealed before shelves existed, under a random id.
+            None => {
+                let (legacy, _) = self.scan_legacy(false)?;
+                let mut legacy = legacy.into_iter().map(|(_, record)| record);
+                (None, legacy.find(|record| record.digest == digest))
+            }
+        };
+        if let Some(record) = existing {
+            if record.digest != digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "archive id belongs to another projection",
+                ));
+            }
             let Body::Live { note: stored, .. } = &record.body else {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -428,17 +468,14 @@ impl ArchiveStore {
                 ));
             };
             // A previous call may have failed AFTER rename but BEFORE fsync.
-            self.fs.sync()?;
+            shelf.as_ref().unwrap_or(&self.fs).sync()?;
             return Ok((record.reference()?, stored.clone()));
         }
-        let slot = (0..MAX_SEGMENTS)
-            .find(|slot| !records.iter().any(|(s, _)| s == slot))
-            .ok_or_else(|| invalid("archive segment budget exhausted (tombstones retained)"))?;
         let record = Record {
             version: 1,
             scope: self.scope.clone(),
             logical: self.logical.clone(),
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id,
             digest,
             body: Body::Live {
                 source_message_count,
@@ -447,10 +484,9 @@ impl ArchiveStore {
             },
         };
         let bytes = bounded_json(&record, MAX_SEGMENT_BYTES)?;
-        if used + bytes.len() > MAX_STORE_BYTES {
-            return Err(invalid("archive storage byte budget exhausted"));
-        }
-        self.fs.publish(&slot_name(slot), &bytes, false)?;
+        // Created new: a file that is already there is never renamed over.
+        self.writable_shelf(&shelves)?
+            .publish(&archive_name(&record.id), &bytes, true)?;
         Ok((record.reference()?, note))
     }
 
@@ -475,9 +511,7 @@ impl ArchiveStore {
             return Err(invalid("archive fetch limit exceeds 128"));
         }
         let _lock = self.exclusive()?;
-        let (records, _) = self.scan()?;
-        let record = find_record(records, id)?;
-        match record.body {
+        match self.find(id)?.body {
             Body::Live { messages, .. } => {
                 Ok(messages.into_iter().skip(start).take(limit).collect())
             }
@@ -490,96 +524,161 @@ impl ArchiveStore {
     pub fn fetch_note(&self, id: &str) -> io::Result<String> {
         validate_id(id)?;
         let _lock = self.exclusive()?;
-        let (records, _) = self.scan()?;
-        match find_record(records, id)?.body {
+        match self.find(id)?.body {
             Body::Live { note, .. } => Ok(note),
             Body::Tombstone => Err(not_found()),
         }
     }
 
-    /// Case-insensitive literal substring search of eligible source JSON, in
-    /// publication-slot order. Empty query lists descriptors. Not an exhaustive
-    /// ranking service: output is bounded by limit, with no hidden-note matches.
+    /// Case-insensitive literal substring search of eligible source JSON,
+    /// newest first. Empty query lists descriptors. Not an exhaustive ranking
+    /// service: output is bounded by limit, with no hidden-note matches, and
+    /// the scan by [`SEARCH_SCAN_FILES`] / [`SEARCH_SCAN_BYTES`].
     pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<ArchiveDescriptor>> {
+        self.search_scan(query, limit).map(|(rows, _)| rows)
+    }
+
+    /// [`search`](Self::search) that also says whether the scan budget cut it
+    /// short: `Some(n)` when it stopped after reading the `n` newest segment
+    /// files and left older ones unread, `None` when nothing it was asked for
+    /// is missing. Shelves are read newest to oldest, a shelf's files by
+    /// modification time, the legacy slots last. A file that is not a valid
+    /// record is skipped (one corrupt file must not hide the rest); a link, a
+    /// FIFO or a file that is not ours alone where a segment belongs still
+    /// fails the search.
+    pub fn search_scan(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> io::Result<(Vec<ArchiveDescriptor>, Option<usize>)> {
         if query.len() > 512 || limit > MAX_SEARCH_RESULTS {
             return Err(invalid("archive search query/result budget exceeded"));
         }
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let query = query.to_lowercase();
         let _lock = self.exclusive()?;
-        let (records, _) = self.scan()?;
-        let mut result = Vec::new();
-        for (_, record) in records {
-            if let Body::Live {
-                messages,
-                source_message_count,
-                ..
-            } = &record.body
-            {
-                let mut snippet = None;
-                for message in messages {
-                    let text = serde_json::to_string(&message.message).map_err(json_error)?;
-                    if query.is_empty() || text.to_lowercase().contains(&query) {
-                        snippet = Some(prefix(&text, 256).to_owned());
-                        break;
-                    }
+        let (shelves, mut slots) = self.layout()?;
+        let mut rows = Vec::new();
+        let (mut files, mut bytes) = (0, 0);
+        // `None` is the project directory itself: the legacy slots, oldest of all.
+        for shelf in shelves.iter().map(Some).chain([None]) {
+            let opened;
+            let (dir, names) = match shelf {
+                Some(shelf) => {
+                    let Some(dir) = self.fs.open_child(shelf, false)? else {
+                        continue;
+                    };
+                    let mut entries = dir.names()?;
+                    entries.retain(|(name, ..)| archive_id(name).is_some());
+                    // Modification time only orders the files of one shelf;
+                    // nothing else depends on it.
+                    entries.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+                    opened = dir;
+                    let names: Vec<_> = entries.into_iter().map(|(name, ..)| name).collect();
+                    (&opened, names)
                 }
-                if snippet.is_some() || (query.is_empty() && messages.is_empty()) {
-                    result.push(ArchiveDescriptor {
-                        id: record.id,
-                        message_count: messages.len(),
-                        source_message_count: *source_message_count,
-                        snippet: snippet.unwrap_or_default(),
-                    });
+                None => (&self.fs, std::mem::take(&mut slots)),
+            };
+            for name in names {
+                if rows.len() == limit {
+                    return Ok((rows, None));
                 }
-            }
-            if result.len() == limit {
-                break;
+                if files == SEARCH_SCAN_FILES || bytes >= SEARCH_SCAN_BYTES {
+                    return Ok((rows, Some(files)));
+                }
+                let raw = match dir.read_with(&name, MAX_SEGMENT_BYTES, false) {
+                    Ok(Some(raw)) => raw,
+                    Ok(None) => continue,
+                    // Too large to be a segment: not read, and no record below.
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => Vec::new(),
+                    Err(error) => return Err(error),
+                };
+                files += 1;
+                bytes += raw.len();
+                if let Ok(record) = self.record(&name, &raw) {
+                    rows.extend(describe(record, &query)?);
+                }
             }
         }
-        Ok(result)
+        Ok((rows, None))
     }
 
-    /// Durable, idempotent deletion. Replaces content in the SAME slot with a
-    /// marker; it never frees the slot/digest for reuse. Unknown ids are NotFound.
+    /// Durable, idempotent deletion. Replaces content in the SAME file with a
+    /// marker; it never frees the id/digest for reuse. Unknown ids are NotFound.
     /// This is logical deletion, not secure erasure of filesystem snapshots.
+    /// The only operation that replaces a file, and only the one for `id`.
     pub fn forget(&self, id: &str) -> io::Result<()> {
         validate_id(id)?;
         let _lock = self.exclusive()?;
-        let (records, _) = self.scan()?;
-        let (slot, mut record) = records
-            .into_iter()
-            .find(|(_, r)| r.id == id)
-            .ok_or_else(not_found)?;
+        let (shelf, name, mut record) = match self.locate(&self.shelves()?, id, false)? {
+            Some((shelf, record)) => (Some(shelf), archive_name(id), record),
+            None => {
+                let (legacy, _) = self.scan_legacy(false)?;
+                let found = legacy.into_iter().find(|(_, record)| record.id == id);
+                let (slot, record) = found.ok_or_else(not_found)?;
+                (None, slot_name(slot), record)
+            }
+        };
+        let dir = shelf.as_ref().unwrap_or(&self.fs);
         if matches!(record.body, Body::Tombstone) {
-            return self.fs.sync();
+            return dir.sync();
         }
         record.body = Body::Tombstone;
-        self.fs.publish(
-            &slot_name(slot),
-            &bounded_json(&record, MAX_SEGMENT_BYTES)?,
-            false,
-        )
+        dir.publish(&name, &bounded_json(&record, MAX_SEGMENT_BYTES)?, false)
     }
 
     /// Migration-only export of validated eligible evidence and permanent
     /// tombstones. Includes hidden notes: this is HOST data, never a model tool.
     /// No files, directories, permissions or archive contents are changed.
+    /// Legacy slots first, then shelves oldest to newest. A migration carries
+    /// at most [`MAX_SEGMENTS`] segments / [`MAX_STORE_BYTES`]; a larger store
+    /// is refused whole rather than exported in part.
     pub fn export_records(&self) -> io::Result<Vec<Value>> {
         let gate = self.enter(BUSY_EXPORT)?;
         let lock = Locked {
             file: self.fs.lock_existing()?,
             _gate: gate,
         };
-        let (records, _) = self.scan_with(true)?;
+        let over_limit =
+            || invalid("archive store exceeds the migration limit (128 archives / 256 MiB)");
+        let (legacy, mut used) = self.scan_legacy(true)?;
+        let mut records: Vec<Record> = legacy.into_iter().map(|(_, record)| record).collect();
+        for shelf in self.shelves()?.iter().rev() {
+            let Some(dir) = self.fs.open_child(shelf, true)? else {
+                continue;
+            };
+            let mut names: Vec<_> = dir.names()?.into_iter().map(|(name, ..)| name).collect();
+            names.retain(|name| archive_id(name).is_some());
+            names.sort_unstable();
+            for name in names {
+                if records.len() == MAX_SEGMENTS {
+                    return Err(over_limit());
+                }
+                let Some(raw) = dir.read_with(&name, MAX_SEGMENT_BYTES, true)? else {
+                    continue;
+                };
+                used += raw.len();
+                if used > MAX_STORE_BYTES {
+                    return Err(over_limit());
+                }
+                let record = self.record(&name, &raw)?;
+                if records
+                    .iter()
+                    .any(|r| r.id == record.id || r.digest == record.digest)
+                {
+                    return Err(corrupt());
+                }
+                records.push(record);
+            }
+        }
         if lock.file.is_none() && !records.is_empty() {
             return Err(corrupt());
         }
         Ok(records
             .into_iter()
-            .map(|(_, record)| {
+            .map(|record| {
                 let (source_message_count, messages, note, tombstone) = match record.body {
                     Body::Live {
                         source_message_count,
@@ -597,53 +696,145 @@ impl ArchiveStore {
             .collect())
     }
 
-    fn scan(&self) -> io::Result<(Vec<(usize, Record)>, usize)> {
-        self.scan_with(false)
+    /// Shelf names in the project directory, newest first.
+    fn shelves(&self) -> io::Result<Vec<String>> {
+        Ok(self.layout()?.0)
     }
 
-    fn scan_with(&self, readonly: bool) -> io::Result<(Vec<(usize, Record)>, usize)> {
-        let mut records = Vec::new();
-        let mut used = 0;
-        for slot in 0..MAX_SEGMENTS {
-            let Some(bytes) =
-                self.fs
-                    .read_with(&slot_name(slot), MAX_STORE_BYTES - used, readonly)?
-            else {
+    /// The project directory's shelves and legacy slot files, each newest
+    /// first. One directory listing; no segment is opened.
+    fn layout(&self) -> io::Result<(Vec<String>, Vec<String>)> {
+        let (mut shelves, mut slots) = (Vec::new(), Vec::new());
+        for (name, is_dir, _) in self.fs.names()? {
+            if let Some(number) = shelf_number(&name) {
+                // A link or a file under a shelf's name is refused, not skipped.
+                if !is_dir {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "archive shelf must be a private directory",
+                    ));
+                }
+                shelves.push((number, name));
+            } else if slot_number(&name).is_some() {
+                slots.push(name);
+            }
+        }
+        shelves.sort_unstable();
+        slots.sort_unstable();
+        let shelves = shelves.into_iter().rev().map(|(_, name)| name).collect();
+        slots.reverse();
+        Ok((shelves, slots))
+    }
+
+    /// The shelf the next segment goes to: the newest one, or a new one after
+    /// it once it holds [`SHELF_FILES`]. An empty shelf left by a crash is used.
+    fn writable_shelf(&self, shelves: &[String]) -> io::Result<PrivateDir> {
+        let newest = shelves.first().and_then(|name| shelf_number(name));
+        if let Some(number) = newest {
+            // `child` also makes the shelf's own directory entry durable.
+            let shelf = self.fs.child(&shelf_name(number), true)?;
+            let names = shelf.names()?;
+            if names.iter().filter(|(name, ..)| name.ends_with(".json")).count() < SHELF_FILES {
+                return Ok(shelf);
+            }
+        }
+        let next = newest.map_or(Some(1), |number| number.checked_add(1));
+        let next = next.ok_or_else(|| invalid("archive shelf numbers exhausted"))?;
+        self.fs.child(&shelf_name(next), true)
+    }
+
+    /// The shelf that holds segment `id`, and its record: one `openat` per
+    /// shelf, newest first, and one file read. Never a scan.
+    fn locate(
+        &self,
+        shelves: &[String],
+        id: &str,
+        readonly: bool,
+    ) -> io::Result<Option<(PrivateDir, Record)>> {
+        let name = archive_name(id);
+        for shelf in shelves {
+            let Some(dir) = self.fs.open_child(shelf, readonly)? else {
                 continue;
             };
-            used += bytes.len();
-            let record: Record = serde_json::from_slice(&bytes).map_err(|_| corrupt())?;
-            if record.version != 1
-                || record.scope != self.scope
-                || record.logical.len() != 64
-                || !record.logical.bytes().all(|b| b.is_ascii_hexdigit())
-                || validate_id(&record.id).is_err()
-                || record.digest.len() != 64
-                || !record.digest.bytes().all(|b| b.is_ascii_hexdigit())
+            if let Some(record) = self.read_record(&dir, &name, readonly)? {
+                return Ok(Some((dir, record)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The record of segment `id`: one file when it is on a shelf, otherwise
+    /// whichever legacy slot holds it.
+    fn find(&self, id: &str) -> io::Result<Record> {
+        match self.locate(&self.shelves()?, id, false)? {
+            Some((_, record)) => Ok(record),
+            None => find_record(self.scan_legacy(false)?.0, id),
+        }
+    }
+
+    fn read_record(
+        &self,
+        dir: &PrivateDir,
+        name: &str,
+        readonly: bool,
+    ) -> io::Result<Option<Record>> {
+        dir.read_with(name, MAX_SEGMENT_BYTES, readonly)?
+            .map(|raw| self.record(name, &raw))
+            .transpose()
+    }
+
+    /// Parse and validate the contents of the segment file `name`. Anything
+    /// that is not a whole record of this scope is `InvalidData`.
+    fn record(&self, name: &str, raw: &[u8]) -> io::Result<Record> {
+        let record: Record = serde_json::from_slice(raw).map_err(|_| corrupt())?;
+        if record.version != 1
+            || record.scope != self.scope
+            || record.logical.len() != 64
+            || !record.logical.bytes().all(|b| b.is_ascii_hexdigit())
+            || validate_id(&record.id).is_err()
+            || record.digest.len() != 64
+            || !record.digest.bytes().all(|b| b.is_ascii_hexdigit())
+            // A shelf file is named by its id; only a legacy slot is not.
+            || (name != archive_name(&record.id) && slot_number(name).is_none())
+        {
+            return Err(corrupt());
+        }
+        if let Body::Live {
+            messages,
+            source_message_count,
+            note,
+        } = &record.body
+        {
+            if messages.len() > MAX_MESSAGES
+                || *source_message_count > MAX_MESSAGES
+                || note.len() > MAX_NOTE_BYTES
+                || messages
+                    .iter()
+                    .any(|m| m.source_index >= *source_message_count)
+                || messages
+                    .windows(2)
+                    .any(|m| m[0].source_index >= m[1].source_index)
+                || projection_digest(&record.logical, *source_message_count, messages)?
+                    != record.digest
             {
                 return Err(corrupt());
             }
-            if let Body::Live {
-                messages,
-                source_message_count,
-                note,
-            } = &record.body
-            {
-                if messages.len() > MAX_MESSAGES
-                    || *source_message_count > MAX_MESSAGES
-                    || note.len() > MAX_NOTE_BYTES
-                    || messages
-                        .iter()
-                        .any(|m| m.source_index >= *source_message_count)
-                    || messages
-                        .windows(2)
-                        .any(|m| m[0].source_index >= m[1].source_index)
-                    || projection_digest(&record.logical, *source_message_count, messages)?
-                        != record.digest
-                {
-                    return Err(corrupt());
-                }
-            }
+        }
+        Ok(record)
+    }
+
+    /// Every legacy slot, read and validated together as before shelves
+    /// existed: at most [`MAX_SEGMENTS`] files / [`MAX_STORE_BYTES`].
+    fn scan_legacy(&self, readonly: bool) -> io::Result<(Vec<(usize, Record)>, usize)> {
+        let mut records = Vec::new();
+        let mut used = 0;
+        for slot in 0..MAX_SEGMENTS {
+            let name = slot_name(slot);
+            let Some(raw) = self.fs.read_with(&name, MAX_STORE_BYTES - used, readonly)? else {
+                continue;
+            };
+            used += raw.len();
+            let record = self.record(&name, &raw)?;
             if records
                 .iter()
                 .any(|(_, r): &(usize, Record)| r.id == record.id || r.digest == record.digest)
@@ -654,6 +845,35 @@ impl ArchiveStore {
         }
         Ok((records, used))
     }
+}
+
+/// The search row of a live record that matches `query` (already lowercased).
+fn describe(record: Record, query: &str) -> io::Result<Option<ArchiveDescriptor>> {
+    let Body::Live {
+        messages,
+        source_message_count,
+        ..
+    } = &record.body
+    else {
+        return Ok(None);
+    };
+    let mut snippet = None;
+    for message in messages {
+        let text = serde_json::to_string(&message.message).map_err(json_error)?;
+        if query.is_empty() || text.to_lowercase().contains(query) {
+            snippet = Some(prefix(&text, 256).to_owned());
+            break;
+        }
+    }
+    if snippet.is_none() && !(query.is_empty() && messages.is_empty()) {
+        return Ok(None);
+    }
+    Ok(Some(ArchiveDescriptor {
+        message_count: messages.len(),
+        source_message_count: *source_message_count,
+        snippet: snippet.unwrap_or_default(),
+        id: record.id,
+    }))
 }
 
 impl Projector {
@@ -814,22 +1034,51 @@ impl Projector {
 /// archive is empty; corrupt, unsafe or locked paths fail closed. In particular,
 /// this never invokes `ArchiveStore::new`, mkdir, chmod, or lock-file creation.
 pub fn export_in(base: &Path, scope_key: &str) -> io::Result<Vec<Value>> {
+    match existing_store(base, scope_key)? {
+        Some(store) => store.export_records(),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Absolute path of the file holding segment `id`, or `None`. Opens nothing
+/// for writing, creates nothing and takes no lock (files are published by
+/// atomic rename). The file is the validated record of `id`, which may be a
+/// tombstone, or become one later; a corrupt or unsafe path fails closed.
+pub fn archive_file(base: &Path, scope_key: &str, id: &str) -> io::Result<Option<PathBuf>> {
+    validate_id(id)?;
+    let Some(store) = existing_store(base, scope_key)? else {
+        return Ok(None);
+    };
+    let directory = base.join("context-archives").join(&store.scope);
+    for shelf in store.shelves()? {
+        let found = store.locate(std::slice::from_ref(&shelf), id, true)?;
+        if found.is_some() {
+            return Ok(Some(directory.join(shelf).join(archive_name(id))));
+        }
+    }
+    let (legacy, _) = store.scan_legacy(true)?;
+    let slot = legacy.into_iter().find(|(_, record)| record.id == id);
+    Ok(slot.map(|(slot, _)| directory.join(slot_name(slot))))
+}
+
+/// A project archive that is already there, opened read-only: unlike
+/// `ArchiveStore::new` this never runs mkdir, chmod or lock-file creation.
+fn existing_store(base: &Path, scope_key: &str) -> io::Result<Option<ArchiveStore>> {
     validate_key(scope_key)?;
     let scope = digest_parts(&[scope_key.as_bytes()]);
     let fs = match PrivateDir::open_existing(base, &scope) {
         Ok(fs) => fs,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    ArchiveStore {
+    Ok(Some(ArchiveStore {
         fs,
         scope,
-        logical: String::new(), // export scans all logical conversations in this scope
+        logical: String::new(), // reads all logical conversations in this scope
         redactor: None,
         abort: None,
         wait: LOCK_WAIT,
-    }
-    .export_records()
+    }))
 }
 
 /// Project-wide archive lookup; base and scope are trusted host values, never
@@ -1173,9 +1422,30 @@ fn find_record(records: Vec<(usize, Record)>, id: &str) -> io::Result<Record> {
         .map(|(_, r)| r)
         .ok_or_else(not_found)
 }
-/// File name of a numbered slot in the project directory.
+/// File name of a numbered legacy slot in the project directory.
 fn slot_name(slot: usize) -> String {
     format!("{slot:03}.json")
+}
+fn slot_number(name: &str) -> Option<usize> {
+    let slot = name.strip_suffix(".json")?.parse().ok()?;
+    (slot < MAX_SEGMENTS && slot_name(slot) == name).then_some(slot)
+}
+/// File name of segment `id` in its shelf.
+fn archive_name(id: &str) -> String {
+    format!("{id}.json")
+}
+fn archive_id(name: &str) -> Option<&str> {
+    name.strip_suffix(".json")
+        .filter(|id| validate_id(id).is_ok())
+}
+/// Shelves are `s` and six or more digits, numbered from 1 in creation order.
+fn shelf_name(number: u64) -> String {
+    format!("s{number:06}")
+}
+/// Only the one spelling `shelf_name` produces is a shelf.
+fn shelf_number(name: &str) -> Option<u64> {
+    let number = name.strip_prefix('s')?.parse().ok()?;
+    (shelf_name(number) == name).then_some(number)
 }
 fn prefix(text: &str, bytes: usize) -> &str {
     let mut end = bytes.min(text.len());
@@ -1218,9 +1488,9 @@ fn json_error(_: serde_json::Error) -> io::Error {
     invalid("archive JSON serialization failed or exceeded budget")
 }
 
-// ConfinedDir has no public directory fsync or bounded enumeration API. Keep a
-// private directory fd using the same openat/O_NOFOLLOW policy and modes as
-// private_fs, and use fixed numbered slots instead of an unbounded index scan.
+// ConfinedDir has no public directory fsync API. Keep a private directory fd
+// using the same openat/O_NOFOLLOW policy and modes as private_fs. Every method
+// takes a single name inside this directory, never a path.
 #[cfg(unix)]
 struct PrivateDir(std::fs::File);
 #[cfg(unix)]
@@ -1307,6 +1577,83 @@ impl PrivateDir {
         // EEXIST on retry is not evidence that the directory entry is durable.
         self.sync()?;
         Ok(Self(file))
+    }
+    /// An existing child directory, or `None`. A link is refused, never
+    /// followed. Unless `readonly`, its mode is made private again, as `child`
+    /// does.
+    fn open_child(&self, name: &str, readonly: bool) -> io::Result<Option<Self>> {
+        use crate::core::private_fs::DIR_MODE;
+        use std::os::unix::fs::PermissionsExt;
+        let file = match self.open(&c_name(name)?, libc::O_RDONLY | libc::O_DIRECTORY) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !readonly {
+            file.set_permissions(std::fs::Permissions::from_mode(DIR_MODE))?;
+        }
+        Ok(Some(Self(file)))
+    }
+    /// Direct children as (name, is a directory, modification time in ns), in
+    /// no order. Nothing is followed, so a link is not a directory. Names that
+    /// are not valid components are left out; a failed read is an error, never
+    /// a shorter listing.
+    fn names(&self) -> io::Result<Vec<(String, bool, i64)>> {
+        use std::os::fd::IntoRawFd;
+        // The stream owns its own handle on this directory, opened afresh so
+        // that listings share no read position (a duplicate would).
+        let fd = self
+            .open(c".", libc::O_RDONLY | libc::O_DIRECTORY)?
+            .into_raw_fd();
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
+        let mut names = Vec::new();
+        let mut entry: libc::dirent = unsafe { std::mem::zeroed() };
+        let mut next = std::ptr::null_mut();
+        let result = loop {
+            // readdir_r returns a failed read as an error; readdir's null is
+            // also the end of the directory.
+            let code = unsafe { libc::readdir_r(stream, &mut entry, &mut next) };
+            if code != 0 {
+                break Err(io::Error::from_raw_os_error(code));
+            }
+            if next.is_null() {
+                break Ok(());
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr(entry.d_name.as_ptr()) };
+            let Some(name) = name.to_str().ok().filter(|name| c_name(name).is_ok()) else {
+                continue;
+            };
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let found = unsafe {
+                libc::fstatat(
+                    self.fd(),
+                    entry.d_name.as_ptr(),
+                    &mut stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if found != 0 {
+                let error = io::Error::last_os_error();
+                // Gone since it was listed: whoever opens it next decides.
+                if error.kind() == io::ErrorKind::NotFound {
+                    continue;
+                }
+                break Err(error);
+            }
+            let kind = stat.st_mode & libc::S_IFMT;
+            #[allow(clippy::useless_conversion)]
+            let modified = i64::from(stat.st_mtime)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(i64::from(stat.st_mtime_nsec));
+            names.push((name.to_owned(), kind == libc::S_IFDIR, modified));
+        };
+        unsafe { libc::closedir(stream) }; // closes its handle too
+        result.map(|()| names)
     }
     fn open(&self, name: &std::ffi::CStr, flags: i32) -> io::Result<std::fs::File> {
         use std::os::fd::FromRawFd;
@@ -1470,6 +1817,15 @@ impl PrivateDir {
         Self::unsupported()
     }
     fn open_existing(_: &Path, _: &str) -> io::Result<Self> {
+        Self::unsupported()
+    }
+    fn child(&self, _: &str, _: bool) -> io::Result<Self> {
+        Self::unsupported()
+    }
+    fn open_child(&self, _: &str, _: bool) -> io::Result<Option<Self>> {
+        Self::unsupported()
+    }
+    fn names(&self) -> io::Result<Vec<(String, bool, i64)>> {
         Self::unsupported()
     }
     fn lock_existing(&self) -> io::Result<Option<FlockGuard>> {
@@ -1842,6 +2198,76 @@ mod tests {
     fn directory(tmp: &tempfile::TempDir, store: &ArchiveStore) -> std::path::PathBuf {
         tmp.path().join("context-archives").join(&store.scope)
     }
+    /// Every segment file on the shelves of a project directory, in path order.
+    fn shelf_files(dir: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for shelf in std::fs::read_dir(dir).unwrap() {
+            let shelf = shelf.unwrap().path();
+            if std::fs::symlink_metadata(&shelf).unwrap().is_dir() {
+                let entries = std::fs::read_dir(&shelf).unwrap();
+                files.extend(entries.map(|entry| entry.unwrap().path()));
+            }
+        }
+        files.retain(|file| file.extension().is_some_and(|extension| extension == "json"));
+        files.sort();
+        files
+    }
+    /// The one segment file of a store that has sealed once.
+    fn only_archive_file(dir: &Path) -> PathBuf {
+        let files = shelf_files(dir);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].parent().unwrap(), dir.join("s000001"));
+        files[0].clone()
+    }
+    /// A segment as stores wrote it before shelves existed: a random id in a
+    /// numbered slot of the project directory.
+    fn seal_legacy_slot(
+        store: &ArchiveStore,
+        slot: usize,
+        messages: &[SharedMessage],
+        note: &str,
+    ) -> ArchiveRef {
+        let projection = project_hashed(&store.logical, messages, note, None).unwrap();
+        let record = Record {
+            version: 1,
+            scope: store.scope.clone(),
+            logical: store.logical.clone(),
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            digest: projection.digest,
+            body: Body::Live {
+                source_message_count: projection.source_message_count,
+                messages: projection.messages,
+                note: projection.note,
+            },
+        };
+        let bytes = bounded_json(&record, MAX_SEGMENT_BYTES).unwrap();
+        let _lock = store.exclusive().unwrap();
+        store.fs.publish(&slot_name(slot), &bytes, false).unwrap();
+        record.reference().unwrap()
+    }
+    fn text(content: &str) -> Vec<SharedMessage> {
+        vec![msg("user", json!(content))]
+    }
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+    /// Path -> SHA-256 of every file under a directory.
+    fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, String> {
+        let mut files = std::collections::BTreeMap::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                    pending.push(path);
+                } else {
+                    let hash = digest_parts(&[&std::fs::read(&path).unwrap()]);
+                    files.insert(path, hash);
+                }
+            }
+        }
+        files
+    }
 
     #[test]
     fn export_preview_is_read_only_and_matches_projection_including_tombstones() {
@@ -1876,6 +2302,8 @@ mod tests {
             dir.clone(),
         ];
         paths.extend(std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()));
+        paths.extend(shelf_files(&dir));
+        assert_eq!(paths.len(), 7, "lock, one shelf and its two segments");
         // Export must not silently repair permissions, unlike normal archive IO.
         for path in &paths {
             let mode = if path.is_dir() { 0o750 } else { 0o640 };
@@ -1903,16 +2331,18 @@ mod tests {
         let rows = export_in(tmp.path(), "synthetic-project").unwrap();
         assert_eq!(rows, store.export_records().unwrap());
         assert_eq!(before, snapshot());
+        assert_eq!(rows.len(), 2);
+        let row = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap();
         assert_eq!(
-            rows[0],
-            json!({"id":reference.id,"digest":projection.digest,"logical_id":projection.logical_id,
+            row(&reference.id),
+            &json!({"id":reference.id,"digest":projection.digest,"logical_id":projection.logical_id,
             "source_message_count":1,"messages":projection.messages,"note":"hidden note","tombstone":false})
         );
-        assert_eq!(rows[1]["id"], tombstone.id);
-        assert_eq!(rows[1]["tombstone"], true);
-        assert_eq!(rows[1]["source_message_count"], 0);
-        assert_eq!(rows[1]["messages"], json!([]));
-        assert_eq!(rows[1]["note"], "");
+        let forgotten = row(&tombstone.id);
+        assert_eq!(forgotten["tombstone"], true);
+        assert_eq!(forgotten["source_message_count"], 0);
+        assert_eq!(forgotten["messages"], json!([]));
+        assert_eq!(forgotten["note"], "");
         let lock = store.fs.lock().unwrap();
         assert_eq!(
             export_in(tmp.path(), "synthetic-project")
@@ -1921,7 +2351,7 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         drop(lock);
-        std::fs::write(dir.join("000.json"), b"corrupt").unwrap();
+        std::fs::write(&shelf_files(&dir)[0], b"corrupt").unwrap();
         assert!(export_in(tmp.path(), "synthetic-project").is_err());
     }
 
@@ -1932,7 +2362,7 @@ mod tests {
         let r = store
             .seal(&[msg("user", json!("evidence"))], "note")
             .unwrap();
-        let path = dir.join("000.json");
+        let path = only_archive_file(&dir);
         let bytes = std::fs::read(&path).unwrap();
         std::fs::remove_file(dir.join("lock")).unwrap();
         assert!(export_in(tmp.path(), "synthetic-project").is_err());
@@ -1970,7 +2400,7 @@ mod tests {
         let serialized = serde_json::to_string(&fetched).unwrap();
         assert!(serialized.contains("Compare the selected files"));
         assert!(!serialized.contains("ATTACHMENT_"));
-        let raw = std::fs::read_to_string(directory(&tmp, &store).join("000.json")).unwrap();
+        let raw = std::fs::read_to_string(only_archive_file(&directory(&tmp, &store))).unwrap();
         assert!(!raw.contains("ATTACHMENT_"));
         assert!(messages[0].to_string().contains("ATTACHMENT_TEXT_SECRET"));
     }
@@ -2013,7 +2443,7 @@ mod tests {
             .fetch(&reference.id, usize::MAX, 10)
             .unwrap()
             .is_empty());
-        let raw = std::fs::read_to_string(directory(&tmp, &store).join("000.json")).unwrap();
+        let raw = std::fs::read_to_string(only_archive_file(&directory(&tmp, &store))).unwrap();
         assert!(!raw.contains("FORBIDDEN"));
         assert!(!raw.contains("cache_control"));
         assert_eq!(messages[0]["content"], "FORBIDDEN SYSTEM");
@@ -2053,7 +2483,7 @@ mod tests {
         let reference = store.seal(&messages, "removable note").unwrap();
         store.forget(&reference.id).unwrap();
         store.forget(&reference.id).unwrap();
-        let raw = std::fs::read_to_string(directory(&tmp, &store).join("000.json")).unwrap();
+        let raw = std::fs::read_to_string(only_archive_file(&directory(&tmp, &store))).unwrap();
         assert!(raw.contains("tombstone"));
         assert!(!raw.contains("removable"));
         assert!(!raw.contains("source_message_count"));
@@ -2093,15 +2523,24 @@ mod tests {
             );
             assert!(store.forget(id).is_err());
         }
-        std::fs::copy(
-            directory(&tmp, &store).join("000.json"),
-            directory(&tmp, &foreign).join("000.json"),
-        )
-        .unwrap();
-        assert_eq!(
-            foreign.search("", 1).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
+        // Copied into the foreign project, as a shelf file or as a legacy slot,
+        // the record is invalid there: never fetched, and search passes over it.
+        let source = only_archive_file(&directory(&tmp, &store));
+        let foreign_dir = directory(&tmp, &foreign);
+        std::fs::create_dir(foreign_dir.join("s000001")).unwrap();
+        for target in [
+            foreign_dir.join("s000001").join(source.file_name().unwrap()),
+            foreign_dir.join("000.json"),
+        ] {
+            std::fs::copy(&source, &target).unwrap();
+            assert_eq!(
+                foreign.fetch(&reference.id, 0, 1).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(foreign.search("", 1).unwrap().is_empty());
+            assert!(foreign.export_records().is_err());
+            std::fs::remove_file(&target).unwrap();
+        }
         assert!(ArchiveStore::new(&tmp.path().join("../escape"), "p", "l").is_err());
     }
 
@@ -2135,7 +2574,7 @@ mod tests {
         ));
         let reference = store.seal(&messages, "").unwrap();
         assert_eq!(reference.message_count, 3);
-        let raw = std::fs::read_to_string(directory(&tmp, &store).join("000.json")).unwrap();
+        let raw = std::fs::read_to_string(only_archive_file(&directory(&tmp, &store))).unwrap();
         for forbidden in ["unclassified raw", "synthetic-credential", "FORBIDDEN"] {
             assert!(!raw.contains(forbidden));
         }
@@ -2262,45 +2701,56 @@ mod tests {
     fn torn_final_fails_closed_stale_temporary_is_not_visible() {
         let (tmp, store) = setup();
         let dir = directory(&tmp, &store);
-        std::fs::write(dir.join("pending.tmp"), b"unpublished partial").unwrap();
-        assert!(store.search("", 1).unwrap().is_empty());
-        let reference = store.seal(&[msg("user", json!("complete"))], "").unwrap();
-        assert!(!dir.join("pending.tmp").exists());
-        std::fs::write(dir.join("000.json"), b"{\"version\":1,").unwrap();
-        assert_eq!(
-            store.fetch(&reference.id, 0, 1).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(store.search("", 1).is_err());
-        assert!(store.seal(&[msg("user", json!("next"))], "").is_err());
-        assert!(store.forget(&reference.id).is_err());
+        let reference = store.seal(&text("complete"), "").unwrap();
+        let file = only_archive_file(&dir);
+        let stale = dir.join("s000001").join("pending.tmp");
+        std::fs::write(&stale, b"unpublished partial").unwrap();
+        assert_eq!(store.search("", 2).unwrap().len(), 1);
+        let other = store.seal(&text("another"), "").unwrap();
+        assert!(!stale.exists());
+        std::fs::write(&file, b"{\"version\":1,").unwrap();
+        for result in [
+            store.fetch(&reference.id, 0, 1).map(drop),
+            store.fetch_note(&reference.id).map(drop),
+            store.forget(&reference.id),
+            // The torn file is neither trusted as the same projection nor replaced.
+            store.seal(&text("complete"), "").map(drop),
+        ] {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), b"{\"version\":1,");
+        // Other segments do not depend on it.
+        assert_eq!(store.fetch(&other.id, 0, 1).unwrap(), text("another"));
+        assert!(store.seal(&text("next"), "").is_ok());
     }
 
     #[test]
     fn private_modes_symlink_hardlink_fifo_and_lock_refusal() {
         let (tmp, store) = setup();
         let dir = directory(&tmp, &store);
-        let reference = store.seal(&[msg("user", json!("private"))], "").unwrap();
+        let reference = store.seal(&text("private"), "").unwrap();
+        let file = only_archive_file(&dir);
         for path in [
             tmp.path().to_path_buf(),
             tmp.path().join("context-archives"),
             dir.clone(),
+            dir.join("s000001"),
         ] {
-            assert_eq!(
-                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
+            assert_eq!(mode(&path), 0o700);
         }
-        for name in ["000.json", "lock"] {
-            assert_eq!(
-                std::fs::metadata(dir.join(name))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
+        for path in [&file, &dir.join("lock")] {
+            assert_eq!(mode(path), 0o600);
         }
+        // Loosened modes are made private again by the next operation, but
+        // not by the read-only path lookup.
+        std::fs::set_permissions(dir.join("s000001"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let located = archive_file(tmp.path(), "synthetic-project", &reference.id).unwrap();
+        assert_eq!(located, Some(file.clone()));
+        assert_eq!((mode(&dir.join("s000001")), mode(&file)), (0o755, 0o644));
+        store.fetch(&reference.id, 0, 1).unwrap();
+        assert_eq!((mode(&dir.join("s000001")), mode(&file)), (0o700, 0o600));
         let lock = store.fs.lock().unwrap();
         assert_eq!(
             store.fetch(&reference.id, 0, 1).unwrap_err().kind(),
@@ -2309,24 +2759,68 @@ mod tests {
         drop(lock);
         let victim = tmp.path().join("synthetic-victim");
         std::fs::write(&victim, "do not change").unwrap();
-        std::fs::remove_file(dir.join("000.json")).unwrap();
-        symlink(&victim, dir.join("000.json")).unwrap();
-        assert!(store.search("", 1).is_err());
-        assert!(store.seal(&[msg("user", json!("private"))], "").is_err());
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not change");
-        std::fs::remove_file(dir.join("000.json")).unwrap();
-        std::fs::hard_link(&victim, dir.join("000.json")).unwrap();
-        assert!(store.search("", 1).is_err());
-        std::fs::remove_file(dir.join("000.json")).unwrap();
-        let fifo = std::ffi::CString::new(dir.join("000.json").to_str().unwrap()).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let refused = || {
+            assert!(store.search("", 1).is_err());
+            assert!(store.fetch(&reference.id, 0, 1).is_err());
+            assert!(store.fetch_note(&reference.id).is_err());
+            assert!(store.forget(&reference.id).is_err());
+            // The same projection would be published under this very name.
+            assert!(store.seal(&text("private"), "").is_err());
+            assert!(store.export_records().is_err());
+            assert!(archive_file(tmp.path(), "synthetic-project", &reference.id).is_err());
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not change");
+            assert_eq!(mode(&victim), 0o644);
+        };
+        std::fs::remove_file(&file).unwrap();
+        symlink(&victim, &file).unwrap();
+        refused();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::hard_link(&victim, &file).unwrap();
+        refused();
+        std::fs::remove_file(&file).unwrap();
+        let fifo = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        assert!(store.search("", 1).is_err());
+        refused();
         let alias = tmp.path().join("alias");
         symlink(tmp.path().join("context-archives"), &alias).unwrap();
         assert!(ArchiveStore::new(&alias.join("nested"), "p", "l").is_err());
         std::fs::remove_file(dir.join("lock")).unwrap();
         symlink(&victim, dir.join("lock")).unwrap();
         assert!(store.fs.lock().is_err());
+    }
+
+    #[test]
+    fn a_shelf_that_is_a_link_or_a_file_is_refused_not_followed() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let reference = store.seal(&text("shelved"), "").unwrap();
+        let shelf = dir.join("s000001");
+        let outside = tmp.path().join("outside-shelf");
+        std::fs::rename(&shelf, &outside).unwrap();
+        let before = snapshot(&outside);
+        let refused = || {
+            assert!(store.fetch(&reference.id, 0, 1).is_err());
+            assert!(store.fetch_note(&reference.id).is_err());
+            assert!(store.search("", 1).is_err());
+            assert!(store.forget(&reference.id).is_err());
+            assert!(store.seal(&text("shelved"), "").is_err());
+            assert!(store.seal(&text("something new"), "").is_err());
+            assert!(store.export_records().is_err());
+            assert!(export_in(tmp.path(), "synthetic-project").is_err());
+            assert!(archive_file(tmp.path(), "synthetic-project", &reference.id).is_err());
+        };
+        symlink(&outside, &shelf).unwrap();
+        refused();
+        std::fs::remove_file(&shelf).unwrap();
+        std::fs::write(&shelf, b"not a directory").unwrap();
+        refused();
+        // Nothing was read into, written through or created beside the link.
+        assert_eq!(snapshot(&outside), before);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "lock and s000001");
+        // A newer shelf does not make an unsafe older one acceptable.
+        std::fs::create_dir(dir.join("s000002")).unwrap();
+        refused();
     }
 
     #[test]
@@ -2371,22 +2865,517 @@ mod tests {
     }
 
     #[test]
-    fn bounded_search_utf8_and_permanent_capacity() {
+    fn bounded_search_utf8() {
         let (_tmp, store) = setup();
-        for index in 0..MAX_SEGMENTS {
-            store
-                .seal(
-                    &[msg("user", json!(format!("{index} {}", "é".repeat(200))))],
-                    "",
-                )
-                .unwrap();
+        for index in 0..MAX_SEARCH_RESULTS + 8 {
+            let words = format!("{index} {}", "é".repeat(200));
+            store.seal(&text(&words), "").unwrap();
         }
         let descriptors = store.search("", MAX_SEARCH_RESULTS).unwrap();
         assert_eq!(descriptors.len(), MAX_SEARCH_RESULTS);
         assert!(descriptors.iter().all(|d| d.snippet.len() <= 256));
-        assert!(store.seal(&[msg("user", json!("overflow"))], "").is_err());
-        store.forget(&descriptors[0].id).unwrap();
-        assert!(store.seal(&[msg("user", json!("still full"))], "").is_err());
+    }
+
+    #[test]
+    fn seal_129_succeed() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let seal = |index: usize| store.seal(&text(&format!("archive {index}")), "").unwrap();
+        let mut ids = vec![seal(0).id];
+        let first = only_archive_file(&dir);
+        let bytes = std::fs::read(&first).unwrap();
+        ids.extend((1..=SHELF_FILES).map(|index| seal(index).id));
+        assert_eq!(ids.len(), 129);
+        assert_eq!(first, dir.join("s000001").join(archive_name(&ids[0])));
+        for (index, id) in ids.iter().enumerate() {
+            assert_eq!(
+                store.fetch(id, 0, 1).unwrap(),
+                text(&format!("archive {index}"))
+            );
+        }
+        assert_eq!(std::fs::read(&first).unwrap(), bytes);
+        // The 129th starts the second shelf; nothing was put in a legacy slot.
+        let files = shelf_files(&dir);
+        assert_eq!(files.len(), 129);
+        assert_eq!(files[128], dir.join("s000002").join(archive_name(&ids[128])));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "lock and two shelves");
+        // Forgetting does not make room in a full shelf, and none is needed.
+        store.forget(&ids[0]).unwrap();
+        let next = seal(129);
+        assert_eq!(shelf_files(&dir).len(), 130);
+        assert!(dir.join("s000002").join(archive_name(&next.id)).is_file());
+    }
+
+    #[test]
+    #[ignore = "seals 10,000 archives (30,000 fsyncs): 4 s on tmpfs, far longer on a real disk"]
+    fn seal_10000_succeed() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let seal = |index: usize| store.seal(&text(&format!("archive {index}")), "").unwrap();
+        let ids: Vec<_> = (0..10_000).map(|index| seal(index).id).collect();
+        let shelves = store.shelves().unwrap();
+        assert_eq!(shelves.len(), 79);
+        assert_eq!(shelves[0], "s000079");
+        assert_eq!(shelf_files(&dir).len(), 10_000);
+        for index in [0, 9_999] {
+            assert_eq!(
+                store.fetch(&ids[index], 0, 1).unwrap(),
+                text(&format!("archive {index}"))
+            );
+        }
+        let started = Instant::now();
+        store.fetch(&ids[0], 0, 1).unwrap();
+        eprintln!("fetch of the oldest of 10,000: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn no_seal_replaces_a_file() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        seal_legacy_slot(&store, 0, &text("legacy kept"), "");
+        let forgotten = seal_legacy_slot(&store, 1, &text("legacy forgotten"), "");
+        store.forget(&forgotten.id).unwrap();
+        let mut before = snapshot(&dir);
+        assert_eq!(before.len(), 3, "lock and two legacy slots");
+        for index in 0..300 {
+            store.seal(&text(&format!("archive {index}")), "").unwrap();
+            let after = snapshot(&dir);
+            for (path, hash) in &before {
+                assert_eq!(after.get(path), Some(hash), "seal {index} touched {path:?}");
+            }
+            assert_eq!(after.len(), before.len() + 1);
+            before = after;
+        }
+        // Neither does sealing something again, forgotten or not.
+        store.seal(&text("archive 7"), "changed note").unwrap();
+        assert!(store.seal(&text("legacy forgotten"), "").is_err());
+        assert_eq!(snapshot(&dir), before);
+    }
+
+    #[test]
+    #[ignore = "writes and re-reads about 280 MiB: about 55 s in a debug build"]
+    fn byte_cap_is_gone() {
+        let (tmp, store) = setup();
+        let large = |index: usize| {
+            let filler = "x".repeat(15 * 1024 * 1024 + 512 * 1024);
+            text(&format!("archive-{index:02} {filler}"))
+        };
+        // 18 segments of 15.5 MiB: 279 MiB, where the store used to stop at 256.
+        let ids: Vec<_> = (0..18)
+            .map(|index| store.seal(&large(index), "").unwrap().id)
+            .collect();
+        let files = shelf_files(&directory(&tmp, &store));
+        let stored: u64 = files.iter().map(|f| f.metadata().unwrap().len()).sum();
+        assert!(stored > MAX_STORE_BYTES as u64 + MAX_SEGMENT_BYTES as u64);
+        for (index, id) in ids.iter().enumerate() {
+            let fetched = store.fetch(id, 0, 1).unwrap();
+            let content = fetched[0]["content"].as_str().unwrap();
+            assert!(content.starts_with(&format!("archive-{index:02} ")));
+            assert_eq!(content.len(), large(index)[0]["content"].as_str().unwrap().len());
+        }
+        // The search budget is bytes as well as files: 17 files pass 256 MiB.
+        let (rows, stopped) = store.search_scan("archive-00", 1).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(stopped, Some(17));
+        let (rows, stopped) = store.search_scan("archive-17", 1).unwrap();
+        assert_eq!((rows[0].id.as_str(), stopped), (ids[17].as_str(), None));
+        // A migration cannot carry it, and says so instead of exporting a part.
+        let error = store.export_records().unwrap_err();
+        assert!(error.to_string().contains("exceeds the migration limit"));
+    }
+
+    #[test]
+    fn legacy_slots_read_by_new_code() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let a = seal_legacy_slot(&store, 0, &text("legacy alpha"), "note a");
+        let b = seal_legacy_slot(&store, 1, &text("legacy beta"), "note b");
+        let c = seal_legacy_slot(&store, 2, &text("legacy gamma"), "note c");
+        store.forget(&c.id).unwrap();
+        let slots = ["000.json", "001.json", "002.json"].map(|name| dir.join(name));
+        assert!(std::fs::read_to_string(&slots[2]).unwrap().contains("tombstone"));
+        let kept = std::fs::read(&slots[1]).unwrap();
+        assert_eq!(store.fetch(&a.id, 0, 1).unwrap(), text("legacy alpha"));
+        assert_eq!(store.fetch_note(&b.id).unwrap(), "note b");
+        assert_eq!(
+            store.fetch(&c.id, 0, 1).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let found = |query: &str| -> Vec<String> {
+            let rows = store.search(query, 10).unwrap();
+            rows.into_iter().map(|row| row.id).collect()
+        };
+        assert_eq!(found("legacy"), [b.id.as_str(), a.id.as_str()]);
+        assert_eq!(
+            archive_file(tmp.path(), "synthetic-project", &b.id).unwrap(),
+            Some(slots[1].clone())
+        );
+        store.forget(&a.id).unwrap();
+        store.forget(&a.id).unwrap();
+        assert!(std::fs::read_to_string(&slots[0]).unwrap().contains("tombstone"));
+        assert_eq!(found(""), [b.id.as_str()]);
+        assert!(shelf_files(&dir).is_empty());
+        // Only what is sealed from now on goes to a shelf, under its digest id.
+        let new = store.seal(&text("after shelves"), "").unwrap();
+        assert_eq!(
+            only_archive_file(&dir),
+            dir.join("s000001").join(archive_name(&new.id))
+        );
+        assert_eq!(found(""), [new.id.as_str(), b.id.as_str()]);
+        assert_eq!(std::fs::read(&slots[1]).unwrap(), kept);
+        assert!(slots.iter().all(|slot| slot.is_file()));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 5);
+        assert_eq!(store.export_records().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn legacy_full_store_accepts_seal() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let legacy: Vec<_> = (0..MAX_SEGMENTS)
+            .map(|slot| seal_legacy_slot(&store, slot, &text(&format!("legacy {slot}")), ""))
+            .collect();
+        let before = snapshot(&dir);
+        let new = store.seal(&text("the 129th"), "").unwrap();
+        assert_eq!(store.fetch(&new.id, 0, 1).unwrap(), text("the 129th"));
+        assert_eq!(
+            only_archive_file(&dir),
+            dir.join("s000001").join(archive_name(&new.id))
+        );
+        for slot in [0, MAX_SEGMENTS - 1] {
+            assert_eq!(
+                store.fetch(&legacy[slot].id, 0, 1).unwrap(),
+                text(&format!("legacy {slot}"))
+            );
+        }
+        let after = snapshot(&dir);
+        assert!(before.iter().all(|(path, hash)| after.get(path) == Some(hash)));
+        // Newest first: the shelf, then the highest slot.
+        let rows = store.search("", 2).unwrap();
+        assert_eq!(rows[0].id, new.id);
+        assert_eq!(rows[1].id, legacy[MAX_SEGMENTS - 1].id);
+    }
+
+    #[test]
+    fn legacy_duplicate_and_tombstone_still_honoured() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let live = seal_legacy_slot(&store, 0, &text("sealed long ago"), "first note");
+        let gone = seal_legacy_slot(&store, 1, &text("forgotten long ago"), "");
+        store.forget(&gone.id).unwrap();
+        let (again, note) = store
+            .seal_with_note(&text("sealed long ago"), "second note")
+            .unwrap();
+        assert_eq!((again, note.as_str()), (live, "first note"));
+        assert_eq!(
+            store.seal(&text("forgotten long ago"), "").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(shelf_files(&dir).is_empty());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "lock and two slots");
+    }
+
+    #[test]
+    fn duplicate_seal_returns_same_id_across_shelves() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let seal = |index: usize, note: &str| {
+            let words = format!("archive {index}");
+            store.seal_with_note(&text(&words), note).unwrap()
+        };
+        let first = seal(0, "first note");
+        for index in 1..=SHELF_FILES {
+            seal(index, "");
+        }
+        let before = snapshot(&dir);
+        assert_eq!(shelf_files(&dir).len(), 129);
+        // The newest shelf is the second; the first projection is on the first.
+        assert_eq!(seal(0, "another note"), first);
+        assert_eq!(seal(SHELF_FILES, "another note").1, "");
+        assert_eq!(snapshot(&dir), before);
+        assert_eq!(first.0.id.len(), 32);
+        let digest = project_archive("synthetic-logical", &text("archive 0"), "", None)
+            .unwrap()
+            .digest;
+        assert_eq!(first.0.id, digest[..32]);
+    }
+
+    #[test]
+    fn forgotten_projection_cannot_be_resealed() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let reference = store.seal(&text("forget me"), "note").unwrap();
+        store.forget(&reference.id).unwrap();
+        let before = snapshot(&dir);
+        for note in ["note", "another note"] {
+            assert_eq!(
+                store.seal(&text("forget me"), note).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        assert_eq!(snapshot(&dir), before);
+        // Another conversation's identical words are another projection.
+        let other = ArchiveStore::new(tmp.path(), "synthetic-project", "other-logical").unwrap();
+        assert!(other.seal(&text("forget me"), "").is_ok());
+        assert!(store.seal(&text("remember me"), "").is_ok());
+    }
+
+    #[test]
+    fn forget_is_in_place_and_idempotent() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let kept = store.seal(&text("keep me"), "").unwrap();
+        let reference = store.seal(&text("forget me"), "note").unwrap();
+        let file = dir.join("s000001").join(archive_name(&reference.id));
+        let neighbour = dir.join("s000001").join(archive_name(&kept.id));
+        let untouched = snapshot(&dir)[&neighbour].clone();
+        store.forget(&reference.id).unwrap();
+        assert_eq!(shelf_files(&dir).len(), 2, "same name, same shelf");
+        let tombstone = std::fs::read_to_string(&file).unwrap();
+        assert!(tombstone.contains("tombstone") && !tombstone.contains("forget me"));
+        let written = file.metadata().unwrap().modified().unwrap();
+        // Again: nothing is rewritten.
+        store.forget(&reference.id).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), tombstone);
+        assert_eq!(file.metadata().unwrap().modified().unwrap(), written);
+        assert!(!dir.join("s000001").join("pending.tmp").exists());
+        assert_eq!(snapshot(&dir)[&neighbour], untouched);
+        assert_eq!(store.fetch(&kept.id, 0, 1).unwrap(), text("keep me"));
+        assert_eq!(
+            store.forget(&"a".repeat(32)).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn fetch_reads_one_file() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let ids: Vec<_> = (0..300)
+            .map(|index| store.seal(&text(&format!("archive {index}")), "note").unwrap().id)
+            .collect();
+        // On the oldest shelf, behind two newer ones.
+        let target = dir.join("s000001").join(archive_name(&ids[5]));
+        for file in shelf_files(&dir) {
+            if file != target {
+                std::fs::write(file, b"corrupt").unwrap();
+            }
+        }
+        assert_eq!(store.fetch(&ids[5], 0, 1).unwrap(), text("archive 5"));
+        assert_eq!(store.fetch_note(&ids[5]).unwrap(), "note");
+        assert_eq!(store.seal(&text("archive 5"), "").unwrap().id, ids[5]);
+        assert!(store.seal(&text("archive 300"), "").is_ok());
+        store.forget(&ids[5]).unwrap();
+        assert_eq!(
+            store.fetch(&ids[6], 0, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn search_is_newest_first_and_budgeted() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let epoch = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        // Inside a shelf the order is by modification time, which a fast
+        // filesystem clock does not tell apart: give every file its own.
+        let seal = |index: usize| {
+            let words = match index {
+                0 => "needle oldest-only".to_owned(),
+                _ => format!("needle {index}"),
+            };
+            let id = store.seal(&text(&words), "").unwrap().id;
+            let shelf = dir.join(shelf_name((index / SHELF_FILES + 1) as u64));
+            let file = std::fs::File::options()
+                .write(true)
+                .open(shelf.join(archive_name(&id)))
+                .unwrap();
+            file.set_modified(epoch + Duration::from_secs(index as u64))
+                .unwrap();
+            id
+        };
+        let mut ids: Vec<_> = (0..100).map(&seal).collect();
+        let (rows, stopped) = store.search_scan("oldest-only", 32).unwrap();
+        assert_eq!((rows.len(), rows[0].id.as_str(), stopped), (1, ids[0].as_str(), None));
+
+        ids.extend((100..300).map(&seal));
+        let rows = store.search("needle", 32).unwrap();
+        let newest: Vec<_> = rows.iter().map(|row| row.id.as_str()).collect();
+        let expected: Vec<_> = ids.iter().rev().take(32).map(String::as_str).collect();
+        assert_eq!(newest, expected);
+        // A full page is not a budget stop.
+        assert_eq!(store.search_scan("needle", 32).unwrap().1, None);
+
+        // Exactly the budget: every file is read, so nothing is left unread.
+        ids.extend((300..SEARCH_SCAN_FILES).map(&seal));
+        let (rows, stopped) = store.search_scan("oldest-only", 32).unwrap();
+        assert_eq!((rows.len(), stopped), (1, None));
+        // One more, and the oldest is beyond it.
+        ids.push(seal(SEARCH_SCAN_FILES));
+        let (rows, stopped) = store.search_scan("oldest-only", 32).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(stopped, Some(SEARCH_SCAN_FILES));
+        assert_eq!(store.search("needle", 1).unwrap()[0].id, ids[SEARCH_SCAN_FILES]);
+        assert_eq!(store.fetch(&ids[0], 0, 1).unwrap(), text("needle oldest-only"));
+    }
+
+    #[test]
+    fn search_skips_a_corrupt_file() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let ids: Vec<_> = ["first", "second", "third"]
+            .iter()
+            .map(|words| store.seal(&text(words), "").unwrap().id)
+            .collect();
+        let legacy = seal_legacy_slot(&store, 0, &text("legacy first"), "");
+        seal_legacy_slot(&store, 1, &text("legacy second"), "");
+        std::fs::write(dir.join("s000001").join(archive_name(&ids[1])), b"corrupt").unwrap();
+        std::fs::write(dir.join("001.json"), b"{}").unwrap();
+        // Larger than any segment: not even read.
+        let huge = std::fs::File::create(dir.join("s000001").join(archive_name(&"f".repeat(32))));
+        huge.unwrap().set_len(MAX_SEGMENT_BYTES as u64 + 1).unwrap();
+        // Not segment names: never opened.
+        std::fs::write(dir.join("s000001").join("notes.json"), b"stray").unwrap();
+        std::fs::write(dir.join("s0000001"), b"stray").unwrap();
+        let (rows, stopped) = store.search_scan("", 10).unwrap();
+        let mut found: Vec<_> = rows.into_iter().map(|row| row.id).collect();
+        found.sort();
+        let mut expected = vec![ids[0].clone(), ids[2].clone(), legacy.id];
+        expected.sort();
+        assert_eq!(found, expected);
+        assert_eq!(stopped, None);
+        assert_eq!(store.search("second", 10).unwrap(), []);
+    }
+
+    #[test]
+    fn file_name_must_match_record_id() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let a = store.seal(&text("the original"), "").unwrap();
+        let b = "b".repeat(32);
+        let copy = dir.join("s000001").join(archive_name(&b));
+        std::fs::copy(only_archive_file(&dir), &copy).unwrap();
+        for result in [
+            store.fetch(&b, 0, 1).map(drop),
+            store.fetch_note(&b).map(drop),
+            store.forget(&b),
+            archive_file(tmp.path(), "synthetic-project", &b).map(drop),
+        ] {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+        let original = dir.join("s000001").join(archive_name(&a.id));
+        assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(original).unwrap());
+        // Search lists the original once and passes over the copy.
+        let rows = store.search("", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, a.id);
+        assert_eq!(store.fetch(&a.id, 0, 1).unwrap(), text("the original"));
+    }
+
+    #[test]
+    fn shelf_gap_is_tolerated() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let seal = |index: usize| store.seal(&text(&format!("archive {index}")), "").unwrap().id;
+        let ids: Vec<_> = (0..2 * SHELF_FILES + 1).map(seal).collect();
+        assert_eq!(store.shelves().unwrap(), ["s000003", "s000002", "s000001"]);
+        std::fs::remove_dir_all(dir.join("s000002")).unwrap();
+        assert_eq!(store.fetch(&ids[256], 0, 1).unwrap(), text("archive 256"));
+        assert_eq!(store.fetch(&ids[0], 0, 1).unwrap(), text("archive 0"));
+        assert_eq!(
+            store.fetch(&ids[200], 0, 1).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        // The next seal goes to the newest shelf; the gap is not filled in.
+        let next = seal(1_000);
+        assert!(dir.join("s000003").join(archive_name(&next)).is_file());
+        assert_eq!(store.shelves().unwrap(), ["s000003", "s000001"]);
+        assert_eq!(store.search("", 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn crash_leftovers() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let first = store.seal(&text("before the crash"), "").unwrap();
+        // A crash after mkdir and after writing the temporary file, before
+        // the rename; and a temporary file from a legacy-slot write.
+        let empty = dir.join("s000002");
+        std::fs::create_dir(&empty).unwrap();
+        std::fs::write(empty.join("pending.tmp"), b"unpublished partial").unwrap();
+        std::fs::write(dir.join("pending.tmp"), b"unpublished partial").unwrap();
+        assert_eq!(store.search("", 10).unwrap().len(), 1);
+        let next = store.seal(&text("after the crash"), "").unwrap();
+        assert!(empty.join(archive_name(&next.id)).is_file());
+        assert!(!empty.join("pending.tmp").exists());
+        assert_eq!(store.fetch(&first.id, 0, 1).unwrap(), text("before the crash"));
+        assert_eq!(store.fetch(&next.id, 0, 1).unwrap(), text("after the crash"));
+        assert_eq!(store.search("", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn export_fails_closed_above_migration_limit() {
+        let (tmp, store) = setup();
+        // Legacy slots and shelves count together.
+        let mut ids: Vec<_> = (0..100)
+            .map(|slot| seal_legacy_slot(&store, slot, &text(&format!("legacy {slot}")), "").id)
+            .collect();
+        let seal = |index: usize| store.seal(&text(&format!("archive {index}")), "").unwrap().id;
+        ids.extend((100..MAX_SEGMENTS).map(seal));
+        let rows = export_in(tmp.path(), "synthetic-project").unwrap();
+        assert_eq!(rows, store.export_records().unwrap());
+        let exported: Vec<_> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+        assert_eq!(exported.len(), MAX_SEGMENTS);
+        assert!(ids.iter().all(|id| exported.contains(&id.as_str())));
+        assert_eq!(exported[..100], ids[..100], "legacy slots first, in slot order");
+        seal(MAX_SEGMENTS);
+        for error in [
+            export_in(tmp.path(), "synthetic-project").unwrap_err(),
+            store.export_records().unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "archive store exceeds the migration limit (128 archives / 256 MiB)"
+            );
+        }
+        // Only the export is limited.
+        assert_eq!(store.fetch(&ids[0], 0, 1).unwrap(), text("legacy 0"));
+        assert!(store.seal(&text("and one more"), "").is_ok());
+    }
+
+    #[test]
+    fn archive_file_returns_path_and_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unknown = "a".repeat(32);
+        for base in [tmp.path().join("missing"), tmp.path().to_path_buf()] {
+            assert_eq!(archive_file(&base, "synthetic-project", &unknown).unwrap(), None);
+        }
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        let store =
+            ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-logical").unwrap();
+        let dir = directory(&tmp, &store);
+        let reference = store.seal(&text("where am I"), "").unwrap();
+        let file = only_archive_file(&dir);
+        let locate = |project: &str, id: &str| archive_file(tmp.path(), project, id);
+        // No lock is taken or made, and a held one is not waited for.
+        let held = store.fs.lock().unwrap();
+        assert_eq!(locate("synthetic-project", &reference.id).unwrap(), Some(file.clone()));
+        drop(held);
+        std::fs::remove_file(dir.join("lock")).unwrap();
+        let before = snapshot(tmp.path());
+        assert_eq!(locate("synthetic-project", &reference.id).unwrap(), Some(file.clone()));
+        assert_eq!(locate("synthetic-project", &unknown).unwrap(), None);
+        assert_eq!(locate("another-project", &reference.id).unwrap(), None);
+        assert_eq!(
+            locate("synthetic-project", "../s000001/x").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(snapshot(tmp.path()), before);
+        assert_eq!(std::fs::read_dir(tmp.path().join("context-archives")).unwrap().count(), 1);
+        // A forgotten segment still has a file: its tombstone.
+        store.forget(&reference.id).unwrap();
+        assert_eq!(locate("synthetic-project", &reference.id).unwrap(), Some(file));
     }
 }
 
@@ -2570,7 +3559,7 @@ mod lock_tests {
             result.unwrap();
         }
         let store = ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-reader").unwrap();
-        assert_eq!(store.scan().unwrap().0.len(), workers * 8);
+        assert_eq!(store.export_records().unwrap().len(), workers * 8);
     }
 
     /// A separate open file description is what another process holds.
@@ -2597,7 +3586,7 @@ mod lock_tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         drop(foreign);
         assert_eq!(store.fetch(&reference.id, 0, 1).unwrap().len(), 1);
-        assert_eq!(store.scan().unwrap().0.len(), 1);
+        assert_eq!(store.export_records().unwrap().len(), 1);
     }
 
     fn other(tmp: &tempfile::TempDir) -> ArchiveStore {
@@ -2658,7 +3647,7 @@ mod lock_tests {
         let error = waiter.join().unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         drop(held);
-        assert!(store.scan().unwrap().0.is_empty());
+        assert!(store.export_records().unwrap().is_empty());
         assert!(store.search("", 1).unwrap().is_empty());
     }
 

@@ -45,8 +45,12 @@ must remain allowed. Eviction is scoped to the authorized scope group only.
   host retry. The host already retains history on failure; after this change the
   failure cannot occur for capacity.
 - Local file `ArchiveStore` (crates/agent-core/src/core/context_archive.rs,
-  `MAX_SEGMENTS = 128`, "archive segment budget exhausted") has the same failure mode
-  for non-Axel users; follow-up: apply the same oldest-live-first eviction there.
+  `MAX_SEGMENTS = 128`, "archive segment budget exhausted") had the same failure mode
+  for non-Axel users. The follow-up proposed here, the same oldest-live-first
+  eviction, is superseded: the file store never evicts. It now keeps every archive
+  in numbered shelf directories with no count or byte cap (see "Archives live
+  under" in [context continuation](context-continuation.md)). Only its migration
+  export keeps the 128 archives / 256 MiB bound, to match `migration_apply` below.
 
 ### Contract/docs
 

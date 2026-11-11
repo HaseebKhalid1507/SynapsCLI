@@ -268,15 +268,33 @@ projection may still contain duplicated material. This is exact-projection
 suppression, not content-wide erasure.
 
 Archives live under the private `context-archives/<scope-hash>/` directory,
-separate from ordinary session-retention cleanup. Limits: 128 slots including
-tombstones, 16 MiB eligible input/serialized segment, 256 MiB per project,
-4,096 source messages, 65,536 visited input nodes and depth 32. Excluded message
+separate from ordinary session-retention cleanup. With the built-in file store
+(`memory.backend = legacy`) that directory holds numbered shelves, `s000001/`,
+`s000002/` and so on, each with at most 128 archives, one `<archive id>.json`
+per archive. A full shelf is followed by a new one. The store has no limit on
+how many archives a project holds or on their total size, and sealing never
+deletes, moves or replaces an older archive: only `memory_forget` rewrites a
+file, the one it names, and a forgotten archive keeps its place as a tombstone.
+An archive's id is the first 32 hex characters of its digest, so fetching one
+opens one file and never scans the store.
+
+A directory written by an earlier version keeps its `000.json` to `127.json`
+slot files. They are read and tombstoned where they are, with no migration
+step, and nothing is added to them. An earlier version pointed at the same
+directory sees only those slot files, not the shelves.
+
+Limits on one archive: 16 MiB eligible input/serialized segment, 4,096 source
+messages, 65,536 visited input nodes and depth 32. Excluded message
 and media payloads and ignored metadata do not consume eligible byte budget;
 their opaque descendants are not traversed. Admitted tool arguments/results
 still count, and genuinely oversized eligible evidence fails without truncation.
 See [eligible-input budgeting](archive-eligible-input-budget.md).
-Storage exhaustion stops rollover; no automatic source eviction or tombstoning.
-The index is currently a bounded scan, not a large-corpus search engine.
+A full disk, a permission error or an archive locked by another process still
+stops rollover with history retained; there is no automatic source eviction or
+tombstoning. History search is a bounded scan, not a large-corpus search
+engine: it reads archives newest first and stops after 1,024 archives or
+256 MiB. The files-to-Axel migration carries at most 128 archives / 256 MiB
+and refuses a larger store rather than importing part of it.
 Non-Unix archive operations fail explicitly; enabling via the command is refused.
 
 Concurrency: operations on one project's archive (rollover seals, parallel
