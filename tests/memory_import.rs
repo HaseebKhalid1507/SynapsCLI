@@ -101,8 +101,16 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u32, Option<Vec<u8>>)>) 
         if meta.is_dir() {
             out.push((name, mode, None));
             walk(root, &path, out);
-        } else {
+        } else if meta.is_file() {
             out.push((name, mode, Some(std::fs::read(&path).unwrap_or_default())));
+        } else if meta.is_symlink() {
+            // Where it points, not what is there: it is not followed.
+            use std::os::unix::ffi::OsStrExt;
+            let target = std::fs::read_link(&path).unwrap();
+            out.push((name, mode, Some(target.as_os_str().as_bytes().to_vec())));
+        } else {
+            // A FIFO: reading it would wait for a writer.
+            out.push((name, mode, None));
         }
     }
 }
@@ -233,7 +241,8 @@ fn note(id: &str, project: &str, content: &str) -> String {
 }
 
 fn note_tombstone(id: &str) -> String {
-    json!({"tombstone": id, "timestamp_ms": 1_777_000_000_500u64}).to_string()
+    // In the order the notes store writes it.
+    format!(r#"{{"tombstone":"{id}","timestamp_ms":1777000000500}}"#)
 }
 
 // ─── Archives ───────────────────────────────────────────────────────────────
