@@ -497,6 +497,32 @@ All notable changes to this project will be documented in this file.
   event, undelayed. An extension that needs every archive must be able to
   catch up by listing the store (`docs/extensions/hooks.md`). Not changed:
   a `before_tool_call` that times out still lets the tool run.
+
+- **Docs: `docs/extensions/session-id.md` no longer describes a worker on
+  a model an extension provides.** No such worker can exist; the page now
+  says why (a worker's model is an authorized `provider/model` id). The
+  folder tests of hook events and extension tool calls
+  (`session_actor_hook_cwd`) now check in every case that the extension
+  heard from no session but the test's own.
+- **Extension models: stop ends a tool call in their tool loop.** On a
+  `plugin:provider:model` model the loop that runs the model's tool calls
+  did not watch the turn's cancel, so after stop the turn waited for the
+  running command to finish (now up to the configured limits, not 30 s).
+  The loop is now raced against the cancel the way the ordinary tool loop
+  races each call: stop drops the running call and the turn ends as
+  cancelled at once (trace and audit record it as cancelled). The loop's
+  own rounds are not part of the chat's history, so nothing is added there.
+- **Memory: a chat whose folder has no project gets no memory lease.** Such
+  a chat (no folder, or a folder that cannot be resolved) was granted
+  leases under the one id `project-unresolved`, so two of them sent a
+  memory extension the same project id for capture and recall, and one
+  could be handed what the other captured. Now no id is invented: memory
+  is off for that chat. `/memory` answers that it is unavailable, the
+  default mode and a restored `/memory` choice log one warning, and the
+  turn runs without recall. A chat woken from park after its folder was
+  deleted wakes without that folder (in the daemon's folder and its
+  project), as a daemon reload and a pinned restore already did; a folder
+  that exists but cannot be checked right now is kept.
 - **Notes: a save made while a notes file is rewritten is no longer lost.**
   `synaps retention sweep` and `synaps retention forget memory` rewrite
   `memory/<ns>.jsonl` and rename the new file over the old one. A note saved

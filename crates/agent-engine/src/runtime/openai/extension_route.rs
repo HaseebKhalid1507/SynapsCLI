@@ -347,25 +347,38 @@ pub(crate) async fn route_extension_provider(
                 || tool_session_id.cloned().unwrap_or_else(local_gate_session),
             );
             let turn_tools = tool_context.cloned().unwrap_or_else(TurnToolContext::no_chat);
-            crate::extensions::runtime::process::complete_provider_with_tools(
-                handler.clone(),
-                params,
-                &registry,
-                &session_tools,
-                &hook_bus,
-                // A call's context is made from the turn's, like a call of
-                // the caller's own loop, the turn's event channel included
-                // (never this route's `tx`: under usage metering that is a
-                // relay which ends with the round, and a worker started
-                // here reports for longer). No delta lane: these calls are
-                // not announced to the frontend, so partial output would
-                // have no tool call to belong to.
-                || turn_tools.for_call(None),
-                turn_tools.limits().max_tool_output,
-                8,
-                &mut tools_requested,
+            // Raced against the turn's cancel as the stream loop races each
+            // tool call: a stop drops the round, the tool call it is running
+            // included, and ends below as a cancelled turn. `None` = cancelled.
+            let looped = crate::runtime::stream::await_tool_call(
+                cancel,
+                // Boxed: inline, the loop's future made the turn's future
+                // too large for a tokio worker's stack in a debug build.
+                Box::pin(crate::extensions::runtime::process::complete_provider_with_tools(
+                    handler.clone(),
+                    params,
+                    &registry,
+                    &session_tools,
+                    &hook_bus,
+                    // A call's context is made from the turn's, like a call of
+                    // the caller's own loop, the turn's event channel included
+                    // (never this route's `tx`: under usage metering that is a
+                    // relay which ends with the round, and a worker started
+                    // here reports for longer). No delta lane: these calls are
+                    // not announced to the frontend, so partial output would
+                    // have no tool call to belong to.
+                    || turn_tools.for_call(None),
+                    turn_tools.limits().max_tool_output,
+                    8,
+                    &mut tools_requested,
+                )),
             )
             .await
+            .0;
+            match looped {
+                Some(result) => result,
+                None => Err("operation canceled".to_string()),
+            }
         } else {
             handler.provider_complete(params).await
         };
@@ -407,5 +420,148 @@ pub(crate) async fn route_extension_provider(
                 Err(format!("extension provider: {e}").into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use crate::extensions::hooks::events::{HookEvent, HookResult};
+    use crate::extensions::runtime::process::{
+        ProviderCompleteParams, ProviderCompleteResult, RegisteredProviderModelSpec,
+        RegisteredProviderSpec,
+    };
+    use crate::extensions::runtime::ExtensionHandler;
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// Asks for the `sleeper` tool on every round.
+    struct AsksForSleeper;
+
+    #[async_trait::async_trait]
+    impl ExtensionHandler for AsksForSleeper {
+        fn id(&self) -> &str {
+            "asks-for-sleeper"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+        async fn provider_complete(
+            &self,
+            _params: ProviderCompleteParams,
+        ) -> Result<ProviderCompleteResult, String> {
+            Ok(ProviderCompleteResult {
+                content: vec![json!({
+                    "type": "tool_use", "id": "t1", "name": "sleeper", "input": {}
+                })],
+                stop_reason: Some("tool_use".to_string()),
+                usage: None,
+            })
+        }
+    }
+
+    /// A tool that takes 30 s, and says when it has started.
+    struct Sleeper(Arc<tokio::sync::Notify>);
+
+    #[async_trait::async_trait]
+    impl crate::Tool for Sleeper {
+        fn name(&self) -> &str {
+            "sleeper"
+        }
+        fn description(&self) -> &str {
+            "sleeps"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        async fn execute(&self, _params: Value, _ctx: crate::ToolContext) -> crate::Result<String> {
+            self.0.notify_one();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok("woke".to_string())
+        }
+    }
+
+    /// A stop while the extension model's tool loop runs a tool ends the
+    /// turn at once as cancelled; it does not wait for the tool.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_running_tool_call_in_the_extension_loop_is_cancelled() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut registry = crate::ToolRegistry::new();
+        registry.register(Arc::new(Sleeper(started.clone())));
+        let mut manager = ExtensionManager::new_with_tools(
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            Arc::new(tokio::sync::RwLock::new(registry)),
+        );
+        manager
+            .register_provider_handler_for_tests(
+                "plug",
+                RegisteredProviderSpec {
+                    id: "prov".to_string(),
+                    display_name: "Fake".to_string(),
+                    description: "fake provider".to_string(),
+                    models: vec![RegisteredProviderModelSpec {
+                        id: "model-x".to_string(),
+                        display_name: None,
+                        capabilities: json!({"streaming": false, "tool_use": true}),
+                        context_window: None,
+                    }],
+                    config_schema: None,
+                },
+                Arc::new(AsksForSleeper),
+            )
+            .unwrap();
+        let manager = Arc::new(tokio::sync::RwLock::new(manager));
+        let tools = Arc::new(vec![json!({
+            "name": "sleeper", "description": "sleeps", "input_schema": {"type": "object"}
+        })]);
+        let messages: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role": "user", "content": "go"}))];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let trace = crate::runtime::trace::TraceContext::disabled();
+
+        let route = route_extension_provider(
+            manager,
+            "plug",
+            "prov",
+            "model-x",
+            "plug:prov:model-x",
+            &tools,
+            &None,
+            &messages,
+            &tx,
+            None,
+            None,
+            0,
+            &cancel,
+            None,
+            None,
+            None,
+            &trace,
+        );
+        let stop = async {
+            tokio::time::timeout(Duration::from_secs(10), started.notified())
+                .await
+                .expect("the tool never started");
+            cancel.cancel();
+            std::time::Instant::now()
+        };
+        let (result, stopped_at) = tokio::time::timeout(
+            Duration::from_secs(10),
+            async { tokio::join!(route, stop) },
+        )
+        .await
+        .expect("the loop waited for the tool");
+        let waited = stopped_at.elapsed();
+        assert!(waited < Duration::from_secs(1), "returned {waited:?} after the stop");
+        let error = result.expect_err("a stopped turn is not a success").to_string();
+        assert_eq!(error, "operation canceled");
     }
 }

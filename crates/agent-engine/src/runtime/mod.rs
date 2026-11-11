@@ -2666,12 +2666,15 @@ impl Runtime {
     ) -> std::result::Result<(), memory_context::MemoryContextError> {
         let budget = memory_context::memory_budget_tokens(self.context_window())
             .ok_or(memory_context::MemoryContextError::RecallBudgetBelowMinimum)?;
+        let project_id = self
+            .memory_context_project_id()
+            .ok_or(memory_context::MemoryContextError::ContributionProjectMismatch)?;
         // Phase A hold path: until task B3 threads a real `RecallRequest`
         // through dispatch, the host's conservative default grant applies —
         // only baseline model-visible records are accepted back.
         memory_context::validate_contribution(
             &contribution,
-            &self.memory_context_project_id(),
+            &project_id,
             budget,
             &memory_context::DisclosureGrantSet::model_visible_only(),
         )?;
@@ -2733,6 +2736,11 @@ impl Runtime {
             tracing::debug!("memory recall unavailable for the selected host backend");
             return;
         }
+        // No project: no lease was granted, so there is nothing to recall.
+        let Some(project_id) = self.memory_context_project_id() else {
+            self.clear_memory_contribution();
+            return;
+        };
         let extension_runtime = self.extension_runtime.clone();
         let binding = self.memory_backend.clone();
         let session = self.host_tool_session.clone();
@@ -2740,7 +2748,7 @@ impl Runtime {
         let outcome = memory_context::resolve_turn_recall(
             &self.memory_context_state,
             &self.retained_recall_turn,
-            &self.memory_context_project_id(),
+            &project_id,
             self.context_window(),
             messages,
             memory_context::RECALL_HARD_TIMEOUT,
@@ -2985,24 +2993,27 @@ impl Runtime {
     /// of the chat's memory binding, whichever the backend. The binding is
     /// made from the chat's folder (or `SYNAPS_PROJECT_ROOT`); the process
     /// folder is the daemon's under the daemon, so it is never asked here.
-    fn memory_context_project_id(&self) -> memory_context::ProjectId {
+    ///
+    /// `None` when the binding has no project (its folder could not be
+    /// resolved): no id is invented, so no lease is granted and memory is
+    /// off for this chat. A shared stand-in id would let two such chats
+    /// capture into and recall from one another.
+    fn memory_context_project_id(&self) -> Option<memory_context::ProjectId> {
         self.memory_backend
             .scope()
             .ok()
             .and_then(|scope| memory_context::ProjectId::parse(scope.key()).ok())
-            .unwrap_or_else(|| {
-                memory_context::ProjectId::parse("project-unresolved").expect("static id")
-            })
     }
 
     pub fn memory_tool_capability(&self) -> Option<memory_context::MemoryContextCapability> {
         if !self.memory_backend.exclusive() {
             return None;
         }
+        let project_id = self.memory_context_project_id()?;
         let runtime = self.clone();
         Some(memory_context::MemoryContextCapability::control_only(
             self.memory_context_state.clone(),
-            self.memory_context_project_id(),
+            project_id,
             memory_context::ContextProviderId::parse(axel_context::PROVIDER_ID).expect("static id"),
             Arc::new(move || runtime.memory_context_disable()),
         ))
@@ -3527,12 +3538,12 @@ impl Runtime {
         };
         // §15 `memory_context.disabled` (task B5): emitted after the state
         // transition applied — session + project digest identities only.
-        memory_context::emit_memory_observability_event(
-            &memory_context::MemoryObservabilityEvent::context_disabled(
-                &session,
-                &self.memory_context_project_id(),
-            ),
-        );
+        // A chat with no project never had a lease to disable.
+        if let Some(project_id) = self.memory_context_project_id() {
+            memory_context::emit_memory_observability_event(
+                &memory_context::MemoryObservabilityEvent::context_disabled(&session, &project_id),
+            );
+        }
         // State mutex released before touching the lease manager: the
         // revocation below locks only the lease map (idempotent no-op when
         // nothing was ever spawned).
@@ -3796,11 +3807,17 @@ impl Runtime {
         requested_provider: Option<&str>,
     ) -> std::result::Result<memory_context::MemoryContextLease, memory_context::MemoryContextError>
     {
+        // No project for this chat's folder: no lease, memory stays off.
+        // The callers report it (`/memory` answers the user; the default
+        // mode and the restored mode log one warning).
+        let project_id = self
+            .memory_context_project_id()
+            .ok_or(memory_context::MemoryContextError::CapabilityUnavailable)?;
         let provider_id = self.resolve_memory_provider(requested_provider)?;
         memory_context::MemoryContextLease::grant(
             memory_context::MemoryLeaseId::parse(&format!("memctx-cmd-{}", uuid::Uuid::new_v4()))?,
             state.session_id().clone(),
-            self.memory_context_project_id(),
+            project_id,
             provider_id,
             mode,
             memory_context::CapturePolicy::default(),
@@ -3927,7 +3944,7 @@ impl Runtime {
         }
         if self.memory_backend.is_axel() {
             if lease.provider_id.as_str() != axel_context::PROVIDER_ID
-                || lease.project_id != self.memory_context_project_id()
+                || Some(&lease.project_id) != self.memory_context_project_id().as_ref()
             {
                 return None;
             }
@@ -7933,6 +7950,52 @@ mod memory_context_provider_tests {
                     .is_none(),
                 "{mode}/{confirmed} must not apply"
             );
+            assert_memory_off_no_lease(&runtime);
+        }
+    }
+
+    /// Two chats whose binding has no project (no folder, a deleted folder)
+    /// get no memory lease at all: no default mode, no `/memory`, no tool
+    /// capability, no recall project. Nothing invents a shared id they
+    /// could capture into and recall from together.
+    #[test]
+    fn memory_binding_without_project_grants_no_lease() {
+        let gone = tempfile::tempdir().unwrap();
+        let gone_path = gone.path().join("deleted");
+        std::fs::create_dir(&gone_path).unwrap();
+        std::fs::remove_dir(&gone_path).unwrap();
+        for cwd in [None, Some(gone_path)] {
+            let mut runtime = Runtime::new_headless();
+            runtime.memory_backend = crate::memory_backend::MemoryBinding::from_config_with_cwd(
+                &Default::default(),
+                cwd.clone(),
+            );
+            assert!(runtime.memory_backend.scope().is_err(), "{cwd:?} must have no project");
+            assert_eq!(runtime.memory_context_project_id(), None);
+
+            let defaulted = runtime
+                .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
+                .expect("a confirmed default is attempted");
+            assert!(matches!(
+                defaulted,
+                Err(memory_context::MemoryContextError::CapabilityUnavailable)
+            ));
+            assert_memory_off_no_lease(&runtime);
+
+            assert!(runtime
+                .memory_context_enable(
+                    memory_context::MemoryContextMode::CaptureAndRecall,
+                    memory_context::mint_explicit_command_proof(),
+                )
+                .is_err());
+            assert!(runtime
+                .memory_context_recall_once(memory_context::mint_explicit_command_proof())
+                .is_err());
+            runtime.restore_session_memory_mode(crate::session::SessionMemoryMode::CaptureAndRecall);
+            assert_memory_off_no_lease(&runtime);
+            assert!(runtime.memory_tool_capability().is_none());
+            // Disable is still a clean no-op.
+            runtime.memory_context_disable();
             assert_memory_off_no_lease(&runtime);
         }
     }

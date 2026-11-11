@@ -288,6 +288,19 @@ fn assert_names(recorder: &Recorder, session_id: &str, dir: &Path, kinds: &[Opti
     }
 }
 
+/// Nothing reached the extension unattributed: every event and call it
+/// recorded is one of `ids`', so each was checked against a folder by
+/// `assert_names` (an event with no session, or another session's, fails
+/// here).
+fn assert_only_sessions(recorder: &Recorder, ids: &[&str]) {
+    let all = recorder.all();
+    assert!(
+        all.iter()
+            .all(|s| s.session_id.as_deref().is_some_and(|id| ids.contains(&id))),
+        "{all:#?}"
+    );
+}
+
 /// Two live sessions on one host: every hook kind a session fires, and its
 /// extension tool call, name its own folder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -319,15 +332,7 @@ async fn each_sessions_hooks_and_tool_calls_name_its_own_folder_not_the_hosts() 
     ]);
     assert_names(&recorder, a.id.as_str(), dir_a.path(), &kinds);
     assert_names(&recorder, b.id.as_str(), dir_b.path(), &kinds);
-    // Nothing reached the extension unattributed: every event and call is
-    // one of the two sessions', so each was checked against a folder above
-    // (an event with no session, or with `cwd: null`, fails here or there).
-    let all = recorder.all();
-    let ids = [Some(a.id.as_str()), Some(b.id.as_str())];
-    assert!(
-        all.iter().all(|s| ids.contains(&s.session_id.as_deref())),
-        "{all:#?}"
-    );
+    assert_only_sessions(&recorder, &[a.id.as_str(), b.id.as_str()]);
 }
 
 /// `await_extensions = false` (the TUI's quick start, every session a daemon
@@ -355,6 +360,7 @@ async fn a_queued_session_start_names_the_sessions_folder() {
     assert_names(&recorder, b.id.as_str(), dir_b.path(), &kinds);
     end_and_close(&recorder, &a, ta).await;
     end_and_close(&recorder, &b, tb).await;
+    assert_only_sessions(&recorder, &[a.id.as_str(), b.id.as_str()]);
 }
 
 /// A session a daemon reload restores parked: its `on_session_start` waits
@@ -396,6 +402,7 @@ async fn a_session_restored_parked_starts_in_its_folder_when_woken() {
     kinds.push(Some(HookKind::OnSessionStart));
     assert_names(&recorder, id, dir.path(), &kinds);
     end_and_close(&recorder, &restored, t).await;
+    assert_only_sessions(&recorder, &[id]);
 }
 
 /// Parking drops the runtime; waking builds a new one. Its hooks and tool
@@ -420,6 +427,39 @@ async fn a_chat_woken_from_park_still_names_its_folder() {
     let mut kinds = TURN.to_vec();
     kinds.push(Some(HookKind::OnSessionEnd));
     assert_names(&recorder, id, dir.path(), &kinds);
+    assert_only_sessions(&recorder, &[id]);
+}
+
+/// A chat whose folder was deleted while it was parked wakes without it, as
+/// a reload restores it: in the host's folder, never naming the dead path
+/// (which has no project, so memory and notes would have nowhere to go).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_chat_whose_folder_was_deleted_while_parked_wakes_without_it() {
+    let (_h, host, recorder) = setup().await;
+    let parent = tempfile::tempdir().unwrap();
+    let folder = parent.path().join("chat");
+    std::fs::create_dir(&folder).unwrap();
+    let (handle, mut t) = session(&host, cfg_in(&folder)).await;
+    let id = handle.id.as_str();
+    turn(&mut t).await;
+    detach(t).await;
+    handle.send(SessionCommand::Park).await.unwrap();
+    wait_parked(&handle).await;
+    std::fs::remove_dir(&folder).unwrap();
+    recorder.clear();
+
+    let mut t = attach(&handle).await;
+    assert_eq!(handle.lifecycle(), SessionLifecycle::Live);
+    turn(&mut t).await;
+    end_and_close(&recorder, &handle, t).await;
+    let host_dir = std::env::current_dir().unwrap();
+    let seen = recorder.all();
+    assert!(seen.iter().any(|s| s.kind.is_none()), "no tool.call: {seen:#?}");
+    for s in &seen {
+        assert_eq!(s.session_id.as_deref(), Some(id), "{seen:#?}");
+        assert_eq!(s.cwd.as_deref(), host_dir.to_str(), "{:?} names {:?}", s.kind, s.cwd);
+    }
 }
 
 /// `--continue` of a chat that is not running takes the folder of the client
@@ -452,4 +492,5 @@ async fn a_continued_chat_names_the_folder_it_was_resumed_in() {
     let mut kinds = TURN.to_vec();
     kinds.extend([Some(HookKind::OnSessionStart), Some(HookKind::OnSessionEnd)]);
     assert_names(&recorder, id, resumed_in.path(), &kinds);
+    assert_only_sessions(&recorder, &[id]);
 }
