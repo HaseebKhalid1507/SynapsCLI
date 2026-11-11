@@ -33,7 +33,8 @@
 //! segment. A project directory holds numbered shelf directories (`s000001`,
 //! `s000002`, ...) of at most 128 segments each; a full shelf is followed by a
 //! new one and shelves are never merged, renumbered or removed. A segment's
-//! file name is its id (the first 32 hex characters of its digest), so finding
+//! file name is its id (one half of its digest: the first 32 hex characters,
+//! or the last 32 when something else has that name), so finding
 //! one is one `openat` per shelf and one file read, never a scan. Directories
 //! written before shelves existed keep their numbered slot files (`000.json`
 //! to `127.json`); those are read and tombstoned in place and never added to.
@@ -44,8 +45,12 @@
 //! followed and never written to; the segment goes to the next shelf number
 //! if the newest is one of them. If the file under a segment's id is not that
 //! segment (corrupt, a link, another projection) it is left as it is and the
-//! segment is stored under the other half of its digest instead; a later
-//! seal of the same projection finds it there. The one thing a seal still
+//! segment is stored under the other half of its digest instead. A seal
+//! looks under both halves before it writes anything, so a later seal of the
+//! same projection finds it under either, whatever has become of the other
+//! name. Only what a file is sends a segment to its other name: a read that
+//! fails for another reason (an I/O error, no descriptor left) fails the
+//! seal, which is retried, rather than store a second copy. The one thing a seal still
 //! honours in a file it cannot validate is a tombstone: JSON that names the
 //! projection and says it was forgotten refuses that seal. A fetch or a
 //! forget is stricter: when it does not find its segment and had to pass
@@ -831,9 +836,12 @@ impl ArchiveStore {
     /// this call's own and renamed without replacing, so `Ok` always means
     /// that the file under the returned id holds this projection, whole.
     ///
-    /// Nothing else in the directory refuses it. The id is the first half of
-    /// the digest; if the file under that name is something else, it is left
-    /// as it is and the second half is the id.
+    /// A projection has two names, the two halves of its digest, and both
+    /// are looked under before anything is written: a copy under either is
+    /// the answer, and a tombstone under either refuses the seal, whatever
+    /// the other name holds. Only then is it written, under the first half
+    /// if that name is free and under the second if something else has the
+    /// first. Nothing else in the directory refuses it.
     fn store(&self, projection: ArchiveProjection) -> io::Result<(ArchiveRef, String)> {
         let ArchiveProjection {
             digest,
@@ -855,34 +863,49 @@ impl ArchiveStore {
             },
         };
         let mut legacy_read = false;
-        // Same projection, same ids in the same order, same file names.
-        for half in [0..32, 32..64] {
-            record.id = record.digest[half].to_owned();
-            // A name that was free when it was looked at can be taken by the
-            // time of the rename, by another seal that the lock should have
-            // kept out. Whatever is there then is looked at once more, like
-            // any file found under the name.
-            for _ in 0..2 {
-                let shelves = self.shelves()?;
-                match self.shelved(&shelves, &record.id, &record.digest)? {
-                    Shelved::This(shelf, found) => return Self::already(&shelf, &found),
-                    Shelved::Other => break,
-                    Shelved::Nothing => {}
-                }
-                if !legacy_read {
-                    // Sealed before shelves existed, under a random id.
-                    if let Some(found) = self.legacy_projection(&record.digest)? {
-                        return Self::already(&self.fs, &found);
+        // A name that was free when it was looked at can be taken by the
+        // time of the rename, by another seal that the lock should have
+        // kept out. Whatever is there then is looked at once more, like any
+        // file found under the name: once for each of the two names.
+        for _ in 0..3 {
+            let shelves = self.shelves()?;
+            let (mut stored, mut free) = (None, None);
+            // Same projection, same names in the same order.
+            for half in [0..32, 32..64] {
+                let id = &record.digest[half];
+                match self.shelved(&shelves, id, &record.digest)? {
+                    Shelved::This(_, found) if matches!(found.body, Body::Tombstone) => {
+                        return Err(forgotten());
                     }
-                    legacy_read = true;
+                    Shelved::This(shelf, found) => {
+                        stored.get_or_insert((shelf, found));
+                    }
+                    Shelved::Other => {}
+                    Shelved::Nothing => {
+                        free.get_or_insert_with(|| id.to_owned());
+                    }
                 }
-                let bytes = bounded_json(&record, MAX_SEGMENT_BYTES)?;
-                // Created new: a file that is already there is never renamed over.
-                let shelf = self.writable_shelf(&shelves)?;
-                match shelf.publish(&archive_name(&record.id), &bytes, true) {
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    result => return result.and_then(|()| Ok((record.reference()?, note))),
+            }
+            if let Some((shelf, found)) = stored {
+                return Self::already(&shelf, &found);
+            }
+            if !legacy_read {
+                // Sealed before shelves existed, under a random id.
+                if let Some(found) = self.legacy_projection(&record.digest)? {
+                    return Self::already(&self.fs, &found);
                 }
+                legacy_read = true;
+            }
+            let Some(id) = free else {
+                break;
+            };
+            record.id = id;
+            let bytes = bounded_json(&record, MAX_SEGMENT_BYTES)?;
+            // Created new: a file that is already there is never renamed over.
+            let shelf = self.writable_shelf(&shelves)?;
+            match shelf.publish(&archive_name(&record.id), &bytes, true) {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                result => return result.and_then(|()| Ok((record.reference()?, note))),
             }
         }
         Err(io::Error::new(
@@ -896,6 +919,14 @@ impl ArchiveStore {
     /// private, is passed over: not followed, not changed, and so not looked
     /// in. The price is the one a legacy slot has: a duplicate or a tombstone
     /// in such a shelf is not seen, and the projection is stored again.
+    ///
+    /// A file under the name that is not this projection, or is not a file
+    /// the store reads (a link, a FIFO, a directory, a file that is not ours
+    /// alone or is too large), has the name taken: `Other`, and it is left
+    /// exactly as it is. A read that fails for any other reason says nothing
+    /// about what the file is, and it may be this very segment: that error
+    /// fails the seal, which the caller retries, instead of sending the
+    /// projection to its other name as a second copy.
     fn shelved(&self, shelves: &[String], id: &str, digest: &str) -> io::Result<Shelved> {
         let name = archive_name(id);
         for shelf in shelves {
@@ -910,12 +941,11 @@ impl ArchiveStore {
             let raw = match dir.read_with(&name, MAX_SEGMENT_BYTES, false) {
                 Ok(Some(raw)) => raw,
                 Ok(None) => continue,
-                // A link, a FIFO, a file that is not ours alone or is too
-                // large: not read, and left exactly as it is.
-                Err(error) => {
+                Err(error) if PrivateDir::not_a_segment(&error) => {
                     tracing::warn!(%shelf, file = %name, %error, "seal found its archive id taken");
                     return Ok(Shelved::Other);
                 }
+                Err(error) => return Err(error),
             };
             return match self.record(&name, &raw) {
                 Ok(record) if record.digest == digest => Ok(Shelved::This(dir, record)),
@@ -2415,6 +2445,10 @@ impl PrivateDir {
     }
     fn open(&self, name: &std::ffi::CStr, flags: i32) -> io::Result<std::fs::File> {
         use std::os::fd::FromRawFd;
+        #[cfg(test)]
+        if let Some(error) = fault("open", name) {
+            return Err(error);
+        }
         let fd = unsafe {
             libc::openat(
                 self.fd(),
@@ -2458,6 +2492,18 @@ impl PrivateDir {
         file.set_permissions(std::fs::Permissions::from_mode(
             crate::core::private_fs::FILE_MODE,
         ))
+    }
+    /// Whether a failed read of the file under a segment's name says what
+    /// that file is, rather than that reading failed: the store's own
+    /// refusal (not a plain file of ours alone, or too large for a segment),
+    /// which carries no system error, and the system's refusal to open it
+    /// for what it is (a link, a file closed to us or that cannot be made
+    /// private, a socket). Such a file is odd and stays odd. Everything
+    /// else (an I/O error, no descriptor or memory left, an interrupted
+    /// call) can happen to a healthy file.
+    fn not_a_segment(error: &io::Error) -> bool {
+        let of_the_file = [libc::ELOOP, libc::EACCES, libc::EPERM, libc::ENXIO];
+        error.raw_os_error().is_none_or(|code| of_the_file.contains(&code))
     }
     /// Directory identity for the in-process gate.
     fn identity(&self) -> io::Result<DirIdentity> {
@@ -2651,6 +2697,25 @@ use libc::__errno_location as errno;
 use libc::__error as errno;
 #[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
 use libc::__errno as errno;
+// Failures a test asks for: system calls that fail only when a disk or the
+// system is in trouble, which no temporary directory brings about. Each is
+// (the call, the start of the names it fails for, the error number), for
+// calls made on the thread that set it and until that thread clears it.
+#[cfg(all(test, unix))]
+thread_local! {
+    static FAULTS: std::cell::RefCell<Vec<(&'static str, String, i32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(all(test, unix))]
+fn fault(call: &str, name: &std::ffi::CStr) -> Option<io::Error> {
+    FAULTS.with_borrow(|faults| {
+        let hit = |(failing, prefix, _): &&(&str, String, i32)| {
+            *failing == call && name.to_bytes().starts_with(prefix.as_bytes())
+        };
+        let code = faults.iter().find(hit).map(|(.., code)| *code);
+        code.map(io::Error::from_raw_os_error)
+    })
+}
 #[cfg(unix)]
 fn c_name(name: &str) -> io::Result<std::ffi::CString> {
     if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\\']) {
@@ -2671,6 +2736,9 @@ impl PrivateDir {
     }
     fn new(_: &Path, _: &str) -> io::Result<Self> {
         Self::unsupported()
+    }
+    fn not_a_segment(_: &io::Error) -> bool {
+        false
     }
     fn identity(&self) -> io::Result<DirIdentity> {
         Self::unsupported()
@@ -4173,11 +4241,8 @@ mod tests {
             shelf.join(archive_name(&digest[32..])),
         ];
         std::fs::remove_file(&places[0]).unwrap();
+        // The second id is looked under whether the first is free or taken.
         for (index, place) in places.iter().enumerate() {
-            if index == 2 {
-                // The second id is looked under when the first is taken.
-                std::fs::write(&places[1], b"not a record").unwrap();
-            }
             for bytes in &altered {
                 assert!(store.record("000.json", bytes.as_bytes()).is_err());
                 std::fs::write(place, bytes).unwrap();
@@ -4189,6 +4254,8 @@ mod tests {
                 std::fs::remove_file(place).unwrap();
             }
         }
+        std::fs::write(&places[1], b"not a record").unwrap();
+        refused("with the first name taken");
         // Only that projection, and only while the file says so.
         assert!(store.seal(&text("other words"), "").is_ok());
         std::fs::write(&places[2], tombstone.replace("tombstone", "tombstoned")).unwrap();
@@ -4197,6 +4264,121 @@ mod tests {
         std::fs::remove_file(&places[2]).unwrap();
         let again = store.seal(&text(words), "").unwrap();
         assert_eq!(again.id, digest[32..]);
+    }
+
+    /// Makes the system call `call` fail with `code` for every name that
+    /// starts with `prefix`, on this thread, until it is dropped.
+    struct Fault;
+    impl Fault {
+        fn on(call: &'static str, prefix: &str, code: i32) -> Self {
+            FAULTS.with_borrow_mut(|faults| faults.push((call, prefix.to_owned(), code)));
+            Fault
+        }
+    }
+    impl Drop for Fault {
+        fn drop(&mut self) {
+            FAULTS.with_borrow_mut(Vec::clear);
+        }
+    }
+    fn digest_of(words: &str) -> String {
+        let projection = project_archive("synthetic-logical", &text(words), "", None);
+        projection.unwrap().digest
+    }
+
+    /// A window that went under its second id because something odd had the
+    /// first is still that one segment when the odd thing is gone.
+    #[test]
+    fn a_segment_under_its_second_id_is_found_when_the_first_name_is_free_again() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let shelf = dir.join("s000001");
+        store.seal(&text("a shelf to begin with"), "").unwrap();
+        let digest = digest_of("stored once");
+        let (first, second) = (&digest[..32], &digest[32..]);
+        let odd = shelf.join(archive_name(first));
+        std::fs::write(&odd, b"{\"version\":1,").unwrap();
+        let sealed = store.seal_with_note(&text("stored once"), "first note").unwrap();
+        assert_eq!(sealed.0.id, second);
+        // The odd file is removed. A seal of the same window finds it where
+        // it is and writes nothing under the name that is free again.
+        std::fs::remove_file(&odd).unwrap();
+        let before = snapshot(&dir);
+        let again = store.seal_with_note(&text("stored once"), "second note").unwrap();
+        assert_eq!(again, sealed);
+        assert_eq!(snapshot(&dir), before);
+        assert_eq!(store.search("stored once", 8).unwrap().len(), 1);
+        // Forgotten under its second id, it stays forgotten although the
+        // first name is free.
+        store.forget(second).unwrap();
+        let forgotten = snapshot(&dir);
+        let refused = store.seal(&text("stored once"), "").unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(refused.to_string().contains("was forgotten"));
+        assert_eq!(snapshot(&dir), forgotten);
+        assert!(!odd.exists());
+    }
+
+    /// With a copy under each name, one live and one forgotten (which a
+    /// store from before both names were looked under can hold), the
+    /// tombstone decides, whichever name has it.
+    #[test]
+    fn a_tombstone_under_either_name_refuses_whatever_the_other_holds() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let shelf = dir.join("s000001");
+        store.seal(&text("a shelf to begin with"), "").unwrap();
+        for (words, forgotten) in [("tombstone first", 0), ("tombstone second", 1)] {
+            let digest = digest_of(words);
+            let ids = [&digest[..32], &digest[32..]];
+            for (index, id) in ids.into_iter().enumerate() {
+                let bytes = record_bytes(&store, id, &text(words), |record| {
+                    if index == forgotten {
+                        record.body = Body::Tombstone;
+                    }
+                });
+                std::fs::write(shelf.join(archive_name(id)), bytes).unwrap();
+            }
+            assert_eq!(store.fetch(ids[1 - forgotten], 0, 1).unwrap(), text(words));
+            let before = snapshot(&dir);
+            let refused = store.seal(&text(words), "").unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{words}");
+            assert_eq!(snapshot(&dir), before, "{words}");
+        }
+    }
+
+    /// A read of the file under the id that fails says nothing about what
+    /// the file is. The seal fails and is tried again; it does not store the
+    /// window a second time under its other id.
+    #[test]
+    fn a_failed_read_of_the_file_under_the_id_fails_the_seal_and_stores_no_second_copy() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let sealed = store.seal_with_note(&text("stored once"), "first note").unwrap();
+        let before = snapshot(&dir);
+        for code in [libc::EIO, libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EINTR] {
+            let failing = Fault::on("open", &sealed.0.id, code);
+            let error = store.seal(&text("stored once"), "").unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+            drop(failing);
+            assert_eq!(snapshot(&dir), before, "error {code}");
+        }
+        let again = store.seal_with_note(&text("stored once"), "a later note").unwrap();
+        assert_eq!(again, sealed);
+        assert_eq!(snapshot(&dir), before);
+        // What a file is still never refuses a save: one that cannot be
+        // opened by its owner has the name taken, like a link or a FIFO.
+        for code in [libc::ELOOP, libc::EACCES, libc::EPERM, libc::ENXIO] {
+            assert!(PrivateDir::not_a_segment(&io::Error::from_raw_os_error(code)));
+        }
+        assert!(PrivateDir::not_a_segment(&corrupt()));
+        if unsafe { libc::geteuid() } == 0 {
+            return; // nothing is closed to root
+        }
+        let file = only_archive_file(&dir);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let other = store.seal(&text("stored once"), "").unwrap();
+        assert_eq!(other.id, digest_of("stored once")[32..]);
+        assert_eq!(mode(&file), 0o000);
     }
 
     #[test]
