@@ -341,6 +341,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: nothing is written that a read would refuse.** The
+  store checked a projection it was handed for its digest and its chat, and
+  not for what a read also checks: a note over 8,192 bytes, more than 4,096
+  messages, a `source_index` that does not rise or is not below the count.
+  Such a record was written, answered `Ok`, and was from then on an invalid
+  file under a name taken for good. Now the bytes about to be written go
+  through the reader's own check first; a record that would not be read
+  back is refused with the name of the check and nothing is written. A seal
+  of a chat's messages never produced such a record and is unchanged.
 - **Extensions: the context archive format page says what the store does.**
   `docs/extensions/context-archives.md` was wrong or silent in several
   places. It now states: a shelf is `s` and exactly six digits (`s000001` to

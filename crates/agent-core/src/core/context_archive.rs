@@ -1293,9 +1293,11 @@ impl ArchiveStore {
             };
             record.id = id;
             let bytes = bounded_json(&record, MAX_SEGMENT_BYTES)?;
+            let name = archive_name(&record.id);
+            // What is about to be written is what a read must accept.
+            self.readable(&name, &bytes)?;
             // Created new: a file that is already there is never renamed over.
             let shelf = self.writable_shelf(&shelves)?;
-            let name = archive_name(&record.id);
             match shelf.publish_dated(&name, &bytes, true, written.modified) {
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 result => return result.and_then(|()| Ok((record.reference()?, note))),
@@ -1305,6 +1307,26 @@ impl ArchiveStore {
             io::ErrorKind::AlreadyExists,
             "both archive ids of this projection are taken by other files",
         ))
+    }
+
+    /// The writer's last step before a record gets a file: `bytes`, exactly
+    /// as they are about to be written under `name`, are put through the
+    /// reader's own check ([`Self::parsed`]). A record that would not be
+    /// read back is refused as `InvalidInput` with the name of the check it
+    /// fails, and nothing is written. [`Self::admit`] checks a projection's
+    /// digest and chat and no more (not the note's length, the number of
+    /// messages or their indexes), and a file written past the reader is one
+    /// no fetch, search or forget accepts, under a name taken for good. With
+    /// this the writer and the reader cannot disagree, whatever either
+    /// checks later.
+    fn readable(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        match Self::parsed(&self.scope, name, bytes) {
+            Ok(_) => Ok(()),
+            Err(fault) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("archive record would not be read back and is not written: {fault}"),
+            )),
+        }
     }
 
     /// What a seal finds under `id` on the shelves, newest first. A shelf
@@ -8315,6 +8337,54 @@ mod tests {
         // A valid record passes, on a shelf name and in a slot.
         assert!(ArchiveStore::parsed(&store.scope, &name, &bytes(&|_| {})).is_ok());
         assert!(ArchiveStore::parsed(&store.scope, "000.json", &bytes(&|_| {})).is_ok());
+    }
+
+    /// What a seal is about to write goes through the reader's check first:
+    /// a projection `admit` lets through (its digest is right, and the note
+    /// and the indexes are not in the digest's way) that a read would refuse
+    /// is refused with the name of the check, and nothing is written.
+    #[test]
+    fn a_projection_no_read_would_accept_is_refused_before_it_is_written() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        // A shelf and a lock file to begin with: a refusal adds nothing.
+        store.seal(&text("a shelf to begin with"), "").unwrap();
+        let project = |words: &[&str]| {
+            let messages: Vec<_> = words.iter().map(|words| msg("user", json!(words))).collect();
+            project_hashed(&store.logical, &messages, "", None, Reduce::None).unwrap()
+        };
+        let mut long_note = project(&["a long note"]);
+        long_note.note = "n".repeat(9_000);
+        // The digest is the digest of exactly these messages, in this order.
+        let mut falling = project(&["first", "second"]);
+        falling.messages.swap(0, 1);
+        falling.digest = projection_digest(&store.logical, 2, &falling.messages).unwrap();
+        let mut beyond = project(&["only"]);
+        beyond.messages[0].source_index = 1;
+        beyond.digest = projection_digest(&store.logical, 1, &beyond.messages).unwrap();
+        let before = snapshot(&dir);
+        let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        names.sort();
+        for (projection, check) in [
+            (long_note, "over a per-archive limit"),
+            (falling, "source_index out of order"),
+            (beyond, "source_index out of order"),
+        ] {
+            store.admit(&projection).expect("admit does not check this");
+            let error = store.seal_projection(projection, None).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{check}: {error}");
+            assert!(error.to_string().ends_with(check), "{check}: {error}");
+            assert_eq!(snapshot(&dir), before, "{check}");
+            let mut after: Vec<_> =
+                std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+            after.sort();
+            assert_eq!(after, names, "{check}");
+        }
+        // An ordinary seal is what it was.
+        let sealed = store.seal(&text("ordinary"), "a note").unwrap();
+        assert_eq!(sealed.id, digest_of("ordinary")[..32]);
+        assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap(), text("ordinary"));
+        assert_eq!(store.fetch_note(&sealed.id).unwrap(), "a note");
     }
 }
 
