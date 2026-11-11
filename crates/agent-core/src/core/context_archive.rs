@@ -43,7 +43,12 @@
 //! shelf name that is not a directory, a shelf that cannot be opened or made
 //! private and a legacy slot that cannot be read are passed over, never
 //! followed and never written to; the segment goes to the next shelf number
-//! if the newest is one of them. If the file under a segment's id is not that
+//! if the newest is one of them. That is for a shelf or a slot that is itself
+//! the trouble, an I/O error reading it included, and it has a price: what
+//! it holds is not seen, so a window in it is stored again and a tombstone in
+//! it no longer refuses. An error that will pass (no descriptor or memory
+//! left, an interrupted call: EMFILE, ENFILE, ENOMEM, EINTR, EAGAIN) is not
+//! about the shelf, and the seal fails on it instead and is retried. If the file under a segment's id is not that
 //! segment (corrupt, a link, another projection) it is left as it is and the
 //! segment is stored under the other half of its digest instead. A seal
 //! looks under both halves before it writes anything, so a later seal of the
@@ -918,7 +923,10 @@ impl ArchiveStore {
     /// name that is not a directory, or a shelf that cannot be opened or made
     /// private, is passed over: not followed, not changed, and so not looked
     /// in. The price is the one a legacy slot has: a duplicate or a tombstone
-    /// in such a shelf is not seen, and the projection is stored again.
+    /// in such a shelf is not seen, and the projection is stored again. That
+    /// price is paid only for a shelf that is itself the trouble. An error
+    /// that will pass ([`PrivateDir::passing`]) fails the seal instead: the
+    /// shelf is healthy, and what it holds must be seen first.
     ///
     /// A file under the name that is not this projection, or is not a file
     /// the store reads (a link, a FIFO, a directory, a file that is not ours
@@ -933,6 +941,7 @@ impl ArchiveStore {
             let dir = match self.fs.open_child(shelf, false) {
                 Ok(Some(dir)) => dir,
                 Ok(None) => continue,
+                Err(error) if PrivateDir::passing(&error) => return Err(error),
                 Err(error) => {
                     tracing::warn!(%shelf, %error, "seal passed over an archive shelf");
                     continue;
@@ -1219,7 +1228,10 @@ impl ArchiveStore {
     /// it once it holds [`SHELF_FILES`]. An empty shelf left by a crash is
     /// used. When the newest shelf name is not a directory that can be
     /// opened and made private, nothing is written to it and the segment
-    /// goes to a new shelf, numbered after it.
+    /// goes to a new shelf, numbered after it. An error that will pass
+    /// fails the seal instead of starting a shelf. A new shelf that was made
+    /// and then could not be opened stays, empty, and is the newest shelf of
+    /// the next seal: one failed attempt after another leaves that one.
     fn writable_shelf(&self, shelves: &[String]) -> io::Result<PrivateDir> {
         let highest = shelves.first().and_then(|name| shelf_number(name));
         let highest = highest.unwrap_or(0);
@@ -1238,6 +1250,9 @@ impl ArchiveStore {
                     }
                     break;
                 }
+                // The shelf is not the trouble: no other one is started
+                // because of it.
+                Err(error) if PrivateDir::passing(&error) => return Err(error),
                 Err(error) => {
                     tracing::warn!(shelf = %name, %error, "seal passed over an archive shelf");
                     if !last {
@@ -1384,7 +1399,8 @@ impl ArchiveStore {
     /// which the export still uses and which fails as a whole, this passes
     /// over a slot that cannot be read (a link, a FIFO, a file
     /// that is not ours alone or is over the size of a segment, an I/O error)
-    /// or that is not a valid record of this scope. A slot passed over is
+    /// or that is not a valid record of this scope. Only an error that will
+    /// pass ([`PrivateDir::passing`]) fails the seal. A slot passed over is
     /// left as it is: a link is not followed, and a file that is not ours
     /// alone is neither read nor made private. One slot is in memory at a
     /// time, so their total size is not bounded here.
@@ -1410,6 +1426,8 @@ impl ArchiveStore {
             match record {
                 Ok(record) if record.digest == digest => return Ok(Some(record)),
                 Ok(_) => {}
+                // Not the slot's fault, and it may hold this projection.
+                Err(error) if PrivateDir::passing(&error) => return Err(error),
                 // The file name and the error only: never content.
                 Err(error) => {
                     tracing::warn!(slot = %name, %error, "seal passed over a legacy archive slot");
@@ -2505,6 +2523,17 @@ impl PrivateDir {
         let of_the_file = [libc::ELOOP, libc::EACCES, libc::EPERM, libc::ENXIO];
         error.raw_os_error().is_none_or(|code| of_the_file.contains(&code))
     }
+    /// Whether an error is about the state of this process or the system at
+    /// this moment (no descriptor or memory left, an interrupted call) and
+    /// not about the shelf, slot or file it was met at. Such an error passes
+    /// and a seal fails on it: the caller keeps its history and retries.
+    /// Every other error from a shelf or a slot (not a directory, a link,
+    /// closed to us, an I/O error reading it) is taken to stay, and a seal
+    /// passes over that shelf or slot rather than be refused for good.
+    fn passing(error: &io::Error) -> bool {
+        let passing = [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EINTR, libc::EAGAIN];
+        error.raw_os_error().is_some_and(|code| passing.contains(&code))
+    }
     /// Directory identity for the in-process gate.
     fn identity(&self) -> io::Result<DirIdentity> {
         use std::os::unix::fs::MetadataExt;
@@ -2738,6 +2767,9 @@ impl PrivateDir {
         Self::unsupported()
     }
     fn not_a_segment(_: &io::Error) -> bool {
+        false
+    }
+    fn passing(_: &io::Error) -> bool {
         false
     }
     fn identity(&self) -> io::Result<DirIdentity> {
@@ -4379,6 +4411,115 @@ mod tests {
         let other = store.seal(&text("stored once"), "").unwrap();
         assert_eq!(other.id, digest_of("stored once")[32..]);
         assert_eq!(mode(&file), 0o000);
+    }
+
+    const PASSING: [i32; 5] = [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EINTR, libc::EAGAIN];
+
+    /// An error that is not about the shelf (the process is out of
+    /// descriptors, say) is not a reason to pass over it: what the shelf
+    /// holds is not seen then, and a window in it would be stored again and
+    /// a forgotten one would be back.
+    #[test]
+    fn a_passing_error_on_a_shelf_or_a_slot_fails_the_seal_and_changes_nothing() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let slot = seal_legacy_slot(&store, 0, &text("in a slot"), "");
+        store.forget(&slot.id).unwrap();
+        let kept = store.seal(&text("kept"), "").unwrap();
+        let gone = store.seal(&text("forgotten"), "").unwrap();
+        store.forget(&gone.id).unwrap();
+        // Later seals go to a newer shelf.
+        std::fs::create_dir(dir.join("s000002")).unwrap();
+        let before = snapshot(&dir);
+        let entries = || std::fs::read_dir(&dir).unwrap().count();
+        let listed = entries();
+        let refused = |words: &str, code: i32| {
+            let error = store.seal(&text(words), "").unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code), "{words}: {error}");
+        };
+        for code in PASSING {
+            assert!(PrivateDir::passing(&io::Error::from_raw_os_error(code)));
+            // The older shelf, the newest one, every shelf, the slot.
+            for place in ["s000001", "s000002", "s", "000.json"] {
+                let failing = Fault::on("open", place, code);
+                // A window found on a shelf is not looked for in the slots.
+                if place != "000.json" {
+                    refused("kept", code);
+                    refused("forgotten", code);
+                }
+                refused("in a slot", code);
+                refused("something new", code);
+                drop(failing);
+                assert_eq!(snapshot(&dir), before, "{place}, error {code}");
+                assert_eq!(entries(), listed, "{place}, error {code}: a shelf was started");
+            }
+        }
+        // The trouble over, everything is what it was.
+        assert_eq!(store.seal(&text("kept"), "").unwrap(), kept);
+        for words in ["forgotten", "in a slot"] {
+            let error = store.seal(&text(words), "").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{words}");
+        }
+        assert_eq!(snapshot(&dir), before);
+    }
+
+    /// A shelf or a slot that is itself the trouble, an I/O error reading it
+    /// included, is still passed over: one bad shelf never stops a save.
+    #[test]
+    fn an_io_error_on_a_shelf_or_a_slot_is_passed_over() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        seal_legacy_slot(&store, 0, &text("in a slot"), "");
+        let kept = store.seal(&text("kept"), "").unwrap();
+        for code in [libc::EIO, libc::EACCES, libc::ENOTDIR, libc::ELOOP, libc::ESTALE] {
+            assert!(!PrivateDir::passing(&io::Error::from_raw_os_error(code)));
+        }
+        // An older shelf: the new window goes to the newest.
+        std::fs::create_dir(dir.join("s000002")).unwrap();
+        let failing = Fault::on("open", "s000001", libc::EIO);
+        let new = store.seal(&text("something new"), "").unwrap();
+        assert!(dir.join("s000002").join(archive_name(&new.id)).is_file());
+        // The price: a window in it is not seen and is stored again.
+        assert_eq!(store.seal(&text("kept"), "").unwrap(), kept);
+        assert!(dir.join("s000002").join(archive_name(&kept.id)).is_file());
+        drop(failing);
+        // The newest shelf: the next number is started.
+        let failing = Fault::on("open", "s000002", libc::EIO);
+        let next = store.seal(&text("after the newest"), "").unwrap();
+        assert!(dir.join("s000003").join(archive_name(&next.id)).is_file());
+        drop(failing);
+        // A slot: the window in it is stored again, on a shelf.
+        let _failing = Fault::on("open", "000.json", libc::EIO);
+        let again = store.seal(&text("in a slot"), "").unwrap();
+        assert!(dir.join("s000003").join(archive_name(&again.id)).is_file());
+    }
+
+    /// A shelf that was made and then could not be opened is the one the
+    /// next seal uses. Failed attempts do not leave one shelf each.
+    #[test]
+    fn a_failed_attempt_leaves_at_most_one_empty_shelf_and_the_next_seal_uses_it() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        store.seal(&text("a lock to begin with"), "").unwrap();
+        // The newest shelf name is not a shelf, so a seal starts the next
+        // one; out of descriptors, it makes the directory and cannot open it.
+        std::fs::write(dir.join("s000002"), b"not a directory").unwrap();
+        let shelves = || {
+            let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+            names.retain(|entry| entry.as_ref().unwrap().file_name() != "lock");
+            names.len()
+        };
+        let failing = Fault::on("open", "s000003", libc::EMFILE);
+        for _ in 0..3 {
+            let error = store.seal(&text("after the trouble"), "").unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+            assert_eq!(shelves(), 3, "s000001, the file s000002 and the empty s000003");
+        }
+        assert_eq!(std::fs::read_dir(dir.join("s000003")).unwrap().count(), 0);
+        drop(failing);
+        let sealed = store.seal(&text("after the trouble"), "").unwrap();
+        assert!(dir.join("s000003").join(archive_name(&sealed.id)).is_file());
+        assert_eq!(shelves(), 3);
     }
 
     #[test]
