@@ -14,7 +14,8 @@ All notable changes to this project will be documented in this file.
   an archive file holds; for notes a note line or a tombstone line. There
   is no default destination: exactly one of `--as-recorded` (each line
   under the project it names), `--cwd DIR` (the project of that folder, as
-  for a chat started there) or `--project-key KEY` is required. Every
+  for a chat started there) or `--project-key KEY` is required; `--cwd` is refused
+  while `SYNAPS_PROJECT_ROOT` is set. Every
   decision about a line is the store's own (`ArchiveStore::import`,
   `import_line_in`), so a second run of the same input stores nothing and a
   forget is never undone. Each run prints one JSON document: the inputs

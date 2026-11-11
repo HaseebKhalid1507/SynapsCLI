@@ -80,7 +80,7 @@ pub struct ImportArgs {
     #[arg(long)]
     as_recorded: bool,
     /// File every line under the project of this folder, as a chat started
-    /// there would (`SYNAPS_PROJECT_ROOT` applies).
+    /// there would. Refused while `SYNAPS_PROJECT_ROOT` is set.
     #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
     /// File every line under this project key (`p` and 16 hex characters).
@@ -314,6 +314,15 @@ fn destination(args: &ImportArgs) -> Result<Target, String> {
         });
     }
     if let Some(cwd) = &args.cwd {
+        if root_override() {
+            // The override wins before the folder is looked at: every
+            // folder, also one that does not exist, would be its project.
+            return Err(
+                "--cwd cannot be used while SYNAPS_PROJECT_ROOT is set: every folder is then \
+                 that root's project. Unset it, or pass --project-key; nothing was imported"
+                    .to_owned(),
+            );
+        }
         let scope = ProjectScope::discover(cwd).map_err(|e| format!("--cwd: {e}"))?;
         return Ok(Target {
             key: Some(scope.key().to_owned()),
@@ -321,7 +330,9 @@ fn destination(args: &ImportArgs) -> Result<Target, String> {
                 mode: "cwd",
                 cwd: Some(shown(cwd)),
                 project_key: Some(scope.key().to_owned()),
-                project_root_override: Some(root_override()),
+                // Always false: see above. Kept, so that a reader of the
+                // document need not know that.
+                project_root_override: Some(false),
             },
         });
     }

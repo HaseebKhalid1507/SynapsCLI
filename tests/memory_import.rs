@@ -507,13 +507,38 @@ fn t_a15_the_destination() {
     let key = ProjectScope::for_root(&root).unwrap().key().to_owned();
     assert_ne!(key, ProjectScope::for_root(Path::new(other)).unwrap().key());
 
-    let mut command = env.command(&["import-archives", &file, "--cwd", other]);
+    // An import refuses --cwd then (core-a5-review finding 4): the folder
+    // would not be looked at, and one that is not there would pass.
+    let before = env.listing();
+    for command in ["import-archives", "import-notes"] {
+        for cwd in [other, missing] {
+            for dry_run in [true, false] {
+                let mut args = vec![command, file.as_str(), "--cwd", cwd];
+                if dry_run {
+                    args.push("--dry-run");
+                }
+                let mut command = env.command(&args);
+                command.env("SYNAPS_PROJECT_ROOT", &root);
+                let run = finish(command, None);
+                assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+                assert!(run.stdout.is_empty(), "{}", run.stdout);
+                assert!(run.stderr.contains("SYNAPS_PROJECT_ROOT"), "{}", run.stderr);
+            }
+        }
+    }
+    assert_eq!(env.listing(), before);
+    // The other two destinations do not look at it.
+    let mut command = env.command(&["import-archives", &file, "--project-key", KEY]);
     command.env("SYNAPS_PROJECT_ROOT", &root);
     let run = finish(command, None);
     assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
-    assert_eq!(run.doc["destination"]["project_root_override"], true);
-    assert_eq!(run.doc["destination"]["project_key"], key.as_str());
-    assert_eq!(run.doc["projects"][0]["dir"], project_scope(&key).unwrap().as_str());
+    assert_eq!(run.doc["projects"][0]["dir"], project_scope(KEY).unwrap().as_str());
+    // Without the variable the folder is its own project.
+    let run = env.run(&["import-archives", &file, "--cwd", other]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.doc["destination"]["project_root_override"], false);
+    let own = ProjectScope::for_root(Path::new(other)).unwrap().key().to_owned();
+    assert_eq!(run.doc["destination"]["project_key"], own.as_str());
 
     let mut command = env.command(&["project", "--cwd", other]);
     command.env("SYNAPS_PROJECT_ROOT", &root);

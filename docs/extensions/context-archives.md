@@ -719,7 +719,8 @@ for f in "$dir"/*.json "$dir"/s*/*.json; do cat "$f"; echo; done | synaps memory
 - `--as-recorded` files each record in the project directory its own
   `scope` names, and changes nothing in it;
 - `--cwd DIR` files every record under the project of that folder, found as
-  for a chat started there;
+  for a chat started there (refused while `SYNAPS_PROJECT_ROOT` is set:
+  that variable makes every folder one project);
 - `--project-key KEY` files every record under that project key.
 
 With the last two, `scope` is set to the new directory's name. That is the
