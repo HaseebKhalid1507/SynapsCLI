@@ -1293,43 +1293,201 @@ fn announce_archived(
     });
 }
 
+/// What looking up the archive a resumed head names found.
+enum Lookup {
+    Found,
+    /// It is not there, and looking again would not find it: why.
+    Absent(String),
+    /// The lookup itself failed, so nothing is known: why.
+    Failed(String),
+}
+
+/// Look archive `id` up in the file store of `binding`'s project, as a
+/// resume needs to know it. A read: the store is opened as it is and nothing
+/// is created for a project that has no archive.
+///
+/// `Absent` is the three ways of not being there, told apart in its text:
+/// the chat has no project, the project has no archive store, the store
+/// does not hold the id (the store's own "not found", which it gives only
+/// when it could read everything the archive might be in). Anything else,
+/// such as a busy store, a shelf that cannot be read or an I/O error, is
+/// `Failed`.
+fn look_up(binding: &MemoryBinding, id: &str) -> Lookup {
+    let scope = match binding.scope() {
+        Ok(scope) => scope,
+        Err(error) => return Lookup::Absent(format!("the chat has no project to look in ({error})")),
+    };
+    let project = format!("project {} ({})", scope.key(), scope.root().display());
+    let store = match existing_archive_store_in(binding.base(), scope) {
+        Ok(Some(store)) => store,
+        Ok(None) => return Lookup::Absent(format!("{project} has no archive store")),
+        Err(error) => {
+            return Lookup::Failed(format!("the archive store of {project} could not be opened: {error}"))
+        }
+    };
+    match store.fetch(id, 0, 1) {
+        Ok(_) => Lookup::Found,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && error.to_string() == agent_core::context_archive::NOT_FOUND =>
+        {
+            Lookup::Absent(format!(
+                "the archive store of {project} does not hold it (missing, forgotten, or sealed in another project)"
+            ))
+        }
+        Err(error) => Lookup::Failed(format!(
+            "the archive store of {project} could not be read for it: {error}"
+        )),
+    }
+}
+
 /// Resume restores only window metadata from a verified source reference. It
 /// never enables mode or reconstructs capability/consent from model text.
 ///
-/// The reference is verified in the file store of `binding`, the one the
-/// chat's rollover sealed it into (`MemoryBinding::history_seal`): the
-/// project of the chat's folder, which under the daemon is not the project
-/// of the process folder.
+/// The reference is the archive the head's marker names, and it is looked
+/// up in the file store of `binding`: the project of the folder the chat
+/// runs in now, which under the daemon is not the project of the process
+/// folder. That is the store the chat's rollover sealed the archive into
+/// (`MemoryBinding::history_seal_window`) only if the chat is resumed in
+/// the project it rolled over in. A chat continued from a folder of another
+/// project (`--continue` takes the folder of the client that resumes it) is
+/// looked up in that project, where the archive is not.
+///
+/// - Found: the window number and the archive link are restored.
+/// - Not there (no project, no archive store, no such archive): the chat
+///   goes on at window 1 without an archive link, and a warning says which
+///   archive was looked for, in which project's store, and which of the
+///   three it was.
+/// - The lookup failed for another reason (a busy store, something that
+///   could not be read): nothing is settled. A warning says why, the chat
+///   goes on, and the next call looks again.
+///
+/// The lookup reads a file and can wait for a busy store, so the state lock
+/// is not held across it. A head that lists several parts
+/// (`_synaps_context.archives`) has its other parts checked afterwards
+/// ([`warn_unavailable_parts`]), which nothing waits for.
 pub fn restore_window(
     messages: &[SharedMessage],
     state: &SharedContinuation,
     binding: &MemoryBinding,
 ) {
-    let mut s = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if s.initialized {
-        return;
+    let (id, window, mut listed, epoch, chat) = {
+        let mut s = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if s.initialized {
+            return;
+        }
+        let marker = messages
+            .iter()
+            .find_map(|m| (m["_synaps_context"]["schema"] == MARKER).then_some(&m["_synaps_context"]));
+        let Some((marker, id)) = marker.and_then(|marker| Some((marker, marker["archive"].as_str()?)))
+        else {
+            s.initialized = true;
+            return;
+        };
+        let listed: Vec<String> = marker["archives"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part["id"].as_str().map(str::to_owned))
+            .collect();
+        let window = marker["window"].as_u64().unwrap_or(1);
+        (id.to_owned(), window, listed, s.epoch, s.logical_id.clone())
+    };
+
+    // Off the lock from here: a file is read.
+    let is_id = id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let lookup = if is_id {
+        look_up(binding, &id)
+    } else {
+        Lookup::Absent("the head's marker does not hold an archive id".into())
+    };
+    match &lookup {
+        Lookup::Found => {}
+        Lookup::Absent(why) => tracing::warn!(
+            session = %chat,
+            archive = %format_args!("ctx-{id}"),
+            "resumed chat: the archive its context head names was not found: {why}; \
+             the chat goes on at window 1 without its archive link"
+        ),
+        Lookup::Failed(why) => tracing::warn!(
+            session = %chat,
+            archive = %format_args!("ctx-{id}"),
+            "resumed chat: the archive its context head names could not be looked up: {why}; \
+             its window number is not restored yet and the lookup is made again on the next request"
+        ),
     }
-    s.initialized = true;
-    let Some(marker) = messages
-        .iter()
-        .find_map(|m| (m["_synaps_context"]["schema"] == MARKER).then_some(&m["_synaps_context"]))
-    else {
-        return;
+
+    {
+        let mut s = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Reset to another conversation meanwhile, or settled by another call.
+        if s.epoch != epoch || s.initialized {
+            return;
+        }
+        match lookup {
+            Lookup::Found => {
+                s.latest_archive = Some(id.clone());
+                s.window = window;
+            }
+            Lookup::Absent(_) => {}
+            Lookup::Failed(_) => return,
+        }
+        s.initialized = true;
+    }
+    // Each other part once: parts with the same content are one archive.
+    let mut seen = std::collections::HashSet::from([id]);
+    listed.retain(|part| seen.insert(part.clone()));
+    if !listed.is_empty() {
+        warn_unavailable_parts(binding.clone(), chat, listed);
+    }
+}
+
+/// A resumed head that lists the parts of a split window: warn for each of
+/// `ids` (the parts other than the one the marker names, which
+/// [`restore_window`] has looked up) that the chat's store cannot give back.
+/// The head tells the model those archives are available, and without this
+/// a missing or damaged one is noticed only when the model fetches it.
+///
+/// A warning is all it is: nothing waits for it and the resume does not
+/// depend on it. Each lookup reads a whole archive file, so the check runs
+/// detached, on the blocking pool (or a thread of its own where there is no
+/// runtime), holding no lock. With no project or no store there is nothing
+/// to add to the one warning `restore_window` has given.
+fn warn_unavailable_parts(binding: MemoryBinding, chat: String, ids: Vec<String>) {
+    // The detached thread logs where the caller does.
+    let log = tracing::dispatcher::get_default(Clone::clone);
+    let check = move || {
+        tracing::dispatcher::with_default(&log, || {
+            let Ok(scope) = binding.scope() else {
+                return;
+            };
+            let Ok(Some(store)) = existing_archive_store_in(binding.base(), scope) else {
+                return;
+            };
+            for id in ids {
+                if let Err(error) = store.fetch(&id, 0, 1) {
+                    tracing::warn!(
+                        session = %chat,
+                        archive = %format_args!("ctx-{id}"),
+                        project = %scope.key(),
+                        "resumed chat: its context head lists an earlier archive that its project's \
+                         store cannot give back ({error}); memory_fetch of it will fail"
+                    );
+                }
+            }
+        })
     };
-    let Some(id) = marker["archive"].as_str() else {
-        return;
-    };
-    // A read: the chat's store is opened as it is, and nothing is created
-    // for a project that has no archive.
-    let store = binding
-        .scope()
-        .map_err(|e| std::io::Error::other(e.to_string()))
-        .and_then(|scope| existing_archive_store_in(binding.base(), scope));
-    if matches!(store, Ok(Some(store)) if store.fetch(id, 0, 1).is_ok()) {
-        s.latest_archive = Some(id.into());
-        s.window = marker["window"].as_u64().unwrap_or(1);
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn_blocking(check);
+        }
+        Err(_) => {
+            let thread = std::thread::Builder::new().name("context-parts-check".into());
+            let _ = thread.spawn(check);
+        }
     }
 }
 
@@ -5573,9 +5731,9 @@ mod archived_hook_tests {
     use crate::test_env::BaseDirGuard;
     use agent_core::config::MemoryBackendKind;
 
-    const CHAT: &str = "chat-under-test";
+    pub(super) const CHAT: &str = "chat-under-test";
 
-    fn window() -> Vec<SharedMessage> {
+    pub(super) fn window() -> Vec<SharedMessage> {
         vec![
             Arc::new(json!({"role":"user","content":"Build the plan. Do not deploy."})),
             Arc::new(json!({"role":"assistant","content":"prior evidence ".repeat(5000)})),
@@ -5587,7 +5745,7 @@ mod archived_hook_tests {
     /// [`window`] with three tool calls in it whose inputs are 40,000 nodes
     /// each. One archive admits 65,536, so no two of them share an archive
     /// and the window is sealed as several, however the store cuts it.
-    fn split_window() -> Vec<SharedMessage> {
+    pub(super) fn split_window() -> Vec<SharedMessage> {
         let mut messages = window();
         let wide = json!(vec![0; 40_000]);
         for n in 0..3 {
@@ -5600,7 +5758,7 @@ mod archived_hook_tests {
         messages
     }
 
-    fn chat_state() -> SharedContinuation {
+    pub(super) fn chat_state() -> SharedContinuation {
         let state = Arc::new(Mutex::new(ContinuationState::default()));
         {
             let mut s = state.lock().unwrap();
@@ -5610,7 +5768,7 @@ mod archived_hook_tests {
         state
     }
 
-    async fn seal(
+    pub(super) async fn seal(
         binding: &MemoryBinding,
         state: &SharedContinuation,
         messages: &[SharedMessage],
@@ -5879,5 +6037,297 @@ mod archived_hook_tests {
         );
         settle().await;
         assert!(listener.events().is_empty());
+    }
+}
+
+/// What a resumed chat finds of the archives its head names, and what the
+/// log says when it does not find them ([`restore_window`]).
+#[cfg(test)]
+mod resume_tests {
+    use super::archived_hook_tests::{chat_state, seal, split_window, window, CHAT};
+    use super::*;
+    use crate::test_env::{BaseDirGuard, EnvVarGuard};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// The warnings of this thread, and of the detached part check it
+    /// starts, as the log file would have them.
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Log {
+        /// Capture from here until the guard is dropped.
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            let sink = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || sink.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        /// The lines about a resumed chat (the store logs what it passes
+        /// over, too).
+        fn lines(&self) -> Vec<String> {
+            let text = String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned();
+            let ours = |line: &&str| line.contains("resumed chat:");
+            text.lines().filter(ours).map(str::to_owned).collect()
+        }
+
+        /// Those lines once there are `count` of them, and whatever the
+        /// detached check adds in the fifth of a second after that.
+        async fn wait_for(&self, count: usize) -> Vec<String> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.lines().len() < count {
+                assert!(Instant::now() < deadline, "{count} lines expected: {:?}", self.lines());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.lines()
+        }
+
+        fn clear(&self) {
+            self.0.lock().unwrap().clear();
+        }
+    }
+
+    /// `messages` rolled over and committed, as chat [`CHAT`]: the new head
+    /// and what the window was sealed as.
+    async fn rolled_over(
+        binding: &MemoryBinding,
+        messages: &[SharedMessage],
+    ) -> (Vec<SharedMessage>, Vec<ArchivePart>) {
+        let state = chat_state();
+        let prepared = seal(binding, &state, messages).await;
+        let parts = prepared.parts.clone();
+        (prepared.commit(&state).unwrap(), parts)
+    }
+
+    /// (archive link, window, settled) of a chat's state.
+    fn restored(state: &SharedContinuation) -> (Option<String>, u64, bool) {
+        let s = state.lock().unwrap();
+        (s.latest_archive.clone(), s.window, s.initialized)
+    }
+
+    /// `head` resumed as a chat that was never open in this process.
+    fn resume(head: &[SharedMessage], binding: &MemoryBinding) -> (Option<String>, u64, bool) {
+        let state = chat_state();
+        restore_window(head, &state, binding);
+        restored(&state)
+    }
+
+    fn file_of(binding: &MemoryBinding, id: &str) -> PathBuf {
+        let key = binding.scope().unwrap().key();
+        agent_core::context_archive::archive_file(binding.base(), key, id)
+            .unwrap()
+            .expect("the archive's file")
+    }
+
+    /// Put something that is not a file where archive `id` is, keeping the
+    /// archive beside it: a lookup of `id` now fails, and not with "not
+    /// found". Returns what undoes it.
+    fn make_unreadable(binding: &MemoryBinding, id: &str) -> impl FnOnce() {
+        let file = file_of(binding, id);
+        let aside = file.with_extension("aside");
+        std::fs::rename(&file, &aside).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        move || {
+            std::fs::remove_dir(&file).unwrap();
+            std::fs::rename(&aside, &file).unwrap();
+        }
+    }
+
+    /// A folder that is a project of its own.
+    fn project() -> tempfile::TempDir {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join(".synaps-project"), "").unwrap();
+        folder
+    }
+
+    /// A session runtime as the host builds it for a chat in `folder`: the
+    /// folder first, then the configuration, which binds the chat's memory
+    /// to that folder's project.
+    fn runtime_in(folder: &Path) -> crate::Runtime {
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_cwd(Some(folder.to_path_buf()));
+        rt.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig::default());
+        rt
+    }
+
+    fn assert_says(line: &str, said: &[&str]) {
+        for said in said {
+            assert!(line.contains(said), "{said:?} is not in: {line}");
+        }
+    }
+
+    /// `--continue` gives a chat the folder of the client that resumes it.
+    /// A window sealed with the chat in folder A is in A's project; the chat
+    /// continued from folder B looks in B's project, where it is not, and
+    /// goes on at window 1 without an archive link. That is the policy as it
+    /// stands, and this pins it. What is new is that it is no longer silent:
+    /// the log says which archive was looked for and in which project's
+    /// store, and the three ways of not finding it read differently.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_chat_continued_in_another_project_goes_on_at_window_1_and_the_log_says_where_it_looked() {
+        let _env = BaseDirGuard::new();
+        let _root = EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        let (a, b) = (project(), project());
+        let (in_a, in_b) = (runtime_in(a.path()), runtime_in(b.path()));
+        let key = |rt: &crate::Runtime| rt.memory_backend.scope().unwrap().key().to_owned();
+        let (key_a, key_b) = (key(&in_a), key(&in_b));
+        assert_ne!(key_a, key_b);
+
+        // The chat rolls over while it runs in folder A.
+        let (head, parts) = rolled_over(&in_a.memory_backend, &window()).await;
+        let archive = format!("ctx-{}", parts[0].archive.id);
+        let log = Log::default();
+        let _capture = log.capture();
+        let continued_in = |folder: &Path| {
+            let rt = runtime_in(folder);
+            rt.reset_context_continuation(CHAT, &head);
+            restored(&rt.continuation)
+        };
+
+        // Resumed in A: found, and nothing to say.
+        assert_eq!(continued_in(a.path()), (Some(parts[0].archive.id.clone()), 2, true));
+        assert_eq!(log.lines(), Vec::<String>::new());
+
+        // Continued in B, a project that has archived nothing.
+        assert_eq!(continued_in(b.path()), (None, 1, true));
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_says(&lines[0], &[&archive, &key_b, CHAT, "has no archive store", "goes on at window 1"]);
+        assert!(!lines[0].contains(&key_a), "{}", lines[0]);
+
+        // B has archives of its own, and not this one.
+        in_b.memory_backend.history_seal("another-chat", &window(), "").await.unwrap();
+        assert_eq!(continued_in(b.path()), (None, 1, true));
+        let lines = log.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_says(&lines[1], &[&archive, &key_b, "does not hold it", "sealed in another project"]);
+
+        // Continued in a folder that is not there: no project at all.
+        assert_eq!(continued_in(&b.path().join("gone")), (None, 1, true));
+        let lines = log.lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_says(&lines[2], &[&archive, "no project to look in"]);
+    }
+
+    /// Only an archive that is not there settles a resume. A lookup that
+    /// fails for another reason (here something that cannot be read is under
+    /// the archive's name; a busy store and an I/O error end the same way)
+    /// used to count as "no archive" too, and for good: the chat stayed at
+    /// window 1 without its archive link however often it was asked again.
+    /// It now settles nothing, says so, and the next call looks again.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_lookup_that_fails_settles_nothing_and_the_next_call_looks_again() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let id = parts[0].archive.id.clone();
+        let heal = make_unreadable(&binding, &id);
+
+        let log = Log::default();
+        let _capture = log.capture();
+        let state = chat_state();
+        restore_window(&head, &state, &binding);
+        assert_eq!(restored(&state), (None, 1, false), "nothing is settled");
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let key = binding.scope().unwrap().key();
+        assert_says(&lines[0], &[&format!("ctx-{id}"), key, "could not be looked up", "made again"]);
+        // Asked again while it still fails: still open, and said again.
+        restore_window(&head, &state, &binding);
+        assert_eq!(restored(&state), (None, 1, false));
+        assert_eq!(log.lines().len(), 2);
+
+        // The store can be read again: the same call finds the archive.
+        heal();
+        restore_window(&head, &state, &binding);
+        assert_eq!(restored(&state), (Some(id), 2, true));
+        assert_eq!(log.lines().len(), 2, "found: nothing more to say");
+    }
+
+    /// A head that lists the parts of a split window tells the model each of
+    /// them is available. Resume looked up the last one only, so a missing
+    /// or damaged earlier part was noticed when the model fetched it. Each
+    /// listed part is now looked up, and the log names every one the store
+    /// cannot give back. The resume itself does not wait for that and does
+    /// not depend on it.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn resume_warns_for_each_listed_part_the_store_cannot_give_back() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let (head, parts) = rolled_over(&binding, &split_window()).await;
+        let (last, earlier) = parts.split_last().unwrap();
+        assert!(earlier.len() >= 2, "three inputs that cannot share an archive: {parts:?}");
+        let (missing, damaged) = (&earlier[0].archive.id, &earlier[1].archive.id);
+        assert!(missing != damaged && missing != &last.archive.id && damaged != &last.archive.id);
+        let found = (Some(last.archive.id.clone()), 2, true);
+        let key = binding.scope().unwrap().key();
+        let log = Log::default();
+        let _capture = log.capture();
+
+        // Every part is there: nothing to say.
+        assert_eq!(resume(&head, &binding), found);
+        assert_eq!(log.wait_for(0).await, Vec::<String>::new());
+
+        // An earlier part's file is gone.
+        std::fs::remove_file(file_of(&binding, missing)).unwrap();
+        assert_eq!(resume(&head, &binding), found);
+        let lines = log.wait_for(1).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_says(&lines[0], &[&format!("ctx-{missing}"), key, CHAT, "lists an earlier archive"]);
+
+        // Another one cannot be read.
+        let _heal = make_unreadable(&binding, damaged);
+        log.clear();
+        assert_eq!(resume(&head, &binding), found);
+        let lines = log.wait_for(2).await;
+        assert_eq!(lines.len(), 2, "one line for each, in the head's order: {lines:?}");
+        assert_says(&lines[0], &[&format!("ctx-{missing}"), "lists an earlier archive"]);
+        assert_says(&lines[1], &[&format!("ctx-{damaged}"), "lists an earlier archive"]);
+    }
+
+    /// The marker names the last part, so forgetting it (`memory_forget`) is
+    /// what forgetting the single archive of a window is: the chat goes on
+    /// at window 1 without an archive link. It says so now, and the earlier
+    /// parts, which are all there, are not reported.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn resume_with_the_last_part_forgotten_goes_on_at_window_1_and_says_so() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let (head, parts) = rolled_over(&binding, &split_window()).await;
+        let (last, earlier) = parts.split_last().unwrap();
+        assert!(!earlier.is_empty(), "{parts:?}");
+        binding.history_forget(&last.archive.id).await.unwrap();
+
+        let log = Log::default();
+        let _capture = log.capture();
+        assert_eq!(resume(&head, &binding), (None, 1, true));
+        let lines = log.wait_for(1).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let key = binding.scope().unwrap().key();
+        let archive = format!("ctx-{}", last.archive.id);
+        assert_says(&lines[0], &[&archive, key, "was not found", "missing, forgotten", "goes on at window 1"]);
+        // The earlier parts are still fetched by the ids the head lists.
+        for part in earlier {
+            binding.history_fetch(&part.archive.id, 0, 1).await.unwrap();
+        }
     }
 }

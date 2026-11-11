@@ -300,15 +300,40 @@ the source messages it covers, `messages` the messages stored, `reduced` (only
 when not 0) those stored reduced. The archive files record nothing about each
 other, so this list, saved with the session head, and the per-part
 `on_context_archived` events are the only record of how a window was cut.
-Nothing reads `archives` back; like `archive`, it describes the window just
-archived and is replaced at the next rollover, after which those parts are
-ordinary archives found by search.
+Resume reads `archives` back only to check it (below); nothing is rebuilt from
+it. Like `archive`, it describes the window just archived and is replaced at
+the next rollover, after which those parts are ordinary archives found by
+search.
 
 **Resume.** A chat that rolled over in parts restores exactly as one that
 rolled over into a single archive: the window number and the last part's id,
 once that archive is found. (So forgetting the last part of a window with
 `memory_forget` has the effect forgetting the single archive has: the window
 count is not restored. Forgetting another part does not.)
+
+The archive is looked for in the store of the project the chat is resumed in.
+That is where the rollover wrote it when the chat comes back in the same
+project: a daemon reload or restart, a parked chat woken, `--continue` from a
+folder of that project. A chat continued from a folder of another project
+takes that folder's project, where the archive is not, and goes on at window 1
+without an archive link.
+
+- **Not found** settles it, and is logged: a warning names the archive and the
+  project whose store was searched and says which it was, the chat has no
+  project, the project has no archive store, or the store does not hold the
+  archive (missing, forgotten, or sealed in another project).
+- **A lookup that failed** for any other reason (the store is busy, something
+  in it cannot be read) settles nothing. It is logged, the chat goes on, and
+  the lookup is made again at the next request, until it finds the archive or
+  finds that it is not there.
+- **The other parts.** For a head that lists several parts, each listed id is
+  looked up as well, in the background, and the log names every one the store
+  cannot give back. This is a warning only: the continuation message still
+  lists the part, and the resume neither waits for the check nor depends on
+  it.
+
+The lookup reads a file and can wait for a busy store; the continuation state
+is not locked while it does.
 
 **Interrupted between parts.** Each part is written and synced by itself. If
 sealing stops after some parts (a full disk, a store locked by another process

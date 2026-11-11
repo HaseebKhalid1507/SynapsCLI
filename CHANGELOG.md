@@ -297,14 +297,38 @@ All notable changes to this project will be documented in this file.
   its `tool.call` with `session_id: null` and the daemon's folder as `cwd`.
   It now carries the chat's id and the chat's folder, like a tool call in a
   turn.
-- **Daemon: a resumed chat keeps its context-window count.** With the
-  plain-file memory backend and context management on, a daemon-hosted chat
-  that was resumed (`--continue`, a daemon reload or restart, waking a
-  parked chat) checked for its last archived window in the project of the
-  daemon's folder instead of its own. The archive is not there, so the chat
-  silently started counting windows from 1 again and reported no archive.
-  The check now uses the chat's project, where its rollover wrote the
-  archive. No file moves; in-process hosts are unchanged.
+- **Daemon: a chat resumed in the same project keeps its context-window
+  count.** With the plain-file memory backend and context management on, a
+  daemon-hosted chat that was resumed (`--continue`, a daemon reload or
+  restart, waking a parked chat) checked for its last archived window in the
+  project of the daemon's folder instead of its own. The archive is not
+  there, so the chat silently started counting windows from 1 again and
+  reported no archive. The check now uses the project of the folder the chat
+  is resumed in. That is where its rollover wrote the archive when the chat
+  comes back in the project it rolled over in: a daemon reload or restart,
+  waking a parked chat, `--continue` from a folder of that project. A chat
+  continued with `--continue` from a folder of another project takes that
+  folder's project, where the archive is not: it still starts counting
+  windows from 1, reports no archive, and cannot fetch its earlier windows
+  from there. No file moves; in-process hosts are unchanged.
+- **A resumed chat that does not find its archive says so, and a lookup that
+  merely failed is made again.** A chat whose saved window names an archive
+  that is not found used to go on at window 1 without a word. The log now
+  has a warning that names the archive and the project whose store was
+  searched, and tells the three causes apart: the chat has no project, the
+  project has no archive store, the store does not hold the archive. Only
+  those settle it. A lookup that fails for another reason (the store is
+  busy, something in it cannot be read) used to count as "no archive" for
+  good; it now leaves the question open, is logged, and is asked again at
+  the next request. For a window that was sealed as several archives, every
+  archive the saved window lists is looked up in the background and the log
+  names each one that cannot be read; this never delays or fails the resume.
+- **Daemon: a chat whose folder was deleted survives `synaps daemon reload`
+  with a project.** The reload restored the chat on the deleted path, where
+  no project can be found: memory tools answered "host project scope
+  unavailable" and the next rollover could not save its archive. It now
+  runs in the daemon's folder, as a pinned chat restored after its folder
+  was deleted already did.
 - **Daemon: memory tools called by an extension-provided model act on the
   chat's project.** A model served by an extension (`plugin:provider:model`)
   runs its tool calls in a loop of its own, and that loop gave the memory

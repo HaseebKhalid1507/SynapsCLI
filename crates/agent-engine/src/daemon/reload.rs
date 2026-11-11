@@ -872,10 +872,17 @@ pub(crate) async fn send_reload_aborted(h: &SessionHandle, budget: Duration) -> 
 /// use), so the restore of N sessions does not take N hook round trips
 /// while the socket waits. A session restored Parked runs it only once it
 /// is unparked.
+///
+/// A folder that is no longer there is dropped, as the pinned restore drops
+/// it (`pins::restore_one`): the chat then runs in the daemon's folder and
+/// its project. Kept, the dead path gave the chat no project at all:
+/// discovery fails on a path it cannot resolve, the memory tools answer
+/// "host project scope unavailable" and the next rollover cannot seal.
 fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle) -> SessionConfig {
     SessionConfig {
         await_extensions: false,
         restore_parked: matches!(lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking),
+        cwd: saved.cwd.clone().filter(|folder| folder.is_dir()),
         ..saved.clone()
     }
 }
@@ -1161,6 +1168,45 @@ mod tests {
             let wire = serde_json::to_value(&restored).unwrap();
             assert!(wire.get("restore_parked").is_none(), "never on the wire");
         }
+    }
+
+    /// A chat whose folder was deleted while the daemon held it. The pinned
+    /// restore drops such a folder (`pins::restore_one`: `cwd:
+    /// entry.cwd.clone().filter(|c| c.is_dir())`) and the chat runs in the
+    /// daemon's folder: a runtime without a folder of its own takes the
+    /// process's. A reload kept the dead path. The chat's memory binding was
+    /// then built on a path project discovery cannot resolve, so it had no
+    /// project: memory tools answered "host project scope unavailable" and a
+    /// rollover could not seal. Reload now drops it too.
+    #[test]
+    fn a_restore_drops_a_folder_that_is_gone_as_the_pinned_restore_does() {
+        let parent = tempfile::tempdir().unwrap();
+        let (kept, gone) = (parent.path().join("kept"), parent.path().join("gone"));
+        std::fs::create_dir(&kept).unwrap();
+        let saved = |folder: &Path| SessionConfig {
+            cwd: Some(folder.to_path_buf()),
+            ..Default::default()
+        };
+
+        // What the dead path does to a chat that keeps it.
+        let files = crate::config::MemoryBackendConfig::default();
+        let binding =
+            crate::memory_backend::MemoryBinding::from_config_with_cwd(&files, Some(gone.clone()));
+        let error = binding.scope().unwrap_err().to_string();
+        assert!(error.contains("host project scope unavailable"), "{error}");
+        let binding =
+            crate::memory_backend::MemoryBinding::from_config_with_cwd(&files, Some(kept.clone()));
+        assert!(binding.scope().is_ok());
+
+        for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked] {
+            assert_eq!(restore_config(&saved(&kept), lifecycle).cwd, Some(kept.clone()));
+            assert_eq!(restore_config(&saved(&gone), lifecycle).cwd, None, "{lifecycle:?}");
+        }
+        // A file where the folder was is not a folder to run in either.
+        std::fs::write(&gone, b"").unwrap();
+        assert_eq!(restore_config(&saved(&gone), SessionLifecycle::Live).cwd, None);
+        // No folder saved: nothing to drop.
+        assert_eq!(restore_config(&SessionConfig::default(), SessionLifecycle::Live).cwd, None);
     }
 
     #[test]

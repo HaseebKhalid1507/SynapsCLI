@@ -360,8 +360,9 @@ Which folder that is:
   can differ from the folder the chat was created in. Attaching to a chat
   that is still running, or waking a parked one, does not change its folder.
 - **No folder of its own:** the host process's folder, which is also where
-  the tools run. One case: a pinned chat the daemon restores after its
-  folder was deleted. It reports the daemon's folder.
+  the tools run. Two cases: a pinned chat the daemon restores, and a chat
+  the daemon carries through `synaps daemon reload`, after its folder was
+  deleted. It reports the daemon's folder.
 
 The calls a chat causes outside its own turn loop carry its folder too:
 
