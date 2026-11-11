@@ -1142,17 +1142,6 @@ fn forum_alias_worktrees_keep_original_envelope_and_shared_tombstones() {
     assert_eq!(old["tombstones"], json!([root["id"]]));
     assert_eq!(old["records"], json!([]));
 }
-/// In-process protocol (same frames, no spawn) for bulk setup.
-fn local(p: &Path, scope: &str, op: &str, payload: Value) -> Value {
-    let input = format!(
-        "{}\n{}\n",
-        json!({"schema":SCHEMA,"project":scope,"operation":"hello","payload":{}}),
-        json!({"schema":SCHEMA,"project":scope,"operation":op,"payload":payload})
-    );
-    let mut out = Vec::new();
-    synaps_axel_memory_service::protocol::run(&mut input.as_bytes(), &mut out, p, scope).unwrap();
-    serde_json::from_slice(out.split(|b| *b == b'\n').rfind(|b| !b.is_empty()).unwrap()).unwrap()
-}
 #[test]
 fn alias_union_past_128_histories_keeps_every_archive() {
     // docs/specs/archive-size-fit.md: no group inventory cap refuses a link.
@@ -1162,7 +1151,7 @@ fn alias_union_past_128_histories_keeps_every_archive() {
         .map(|i| {
             let scope = if i % 2 == 0 { &a } else { &b };
             let q = seal_with(&hash(&[format!("chat-{i}").as_bytes()]), &format!("archive {i}"));
-            ok(local(&p, scope, "history_seal", q))["id"].clone()
+            ok(call(&p, scope, "history_seal", q))["id"].clone()
         })
         .collect();
     ok(alias(&p, &a, &main, &b, &wt));

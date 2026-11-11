@@ -432,3 +432,65 @@ fn eligible_json(v: &Value, depth: usize) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    fn seal(n: usize) -> Seal {
+        let logical_id = hash_parts(&[format!("chat-{n}").as_bytes()]);
+        let messages = vec![ArchivedMessage {
+            source_index: 0,
+            block_indices: vec![],
+            message: json!({"role":"user","content":format!("evidence {n}")}),
+        }];
+        let digest = hash_parts(&[
+            logical_id.as_bytes(),
+            &1u64.to_be_bytes(),
+            &serde_json::to_vec(&messages).unwrap(),
+        ]);
+        Seal {
+            logical_id,
+            source_message_count: 1,
+            messages,
+            note: String::new(),
+            digest,
+        }
+    }
+    #[test]
+    fn seals_never_delete_live_or_tombstoned_rows() {
+        use std::os::unix::fs::PermissionsExt;
+        // The service binary sets this umask before SQLite creates any file.
+        unsafe { libc::umask(0o077) };
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let service = Service::open(&root.path().join("synthetic.r8"), "p0123456789abcdef").unwrap();
+        let id = |n| service.history_seal(seal(n)).unwrap()["id"].as_str().unwrap().to_owned();
+        let mut ids: Vec<String> = (0..200).map(id).collect();
+        let forgotten = [0, 5, 129];
+        for n in forgotten {
+            assert!(service.history_forget(&ids[n]).unwrap());
+        }
+        ids.extend((200..210).map(id));
+        let (rows, tombstones): (usize, usize) = service
+            .brain
+            .conn()
+            .query_row("SELECT count(*),sum(tombstoned) FROM synaps_history", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((rows, tombstones), (210, 3));
+        for (n, id) in ids.iter().enumerate() {
+            let fetched = service.history_fetch(HistoryFetch {
+                id: id.clone(),
+                start: 0,
+                limit: None,
+                offset_bytes: 0,
+            });
+            if forgotten.contains(&n) {
+                assert_eq!(fetched.err(), Some(Error::NotFound));
+            } else {
+                assert_eq!(fetched.unwrap()[0].message, seal(n).messages[0].message);
+            }
+        }
+    }
+}
