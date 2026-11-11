@@ -1137,6 +1137,22 @@ impl ArchiveStore {
     /// Legacy slots first, then shelves oldest to newest. A migration carries
     /// at most [`MAX_SEGMENTS`] segments / [`MAX_STORE_BYTES`]; a larger store
     /// is refused whole rather than exported in part.
+    ///
+    /// One projection can be in several files (under each half of its
+    /// digest, under one id on two shelves, in a slot and on a shelf). The
+    /// export carries it once: the first record read, or the tombstone if
+    /// any copy is one, because a forgotten projection must not come out of
+    /// a migration live. The ids of the other copies are not carried. Two
+    /// records with one id and different content are still an error: only
+    /// one of them could go under that id.
+    ///
+    /// Unlike a search, an export stays strict about what it cannot read: a
+    /// shelf name that is not a directory that can be opened, a link or a
+    /// FIFO where a segment belongs and a file that is not a valid record
+    /// each fail it whole. Its caller takes the rows for everything the
+    /// project holds and moves the project by them; rows that silently
+    /// lacked a shelf would leave that history behind with nothing to say
+    /// so.
     pub fn export_records(&self) -> io::Result<Vec<Value>> {
         let gate = self.enter(BUSY_EXPORT)?;
         let lock = Locked {
@@ -1155,9 +1171,6 @@ impl ArchiveStore {
             names.retain(|name| archive_id(name).is_some());
             names.sort_unstable();
             for name in names {
-                if records.len() == MAX_SEGMENTS {
-                    return Err(over_limit());
-                }
                 let Some(raw) = dir.read_with(&name, MAX_SEGMENT_BYTES, true)? else {
                     continue;
                 };
@@ -1166,11 +1179,20 @@ impl ArchiveStore {
                     return Err(over_limit());
                 }
                 let record = self.record(&name, &raw)?;
-                if records
-                    .iter()
-                    .any(|r| r.id == record.id || r.digest == record.digest)
-                {
+                let other_content = |r: &Record| r.id == record.id && r.digest != record.digest;
+                if records.iter().any(other_content) {
                     return Err(corrupt());
+                }
+                // Another copy of a projection already read: one is kept,
+                // the tombstone if there is one.
+                if let Some(kept) = records.iter_mut().find(|r| r.digest == record.digest) {
+                    if matches!(kept.body, Body::Live { .. }) && matches!(record.body, Body::Tombstone) {
+                        *kept = record;
+                    }
+                    continue;
+                }
+                if records.len() == MAX_SEGMENTS {
+                    return Err(over_limit());
                 }
                 records.push(record);
             }
@@ -3352,6 +3374,64 @@ mod tests {
         drop(lock);
         std::fs::write(&shelf_files(&dir)[0], b"corrupt").unwrap();
         assert!(export_in(tmp.path(), "synthetic-project").is_err());
+    }
+
+    /// The store can hold one window in more than one file. The export
+    /// carries it once, and as forgotten if any copy is.
+    #[test]
+    fn export_carries_a_window_stored_twice_once_and_forgotten_if_any_copy_is() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let (older, newer) = (dir.join("s000001"), dir.join("s000002"));
+        let twice = store.seal(&text("one id on two shelves"), "").unwrap();
+        let halves = store.seal(&text("under both halves"), "the note").unwrap();
+        let alone = store.seal(&text("stored once"), "").unwrap();
+        std::fs::create_dir(&newer).unwrap();
+        let name = archive_name(&twice.id);
+        std::fs::copy(older.join(&name), newer.join(&name)).unwrap();
+        let digest = digest_of("under both halves");
+        assert_eq!(halves.id, digest[..32]);
+        let second = record_bytes(&store, &digest[32..], &text("under both halves"), |_| {});
+        std::fs::write(newer.join(archive_name(&digest[32..])), second).unwrap();
+        let exported = || {
+            let rows = store.export_records().unwrap();
+            assert_eq!(rows, export_in(tmp.path(), "synthetic-project").unwrap());
+            let mut rows: Vec<_> = rows
+                .iter()
+                .map(|row| (row["id"].as_str().unwrap().to_owned(), row["tombstone"] == true))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let sorted = |rows: [(&str, bool); 3]| {
+            let mut rows = rows.map(|(id, gone)| (id.to_owned(), gone)).to_vec();
+            rows.sort();
+            rows
+        };
+        // The copy read first is the one carried: the oldest shelf's.
+        let (twice_id, alone_id) = (twice.id.as_str(), alone.id.as_str());
+        let live = sorted([(twice_id, false), (halves.id.as_str(), false), (alone_id, false)]);
+        assert_eq!(exported(), live);
+        let rows = store.export_records().unwrap();
+        let row = rows.iter().find(|row| row["id"] == halves.id.as_str()).unwrap();
+        assert_eq!(row["note"], "the note");
+        // A tombstone in any copy, whichever file it is, makes it forgotten.
+        let tombstone = |file: &Path| {
+            let live = std::fs::read_to_string(file).unwrap();
+            let body = &live[live.find("\"body\":").unwrap()..];
+            std::fs::write(file, live.replace(body, "\"body\":{\"state\":\"tombstone\"}}")).unwrap();
+        };
+        tombstone(&newer.join(&name));
+        tombstone(&newer.join(archive_name(&digest[32..])));
+        let forgotten = sorted([(twice_id, true), (&digest[32..], true), (alone_id, false)]);
+        assert_eq!(exported(), forgotten);
+        // Two records with one id and different content are not one window
+        // stored twice: only one of them could go under that id.
+        let name = archive_name(&alone.id);
+        let other = record_bytes(&store, &alone.id, &text("other content"), |_| {});
+        std::fs::write(newer.join(&name), other).unwrap();
+        let error = store.export_records().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
