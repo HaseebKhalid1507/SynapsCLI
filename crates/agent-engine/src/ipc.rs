@@ -200,6 +200,69 @@ mod imp {
         win::verify_server_is_current_user(client.as_raw_handle())
     }
 
+    /// An account and its integrity level: who a daemon or a client runs as.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Identity {
+        /// The token user's SID (`S-1-5-…`).
+        pub sid: String,
+        /// The mandatory label's RID: 0x1000 low, 0x2000 medium, 0x3000
+        /// high (elevated), 0x4000 system.
+        pub integrity: u32,
+    }
+
+    /// The raw handle of an accepted pipe, kept by `conn::serve` before it
+    /// splits the stream so it can identify the client after `Hello`. Valid
+    /// while either half of the stream lives.
+    #[derive(Clone, Copy)]
+    pub struct PeerHandle(std::os::windows::io::RawHandle);
+
+    // SAFETY: a kernel handle value, usable from any thread; it is only
+    // passed to `client_identity` while the stream that owns it is alive.
+    unsafe impl Send for PeerHandle {}
+
+    impl PeerHandle {
+        pub fn of(server: &NamedPipeServer) -> Self {
+            use std::os::windows::io::AsRawHandle;
+            Self(server.as_raw_handle())
+        }
+    }
+
+    /// This process's identity.
+    pub fn own_identity() -> io::Result<Identity> {
+        win::current_process_identity()
+    }
+
+    /// The identity of the client on an accepted pipe: the token it
+    /// presented, read by impersonating it (so no PID-reuse race). Call it
+    /// only after reading from the pipe: a client opened without SQOS flags
+    /// can't be impersonated until it has written, and is then identified as
+    /// the thread that wrote the last bytes read.
+    pub fn client_identity(peer: PeerHandle) -> io::Result<Identity> {
+        win::client_identity(peer.0)
+    }
+
+    /// The Windows `admit`, run by `conn::serve` after `Hello` and before
+    /// `Welcome`. The client must be the daemon's user, at the daemon's
+    /// integrity level or higher, so an elevated daemon serves no medium
+    /// process of its user (on Unix, elevation changes the uid and the uid
+    /// check covers it). SYSTEM is refused like root. An Anonymous-level
+    /// client can't be read, and anything unreadable refuses the connection.
+    pub fn admit_client(peer: PeerHandle, own: &io::Result<Identity>) -> Result<(), String> {
+        let own = own.as_ref().map_err(|e| format!("daemon identity unreadable: {e}"))?;
+        let who = client_identity(peer).map_err(|e| format!("peer identity unreadable: {e}"))?;
+        admit_identity(own, &who)
+    }
+
+    fn admit_identity(own: &Identity, peer: &Identity) -> Result<(), String> {
+        if peer.sid != own.sid {
+            return Err(format!("peer {} is not the daemon's user {}", peer.sid, own.sid));
+        }
+        if peer.integrity < own.integrity {
+            return Err(format!("peer integrity {:#x} is below the daemon's {:#x}", peer.integrity, own.integrity));
+        }
+        Ok(())
+    }
+
     /// The pipe name for an endpoint path. Hashed: pipe names live in one
     /// flat, machine-wide namespace and may not contain `\`.
     ///
@@ -256,12 +319,14 @@ mod imp {
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
         };
         use windows_sys::Win32::Security::{
-            EqualSid, GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-            TOKEN_USER,
+            EqualSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf,
+            TokenIntegrityLevel, TokenUser, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS,
+            TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
         };
-        use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+        use windows_sys::Win32::System::Pipes::{GetNamedPipeServerProcessId, ImpersonateNamedPipeClient};
         use windows_sys::Win32::System::Threading::{
-            GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+            GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
+            PROCESS_QUERY_LIMITED_INFORMATION,
         };
 
         struct Handle(HANDLE);
@@ -324,9 +389,11 @@ mod imp {
             Ok(out)
         }
 
-        /// Security descriptor for daemon pipe instances: a protected DACL
-        /// granting full access to this user and SYSTEM only (the default
-        /// pipe DACL also grants Everyone read).
+        /// Security descriptor for daemon pipes: a protected DACL granting
+        /// full access to this user and SYSTEM only (the default pipe DACL
+        /// also grants Everyone read), and a no-write-up label at this
+        /// process's integrity level. NPFS keeps the first instance's
+        /// descriptor for the whole pipe name.
         pub struct PipeSecurity(PSECURITY_DESCRIPTOR);
 
         // SAFETY: an immutable, self-contained LocalAlloc'd descriptor.
@@ -335,8 +402,12 @@ mod imp {
 
         impl PipeSecurity {
             pub fn current_user_only() -> io::Result<Self> {
-                let user = sid_string(TokenUserBuf::current()?.sid())?;
-                let sddl: Vec<u16> = format!("D:P(A;;GA;;;SY)(A;;GA;;;{user})").encode_utf16().chain([0]).collect();
+                // Owner-only DACL, plus a no-write-up label at our own
+                // integrity: a lower-integrity process of this user can't
+                // open the pipe for writing (`admit_client` checks the rest).
+                let me = current_process_identity()?;
+                let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{})S:(ML;;NW;;;S-1-16-{})", me.sid, me.integrity);
+                let sddl: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
                 let mut sd: PSECURITY_DESCRIPTOR = null_mut();
                 // SAFETY: NUL-terminated SDDL; sd receives a LocalAlloc'd descriptor.
                 if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()) } == 0 {
@@ -402,6 +473,85 @@ mod imp {
             }
             Ok(())
         }
+
+        /// One `GetTokenInformation` result (8-aligned: it holds pointers).
+        fn token_info(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<u64>> {
+            let mut len = 0u32;
+            // SAFETY: size query (fails with ERROR_INSUFFICIENT_BUFFER, sets len).
+            unsafe { GetTokenInformation(token, class, null_mut(), 0, &mut len) };
+            if len == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+            // SAFETY: buf holds at least `len` bytes.
+            if unsafe { GetTokenInformation(token, class, buf.as_mut_ptr().cast(), len, &mut len) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(buf)
+        }
+
+        /// A token's user SID and integrity RID.
+        fn token_identity(token: HANDLE) -> io::Result<super::Identity> {
+            let user = token_info(token, TokenUser)?;
+            // SAFETY: filled by GetTokenInformation(TokenUser).
+            let sid = sid_string(unsafe { (*(user.as_ptr() as *const TOKEN_USER)).User.Sid })?;
+            let label = token_info(token, TokenIntegrityLevel)?;
+            // SAFETY: filled by GetTokenInformation(TokenIntegrityLevel); a
+            // label SID (S-1-16-<rid>) ends with its RID.
+            let integrity = unsafe {
+                let il = (*(label.as_ptr() as *const TOKEN_MANDATORY_LABEL)).Label.Sid;
+                let n = *GetSidSubAuthorityCount(il);
+                if n == 0 {
+                    return Err(io::Error::other("integrity label without a RID"));
+                }
+                *GetSidSubAuthority(il, u32::from(n) - 1)
+            };
+            Ok(super::Identity { sid, integrity })
+        }
+
+        pub fn current_process_identity() -> io::Result<super::Identity> {
+            let mut token: HANDLE = null_mut();
+            // SAFETY: the pseudo-handle needs no close; token is an out-pointer.
+            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let token = Handle(token);
+            token_identity(token.0)
+        }
+
+        /// Ends this thread's impersonation when dropped, on every path out.
+        /// A failed revert aborts: a worker thread must never keep a
+        /// client's identity.
+        struct RevertOnDrop;
+        impl Drop for RevertOnDrop {
+            fn drop(&mut self) {
+                // SAFETY: created right after a successful impersonation on this thread.
+                if unsafe { RevertToSelf() } == 0 {
+                    std::process::abort();
+                }
+            }
+        }
+
+        /// Impersonate the pipe's client on this thread, read its token,
+        /// revert. Synchronous: nothing else runs on this thread while it
+        /// wears the client's identity.
+        pub fn client_identity(pipe: std::os::windows::io::RawHandle) -> io::Result<super::Identity> {
+            // SAFETY: a connected server pipe handle.
+            if unsafe { ImpersonateNamedPipeClient(pipe as HANDLE) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Declared before `token`, so it drops (reverts) after the token closes.
+            let _revert = RevertOnDrop;
+            let mut token: HANDLE = null_mut();
+            // SAFETY: OpenAsSelf = TRUE: the client's token is at
+            // Identification level and can't open itself. An Anonymous-level
+            // client fails here (ERROR_CANT_OPEN_ANONYMOUS).
+            if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let token = Handle(token);
+            token_identity(token.0)
+        }
     }
 
     #[cfg(test)]
@@ -423,6 +573,17 @@ mod imp {
         use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING, READ_CONTROL};
         use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
         use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+        use std::io::Write;
+
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GENERIC_WRITE};
+        use windows_sys::Win32::Security::{
+            DuplicateTokenEx, GetLengthSid, SetTokenInformation, SecurityImpersonation, TokenImpersonation,
+            TokenIntegrityLevel, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
+            TOKEN_MANDATORY_LABEL,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken};
 
         fn endpoint() -> (tempfile::TempDir, std::path::PathBuf) {
             let d = tempfile::tempdir().unwrap();
@@ -605,6 +766,211 @@ mod imp {
             let mut b = [0u8; 1];
             server.read_exact(&mut b).await.unwrap();
             assert_eq!(client_impersonation_level(&server).unwrap(), SecurityIdentification);
+        }
+
+        /// `SE_GROUP_INTEGRITY` (winnt.h); its windows-sys constant needs the
+        /// `Win32_System_SystemServices` feature, which this crate doesn't enable.
+        const SE_GROUP_INTEGRITY: u32 = 0x20;
+
+        /// Stands in for the `Hello` line: `admit_client` doesn't parse it,
+        /// `conn::serve` has already done that when it calls it.
+        const HELLO: &[u8] = b"{\"hello\":1}\n";
+
+        async fn read_hello(server: &mut NamedPipeServer) {
+            let mut b = vec![0u8; HELLO.len()];
+            server.read_exact(&mut b).await.unwrap();
+            assert_eq!(b, HELLO);
+        }
+
+        /// A synchronous write on a raw client handle, from the calling thread.
+        fn write_line(client: &OwnedHandle, line: &[u8]) -> io::Result<()> {
+            std::fs::File::from(client.try_clone()?).write_all(line)
+        }
+
+        /// This process's token, duplicated for impersonation and lowered to
+        /// integrity `rid` (lowering needs no privilege).
+        fn lowered_token(rid: u32) -> io::Result<OwnedHandle> {
+            let mut process_token: HANDLE = null_mut();
+            // SAFETY: the pseudo-handle and an out-pointer.
+            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut process_token) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: a token handle we own.
+            let process_token = unsafe { OwnedHandle::from_raw_handle(process_token) };
+            let mut dup: HANDLE = null_mut();
+            let access = TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_ADJUST_DEFAULT;
+            // SAFETY: a valid token; dup receives an impersonation token a thread can wear.
+            if unsafe { DuplicateTokenEx(process_token.as_raw_handle() as HANDLE, access, null(), SecurityImpersonation, TokenImpersonation, &mut dup) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: a token handle we own.
+            let dup = unsafe { OwnedHandle::from_raw_handle(dup) };
+            let il = Sid::parse(&format!("S-1-16-{rid}"));
+            let label = TOKEN_MANDATORY_LABEL { Label: SID_AND_ATTRIBUTES { Sid: il.0, Attributes: SE_GROUP_INTEGRITY } };
+            // SAFETY: label and its SID outlive the call; the length covers the struct and the SID it points to.
+            let len = std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + unsafe { GetLengthSid(il.0) };
+            // SAFETY: as above.
+            if unsafe { SetTokenInformation(dup.as_raw_handle() as HANDLE, TokenIntegrityLevel, (&label as *const TOKEN_MANDATORY_LABEL).cast(), len) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(dup)
+        }
+
+        /// Run `f` on a fresh thread wearing this process's token one
+        /// integrity level lower (High → Medium, Medium → Low). Returns the
+        /// lowered RID and `f`'s result; `None` when already at Low.
+        fn as_lower_integrity<T: Send>(f: impl FnOnce() -> T + Send) -> Option<(u32, T)> {
+            let own = own_identity().unwrap().integrity;
+            if own < 0x2000 {
+                return None;
+            }
+            let lower = (own & !0xfff) - 0x1000;
+            Some(std::thread::scope(|s| {
+                s.spawn(move || {
+                    let token = lowered_token(lower).unwrap();
+                    // SAFETY: null = the calling thread; a token with TOKEN_IMPERSONATE.
+                    assert_ne!(unsafe { SetThreadToken(null(), token.as_raw_handle() as HANDLE) }, 0, "{}", io::Error::last_os_error());
+                    let out = f();
+                    // SAFETY: ends this thread's impersonation.
+                    if unsafe { RevertToSelf() } == 0 {
+                        std::process::abort();
+                    }
+                    (lower, out)
+                })
+                .join()
+                .unwrap()
+            }))
+        }
+
+        /// The mandatory-label ACE, wherever the SACL puts it (`S:(ML;…)`,
+        /// or `S:AI(ML;…)` once the label is inherited).
+        fn assert_label(sddl: &str, rid: u32) {
+            let start = sddl.find("(ML;").unwrap_or_else(|| panic!("no label: {sddl}")) + 1;
+            let end = start + sddl[start..].find(')').unwrap_or_else(|| panic!("unclosed label: {sddl}"));
+            let ace: Vec<&str> = sddl[start..end].split(';').collect();
+            assert_eq!(ace.len(), 6, "{sddl}");
+            assert_eq!(ace[..5], ["ML", "", "NW", "", ""], "{sddl}");
+            assert_eq!(canon(ace[5]), format!("S-1-16-{rid}"), "{sddl}");
+        }
+
+        /// §5 row 1, second half: the pipe name's descriptor carries the
+        /// daemon's integrity label, read through the first instance and
+        /// again through its replacement.
+        #[tokio::test]
+        async fn the_pipe_name_carries_the_daemons_integrity_label() {
+            let (_d, path) = endpoint();
+            let name = pipe_name(&path);
+            let rid = own_identity().unwrap().integrity;
+            let mut l = Listener::bind(&path).unwrap();
+            let first = open_raw(&name, GENERIC_READ | READ_CONTROL, 0).unwrap();
+            assert_label(&sddl_of(&first), rid);
+            let _served = l.accept().await.unwrap();
+            let second = open_raw(&name, GENERIC_READ | READ_CONTROL, 0).unwrap();
+            assert_label(&sddl_of(&second), rid);
+            assert_owner_only_dacl(&sddl_of(&second));
+        }
+
+        /// §5 row 3: tokio's client (SQOS, Identification) is admitted after `Hello`.
+        #[tokio::test]
+        async fn an_sqos_client_is_admitted_after_hello() {
+            let (_d, path) = endpoint();
+            let mut l = Listener::bind(&path).unwrap();
+            let client = connect(&path).await.unwrap();
+            let mut server = l.accept().await.unwrap();
+            let (_cr, mut cw) = split_client(client);
+            cw.write_all(HELLO).await.unwrap();
+            read_hello(&mut server).await;
+            let peer = PeerHandle::of(&server);
+            assert_eq!(client_identity(peer).unwrap(), own_identity().unwrap());
+            assert_eq!(admit_client(peer, &own_identity()), Ok(()));
+        }
+
+        /// §5 row 3: a client opened without SQOS flags (flags 0: .NET's
+        /// default, libuv) is admitted after `Hello`, as the thread that wrote it.
+        #[tokio::test]
+        async fn a_client_without_sqos_is_admitted_after_hello() {
+            let (_d, path) = endpoint();
+            let name = pipe_name(&path);
+            let mut l = Listener::bind(&path).unwrap();
+            let client = open_raw(&name, GENERIC_READ | GENERIC_WRITE, 0).unwrap();
+            let mut server = l.accept().await.unwrap();
+            write_line(&client, HELLO).unwrap();
+            read_hello(&mut server).await;
+            let peer = PeerHandle::of(&server);
+            assert_eq!(client_identity(peer).unwrap(), own_identity().unwrap());
+            assert_eq!(admit_client(peer, &own_identity()), Ok(()));
+        }
+
+        /// §5 row 12 (b): a client opened at this process's level whose `Hello`
+        /// is written from a lower-integrity thread is identified as that
+        /// thread, and refused.
+        #[tokio::test]
+        async fn a_hello_written_at_lower_integrity_is_refused() {
+            let (_d, path) = endpoint();
+            let name = pipe_name(&path);
+            let mut l = Listener::bind(&path).unwrap();
+            let client = open_raw(&name, GENERIC_READ | GENERIC_WRITE, 0).unwrap();
+            let mut server = l.accept().await.unwrap();
+            let Some((lower, wrote)) = as_lower_integrity(|| write_line(&client, HELLO)) else {
+                eprintln!("skipped: this process already runs at Low integrity");
+                return;
+            };
+            wrote.unwrap();
+            read_hello(&mut server).await;
+            let peer = PeerHandle::of(&server);
+            let who = client_identity(peer).unwrap();
+            assert_eq!(who.sid, own_identity().unwrap().sid);
+            assert_eq!(who.integrity, lower, "the identity of the thread that wrote Hello");
+            let err = admit_client(peer, &own_identity()).unwrap_err();
+            assert!(err.contains("below the daemon's"), "{err}");
+        }
+
+        /// §5 row 3: a client that opened at Anonymous level can't be identified, so it is refused.
+        #[tokio::test]
+        async fn an_anonymous_client_is_refused() {
+            let (_d, path) = endpoint();
+            let name = pipe_name(&path);
+            let mut l = Listener::bind(&path).unwrap();
+            let client = open_raw(&name, GENERIC_READ | GENERIC_WRITE, SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS).unwrap();
+            let mut server = l.accept().await.unwrap();
+            write_line(&client, HELLO).unwrap();
+            read_hello(&mut server).await;
+            let err = admit_client(PeerHandle::of(&server), &own_identity()).unwrap_err();
+            // Expected: OpenThreadToken's ERROR_CANT_OPEN_ANONYMOUS (os error 1347).
+            eprintln!("anonymous client: {err}");
+            assert!(err.contains("peer identity unreadable"), "{err}");
+        }
+
+        /// §5 row 3: another account is refused, mirroring Unix's `admit`.
+        #[test]
+        fn a_client_of_another_account_is_refused() {
+            let own = own_identity().unwrap();
+            let system = Identity { sid: "S-1-5-18".into(), integrity: 0x4000 };
+            let err = admit_identity(&own, &system).unwrap_err();
+            assert!(err.contains("is not the daemon's user"), "{err}");
+        }
+
+        #[test]
+        fn a_lower_integrity_client_is_refused_and_a_higher_one_admitted() {
+            let high = Identity { sid: "S-1-5-21-1-2-3-1001".into(), integrity: 0x3000 };
+            let medium = Identity { integrity: 0x2000, ..high.clone() };
+            let err = admit_identity(&high, &medium).unwrap_err();
+            assert!(err.contains("below the daemon's"), "{err}");
+            assert_eq!(admit_identity(&medium, &high), Ok(()));
+        }
+
+        /// §5 row 12 (a): the label stops a lower-integrity writer at open.
+        #[tokio::test]
+        async fn a_lower_integrity_writer_is_refused_at_open() {
+            let (_d, path) = endpoint();
+            let _l = Listener::bind(&path).unwrap();
+            let name = pipe_name(&path);
+            let Some((lower, opened)) = as_lower_integrity(|| open_raw(&name, GENERIC_READ | GENERIC_WRITE, 0)) else {
+                eprintln!("skipped: this process already runs at Low integrity");
+                return;
+            };
+            let e = opened.expect_err("a lower-integrity writer must be refused at open");
+            assert_eq!(e.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32), "integrity {lower:#x}: {e}");
         }
     }
 
