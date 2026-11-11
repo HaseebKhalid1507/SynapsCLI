@@ -662,4 +662,18 @@ mod windows_tests {
         shutdown.store(true, Ordering::Release);
         handle.await.unwrap();
     }
+
+    /// `synaps send` and third-party clients derive this name: a contract.
+    /// Hashed exactly as registered, so another spelling is another pipe.
+    #[test]
+    fn session_pipe_names_match_the_published_vectors() {
+        assert_eq!(
+            pipe_name_for(r"\\?\C:\Users\Me\.synaps-cli\run\abc.sock"),
+            r"\\.\pipe\synaps-session-e1e886a406c7d9ae3b17fb22b83dc46a"
+        );
+        assert_eq!(
+            pipe_name_for(r"\\?\c:\users\me\.synaps-cli\run\abc.sock"),
+            r"\\.\pipe\synaps-session-ad5fd1062e53b8b3294a1f452d75947f"
+        );
+    }
 }
