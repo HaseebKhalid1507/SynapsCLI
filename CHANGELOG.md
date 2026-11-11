@@ -374,6 +374,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Extensions: the context archive format page says where a linked base
+  works, and what an import changes.** A base that is a symbolic link works
+  for the archive store only; the session journal, drafts and the source of
+  a memory migration still refuse it. An imported archive keeps its id and
+  its `created_ms`, so the same content can be under two ids (each fetched
+  by itself, both forgotten together), and a shelf is in the order of
+  writing, not of `created_ms`. Also: which unread files a forget passes
+  over, and that a lock file with a second name keeps its mode.
 - **Context archives: a lock file with a second name keeps its mode, and
   `memory_forget` says what to do about a file it could not use.** A lock
   file open to group or others was closed to them even when it had a
