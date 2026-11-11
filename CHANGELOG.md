@@ -313,6 +313,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: a lock file with a second name, or read-only, no
+  longer refuses every save.** The store wanted `lock` in a project's
+  archive directory to have exactly one link and opened it read-write. A
+  backup made with hard links (`cp -al`, rsync `--link-dest`) gives it a
+  second name and a restore can leave it read-only; after either, nothing
+  could be saved or forgotten in that project. The lock file is only ever
+  locked, never written or read, so it is now used whenever it is a regular
+  file of this user, whatever its link count and mode (a read-only one is
+  opened for reading; the lock excludes all the same). Its mode is changed
+  only to clear group and other bits. A lock file that is a link (never
+  followed), not a regular file, another user's, or closed to its owner is
+  still refused, and the error now gives its path, what is wrong with it
+  and the fix (`rm` it: it holds no data).
 - **Context archives: a fetch and a forget by id look past a file of that
   name that is not a record.** A lookup by id stopped at the newest shelf
   that had any file under the id. If that file was not a valid record (a

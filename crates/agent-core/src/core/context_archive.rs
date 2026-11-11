@@ -89,6 +89,15 @@
 //! record or a whole tombstone and nothing else. Legacy slot files are read
 //! under the lock, shared, if the directory has a lock file.
 //!
+//! The lock file (`lock` in the project directory) is only ever locked: the
+//! store never writes to it, truncates it or reads it. So it is usable as
+//! long as it is a regular file of this user, whatever its link count (a
+//! hard-link backup gives it a second name) and whatever its mode (read-only
+//! after a restore: it is then opened for reading, and a lock on that
+//! descriptor excludes as any other does). A link (never followed), anything
+//! that is not a regular file, a file of another user and a file its mode
+//! does not let its owner open are refused, with an error that names the file.
+//!
 //! A read writes nothing. [`ArchiveStore::new`] is for a seal or a forget: it
 //! creates the directories, makes them private and syncs them.
 //! [`ArchiveStore::open_existing`] is for a fetch or a search: it opens what
@@ -467,6 +476,9 @@ pub struct ArchiveStore {
     wait: Duration,
     /// [`PROCESS_LOCK_WAIT`]; tests shorten it.
     process_wait: Duration,
+    /// The project directory as a path, for messages only: nothing is
+    /// opened by it.
+    directory: PathBuf,
 }
 
 /// Process-local mutual exclusion for one archive directory. The advisory
@@ -583,6 +595,19 @@ impl Drop for FlockGuard {
         let _ = fs4::fs_std::FileExt::unlock(&self.0);
     }
 }
+
+/// Why the lock file of a project directory is not one the store uses.
+/// [`ArchiveStore::lock_error`] makes the message, with the file's path.
+#[derive(Debug)]
+struct LockRefused(&'static str);
+
+impl std::fmt::Display for LockRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "archive lock file {}", self.0)
+    }
+}
+
+impl std::error::Error for LockRefused {}
 
 /// What a lookup by id found on the shelves: the newest valid record under
 /// the id.
@@ -753,7 +778,7 @@ impl ArchiveStore {
     pub fn new(base: &Path, scope_key: &str, logical_id: &str) -> io::Result<Self> {
         let (scope, logical) = Self::keys(scope_key, logical_id)?;
         let fs = PrivateDir::new(base, &scope)?;
-        Ok(Self::opened(fs, scope, logical))
+        Ok(Self::opened(fs, base, scope, logical))
     }
 
     /// Open a project's archive for a read (fetch, fetch_note, search), if
@@ -769,7 +794,7 @@ impl ArchiveStore {
     ) -> io::Result<Option<Self>> {
         let (scope, logical) = Self::keys(scope_key, logical_id)?;
         match PrivateDir::open_existing(base, &scope) {
-            Ok(fs) => Ok(Some(Self::opened(fs, scope, logical))),
+            Ok(fs) => Ok(Some(Self::opened(fs, base, scope, logical))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
@@ -785,8 +810,9 @@ impl ArchiveStore {
         Ok((scope, digest_parts(&[logical_id.as_bytes()])))
     }
 
-    fn opened(fs: PrivateDir, scope: String, logical: String) -> Self {
+    fn opened(fs: PrivateDir, base: &Path, scope: String, logical: String) -> Self {
         Self {
+            directory: base.join("context-archives").join(&scope),
             fs,
             scope,
             logical,
@@ -826,6 +852,24 @@ impl ArchiveStore {
         self.locked(|fs| fs.lock().map(Some))
     }
 
+    /// The error of a lock file that is not one the store uses, with the
+    /// file by its path and what to do about it; any other error as it is.
+    fn lock_error(&self, error: io::Error) -> io::Error {
+        let refused = error.get_ref().and_then(|inner| inner.downcast_ref::<LockRefused>());
+        let Some(LockRefused(what)) = refused else {
+            return error;
+        };
+        let file = self.directory.join("lock");
+        let file = file.display();
+        io::Error::new(
+            error.kind(),
+            format!(
+                "context archive lock file {file} {what}; nothing is saved or forgotten while \
+                 it is. It holds no data: remove it (rm '{file}') and try again"
+            ),
+        )
+    }
+
     /// What a read of the legacy slots holds instead: the gate and, with the
     /// same wait, the lock shared. The lock file is opened only if it is
     /// there and only for reading, because a read creates nothing and
@@ -849,7 +893,7 @@ impl ArchiveStore {
                     self.check_abort()?;
                     Ok(None)
                 }
-                result => result.map(Some),
+                result => result.map(Some).map_err(|error| self.lock_error(error)),
             },
         )?
         .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, BUSY))?;
@@ -1591,7 +1635,7 @@ impl ArchiveStore {
     pub fn export_records(&self) -> io::Result<Vec<Value>> {
         let gate = self.enter(BUSY_EXPORT)?;
         let lock = Locked {
-            file: self.fs.lock_existing()?,
+            file: self.fs.lock_existing().map_err(|error| self.lock_error(error))?,
             _gate: gate,
         };
         let (mut records, mut used) = self.scan_legacy(true)?;
@@ -3090,13 +3134,58 @@ impl PrivateDir {
         let meta = self.0.metadata()?;
         Ok((meta.dev(), meta.ino()))
     }
-    fn lock_existing(&self) -> io::Result<Option<FlockGuard>> {
-        let file = match self.open(&c_name("lock")?, libc::O_RDONLY) {
+    /// The lock file, opened and looked at, or `None` if there is none.
+    /// Only ever locked: never written, truncated or read, so neither a
+    /// second name nor its mode matters. With `create` it is made if it is
+    /// missing and opened read-write, or for reading if its mode refuses
+    /// that; a group or other bit in its mode is cleared. Without `create`
+    /// nothing is changed. A link is not followed.
+    fn lock_file(&self, create: bool) -> io::Result<Option<std::fs::File>> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let refused = |what| io::Error::new(io::ErrorKind::PermissionDenied, LockRefused(what));
+        let name = c_name("lock")?;
+        let mut opened = match create {
+            true => self.open(&name, libc::O_RDWR | libc::O_CREAT),
+            false => self.open(&name, libc::O_RDONLY),
+        };
+        if create && opened.as_ref().is_err_and(|error| error.raw_os_error() == Some(libc::EACCES)) {
+            // Read-only, or in a directory nothing can be made in.
+            match self.open(&name, libc::O_RDONLY) {
+                // There is none and none can be made: the error as it is.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return opened.map(Some),
+                again => opened = again,
+            }
+        }
+        let file = match opened {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(match error.raw_os_error() {
+                    // `O_NOFOLLOW`; FreeBSD says EMLINK.
+                    Some(libc::ELOOP | libc::EMLINK) => refused("is a link"),
+                    Some(libc::EISDIR | libc::ENXIO) => refused("is not a regular file"),
+                    Some(libc::EACCES) => refused("cannot be opened by its owner with its mode"),
+                    _ => error,
+                });
+            }
         };
-        Self::check_readonly(&file)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(refused("is not a regular file"));
+        }
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(refused("is owned by another user"));
+        }
+        let mode = meta.permissions().mode() & 0o7777;
+        if create && mode & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(mode & 0o700))?;
+        }
+        Ok(Some(file))
+    }
+    fn lock_existing(&self) -> io::Result<Option<FlockGuard>> {
+        let Some(file) = self.lock_file(false)? else {
+            return Ok(None);
+        };
         if !fs4::fs_std::FileExt::try_lock_shared(&file)? {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, BUSY_EXPORT));
         }
@@ -3105,8 +3194,7 @@ impl PrivateDir {
     /// Never waits: a lock held by another process fails closed at once;
     /// `ArchiveStore::exclusive` polls it.
     fn lock(&self) -> io::Result<FlockGuard> {
-        let file = self.open(&c_name("lock")?, libc::O_RDWR | libc::O_CREAT)?;
-        Self::check(&file)?;
+        let file = self.lock_file(true)?.ok_or_else(not_found)?;
         if !fs4::fs_std::FileExt::try_lock_exclusive(&file)? {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, BUSY));
         }
@@ -4439,6 +4527,99 @@ mod tests {
         std::fs::remove_file(dir.join("lock")).unwrap();
         symlink(&victim, dir.join("lock")).unwrap();
         assert!(store.fs.lock().is_err());
+    }
+
+    /// The lock file is only ever locked, so a second name (a hard-link
+    /// backup) or a read-only mode (a restore) does not refuse a save. What
+    /// is not a regular file of ours is refused, and the error names it.
+    #[test]
+    fn a_lock_file_with_two_names_or_read_only_is_used_and_a_link_is_refused_by_name() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let lock = dir.join("lock");
+        let mut other = setup_in(tmp.path(), "synthetic-project");
+        other.process_wait = Duration::ZERO;
+        store.seal(&text("first"), "").unwrap();
+        let works = |words: &str| {
+            let sealed = store.seal(&text(words), "").unwrap();
+            assert_eq!(store.forget(&sealed.id).unwrap(), forgotten(&[&sealed.id]));
+            assert!(export_in(tmp.path(), "synthetic-project").is_ok(), "{words}");
+            // And it still excludes: a save by another store is busy while
+            // the lock is held, and goes through once it is not.
+            let held = store.fs.lock().unwrap();
+            assert!(store.fs.lock().is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock));
+            let busy = other.seal(&text(words), "").unwrap_err();
+            assert_eq!(busy.kind(), io::ErrorKind::WouldBlock, "{words}: {busy}");
+            assert_eq!(busy.to_string(), BUSY);
+            drop(held);
+            assert!(other.seal(&text(&format!("{words}, after")), "").is_ok());
+        };
+        // A second name, as `cp -al` of the base gives every file.
+        let second = tmp.path().join("a-backup-of-the-lock");
+        std::fs::hard_link(&lock, &second).unwrap();
+        works("with two names");
+        // Read-only, with the second name still there and then without.
+        for links in [2, 1] {
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o400)).unwrap();
+            works(&format!("read-only, {links} name(s)"));
+            assert_eq!(mode(&lock), 0o400, "left as it is");
+            if links == 2 {
+                assert_eq!(identity(&lock), identity(&second), "not replaced");
+                std::fs::remove_file(&second).unwrap();
+            }
+        }
+        assert_eq!(std::fs::metadata(&lock).unwrap().len(), 0, "never written");
+        // Open to others: closed to them again, as it always was.
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        works("loosened");
+        assert_eq!(mode(&lock), 0o600);
+
+        // Not a regular file of ours: refused, named, and left as it is.
+        let victim = tmp.path().join("synthetic-victim");
+        std::fs::write(&victim, "do not change").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let sealed = store.seal(&text("to forget later"), "").unwrap();
+        let refused = |what: &str| {
+            let before = snapshot(&dir.join("s000001"));
+            let errors = [
+                store.seal(&text("refused"), "").unwrap_err(),
+                store.forget(&sealed.id).unwrap_err(),
+                export_in(tmp.path(), "synthetic-project").unwrap_err(),
+            ];
+            for error in errors {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{what}: {error}");
+                let message = error.to_string();
+                let named = format!("context archive lock file {} {what}", lock.display());
+                assert!(message.starts_with(&named), "{message}");
+                assert!(message.contains(&format!("rm '{}'", lock.display())), "{message}");
+            }
+            assert_eq!(snapshot(&dir.join("s000001")), before, "{what}");
+            // A read by id needs no lock.
+            assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap(), text("to forget later"));
+        };
+        std::fs::remove_file(&lock).unwrap();
+        symlink(&victim, &lock).unwrap();
+        refused("is a link");
+        assert!(std::fs::symlink_metadata(&lock).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not change");
+        assert_eq!(mode(&victim), 0o644);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        refused("is not a regular file");
+        std::fs::remove_dir(&lock).unwrap();
+        let fifo = std::ffi::CString::new(lock.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        refused("is not a regular file");
+        std::fs::remove_file(&lock).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::write(&lock, b"").unwrap();
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+            refused("cannot be opened by its owner with its mode");
+            std::fs::remove_file(&lock).unwrap();
+        }
+        // The fix the message gives is the fix.
+        assert_eq!(store.forget(&sealed.id).unwrap(), forgotten(&[&sealed.id]));
+        assert_eq!(mode(&lock), 0o600);
     }
 
     #[test]
