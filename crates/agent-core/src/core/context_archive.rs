@@ -13,8 +13,20 @@
 //!
 //! Each segment contains its hidden, screened note and source indices in ONE
 //! atomic file. Notes are not searched or returned by message fetch. Eligible
-//! text is otherwise exact: no truncation, whitespace rewriting or summarizing.
+//! text is otherwise exact: no truncation, whitespace rewriting or summarizing
+//! (one marked exception: a reduced message, below).
 //! `fetch_with_provenance` reports indices into the original `seal` slice.
+//!
+//! A window over the limits of one segment is refused by `seal`, and sealed
+//! by [`ArchiveStore::seal_window`] as consecutive parts: it is halved until
+//! each part fits, each part is an ordinary segment, and the returned part
+//! list is what puts the window back together. Only a single message that is
+//! over a limit by itself is stored reduced, by as little as makes it fit:
+//! without the tool inputs that are too large, then without any tool input,
+//! then with long strings and block lists cut short. Each omission is marked
+//! in place with its size, and a reduced message carries `_archive_reduced`
+//! ([`REDUCED_KEY`]), which no source message can supply, so it is never read
+//! back as a complete one.
 //!
 //! The store keeps every segment: there is no cap on how many a project holds
 //! or on their total size, and no seal deletes, moves or replaces another
@@ -71,6 +83,7 @@ use crate::core::stream_types::SharedMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{self, Write};
 #[cfg(unix)]
@@ -97,6 +110,14 @@ pub const MAX_MESSAGES: usize = 4096;
 pub const MAX_NOTE_BYTES: usize = 8192;
 pub const MAX_FETCH_MESSAGES: usize = 128;
 pub const MAX_SEARCH_RESULTS: usize = 32;
+/// Key of a stored message that says it is reduced: [`ArchiveStore::seal_window`]
+/// left something out of it, and marked each omission in place. Only the
+/// store sets it; a message without it is exactly what the projection gives.
+pub const REDUCED_KEY: &str = "_archive_reduced";
+/// The most a reduced message keeps of one string that is cut short...
+const REDUCED_TEXT_BYTES: usize = 4096;
+/// ...and of its content blocks.
+const REDUCED_BLOCKS: usize = 256;
 /// Longest an operation waits for earlier operations on the same archive in
 /// this process before failing closed as busy.
 pub const LOCK_WAIT: Duration = Duration::from_secs(30);
@@ -122,6 +143,32 @@ pub struct ArchiveRef {
     /// Eligible messages, not the length of the source slice.
     pub message_count: usize,
     pub source_message_count: usize,
+}
+
+/// One of the segments a window was sealed as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivePart {
+    pub archive: ArchiveRef,
+    /// Index in the window of the first source message this part covers; it
+    /// covers `archive.source_message_count` messages from there, and the
+    /// `source_index` of its messages counts from there too.
+    pub first_source_index: usize,
+    /// Source messages in this part stored with an over-limit payload omitted
+    /// (0 or 1): the messages that carry [`REDUCED_KEY`].
+    pub reduced_messages: usize,
+}
+
+/// What [`ArchiveStore::seal_window`] stored. The segments record nothing
+/// about each other: this list is what puts the window back together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedWindow {
+    /// In source order, contiguous, covering the whole window. Never empty.
+    pub parts: Vec<ArchivePart>,
+    /// The window's screened note, as stored with the last part: the earlier
+    /// note if that part had been sealed before. When the last part is the
+    /// same segment as an earlier part of this window, which was stored
+    /// without a note, it is the screened note of this call.
+    pub note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,7 +217,53 @@ pub fn project_archive(
         messages,
         note,
         redactor,
+        Reduce::None,
     )
+}
+
+/// What is left out of a message that is over a segment budget by itself: it
+/// cannot be stored whole, and being alone it cannot be cut out of its part.
+/// A step is tried only when the one before it still does not fit, and
+/// whatever a step does not name stays exact. Each omission is replaced by a
+/// marker that says how large it was, and the stored message carries
+/// [`REDUCED_KEY`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reduce {
+    /// Nothing: the exact projection, the only one `seal` and
+    /// [`project_archive`] ever make.
+    None,
+    /// Each tool input that is over a budget by itself.
+    LargeInputs,
+    /// Every tool input.
+    Inputs,
+    /// Every tool input; of each string, what follows its first
+    /// [`REDUCED_TEXT_BYTES`]; the content blocks that follow the first
+    /// [`REDUCED_BLOCKS`] kept; and of a tool result's block list, what
+    /// follows its first text. Always fits.
+    Text,
+}
+
+impl Reduce {
+    fn next(self) -> Option<Self> {
+        match self {
+            Reduce::None => Some(Reduce::LargeInputs),
+            Reduce::LargeInputs => Some(Reduce::Inputs),
+            Reduce::Inputs => Some(Reduce::Text),
+            Reduce::Text => None,
+        }
+    }
+
+    /// Whether the preflight passes over a tool input instead of walking it.
+    /// Under `LargeInputs` the projector also leaves out an input whose
+    /// screened form is over a budget; the preflight has then charged for it,
+    /// which errs on the strict side.
+    fn skips(self, input: &Value) -> bool {
+        match self {
+            Reduce::None => false,
+            Reduce::LargeInputs => InputBudget::alone(input).is_err(),
+            Reduce::Inputs | Reduce::Text => true,
+        }
+    }
 }
 
 fn project_hashed(
@@ -178,15 +271,33 @@ fn project_hashed(
     messages: &[SharedMessage],
     note: &str,
     redactor: Option<Arc<ArchiveRedactor>>,
+    reduce: Reduce,
 ) -> io::Result<ArchiveProjection> {
-    if messages.len() > MAX_MESSAGES || note.len() > MAX_NOTE_BYTES {
+    debug_assert!(reduce == Reduce::None || messages.len() <= 1);
+    // Sealing fewer messages does not make a note smaller: not `over`.
+    if note.len() > MAX_NOTE_BYTES {
         return Err(invalid("archive message/note budget exceeded"));
     }
-    let mut budget = InputBudget { bytes: 0, nodes: 0 };
-    for message in messages {
-        budget.message(message, redactor.is_some())?;
+    if messages.len() > MAX_MESSAGES {
+        return Err(over("archive message/note budget exceeded"));
     }
-    let projector = Projector { redactor };
+    // A `Text` projection is bounded by what it keeps, whatever the source
+    // holds, and walks no tool input.
+    if reduce != Reduce::Text {
+        let mut budget = InputBudget {
+            bytes: 0,
+            nodes: 0,
+            reduce,
+        };
+        for message in messages {
+            budget.message(message, redactor.is_some())?;
+        }
+    }
+    let projector = Projector {
+        redactor,
+        reduce,
+        omitted: Cell::new(0),
+    };
     let mut eligible = Vec::new();
     for (source_index, message) in messages.iter().enumerate() {
         if let Some((message, block_indices)) = projector.project(message)? {
@@ -213,6 +324,9 @@ fn project_hashed(
 
 struct Projector {
     redactor: Option<Arc<ArchiveRedactor>>,
+    reduce: Reduce,
+    /// Omissions made so far in the message being projected.
+    omitted: Cell<usize>,
 }
 
 /// No Debug implementation: do not accidentally log redactor state or content.
@@ -473,7 +587,95 @@ impl ArchiveStore {
         messages: &[SharedMessage],
         note: &str,
     ) -> io::Result<(ArchiveRef, String)> {
-        let projection = project_hashed(&self.logical, messages, note, self.redactor.clone())?;
+        let (reference, note, _) = self.seal_one(messages, note, Reduce::None)?;
+        Ok((reference, note))
+    }
+
+    /// Seal one window as one or more segments ("parts"). No per-segment
+    /// budget fails it; what still can is what fails any seal (I/O, a busy
+    /// lock, an abort, a part that was forgotten) and a note over its limit,
+    /// which is refused before anything is written.
+    ///
+    /// A window within the budgets is one part: the same segment, id and note
+    /// as [`seal_with_note`](Self::seal_with_note). A larger one is halved
+    /// until each part fits. Every part is an ordinary segment; together they
+    /// hold every message of the window exactly once, in order. Only a
+    /// message that is over a budget by itself is stored reduced, and is then
+    /// a part of its own.
+    ///
+    /// Parts are sealed first to last, each in its own locked operation, and
+    /// the note goes to the last one. After an error the parts already sealed
+    /// stay (callers keep the source history, as for `seal`); a retry finds
+    /// them by id, writes only what is missing and returns the same list.
+    pub fn seal_window(&self, messages: &[SharedMessage], note: &str) -> io::Result<SealedWindow> {
+        // Sealing fewer messages does not make a note smaller: one over its
+        // limit is refused here, before any part exists.
+        let redactor = self.redactor.clone();
+        let screened = project_hashed(&self.logical, &[], note, redactor, Reduce::None)?.note;
+        let mut window = SealedWindow {
+            parts: Vec::new(),
+            note: String::new(),
+        };
+        self.seal_range(messages, 0..messages.len(), note, &mut window)?;
+        // Parts with identical content are one segment. When the last part is
+        // also an earlier one, that segment was stored for the earlier part,
+        // without the note; the window's note is still this one.
+        if let Some((last, earlier)) = window.parts.split_last() {
+            if earlier.iter().any(|part| part.archive.id == last.archive.id) {
+                window.note = screened;
+            }
+        }
+        Ok(window)
+    }
+
+    /// Seal `messages[range]` as one part if it fits, otherwise as the parts
+    /// of its two halves, the left one first. `note` is the window's note for
+    /// the range that ends the window and empty for every other.
+    fn seal_range(
+        &self,
+        messages: &[SharedMessage],
+        range: std::ops::Range<usize>,
+        note: &str,
+        window: &mut SealedWindow,
+    ) -> io::Result<()> {
+        let mut reduce = Reduce::None;
+        let refused = loop {
+            match self.seal_one(&messages[range.clone()], note, reduce) {
+                Ok((archive, stored, reduced_messages)) => {
+                    window.parts.push(ArchivePart {
+                        archive,
+                        first_source_index: range.start,
+                        reduced_messages,
+                    });
+                    window.note = stored;
+                    return Ok(());
+                }
+                Err(error) if !over_budget(&error) => return Err(error),
+                // Reduced only when halving cannot help: one message, alone.
+                Err(error) => match reduce.next().filter(|_| range.len() == 1) {
+                    Some(next) => reduce = next,
+                    None => break error,
+                },
+            }
+        };
+        if range.len() < 2 {
+            return Err(refused);
+        }
+        let middle = cut(messages, &range);
+        self.seal_range(messages, range.start..middle, "", window)?;
+        self.seal_range(messages, middle..range.end, note, window)
+    }
+
+    /// [`seal_with_note`](Self::seal_with_note) of the projection `reduce`
+    /// selects. Also returns how many of its messages are stored reduced.
+    fn seal_one(
+        &self,
+        messages: &[SharedMessage],
+        note: &str,
+        reduce: Reduce,
+    ) -> io::Result<(ArchiveRef, String, usize)> {
+        let redactor = self.redactor.clone();
+        let projection = project_hashed(&self.logical, messages, note, redactor, reduce)?;
         let ArchiveProjection {
             digest,
             source_message_count,
@@ -481,6 +683,10 @@ impl ArchiveStore {
             note,
             ..
         } = projection;
+        let reduced = eligible
+            .iter()
+            .filter(|archived| archived.message.get(REDUCED_KEY).is_some())
+            .count();
         // Same projection, same id, same file name.
         let id = digest[..32].to_owned();
         let _lock = self.exclusive()?;
@@ -509,7 +715,7 @@ impl ArchiveStore {
             };
             // A previous call may have failed AFTER rename but BEFORE fsync.
             shelf.as_ref().unwrap_or(&self.fs).sync()?;
-            return Ok((record.reference()?, stored.clone()));
+            return Ok((record.reference()?, stored.clone(), reduced));
         }
         let record = Record {
             version: 1,
@@ -527,7 +733,7 @@ impl ArchiveStore {
         // Created new: a file that is already there is never renamed over.
         self.writable_shelf(&shelves)?
             .publish(&archive_name(&record.id), &bytes, true)?;
-        Ok((record.reference()?, note))
+        Ok((record.reference()?, note, reduced))
     }
 
     pub fn fetch(&self, id: &str, start: usize, limit: usize) -> io::Result<Vec<SharedMessage>> {
@@ -945,8 +1151,10 @@ impl Projector {
         };
         // All text is screened, including the ordinary model-visible class.
         let text = redactor(text);
-        if text.len() > MAX_SEGMENT_BYTES {
-            return Err(invalid("redactor output exceeds archive budget"));
+        // A `Text` reduction bounds what it stores after screening: a message
+        // string by cutting it (`text`), the note by its own limit.
+        if text.len() > MAX_SEGMENT_BYTES && self.reduce != Reduce::Text {
+            return Err(over("redactor output exceeds archive budget"));
         }
         match gate_for_model(class, &text, false, Some(&|s| s.to_owned())) {
             ModelVisibility::Visible(text) => Ok(text),
@@ -954,15 +1162,50 @@ impl Projector {
         }
     }
 
+    /// A message string as stored: screened whole and then, in a `Text`
+    /// reduction, cut to its first [`REDUCED_TEXT_BYTES`]. The cut comes last
+    /// so that the redactor never sees half of something it would remove.
+    fn text(&self, text: &str, class: DisclosureClass) -> io::Result<String> {
+        let text = self.screen(text, class)?;
+        if self.reduce != Reduce::Text || text.len() <= REDUCED_TEXT_BYTES {
+            return Ok(text);
+        }
+        let kept = prefix(&text, REDUCED_TEXT_BYTES);
+        let omitted = self.omission(format_args!("{} bytes", text.len() - kept.len()));
+        Ok(format!("{kept}\n{omitted}"))
+    }
+
+    /// What stands in place of something a reduction left out: what it was
+    /// and how large.
+    fn omission(&self, what: std::fmt::Arguments<'_>) -> String {
+        self.omitted.set(self.omitted.get() + 1);
+        format!("[archive: {what} omitted, over the per-archive limit]")
+    }
+
+    /// The stored form of a message. One that a reduction left something out
+    /// of says so under [`REDUCED_KEY`], which a source message cannot
+    /// supply: only its role and content are ever taken. The markers inside
+    /// the content can be imitated by content; this key cannot.
+    fn stored(&self, role: &str, content: Value) -> Value {
+        let mut message = json!({"role": role, "content": content});
+        let omitted = self.omitted.replace(0);
+        if omitted > 0 {
+            message[REDUCED_KEY] = json!(format!(
+                "this message alone is over the per-archive limit; it is stored with \
+                 {omitted} omission(s), each marked in place"
+            ));
+        }
+        message
+    }
+
     fn project(&self, message: &Value) -> io::Result<Option<(Value, Vec<usize>)>> {
         let Some((class, role, content)) = projection_content(message) else {
             return Ok(None);
         };
+        self.omitted.set(0);
         if let Some(text) = content.as_str() {
-            return Ok(Some((
-                json!({"role": role, "content": self.screen(text, class)?}),
-                Vec::new(),
-            )));
+            let content = json!(self.text(text, class)?);
+            return Ok(Some((self.stored(role, content), Vec::new())));
         }
         let Some(blocks) = content.as_array() else {
             return Ok(None);
@@ -970,6 +1213,13 @@ impl Projector {
         let mut output = Vec::new();
         let mut indices = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
+            if self.reduce == Reduce::Text && output.len() == REDUCED_BLOCKS {
+                // This block and all after it, under the index of this one.
+                let rest = self.omission(format_args!("{} blocks", blocks.len() - index));
+                output.push(json!({"type":"text", "text":rest}));
+                indices.push(index);
+                break;
+            }
             let Some(mut block_class) = eligible_class(block) else {
                 continue;
             };
@@ -981,7 +1231,7 @@ impl Projector {
                     .get("text")
                     .and_then(Value::as_str)
                     .map(|text| {
-                        self.screen(text, block_class)
+                        self.text(text, block_class)
                             .map(|text| json!({"type":"text", "text":text}))
                     })
                     .transpose()?,
@@ -1030,23 +1280,39 @@ impl Projector {
         if output.is_empty() {
             Ok(None)
         } else {
-            Ok(Some((json!({"role":role,"content":output}), indices)))
+            Ok(Some((self.stored(role, json!(output)), indices)))
         }
     }
 
+    /// A tool input as stored: exact, or, where a reduction leaves it out, a
+    /// marker with its size as JSON.
     fn tool_input(&self, input: Option<&Value>, class: DisclosureClass) -> io::Result<Value> {
+        let omit = |input: &Value| {
+            let bytes = json_len(input);
+            let marker = self.omission(format_args!("tool input of {bytes} bytes"));
+            Ok(json!({"_archive_omitted": marker}))
+        };
+        match (self.reduce, input) {
+            (Reduce::Inputs | Reduce::Text, Some(input)) => omit(input),
+            (Reduce::LargeInputs, Some(value)) => match self.exact_input(input, class) {
+                Err(error) if over_budget(&error) => omit(value),
+                exact => exact,
+            },
+            _ => self.exact_input(input, class),
+        }
+    }
+
+    fn exact_input(&self, input: Option<&Value>, class: DisclosureClass) -> io::Result<Value> {
         if let Some(input) = input {
             // The full preflight already enforced aggregate limits. Reuse its
             // guarded admission predicate so recursion and withholding cannot
             // drift. JSON escaping expands at most sixfold (node allowance
             // covers punctuation/numbers); redactors may shrink that scratch
             // string below the unchanged final output limit.
-            let mut budget = InputBudget { bytes: 0, nodes: 0 };
-            if let Some(bytes) = budget.input(input, 3)? {
-                budget.charge(bytes)?;
+            if let Some(bytes) = InputBudget::alone(input)? {
                 let limit = bytes
                     .checked_mul(6)
-                    .ok_or_else(|| invalid("archive input byte budget exceeded"))?;
+                    .ok_or_else(|| over("archive input byte budget exceeded"))?;
                 let encoded = bounded_json(input, limit)?;
                 let text =
                     self.screen(std::str::from_utf8(&encoded).map_err(|_| corrupt())?, class)?;
@@ -1059,15 +1325,26 @@ impl Projector {
 
     fn tool_result(&self, content: &Value, class: DisclosureClass) -> io::Result<Value> {
         if let Some(text) = content.as_str() {
-            return Ok(json!(self.screen(text, class)?));
+            return Ok(json!(self.text(text, class)?));
         }
         let mut output = Vec::new();
         if let Some(blocks) = content.as_array() {
-            for block in blocks {
+            for (index, block) in blocks.iter().enumerate() {
                 if let Some(class) = eligible_class(block) {
                     if block["type"] == "text" {
                         if let Some(text) = block["text"].as_str() {
-                            output.push(json!({"type":"text", "text":self.screen(text, class)?}));
+                            let text = self.text(text, class)?;
+                            if self.reduce == Reduce::Text {
+                                // One string: the first text, then how many
+                                // blocks followed it.
+                                let rest = blocks.len() - index - 1;
+                                if rest == 0 {
+                                    return Ok(json!(text));
+                                }
+                                let rest = self.omission(format_args!("{rest} blocks"));
+                                return Ok(json!(format!("{text}\n{rest}")));
+                            }
+                            output.push(json!({"type":"text", "text":text}));
                         }
                     }
                 }
@@ -1254,12 +1531,13 @@ fn credential_like(text: &str) -> bool {
 struct InputBudget {
     bytes: usize,
     nodes: usize,
+    reduce: Reduce,
 }
 impl InputBudget {
     fn node(&mut self, depth: usize) -> io::Result<()> {
         self.nodes += 1;
         if depth > 32 || self.nodes > 65536 {
-            return Err(invalid("archive input structural budget exceeded"));
+            return Err(over("archive input structural budget exceeded"));
         }
         Ok(())
     }
@@ -1267,9 +1545,24 @@ impl InputBudget {
     fn charge(&mut self, bytes: usize) -> io::Result<()> {
         self.bytes = self.bytes.saturating_add(bytes);
         if self.bytes > MAX_INPUT_BYTES {
-            return Err(invalid("archive input byte budget exceeded"));
+            return Err(over("archive input byte budget exceeded"));
         }
         Ok(())
+    }
+
+    /// One tool input against a budget of its own: its cost when admitted
+    /// (`None`: withheld whole), an error when it is over a budget by itself.
+    fn alone(input: &Value) -> io::Result<Option<usize>> {
+        let mut budget = InputBudget {
+            bytes: 0,
+            nodes: 0,
+            reduce: Reduce::None,
+        };
+        let bytes = budget.input(input, 3)?;
+        if let Some(bytes) = bytes {
+            budget.charge(bytes)?;
+        }
+        Ok(bytes)
     }
 
     // Only selected fields are charged; ignored metadata is opaque. Include the
@@ -1336,7 +1629,8 @@ impl InputBudget {
                         self.field("id", id, 3)?;
                         self.field("name", name, 3)?;
                         if name != "context_checkpoint" && redactor {
-                            if let Some(input) = block.get("input") {
+                            let input = block.get("input");
+                            if let Some(input) = input.filter(|input| !self.reduce.skips(input)) {
                                 if let Some(bytes) = self.input(input, 3)? {
                                     self.charge("input".len().saturating_add(bytes))?;
                                 }
@@ -1451,7 +1745,7 @@ fn bounded_json<T: Serialize + ?Sized>(value: &T, limit: usize) -> io::Result<Ve
     impl Write for Sink {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if bytes.len() > self.limit - self.bytes.len() {
-                return Err(invalid("archive serialized byte budget exceeded"));
+                return Err(over("archive serialized byte budget exceeded"));
             }
             self.bytes.extend_from_slice(bytes);
             Ok(bytes.len())
@@ -1466,6 +1760,38 @@ fn bounded_json<T: Serialize + ?Sized>(value: &T, limit: usize) -> io::Result<Ve
     };
     serde_json::to_writer(&mut sink, value).map_err(json_error)?;
     Ok(sink.bytes)
+}
+/// The length of `value` as JSON, without building it.
+fn json_len(value: &Value) -> usize {
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // Cannot fail: the sink takes everything and a `Value` always serializes.
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
+/// Where a range that does not fit one segment is cut: its midpoint, moved
+/// forward past tool results so that a call and the result that follows it
+/// stay in one part where they can. A courtesy to readers, not a rule: the
+/// store pairs nothing.
+fn cut(messages: &[SharedMessage], range: &std::ops::Range<usize>) -> usize {
+    let is_result = |message: &Value| {
+        let blocks = message["content"].as_array();
+        message["role"] == "user"
+            && blocks.is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
+    };
+    let middle = range.start + range.len() / 2;
+    (middle..range.end)
+        .find(|&index| !is_result(&messages[index]))
+        .unwrap_or(middle)
 }
 fn find_record(records: Vec<(usize, Record)>, id: &str) -> io::Result<Record> {
     records
@@ -1543,7 +1869,24 @@ fn canceled() -> io::Error {
     )
 }
 fn json_error(_: serde_json::Error) -> io::Error {
-    invalid("archive JSON serialization failed or exceeded budget")
+    over("archive JSON serialization failed or exceeded budget")
+}
+/// The payload of an error that says one segment's budget was exceeded: the
+/// only kind of error that sealing fewer messages, or less of one message,
+/// can cure. It prints as its message.
+#[derive(Debug)]
+struct OverBudget(&'static str);
+impl std::fmt::Display for OverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for OverBudget {}
+fn over(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, OverBudget(message))
+}
+fn over_budget(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<OverBudget>())
 }
 
 // ConfinedDir has no public directory fsync API. Keep a private directory fd
@@ -2304,7 +2647,8 @@ mod tests {
         messages: &[SharedMessage],
         note: &str,
     ) -> ArchiveRef {
-        let projection = project_hashed(&store.logical, messages, note, None).unwrap();
+        let projection =
+            project_hashed(&store.logical, messages, note, None, Reduce::None).unwrap();
         let record = Record {
             version: 1,
             scope: store.scope.clone(),
@@ -3572,6 +3916,500 @@ mod tests {
         // A forgotten segment still has a file: its tombstone.
         store.forget(&reference.id).unwrap();
         assert_eq!(locate("synthetic-project", &reference.id).unwrap(), Some(file));
+    }
+
+    /// What a window holds however it is cut: the projection of each source
+    /// message by itself, under its index in the window.
+    fn exact(store: &ArchiveStore, messages: &[SharedMessage]) -> Vec<ArchivedMessage> {
+        let mut expected = Vec::new();
+        for (index, message) in messages.iter().enumerate() {
+            let one = std::slice::from_ref(message);
+            let redactor = store.redactor.clone();
+            let alone = project_hashed(&store.logical, one, "", redactor, Reduce::None).unwrap();
+            expected.extend(alone.messages.into_iter().map(|mut archived| {
+                archived.source_index = index;
+                archived
+            }));
+        }
+        expected
+    }
+    /// A sealed window of `len` messages read back and put together again
+    /// from its part list alone: the parts are contiguous and cover it, and
+    /// each part's messages follow under their index in the window.
+    fn reassemble(
+        store: &ArchiveStore,
+        window: &SealedWindow,
+        len: usize,
+    ) -> Vec<ArchivedMessage> {
+        let mut messages = Vec::new();
+        let mut next = 0;
+        for part in &window.parts {
+            let ArchiveRef {
+                id,
+                message_count,
+                source_message_count,
+            } = &part.archive;
+            assert_eq!(part.first_source_index, next);
+            assert!(*source_message_count <= MAX_MESSAGES);
+            next += source_message_count;
+            let mut start = 0;
+            while start < *message_count {
+                let page = store
+                    .fetch_with_provenance(id, start, MAX_FETCH_MESSAGES)
+                    .unwrap();
+                assert!(!page.is_empty());
+                start += page.len();
+                messages.extend(page.into_iter().map(|mut archived| {
+                    assert!(archived.source_index < *source_message_count);
+                    archived.source_index += part.first_source_index;
+                    archived
+                }));
+            }
+            assert_eq!(start, *message_count);
+        }
+        assert_eq!(next, len, "the parts cover the window");
+        messages
+    }
+    /// `exact` for a window of plain text that is all eligible: each message
+    /// is its own projection.
+    fn assert_whole(read: &[ArchivedMessage], messages: &[SharedMessage]) {
+        assert_eq!(read.len(), messages.len());
+        for (index, archived) in read.iter().enumerate() {
+            assert_eq!(archived.source_index, index);
+            assert!(archived.message == messages[index], "message {index} differs");
+        }
+    }
+    fn lines(len: usize) -> Vec<SharedMessage> {
+        (0..len)
+            .map(|index| msg("user", json!(format!("line {index} of {len}"))))
+            .collect()
+    }
+    /// A tool input nested deeper than one segment admits.
+    fn deep_input() -> Value {
+        let mut deep = json!("leaf");
+        for _ in 0..40 {
+            deep = json!([deep]);
+        }
+        deep
+    }
+    const OVER_LIMIT: &str = "over the per-archive limit]";
+
+    #[test]
+    fn window_within_caps_is_one_part_identical_to_seal() {
+        let messages = vec![
+            msg("system", json!("not eligible")),
+            msg("user", json!("a question")),
+            msg("assistant", json!([{"type":"text","text":"an answer"}])),
+        ];
+        let (strict_tmp, strict) = setup();
+        let (tmp, store) = setup();
+        let (reference, note) = strict.seal_with_note(&messages, "the note").unwrap();
+        let window = store.seal_window(&messages, "the note").unwrap();
+        let part = ArchivePart {
+            archive: reference.clone(),
+            first_source_index: 0,
+            reduced_messages: 0,
+        };
+        let expected = SealedWindow {
+            parts: vec![part],
+            note,
+        };
+        assert_eq!(window, expected);
+        assert_eq!(
+            std::fs::read(only_archive_file(&directory(&tmp, &store))).unwrap(),
+            std::fs::read(only_archive_file(&directory(&strict_tmp, &strict))).unwrap()
+        );
+        // In one store the two calls find each other's segment.
+        assert_eq!(strict.seal_window(&messages, "another note").unwrap(), window);
+        assert_eq!(
+            store.seal_with_note(&messages, "another note").unwrap(),
+            (reference, "the note".to_owned())
+        );
+        // An empty window is one empty part, as it is one empty segment.
+        let empty = store.seal_window(&[], "").unwrap();
+        assert_eq!(empty.parts.len(), 1);
+        assert_eq!(empty.parts[0].archive, store.seal(&[], "").unwrap());
+    }
+
+    #[test]
+    fn window_over_message_cap_splits() {
+        let (tmp, store) = setup();
+        for (len, parts) in [(MAX_MESSAGES + 1, 2), (10_000, 4)] {
+            // Every seventh message is not eligible: source indices have gaps.
+            let messages: Vec<_> = (0..len)
+                .map(|index| {
+                    let role = ["user", "assistant", "user", "system", "assistant"][index % 7 % 5];
+                    msg(role, json!(format!("window of {len}, line {index}")))
+                })
+                .collect();
+            assert!(store.seal(&messages, "").is_err());
+            let window = store.seal_window(&messages, "").unwrap();
+            assert_eq!(window.parts.len(), parts);
+            assert!(window.parts.iter().all(|part| part.reduced_messages == 0));
+            let read = reassemble(&store, &window, len);
+            assert_eq!(read.len(), len - (len + 3) / 7);
+            assert!(read == exact(&store, &messages));
+        }
+        assert_eq!(shelf_files(&directory(&tmp, &store)).len(), 6);
+    }
+
+    #[test]
+    fn window_over_byte_cap_splits() {
+        let (_tmp, store) = setup();
+        // 17 MiB of eligible text, in messages far below any other cap.
+        let messages: Vec<_> = (0..34)
+            .map(|index| msg("user", json!(format!("{index:02} {}", "x".repeat(512 * 1024)))))
+            .collect();
+        let error = store.seal(&messages, "").unwrap_err();
+        assert!(error.to_string().contains("input byte budget"));
+        let window = store.seal_window(&messages, "").unwrap();
+        assert_eq!(window.parts.len(), 2);
+        assert_whole(&reassemble(&store, &window, messages.len()), &messages);
+    }
+
+    #[test]
+    fn window_over_node_cap_splits() {
+        let (_tmp, store) = setup();
+        let store = store.with_redactor(Arc::new(str::to_owned));
+        // 3,000 tool calls of 40 arguments: 48 visited nodes each, 144,000
+        // in all, where one segment admits 65,536.
+        let input: serde_json::Map<String, Value> = (0..40)
+            .map(|key| (format!("k{key:02}"), json!(key)))
+            .collect();
+        let messages: Vec<_> = (0..3000)
+            .map(|index| {
+                let id = format!("call-{index}");
+                msg(
+                    "assistant",
+                    json!([{"type":"tool_use","id":id,"name":"plot","input":input}]),
+                )
+            })
+            .collect();
+        let error = store.seal(&messages, "").unwrap_err();
+        assert!(error.to_string().contains("structural budget"));
+        let window = store.seal_window(&messages, "").unwrap();
+        assert_eq!(window.parts.len(), 4);
+        assert!(window.parts.iter().all(|part| part.reduced_messages == 0));
+        let read = reassemble(&store, &window, messages.len());
+        assert_eq!(read[2999].message, messages[2999]);
+        assert!(read == exact(&store, &messages));
+    }
+
+    #[test]
+    fn serialized_overflow_after_projection_splits() {
+        let (_tmp, store) = setup();
+        // 3 MiB of control characters passes the input budget, and is 18 MiB
+        // once each is written as "\u0001".
+        let messages: Vec<_> = (0..4)
+            .map(|index| msg("user", json!(format!("{index}{}", "\u{1}".repeat(768 * 1024)))))
+            .collect();
+        let error = store.seal(&messages, "").unwrap_err();
+        assert!(error.to_string().contains("serialization failed or exceeded budget"));
+        let window = store.seal_window(&messages, "").unwrap();
+        assert_eq!(window.parts.len(), 2);
+        assert_whole(&reassemble(&store, &window, messages.len()), &messages);
+    }
+
+    #[test]
+    fn single_deep_input_is_withheld_not_failed() {
+        let (_tmp, store) = setup();
+        let store = store.with_redactor(Arc::new(str::to_owned));
+        let messages = vec![
+            msg("user", json!("please run both")),
+            msg(
+                "assistant",
+                json!([
+                    {"type":"text","text":"running both"},
+                    {"type":"tool_use","id":"t1","name":"nest","input":deep_input()},
+                    {"type":"tool_use","id":"t2","name":"read","input":{"path":"src/lib.rs"}}
+                ]),
+            ),
+            msg(
+                "user",
+                json!([
+                    {"type":"tool_result","tool_use_id":"t1","content":"nested"},
+                    {"type":"tool_result","tool_use_id":"t2","content":"fn main() {}"}
+                ]),
+            ),
+            msg("assistant", json!("both ran")),
+        ];
+        assert!(store.seal(&messages, "").is_err());
+        let window = store.seal_window(&messages, "").unwrap();
+        // The message that does not fit by itself is a part of its own, and
+        // the only one that is not exact.
+        let reduced: Vec<_> = window
+            .parts
+            .iter()
+            .map(|part| (part.first_source_index, part.reduced_messages))
+            .collect();
+        assert_eq!(reduced, [(0, 0), (1, 1), (2, 0), (3, 0)]);
+        let read = reassemble(&store, &window, messages.len());
+        for index in [0, 2, 3] {
+            assert_eq!(read[index].source_index, index);
+            assert_eq!(read[index].message, messages[index]);
+        }
+        // Of that message only the one input that is too deep is left out:
+        // its text and the other call's input are exact.
+        let bytes = serde_json::to_string(&deep_input()).unwrap().len();
+        let omitted = format!("[archive: tool input of {bytes} bytes omitted, {OVER_LIMIT}");
+        let expected = json!({
+            "role":"assistant",
+            "_archive_reduced":"this message alone is over the per-archive limit; it is stored \
+                with 1 omission(s), each marked in place",
+            "content":[
+                {"type":"text","text":"running both"},
+                {"type":"tool_use","id":"t1","name":"nest","input":{"_archive_omitted":omitted}},
+                {"type":"tool_use","id":"t2","name":"read","input":{"path":"src/lib.rs"}}
+            ]
+        });
+        assert_eq!(*read[1].message, expected);
+        assert_eq!(read[1].block_indices, [0, 1, 2]);
+        // However it is read back it says so first: the key sorts before
+        // `content` and `role`.
+        let found = store.search("running both", 1).unwrap();
+        assert!(found[0].snippet.starts_with("{\"_archive_reduced\":\"this message alone"));
+    }
+
+    #[test]
+    fn inputs_too_large_together_are_all_omitted_and_text_stays_exact() {
+        let (_tmp, store) = setup();
+        let store = store.with_redactor(Arc::new(str::to_owned));
+        // 30,001 visited nodes each: every input fits by itself, the three
+        // together do not.
+        let wide = json!(vec![0; 30_000]);
+        let long = "exact words ".repeat(1000);
+        let message = msg(
+            "assistant",
+            json!([
+                {"type":"text","text":long},
+                {"type":"tool_use","id":"t1","name":"plot","input":wide},
+                {"type":"tool_use","id":"t2","name":"plot","input":wide},
+                {"type":"tool_use","id":"t3","name":"plot","input":wide}
+            ]),
+        );
+        let window = store.seal_window(&[message], "").unwrap();
+        assert_eq!(window.parts.len(), 1);
+        assert_eq!(window.parts[0].reduced_messages, 1);
+        let stored = &store.fetch(&window.parts[0].archive.id, 0, 1).unwrap()[0];
+        assert_eq!(stored["content"][0]["text"], long);
+        let bytes = serde_json::to_string(&wide).unwrap().len();
+        let omitted = format!("[archive: tool input of {bytes} bytes omitted, {OVER_LIMIT}");
+        for block in 1..=3 {
+            assert_eq!(stored["content"][block]["input"], json!({"_archive_omitted":omitted}));
+        }
+        assert!(stored[REDUCED_KEY].as_str().unwrap().contains("with 3 omission(s)"));
+    }
+
+    #[test]
+    fn single_huge_message_is_reduced_with_markers() {
+        let (_tmp, store) = setup();
+        // One byte over the input cap, with a two-byte character across the
+        // 4,096th byte.
+        let huge = format!("a{}", "é".repeat(MAX_INPUT_BYTES / 2));
+        assert_eq!(huge.len(), MAX_INPUT_BYTES + 1);
+        let messages = vec![
+            msg("user", json!("before")),
+            msg("user", json!(huge)),
+            msg("assistant", json!("after")),
+        ];
+        assert!(store.seal(&messages, "").is_err());
+        let window = store.seal_window(&messages, "").unwrap();
+        let reduced: Vec<_> = window.parts.iter().map(|part| part.reduced_messages).collect();
+        assert_eq!(reduced, [0, 1, 0]);
+        let read = reassemble(&store, &window, messages.len());
+        assert_eq!(read[0].message, messages[0]);
+        assert_eq!(read[2].message, messages[2]);
+        let kept = &huge[..4095];
+        let omitted = huge.len() - 4095;
+        let stored = read[1].message["content"].as_str().unwrap();
+        assert_eq!(stored, format!("{kept}\n[archive: {omitted} bytes omitted, {OVER_LIMIT}"));
+        assert!(read[1].message[REDUCED_KEY].as_str().unwrap().contains("with 1 omission(s)"));
+    }
+
+    #[test]
+    fn reduced_wide_message_keeps_its_first_blocks_and_counts_the_rest() {
+        let (_tmp, store) = setup();
+        let store = store.with_redactor(Arc::new(str::to_owned));
+        // 70,000 small blocks are more nodes than one segment admits, with
+        // or without tool inputs.
+        let mut blocks = vec![json!({"type":"tool_result","tool_use_id":"t1","content":[
+            {"type":"text","text":"x".repeat(5000)},
+            {"type":"text","text":"second"},
+            {"type":"text","text":"third"}
+        ]})];
+        let small = |index: usize| json!({"type":"text","text":format!("block {index}")});
+        blocks.extend((1..70_000).map(small));
+        let window = store.seal_window(&[msg("user", json!(blocks))], "").unwrap();
+        assert_eq!(window.parts.len(), 1);
+        assert_eq!(window.parts[0].reduced_messages, 1);
+        let id = &window.parts[0].archive.id;
+        let fetched = &store.fetch_with_provenance(id, 0, 1).unwrap()[0];
+        let content = fetched.message["content"].as_array().unwrap();
+        assert_eq!(content.len(), 257);
+        // A tool result's block list becomes its first text, cut like any
+        // string, and says how many blocks followed.
+        let short = format!("[archive: 904 bytes omitted, {OVER_LIMIT}");
+        let followed = format!("[archive: 2 blocks omitted, {OVER_LIMIT}");
+        let result = format!("{}\n{short}\n{followed}", "x".repeat(REDUCED_TEXT_BYTES));
+        assert_eq!(content[0]["content"], result);
+        assert_eq!(content[1], json!({"type":"text","text":"block 1"}));
+        assert_eq!(content[255], json!({"type":"text","text":"block 255"}));
+        let rest = format!("[archive: 69744 blocks omitted, {OVER_LIMIT}");
+        assert_eq!(content[256], json!({"type":"text","text":rest}));
+        assert_eq!(fetched.block_indices, (0..=256).collect::<Vec<_>>());
+        assert!(fetched.message[REDUCED_KEY].as_str().unwrap().contains("with 3 omission(s)"));
+    }
+
+    #[test]
+    fn only_the_store_marks_a_message_as_reduced() {
+        let (_tmp, store) = setup();
+        let store = store.with_redactor(Arc::new(str::to_owned));
+        // A source message that imitates every marker of a reduced one.
+        let marker = format!("[archive: 9 bytes omitted, {OVER_LIMIT}");
+        let source = Arc::new(json!({"role":"assistant","_archive_reduced":"imitation","content":[
+            {"type":"text","text":format!("cut short\n{marker}")},
+            {"type":"tool_use","id":"t1","name":"read","input":{"_archive_omitted":marker}}
+        ]}));
+        let window = store.seal_window(std::slice::from_ref(&source), "").unwrap();
+        assert_eq!(window.parts[0].reduced_messages, 0);
+        let stored = &store.fetch(&window.parts[0].archive.id, 0, 1).unwrap()[0];
+        // Its content is kept as it is; the key is not.
+        assert_eq!(stored["content"], source["content"]);
+        assert_eq!(stored.as_object().unwrap().len(), 2, "role and content");
+    }
+
+    #[test]
+    fn retry_returns_the_same_parts_and_writes_nothing() {
+        let (tmp, store) = setup();
+        let store = store.with_redactor(Arc::new(str::to_owned));
+        let dir = directory(&tmp, &store);
+        // A window that is split, with one message that is reduced.
+        let mut messages = lines(MAX_MESSAGES + 10);
+        let call = json!([{"type":"tool_use","id":"t1","name":"nest","input":deep_input()}]);
+        messages[7] = msg("assistant", call);
+        let first = store.seal_window(&messages, "note").unwrap();
+        assert!(first.parts.len() > 2);
+        let reduced: usize = first.parts.iter().map(|part| part.reduced_messages).sum();
+        assert_eq!(reduced, 1);
+        let before = snapshot(&dir);
+        assert_eq!(before.len(), first.parts.len() + 1, "one file a part, and the lock");
+        assert_eq!(store.seal_window(&messages, "note").unwrap(), first);
+        // A changed note changes nothing either: the first one is returned.
+        assert_eq!(store.seal_window(&messages, "another note").unwrap(), first);
+        assert_eq!(snapshot(&dir), before);
+    }
+
+    #[test]
+    fn partial_failure_then_retry() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let messages = lines(MAX_MESSAGES + 2);
+        let (left, right) = messages.split_at(messages.len() / 2);
+        let id = |part: &[SharedMessage]| {
+            let projection = project_hashed(&store.logical, part, "", None, Reduce::None);
+            projection.unwrap().digest[..32].to_owned()
+        };
+        // Something that is not a file sits where the second part belongs.
+        let shelf = dir.join("s000001");
+        std::fs::create_dir(&shelf).unwrap();
+        let obstacle = shelf.join(archive_name(&id(right)));
+        std::fs::create_dir(&obstacle).unwrap();
+        let error = store.seal_window(&messages, "note").unwrap_err();
+        assert!(!over_budget(&error));
+        // The first part is on disk, an ordinary segment.
+        let first = shelf.join(archive_name(&id(left)));
+        let bytes = std::fs::read(&first).unwrap();
+        assert_eq!(store.fetch(&id(left), 0, 1).unwrap(), messages[..1]);
+        std::fs::remove_dir(&obstacle).unwrap();
+        let window = store.seal_window(&messages, "note").unwrap();
+        let ids: Vec<_> = window.parts.iter().map(|part| part.archive.id.clone()).collect();
+        assert_eq!(ids, [id(left), id(right)]);
+        assert_eq!(std::fs::read(&first).unwrap(), bytes);
+        assert_eq!(window.note, "note");
+        assert!(reassemble(&store, &window, messages.len()) == exact(&store, &messages));
+    }
+
+    #[test]
+    fn note_is_stored_on_the_last_part_only() {
+        let (_tmp, store) = setup();
+        let messages = lines(2 * MAX_MESSAGES + 1);
+        let window = store.seal_window(&messages, "the working note").unwrap();
+        assert_eq!(window.note, "the working note");
+        let notes: Vec<_> = window
+            .parts
+            .iter()
+            .map(|part| store.fetch_note(&part.archive.id).unwrap())
+            .collect();
+        assert_eq!(notes, ["", "", "the working note"]);
+        // Sealed again, the window has the note it was first sealed with.
+        let again = store.seal_window(&messages, "a later note").unwrap();
+        assert_eq!(again.note, "the working note");
+    }
+
+    #[test]
+    fn identical_halves_share_one_id() {
+        let (tmp, store) = setup();
+        let messages = vec![msg("user", json!("again")); 2 * MAX_MESSAGES];
+        let window = store.seal_window(&messages, "the working note").unwrap();
+        assert_eq!(window.parts.len(), 2);
+        assert_eq!(window.parts[0].archive, window.parts[1].archive);
+        assert_eq!(window.parts[0].first_source_index, 0);
+        assert_eq!(window.parts[1].first_source_index, MAX_MESSAGES);
+        assert_eq!(shelf_files(&directory(&tmp, &store)).len(), 1);
+        assert!(reassemble(&store, &window, messages.len()) == exact(&store, &messages));
+        // The one segment was stored for the first part, which has no note.
+        // The window's note is not lost with it.
+        assert_eq!(store.fetch_note(&window.parts[1].archive.id).unwrap(), "");
+        assert_eq!(window.note, "the working note");
+    }
+
+    #[test]
+    fn oversized_note_is_not_treated_as_splittable() {
+        let (tmp, store) = setup();
+        let window = lines(MAX_MESSAGES + 1);
+        let note = "n".repeat(9 * 1024);
+        for messages in [&window[..1], &window[..]] {
+            let error = store.seal_window(messages, &note).unwrap_err();
+            assert_eq!(error.to_string(), "archive message/note budget exceeded");
+            assert!(!over_budget(&error));
+        }
+        // So is a note that only the redactor makes too long.
+        let tripling = ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-logical")
+            .unwrap()
+            .with_redactor(Arc::new(|text: &str| text.repeat(3)));
+        let error = tripling.seal_window(&window, &"n".repeat(4096)).unwrap_err();
+        assert_eq!(error.to_string(), "redacted note exceeds archive budget");
+        assert!(shelf_files(&directory(&tmp, &store)).is_empty());
+    }
+
+    #[test]
+    fn strict_seal_still_refuses() {
+        let (tmp, store) = setup();
+        let messages = lines(MAX_MESSAGES + 1);
+        for error in [
+            store.seal(&messages, "").unwrap_err(),
+            store.seal_with_note(&messages, "").unwrap_err(),
+            project_archive("synthetic-logical", &messages, "", None).err().unwrap(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), "archive message/note budget exceeded");
+            assert!(over_budget(&error));
+        }
+        assert!(shelf_files(&directory(&tmp, &store)).is_empty());
+        assert_eq!(store.seal_window(&messages, "").unwrap().parts.len(), 2);
+    }
+
+    #[test]
+    fn a_cut_keeps_a_tool_result_with_its_call_where_it_can() {
+        let call = msg("assistant", json!([{"type":"tool_use","id":"t","name":"read","input":{}}]));
+        let result = msg("user", json!([{"type":"tool_result","tool_use_id":"t","content":"ok"}]));
+        let words = msg("user", json!("words"));
+        let window = [words.clone(), call.clone(), result.clone(), words];
+        assert_eq!(cut(&window, &(0..4)), 3, "moved past the result at the midpoint");
+        assert_eq!(cut(&window, &(0..3)), 1);
+        assert_eq!(cut(&window, &(1..3)), 2, "it cannot: the plain midpoint");
+        let results = [call, result.clone(), result.clone(), result];
+        assert_eq!(cut(&results, &(0..4)), 2, "nothing but results to the end");
     }
 }
 
