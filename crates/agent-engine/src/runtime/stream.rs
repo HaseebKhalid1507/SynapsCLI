@@ -7502,12 +7502,28 @@ mod rich_output_tests {
 
         /// One turn on the extension's model; `configure` makes the stream
         /// the chat's. Returns the tool results the model was handed.
+        ///
+        /// `bus` is the stream's. The extension manager gets another: in a
+        /// host the two are one object, and with one object a test cannot
+        /// tell which of them a tool was handed.
         async fn turn(
             calls: Vec<Value>,
             extra_tools: Vec<Arc<dyn Tool>>,
             bus: Arc<HookBus>,
             configure: impl FnOnce(&mut StreamSession),
         ) -> Vec<Value> {
+            turn_on(calls, extra_tools, Arc::new(HookBus::new()), bus, configure).await
+        }
+
+        /// [`turn`], with the extension manager's bus given too.
+        async fn turn_on(
+            calls: Vec<Value>,
+            extra_tools: Vec<Arc<dyn Tool>>,
+            managers_bus: Arc<HookBus>,
+            bus: Arc<HookBus>,
+            configure: impl FnOnce(&mut StreamSession),
+        ) -> Vec<Value> {
+            assert!(!Arc::ptr_eq(&managers_bus, &bus));
             let mut registry = ToolRegistry::new();
             for tool in extra_tools {
                 registry.register(tool);
@@ -7517,7 +7533,7 @@ mod rich_output_tests {
                 calls,
                 results: Default::default(),
             });
-            serve(provider.clone(), bus.clone(), tools.clone());
+            serve(provider.clone(), managers_bus, tools.clone());
             let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
             let mut session = harness_session(
                 // Never dialled: the model is not Anthropic's.
@@ -7650,8 +7666,8 @@ mod rich_output_tests {
         }
 
         /// What a tool's context says about who called it: the conversation,
-        /// its folder, and whether it was given a hook bus.
-        type Caller = (Option<String>, Option<PathBuf>, bool);
+        /// its folder, and which hook bus it was given ([`at`]).
+        type Caller = (Option<String>, Option<PathBuf>, usize);
         struct CallerProbe(Arc<std::sync::Mutex<Vec<Caller>>>);
         #[async_trait::async_trait]
         impl Tool for CallerProbe {
@@ -7674,7 +7690,7 @@ mod rich_output_tests {
                 self.0.lock().unwrap().push((
                     ctx.capabilities.session_id.clone(),
                     ctx.capabilities.cwd.clone(),
-                    ctx.capabilities.hook_bus.is_some(),
+                    at(ctx.capabilities.hook_bus.as_ref()),
                 ));
                 Ok("probed".to_string())
             }
@@ -7682,7 +7698,14 @@ mod rich_output_tests {
 
         /// The loop's tools run in the chat's folder (a relative path names
         /// the chat's file), their context names the chat, and so do the
-        /// hooks around them. None of it is the host process's folder.
+        /// hooks around them. None of it is the host process's folder. The
+        /// hook bus in their context is the stream's, not the extension
+        /// manager's.
+        ///
+        /// The hooks around a call are listened for on both buses: the loop
+        /// sends them on the manager's, which in a host is the bus every
+        /// chat's stream holds too. (A worker's stream holds a view of its
+        /// own instead, but a worker is never given an extension's model.)
         #[tokio::test]
         #[serial_test::serial(synaps_base_dir, extension_routing)]
         async fn its_tools_run_in_the_chats_folder_and_its_hooks_name_the_chat() {
@@ -7694,23 +7717,27 @@ mod rich_output_tests {
             std::fs::write(chat.path().join("where.txt"), "IN_THE_CHATS_FOLDER").unwrap();
             assert!(!process.join("where.txt").exists());
 
-            let bus = Arc::new(HookBus::new());
+            let (managers_bus, bus) = (Arc::new(HookBus::new()), Arc::new(HookBus::new()));
             let hooks = Arc::new(WhoProbe(Default::default()));
             for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
-                let mut perms = PermissionSet::new();
-                perms.grant(kind.required_permission());
-                bus.subscribe(kind, hooks.clone(), None, None, perms)
-                    .await
-                    .unwrap();
+                for listened in [&managers_bus, &bus] {
+                    let mut perms = PermissionSet::new();
+                    perms.grant(kind.required_permission());
+                    listened
+                        .subscribe(kind, hooks.clone(), None, None, perms)
+                        .await
+                        .unwrap();
+                }
             }
             let callers = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let results = turn(
+            let results = turn_on(
                 vec![
                     call("call-1", "read", json!({"path": "where.txt"})),
                     call("call-2", "caller_probe", json!({})),
                 ],
                 vec![Arc::new(CallerProbe(callers.clone()))],
-                bus,
+                managers_bus.clone(),
+                bus.clone(),
                 |session| {
                     session.session_id = Some("chat-A".into());
                     session.cwd = Some(chat.path().to_path_buf());
@@ -7728,7 +7755,13 @@ mod rich_output_tests {
             );
             assert_eq!(
                 *callers.lock().unwrap(),
-                vec![(Some("chat-A".to_string()), Some(chat.path().to_path_buf()), true)]
+                vec![(
+                    Some("chat-A".to_string()),
+                    Some(chat.path().to_path_buf()),
+                    at(Some(&bus))
+                )],
+                "the extension manager's bus is at {}",
+                at(Some(&managers_bus))
             );
             let folder = chat.path().to_str().map(str::to_string);
             let events = hooks.0.lock().unwrap().clone();
