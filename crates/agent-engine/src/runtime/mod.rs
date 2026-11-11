@@ -3807,12 +3807,13 @@ impl Runtime {
         requested_provider: Option<&str>,
     ) -> std::result::Result<memory_context::MemoryContextLease, memory_context::MemoryContextError>
     {
-        // No project for this chat's folder: no lease, memory stays off.
-        // The callers report it (`/memory` answers the user; the default
-        // mode and the restored mode log one warning).
+        // No project for this chat's folder: no lease, memory stays off,
+        // and the error says that this is why. The callers report it
+        // (`/memory` answers the user; the default mode and the restored
+        // mode log one warning).
         let project_id = self
             .memory_context_project_id()
-            .ok_or(memory_context::MemoryContextError::CapabilityUnavailable)?;
+            .ok_or(memory_context::MemoryContextError::NoProject)?;
         let provider_id = self.resolve_memory_provider(requested_provider)?;
         memory_context::MemoryContextLease::grant(
             memory_context::MemoryLeaseId::parse(&format!("memctx-cmd-{}", uuid::Uuid::new_v4()))?,
@@ -7976,21 +7977,29 @@ mod memory_context_provider_tests {
             let defaulted = runtime
                 .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
                 .expect("a confirmed default is attempted");
-            assert!(matches!(
-                defaulted,
-                Err(memory_context::MemoryContextError::CapabilityUnavailable)
-            ));
+            assert!(matches!(defaulted, Err(memory_context::MemoryContextError::NoProject)));
             assert_memory_off_no_lease(&runtime);
 
-            assert!(runtime
+            // What `/memory` answers names the cause, not "unavailable".
+            let enable = runtime
                 .memory_context_enable(
                     memory_context::MemoryContextMode::CaptureAndRecall,
                     memory_context::mint_explicit_command_proof(),
                 )
-                .is_err());
-            assert!(runtime
+                .unwrap_err();
+            let once = runtime
                 .memory_context_recall_once(memory_context::mint_explicit_command_proof())
-                .is_err());
+                .unwrap_err();
+            for refused in [enable, once] {
+                let said = refused.to_string();
+                assert!(said.contains("this folder has no project"), "{said}");
+                assert!(!said.contains("capability is unavailable"), "{said}");
+            }
+            // Every other cause keeps its text.
+            assert_eq!(
+                memory_context::MemoryContextError::CapabilityUnavailable.to_string(),
+                "memory-context capability is unavailable in this context"
+            );
             runtime.restore_session_memory_mode(crate::session::SessionMemoryMode::CaptureAndRecall);
             assert_memory_off_no_lease(&runtime);
             assert!(runtime.memory_tool_capability().is_none());

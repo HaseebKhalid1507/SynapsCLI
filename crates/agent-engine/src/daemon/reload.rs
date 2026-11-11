@@ -900,7 +900,8 @@ fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle, chat: &str
 /// away for a moment, an I/O error) is kept: the chat stays in its
 /// own project, where its tools fail until the folder is back, rather than
 /// being moved to another project's files and memory without a word. Every
-/// drop is logged with the folder and the chat.
+/// drop is logged with the folder and the chat. The lines name no host: an
+/// unpark in a host that is not the daemon writes them too.
 pub(crate) fn restorable_folder(folder: Option<PathBuf>, chat: &str) -> Option<PathBuf> {
     let folder = folder?;
     let gone = match std::fs::metadata(&folder) {
@@ -915,7 +916,8 @@ pub(crate) fn restorable_folder(folder: Option<PathBuf>, chat: &str) -> Option<P
                 session = %chat,
                 folder = %folder.display(),
                 error = %error,
-                "daemon: the chat's folder cannot be looked at; restored with it all the same"
+                "{}",
+                UNSEEN_NOTICE
             );
             return Some(folder);
         }
@@ -923,9 +925,24 @@ pub(crate) fn restorable_folder(folder: Option<PathBuf>, chat: &str) -> Option<P
     tracing::warn!(
         session = %chat,
         folder = %folder.display(),
-        "daemon: the chat's folder is gone ({gone}); it is restored in the daemon's folder and that folder's project"
+        "{}",
+        gone_notice(gone)
     );
     None
+}
+
+/// What [`restorable_folder`] logs for a folder it keeps without having
+/// seen it. Like [`gone_notice`] it names no host.
+const UNSEEN_NOTICE: &str = "the chat's folder cannot be looked at; restored with it all the same";
+
+/// What [`restorable_folder`] logs for a folder it drops, `gone` being why.
+/// It names no host ("daemon:" it once began with): a reload and a pinned
+/// restore run in the daemon, an unpark in whichever host holds the chat.
+fn gone_notice(gone: &str) -> String {
+    format!(
+        "the chat's folder is gone ({gone}); it is restored in the host process's folder \
+         and that folder's project"
+    )
 }
 
 pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
@@ -1248,6 +1265,21 @@ mod tests {
         assert_eq!(restore_config(&saved(&gone), SessionLifecycle::Live, "chat").cwd, None);
         // No folder saved: nothing to drop.
         assert_eq!(restore_config(&SessionConfig::default(), SessionLifecycle::Live, "chat").cwd, None);
+    }
+
+    /// The two lines `restorable_folder` logs do not say "daemon": an unpark
+    /// in a host that is not the daemon goes through the same function.
+    /// (The text is checked, not a captured log: a log captured on one test
+    /// thread loses lines to tracing's callsite cache when another test
+    /// reaches the same line first.)
+    #[test]
+    fn the_lines_about_a_chats_folder_name_no_host() {
+        let gone = gone_notice("it does not exist");
+        assert!(gone.starts_with("the chat's folder is gone (it does not exist); "), "{gone}");
+        for line in [gone.as_str(), UNSEEN_NOTICE] {
+            assert!(line.starts_with("the chat's folder "), "{line}");
+            assert!(!line.contains("daemon"), "{line}");
+        }
     }
 
     /// The rule a reload and the pinned restore share. A folder is dropped,

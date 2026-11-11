@@ -337,6 +337,24 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Memory off for a chat with no project says why; a resumed head's marker
+  is read by one rule; a log line no longer names the wrong host.** Three
+  small things:
+  - A chat whose folder has no project (with Axel memory, any folder that
+    is not in a repository, the home folder for one) gets no memory lease.
+    `/memory` answered "memory-context capability is unavailable in this
+    context". It now answers "memory is off for this chat: this folder has
+    no project". Every other cause keeps its text.
+  - A resumed chat's context head with `window` 0 in its marker was refused
+    with Axel memory and taken, archive link and all, with plain-file
+    memory. Both refuse it now: the chat goes on at window 1 without the
+    link, and a warning says so. And "has the form of an archive id" is one
+    function on the three paths that read such a marker: 32 lowercase hex
+    characters, which is what both stores write. Two of the paths took
+    capitals too; a marker naming an id in capitals is now invalid there.
+  - The two warnings about a chat's folder that is gone or cannot be looked
+    at began "daemon:", and an unpark in a host that is not the daemon
+    writes them too. They no longer name a host.
 - **Extensions: `caller` is tested on the three paths that had no test.**
   A `tool.call` made from the deferred-tool lane, from a tool-backed
   `/plugin:command` and from the tool loop of a model an extension provides

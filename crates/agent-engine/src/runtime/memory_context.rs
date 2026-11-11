@@ -927,6 +927,11 @@ pub enum MemoryContextError {
     /// No memory-context capability is wired into this execution context;
     /// lease-granting actions are unavailable and nothing was mutated.
     CapabilityUnavailable,
+    /// The chat's memory binding has no project: its folder is in none (no
+    /// repository there, or the folder is gone). Leases are per project and
+    /// no project id is invented, so nothing was granted and memory stays
+    /// off for this chat.
+    NoProject,
     /// Enable-time provider validation failed (task A6, spec §7.1): no
     /// loaded extension declares the requested context provider as a
     /// validated `deferred.context_providers` capability. Fail closed —
@@ -1019,6 +1024,11 @@ impl std::fmt::Display for MemoryContextError {
             MemoryContextError::CapabilityUnavailable => write!(
                 f,
                 "memory-context capability is unavailable in this context"
+            ),
+            MemoryContextError::NoProject => write!(
+                f,
+                "memory is off for this chat: this folder has no project (memory is kept \
+                 per project; start the chat in a project's folder to use it)"
             ),
             MemoryContextError::ProviderNotRegistered => write!(
                 f,
