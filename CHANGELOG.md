@@ -300,6 +300,18 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Notes: a save made while a notes file is rewritten is no longer lost.**
+  `synaps retention sweep` and `synaps retention forget memory` rewrite
+  `memory/<ns>.jsonl` and rename the new file over the old one. A note saved
+  between their read and their rename went into the file that was replaced,
+  after the save had reported success. Every save and every rewrite now
+  holds a lock on `memory/<ns>.jsonl.lock` (an empty file beside the notes
+  file, never removed; it is not a notes file and is not listed, counted,
+  swept or exported). A save waits up to 5 seconds for it, then fails and
+  writes nothing; a sweep or forget that cannot get it fails and rewrites
+  nothing. The lock also stops a line from landing on another writer's torn
+  line. A version older than this one does not take the lock: do not run a
+  sweep from one version while another version saves notes.
 - **Notes: a saved note is on disk before `memory_store` says it is saved.**
   With the plain-file memory backend a note was written to
   `memory/project-<key>.jsonl` but not synced, so a crash or a power cut

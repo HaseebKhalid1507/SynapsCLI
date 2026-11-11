@@ -133,6 +133,10 @@ pub struct RetentionPolicy {
 
 const DAY_MS: u64 = 86_400_000;
 
+/// The end of a notes lock file's name (`memory/<ns>.jsonl.lock`).
+#[cfg(unix)]
+const NOTES_LOCK_SUFFIX: &str = ".jsonl.lock";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DomainReport {
     pub domain: RetentionDomain,
@@ -540,7 +544,11 @@ fn evict_oldest_memory_records(
     }
 
     for (path, ids) in victims {
+        // Held from this read through the rename. The pass above looked
+        // without it: this one decides by id on what it reads here.
+        let _lock = lock_notes(&path)?;
         let raw = fs::read_to_string(&path).map_err(RetentionError::Io)?;
+        rewrite_read_done();
         let kept: Vec<&str> = raw
             .lines()
             .filter(|line| {
@@ -568,6 +576,32 @@ fn evict_oldest_memory_records(
     }
     Ok(dropped)
 }
+
+/// The lock every appender and rewriter of a notes file holds
+/// (`memory::store::lock_notes_file`). An error when it is not had in time:
+/// the caller does not rewrite.
+fn lock_notes(path: &Path) -> io::Result<crate::core::lock_file::ExclusiveLock> {
+    crate::memory::store::lock_notes_file(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run by this thread's rewriters once they have read the file, lock
+    /// held, before they write: where a test puts a save in their way.
+    static AFTER_REWRITE_READ: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn rewrite_read_done() {
+    let hook = AFTER_REWRITE_READ.with(|hook| hook.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn rewrite_read_done() {}
 
 /// Recursively list REGULAR files under a confined root. Symlinks (files
 /// or directories) are never followed — `DirEntry::file_type` does not
@@ -668,12 +702,20 @@ fn delete_session_artifact(path: &Path, outcome: &mut SweepOutcome) -> io::Resul
 /// their own retention class (`ts + max_age_days < now`), and — when a
 /// global cutoff is set — records older than it. Atomic rewrite; returns
 /// the number of records physically removed.
+///
+/// A line that does not parse is dropped and counted too. The file's lock is
+/// held here, so such a line is never a save caught half written: it is a
+/// fragment a writer left behind (a torn tail that a later save fenced off).
 fn compact_memory_file(
     path: &Path,
     now_ms: u64,
     global_cutoff_ms: Option<u64>,
 ) -> io::Result<usize> {
+    // Held from the read through the rename, so no save lands in the file
+    // this replaces, and no line is read half written.
+    let _lock = lock_notes(path)?;
     let raw = fs::read_to_string(path)?;
+    rewrite_read_done();
     let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut records: Vec<(Option<String>, u64, Option<u64>, String)> = Vec::new();
     let mut dropped = 0usize;
@@ -761,6 +803,9 @@ pub fn export(roots: &RetentionRoots, dest: &Path) -> io::Result<ExportSummary> 
         for entry in src_root.entries()? {
             if !entry.is_file {
                 continue; // source symlink/non-regular entries are omitted
+            }
+            if sub == "memory" && entry.name.ends_with(NOTES_LOCK_SUFFIX) {
+                continue; // a notes file's lock, not data
             }
             let components = [entry.name.clone()];
             match src_root.open_file(&components) {
@@ -952,7 +997,12 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
             let path = roots
                 .memory_dir()
                 .join(format!("{}.jsonl", namespace.display()));
+            // No file, no lock file: fail before one is created.
+            fs::metadata(&path)?;
+            // Held from the read through the rename.
+            let _lock = lock_notes(&path)?;
             let raw = fs::read_to_string(&path)?;
+            rewrite_read_done();
 
             // EXACT live-id match (CP-13 fix1 M4): parse every line;
             // substring/prefix probes and already-tombstoned ids fail
@@ -997,4 +1047,265 @@ fn sanitize_file_id(id: &str) -> io::Result<PathBuf> {
         return Err(io::Error::other(format!("invalid artifact id: {id:?}")));
     }
     Ok(PathBuf::from(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::store::{self, MemoryRecord};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn roots(tmp: &TempDir) -> RetentionRoots {
+        RetentionRoots {
+            config_dir: tmp.path().join("config"),
+            base_dir: tmp.path().join("base"),
+            cache_dir: tmp.path().join("cache"),
+        }
+    }
+
+    fn note(ns: &str, id: &str, timestamp_ms: u64) -> MemoryRecord {
+        let mut record = store::new_record(ns, format!("content of {id}"), vec![], None);
+        record.id = Some(id.to_string());
+        record.timestamp_ms = timestamp_ms;
+        record
+    }
+
+    fn save(roots: &RetentionRoots, ns: &str, id: &str, timestamp_ms: u64) {
+        store::append_to(&roots.base_dir, &note(ns, id, timestamp_ms)).unwrap();
+    }
+
+    fn notes_file(roots: &RetentionRoots, ns: &str) -> PathBuf {
+        roots.memory_dir().join(format!("{ns}.jsonl"))
+    }
+
+    /// The ids of the note lines in a file, in order (tombstones left out).
+    fn ids(path: &Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|value| value["id"].as_str().map(String::from))
+            .collect()
+    }
+
+    const AGE: RetentionPolicy = RetentionPolicy {
+        max_age_days: Some(1),
+        max_disk_bytes: None,
+    };
+
+    /// Put a save of note `id` in the way of this thread's next rewrite: it
+    /// starts once the rewriter has read the file and before it writes. The
+    /// rewriter is held there for a moment, and the save must still be
+    /// waiting. Returns where the save's thread is left.
+    fn save_during_next_rewrite(
+        roots: &RetentionRoots,
+        ns: &'static str,
+        id: &'static str,
+    ) -> Arc<Mutex<Option<JoinHandle<()>>>> {
+        let slot = Arc::new(Mutex::new(None));
+        let (left, roots, path) = (slot.clone(), roots.clone(), notes_file(roots, ns));
+        AFTER_REWRITE_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let saver = {
+                    let roots = roots.clone();
+                    std::thread::spawn(move || save(&roots, ns, id, crate::epoch_millis()))
+                };
+                std::thread::sleep(Duration::from_millis(150));
+                assert!(!saver.is_finished(), "the save waits for the rewrite");
+                assert!(!ids(&path).contains(&id.to_string()));
+                *left.lock().unwrap() = Some(saver);
+            }));
+        });
+        slot
+    }
+
+    fn join_save(slot: &Arc<Mutex<Option<JoinHandle<()>>>>) {
+        let saver = slot.lock().unwrap().take();
+        saver.expect("the rewriter read the file").join().unwrap();
+    }
+
+    /// Each of the three rewriters holds the lock from its read through its
+    /// rename: a save that arrives in between waits, and its note is in the
+    /// file the rewrite left. Without the lock the save would go into the
+    /// file the rename replaces, and be lost after it returned Ok.
+    #[test]
+    fn a_save_waits_for_a_rewrite_and_its_note_is_in_the_file_after_it() {
+        let now = crate::epoch_millis();
+
+        // The sweep.
+        let tmp = TempDir::new().unwrap();
+        let roots = roots(&tmp);
+        save(&roots, "ns", "mem-old", 1);
+        save(&roots, "ns", "mem-new", now);
+        let late = save_during_next_rewrite(&roots, "ns", "mem-late");
+        let outcome = sweep_at(&roots, &AGE, now).unwrap();
+        join_save(&late);
+        assert_eq!(outcome.memory_records_dropped, 1);
+        assert_eq!(ids(&notes_file(&roots, "ns")), ["mem-new", "mem-late"]);
+
+        // Eviction.
+        let tmp = TempDir::new().unwrap();
+        let roots = self::roots(&tmp);
+        save(&roots, "ns", "mem-old", 1);
+        save(&roots, "ns", "mem-new", 2);
+        let late = save_during_next_rewrite(&roots, "ns", "mem-late");
+        assert_eq!(evict_oldest_memory_records(&roots, 1).unwrap(), 1);
+        join_save(&late);
+        assert_eq!(ids(&notes_file(&roots, "ns")), ["mem-new", "mem-late"]);
+
+        // `retention forget memory`.
+        let tmp = TempDir::new().unwrap();
+        let roots = self::roots(&tmp);
+        save(&roots, "ns", "mem-a", now);
+        let late = save_during_next_rewrite(&roots, "ns", "mem-late");
+        forget(&roots, RetentionDomain::Memory, "ns:mem-a").unwrap();
+        join_save(&late);
+        let path = notes_file(&roots, "ns");
+        assert_eq!(ids(&path), ["mem-a", "mem-late"]);
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains(r#""tombstone":"mem-a""#));
+    }
+
+    /// Savers on four threads against a thread that rewrites the same file
+    /// over and over (a forget, then a sweep that has something to drop):
+    /// every save that returned Ok is in the file at the end, once.
+    #[test]
+    fn saves_beside_repeated_rewrites_lose_no_note() {
+        const SAVERS: usize = 4;
+        const SAVES: usize = 40;
+        let tmp = TempDir::new().unwrap();
+        let roots = roots(&tmp);
+        save(&roots, "ns", "mem-first", crate::epoch_millis());
+        let done = Arc::new(AtomicBool::new(false));
+
+        let rewriter = {
+            let (roots, done) = (roots.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut rewrites = 0usize;
+                let mut round = 0usize;
+                while !done.load(Ordering::Acquire) || round < 3 {
+                    let now = crate::epoch_millis();
+                    let victim = format!("mem-victim-{round}");
+                    save(&roots, "ns", &victim, now);
+                    save(&roots, "ns", &format!("mem-aged-{round}"), 1);
+                    forget(&roots, RetentionDomain::Memory, &format!("ns:{victim}")).unwrap();
+                    let outcome = sweep_at(&roots, &AGE, now).unwrap();
+                    assert_eq!(outcome.memory_records_dropped, 2, "round {round}");
+                    rewrites += 2;
+                    round += 1;
+                }
+                rewrites
+            })
+        };
+        let savers: Vec<_> = (0..SAVERS)
+            .map(|saver| {
+                let roots = roots.clone();
+                std::thread::spawn(move || {
+                    for n in 0..SAVES {
+                        save(&roots, "ns", &format!("mem-{saver}-{n}"), crate::epoch_millis());
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                })
+            })
+            .collect();
+        for saver in savers {
+            saver.join().unwrap();
+        }
+        done.store(true, Ordering::Release);
+        assert!(rewriter.join().unwrap() >= 6);
+
+        let mut found = ids(&notes_file(&roots, "ns"));
+        found.sort();
+        let mut expected: Vec<String> = (0..SAVERS)
+            .flat_map(|saver| (0..SAVES).map(move |n| format!("mem-{saver}-{n}")))
+            .collect();
+        expected.push("mem-first".into());
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    /// A rewriter that cannot get the lock in time fails and leaves the file
+    /// as it was.
+    #[test]
+    fn a_rewrite_that_cannot_get_the_lock_fails_and_rewrites_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let roots = roots(&tmp);
+        let now = crate::epoch_millis();
+        save(&roots, "ns", "mem-old", 1);
+        save(&roots, "ns", "mem-new", now);
+        let path = notes_file(&roots, "ns");
+        let before = fs::read(&path).unwrap();
+
+        let held = store::lock_notes_file(&path).unwrap();
+        store::set_notes_lock_wait(Some(Duration::from_millis(60)));
+        let swept = sweep_at(&roots, &AGE, now).unwrap_err();
+        let evicted = evict_oldest_memory_records(&roots, 1).unwrap_err();
+        let forgotten = forget(&roots, RetentionDomain::Memory, "ns:mem-new").unwrap_err();
+        store::set_notes_lock_wait(None);
+        for message in [swept.to_string(), evicted.to_string(), forgotten.to_string()] {
+            assert!(message.contains("ns.jsonl is locked by another writer"), "{message}");
+        }
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("jsonl.tmp").exists());
+
+        // Released, each of them goes through.
+        drop(held);
+        assert_eq!(sweep_at(&roots, &AGE, now).unwrap().memory_records_dropped, 1);
+        forget(&roots, RetentionDomain::Memory, "ns:mem-new").unwrap();
+    }
+
+    /// The lock file sits in `memory/` beside the notes file and is not one:
+    /// it is not listed as a namespace, not counted, not swept and not
+    /// exported, and a sweep leaves it where it is.
+    #[test]
+    fn the_lock_file_is_not_a_notes_file() {
+        let tmp = TempDir::new().unwrap();
+        let roots = roots(&tmp);
+        let now = crate::epoch_millis();
+        save(&roots, "ns", "mem-old", 1);
+        save(&roots, "ns", "mem-new", now);
+        let path = notes_file(&roots, "ns");
+        let lock = roots.memory_dir().join("ns.jsonl.lock");
+        assert_eq!(store::notes_lock_path(&path), lock);
+        assert!(lock.is_file());
+
+        assert_eq!(store::list_namespaces_in(&roots.base_dir).unwrap(), ["ns"]);
+        let counted = |roots: &RetentionRoots| {
+            let report = inspect(roots).unwrap();
+            let memory = report
+                .domains
+                .iter()
+                .find(|d| d.domain == RetentionDomain::Memory)
+                .unwrap();
+            (memory.files, memory.bytes)
+        };
+        assert_eq!(counted(&roots), (1, fs::metadata(&path).unwrap().len()));
+
+        // A sweep that rewrites the notes file, and an eviction after it.
+        assert_eq!(sweep_at(&roots, &AGE, now).unwrap().memory_records_dropped, 1);
+        assert_eq!(evict_oldest_memory_records(&roots, 1).unwrap(), 1);
+        assert!(lock.is_file(), "the lock file is never removed or renamed");
+        assert_eq!(fs::metadata(&lock).unwrap().len(), 0);
+        assert_eq!(counted(&roots), (1, 0));
+        assert_eq!(store::list_namespaces_in(&roots.base_dir).unwrap(), ["ns"]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&lock).unwrap().permissions().mode() & 0o777, 0o600);
+            let dest = tmp.path().join("export");
+            let summary = export(&roots, &dest).unwrap();
+            assert_eq!(summary.files, 1);
+            let exported: Vec<_> = fs::read_dir(dest.join("memory"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(exported, ["ns.jsonl"]);
+        }
+    }
 }

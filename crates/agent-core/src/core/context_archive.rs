@@ -829,20 +829,19 @@ impl ArchiveStore {
         lock: impl Fn(&PrivateDir) -> io::Result<Option<FlockGuard>>,
     ) -> io::Result<Locked> {
         let gate = self.enter(BUSY)?;
-        let deadline = Instant::now() + self.process_wait;
-        let file = loop {
-            match lock(&self.fs) {
+        // The wait the notes store shares (`lock_file::lock_within`).
+        let file = crate::core::lock_file::lock_within(
+            self.process_wait,
+            PROCESS_LOCK_POLL,
+            || match lock(&self.fs) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.check_abort()?;
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(io::Error::new(io::ErrorKind::WouldBlock, BUSY));
-                    }
-                    std::thread::sleep(PROCESS_LOCK_POLL.min(deadline - now));
+                    Ok(None)
                 }
-                result => break result?,
-            }
-        };
+                result => result.map(Some),
+            },
+        )?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, BUSY))?;
         Ok(Locked { file, _gate: gate })
     }
 

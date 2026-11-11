@@ -218,14 +218,15 @@ fn append_record(base: &Path, record: &MemoryRecord, sync_now: bool) -> Result<(
 /// parseable. Nothing is ever cut off the file, so healing cannot drop a
 /// line, and a line that only lacked its newline becomes a good line.
 ///
-/// There is no lock. Appenders in other processes are kept apart by the
-/// append mode alone, which is enough for whole lines: each is one `write`.
-/// What it does not cover is the look at the last byte, which is a separate
-/// step from the write. If another writer's line is torn between the two (it
-/// died, or its write was short), this line lands on that fragment and is
-/// lost with it. Looking and finding a line that another writer has only
-/// half written costs nothing: the newline it adds makes an empty line.
+/// The file's lock ([`lock_notes_file`]) is held from the look at the last
+/// byte through the sync, and the notes file is opened only once the lock is
+/// had. So no other appender's line can tear between the look and the write,
+/// and no rewrite (sweep, eviction, `retention forget memory`) can replace
+/// the file between this line going in and this call returning: a rewrite
+/// reads the file either before this line or with it whole. If the lock is
+/// not had within [`NOTES_LOCK_WAIT`] the save fails and nothing is written.
 fn append_jsonl_line(path: &Path, line: &str, sync_now: bool) -> Result<(), MemoryError> {
+    let _lock = lock_notes_file(path)?;
     let (had_bytes, needs_heal) = match fs::metadata(path) {
         Ok(meta) if meta.len() > 0 => {
             use std::io::{Read, Seek, SeekFrom};
@@ -248,6 +249,93 @@ fn append_jsonl_line(path: &Path, line: &str, sync_now: bool) -> Result<(), Memo
         }
     }
     Ok(())
+}
+
+/// How long a save or a rewrite waits for a notes file's lock: the archive
+/// store's number.
+pub(crate) const NOTES_LOCK_WAIT: std::time::Duration =
+    crate::context_archive::PROCESS_LOCK_WAIT;
+/// How often that wait tries again. A save holds the lock for one write and
+/// one sync, so the next try is soon.
+const NOTES_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The lock file of the notes file at `path`: `<ns>.jsonl.lock` beside it.
+/// Its name does not end in `.jsonl`, so nothing that lists notes files
+/// takes it for one, and it is never renamed or removed: a lock on the notes
+/// file itself would be lost with the inode a rewrite replaces.
+pub(crate) fn notes_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Take the exclusive lock of the notes file at `path`, waiting up to
+/// [`NOTES_LOCK_WAIT`]. Every appender and every rewriter of a notes file
+/// holds it: an append from its look at the last byte through its sync, a
+/// rewrite from its read through its rename. Dropping the guard releases it.
+///
+/// When the wait runs out this is an error (`WouldBlock`), and the caller
+/// must not go on: a save never appends without the lock and a rewrite never
+/// rewrites without it. The lock is a `flock`, so it holds between threads
+/// of one process as well (each call opens the file anew), and it must not
+/// be taken twice on one call path.
+///
+/// A binary older than this lock does not take it. Beside such a binary a
+/// rewrite can still lose a save, as before.
+pub(crate) fn lock_notes_file(
+    path: &Path,
+) -> std::io::Result<crate::core::lock_file::ExclusiveLock> {
+    let lock_path = notes_lock_path(path);
+    let wait = notes_lock_wait();
+    crate::core::lock_file::lock_within(wait, NOTES_LOCK_POLL, || {
+        crate::core::lock_file::try_lock(open_lock_file(&lock_path)?)
+    })?
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "notes file {} is locked by another writer (waited {} ms); nothing was written",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                wait.as_millis()
+            ),
+        )
+    })
+}
+
+/// Open (creating it, mode 0600, never through a symlink) a lock file. Read
+/// and write access: Windows locks only a handle that has one of them.
+fn open_lock_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(crate::core::private_fs::FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A shorter lock wait for this thread's saves and rewrites.
+    static NOTES_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Shorten (or with `None` restore) the lock wait of this thread.
+#[cfg(test)]
+pub(crate) fn set_notes_lock_wait(wait: Option<std::time::Duration>) {
+    NOTES_LOCK_WAIT_OVERRIDE.with(|cell| cell.set(wait));
+}
+
+fn notes_lock_wait() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(wait) = NOTES_LOCK_WAIT_OVERRIDE.with(|cell| cell.get()) {
+        return wait;
+    }
+    NOTES_LOCK_WAIT
 }
 
 /// How many `write` calls one line may take before the append gives up.
@@ -1530,6 +1618,40 @@ mod tests {
         fs::write(memory_dir_in(tmp.path()).join("empty.jsonl"), "").unwrap();
         append_to(tmp.path(), &rec("empty", 1, "x", vec![])).unwrap();
         assert_eq!(take_steps(), ["write", "sync file", "sync dir"]);
+    }
+
+    /// A save that cannot get the file's lock in time fails and writes
+    /// nothing: it never appends without the lock.
+    #[test]
+    fn a_save_that_cannot_get_the_lock_fails_and_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let scope = project_scope(&tmp);
+        store_record_in(tmp.path(), &scope, note("first")).unwrap();
+        let path = namespace_file(tmp.path(), &project_namespace(scope.key()));
+        let before = fs::read(&path).unwrap();
+
+        let held = lock_notes_file(&path).unwrap();
+        set_notes_lock_wait(Some(std::time::Duration::from_millis(60)));
+        let started = std::time::Instant::now();
+        let refused = store_record_in(tmp.path(), &scope, note("second")).unwrap_err();
+        // A file that is not there yet is not created either.
+        let other = append_to(tmp.path(), &rec("other", 1, "x", vec![]));
+        let _other_lock = lock_notes_file(&namespace_file(tmp.path(), "held")).unwrap();
+        let unborn = append_to(tmp.path(), &rec("held", 1, "x", vec![])).unwrap_err();
+        set_notes_lock_wait(None);
+
+        assert!(started.elapsed() >= std::time::Duration::from_millis(60));
+        let message = refused.to_string();
+        assert!(message.contains("is locked by another writer"), "{message}");
+        assert!(message.contains("nothing was written"), "{message}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        other.expect("another file's lock is free");
+        assert!(unborn.to_string().contains("held.jsonl is locked"));
+        assert!(!namespace_file(tmp.path(), "held").exists());
+
+        drop(held);
+        store_record_in(tmp.path(), &scope, note("second")).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
     }
 
     /// A file opened for append that another writer shares, as far as a
