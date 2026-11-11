@@ -99,7 +99,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "axel"
 version = "0.1.0"
-source = "git+https://github.com/maha-media/axel.git?rev=edbdea401d66feedb87fcad28c879ece54e3ccd2#edbdea401d66feedb87fcad28c879ece54e3ccd2"
+source = "git+https://github.com/HaseebKhalid1507/axel.git?rev=edbdea401d66feedb87fcad28c879ece54e3ccd2#edbdea401d66feedb87fcad28c879ece54e3ccd2"
 dependencies = [
  "axel-memkoshi",
  "chrono",
@@ -121,7 +121,7 @@ dependencies = [
 [[package]]
 name = "axel-memkoshi"
 version = "0.1.0"
-source = "git+https://github.com/maha-media/axel.git?rev=edbdea401d66feedb87fcad28c879ece54e3ccd2#edbdea401d66feedb87fcad28c879ece54e3ccd2"
+source = "git+https://github.com/HaseebKhalid1507/axel.git?rev=edbdea401d66feedb87fcad28c879ece54e3ccd2#edbdea401d66feedb87fcad28c879ece54e3ccd2"
 dependencies = [
  "chrono",
  "hex",
@@ -2042,7 +2042,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "velocirag"
 version = "0.1.0"
-source = "git+https://github.com/maha-media/axel.git?rev=edbdea401d66feedb87fcad28c879ece54e3ccd2#edbdea401d66feedb87fcad28c879ece54e3ccd2"
+source = "git+https://github.com/HaseebKhalid1507/axel.git?rev=edbdea401d66feedb87fcad28c879ece54e3ccd2#edbdea401d66feedb87fcad28c879ece54e3ccd2"
 dependencies = [
  "chrono",
  "dirs",

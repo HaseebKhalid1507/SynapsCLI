@@ -41,7 +41,7 @@ normal/restricted capture metadata round trips and tombstone-only source identit
 
 Independent Cargo workspace; no SQLite/ONNX dependencies are added to SynapsCLI.
 Both `axel` and `axel-memkoshi` are pinned to
-`https://github.com/maha-media/axel.git`, revision
+`https://github.com/HaseebKhalid1507/axel.git`, revision
 `edbdea401d66feedb87fcad28c879ece54e3ccd2`. The checked-in lockfile uses these
 Git sources, including transitive `velocirag`; there are no local path patches.
 
