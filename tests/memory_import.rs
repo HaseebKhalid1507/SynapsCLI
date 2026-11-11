@@ -682,20 +682,46 @@ fn an_input_that_cannot_be_opened_stops_the_run_before_anything_is_written() {
     let file = env.file("records.jsonl", &lines(&sealed("stop", 2)));
     let notes = env.file("notes.jsonl", &[note("mem-1", KEY, "one")]);
     let missing = env.work().join("not-there.jsonl");
-    let missing = missing.to_str().unwrap();
+    // Not regular files (core-a5-review finding 5). The directory comes
+    // first: opening it does not fail, reading it does. A FIFO would block
+    // at the open and /dev/zero never ends a line.
+    let directory = env.work().join("a-directory");
+    std::fs::create_dir(&directory).unwrap();
+    let fifo = env.work().join("a-fifo");
+    let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success());
+    let link = env.work().join("a-link-to-a-device");
+    std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+    let cases = [
+        (missing.as_path(), "No such file"),
+        (directory.as_path(), "not a regular file"),
+        (fifo.as_path(), "not a regular file"),
+        (Path::new("/dev/zero"), "not a regular file"),
+        (link.as_path(), "not a regular file"),
+    ];
     let before = env.listing();
-    for (command, good) in [("import-archives", &file), ("import-notes", &notes)] {
-        let run = env.run(&[command, good, missing, "--project-key", KEY]);
-        assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
-        assert_eq!(run.totals(), [0; 6]);
-        assert_eq!(run.doc["stopped"]["input"], 1);
-        assert_eq!(run.doc["stopped"]["line"], Value::Null);
-        assert_eq!(run.doc["stopped"]["id"], Value::Null);
-        let error = run.doc["stopped"]["error"].as_str().unwrap();
-        assert!(error.starts_with("cannot open the input"), "{error}");
-        assert_eq!(run.doc["records"], json!([]));
+    for (bad, why) in cases {
+        let bad = bad.to_str().unwrap();
+        for (command, good) in [("import-archives", &file), ("import-notes", &notes)] {
+            let run = env.run(&[command, good, bad, "--project-key", KEY]);
+            assert_eq!(run.code, 2, "{bad}: {}{}", run.stdout, run.stderr);
+            assert_eq!(run.totals(), [0; 6], "{bad}");
+            assert_eq!(run.doc["stopped"]["input"], 1);
+            assert_eq!(run.doc["stopped"]["line"], Value::Null);
+            assert_eq!(run.doc["stopped"]["id"], Value::Null);
+            let error = run.doc["stopped"]["error"].as_str().unwrap();
+            assert!(error.starts_with("cannot open the input"), "{bad}: {error}");
+            assert!(error.contains(why), "{bad}: {error}");
+            assert!(error.ends_with("nothing was imported"), "{bad}: {error}");
+            assert_eq!(run.doc["records"], json!([]));
+            assert_eq!(env.listing(), before, "{bad}: a stopped run wrote something");
+        }
     }
-    assert_eq!(env.listing(), before, "a stopped run wrote something");
+    // A link to a regular file is an input.
+    let linked = env.work().join("a-link-to-a-file");
+    std::os::unix::fs::symlink(&file, &linked).unwrap();
+    let run = env.run(&["import-archives", linked.to_str().unwrap(), "--project-key", KEY]);
+    assert_eq!((run.code, run.totals()), (0, [2, 2, 0, 0, 0, 0]), "{}", run.stderr);
 }
 
 #[test]

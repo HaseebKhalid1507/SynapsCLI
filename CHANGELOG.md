@@ -8,7 +8,9 @@ All notable changes to this project will be documented in this file.
 
 - **`synaps memory import-archives | import-notes | project`**, the command
   for moving saved archives and notes into the plain-file stores from
-  somewhere else. The input is JSON Lines (`-` is standard input; blank
+  somewhere else. The input is JSON Lines (`-` is standard input, anything
+  else must be a regular file and all inputs are opened before a line is
+  imported; blank
   lines are skipped; a line over 16 MiB and 4 KiB is refused without being
   read into memory): for archives one archive record per line, the object
   an archive file holds; for notes a note line or a tombstone line. There

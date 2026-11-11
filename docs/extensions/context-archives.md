@@ -706,7 +706,9 @@ synaps memory project [--cwd <DIR>]
 
 **The input is JSON Lines: one record per line,** the same object an archive
 file holds ([The record](#the-record)), live or tombstone. `-` is standard
-input, blank lines are skipped, and lines are imported in the order given,
+input; any other input must be a regular file (not a directory, a FIFO or a
+device), and every input is opened before a line is imported. Blank lines
+are skipped, and lines are imported in the order given,
 across the files in the order they are named. A directory of archive files
 is the same thing, one file after another with a newline between them:
 

@@ -72,7 +72,8 @@ pub enum MemoryAction {
         .args(["as_recorded", "cwd", "project_key"])
 ))]
 pub struct ImportArgs {
-    /// JSON Lines files, imported in the order given. `-` is standard input.
+    /// JSON Lines files, imported in the order given. `-` is standard input;
+    /// anything else must be a regular file.
     /// Blank lines are skipped.
     #[arg(required = true, value_name = "FILE")]
     files: Vec<PathBuf>,
@@ -424,7 +425,22 @@ fn open_input(path: &Path) -> io::Result<Box<dyn BufRead>> {
     if path.as_os_str() == "-" {
         return Ok(Box::new(BufReader::new(io::stdin())));
     }
-    Ok(Box::new(BufReader::new(File::open(path)?)))
+    // An input is a regular file. Its kind is asked before it is opened
+    // (opening a FIFO waits for a writer) and again of what was opened (the
+    // name can change hands in between). A directory would open and fail at
+    // its first read, after earlier inputs were imported; a device such as
+    // /dev/zero never ends a line. A link to a regular file is one.
+    let regular = |meta: std::fs::Metadata| {
+        if meta.is_file() {
+            Ok(())
+        } else {
+            Err(io::Error::other("not a regular file"))
+        }
+    };
+    regular(std::fs::metadata(path)?)?;
+    let file = File::open(path)?;
+    regular(file.metadata()?)?;
+    Ok(Box::new(BufReader::new(file)))
 }
 
 // ─── The two stores ─────────────────────────────────────────────────────────
