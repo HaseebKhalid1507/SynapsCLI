@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Extensions: the context archive file format is a documented contract.**
+  With the built-in file store (`memory.backend = legacy`), an extension may
+  read the files under `context-archives/` directly.
+  `docs/extensions/context-archives.md` describes where they are, every field
+  of the version 1 record, what `version` means, what Synaps will not change
+  without a new version, what a reader must tolerate and must not do,
+  tombstones, windows stored as several archives, reduced messages and legacy
+  slot files. It comes with real files as fixtures
+  (`docs/extensions/fixtures/context-archives/`) and a reference reader in
+  Python (`examples/extensions/context_archive_reader.py`). The store's
+  behaviour is unchanged; new tests
+  (`crates/agent-core/tests/context_archive_format.rs`) fail if it would
+  write, or stop reading, something the document does not describe.
 - **Owned daemon sessions.** A client can create a session bound to its
   connection (`Attach::Create{owned}`; `SocketTransport::create_owned`;
   `synaps attach --owned`). When the owner disconnects for any reason

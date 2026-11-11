@@ -242,4 +242,6 @@ See [protocol.md](./protocol.md) for the full technical specification, including
 - A complete working Python example
 - Error handling expectations
 
+To read what Synaps has archived from long chats (for search, recall or indexing), see [context-archives.md](./context-archives.md): where the context archive files are, every field of the record, what a reader must tolerate and must not do, with real files as fixtures and a reference reader.
+
 For the compatibility guarantees behind this protocol — the `extension_protocol_version` promise, config-format stability, the deprecation policy, and which surfaces are stable versus reference-implementation — see [../STABILITY.md](../STABILITY.md).
