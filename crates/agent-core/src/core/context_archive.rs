@@ -105,7 +105,10 @@
 //! opened the store, a fetch, a note read and a search create no file (not
 //! the lock file either), change no mode and sync nothing.
 //!
-//! Unix-only private, handle-relative no-symlink filesystem; other platforms
+//! Unix-only private, handle-relative no-symlink filesystem below the base
+//! (the base itself may be reached through links: it is resolved once, when
+//! a store is opened, and everything below it is opened by name from that
+//! handle, never following a link); other platforms
 //! fail Unsupported. Live records are immutable; forget atomically replaces a
 //! record with a content-free id/digest/scope tombstone, and is the only
 //! operation that replaces a file. The digest covers ONLY
@@ -775,6 +778,11 @@ impl ArchiveStore {
     /// `context-archives` and project directories if they are missing, makes
     /// them private again and syncs them, every time. A read must not go
     /// through here: see [`open_existing`](Self::open_existing).
+    ///
+    /// `base` may be reached through links (a home directory on another
+    /// disk): it is resolved once, here, and the store lives in the real
+    /// directory. Below the base no link is followed: `context-archives`,
+    /// the project directory, a shelf or a file that is a link is refused.
     pub fn new(base: &Path, scope_key: &str, logical_id: &str) -> io::Result<Self> {
         let (scope, logical) = Self::keys(scope_key, logical_id)?;
         let fs = PrivateDir::new(base, &scope)?;
@@ -785,8 +793,8 @@ impl ArchiveStore {
     /// it is there. Nothing is created, no mode is changed and nothing is
     /// synced, so this also works where nothing can be written. `None` when
     /// the project has no archive directory: a search of it finds nothing and
-    /// a fetch is [`NOT_FOUND`]. A link anywhere on the way is an error, as
-    /// it is for `new`.
+    /// a fetch is [`NOT_FOUND`]. The base is resolved as `new` resolves it,
+    /// and a link below the base is an error, as it is for `new`.
     pub fn open_existing(
         base: &Path,
         scope_key: &str,
@@ -2888,57 +2896,104 @@ fn over_budget(error: &io::Error) -> bool {
 struct PrivateDir(std::fs::File);
 #[cfg(unix)]
 impl PrivateDir {
-    fn new(base: &Path, scope: &str) -> io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
+    /// The base as given must be absolute, not the root, and name no `.` or
+    /// `..`; its names must be UTF-8.
+    fn check_base(base: &Path) -> io::Result<()> {
         if !base.is_absolute() || base == Path::new("/") {
             return Err(invalid("archive base must be an absolute non-root path"));
         }
-        let mut dir = Self(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open("/")?,
-        );
-        let components: Vec<_> = base.components().collect();
-        for (index, component) in components.iter().enumerate() {
-            match component {
-                std::path::Component::RootDir => {}
-                std::path::Component::Normal(name) => {
-                    let name = name
-                        .to_str()
-                        .ok_or_else(|| invalid("archive path must be UTF-8"))?;
-                    dir = dir.child(name, index == components.len() - 1)?;
-                }
-                _ => return Err(invalid("archive base contains traversal")),
-            }
-        }
-        dir = dir.child("context-archives", true)?;
-        dir.child(scope, true)
-    }
-    fn open_existing(base: &Path, scope: &str) -> io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-        if !base.is_absolute() || base == Path::new("/") {
-            return Err(invalid("archive base must be an absolute non-root path"));
-        }
-        let mut dir = Self(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open("/")?,
-        );
         for component in base.components() {
             match component {
                 std::path::Component::RootDir => {}
                 std::path::Component::Normal(name) => {
-                    let name = c_name(
-                        name.to_str()
-                            .ok_or_else(|| invalid("archive path must be UTF-8"))?,
-                    )?;
-                    dir = Self(dir.open(&name, libc::O_RDONLY | libc::O_DIRECTORY)?);
+                    name.to_str().ok_or_else(|| invalid("archive path must be UTF-8"))?;
                 }
                 _ => return Err(invalid("archive base contains traversal")),
             }
         }
+        Ok(())
+    }
+    /// Where the base really is, resolved once, when a store is opened: the
+    /// deepest part of it that exists with every link in it followed, and
+    /// the names after that, which do not exist yet. The base is the user's
+    /// own choice of place and may be reached through a link (a home
+    /// directory on another disk). Everything below it is the store's, and
+    /// there no link is ever followed.
+    fn resolve(base: &Path) -> io::Result<(PathBuf, Vec<String>)> {
+        Self::check_base(base)?;
+        let (mut existing, mut missing) = (base.to_path_buf(), Vec::new());
+        let real = loop {
+            match std::fs::canonicalize(&existing) {
+                Ok(real) => break real,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // `check_base`: every name is UTF-8, and the root exists.
+                    let name = existing.file_name().and_then(|name| name.to_str());
+                    missing.push(name.ok_or(error)?.to_owned());
+                    existing.pop();
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if real == Path::new("/") && missing.is_empty() {
+            return Err(invalid("archive base must be an absolute non-root path"));
+        }
+        missing.reverse();
+        Ok((real, missing))
+    }
+    /// A directory by its resolved path. Used for the base and what is above
+    /// it only; everything below is opened by name from this handle.
+    fn at(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.open(path).map(Self)
+    }
+    fn new(base: &Path, scope: &str) -> io::Result<Self> {
+        use crate::core::private_fs::DIR_MODE;
+        use std::os::unix::fs::PermissionsExt;
+        let (real, mut missing) = Self::resolve(base)?;
+        // The directory the first name is made or opened in: the deepest
+        // one that exists or, when the base itself exists, its parent, so
+        // that the base is made private and its entry synced as before.
+        let mut above = real.clone();
+        if missing.is_empty() {
+            let name = real.file_name().and_then(|name| name.to_str());
+            missing.push(name.ok_or_else(|| invalid("archive path must be UTF-8"))?.to_owned());
+            above.pop();
+        }
+        let closed = |error: &io::Error| {
+            matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+        };
+        let mut dir = match Self::at(&above) {
+            Ok(above) => {
+                let last = missing.len() - 1;
+                let mut dir = above;
+                for (index, name) in missing.iter().enumerate() {
+                    dir = dir.child(name, index == last)?;
+                }
+                dir
+            }
+            // The parent of a base that exists cannot be opened (it can be
+            // passed through and not listed): the base itself can.
+            Err(error) if closed(&error) && above != real => {
+                let dir = Self::at(&real)?;
+                dir.0.set_permissions(std::fs::Permissions::from_mode(DIR_MODE))?;
+                dir
+            }
+            Err(error) => return Err(error),
+        };
+        dir = dir.child("context-archives", true)?;
+        dir.child(scope, true)
+    }
+    fn open_existing(base: &Path, scope: &str) -> io::Result<Self> {
+        Self::check_base(base)?;
+        // `NotFound` when the base, or a link on the way to it, is not there.
+        let real = std::fs::canonicalize(base)?;
+        if real == Path::new("/") {
+            return Err(invalid("archive base must be an absolute non-root path"));
+        }
+        let mut dir = Self::at(&real)?;
         for name in ["context-archives", scope] {
             dir = Self(dir.open(&c_name(name)?, libc::O_RDONLY | libc::O_DIRECTORY)?);
         }
@@ -4107,9 +4162,6 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::hard_link(&outside, &path).unwrap();
         assert!(export_in(tmp.path(), "synthetic-project").is_err());
-        let alias = tmp.path().join("alias");
-        symlink(tmp.path(), &alias).unwrap();
-        assert!(export_in(&alias, "synthetic-project").is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), bytes);
     }
 
@@ -4521,9 +4573,6 @@ mod tests {
         let fifo = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         refused();
-        let alias = tmp.path().join("alias");
-        symlink(tmp.path().join("context-archives"), &alias).unwrap();
-        assert!(ArchiveStore::new(&alias.join("nested"), "p", "l").is_err());
         std::fs::remove_file(dir.join("lock")).unwrap();
         symlink(&victim, dir.join("lock")).unwrap();
         assert!(store.fs.lock().is_err());
@@ -4798,11 +4847,105 @@ mod tests {
             let error = project_fetch(tmp.path(), project, id, 0, 1).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
-        // A link on the way is refused, not followed and not "nothing there".
-        let alias = tmp.path().join("alias");
-        symlink(tmp.path(), &alias).unwrap();
-        assert!(ArchiveStore::open_existing(&alias, "another-project", "reader").is_err());
-        assert!(project_search(&alias, "another-project", "", 8).is_err());
+        // A link below the base is refused, not followed and not "nothing
+        // there".
+        let context = tmp.path().join("context-archives");
+        let scope = digest_parts(&[b"synthetic-project"]);
+        symlink(context.join(&other.scope), context.join(&scope)).unwrap();
+        assert!(ArchiveStore::open_existing(tmp.path(), "synthetic-project", "reader").is_err());
+        assert!(project_search(tmp.path(), "synthetic-project", "", 8).is_err());
+    }
+
+    /// The base is the user's choice of place and may be reached through a
+    /// link: it is resolved when the store is opened and the files are in
+    /// the real folder. Below the base nothing that is a link is followed.
+    #[test]
+    fn a_base_reached_through_a_link_works_and_a_link_below_the_base_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Where a temporary directory really is (on macOS, behind a link).
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let disk = root.join("another-disk");
+        std::fs::create_dir_all(disk.join("synaps")).unwrap();
+        std::fs::create_dir(root.join("home")).unwrap();
+        // The base itself is a link; and a link above a base that does not
+        // exist yet, two names deep.
+        symlink(disk.join("synaps"), root.join("home/.synaps-cli")).unwrap();
+        symlink(&disk, root.join("mount")).unwrap();
+        let bases = [
+            (root.join("home/.synaps-cli"), disk.join("synaps")),
+            (root.join("mount/not/yet"), disk.join("not/yet")),
+        ];
+        for (base, real) in &bases {
+            let store = setup_in(base, "synthetic-project");
+            let real_dir = real.join("context-archives").join(&store.scope);
+            let words = "through a link";
+            let sealed = store.seal_with_note(&text(words), "a note").unwrap().0;
+            let file = only_archive_file(&real_dir);
+            assert_eq!(file.file_name().unwrap().to_str(), Some(archive_name(&sealed.id).as_str()));
+            assert_eq!(mode(real), 0o700);
+            assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap(), text(words));
+            assert_eq!(store.search("through", 8).unwrap().len(), 1);
+            // The reads that open the store for themselves, and a second
+            // store on a base that now exists.
+            assert_eq!(project_fetch(base, "synthetic-project", &sealed.id, 0, 1).unwrap(), text(words));
+            assert_eq!(project_search(base, "synthetic-project", "through", 8).unwrap().len(), 1);
+            assert_eq!(export_in(base, "synthetic-project").unwrap().len(), 1);
+            let located = archive_file(base, "synthetic-project", &sealed.id).unwrap().unwrap();
+            assert_eq!(std::fs::canonicalize(located).unwrap(), file);
+            let again = setup_in(base, "synthetic-project");
+            assert_eq!(again.seal(&text(words), "").unwrap(), sealed);
+            assert_eq!(again.forget(&sealed.id).unwrap(), forgotten(&[&sealed.id]));
+            assert!(is_tombstone_of(&store, &file, &digest_of(words)));
+            assert!(store.search("through", 8).unwrap().is_empty());
+            assert_eq!(shelf_files(&real_dir).len(), 1);
+        }
+        for link in [root.join("home/.synaps-cli"), root.join("mount")] {
+            assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        }
+
+        // Below the base: `context-archives`, the project folder and a shelf
+        // that are links are not followed, through a linked base or not.
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let empty = || std::fs::read_dir(&outside).unwrap().count() == 0;
+        let (base, real) = &bases[0];
+        let scope = digest_parts(&[b"linked-project"]);
+        symlink(&outside, real.join("context-archives").join(&scope)).unwrap();
+        assert!(ArchiveStore::new(base, "linked-project", "l").is_err());
+        assert!(ArchiveStore::open_existing(base, "linked-project", "l").is_err());
+        assert!(project_search(base, "linked-project", "", 8).is_err());
+        for base in [root.join("plain"), root.join("mount/linked-below")] {
+            std::fs::create_dir(&base).unwrap();
+            symlink(&outside, base.join("context-archives")).unwrap();
+            assert!(ArchiveStore::new(&base, "synthetic-project", "l").is_err());
+            assert!(ArchiveStore::open_existing(&base, "synthetic-project", "l").is_err());
+        }
+        let store = setup_in(base, "synthetic-project");
+        let real_dir = real.join("context-archives").join(&store.scope);
+        symlink(&outside, real_dir.join("s000002")).unwrap();
+        let sealed = store.seal(&text("past a shelf that is a link"), "").unwrap();
+        let file = real_dir.join("s000003").join(archive_name(&sealed.id));
+        assert!(file.is_file());
+        assert!(empty(), "nothing was written through a link");
+
+        // A parent that can be passed through and not listed.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // nothing is closed to root
+        }
+        let parent = root.join("closed");
+        let base = parent.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let result = (|| {
+            let store = ArchiveStore::new(&base, "synthetic-project", "synthetic-logical")?;
+            let sealed = store.seal(&text("under a closed parent"), "")?;
+            let read = project_fetch(&base, "synthetic-project", &sealed.id, 0, 1)?;
+            store.forget(&sealed.id)?;
+            Ok::<_, io::Error>(read)
+        })();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.unwrap(), text("under a closed parent"));
+        assert_eq!(mode(&base), 0o700);
     }
 
     #[test]

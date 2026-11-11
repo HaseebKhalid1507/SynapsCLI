@@ -313,6 +313,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: a base directory reached through a link works.** The
+  store refused any link on the way to its base, so with `~/.synaps-cli`
+  (or a directory above it) a link to another disk, no context could be
+  saved, read or forgotten. It also opened every directory from `/` down
+  for reading, so a parent that can be passed through but not listed
+  refused it too. The base path is now resolved once, when the store is
+  opened, and the store lives in the real directory; a parent of an
+  existing base need not be listable. Below the base nothing changed:
+  `context-archives`, a project directory, a shelf or a file that is a link
+  is still refused and never followed.
 - **Context archives: a lock file with a second name, or read-only, no
   longer refuses every save.** The store wanted `lock` in a project's
   archive directory to have exactly one link and opened it read-write. A
