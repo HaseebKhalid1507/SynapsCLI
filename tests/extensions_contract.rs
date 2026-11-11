@@ -166,6 +166,40 @@ fn after_tool_call_truncates_utf8_safely() {
     );
 }
 
+/// A hook is documented as notify-only exactly when the engine sends it
+/// without waiting, and each such hook says what naming it costs on an
+/// older host.
+#[test]
+fn notify_only_hooks_are_documented_as_such_and_as_additive() {
+    let contract = extension_contract();
+    for &hook in ALL_HOOK_KINDS {
+        let entry = &contract["hooks"][hook.as_str()];
+        let delivery = entry["delivery"].as_str();
+        assert_eq!(
+            delivery.is_some_and(|text| text.starts_with("notify-only")),
+            hook.is_notification(),
+            "{}: delivery = {delivery:?}",
+            hook.as_str()
+        );
+        if hook.is_notification() {
+            assert_eq!(hook.allowed_action_names(), ["continue"]);
+            let compatibility = entry["compatibility"].as_str().unwrap_or_default();
+            assert!(
+                compatibility.contains("no version bump")
+                    && compatibility.contains("fails to load on a host that predates it"),
+                "{}: {compatibility}",
+                hook.as_str()
+            );
+            assert!(entry["event_data"].is_string(), "{}", hook.as_str());
+        }
+    }
+    assert_eq!(
+        contract["extension_protocol_version"],
+        serde_json::json!(1),
+        "new hook kinds are additive: no protocol bump"
+    );
+}
+
 /// `context_phase` is an additive optional result within protocol version 1:
 /// it is advertised only on `on_message_complete`, documented in the
 /// contract, and the protocol version is not bumped for it.

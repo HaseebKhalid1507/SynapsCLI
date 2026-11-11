@@ -24,11 +24,11 @@ pub const MAX_HOOK_OUTPUT: usize = 256 * 1024; // 256 KB
 
 // ── HookKind ──────────────────────────────────────────────────────────────────
 
-/// All hook event kinds in the phase-1 catalog.
+/// All hook event kinds.
 ///
 /// Each variant identifies a well-defined extension point in the agent loop.
-/// The set is intentionally closed; new kinds are added via a breaking version
-/// bump so existing permission grants stay coherent.
+/// Kinds are added additively within protocol version 1; an extension that
+/// names a kind the host does not know fails to load on that host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookKind {
@@ -46,6 +46,9 @@ pub enum HookKind {
     OnSessionStart,
     /// Fires when a session is torn down.
     OnSessionEnd,
+    /// Fires after a context rollover has sealed a window into an archive
+    /// file. Notify-only ([`Self::is_notification`]).
+    OnContextArchived,
 }
 
 impl HookKind {
@@ -63,6 +66,7 @@ impl HookKind {
         Self::OnCompaction,
         Self::OnSessionStart,
         Self::OnSessionEnd,
+        Self::OnContextArchived,
     ];
 
     /// Canonical string identifier for this kind, suitable for serialization
@@ -76,6 +80,7 @@ impl HookKind {
             Self::OnCompaction => "on_compaction",
             Self::OnSessionStart => "on_session_start",
             Self::OnSessionEnd => "on_session_end",
+            Self::OnContextArchived => "on_context_archived",
         }
     }
 
@@ -93,6 +98,7 @@ impl HookKind {
             "on_compaction" => Some(Self::OnCompaction),
             "on_session_start" => Some(Self::OnSessionStart),
             "on_session_end" => Some(Self::OnSessionEnd),
+            "on_context_archived" => Some(Self::OnContextArchived),
             _ => None,
         }
     }
@@ -113,8 +119,17 @@ impl HookKind {
             // `context_checkpoint` tool without a note). Never capacity or
             // permission authority.
             Self::OnMessageComplete => &["continue", "context_phase"],
-            Self::OnCompaction | Self::OnSessionEnd => &["continue"],
+            Self::OnCompaction | Self::OnSessionEnd | Self::OnContextArchived => &["continue"],
         }
+    }
+
+    /// Whether this kind is notify-only: sent with
+    /// [`HookBus::notify`](crate::extensions::hooks::HookBus::notify), which
+    /// does not wait for the handlers and discards whatever they answer. A
+    /// slow, failing or absent handler cannot delay or change what the
+    /// event reports.
+    pub fn is_notification(&self) -> bool {
+        matches!(self, Self::OnContextArchived)
     }
 
     /// Whether this hook can be filtered by tool name in a manifest.
@@ -145,9 +160,12 @@ impl HookKind {
     pub fn required_permission(&self) -> Permission {
         match self {
             Self::BeforeToolCall | Self::AfterToolCall => Permission::ToolsIntercept,
-            Self::BeforeMessage | Self::OnMessageComplete | Self::OnCompaction => {
-                Permission::LlmContent
-            }
+            // `on_context_archived` carries no content, but its path leads
+            // to the archived conversation.
+            Self::BeforeMessage
+            | Self::OnMessageComplete
+            | Self::OnCompaction
+            | Self::OnContextArchived => Permission::LlmContent,
             Self::OnSessionStart | Self::OnSessionEnd => Permission::SessionLifecycle,
         }
     }
@@ -190,6 +208,9 @@ pub fn hook_cwd(cwd: Option<&Path>) -> Option<String> {
 /// | `on_compaction`       |           |            |             | ✓       | ✓          | ✓   |
 /// | `on_session_start`    |           |            |             |         | ✓          | ✓   |
 /// | `on_session_end`      |           |            |             |         | ✓          | ✓   |
+/// | `on_context_archived` |           |            |             |         | ✓          | ✓   |
+///
+/// `on_context_archived` carries its payload in `data`.
 ///
 /// `✓*` — set via [`HookEvent::with_session`] for foreground sessions; `null`
 /// for workers (no conversation id) and when `SYNAPS_HOOK_SESSION_ID=0`.
@@ -371,6 +392,49 @@ impl HookEvent {
             tool_runtime_name: None,
             transcript: None,
             data,
+        }
+    }
+
+    /// Construct an `on_context_archived` event: a context rollover sealed a
+    /// window of chat `session_id` into the archive file at `path` (`None`
+    /// when the file could not be located, or its path is not UTF-8).
+    /// `window` is the window that starts after the archive.
+    ///
+    /// One window is one archive today, so the event is always part 1 of 1,
+    /// starting at source message 0, with nothing reduced. Those four fields
+    /// are there now so the shape stays the same once an oversized window is
+    /// sealed as several archives, one event per part.
+    pub fn on_context_archived(
+        session_id: &str,
+        archive_id: &str,
+        path: Option<&Path>,
+        project_key: &str,
+        message_count: usize,
+        source_message_count: usize,
+        window: u64,
+    ) -> Self {
+        Self {
+            kind: HookKind::OnContextArchived,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            message: None,
+            session_id: Some(session_id.to_string()),
+            cwd: None,
+            tool_runtime_name: None,
+            transcript: None,
+            data: serde_json::json!({
+                "archive_id": archive_id,
+                "path": path.and_then(Path::to_str),
+                "project_key": project_key,
+                "message_count": message_count,
+                "source_message_count": source_message_count,
+                "window": window,
+                "part": 1,
+                "parts": 1,
+                "first_source_index": 0,
+                "reduced_messages": 0,
+            }),
         }
     }
 
@@ -629,6 +693,7 @@ mod tests {
             HookKind::OnCompaction,
             HookKind::OnSessionStart,
             HookKind::OnSessionEnd,
+            HookKind::OnContextArchived,
         ];
         for kind in all {
             let s = kind.as_str();
@@ -689,6 +754,37 @@ mod tests {
             HookKind::OnSessionEnd.required_permission(),
             Permission::SessionLifecycle
         );
+        assert_eq!(
+            HookKind::OnContextArchived.required_permission(),
+            Permission::LlmContent
+        );
+    }
+
+    /// The notify-only kinds: no tool filter, and `continue` is the only
+    /// answer they accept (it is discarded anyway).
+    #[test]
+    fn notification_kinds_are_continue_only() {
+        let notifications: Vec<HookKind> = HookKind::ALL
+            .iter()
+            .copied()
+            .filter(HookKind::is_notification)
+            .collect();
+        assert_eq!(notifications, [HookKind::OnContextArchived]);
+        for kind in notifications {
+            assert_eq!(kind.allowed_action_names(), ["continue"], "{kind:?}");
+            assert!(!kind.allows_tool_filter(), "{kind:?}");
+            assert!(kind.allows_result(&HookResult::Continue));
+            for refused in [
+                HookResult::Block { reason: "r".into() },
+                HookResult::Inject { content: "c".into() },
+                HookResult::confirm("m"),
+                HookResult::Modify { input: json!({}) },
+                HookResult::Replace { output: "o".into() },
+                HookResult::ContextPhase { phase: "new_task".into() },
+            ] {
+                assert!(!kind.allows_result(&refused), "{kind:?} {refused:?}");
+            }
+        }
     }
 
     // ── HookEvent constructors ────────────────────────────────────────────────
@@ -765,6 +861,56 @@ mod tests {
         assert!(ev.transcript.is_none());
     }
 
+    /// The wire shape of `on_context_archived`: everything new is in `data`,
+    /// and a single archive is part 1 of 1.
+    #[test]
+    fn hook_event_on_context_archived() {
+        let id = "9f2c".repeat(8);
+        let file = std::env::temp_dir().join("s000001").join(format!("{id}.json"));
+        let ev = HookEvent::on_context_archived(
+            "chat-1",
+            &id,
+            Some(&file),
+            "p0123456789abcdef",
+            212,
+            240,
+            4,
+        );
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            json!({
+                "kind": "on_context_archived",
+                "tool_name": null,
+                "tool_runtime_name": null,
+                "tool_input": null,
+                "tool_output": null,
+                "message": null,
+                "session_id": "chat-1",
+                "cwd": null,
+                "transcript": null,
+                "data": {
+                    "archive_id": id,
+                    "path": file.to_str().unwrap(),
+                    "project_key": "p0123456789abcdef",
+                    "message_count": 212,
+                    "source_message_count": 240,
+                    "window": 4,
+                    "part": 1,
+                    "parts": 1,
+                    "first_source_index": 0,
+                    "reduced_messages": 0,
+                },
+            })
+        );
+        // The id is always set: the SYNAPS_HOOK_SESSION_ID switch is for the
+        // tool and message hooks, whose constructors leave it unset.
+        assert_eq!(ev.session_id.as_deref(), Some("chat-1"));
+        // A file that could not be located is `null`, never a guessed path.
+        let lost = HookEvent::on_context_archived("chat-1", &id, None, "p0", 1, 1, 2);
+        assert_eq!(lost.data["path"], Value::Null);
+        assert_eq!(lost.data["archive_id"], json!(id));
+    }
+
     #[test]
     fn hook_event_on_session_start() {
         let ev = HookEvent::on_session_start("sess-abc-123");
@@ -829,6 +975,7 @@ mod tests {
             HookEvent::on_compaction("a", "b", "s", 1, json!({})),
             HookEvent::on_session_start("s"),
             HookEvent::on_session_end("s", None),
+            HookEvent::on_context_archived("s", "a", None, "p", 1, 1, 2),
         ] {
             let wire = serde_json::to_value(&ev).unwrap();
             assert_eq!(wire.get("cwd"), Some(&Value::Null), "{:?}", ev.kind);
@@ -862,6 +1009,16 @@ mod tests {
         assert_eq!(hook_cwd(Some(dir)), None);
         let ev = HookEvent::before_message("hi").with_cwd(Some(dir));
         assert_eq!(serde_json::to_value(&ev).unwrap()["cwd"], Value::Null);
+    }
+
+    /// The same rule for an archive's `path`.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_archive_path_is_null() {
+        use std::os::unix::ffi::OsStrExt;
+        let file = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/archives-\xff/a.json"));
+        let ev = HookEvent::on_context_archived("s", "a", Some(file), "p", 1, 1, 2);
+        assert_eq!(ev.data["path"], Value::Null);
     }
 
     // ── HookResult ────────────────────────────────────────────────────────────
@@ -956,12 +1113,13 @@ mod tests {
                 | HookKind::OnMessageComplete
                 | HookKind::OnCompaction
                 | HookKind::OnSessionStart
-                | HookKind::OnSessionEnd => {}
+                | HookKind::OnSessionEnd
+                | HookKind::OnContextArchived => {}
             }
         }
         assert_eq!(
             HookKind::ALL.len(),
-            7,
+            8,
             "a HookKind variant was added or removed -- update HookKind::ALL \
              and docs/extensions/contract.json to match"
         );

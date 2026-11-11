@@ -39,6 +39,7 @@ filters stay exact.
 | `on_compaction` | `privacy.llm_content` | no | `continue` | Observe completed conversation compaction summaries |
 | `on_session_start` | `session.lifecycle` | no | `continue`, `inject` | Observe session creation and optionally inject session-stable context |
 | `on_session_end` | `session.lifecycle` | no | `continue` | Observe session shutdown and transcript |
+| `on_context_archived` | `privacy.llm_content` | no | `continue` | [Notify-only](#notify-only-hooks): a context window was sealed into an archive file |
 
 Unsupported result actions are ignored fail-open and logged as warnings.
 
@@ -95,6 +96,108 @@ registration order. Put high-priority security policy extensions earlier in plug
 load order, and avoid granting trust to plugins that can modify tool inputs unless
 you accept this ordering behavior.
 
+## Notify-only hooks
+
+`on_context_archived` tells you that something has already happened. It is
+sent after the fact, and Synaps does not wait for you:
+
+- **Nothing you do changes or delays it.** The host hands the event to a
+  background task and carries on at once. A handler that is slow, hangs,
+  crashes, answers with an error, or is not there at all leaves the rollover
+  exactly as it would have been, and no slower.
+- **Your answer is discarded.** Return `{"action": "continue"}`. Anything
+  else is ignored.
+- **Best effort.** An event is sent once and not retried. It is lost when
+  your process is down and cannot be started within the call, when the call
+  takes longer than 5 s, when 64 notify-only events are already being
+  delivered (a handler that is slow while events keep coming does not build
+  a queue in the host; the extra events are dropped and logged), and when
+  the host exits first.
+- **Unordered, and sometimes twice.** Events are delivered independently, so
+  two of them can arrive in either order. If your process dies mid-call it is
+  restarted and sent the event again. Make the handler idempotent.
+- **Answer at once and do the work afterwards.** Calls to one extension are
+  made one at a time, so while your handler sits on a notify-only event your
+  other hooks (a `before_tool_call`, say) wait behind it, each for up to its
+  own 5 s. Put the event on your own queue and reply.
+- **The files are the truth; the hook is a hint.** If your index must be
+  complete, read the store when you start and treat events as the fast path.
+- **Not sent for subagent workers.**
+
+**Compatibility.** These hook kinds are additive within protocol version 1:
+an extension that does not name them is unaffected. An extension that does
+name one fails to load on a Synaps that predates it (`Unknown hook kind`), so
+a plugin that subscribes needs a new enough host.
+
+### `on_context_archived`
+
+When a chat gets too long, automatic context management (`/context auto`)
+seals the older messages into an archive file and the chat continues in a
+fresh window. This hook fires each time such a file has been written.
+Requires `privacy.llm_content`: the event carries no conversation text, but
+its `path` leads to it.
+
+```json
+{
+  "kind": "on_context_archived",
+  "tool_name": null,
+  "tool_runtime_name": null,
+  "tool_input": null,
+  "tool_output": null,
+  "message": null,
+  "session_id": "20260501-120000-abcd",
+  "cwd": "/home/u/project",
+  "transcript": null,
+  "data": {
+    "archive_id": "9f2c1a7e04b35d6688c1f0a2b7d94e13",
+    "path": "/home/u/.synaps-cli/context-archives/<64 hex>/s000001/9f2c1a7e04b35d6688c1f0a2b7d94e13.json",
+    "project_key": "p0123456789abcdef",
+    "message_count": 212,
+    "source_message_count": 240,
+    "window": 4,
+    "part": 1,
+    "parts": 1,
+    "first_source_index": 0,
+    "reduced_messages": 0
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `session_id` | The chat the window belonged to. Always set; `SYNAPS_HOOK_SESSION_ID=0` does not apply. |
+| `cwd` | That chat's working folder (see below). |
+| `data.archive_id` | 32 lowercase hex characters. The model sees it as `ctx-<archive_id>` in `memory_search` and `memory_fetch`. |
+| `data.path` | Absolute path of the file that holds the archive, or `null` if it could not be located or is not valid UTF-8. |
+| `data.project_key` | The project the archive belongs to (`p` and 16 hex characters). |
+| `data.message_count` | Messages stored in the archive. |
+| `data.source_message_count` | Messages in the window before filtering; system messages, reasoning and restricted content are not archived. |
+| `data.window` | Number of the window that starts after this archive. |
+| `data.part`, `data.parts` | Which archive of the window this is, counting from 1, and how many there are. A window is one archive today, so both are `1`. A later version may seal an oversized window as several archives and then sends one event per part, with the same `window`, in any order. |
+| `data.first_source_index` | Index in the window of the first message this archive covers. `0` today. |
+| `data.reduced_messages` | Messages stored with an oversized payload left out. `0` today. |
+
+What it means, and what it does not:
+
+- **"This archive file now exists."** It is sent once the file is written and
+  synced. It does not promise the chat went on in the new window: saving the
+  new window can still fail or be cancelled, and a later attempt seals the
+  window again.
+- **The same `archive_id` can be announced more than once.** Sealing the same
+  window again finds the archive already written, writes nothing, and
+  announces it again. Key your work on `archive_id`.
+- **An archive can exist that was never announced:** the rollover was
+  cancelled just after the file was written, the event was dropped, or no
+  extension was listening. List the store when you start.
+- **Not sent when the seal fails.** The chat keeps its history and no event
+  goes out.
+- **Plain-file memory backend only.** With `memory.backend = axel` there is
+  no archive file and no event.
+- **Not for subagent workers**, whose windows are saved beside their own
+  transcripts, and not for `/compact`, which is `on_compaction`.
+- **Treat the file as read-only.** It is written once and never changed,
+  except that forgetting the archive replaces its content with a tombstone.
+
 ## `cwd`: the chat's working folder
 
 Every hook event carries `cwd`, and so does every `tool.call` request
@@ -108,6 +211,7 @@ for; `cwd` does.
 |---|---|
 | `before_message`, `on_message_complete`, `before_tool_call`, `after_tool_call` | the folder of the chat that fired the hook |
 | `on_session_start`, `on_session_end`, `on_compaction` | the folder of that session |
+| `on_context_archived` | the folder of the chat whose window was archived |
 | `tool.call` `params.cwd` | the folder of the chat (or worker) that called your tool |
 
 Which folder that is:
@@ -154,7 +258,8 @@ for extensions that hold **`tools.transform_output`**, so output transforms
 session's. Nothing else fires for a worker's tool calls: no `before_tool_call`
 (so a worker never raises a confirm prompt and an extension can't block or
 modify its input), no observe-only `after_tool_call` (`tools.intercept`
-without `tools.transform_output`), no message or session hooks.
+without `tools.transform_output`), no message or session hooks, no
+notify-only hooks.
 
 - **Same rules as the main session:** the handler chain order, the first
   `replace` wins, the two-key permission gate, the 5 s timeout, the 1 MiB

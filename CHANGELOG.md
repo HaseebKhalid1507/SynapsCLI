@@ -34,6 +34,16 @@ All notable changes to this project will be documented in this file.
   report their parent chat's folder. Always present (`null` only if the
   path is not valid UTF-8), not canonicalised, additive: an extension that
   ignores it is unaffected. See `docs/extensions/hooks.md`.
+- **Extensions: `on_context_archived` hook.** When context rollover seals a
+  chat's older messages into an archive file, extensions that subscribe
+  (`privacy.llm_content`) are told the archive's id, the file that holds it,
+  the project, the message counts and the chat's `session_id` and `cwd`, so
+  an extension that indexes history can keep up. It is notify-only: the host
+  never waits for the handler, and a slow, hung, crashed or absent extension
+  cannot delay, fail or change a rollover. Best effort and unordered; one
+  archive can be announced more than once. Plain-file memory backend only.
+  Additive: existing extensions are unaffected, and an extension that names
+  the hook does not load on an older Synaps. See `docs/extensions/hooks.md`.
 
 ### Changed
 

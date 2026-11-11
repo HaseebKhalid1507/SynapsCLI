@@ -18,6 +18,9 @@ use synaps_cli::extensions::runtime::ExtensionHandler;
 use synaps_cli::tools::ToolOrigin;
 use synaps_cli::{Tool, ToolContext};
 
+#[path = "support/notify_hooks.rs"]
+mod notify_hooks;
+
 struct EchoTestTool;
 
 #[async_trait]
@@ -2274,6 +2277,83 @@ async fn plugin_load_in_one_session_keeps_other_sessions_activations() {
         set_b = next;
     }
     assert!(!set_b.is_stale(tools.read().await.catalog()));
+
+    manager.shutdown_all().await;
+}
+
+// ── notify-only hooks over the real wire ─────────────────────────────────────
+
+/// `on_context_archived` as a process extension receives it: the full
+/// `hook.handle` params, with the chat's folder. The extension answers
+/// `block`, which this hook does not accept and nobody waits for. An
+/// extension written before the hook existed is sent nothing new.
+#[tokio::test(flavor = "current_thread")]
+async fn on_context_archived_reaches_its_subscriber_and_nobody_else() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    // Subscribed to every hook kind that existed before this one.
+    let bystander_log = install_session_id_echo_plugin(home.path(), "bystander");
+
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let (loaded, failed) = manager.discover_and_load().await;
+    assert_eq!(loaded, vec!["bystander".to_string()]);
+    assert!(failed.is_empty(), "unexpected discovery failures: {failed:?}");
+    let log = notify_hooks::load(
+        &mut manager,
+        home.path(),
+        "archive-indexer",
+        "block",
+        &["on_context_archived"],
+    )
+    .await;
+
+    let chat = tempfile::tempdir().unwrap();
+    assert_ne!(chat.path(), std::env::current_dir().unwrap());
+    let id = "9f2c".repeat(8);
+    let file = home.path().join("s000001").join(format!("{id}.json"));
+    hook_bus.notify(
+        HookEvent::on_context_archived("sess-A", &id, Some(&file), "p0123456789abcdef", 212, 240, 4)
+            .with_cwd(Some(chat.path())),
+    );
+
+    let seen = notify_hooks::wait_for(&log, 1).await;
+    assert_eq!(
+        seen[0]["params"],
+        json!({
+            "kind": "on_context_archived",
+            "tool_name": null,
+            "tool_runtime_name": null,
+            "tool_input": null,
+            "tool_output": null,
+            "message": null,
+            "session_id": "sess-A",
+            "cwd": chat.path().to_str().unwrap(),
+            "transcript": null,
+            "data": {
+                "archive_id": id,
+                "path": file.to_str().unwrap(),
+                "project_key": "p0123456789abcdef",
+                "message_count": 212,
+                "source_message_count": 240,
+                "window": 4,
+                "part": 1,
+                "parts": 1,
+                "first_source_index": 0,
+                "reduced_messages": 0
+            }
+        })
+    );
+
+    // The bystander is alive and was sent only what it subscribed to.
+    let _ = hook_bus.emit(&HookEvent::before_message("hi")).await;
+    let kinds: Vec<Value> = read_jsonl(&bystander_log)
+        .iter()
+        .map(|entry| entry["kind"].clone())
+        .collect();
+    assert_eq!(kinds, vec![json!("before_message")]);
+    assert_eq!(notify_hooks::logged(&log).len(), 1, "delivered once");
 
     manager.shutdown_all().await;
 }

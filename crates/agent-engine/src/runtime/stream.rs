@@ -1505,6 +1505,15 @@ impl StreamMethods {
                                 return Err(super::continuation::unproductive_rollover_error());
                             }
                             Ok(super::continuation::RolloverPreparation::Ready(prepared)) => {
+                                // The archive is on disk: tell extensions
+                                // (`on_context_archived`). Notify-only, never
+                                // awaited; nothing below depends on it.
+                                super::continuation::notify_archived(
+                                    &hook_bus,
+                                    &memory_backend,
+                                    &prepared,
+                                    cwd.as_deref(),
+                                );
                                 // A cancel that landed while the successor was
                                 // being prepared must stop HERE: `persist_head`
                                 // latches `durability_blocked` before it asks

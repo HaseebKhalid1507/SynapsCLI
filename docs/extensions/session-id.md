@@ -13,6 +13,7 @@ hooks.
 | `on_compaction`       | new session id      | unchanged                                  |
 | `on_session_start`    | session id          | unchanged                                  |
 | `on_session_end`      | session id          | unchanged                                  |
+| `on_context_archived` | (new hook)          | `"<conversation id>"` of the chat whose window was archived; always set |
 | `tool.call` request   | absent              | `params.session_id`: the conversation that invoked the extension's tool (`null` for workers) |
 
 The field already existed as `Option<String>` in the JSON schema

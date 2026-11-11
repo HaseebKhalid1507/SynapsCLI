@@ -74,6 +74,16 @@
       "actions": [
         "continue"
       ]
+    },
+    "on_context_archived": {
+      "permission": "privacy.llm_content",
+      "tool_filter": false,
+      "actions": [
+        "continue"
+      ],
+      "delivery": "notify-only: sent after a context rollover has written and synced the archive file, never awaited, result discarded; best effort (dropped on a 5 s timeout, when 64 notify-only deliveries are in flight, or when the host exits), unordered, and one archive_id may be announced more than once; plain-file memory backend only, never for subagent workers",
+      "compatibility": "additive hook kind within extension_protocol_version 1 (no version bump): extensions that do not name it are unaffected; an extension that subscribes to it fails to load on a host that predates it (unknown hook kind)",
+      "event_data": "{archive_id: 32 lowercase hex, path: absolute path of the archive file | null, project_key: string, message_count: int, source_message_count: int, window: int (the window that starts after the archive), part: int (1-based), parts: int, first_source_index: int, reduced_messages: int}; a window is one archive today, so part = parts = 1, first_source_index = 0 and reduced_messages = 0; session_id is the chat the window belonged to and is always set"
     }
   },
   "permissions": [

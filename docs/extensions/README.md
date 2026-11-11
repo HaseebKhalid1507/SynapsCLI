@@ -98,6 +98,7 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 | `before_message`    | A user message is about to be sent to the model          | ❌          | ❌            | ✅           |
 | `on_session_start`  | A new session has been initialized                       | ❌          | ❌            | ✅           |
 | `on_session_end`    | A session is being torn down                             | ❌          | ❌            | ❌           |
+| `on_context_archived` | A context window has been sealed into an archive file (notify-only) | ❌  | ❌            | ❌           |
 
 **Notes:**
 
@@ -108,6 +109,7 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 - `before_message` supports `inject`; injected content from matching extensions is accumulated. It is attached to the newest user message as a trailing ephemeral text block, positioned after the conversational cache marker (never the system prompt).
 - `on_session_start` supports `inject`; the content is appended to the system prompt once and carried unchanged for the whole session (session-stable, cache-safe).
 - The remaining hooks are observation-oriented today. Returning an unsupported action is ignored by the current call site.
+- `on_context_archived` is notify-only: it is sent after the fact, the host does not wait for the answer, and a slow, failing or absent handler changes nothing. See `hooks.md`, "Notify-only hooks".
 
 ---
 

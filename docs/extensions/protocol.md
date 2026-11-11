@@ -332,10 +332,10 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 | `tool_input`        | object \| null  | `before_tool_call`, `after_tool_call`         | The raw input arguments passed to the tool                       |
 | `tool_output`       | string \| null  | `after_tool_call`                             | The result returned by the tool (size-limited preview: ~32 KB prefix + marker) |
 | `message`           | string \| null  | `before_message`, `on_message_complete`, `on_compaction` | User/assistant/summary message content for message hooks         |
-| `session_id`        | string \| null  | `on_compaction`, `on_session_start`, `on_session_end` | Stable identifier for the current or newly-created session       |
+| `session_id`        | string \| null  | `on_compaction`, `on_session_start`, `on_session_end`, `on_context_archived` | Stable identifier for the current or newly-created session       |
 | `cwd`               | string \| null  | all                                           | The chat's working folder, as the client gave it (not canonicalised); see [hooks.md](hooks.md#cwd-the-chats-working-folder) |
 | `transcript`        | array \| null   | `on_session_end`                              | Conversation transcript delivered at session end                 |
-| `data`              | any             | all                                           | Extension-defined pass-through data; `null` in runtime events    |
+| `data`              | any             | all                                           | Per-hook payload (`on_message_complete`, `on_compaction`, `on_context_archived`); `null` on the other hooks |
 
 Fields that are not applicable to the current hook are always `null`, never omitted. You can safely access any field without a key-existence check.
 
@@ -363,6 +363,41 @@ messages compacted.
     "new_session_id": "20260501-120000-abcd",
     "message_count": 42,
     "source": "manual"
+  }
+}
+```
+
+### `on_context_archived`
+
+`on_context_archived` is sent after a context rollover has sealed a window of
+a chat into an archive file. It requires `privacy.llm_content` and is
+notify-only: the host does not wait for the response and discards it, so the
+handler can neither delay nor change the rollover. Delivery is best effort,
+unordered, and one archive can be announced more than once. See
+[hooks.md](hooks.md#notify-only-hooks) for the rules and for every field.
+
+```json
+{
+  "kind": "on_context_archived",
+  "tool_name": null,
+  "tool_runtime_name": null,
+  "tool_input": null,
+  "tool_output": null,
+  "message": null,
+  "session_id": "20260501-120000-abcd",
+  "cwd": "/home/u/project",
+  "transcript": null,
+  "data": {
+    "archive_id": "9f2c1a7e04b35d6688c1f0a2b7d94e13",
+    "path": "/home/u/.synaps-cli/context-archives/<64 hex>/s000001/9f2c1a7e04b35d6688c1f0a2b7d94e13.json",
+    "project_key": "p0123456789abcdef",
+    "message_count": 212,
+    "source_message_count": 240,
+    "window": 4,
+    "part": 1,
+    "parts": 1,
+    "first_source_index": 0,
+    "reduced_messages": 0
   }
 }
 ```
@@ -774,7 +809,7 @@ Relative command paths and local argument paths are resolved from the plugin dir
 | Permission           | What it unlocks                                                                            |
 |----------------------|--------------------------------------------------------------------------------------------|
 | `tools.intercept`    | Allows subscription to `before_tool_call` and `after_tool_call`.                           |
-| `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`.                     |
+| `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`, and to `on_context_archived` (its path leads to conversation content). |
 | `session.lifecycle`  | Enables receipt of `on_session_start` and `on_session_end` events; also the second key for the advisory `context_phase` result on `on_message_complete`. |
 | `tools.register`    | Register extension-provided tools during initialization.                                    |
 | `providers.register`| Register extension-provided provider metadata during initialization. Chat routing is not wired yet. |
@@ -795,6 +830,9 @@ SynapsCLI is designed to degrade gracefully when extensions misbehave. If your e
 - **Sends a malformed response** — treated as `continue`. The error is logged through SynapsCLI tracing.
 - **Crashes or closes stdout** — the runtime restarts the process and retries the request. If retry also fails, hook delivery fails open for that call.
 - **Sends an error object** instead of a result — treated as `continue`. The error message is logged.
+
+The notify-only hooks (`on_context_archived`) go further: the host does not
+wait for the response at all, so none of the above can delay what they report.
 
 After three restart attempts, the extension health becomes `Failed`; subsequent hook calls continue fail-open.
 

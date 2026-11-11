@@ -813,7 +813,7 @@ pub struct PreparedRollover {
     pub logical_id: String,
     epoch: uuid::Uuid,
     window: u64,
-    archive_id: String,
+    archive: ArchiveRef,
 }
 
 impl PreparedRollover {
@@ -828,7 +828,7 @@ impl PreparedRollover {
             ));
         }
         s.window = self.window;
-        s.latest_archive = Some(self.archive_id);
+        s.latest_archive = Some(self.archive.id);
         s.policy.reset();
         s.note.clear();
         s.last_advisory = None;
@@ -989,8 +989,68 @@ pub(crate) async fn rollover_for_boundary(
         logical_id,
         epoch,
         window,
-        archive_id: reference.id,
+        archive: reference,
     }))
+}
+
+/// Tell extensions that a rollover sealed a window (`on_context_archived`).
+/// Call it once [`rollover_for_boundary`] has returned a prepared rollover:
+/// the archive file is then written and synced.
+///
+/// Notify-only. It returns at once, awaits nothing and cannot fail, so the
+/// cancel check, head save and commit that follow never depend on an
+/// extension. The file lookup and the delivery run on the hook bus's
+/// detached, bounded task ([`HookBus::notify_with`]); with no subscriber not
+/// even the lookup happens.
+///
+/// Sent for the file store only: the Axel backend has no archive file. A
+/// worker's bus sends nothing. Sent whenever the seal succeeded, including
+/// when it found the archive already written by an earlier attempt, so one
+/// archive can be announced more than once; a failed seal never gets here.
+///
+/// [`HookBus::notify_with`]: crate::extensions::hooks::HookBus::notify_with
+pub(crate) fn notify_archived(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    binding: &MemoryBinding,
+    prepared: &PreparedRollover,
+    cwd: Option<&std::path::Path>,
+) {
+    use crate::extensions::hooks::events::{HookEvent, HookKind};
+    if binding.exclusive() {
+        return;
+    }
+    let Ok(scope) = binding.scope() else {
+        return;
+    };
+    let (base, project_key) = (binding.base().to_owned(), scope.key().to_owned());
+    let (session_id, archive, window) = (
+        prepared.logical_id.clone(),
+        prepared.archive.clone(),
+        prepared.window,
+    );
+    let cwd = cwd.map(std::path::Path::to_path_buf);
+    hook_bus.notify_with(HookKind::OnContextArchived, async move {
+        let (key, id) = (project_key.clone(), archive.id.clone());
+        let path = tokio::task::spawn_blocking(move || {
+            agent_core::context_archive::archive_file(&base, &key, &id)
+        })
+        .await
+        .ok()
+        .and_then(|found| found.ok())
+        .flatten();
+        Some(
+            HookEvent::on_context_archived(
+                &session_id,
+                &archive.id,
+                path.as_deref(),
+                &project_key,
+                archive.message_count,
+                archive.source_message_count,
+                window,
+            )
+            .with_cwd(cwd.as_deref()),
+        )
+    });
 }
 
 /// Resume restores only window metadata from a verified source reference. It
@@ -1403,7 +1463,11 @@ mod tests {
             logical_id: "durability-test".into(),
             epoch: state.lock().unwrap().epoch,
             window: 2,
-            archive_id: "a".repeat(32),
+            archive: ArchiveRef {
+                id: "a".repeat(32),
+                message_count: 5,
+                source_message_count: 5,
+            },
         }
     }
 
@@ -2059,7 +2123,11 @@ mod command_tests {
             logical_id: "grace-test".into(),
             epoch,
             window: 2,
-            archive_id: "a".repeat(32),
+            archive: ArchiveRef {
+                id: "a".repeat(32),
+                message_count: 0,
+                source_message_count: 0,
+            },
         }
         .commit(&state)
         .unwrap();
@@ -4369,5 +4437,203 @@ mod calibration_transport_tests {
         assert_eq!(out.heads.len(), 1, "exactly one rollover");
         let head = crate::runtime::context::estimate_history(&out.heads[0]);
         assert!((40_000..=93_333).contains(&head), "head {head}");
+    }
+}
+
+/// `on_context_archived`: what [`notify_archived`] sends for a rollover's
+/// archive, and when it sends nothing. The stream loop's call, and a hook
+/// that hangs, fails or dies, are covered through the real loop in
+/// `tests/context_rollover_recovery.rs`.
+#[cfg(test)]
+mod archived_hook_tests {
+    use super::*;
+    use crate::extensions::hooks::events::HookKind;
+    use crate::extensions::hooks::test_support::Listener;
+    use crate::extensions::hooks::HookBus;
+    use crate::test_env::BaseDirGuard;
+    use agent_core::config::MemoryBackendKind;
+
+    const CHAT: &str = "chat-under-test";
+
+    fn window() -> Vec<SharedMessage> {
+        vec![
+            Arc::new(json!({"role":"user","content":"Build the plan. Do not deploy."})),
+            Arc::new(json!({"role":"assistant","content":"prior evidence ".repeat(5000)})),
+            Arc::new(json!({"role":"user","content":"Write the spec first."})),
+            Arc::new(json!({"role":"assistant","content":"The spec is written."})),
+        ]
+    }
+
+    fn chat_state() -> SharedContinuation {
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            s.logical_id = CHAT.into();
+            s.config.mode = ContextManagementMode::Auto;
+        }
+        state
+    }
+
+    async fn seal(
+        binding: &MemoryBinding,
+        state: &SharedContinuation,
+        messages: &[SharedMessage],
+    ) -> PreparedRollover {
+        let sealed = rollover_for_boundary(
+            messages,
+            state,
+            binding,
+            100_000,
+            SuccessorBudget::UNBOUNDED,
+            &Default::default(),
+            false,
+            "",
+        )
+        .await
+        .unwrap();
+        match sealed {
+            RolloverPreparation::Ready(prepared) => prepared,
+            RolloverPreparation::Unproductive => panic!("the window must roll over"),
+        }
+    }
+
+    async fn listening() -> (Arc<HookBus>, Arc<Listener>) {
+        let bus = Arc::new(HookBus::new());
+        let listener = Listener::prompt("indexer");
+        listener.subscribe(&bus, HookKind::OnContextArchived).await;
+        (bus, listener)
+    }
+
+    /// A rollover that was never sealed: no file holds its archive.
+    fn unsealed() -> PreparedRollover {
+        PreparedRollover {
+            messages: Vec::new(),
+            logical_id: CHAT.into(),
+            epoch: uuid::Uuid::new_v4(),
+            window: 2,
+            archive: ArchiveRef {
+                id: "a".repeat(32),
+                message_count: 3,
+                source_message_count: 4,
+            },
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_sealed_window_is_announced_with_its_archive_file() {
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let (bus, listener) = listening().await;
+        let (messages, state) = (window(), chat_state());
+        let prepared = seal(&binding, &state, &messages).await;
+        // The chat's folder, not the process's: only a stamped event has it.
+        let chat_folder = env.path().join("chat-folder");
+        assert_ne!(chat_folder, std::env::current_dir().unwrap());
+
+        notify_archived(&bus, &binding, &prepared, Some(&chat_folder));
+        let event = listener.wait_for(1).await.remove(0);
+
+        assert_eq!(event.kind, HookKind::OnContextArchived);
+        assert_eq!(event.session_id.as_deref(), Some(CHAT));
+        assert_eq!(event.cwd.as_deref(), chat_folder.to_str());
+        assert!(event.message.is_none() && event.transcript.is_none());
+        let data = &event.data;
+        let id = data["archive_id"].as_str().unwrap().to_owned();
+        assert_eq!(data["project_key"], json!(binding.scope().unwrap().key()));
+        assert_eq!(data["source_message_count"], json!(messages.len()));
+        assert_eq!(data["window"], json!(2));
+        assert_eq!((&data["part"], &data["parts"]), (&json!(1), &json!(1)));
+        assert_eq!(data["first_source_index"], json!(0));
+        assert_eq!(data["reduced_messages"], json!(0));
+
+        // The path is the file that holds this archive, a live record.
+        let path = std::path::PathBuf::from(data["path"].as_str().unwrap());
+        assert!(path.is_absolute() && path.starts_with(env.path()), "{path:?}");
+        assert_eq!(path.file_name().unwrap().to_str(), Some(format!("{id}.json").as_str()));
+        let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["id"], json!(id));
+        assert_eq!(record["body"]["state"], "live");
+        assert_eq!(record["body"]["source_message_count"], data["source_message_count"]);
+        assert_eq!(
+            json!(record["body"]["messages"].as_array().unwrap().len()),
+            data["message_count"]
+        );
+
+        // It is the archive the new window's marker names.
+        let next = prepared.commit(&state).unwrap();
+        assert_eq!(next[0]["_synaps_context"]["archive"], json!(id));
+        assert_eq!(next[0]["_synaps_context"]["window"], data["window"]);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(listener.events().len(), 1, "one archive, one event");
+        assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    /// The decision for a seal that wrote nothing because the archive was
+    /// already there (a retried rollover of the same window): it is
+    /// announced again. The host cannot tell that case from a first write,
+    /// and the retry may be the first attempt that got as far as the hook.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_window_found_already_sealed_is_announced_again() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let (bus, listener) = listening().await;
+        let (messages, state) = (window(), chat_state());
+        // Sealed twice without a commit in between: the same projection.
+        for _ in 0..2 {
+            let prepared = seal(&binding, &state, &messages).await;
+            notify_archived(&bus, &binding, &prepared, None);
+        }
+        let events = listener.wait_for(2).await;
+        assert_eq!(events[0].data, events[1].data, "the same archive, announced twice");
+        assert!(events[0].data["path"].is_string());
+        let listed = binding.history_search("", 8).await.unwrap();
+        assert_eq!(listed.len(), 1, "sealed once: {listed:?}");
+    }
+
+    /// The Axel backend has no archive file, so nothing is announced and
+    /// nothing is touched. The control is the same rollover on the file
+    /// store, which is delivered (without a path: nothing holds that id).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn nothing_is_announced_for_the_axel_backend() {
+        let env = BaseDirGuard::new();
+        let axel = crate::tools::test_helpers::memory_binding(MemoryBackendKind::Axel, env.path());
+        assert!(axel.exclusive());
+        let (bus, listener) = listening().await;
+        notify_archived(&bus, &axel, &unsealed(), None);
+        assert_eq!(bus.notifies_in_flight(), 0, "no delivery was started");
+        assert!(!env.path().join("context-archives").exists());
+        assert!(!env.path().join("brain.r8").exists());
+
+        let files = crate::tools::test_helpers::memory_binding(MemoryBackendKind::Legacy, env.path());
+        notify_archived(&bus, &files, &unsealed(), None);
+        let events = listener.wait_for(1).await;
+        assert_eq!(events.len(), 1, "only the file store's: {events:?}");
+        assert_eq!(events[0].data["path"], Value::Null);
+        assert_eq!(events[0].data["message_count"], json!(3));
+        assert!(!env.path().join("context-archives").exists(), "a lookup creates nothing");
+    }
+
+    /// A worker's windows are not in this store, and with nobody subscribed
+    /// not even the file lookup is started.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn nothing_is_announced_from_a_worker_or_without_a_subscriber() {
+        let env = BaseDirGuard::new();
+        let files = crate::tools::test_helpers::memory_binding(MemoryBackendKind::Legacy, env.path());
+        let (host, listener) = listening().await;
+        let worker = HookBus::worker_transforms(&host);
+        notify_archived(&worker, &files, &unsealed(), None);
+        let silent = Arc::new(HookBus::new());
+        notify_archived(&silent, &files, &unsealed(), None);
+        assert_eq!(
+            (worker.notifies_in_flight(), host.notifies_in_flight(), silent.notifies_in_flight()),
+            (0, 0, 0)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(listener.events().is_empty());
     }
 }
