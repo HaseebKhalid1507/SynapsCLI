@@ -2674,8 +2674,8 @@ impl ArchiveStore {
     /// the store reads ([`PrivateDir::not_a_segment`]), is passed over too,
     /// as a seal passes over it: the segment is the valid record under the
     /// name on an older shelf, if there is one. If there is none, the error
-    /// is that of the newest such file: there, and not readable as its
-    /// record. A read that fails for any other reason says nothing about
+    /// is that of the newest such file, named by its shelf and file name:
+    /// there, and not readable as its record. A read that fails for any other reason says nothing about
     /// what the file is and is the error at once.
     ///
     /// A passed-over file may be a damaged tombstone of the very content the
@@ -2722,7 +2722,13 @@ impl ArchiveStore {
                 Err(error) => return Err(error),
             };
             tracing::warn!(%shelf, file = %name, %error, "archive lookup passed over a file under its id");
-            first.get_or_insert(error);
+            // Named: the caller knows the id, not which shelf holds the file.
+            first.get_or_insert_with(|| {
+                io::Error::new(
+                    error.kind(),
+                    format!("the newest file under this id is not its record: {shelf}/{name}: {error}"),
+                )
+            });
         }
         first.map_or(Ok(None), Err)
     }
@@ -6699,12 +6705,17 @@ mod tests {
         }
 
         // With no valid record under the id on any shelf, the error is the
-        // odd file's, as it was.
+        // newest odd file's, named by its shelf and file.
         let lone = "0123456789abcdef0123456789abcdef";
         std::fs::write(newer.join(archive_name(lone)), b"not a record").unwrap();
         std::fs::write(older.join(archive_name(lone)), b"{}").unwrap();
+        let named = format!(
+            "the newest file under this id is not its record: s000002/{}: invalid archive record",
+            archive_name(lone)
+        );
         for error in [store.fetch(lone, 0, 1).unwrap_err(), store.forget(lone).unwrap_err()] {
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), named);
         }
         assert!(archive_file(base, "synthetic-project", lone).is_err());
         // A read that failed says nothing about the file: still the error.

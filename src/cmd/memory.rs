@@ -493,9 +493,9 @@ impl Archives {
 }
 
 /// A store error at `line`, with what the store's own words leave out: the
-/// id the line names and the project directory. The store may say only
-/// `invalid archive record` of a file under that id; the file is then
-/// `<id>.json` on a shelf of that directory. The id is printed only when it
+/// id the line names and the project directory. The store names a bad file
+/// under that id by its shelf and file name, relative to that directory.
+/// The id is printed only when it
 /// has the form of one (32 lowercase hex characters): nothing else of the
 /// line is.
 fn in_project(base: &Path, scope: &str, line: &[u8], error: io::Error) -> Stop {

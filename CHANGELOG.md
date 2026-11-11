@@ -458,6 +458,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: a lookup that stops at a bad file names it.** When
+  the newest file under an archive id is not a valid record and no older
+  shelf has one, a fetch, a forget or an import now says `the newest file
+  under this id is not its record: <shelf>/<id>.json: <error>` instead of
+  the bare `invalid archive record`, so a stopped `synaps memory
+  import-archives` names the file as well as the id and the project
+  directory.
 - **Extensions: the context archive format page says where a linked base
   works, and what an import changes.** A base that is a symbolic link works
   for the archive store only; the session journal, drafts and the source of
