@@ -305,9 +305,8 @@ What it means, and what it does not:
   already forgotten succeeds again, and is announced again. Key your work on
   `id`.
 - **Not every forget is announced.** No event is sent when the forget was
-  made by a subagent worker, by the tool loop of a model that an extension
-  provides, or by the `synaps retention` command, which runs without
-  extensions. And like every notify-only event it can be dropped.
+  made by a subagent worker or by the `synaps retention` command, which runs
+  without extensions. And like every notify-only event it can be dropped.
 - **The tombstone is the record.** Whether or not you were told, the forget
   is on disk: the archive's file now holds `"body": {"state": "tombstone"}`
   instead of its messages, and with the plain-file backend a forgotten note
@@ -348,20 +347,39 @@ Which folder that is:
   can differ from the folder the chat was created in. Attaching to a chat
   that is still running, or waking a parked one, does not change its folder.
 - **No folder of its own:** the host process's folder, which is also where
-  the tools run. That covers tools run by an extension-provided model's own
-  tool loop, a `tool.call` with no chat behind it, and a pinned chat the
-  daemon restores after its folder was deleted.
+  the tools run. One case: a pinned chat the daemon restores after its
+  folder was deleted. It reports the daemon's folder.
+
+The calls a chat causes outside its own turn loop carry its folder too:
+
+- **Tools run by an extension-provided model.** A model your extension
+  serves (`plugin:provider:model`) has its tool calls run by the host in a
+  loop of their own. They run in the chat's folder, and the
+  `before_tool_call` / `after_tool_call` events and `tool.call` requests
+  they cause carry the chat's `cwd` and `session_id`.
+- **A plugin slash command.** An extension tool run by `/plugin:command`
+  gets the `cwd` and `session_id` of the chat the command was typed in.
+- **The host's own calls to a memory extension** (capture and recall for a
+  chat with memory on) carry that chat's `cwd`. Their `session_id` is
+  `null`: the host makes them, not the chat's model.
 
 Rules:
 
-- **Always present.** A string, or `null` when the folder is not valid
-  UTF-8 or cannot be read. Never omitted. `SYNAPS_HOOK_SESSION_ID=0` does not
-  touch it, and workers have it although their `session_id` is `null`.
-- **As given, not canonical.** The path is the client's spelling: symlinks
-  are not resolved and it is not walked up to a repository root. On macOS
-  `/tmp/x` and `/private/tmp/x` are one folder; on Windows case and `\` vs
-  `/` vary. If you key state on `cwd`, canonicalise it yourself, and find the
-  repository root yourself if that is what you mean by "project".
+- **Always present.** The key is never omitted. The value is a string, or
+  `null` in two cases: the folder's path is not valid UTF-8; or the folder
+  to report is the host process's own (an in-process host, or the pinned
+  chat above) and the process can no longer read it, for instance because
+  it was deleted. `SYNAPS_HOOK_SESSION_ID=0` does not touch it, and workers
+  have it although their `session_id` is `null`.
+- **As given: Synaps does not canonicalise it.** The value is the folder as
+  the client gave it. That is normally the client's own working directory
+  as the operating system reports it, in which the OS has already resolved
+  symbolic links; a client that names a folder itself can spell it any way.
+  Synaps passes it on unchanged and does not walk it up to a repository
+  root. So one folder can arrive under two spellings: on macOS `/tmp/x` and
+  `/private/tmp/x`; on Windows case and `\` vs `/` vary. If you key state on
+  `cwd`, canonicalise it yourself, and find the repository root yourself if
+  that is what you mean by "project".
 - **Additive.** Hosts before this field omit the key. Treat a missing key
   like `null`. An extension that ignores `cwd` is unaffected.
 

@@ -35,14 +35,19 @@ hook event and `tool.call` also carries `cwd`, the chat's working folder
   `hooks.md`, "Subagent workers"), and it arrives with `session_id: null`;
   `SYNAPS_HOOK_SESSION_ID=0` changes nothing for it. Plugins must not assume
   every tool call belongs to a session.
-- **Extension-originated `tool.invoke`.** A tool invoked by a sidecar via the
-  extension protocol runs outside a conversation turn; `null`.
-- **`tool.call` outside a conversation.** The extension-provider tool route,
-  skill commands and host-originated lease calls (memory capture/recall)
-  send `params.session_id: null`.
+- **The host's own `tool.call`s.** The calls the host makes to a memory
+  extension for a chat (capture and recall) send `params.session_id: null`:
+  the host makes them, not the chat's model. Their `params.cwd` is the
+  chat's folder.
 - **Kill-switch `SYNAPS_HOOK_SESSION_ID=0`** (also `false`/`off`): forces
   `null` on the four tool/message hooks and on `tool.call` `params.session_id`. Use it if a plugin misbehaves on the
   new value. Session-lifecycle hooks are unaffected.
+
+Two kinds of call used to send `null` and now carry the chat's id, on their
+hook events and in `tool.call`: the tool calls of a model an extension
+provides (the host runs them in a loop of their own), and an extension tool
+run by a plugin slash command. For a worker on such a model the id is still
+`null`, as for every worker.
 
 ## Why: one sidecar, many sessions
 

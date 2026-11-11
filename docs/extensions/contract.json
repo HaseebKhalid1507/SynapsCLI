@@ -91,7 +91,7 @@
       "actions": [
         "continue"
       ],
-      "delivery": "notify-only: sent after the memory_forget tool has forgotten an archive or a note, never awaited, result discarded; best effort (dropped on a 5 s timeout, when 64 notify-only deliveries are in flight, or when the host exits), unordered, and a forgotten archive may be announced more than once; both memory backends; not sent for a forget that failed, nor for one made by a subagent worker, by an extension-provided model's tool loop, or by `synaps retention`",
+      "delivery": "notify-only: sent after the memory_forget tool has forgotten an archive or a note, never awaited, result discarded; best effort (dropped on a 5 s timeout, when 64 notify-only deliveries are in flight, or when the host exits), unordered, and a forgotten archive may be announced more than once; both memory backends; not sent for a forget that failed, nor for one made by a subagent worker or by `synaps retention`",
       "compatibility": "additive hook kind within extension_protocol_version 1 (no version bump): extensions that do not name it are unaffected; an extension that subscribes to it fails to load on a host that predates it (unknown hook kind)",
       "event_data": "{id: string, kind: \"archive\"|\"note\", project_key: string, scope: \"repository\"|\"user\"}; for an archive id is the bare 32 lowercase hex (archive_id of on_context_archived, no ctx- prefix), for a note the id as stored; scope user implies project_key p0000000000000000; session_id is the chat whose tool call it was, null when the call had no chat behind it"
     }
@@ -171,8 +171,8 @@
         "params": {
           "name": "the extension's own tool name (not the plugin-id:name runtime name)",
           "input": "the model-supplied arguments object",
-          "session_id": "owning conversation id; null for workers/subagents, the extension-provider tool route, contexts with no conversation, and under SYNAPS_HOOK_SESSION_ID=0. Always present.",
-          "cwd": "the folder the caller runs in (the chat's, a worker's parent chat's; the host process's when the call has no chat behind it), as the client gave it, not canonicalised; null only when it is not valid UTF-8 or cannot be read. The same value hook events carry as cwd. Always present."
+          "session_id": "owning conversation id; null for workers/subagents, for the host's own calls to a memory extension (capture and recall), and under SYNAPS_HOOK_SESSION_ID=0. Always present.",
+          "cwd": "the folder the caller runs in (the chat's; a worker's parent chat's; the chat's for the host's own memory calls), as the client gave it, not canonicalised by Synaps; null only when the path is not valid UTF-8, or when the folder to report is the host process's own and it cannot be read. The same value hook events carry as cwd. Always present."
         },
         "compatibility": "session_id and cwd are additive params keys within extension_protocol_version 1; extensions must ignore params keys they do not know"
       }

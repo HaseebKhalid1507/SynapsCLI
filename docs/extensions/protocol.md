@@ -216,8 +216,8 @@ Called when the model invokes an extension-provided tool declared during
 |--------------|----------------|-------------|
 | `name`       | string         | The extension's own tool name, as declared in `capabilities.tools` (not the `plugin-id:name` runtime name). |
 | `input`      | object         | The arguments the model supplied. |
-| `session_id` | string \| null | The conversation that invoked the tool: the same value the hook events carry. `null` for workers/subagents, the extension-provider tool route, contexts with no conversation, and when `SYNAPS_HOOK_SESSION_ID=0`. Always present. |
-| `cwd`        | string \| null | The folder the caller runs in: the same value the hook events carry. Set for workers too (their parent chat's folder); the host process's folder when the call has no chat behind it. Not canonicalised. `null` only when the folder is not valid UTF-8 or cannot be read. Always present. |
+| `session_id` | string \| null | The conversation that invoked the tool: the same value the hook events carry. `null` for workers/subagents, for the host's own calls to a memory extension (capture and recall), and when `SYNAPS_HOOK_SESSION_ID=0`. Always present. |
+| `cwd`        | string \| null | The folder the caller runs in: the same value the hook events carry. Set for workers too (their parent chat's folder) and for the host's own memory calls (the chat's folder). Not canonicalised by Synaps. `null` only when the path is not valid UTF-8, or when the folder to report is the host process's own and it cannot be read. Always present. |
 
 In daemon mode one extension process serves every session, so key any
 per-caller tool state on `params.session_id` (see
