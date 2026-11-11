@@ -376,7 +376,9 @@ pub(crate) fn lock_notes_file(
 
 /// Open (creating it, mode 0600, never through a symlink) a lock file. Read
 /// and write access: Windows locks only a handle that has one of them.
-fn open_lock_file(path: &Path) -> std::io::Result<fs::File> {
+/// The folder is not created. Public for `synaps memory import-notes`, whose
+/// one lock for a whole run is opened as a notes file's lock is.
+pub fn open_lock_file(path: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -1155,6 +1157,9 @@ pub struct ImportRun {
     /// found for them. A note with such an id is refused for the rest of
     /// the run: storing it would bring a forgotten note back.
     unfiled_tombstones: std::collections::HashSet<String>,
+    /// Whether the run has read every project's notes file under the base
+    /// (it does once, the first time a tombstone line has no project).
+    read_every_project: bool,
     finished: bool,
 }
 
@@ -1179,6 +1184,7 @@ impl ImportRun {
             dry_run,
             files: std::collections::HashMap::new(),
             unfiled_tombstones: std::collections::HashSet::new(),
+            read_every_project: false,
             finished: false,
         }
     }
@@ -1214,9 +1220,39 @@ impl ImportRun {
         }
     }
 
+    /// Read every `project-<key>.jsonl` under `<base>/memory` that the run
+    /// has not read yet. Once in a run: a file made later is one the run
+    /// made, and it has that already. Reads only; no memory folder is no
+    /// file. An error is a file or a folder that could not be read: the run
+    /// cannot say that no project holds an id, and must stop.
+    fn read_every_project(&mut self, base: &Path) -> Result<(), MemoryError> {
+        if self.read_every_project {
+            return Ok(());
+        }
+        let entries = match fs::read_dir(memory_dir_in(base)) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries.into_iter().flatten() {
+            let name = entry?.file_name();
+            let key = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("project-"))
+                .and_then(|name| name.strip_suffix(".jsonl"));
+            if let Some(key) = key.filter(|key| ProjectScope::validate_repository_key(key).is_ok())
+            {
+                self.file(base, key)?;
+            }
+        }
+        self.read_every_project = true;
+        Ok(())
+    }
+
     /// The projects in whose files this run has seen `id`, as a note or as a
     /// tombstone, sorted. Only files the run has read: those a line of the
-    /// run was filed in or judged against.
+    /// run was filed in or judged against, and all of them after
+    /// [`Self::read_every_project`].
     fn projects_holding(&self, id: &str) -> Vec<String> {
         let mut keys: Vec<String> = self
             .files
@@ -1321,8 +1357,9 @@ impl Drop for ImportRun {
 ///
 /// A tombstone line names no project. Under [`ImportTarget::AsRecorded`] it
 /// is applied to the project in whose file this run has seen its id (to
-/// each, if the run has seen the id in more than one), and refused only
-/// when there is none. A note with the id of a tombstone line that was
+/// each, if the run has seen the id in more than one). When the run has seen
+/// it in none, every project's notes file under the base is read for the id,
+/// and the line is refused only when none holds it. A note with the id of a tombstone line that was
 /// refused that way is then refused too, for the rest of the run, whatever
 /// its target: a forgotten note never comes out of an import live.
 ///
@@ -1362,6 +1399,10 @@ pub fn import_line_in(
 
 /// Why a note is refused after its tombstone line was.
 const UNFILED_TOMBSTONE: &str = "its tombstone in this run could not be filed";
+
+/// Why a tombstone line is refused as recorded.
+const UNPLACED_TOMBSTONE: &str = "a tombstone line names no project and no project's notes hold \
+                                  its id; pass --cwd or --project-key";
 
 fn refused(reason: &str) -> Result<ImportOutcome, MemoryError> {
     Ok(ImportOutcome::Refused(reason.to_string()))
@@ -1440,14 +1481,22 @@ fn import_tombstone(
     about.id = Some(tombstone.tombstone.clone());
     let keys = match target {
         ImportTarget::Project(key) => vec![key.to_string()],
-        ImportTarget::AsRecorded => run.projects_holding(&tombstone.tombstone),
+        ImportTarget::AsRecorded => {
+            let mut keys = run.projects_holding(&tombstone.tombstone);
+            if keys.is_empty() {
+                // Not in a file this run has opened. The note may be in the
+                // file of a project no line of this run has named yet (an
+                // earlier run stored it): look in every project's file
+                // before saying that there is none.
+                run.read_every_project(base)?;
+                keys = run.projects_holding(&tombstone.tombstone);
+            }
+            keys
+        }
     };
     if keys.is_empty() {
         run.unfiled_tombstones.insert(tombstone.tombstone);
-        return refused(
-            "a tombstone line names no project and this run has not seen its id; \
-             pass --cwd or --project-key",
-        );
+        return refused(UNPLACED_TOMBSTONE);
     }
     about.project = keys.first().cloned();
     let dry_run = run.dry_run;
@@ -2762,7 +2811,7 @@ mod tests {
             (r#"{"tombstone":"mem-x"}"#.to_string(), "missing field timestamp_ms"),
             (
                 r#"{"tombstone":"mem-gone","timestamp_ms":1}"#.to_string(),
-                "a tombstone line names no project and this run has not seen its id; \
+                "a tombstone line names no project and no project's notes hold its id; \
                  pass --cwd or --project-key",
             ),
         ];
@@ -2786,6 +2835,66 @@ mod tests {
             ImportOutcome::Stored
         );
         assert_eq!(run.finish().unwrap().len(), 1);
+    }
+
+    /// A tombstone line as recorded whose note an earlier run stored, in a
+    /// file no line of this run has named: every project's file is read for
+    /// the id before the line is refused (core-a5-review, finding 1).
+    #[test]
+    fn a_tombstone_as_recorded_finds_its_note_in_a_file_the_run_has_not_opened() {
+        let (a, b) = ("p1111111111111111", "p2222222222222222");
+        let as_recorded = ImportTarget::AsRecorded;
+        let tombstone = |id: &str| format!(r#"{{"tombstone":"{id}","timestamp_ms":9}}"#);
+        let file = |base: &Path, key: &str| namespace_file(base, &project_namespace(key));
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let mut run = ImportRun::new(false);
+        for (id, key) in [("mem-1", a), ("mem-5", b)] {
+            let stored = import(base, &exported(id, key, 1, "x"), as_recorded, &mut run);
+            assert_eq!(stored.outcome, ImportOutcome::Stored);
+        }
+        let _ = run.finish().unwrap();
+        // Not notes files of a project: none of these is read for an id.
+        let memory = memory_dir_in(base);
+        fs::write(memory.join("project-p0000000000000000.jsonl"), exported("mem-u", a, 1, "x"))
+            .unwrap();
+        fs::write(memory.join("session-notes.jsonl"), "not a note\n").unwrap();
+        fs::write(memory.join(".import.lock"), "").unwrap();
+
+        // The dry run says what the real run says and writes nothing.
+        for dry_run in [true, false] {
+            let before = fs::read_to_string(file(base, a)).unwrap();
+            let mut run = ImportRun::new(dry_run);
+            let late = import(base, &tombstone("mem-1"), as_recorded, &mut run);
+            assert_eq!(
+                (late.outcome, late.project.as_deref()),
+                (ImportOutcome::Forgotten, Some(a)),
+                "dry run {dry_run}"
+            );
+            // An id that no project's file holds is still refused, and so is
+            // one that only a file of no project holds.
+            for id in ["mem-nowhere", "mem-u"] {
+                let nowhere = import(base, &tombstone(id), as_recorded, &mut run);
+                assert_eq!(refusal(&nowhere), UNPLACED_TOMBSTONE, "{id}");
+            }
+            let files = run.finish().unwrap();
+            let text = fs::read_to_string(file(base, a)).unwrap();
+            if dry_run {
+                assert!(files.is_empty());
+                assert_eq!(text, before);
+            } else {
+                assert_eq!(files, [file(base, a)]);
+                assert_eq!(text.lines().last(), Some(tombstone("mem-1").as_str()));
+                assert!(!fs::read_to_string(file(base, b)).unwrap().contains("tombstone"));
+            }
+        }
+        // Again: it is there.
+        let mut run = ImportRun::new(false);
+        assert_eq!(
+            import(base, &tombstone("mem-1"), as_recorded, &mut run).outcome,
+            ImportOutcome::AlreadyPresent
+        );
+        assert!(run.finish().unwrap().is_empty());
     }
 
     /// A tombstone line as recorded, in both orders, and the refused case
@@ -2842,7 +2951,7 @@ mod tests {
             let refused = import(base, &tombstone("mem-9"), as_recorded, &mut run);
             assert_eq!(
                 refusal(&refused),
-                "a tombstone line names no project and this run has not seen its id; \
+                "a tombstone line names no project and no project's notes hold its id; \
                  pass --cwd or --project-key"
             );
             assert_eq!((refused.id.as_deref(), refused.project), (Some("mem-9"), None));

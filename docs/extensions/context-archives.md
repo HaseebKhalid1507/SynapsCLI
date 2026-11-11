@@ -724,7 +724,9 @@ synaps memory project [--cwd <DIR>]
 
 **The input is JSON Lines: one record per line,** the same object an archive
 file holds ([The record](#the-record)), live or tombstone. `-` is standard
-input, blank lines are skipped, and lines are imported in the order given,
+input; any other input must be a regular file (not a directory, a FIFO or a
+device), and every input is opened before a line is imported. Blank lines
+are skipped, and lines are imported in the order given,
 across the files in the order they are named. A directory of archive files
 is the same thing, one file after another with a newline between them:
 
@@ -737,7 +739,8 @@ for f in "$dir"/*.json "$dir"/s*/*.json; do cat "$f"; echo; done | synaps memory
 - `--as-recorded` files each record in the project directory its own
   `scope` names, and changes nothing in it;
 - `--cwd DIR` files every record under the project of that folder, found as
-  for a chat started there;
+  for a chat started there (refused while `SYNAPS_PROJECT_ROOT` is set:
+  that variable makes every folder one project);
 - `--project-key KEY` files every record under that project key.
 
 With the last two, `scope` is set to the new directory's name. That is the
@@ -769,11 +772,17 @@ What an import does with a record:
 The command prints one JSON document: the totals (`read`, `stored`,
 `already_present`, `forgotten`, `kept_forgotten`, `refused`), then one entry
 for each line with its id, its outcome and, when it was refused, the name of
-the check that failed. Nothing in the document is content. The exit code is
-0 when nothing was refused, 1 when something was, and 2 when the run
+the check that failed. Nothing in the document is content. A tombstone
+whose forget may not have reached every copy (see [Tombstones](#tombstones))
+has `unread` in its entry and its id in `forgets_not_complete`. The exit
+code is 0 when nothing was refused, 1 when something was or when a forget is
+in `forgets_not_complete`, and 2 when the run
 stopped (an input that cannot be read, a store that cannot be read or
 locked): what was imported before the stop is complete, and running the
-same command again continues. `--dry-run` writes nothing at all and prints
+same command again continues. When a store stops at a record, `stopped`
+names the line, the record's id and the project directory: a file under
+that id that is not a record (`<id>.json` on one of its shelves) stops
+every run there until it is moved away. `--dry-run` writes nothing at all and prints
 what the real run would print.
 
 What to know before you rely on it:
@@ -789,6 +798,10 @@ What to know before you rely on it:
 - **A record that names another project is moved, not shared.** Chats find
   an archive by project: after `--cwd` or `--project-key`, only chats of
   that project can fetch it, under the same `ctx-<id>`.
+- **The base directory must be there.** It is `SYNAPS_BASE_DIR`, or
+  `~/.synaps-cli`, and the document prints it as `base`. The command stops
+  (exit code 2) when it is not an absolute path, and a real run stops when
+  it does not exist: an import does not create a base.
 - **A refused record leaves no directory behind:** a project directory is
   made when the first record for it is stored.
 - **The longest line is 16 MiB and 4 KiB.** A longer one is refused without

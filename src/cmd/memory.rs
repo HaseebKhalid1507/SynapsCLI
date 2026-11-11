@@ -11,8 +11,9 @@
 //! holds content of an archive or a note: a refusal reason is the store's
 //! name for the check that failed, or one of the fixed texts below.
 //!
-//! Exit codes: 0 nothing was refused, 1 something was, 2 the run stopped (or
-//! the command line could not be used). There is no other code.
+//! Exit codes: 0 nothing was refused, 1 something was (or a forget did not
+//! reach every copy), 2 the run stopped (or the command line could not be
+//! used). There is no other code.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -28,7 +29,8 @@ use sha2::{Digest, Sha256};
 
 /// Nothing was refused.
 const EXIT_OK: i32 = 0;
-/// At least one line was refused; every other line was handled.
+/// At least one line was refused, or a forget may not have reached every
+/// copy; every other line was handled.
 const EXIT_REFUSED: i32 = 1;
 /// The run stopped, or the command line could not be used.
 const EXIT_STOPPED: i32 = 2;
@@ -70,7 +72,8 @@ pub enum MemoryAction {
         .args(["as_recorded", "cwd", "project_key"])
 ))]
 pub struct ImportArgs {
-    /// JSON Lines files, imported in the order given. `-` is standard input.
+    /// JSON Lines files, imported in the order given. `-` is standard input;
+    /// anything else must be a regular file.
     /// Blank lines are skipped.
     #[arg(required = true, value_name = "FILE")]
     files: Vec<PathBuf>,
@@ -78,7 +81,7 @@ pub struct ImportArgs {
     #[arg(long)]
     as_recorded: bool,
     /// File every line under the project of this folder, as a chat started
-    /// there would (`SYNAPS_PROJECT_ROOT` applies).
+    /// there would. Refused while `SYNAPS_PROJECT_ROOT` is set.
     #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
     /// File every line under this project key (`p` and 16 hex characters).
@@ -105,6 +108,11 @@ struct Report {
     /// they name were not forgotten by this run.
     #[serde(skip_serializing_if = "Option::is_none")]
     tombstones_not_applied: Option<NotApplied>,
+    /// `import-archives` only: tombstone records whose forget may not have
+    /// reached every copy of the content (the entries that have `unread`).
+    /// Their outcome is `forgotten`, so `total` does not show them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forgets_not_complete: Option<NotApplied>,
     projects: Vec<Project>,
     records: Vec<Entry>,
 }
@@ -307,6 +315,15 @@ fn destination(args: &ImportArgs) -> Result<Target, String> {
         });
     }
     if let Some(cwd) = &args.cwd {
+        if root_override() {
+            // The override wins before the folder is looked at: every
+            // folder, also one that does not exist, would be its project.
+            return Err(
+                "--cwd cannot be used while SYNAPS_PROJECT_ROOT is set: every folder is then \
+                 that root's project. Unset it, or pass --project-key; nothing was imported"
+                    .to_owned(),
+            );
+        }
         let scope = ProjectScope::discover(cwd).map_err(|e| format!("--cwd: {e}"))?;
         return Ok(Target {
             key: Some(scope.key().to_owned()),
@@ -314,7 +331,9 @@ fn destination(args: &ImportArgs) -> Result<Target, String> {
                 mode: "cwd",
                 cwd: Some(shown(cwd)),
                 project_key: Some(scope.key().to_owned()),
-                project_root_override: Some(root_override()),
+                // Always false: see above. Kept, so that a reader of the
+                // document need not know that.
+                project_root_override: Some(false),
             },
         });
     }
@@ -406,15 +425,36 @@ fn open_input(path: &Path) -> io::Result<Box<dyn BufRead>> {
     if path.as_os_str() == "-" {
         return Ok(Box::new(BufReader::new(io::stdin())));
     }
-    Ok(Box::new(BufReader::new(File::open(path)?)))
+    // An input is a regular file. Its kind is asked before it is opened
+    // (opening a FIFO waits for a writer) and again of what was opened (the
+    // name can change hands in between). A directory would open and fail at
+    // its first read, after earlier inputs were imported; a device such as
+    // /dev/zero never ends a line. A link to a regular file is one.
+    let regular = |meta: std::fs::Metadata| {
+        if meta.is_file() {
+            Ok(())
+        } else {
+            Err(io::Error::other("not a regular file"))
+        }
+    };
+    regular(std::fs::metadata(path)?)?;
+    let file = File::open(path)?;
+    regular(file.metadata()?)?;
+    Ok(Box::new(BufReader::new(file)))
 }
 
 // ─── The two stores ─────────────────────────────────────────────────────────
 
+/// Why a run stops at a line, and the line's id when it is known.
+struct Stop {
+    id: Option<String>,
+    error: String,
+}
+
 /// One store's side of a run. `Err` from `line` is the machine's fault and
 /// stops the run; a refusal is an `Ok`.
 trait Importer {
-    fn line(&mut self, line: &[u8]) -> Result<Judged, String>;
+    fn line(&mut self, line: &[u8]) -> Result<Judged, Stop>;
     /// An empty block for a project of this store.
     fn block(&self, project: &str) -> Project;
     /// End the run, on an early stop too.
@@ -452,8 +492,36 @@ impl Archives {
     }
 }
 
+/// A store error at `line`, with what the store's own words leave out: the
+/// id the line names and the project directory. The store may say only
+/// `invalid archive record` of a file under that id; the file is then
+/// `<id>.json` on a shelf of that directory. The id is printed only when it
+/// has the form of one (32 lowercase hex characters): nothing else of the
+/// line is.
+fn in_project(base: &Path, scope: &str, line: &[u8], error: io::Error) -> Stop {
+    #[derive(serde::Deserialize)]
+    struct Named {
+        id: String,
+    }
+    let id = serde_json::from_slice::<Named>(line)
+        .ok()
+        .map(|named| named.id)
+        .filter(|id| {
+            id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        });
+    let dir = base.join("context-archives").join(scope);
+    let error = match &id {
+        Some(id) => format!(
+            "{error} (importing {id}: see {id}.json on the shelves of the project directory {})",
+            dir.display()
+        ),
+        None => format!("{error} (in the project directory {})", dir.display()),
+    };
+    Stop { id, error }
+}
+
 impl Importer for Archives {
-    fn line(&mut self, line: &[u8]) -> Result<Judged, String> {
+    fn line(&mut self, line: &[u8]) -> Result<Judged, Stop> {
         let scope = match &self.target {
             Some((_, scope)) => scope.clone(),
             None => match archive::record_scope(line) {
@@ -463,8 +531,8 @@ impl Importer for Archives {
         };
         let rehome = self.target.is_some();
         if !self.stores.contains_key(&scope) {
-            let existing =
-                ArchiveStore::existing_scope(&self.base, &scope).map_err(|e| e.to_string())?;
+            let existing = ArchiveStore::existing_scope(&self.base, &scope)
+                .map_err(|e| in_project(&self.base, &scope, line, e))?;
             self.stores.insert(scope.clone(), existing);
         }
         let answer = match self.stores.get(&scope).and_then(Option::as_ref) {
@@ -480,7 +548,7 @@ impl Importer for Archives {
                 match ArchiveStore::import_dry_absent(&scope, line, rehome, &mut alone) {
                     Ok(Ok(_)) => {
                         let store = ArchiveStore::for_scope(&self.base, &scope)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| in_project(&self.base, &scope, line, e))?;
                         let answer = store.import(line, rehome, false, &mut self.seen);
                         self.stores.insert(scope.clone(), Some(store));
                         answer
@@ -489,7 +557,8 @@ impl Importer for Archives {
                 }
             }
         };
-        Ok(match answer.map_err(|e| e.to_string())? {
+        let answer = answer.map_err(|e| in_project(&self.base, &scope, line, e))?;
+        Ok(match answer {
             Err(refused) => Judged::refused(refused.id, refused.reason, Some(scope)),
             Ok(imported) => {
                 let (outcome, note_differs) = match imported.outcome {
@@ -577,24 +646,21 @@ fn lock_notes_import(base: &Path) -> Result<ExclusiveLock, String> {
     let cannot = |e: &dyn std::fmt::Display| {
         format!("cannot open the import lock {}: {e}; nothing was written", path.display())
     };
-    let open = |create: bool| -> io::Result<File> {
-        if path.symlink_metadata().is_ok_and(|meta| !meta.is_file()) {
+    // The store's own opener: it creates the file private and never opens
+    // through a link, so no check of the name beforehand can be raced.
+    let open = || -> io::Result<File> {
+        let file = notes::open_lock_file(&path)?;
+        if !file.metadata()?.is_file() {
             return Err(io::Error::other("it is not a regular file"));
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(create).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(private_fs::FILE_MODE);
-        }
-        options.open(&path)
+        Ok(file)
     };
-    let file = match open(false) {
+    let file = match open() {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // No memory folder yet.
             private_fs::ensure_private_dir(&dir).map_err(|e| cannot(&e))?;
-            open(true).map_err(|e| cannot(&e))?
+            open().map_err(|e| cannot(&e))?
         }
         Err(error) => return Err(cannot(&error)),
     };
@@ -606,7 +672,7 @@ fn lock_notes_import(base: &Path) -> Result<ExclusiveLock, String> {
 }
 
 impl Importer for Notes {
-    fn line(&mut self, line: &[u8]) -> Result<Judged, String> {
+    fn line(&mut self, line: &[u8]) -> Result<Judged, Stop> {
         let Ok(text) = std::str::from_utf8(line) else {
             return Ok(Judged::refused(None, "not UTF-8".to_owned(), None));
         };
@@ -615,7 +681,10 @@ impl Importer for Notes {
             None => ImportTarget::AsRecorded,
         };
         let imported = notes::import_line_in(&self.base, text, target, &mut self.run)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Stop {
+                id: None,
+                error: e.to_string(),
+            })?;
         let reason = match &imported.outcome {
             notes::ImportOutcome::Refused(reason) => Some(reason.clone()),
             _ => None,
@@ -686,6 +755,40 @@ fn print<T: Serialize>(document: &T) -> bool {
     out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_ok()
 }
 
+/// The base an import files under: `SYNAPS_BASE_DIR`, or `.synaps-cli` in
+/// the home folder. It must be an absolute path: an empty variable, or no
+/// home folder, would otherwise file notes under the folder the command
+/// happens to run in. A real run creates no base: a mistyped one is not
+/// made and filled. A dry run goes on without one and says so.
+fn import_base(dry_run: bool) -> Result<PathBuf, String> {
+    if std::env::var_os("SYNAPS_BASE_DIR").is_some_and(|value| value.to_str().is_none()) {
+        return Err("SYNAPS_BASE_DIR is not UTF-8; nothing was imported".to_owned());
+    }
+    let base = agent_core::config::base_dir();
+    if !base.is_absolute() {
+        return Err(format!(
+            "the base directory \"{}\" is not an absolute path (is SYNAPS_BASE_DIR empty or \
+             relative, or HOME not set?); nothing was imported",
+            base.display()
+        ));
+    }
+    if !base.is_dir() {
+        if !dry_run {
+            return Err(format!(
+                "the base directory {} does not exist or is not a directory, and an import \
+                 does not create it; nothing was imported",
+                base.display()
+            ));
+        }
+        eprintln!(
+            "synaps memory: the base directory {} does not exist or is not a directory; \
+             the real run would stop",
+            base.display()
+        );
+    }
+    Ok(base)
+}
+
 fn import<I: Importer>(
     command: &'static str,
     args: ImportArgs,
@@ -698,7 +801,10 @@ fn import<I: Importer>(
     if args.files.iter().filter(|path| path.as_os_str() == "-").count() > 1 {
         return usage("standard input (-) can be named once");
     }
-    let base = agent_core::config::base_dir();
+    let base = match import_base(args.dry_run) {
+        Ok(base) => base,
+        Err(message) => return usage(&message),
+    };
     let mut report = Report {
         command,
         dry_run: args.dry_run,
@@ -721,6 +827,10 @@ fn import<I: Importer>(
         balanced: true,
         stopped: None,
         tombstones_not_applied: (command == "import-notes").then_some(NotApplied {
+            count: 0,
+            ids: Vec::new(),
+        }),
+        forgets_not_complete: (command == "import-archives").then_some(NotApplied {
             count: 0,
             ids: Vec::new(),
         }),
@@ -793,6 +903,7 @@ fn import<I: Importer>(
             unapplied.ids.join(" ")
         );
     }
+    let incomplete = report.records.iter().any(|entry| entry.unread.is_some());
     for entry in report.records.iter().filter(|entry| entry.unread.is_some()) {
         eprintln!(
             "synaps memory {command}: the forget of {} may not have reached every copy",
@@ -801,7 +912,7 @@ fn import<I: Importer>(
     }
     if !print(&report) || report.stopped.is_some() {
         EXIT_STOPPED
-    } else if report.total.refused > 0 {
+    } else if report.total.refused > 0 || incomplete {
         EXIT_REFUSED
     } else {
         EXIT_OK
@@ -849,12 +960,12 @@ fn feed<I: Importer>(
                 ),
                 Line::Text(_) => match importer.line(trimmed) {
                     Ok(judged) => judged,
-                    Err(error) => {
+                    Err(stop) => {
                         return Some(Stopped {
                             input: Some(input),
                             line: Some(lines.number),
-                            id: None,
-                            error,
+                            id: stop.id,
+                            error: stop.error,
                         })
                     }
                 },
@@ -892,6 +1003,12 @@ fn feed<I: Importer>(
                 if let Some(unapplied) = &mut report.tombstones_not_applied {
                     unapplied.count += 1;
                     unapplied.ids.extend(judged.id.clone());
+                }
+            }
+            if judged.unread.is_some() {
+                if let Some(incomplete) = &mut report.forgets_not_complete {
+                    incomplete.count += 1;
+                    incomplete.ids.extend(judged.id.clone());
                 }
             }
             report.records.push(Entry {
