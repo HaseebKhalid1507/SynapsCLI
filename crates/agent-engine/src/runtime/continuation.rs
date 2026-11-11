@@ -5020,9 +5020,9 @@ mod rollover_path_tests {
         let (single_chat, single_parts) = rolled_and_saved(&long_window(3_000)).await;
         let messages = long_window(5_000);
         let (chat, parts) = rolled_and_saved(&messages).await;
-        assert_eq!((single_parts.len(), parts.len()), (1, 2));
+        assert!(single_parts.len() == 1 && parts.len() > 1, "{single_parts:?} {parts:?}");
         let single_id = single_parts[0].archive.id.clone();
-        let last_id = parts[1].archive.id.clone();
+        let last_id = parts.last().unwrap().archive.id.clone();
 
         // Both are opened again.
         let (single_rt, _) = reopen(&single_chat);
@@ -5090,17 +5090,45 @@ mod rollover_path_tests {
 
     /// A seal that stops between two parts (a full disk, a busy lock, a
     /// cancelled turn) leaves the earlier parts on disk. The rollover fails
-    /// with the history kept, records nothing and has nothing to announce: a
-    /// part list exists only for a window that was sealed whole. The same
+    /// with the history kept, records nothing and announces nothing: a part
+    /// list exists only for a window that was sealed whole. The same
     /// rollover again finds the parts that are there, writes the missing
     /// ones, and gives the list it would have given the first time.
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn a_rollover_interrupted_between_parts_keeps_history_and_a_retry_completes_it() {
+        interrupted_then_retried(Vec::new()).await;
+    }
+
+    /// What usually happens instead: the turn failed, the user wrote again,
+    /// and the retry runs on a window that has grown. It is sealed as that
+    /// window is then cut, which need not be the list of the first attempt.
+    /// Whatever the first attempt wrote stays on disk, the chat refers to
+    /// the parts of the attempt that completed, and only those are
+    /// announced.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_rollover_interrupted_between_parts_is_completed_on_the_window_as_it_has_grown() {
+        interrupted_then_retried(tail("t2", 200)).await;
+    }
+
+    /// A rollover whose seal stops before the last part, then the rollover
+    /// again once the store takes that part, on the window with `grown_by`
+    /// added to it. Nothing here knows where the window is cut or into how
+    /// many parts, beyond more than one.
+    async fn interrupted_then_retried(grown_by: Vec<SharedMessage>) {
+        use crate::extensions::hooks::{events::HookKind, test_support::Listener, HookBus};
         let _env = BaseDirGuard::new();
         let binding = MemoryBinding::legacy_current();
         let scope = binding.scope().unwrap().clone();
-        let messages = long_window(5_000);
+        // Three inputs no two of which fit one archive.
+        let mut messages = vec![user("charter")];
+        messages.extend(wide_calls(3));
+        messages.extend((0..40).map(|i| event(i, 1_100)));
+        messages.extend(tail("t", 200));
+        let bus = Arc::new(HookBus::new());
+        let listener = Listener::prompt("indexer");
+        listener.subscribe(&bus, HookKind::OnContextArchived).await;
         let state = auto_state();
         state
             .lock()
@@ -5116,10 +5144,11 @@ mod rollover_path_tests {
             .unwrap()
             .seal_window(&messages, "the working note")
             .unwrap();
-        assert_eq!(expected.parts.len(), 2);
-        let (first, second) = (&expected.parts[0].archive.id, &expected.parts[1].archive.id);
+        let (last, earlier) = expected.parts.split_last().unwrap();
+        assert!(!earlier.is_empty(), "{:?}", expected.parts);
+        let last = &last.archive.id;
 
-        // Something that is not a file sits where the second part belongs,
+        // Something that is not a file sits where the last part belongs,
         // under both names a seal can give it. One such thing does not stop
         // a seal: it stores the part under its second id, the other half of
         // the digest. With both names taken the part cannot be stored.
@@ -5127,13 +5156,13 @@ mod rollover_path_tests {
         let file_of =
             |id: &str| agent_core::context_archive::archive_file(binding.base(), scope.key(), id);
         let digest = {
-            let file = agent_core::context_archive::archive_file(elsewhere.path(), scope.key(), second)
+            let file = agent_core::context_archive::archive_file(elsewhere.path(), scope.key(), last)
                 .unwrap()
                 .unwrap();
             let record: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
             record["digest"].as_str().unwrap().to_owned()
         };
-        assert_eq!(digest[..32], **second);
+        assert_eq!(digest[..32], **last);
         let (other, _) = binding
             .history_seal("another-chat", &[user("another chat")], "")
             .await
@@ -5155,32 +5184,74 @@ mod rollover_path_tests {
             assert_eq!(s.note, "the working note");
             assert!(!s.durability_blocked);
         }
-        // The first part was written: an ordinary archive nothing refers to.
-        let first_file = file_of(first).unwrap().expect("the first part is on disk");
+        // The parts before it were written: ordinary archives that nothing
+        // refers to.
         let stamp = |file: &std::path::Path| {
             let modified = std::fs::metadata(file).unwrap().modified().unwrap();
             (std::fs::read(file).unwrap(), modified)
         };
-        let written = stamp(&first_file);
-        let page = binding.history_fetch(first, 0, 1).await.unwrap();
-        assert_eq!(page[0].message, messages[1]);
+        let mut written = Vec::new();
+        for part in earlier {
+            let file = file_of(&part.archive.id).unwrap().expect("an earlier part is on disk");
+            written.push((stamp(&file), file));
+        }
+        let page = binding.history_fetch(&earlier[0].archive.id, 0, 1).await.unwrap();
+        assert_eq!(page[0].message, messages[0]);
+        // And nothing was announced: there is no rollover to commit, and
+        // only a committed one sends the events.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(listener.events().len(), 0);
 
-        // The same rollover once the obstacles are gone.
+        // The rollover again once the obstacles are gone, on the window as
+        // it is by then.
         for obstacle in &obstacles {
             std::fs::remove_dir(obstacle).unwrap();
         }
+        let same_window = grown_by.is_empty();
+        messages.extend(grown_by);
         let prepared = ready(roll(&messages, &state, SMALL_TARGET).await);
-        assert_eq!(prepared.parts, expected.parts);
-        assert!(stamp(&first_file) == written, "the first part was found, not written again");
-        assert!(file_of(second).unwrap().is_some());
-        assert!(read_back(&binding, &prepared.parts).await == archivable(&messages));
-        assert_eq!(binding.history_note(second).await.unwrap(), "the working note");
-        let next = prepared.commit(&state).unwrap();
+        let parts = prepared.parts.clone();
+        assert!(parts.len() > 1, "{parts:?}");
+        let mut covered = 0;
+        for part in &parts {
+            assert_eq!(part.first_source_index, covered, "{parts:?}");
+            covered += part.archive.source_message_count;
+        }
+        assert_eq!(covered, messages.len());
+        assert!(read_back(&binding, &parts).await == archivable(&messages));
+        if same_window {
+            assert_eq!(parts, expected.parts);
+            for (before, file) in &written {
+                assert!(stamp(file) == *before, "an earlier part was found, not written again");
+            }
+            assert!(file_of(last).unwrap().is_some());
+        }
+        // What the first attempt wrote is still there, in the list or not.
+        for part in earlier {
+            binding.history_fetch(&part.archive.id, 0, 1).await.unwrap();
+        }
+        let named = &parts.last().unwrap().archive.id;
+        assert_eq!(binding.history_note(named).await.unwrap(), "the working note");
+
+        // The chat refers to the parts of this attempt, and they are what
+        // is announced, once.
+        let next = prepared.commit_and_announce(&state, &bus, &binding, None).unwrap();
         let marker = &next[0]["_synaps_context"];
-        assert_eq!(marker["archive"], *second);
-        assert_eq!(marker["archives"].as_array().unwrap().len(), 2);
-        assert_eq!(state.lock().unwrap().window, 2);
-        assert_eq!(state.lock().unwrap().latest_archive.as_ref(), Some(second));
+        assert_eq!(marker["archive"], **named);
+        let ids: Vec<Value> = parts.iter().map(|part| json!(part.archive.id)).collect();
+        let recorded: Vec<Value> =
+            marker["archives"].as_array().unwrap().iter().map(|entry| entry["id"].clone()).collect();
+        assert_eq!(recorded, ids);
+        {
+            let s = state.lock().unwrap();
+            assert_eq!((s.window, s.latest_archive.as_ref()), (2, Some(named)));
+        }
+        let events = listener.wait_for(parts.len()).await;
+        let announced: Vec<Value> =
+            events.iter().map(|event| event.data["archive_id"].clone()).collect();
+        assert_eq!(announced, ids);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(listener.events().len(), parts.len(), "each part once");
     }
 }
 
@@ -5960,6 +6031,125 @@ mod archived_hook_tests {
     /// Long enough for a delivery that was started to arrive.
     async fn settle() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// An archive's id is one half of its digest: the first, or the second
+    /// when something else already has the first as its name. Nothing may
+    /// work one out from the other, so the id the seal returned is the one
+    /// that has to reach everything written from it. Here the first and the
+    /// last part of a split window are stored under their second ids, and
+    /// those are the ids in the continuation message, in the marker (the
+    /// last part is the archive resume looks up), in the hook events with
+    /// the files they name, and the ids the parts are fetched by.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_part_stored_under_its_second_id_is_named_by_it_in_the_head_the_marker_and_the_event() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let scope = binding.scope().unwrap().clone();
+        let (bus, listener) = listening().await;
+        let (messages, state) = (split_window(), chat_state());
+
+        // What the window is sealed as with nothing in the way, learned in
+        // a store of its own: the cut, and each part's digest.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let usual = archive_store_for_session(elsewhere.path(), &scope, CHAT)
+            .unwrap()
+            .seal_window(&messages, "")
+            .unwrap()
+            .parts;
+        assert!(usual.len() > 1, "{usual:?}");
+        let digest_of = |part: &ArchivePart| {
+            let id = &part.archive.id;
+            let file = agent_core::context_archive::archive_file(elsewhere.path(), scope.key(), id)
+                .unwrap()
+                .unwrap();
+            let record: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+            let digest = record["digest"].as_str().unwrap().to_owned();
+            assert_eq!(digest[..32], **id, "with nothing in the way, the first half");
+            digest
+        };
+
+        // Something that is not a file has the first half as its name, for
+        // the first part and for the last. (Another chat's archive shows
+        // which directory that is.)
+        let (other, _) = binding
+            .history_seal("another-chat", &[Arc::new(json!({"role":"user","content":"another chat"}))], "")
+            .await
+            .unwrap();
+        let file_of =
+            |id: &str| agent_core::context_archive::archive_file(binding.base(), scope.key(), id);
+        let shelf = file_of(&other.id).unwrap().unwrap().parent().unwrap().to_owned();
+        let moved = [0, usual.len() - 1];
+        let mut second = vec![None; usual.len()];
+        for n in moved {
+            let digest = digest_of(&usual[n]);
+            std::fs::create_dir(shelf.join(format!("{}.json", &digest[..32]))).unwrap();
+            second[n] = Some(digest[32..].to_owned());
+        }
+
+        // The same window, cut the same way; the two parts have other ids.
+        let prepared = seal(&binding, &state, &messages).await;
+        let parts = prepared.parts.clone();
+        assert_eq!(parts.len(), usual.len());
+        for ((part, usual), second) in parts.iter().zip(&usual).zip(&second) {
+            assert_eq!(part.first_source_index, usual.first_source_index);
+            assert_eq!(part.archive.source_message_count, usual.archive.source_message_count);
+            assert_eq!(part.archive.message_count, usual.archive.message_count);
+            assert_eq!(&part.archive.id, second.as_ref().unwrap_or(&usual.archive.id));
+        }
+        let last = second[usual.len() - 1].clone().unwrap();
+
+        // The continuation message lists each part by the id it has.
+        let text = prepared.messages[0]["content"].as_str().unwrap().to_owned();
+        let mut from = 0;
+        for part in &parts {
+            let at = text[from..].find(&format!("ctx-{} (", part.archive.id));
+            from += at.unwrap_or_else(|| panic!("{} is listed, in order: {text}", part.archive.id)) + 1;
+        }
+        for n in moved {
+            assert!(!text.contains(&usual[n].archive.id), "not the half that is not its name: {text}");
+        }
+
+        // So does the marker, and its `archive` is the last part's.
+        let next = prepared.commit_and_announce(&state, &bus, &binding, None).unwrap();
+        let marker = &next[0]["_synaps_context"];
+        let ids: Vec<Value> = parts.iter().map(|part| json!(part.archive.id)).collect();
+        let recorded: Vec<Value> =
+            marker["archives"].as_array().unwrap().iter().map(|entry| entry["id"].clone()).collect();
+        assert_eq!(recorded, ids);
+        assert_eq!(marker["archive"], json!(last));
+
+        // Each event names that id, and the file that holds the archive.
+        let events = listener.wait_for(parts.len()).await;
+        assert_eq!(events.len(), parts.len());
+        for (event, part) in events.iter().zip(&parts) {
+            let id = &part.archive.id;
+            assert_eq!(event.data["archive_id"], json!(id));
+            let path = std::path::PathBuf::from(event.data["path"].as_str().expect("a path"));
+            assert_eq!(path.file_name().unwrap().to_str().unwrap(), format!("{id}.json"));
+            assert!(path.is_file(), "{path:?}");
+            let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(record["id"], json!(id));
+            assert_eq!(file_of(id).unwrap().as_deref(), Some(path.as_path()));
+        }
+
+        // Fetched by the id it has; the other half of its digest is not
+        // its name.
+        for n in moved {
+            let stored = binding.history_fetch(&parts[n].archive.id, 0, 1).await.unwrap();
+            assert_eq!(stored.len(), 1);
+            assert!(binding.history_fetch(&usual[n].archive.id, 0, 1).await.is_err());
+        }
+        // And resume finds the chat's archive by the id the marker has.
+        let resumed = chat_state();
+        restore_window(&next, &resumed, &binding);
+        {
+            let s = resumed.lock().unwrap();
+            assert_eq!((s.window, s.latest_archive.as_ref()), (2, Some(&last)));
+        }
+        settle().await;
+        assert_eq!(listener.events().len(), parts.len(), "one event per part");
     }
 
     #[tokio::test]
