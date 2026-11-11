@@ -326,7 +326,9 @@ All notable changes to this project will be documented in this file.
   way to move archives and notes into the plain-file stores is `synaps
   memory import-archives | import-notes`. `synaps retention inspect |
   sweep | export | forget` are unchanged, on plain files and with
-  `memory.backend = axel`. The specs `docs/specs/memory-migration.md`,
+  `memory.backend = axel`, except that an Axel `retention export` can no
+  longer be restored with this binary (its index says so under
+  `"restore"`). The specs `docs/specs/memory-migration.md`,
   `shared-axel-repositories.md` and `axel-host-backend.md` are removed.
 - **The automatic-memory config keys and extension context providers.**
   The eleven keys `memory.default_mode`, `memory.default_mode_confirmed`,

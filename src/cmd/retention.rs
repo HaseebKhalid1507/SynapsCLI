@@ -214,7 +214,7 @@ async fn export_members(binding: &MemoryBinding, dest: &Path) -> Result<Value> {
         "canonical_project":info.canonical_project, "selected_project":binding.scope()?.key(),
         "members":members, "files":files,
         "consistency":"separate exact-owner exports, not an atomic group snapshot; stop writers before export",
-        "restore":"import each file separately with its original source/target project, then explicitly link aliases",
+        "restore":"not restorable by this Synaps: retention migrate-memory --source-export, which restored it, was removed after 0.11.1",
     });
     let index = write_export_file(&root, EXPORT_INDEX, &manifest)?;
     let bytes: u64 = files
