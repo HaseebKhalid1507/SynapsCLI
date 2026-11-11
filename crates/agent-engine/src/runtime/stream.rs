@@ -1513,15 +1513,6 @@ impl StreamMethods {
                                 return Err(super::continuation::unproductive_rollover_error());
                             }
                             Ok(super::continuation::RolloverPreparation::Ready(prepared)) => {
-                                // The archive is on disk: tell extensions
-                                // (`on_context_archived`). Notify-only, never
-                                // awaited; nothing below depends on it.
-                                super::continuation::notify_archived(
-                                    &hook_bus,
-                                    &memory_backend,
-                                    &prepared,
-                                    cwd.as_deref(),
-                                );
                                 // A cancel that landed while the successor was
                                 // being prepared must stop HERE: `persist_head`
                                 // latches `durability_blocked` before it asks
@@ -1535,7 +1526,17 @@ impl StreamMethods {
                                 }
                                 super::continuation::persist_head(&prepared, &continuation, &tx)
                                     .await?;
-                                messages = prepared.commit(&continuation)?;
+                                // Saved, acknowledged and committed: only now
+                                // are extensions told the window's archives
+                                // (`on_context_archived`), so a rollover given
+                                // up above was never announced. Notify-only,
+                                // never awaited; nothing below depends on it.
+                                messages = prepared.commit_and_announce(
+                                    &continuation,
+                                    &hook_bus,
+                                    &memory_backend,
+                                    cwd.as_deref(),
+                                )?;
                                 budget_meter.start_context_segment();
                                 segment_has_provider_round = false;
                                 let window = continuation

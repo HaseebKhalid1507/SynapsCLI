@@ -140,9 +140,11 @@ a plugin that subscribes needs a new enough host.
 
 When a chat gets too long, automatic context management (`/context auto`)
 seals the older messages into an archive file and the chat continues in a
-fresh window. This hook fires for each archive file of a window, once every
-file of that window has been written. Requires `privacy.llm_content`: the
-event carries no conversation text, but its `path` leads to it.
+fresh window. This hook fires for each archive file of a window, once the
+chat has moved to the new window: every file of the old window is written
+and the new window, which names them, is saved. Requires
+`privacy.llm_content`: the event carries no conversation text, but its
+`path` leads to it.
 
 A window is normally one archive and one event (`part` 1 of `parts` 1). A
 window over what one archive may hold (4,096 messages, 16 MiB, 65,536 visited
@@ -193,10 +195,13 @@ parts](#a-window-in-several-parts).
 #### A window in several parts
 
 For a window sealed as several archives the host sends one event per part,
-all after the last part is on disk, as one delivery: first part first, each
-handed to your handler before the next is sent. Every event has the same
-`session_id`, `cwd`, `project_key`, `window` and `parts`, and its own
-`archive_id`, `path`, counts, `part` and `first_source_index`.
+all after the chat has moved to the new window, as one delivery: first part
+first, each handed to your handler once it has answered the one before or
+used up its 5 s for it. Each extension gets that sequence on its own, so
+another extension that is slow, stuck or failing does not delay yours.
+Every event has the same `session_id`, `cwd`, `project_key`, `window` and
+`parts`, and its own `archive_id`, `path`, counts, `part` and
+`first_source_index`.
 
 - **The parts are consecutive and cover the window.** Part `n + 1` starts
   where part `n` ends: its `first_source_index` is the previous part's
@@ -222,8 +227,9 @@ handed to your handler before the next is sent. Every event has the same
 - **A window is announced whole or not at all.** If sealing stops between
   two parts (a full disk, a store that stays locked, a cancelled turn) no
   event is sent. The parts already written stay on disk as ordinary
-  archives; the next attempt finds them, writes the rest and announces
-  every part.
+  archives that nothing refers to. The rollover that does complete
+  announces every part it recorded; a part whose content is already on disk
+  is found there and not written again.
 
 The chat's saved session holds the same list. The first message of the new
 window carries host metadata, `_synaps_context`, in which `archive` is the
@@ -236,17 +242,24 @@ next rolls over.
 
 What it means, and what it does not:
 
-- **"This archive file now exists."** It is sent once every archive file of
-  the window is written and synced. It does not promise the chat went on in
-  the new window: saving the new window can still fail or be cancelled, and
-  a later attempt seals the window again.
-- **The same `archive_id` can be announced more than once.** Sealing the same
-  window again finds the archive already written, writes nothing, and
-  announces it again. Key your work on `archive_id`.
-- **An archive can exist that was never announced:** the rollover was
-  cancelled just after the file was written, sealing stopped between two
-  parts of a window, the event was dropped, or no extension was listening.
-  List the store when you start.
+- **"The chat has left this window, and this file holds it."** It is sent
+  once every archive file of the window is written and synced, the new
+  window that names them is saved, and the chat has gone on in it. A
+  rollover that is given up before that (the seal failed, the turn was
+  cancelled, the new window could not be saved) sends nothing, so you are
+  not told about a window and then told again by the attempt that follows:
+  a `(session_id, window)` is announced by the one rollover that completed.
+- **The same `archive_id` can still arrive more than once:** two parts with
+  identical content are one archive, an event is sent again if your process
+  died while handling it, and a session file put back from a backup can
+  roll the same window over again. Key your work on `archive_id`.
+- **An archive can exist that was never announced:** the rollover that wrote
+  it was given up before the new window was saved (cancelled, the save
+  failed, sealing stopped between two parts); the host exited after saving
+  the new window and before the events went out, in which case the chat's
+  saved session names the archive all the same and nothing sends the events
+  later; the event was dropped; or no extension was listening. List the
+  store when you start.
 - **Not sent when the seal fails.** The chat keeps its history and no event
   goes out.
 - **Plain-file memory backend only.** With `memory.backend = axel` there is
