@@ -18,9 +18,11 @@
 //! `fetch_with_provenance` reports indices into the original `seal` slice.
 //!
 //! A window over the limits of one segment is refused by `seal`, and sealed
-//! by [`ArchiveStore::seal_window`] as consecutive parts: it is halved until
-//! each part fits, each part is an ordinary segment, and the returned part
-//! list is what puts the window back together. Only a single message that is
+//! by [`ArchiveStore::seal_window`] as consecutive parts: each is filled from
+//! where the one before ended until the next message would not fit, each is
+//! an ordinary segment, and the returned part list is what puts the window
+//! back together. Messages added to the end of a window change its last
+//! part only. Only a single message that is
 //! over a limit by itself is stored reduced, by as little as makes it fit.
 //! First nothing is left out: a tool input that is nested too deep or has
 //! too many nodes is stored as one string, its JSON text
@@ -837,16 +839,28 @@ impl ArchiveStore {
     /// which is refused before anything is written.
     ///
     /// A window within the budgets is one part: the same segment, id and note
-    /// as [`seal_with_note`](Self::seal_with_note). A larger one is halved
-    /// until each part fits. Every part is an ordinary segment; together they
-    /// hold every message of the window exactly once, in order. Only a
-    /// message that is over a budget by itself is stored reduced, and is then
-    /// a part of its own.
+    /// as [`seal_with_note`](Self::seal_with_note). A larger one is filled
+    /// from its start: a part ends before the first message that would take
+    /// it over a budget, and the next part starts there. Every part is an
+    /// ordinary segment; together they hold every message of the window
+    /// exactly once, in order. Only a message that is over a budget by
+    /// itself is stored reduced, and is then a part of its own: it costs the
+    /// window two parts more, the one that ends before it and itself.
     ///
-    /// Parts are sealed first to last, each in its own locked operation, and
-    /// the note goes to the last one. After an error the parts already sealed
-    /// stay (callers keep the source history, as for `seal`); a retry finds
-    /// them by id, writes only what is missing and returns the same list.
+    /// Where a part ends depends on the messages from its start to the one
+    /// after its end, and on nothing after that, so every part but the last
+    /// is the same however long the window is. (One corner: a last part that
+    /// was over the size of a segment only with the note in it was cut
+    /// shorter, and is not cut when it is no longer the last.) Parts are
+    /// sealed first to last, each in its own locked operation, and the note
+    /// goes to the last one. After an error the parts already sealed stay
+    /// (callers keep the source history, as for `seal`). A retry on the same
+    /// window finds them by id, writes only what is missing and returns the
+    /// same list. A retry on a window that has grown since (a failed turn
+    /// leaves the user's next message in it) finds every part but the last
+    /// one of the earlier attempt; that one, if it was written, stays as a
+    /// segment no list names, and its messages are stored again in the new
+    /// last part.
     pub fn seal_window(&self, messages: &[SharedMessage], note: &str) -> io::Result<SealedWindow> {
         // Sealing fewer messages does not make a note smaller: one over its
         // limit is refused here, before any part exists.
@@ -856,7 +870,32 @@ impl ArchiveStore {
             parts: Vec::new(),
             note: String::new(),
         };
-        self.seal_range(messages, 0..messages.len(), note, &mut window)?;
+        let mut start = 0;
+        loop {
+            // An abandoned seal projects no further part.
+            self.check_abort()?;
+            let mut end = self.fill(messages, start);
+            // The fill knows the budgets a part is refused on before it is
+            // projected. Its size once screened and written is known only
+            // then. A part over that is tried again at the largest power of
+            // two messages below its length, and so on down: the part ends
+            // up as the largest power of two messages that fits, whatever
+            // length it was first tried at.
+            loop {
+                let note = if end == messages.len() { note } else { "" };
+                match self.seal_part(messages, start..end, note, &mut window) {
+                    Ok(()) => break,
+                    Err(error) if over_budget(&error) && end - start > 1 => {
+                        end = start + (1 << (end - start - 1).ilog2());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            start = end;
+            if start == messages.len() {
+                break;
+            }
+        }
         // Parts with identical content are one segment. When the last part is
         // also an earlier one, that segment was stored for the earlier part,
         // without the note; the window's note is still this one.
@@ -868,10 +907,30 @@ impl ArchiveStore {
         Ok(window)
     }
 
-    /// Seal `messages[range]` as one part if it fits, otherwise as the parts
-    /// of its two halves, the left one first. `note` is the window's note for
-    /// the range that ends the window and empty for every other.
-    fn seal_range(
+    /// Where the part that starts at `start` ends when it is filled: before
+    /// the first message that would take it over the message count or an
+    /// input budget of one segment, which is what [`project_hashed`] refuses
+    /// before it projects anything. Never before `start + 1` in a window
+    /// that has a message there: a message that is over a budget by itself
+    /// is a part of its own. One pass over the messages, without the
+    /// redactor and without allocating.
+    fn fill(&self, messages: &[SharedMessage], start: usize) -> usize {
+        let mut budget = InputBudget {
+            bytes: 0,
+            nodes: 0,
+            reduce: Reduce::None,
+        };
+        let limit = messages.len().min(start.saturating_add(MAX_MESSAGES));
+        let redactor = self.redactor.is_some();
+        let over = (start..limit).find(|&index| budget.message(&messages[index], redactor).is_err());
+        let end = over.unwrap_or(limit).max(start + 1).min(messages.len());
+        before_results(messages, start, end)
+    }
+
+    /// Seal `messages[range]` as one part, or fail with the budget it is
+    /// over. `note` is the window's note for the part that ends the window
+    /// and empty for every other.
+    fn seal_part(
         &self,
         messages: &[SharedMessage],
         range: std::ops::Range<usize>,
@@ -879,7 +938,7 @@ impl ArchiveStore {
         window: &mut SealedWindow,
     ) -> io::Result<()> {
         let mut reduce = Reduce::None;
-        let refused = loop {
+        loop {
             match self.seal_one(&messages[range.clone()], note, reduce) {
                 Ok((archive, stored, reduced_messages)) => {
                     window.parts.push(ArchivePart {
@@ -891,19 +950,14 @@ impl ArchiveStore {
                     return Ok(());
                 }
                 Err(error) if !over_budget(&error) => return Err(error),
-                // Reduced only when halving cannot help: one message, alone.
+                // Reduced only when a shorter part cannot help: one message,
+                // alone.
                 Err(error) => match reduce.next().filter(|_| range.len() == 1) {
                     Some(next) => reduce = next,
-                    None => break error,
+                    None => return Err(error),
                 },
             }
-        };
-        if range.len() < 2 {
-            return Err(refused);
         }
-        let middle = cut(messages, &range);
-        self.seal_range(messages, range.start..middle, "", window)?;
-        self.seal_range(messages, middle..range.end, note, window)
     }
 
     /// [`seal_with_note`](Self::seal_with_note) of the projection `reduce`
@@ -2462,20 +2516,32 @@ fn json_len(value: &Value) -> usize {
     let _ = serde_json::to_writer(&mut count, value);
     count.0
 }
-/// Where a range that does not fit one segment is cut: its midpoint, moved
-/// forward past tool results so that a call and the result that follows it
-/// stay in one part where they can. A courtesy to readers, not a rule: the
-/// store pairs nothing.
-fn cut(messages: &[SharedMessage], range: &std::ops::Range<usize>) -> usize {
-    let is_result = |message: &Value| {
+/// Where the part `messages[start..end]` is cut so that the next part does
+/// not begin with tool results: `end`, moved back to before the call those
+/// results follow, so that a call and its results stay in one part where
+/// they can. It cannot when that would leave nothing in this part, and it
+/// need not when `end` ends the window. A courtesy to readers, not a rule:
+/// the store pairs nothing.
+fn before_results(messages: &[SharedMessage], start: usize, end: usize) -> usize {
+    let is_result = |index: usize| {
+        let message = &messages[index];
         let blocks = message["content"].as_array();
         message["role"] == "user"
             && blocks.is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
     };
-    let middle = range.start + range.len() / 2;
-    (middle..range.end)
-        .find(|&index| !is_result(&messages[index]))
-        .unwrap_or(middle)
+    if end >= messages.len() {
+        return end;
+    }
+    let mut cut = end;
+    while cut > start + 1 && is_result(cut) {
+        cut -= 1;
+    }
+    // Nothing but results back to the start of the part: cut where it was.
+    if is_result(cut) {
+        end
+    } else {
+        cut
+    }
 }
 /// File name of a numbered legacy slot in the project directory.
 fn slot_name(slot: usize) -> String {
@@ -6160,7 +6226,7 @@ mod tests {
     #[test]
     fn window_over_message_cap_splits() {
         let (tmp, store) = setup();
-        for (len, parts) in [(MAX_MESSAGES + 1, 2), (10_000, 4)] {
+        for (len, parts) in [(MAX_MESSAGES + 1, 2), (10_000, 3)] {
             // Every seventh message is not eligible: source indices have gaps.
             let messages: Vec<_> = (0..len)
                 .map(|index| {
@@ -6175,8 +6241,12 @@ mod tests {
             let read = reassemble(&store, &window, len);
             assert_eq!(read.len(), len - (len + 3) / 7);
             assert!(read == exact(&store, &messages));
+            // Each part is full before the next is started.
+            let starts: Vec<_> = window.parts.iter().map(|part| part.first_source_index).collect();
+            let full: Vec<_> = (0..parts).map(|part| part * MAX_MESSAGES).collect();
+            assert_eq!(starts, full);
         }
-        assert_eq!(shelf_files(&directory(&tmp, &store)).len(), 6);
+        assert_eq!(shelf_files(&directory(&tmp, &store)).len(), 5);
     }
 
     #[test]
@@ -6214,7 +6284,9 @@ mod tests {
         let error = store.seal(&messages, "").unwrap_err();
         assert!(error.to_string().contains("structural budget"));
         let window = store.seal_window(&messages, "").unwrap();
-        assert_eq!(window.parts.len(), 4);
+        // 1,365 calls are 65,520 nodes; one more would be over.
+        let starts: Vec<_> = window.parts.iter().map(|part| part.first_source_index).collect();
+        assert_eq!(starts, [0, 1365, 2730]);
         assert!(window.parts.iter().all(|part| part.reduced_messages == 0));
         let read = reassemble(&store, &window, messages.len());
         assert_eq!(read[2999].message, messages[2999]);
@@ -6270,7 +6342,7 @@ mod tests {
             .iter()
             .map(|part| (part.first_source_index, part.reduced_messages))
             .collect();
-        assert_eq!(reduced, [(0, 0), (1, 1), (2, 0), (3, 0)]);
+        assert_eq!(reduced, [(0, 0), (1, 1), (2, 0)]);
         let read = reassemble(&store, &window, messages.len());
         for index in [0, 2, 3] {
             assert_eq!(read[index].source_index, index);
@@ -6494,7 +6566,7 @@ mod tests {
         let (tmp, store) = setup();
         let dir = directory(&tmp, &store);
         let messages = lines(MAX_MESSAGES + 2);
-        let (left, right) = messages.split_at(messages.len() / 2);
+        let (left, right) = messages.split_at(MAX_MESSAGES);
         let digest = |part: &[SharedMessage]| {
             let projection = project_hashed(&store.logical, part, "", None, Reduce::None);
             projection.unwrap().digest
@@ -6595,16 +6667,118 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_keeps_a_tool_result_with_its_call_where_it_can() {
+    fn a_part_does_not_end_between_a_call_and_its_results_where_it_can() {
         let call = msg("assistant", json!([{"type":"tool_use","id":"t","name":"read","input":{}}]));
         let result = msg("user", json!([{"type":"tool_result","tool_use_id":"t","content":"ok"}]));
         let words = msg("user", json!("words"));
-        let window = [words.clone(), call.clone(), result.clone(), words];
-        assert_eq!(cut(&window, &(0..4)), 3, "moved past the result at the midpoint");
-        assert_eq!(cut(&window, &(0..3)), 1);
-        assert_eq!(cut(&window, &(1..3)), 2, "it cannot: the plain midpoint");
-        let results = [call, result.clone(), result.clone(), result];
-        assert_eq!(cut(&results, &(0..4)), 2, "nothing but results to the end");
+        let window = [words.clone(), call.clone(), result.clone(), words.clone()];
+        assert_eq!(before_results(&window, 0, 2), 1, "moved back to before the call");
+        assert_eq!(before_results(&window, 0, 3), 3, "the next part starts with words");
+        assert_eq!(before_results(&window, 1, 2), 2, "it cannot: the part would be empty");
+        assert_eq!(before_results(&window, 0, 4), 4, "the end of the window");
+        let results = [words.clone(), call.clone(), result.clone(), result.clone(), words.clone()];
+        assert_eq!(before_results(&results, 0, 3), 1, "back over every result of the call");
+        assert_eq!(before_results(&results, 1, 3), 3, "nothing but results back to the start");
+
+        // Through a seal: the message limit falls between a call and its
+        // result, and the part ends one message earlier.
+        let (_tmp, store) = setup();
+        let mut messages = numbered(0..MAX_MESSAGES + 5);
+        messages[MAX_MESSAGES - 1] = call;
+        messages[MAX_MESSAGES] = result;
+        let window = store.seal_window(&messages, "").unwrap();
+        let starts: Vec<_> = window.parts.iter().map(|part| part.first_source_index).collect();
+        assert_eq!(starts, [0, MAX_MESSAGES - 1]);
+    }
+
+    /// Plain messages whose text does not say how many there are.
+    fn numbered(range: std::ops::Range<usize>) -> Vec<SharedMessage> {
+        range.map(|index| msg("user", json!(format!("message {index}")))).collect()
+    }
+    fn starts_and_ids(window: &SealedWindow) -> (Vec<usize>, Vec<String>) {
+        let parts = window.parts.iter();
+        parts.map(|part| (part.first_source_index, part.archive.id.clone())).unzip()
+    }
+
+    /// A part ends where the next message would not fit, so what is added
+    /// to the end of a window changes its last part only. A retry after a
+    /// failed turn finds one more message in the window: it writes one file.
+    /// Cut at the midpoint of its length, every part was a new one.
+    #[test]
+    fn parts_do_not_change_when_the_window_grows() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let mut messages = numbered(0..2 * MAX_MESSAGES + 10);
+        let (starts, first) = starts_and_ids(&store.seal_window(&messages, "note").unwrap());
+        assert_eq!(starts, [0, MAX_MESSAGES, 2 * MAX_MESSAGES]);
+        assert_eq!(shelf_files(&dir).len(), 3);
+
+        // One more message, as after a failed turn.
+        messages.extend(numbered(messages.len()..messages.len() + 1));
+        let (starts, second) = starts_and_ids(&store.seal_window(&messages, "note").unwrap());
+        assert_eq!(starts, [0, MAX_MESSAGES, 2 * MAX_MESSAGES]);
+        assert_eq!(second[..2], first[..2]);
+        assert_ne!(second[2], first[2]);
+        assert_eq!(shelf_files(&dir).len(), 4, "one file more: the new last part");
+
+        // Enough more to fill the last part and start another.
+        messages.extend(numbered(messages.len()..3 * MAX_MESSAGES + 5));
+        let window = store.seal_window(&messages, "note").unwrap();
+        let (starts, third) = starts_and_ids(&window);
+        assert_eq!(starts, [0, MAX_MESSAGES, 2 * MAX_MESSAGES, 3 * MAX_MESSAGES]);
+        assert_eq!(third[..2], first[..2]);
+        assert_eq!(shelf_files(&dir).len(), 6, "the part that is full now, and the last");
+        assert_whole(&reassemble(&store, &window, messages.len()), &messages);
+        assert_eq!(window.note, "note");
+    }
+
+    /// The same when a part was cut because of its size once written, which
+    /// the fill cannot know: it is cut to a number of messages that does not
+    /// depend on how many follow.
+    #[test]
+    fn a_part_cut_for_its_written_size_does_not_change_when_the_window_grows() {
+        let (_tmp, store) = setup();
+        // 768 KiB of control characters is 4.5 MiB once each is "\u0001":
+        // three such messages fit one segment, four do not.
+        let large = |index: usize| msg("user", json!(format!("{index}{}", "\u{1}".repeat(768 * 1024))));
+        let mut cuts = Vec::new();
+        // Halved, four were cut after two and six after three.
+        for len in [4, 6] {
+            let messages: Vec<_> = (0..len).map(large).collect();
+            let window = store.seal_window(&messages, "").unwrap();
+            let (starts, ids) = starts_and_ids(&window);
+            assert_eq!(starts[..2], [0, 2], "{len} messages");
+            cuts.push(ids[0].clone());
+        }
+        cuts.dedup();
+        assert_eq!(cuts.len(), 1, "the first part is the same segment every time");
+    }
+
+    /// A message that is over a limit by itself costs the window two parts:
+    /// the one that ends before it and itself. Halving cost one part for
+    /// each time the range around it was halved.
+    #[test]
+    fn an_oversized_message_costs_two_parts_more() {
+        let (_tmp, store) = setup();
+        let store = store.with_redactor(Arc::new(str::to_owned));
+        let deep = || msg("assistant", json!([{"type":"tool_use","id":"t1","name":"nest","input":deep_input()}]));
+        let cut = |len: usize, oversized: &[usize]| {
+            let mut messages = numbered(0..len);
+            for &index in oversized {
+                messages[index] = deep();
+            }
+            let window = store.seal_window(&messages, "").unwrap();
+            let parts = window.parts.iter();
+            parts.map(|part| (part.first_source_index, part.reduced_messages)).collect::<Vec<_>>()
+        };
+        // One at index 7 of 4,106: thirteen parts when the window was halved.
+        let after = 8 + MAX_MESSAGES;
+        assert_eq!(cut(MAX_MESSAGES + 10, &[7]), [(0, 0), (7, 1), (8, 0), (after, 0)]);
+        // Three, evenly, in 4,000: about 34 then.
+        let seven = [(0, 0), (1000, 1), (1001, 0), (2000, 1), (2001, 0), (3000, 1), (3001, 0)];
+        assert_eq!(cut(4000, &[1000, 2000, 3000]), seven);
+        // First, last and next to each other: no part is empty.
+        assert_eq!(cut(4, &[0, 1, 3]), [(0, 1), (1, 1), (2, 0), (3, 1)]);
     }
 
     /// A project directory from before shelves: a live segment in slot 0, a

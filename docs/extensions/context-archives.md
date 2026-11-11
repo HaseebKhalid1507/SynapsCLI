@@ -418,6 +418,19 @@ What a part looks like:
   already there keeps the note it was first stored with.
 - A [reduced message](#reduced-messages) is always a part by itself.
 
+Where a window is cut is not part of the format. Today a part is filled from
+where the one before ended until the next message would take it over a
+limit, so the parts of a window are as few as they can be, apart from the
+two more that each reduced message costs.
+
+**The same messages can be in two archives.** A rollover that fails after
+some parts are written (a full disk, a cancelled turn) leaves those parts
+where they are, and announces nothing. The next attempt finds them and
+writes only what is missing. If the chat got longer in between, the last
+part of the earlier attempt no longer ends the window: the new attempt
+stores those messages again, in a longer last part, and the earlier one
+stays as an archive that no window refers to.
+
 With the files alone you **can** read every archived message (each archive
 is complete in itself and none needs another), keep the order of messages
 inside one archive, group archives by chat with `logical`, and tell a
