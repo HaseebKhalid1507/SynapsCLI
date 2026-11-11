@@ -4373,7 +4373,7 @@ mod rollover_path_tests {
         assert_eq!(state.lock().unwrap().window, 2);
         assert_eq!(state.lock().unwrap().latest_archive.as_ref(), Some(&b.archive.id));
         let restored = Arc::new(Mutex::new(ContinuationState::default()));
-        restore_window(&next, &restored);
+        restore_window(&next, &restored, &binding);
         let s = restored.lock().unwrap();
         assert_eq!((s.window, s.latest_archive.as_ref()), (2, Some(&b.archive.id)));
     }
