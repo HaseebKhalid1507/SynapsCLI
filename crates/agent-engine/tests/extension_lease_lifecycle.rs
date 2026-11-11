@@ -305,6 +305,81 @@ async fn exact_execute_starts_once_reuses_and_calls_only_exact_tool() {
     fx.cleanup();
 }
 
+/// `caller` on the deferred lane. A deferred extension tool's call goes
+/// context -> `DeferredExtensionTool::execute` -> the session lease
+/// (`call_exact_as`) -> the leased process, and the process is sent the
+/// author of the calling run's own binding: each chat's its own, the same
+/// on a later call, and no `caller` key when the context has no binding.
+#[tokio::test]
+async fn a_deferred_tools_call_names_the_calling_runs_own_author() {
+    use agent_core::memory::forum::Author;
+    use agent_engine::memory_backend::MemoryBinding;
+
+    hermetic_base_dir::pin();
+    let fx = fixture("caller", "ok", advertised_tools());
+    let (mgr, _registry) = deferred_manager(&fx).await;
+    let runtime = mgr.extension_runtime();
+    let tools = dormant_extension_tools(PLUGIN, &fx.manifest);
+    let search = tools
+        .iter()
+        .find(|t| t.name() == "fixture-plugin:search")
+        .unwrap();
+
+    // Two chats: each a folder, a binding and a lease session of its own.
+    let chat = |name: &str| {
+        let dir = fx.dir.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let binding = MemoryBinding::from_config_with_cwd(&Default::default(), Some(dir));
+        let session = SessionId::parse(&format!("task20-{name}")).unwrap();
+        (binding, ExtensionLeaseCapability::new(session, Arc::clone(&runtime)), name.to_string())
+    };
+    let (a, b) = (chat("chat-a"), chat("chat-b"));
+    let ctx_of = |(binding, cap, name): &(MemoryBinding, ExtensionLeaseCapability, String)| {
+        let mut ctx = ctx_with(Some(cap.clone()));
+        ctx.capabilities.memory_backend = Some(binding.clone());
+        ctx.capabilities.session_id = Some(name.clone());
+        ctx
+    };
+    for ctx in [ctx_of(&a), ctx_of(&b), ctx_of(&a)] {
+        assert_eq!(search.execute(json!({"q":"x"}), ctx).await.unwrap(), "called:search");
+    }
+    // A context with a lease and no binding: the call is made, for no run.
+    let unbound = ExtensionLeaseCapability::new(sid(), Arc::clone(&runtime));
+    search
+        .execute(json!({"q":"x"}), ctx_with(Some(unbound)))
+        .await
+        .unwrap();
+
+    let mut path = fx.spy.clone().into_os_string();
+    path.push(".callers.jsonl");
+    let calls: Vec<Value> = std::fs::read_to_string(path)
+        .expect("the fixture kept the calls")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("fixture caller JSON"))
+        .filter(|call: &Value| call["name"] == "search")
+        .collect();
+    assert_eq!(calls.len(), 4, "{calls:?}");
+    let author = |call: &Value| {
+        let author: Author = serde_json::from_value(call["caller"].clone())
+            .unwrap_or_else(|e| panic!("no caller on {call}: {e}"));
+        author.validate().expect("a valid author");
+        author
+    };
+    for (call, (binding, _, name)) in calls.iter().zip([&a, &b, &a]) {
+        assert_eq!(call["session_id"], json!(name), "{call}");
+        assert_eq!(&author(call), binding.forum_author(), "{name}: its own binding's author");
+        assert!(author(call).parent.is_none(), "a chat has no parent");
+    }
+    let (of_a, of_b) = (author(&calls[0]), author(&calls[1]));
+    assert_ne!(of_a.actor, of_b.actor);
+    assert_ne!(of_a.group, of_b.group);
+    assert_eq!(calls[3]["has_caller"], json!(false), "no binding, no key: {}", calls[3]);
+    assert_eq!(calls[3]["session_id"], Value::Null);
+
+    runtime.terminate_all();
+    fx.cleanup();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_first_calls_are_single_flight() {
     hermetic_base_dir::pin();

@@ -471,7 +471,8 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
     failing("sync dir")?;
     // Every save syncs the directory, so a directory that cannot be synced
     // at all must not fail every save, each with its line already in the
-    // file. Which errors say that is `private_fs::sync_dir`'s one rule.
+    // file. Which errors say that is `private_fs::sync_dir`'s one rule, and
+    // it logs the one it leaves that may cost a new file's name.
     crate::core::private_fs::sync_dir(dir)
 }
 

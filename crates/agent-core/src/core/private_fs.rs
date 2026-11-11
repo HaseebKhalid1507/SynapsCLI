@@ -139,15 +139,22 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
 ///   reading (a write-and-search-only mode such as `0300`). The rename or
 ///   the append into it has worked; only the open for the sync is refused.
 ///
-/// Such a directory is not a reason to call a finished write failed. Any
-/// other error is returned. A no-op on Windows (not unix), which cannot open
+/// Such a directory is not a reason to call a finished write failed; the
+/// `PermissionDenied` is logged as a warning with the directory. Any other
+/// error is returned. A no-op on Windows (not unix), which cannot open
 /// a directory to flush it, and where NTFS journals the new name itself.
 pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
         match File::open(dir).and_then(|dir| dir.sync_all()) {
-            Err(e) if matches!(e.kind(), InvalidInput | PermissionDenied | Unsupported) => Ok(()),
+            Err(e) if e.kind() == PermissionDenied => {
+                // Left as it is, but not in silence: after a power cut a
+                // name newly made in this directory may be missing.
+                warn_unsynced(dir, &e);
+                Ok(())
+            }
+            Err(e) if matches!(e.kind(), InvalidInput | Unsupported) => Ok(()),
             result => result,
         }
     }
@@ -156,6 +163,30 @@ pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
         let _ = dir;
         Ok(())
     }
+}
+
+/// The one warning for a directory [`sync_dir`] leaves unsynced because it
+/// may not be opened: which directory, and the error.
+#[cfg(unix)]
+fn warn_unsynced(dir: &Path, error: &std::io::Error) {
+    tracing::warn!(
+        directory = %dir.display(),
+        error = %error,
+        "a directory could not be opened to be synced; what was written into it stays, \
+         but a new name in it is not confirmed to be on disk"
+    );
+    #[cfg(test)]
+    UNSYNCED.with(|seen| seen.borrow_mut().push((dir.to_path_buf(), error.kind())));
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// The warnings [`warn_unsynced`] gave on this thread. A test reads
+    /// these and not a captured log: a log captured on one test thread
+    /// loses lines to tracing's callsite cache when another test reaches
+    /// the same line first.
+    static UNSYNCED: std::cell::RefCell<Vec<(std::path::PathBuf, std::io::ErrorKind)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Atomically replace `path` with `data`: the temp file is created in the
@@ -418,7 +449,16 @@ mod tests {
             File::open(&gate).unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
+        // Tolerated, and said: one warning, with the directory and the
+        // error. A directory that syncs says nothing; one that is missing
+        // is an error, not a warning.
+        let warned = || UNSYNCED.with(|seen| seen.borrow().clone());
+        UNSYNCED.with(|seen| seen.borrow_mut().clear());
         sync_dir(&gate).unwrap();
+        assert_eq!(warned(), [(gate.clone(), std::io::ErrorKind::PermissionDenied)]);
+        sync_dir(tmp.path()).unwrap();
+        sync_dir(&tmp.path().join("missing")).unwrap_err();
+        assert_eq!(warned().len(), 1);
     }
 
     #[cfg(target_os = "linux")]

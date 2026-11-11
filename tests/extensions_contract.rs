@@ -166,6 +166,42 @@ fn after_tool_call_truncates_utf8_safely() {
     );
 }
 
+/// What the two pages tell an extension author about `tool.call`'s `caller`:
+/// that the host writes it and it may be gone by, that its values are not
+/// secret, that a call without one gets nothing by identity, and that it
+/// names one life of a run. They once said not to grant access by it.
+#[test]
+fn caller_is_documented_as_host_written_not_secret_and_one_life_of_a_run() {
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let contract = extension_contract();
+    let entry = one_line(
+        contract["registered_capabilities"]["tools"]["call"]["params"]["caller"]
+            .as_str()
+            .expect("registered_capabilities.tools.call.params.caller"),
+    );
+    let page = one_line(include_str!("../docs/extensions/protocol.md"));
+    for (name, text) in [("contract.json", &entry), ("protocol.md", &page)] {
+        for said in [
+            "never from it",
+            "cannot set it",
+            "may go by it",
+            "not secret",
+            "never accept an author from tool",
+            "must get no access that depends on who is calling",
+            "one life of a run",
+            "the same chat has a new",
+            "what stays the same for a chat",
+            "only within one life",
+        ] {
+            let said = said.replace('`', "");
+            assert!(text.replace('`', "").contains(&said), "{name} does not say {said:?}");
+        }
+        for gone in ["Do not grant access", "not a proof"] {
+            assert!(!text.contains(gone), "{name} still says {gone:?}");
+        }
+    }
+}
+
 /// A hook is documented as notify-only exactly when the engine sends it
 /// without waiting, and each such hook says what naming it costs on an
 /// older host.

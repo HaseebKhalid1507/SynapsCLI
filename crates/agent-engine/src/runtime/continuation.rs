@@ -1547,6 +1547,18 @@ pub fn restore_window(
         };
         // What the marker holds is what a session file held: nothing of it
         // is fetched, kept or logged unless it has the form of an id.
+        // A rollover numbers its windows from 2; no marker it writes holds
+        // 0. Such a marker is refused whole, as the Axel path refuses it
+        // (`validate_restored_history`), before anything is looked up.
+        if marker["window"].as_u64() == Some(0) {
+            tracing::warn!(
+                session = %s.logical_id,
+                "resumed chat: its context head's marker has window 0, which no rollover \
+                 writes; the chat goes on at window 1 without its archive link"
+            );
+            s.initialized = true;
+            return;
+        }
         let named = if is_archive_id(named) { Ok(named.to_owned()) } else { Err(named.len()) };
         let (listed, passed_over) = listed_parts(marker, named.as_deref().ok());
         let window = marker["window"].as_u64().unwrap_or(1);
@@ -1613,6 +1625,12 @@ pub fn restore_window(
 }
 
 /// Whether `id` has the form of an archive id: 32 lowercase hex characters.
+/// The one rule for every reader of a resumed head's marker
+/// ([`restore_window`], [`restore_window_syntactic`],
+/// [`validate_restored_history`]), so that they cannot disagree about a
+/// marker. Lowercase only: both stores write their ids so (the first or
+/// last 32 characters of a digest printed in lowercase), and the file store
+/// looks an id up as a file name, which an uppercase spelling is not.
 fn is_archive_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -1715,7 +1733,7 @@ fn restore_window_syntactic(messages: &[SharedMessage], state: &SharedContinuati
         if marker["schema"] == MARKER {
             s.latest_archive = marker["archive"]
                 .as_str()
-                .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+                .filter(|id| is_archive_id(id))
                 .map(str::to_owned);
             s.window = marker["window"].as_u64().filter(|w| *w > 0).unwrap_or(1);
         }
@@ -1761,7 +1779,7 @@ pub async fn validate_restored_history(
     let valid = marker["schema"] == MARKER && markers.next().is_none();
     let id = marker["archive"]
         .as_str()
-        .filter(|id| valid && id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()));
+        .filter(|id| valid && is_archive_id(id));
     let window = marker["window"].as_u64().filter(|w| *w > 0);
     let (Some(id), Some(window)) = (id, window) else {
         return Err(RuntimeError::Session(
@@ -6923,6 +6941,129 @@ mod resume_tests {
             assert_eq!(restored(&state), settled);
         }
         assert_eq!(log.lines().len(), 1, "no lookup, so nothing more is said: {:?}", log.lines());
+    }
+
+    /// `head` with `key` of its marker set to `value`.
+    fn marked(head: &[SharedMessage], key: &str, value: Value) -> Vec<SharedMessage> {
+        let mut first = (*head[0]).clone();
+        first["_synaps_context"][key] = value;
+        let mut head = head.to_vec();
+        head[0] = Arc::new(first);
+        head
+    }
+
+    /// A head whose marker names archive `id` at window 4, and nothing else.
+    fn head_naming(id: &str) -> Vec<SharedMessage> {
+        vec![Arc::new(json!({"role":"user","content":"historical data",
+            "_synaps_context":{"schema":MARKER,"archive":id,"window":4}}))]
+    }
+
+    /// An Axel binding whose service is not there: a lookup through it fails.
+    fn axel_without_service(dir: &Path) -> MemoryBinding {
+        let binding = crate::tools::test_helpers::memory_binding(
+            agent_core::config::MemoryBackendKind::Axel,
+            dir,
+        );
+        assert!(binding.exclusive());
+        binding
+    }
+
+    /// No rollover writes window 0. The Axel path refused such a marker;
+    /// the file-store path took it, archive link and all, and the chat went
+    /// on at window 0. Both refuse it now.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_marker_with_window_0_is_refused_by_the_file_store_resume_too() {
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let id = parts[0].archive.id.clone();
+        assert_eq!(resume(&head, &binding), (Some(id), 2, true), "as it was sealed");
+
+        let zero = marked(&head, "window", json!(0));
+        let log = Log::default();
+        let _capture = log.capture();
+        assert_eq!(resume(&zero, &binding), (None, 1, true));
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_says(&lines[0], &["window 0", "goes on at window 1 without its archive link"]);
+
+        let refused = validate_restored_history(&zero, &chat_state(), &axel_without_service(env.path()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("marker is invalid"), "{refused}");
+    }
+
+    /// An archive id is 32 lowercase hex characters on every path that
+    /// reads a resumed head ([`is_archive_id`]). Here the file-store path:
+    /// the id in capitals is not looked up, and the log says the marker
+    /// names no archive.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn an_id_in_uppercase_is_no_archive_id_for_the_file_store_resume() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let id = parts[0].archive.id.clone();
+        // An id of digits alone has no capitals to test with.
+        let upper = if id.bytes().any(|b| b.is_ascii_lowercase()) {
+            id.to_uppercase()
+        } else {
+            "ABCDEF0123456789ABCDEF0123456789".to_string()
+        };
+        assert!(is_archive_id(&id) && !is_archive_id(&upper));
+
+        let log = Log::default();
+        let _capture = log.capture();
+        assert_eq!(resume(&marked(&head, "archive", json!(upper)), &binding), (None, 1, true));
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_says(&lines[0], &["names no archive", "32 bytes that are not an archive id"]);
+        assert!(!lines[0].contains(&upper), "what is not an id is not logged: {lines:?}");
+    }
+
+    const UPPER: &str = "ABCDEF0123456789ABCDEF0123456789";
+
+    /// The same rule on the syntactic path (Axel memory, before the host
+    /// has validated the head): it kept an id in capitals as the archive
+    /// link.
+    #[test]
+    fn an_id_in_uppercase_is_no_archive_id_for_the_syntactic_restore() {
+        let restore = |id: &str| {
+            let state = chat_state();
+            restore_window_syntactic(&head_naming(id), &state);
+            let s = state.lock().unwrap();
+            (s.latest_archive.clone(), s.window, s.restore_pending)
+        };
+        let lower = UPPER.to_lowercase();
+        assert_eq!(restore(&lower), (Some(lower.clone()), 4, true));
+        assert_eq!(restore(UPPER), (None, 4, true), "pending, with no archive to go by");
+    }
+
+    /// The same rule on the Axel validation path: it asked the service for
+    /// an id in capitals. Such a marker is now invalid before anything is
+    /// asked; an id of the right form is still looked up (and here not
+    /// verified, the service being away).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn an_id_in_uppercase_is_refused_by_the_axel_validation() {
+        let env = BaseDirGuard::new();
+        let axel = axel_without_service(env.path());
+        let refusal = |id: String| {
+            let axel = &axel;
+            async move {
+                validate_restored_history(&head_naming(&id), &chat_state(), axel)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+            }
+        };
+        let lower = refusal(UPPER.to_lowercase()).await;
+        assert!(lower.contains("could not be verified"), "{lower}");
+        let upper = refusal(UPPER.to_string()).await;
+        assert!(upper.contains("marker is invalid"), "{upper}");
+        assert!(!env.path().join("brain.r8").exists());
     }
 
     /// `head` with its marker's `archives` replaced by entries of `ids`.

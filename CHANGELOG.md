@@ -30,8 +30,10 @@ All notable changes to this project will be documented in this file.
   started them as `parent`; a chat has no `parent` key), so an extension
   can tell them apart. The key is absent when the call has no memory
   binding behind it and for the host's own memory calls; the host never
-  invents one. An identity, not a secret or a proof. Additive: an extension
-  that ignores it is unaffected. See `docs/extensions/protocol.md`.
+  invents one. The host writes it beside `input`, never from it, so an
+  extension may go by it; its values are not secret, and it names one life
+  of a run (`session_id` is what stays the same for a chat). Additive: an
+  extension that ignores it is unaffected. See `docs/extensions/protocol.md`.
 - **Extensions: the context archive file format is a documented contract.**
   With the built-in file store (`memory.backend = legacy`), an extension may
   read the files under `context-archives/` directly.
@@ -410,6 +412,69 @@ All notable changes to this project will be documented in this file.
   through the reader's own check first; a record that would not be read
   back is refused with the name of the check and nothing is written. A seal
   of a chat's messages never produced such a record and is unchanged.
+- **A resumed head's marker is read by one rule; a log line no longer names
+  the wrong host.** Two small things:
+  - A resumed chat's context head with `window` 0 in its marker was refused
+    with Axel memory and taken, archive link and all, with plain-file
+    memory. Both refuse it now: the chat goes on at window 1 without the
+    link, and a warning says so. And "has the form of an archive id" is one
+    function on the three paths that read such a marker: 32 lowercase hex
+    characters, which is what both stores write. Two of the paths took
+    capitals too; a marker naming an id in capitals is now invalid there.
+  - The two warnings about a chat's folder that is gone or cannot be looked
+    at began "daemon:", and an unpark in a host that is not the daemon
+    writes them too. They no longer name a host.
+- **Extensions: `caller` is tested on the three paths that had no test.**
+  A `tool.call` made from the deferred-tool lane, from a tool-backed
+  `/plugin:command` and from the tool loop of a model an extension provides
+  carried `caller`, but nothing checked it: a dropped argument on any of
+  them would have passed every test. Each now has a test that the
+  extension is told the calling chat's own author, the same on a later
+  call, and a different one for a second chat
+  (`tests/extension_lease_lifecycle.rs`,
+  `tests/session_actor_plugin_command_caller.rs`,
+  `runtime/openai/extension_route.rs`). Tests only.
+- **Extensions: the contract says what `caller` can be relied on for.**
+  `docs/extensions/protocol.md` and `contract.json` told extension authors
+  "Do not grant access because a call carries a given `caller`". That was
+  wrong: the host writes `caller` beside `input` and never from it, a model
+  cannot set it, and no run is given another's, so it is exactly what an
+  extension can go by. The pages now say that, and what is true instead:
+  the values are not secret (models read them in forum posts), so an
+  extension must never accept an author from tool input; a call with no
+  `caller` (the host's own calls, an older host) must get no access that
+  depends on who is calling; and `caller` identifies one life of a run.
+  After a park and wake, a daemon reload or restart, or `--continue`, the
+  same chat has a new `actor` and `group`; `session_id` is what stays the
+  same for a chat, and a worker's call has none, so `group` ties a worker
+  to its chat only within one life. No code changed; a new test in
+  `tests/extensions_contract.rs` holds the two pages to these statements.
+- **A directory that cannot be opened for its sync is logged.** A save into
+  a directory that may be written but not opened for reading (mode `0300`,
+  for example) succeeds without the directory being synced, for notes and
+  for every private file. That was silent. Each such save now logs one
+  warning with the directory and the error: after a power cut the name of a
+  file newly created there may be missing. Nothing else changes: the save
+  still answers as it did.
+- **`synaps retention sweep` with Axel memory: an age or a budget is refused
+  without `--include-notes`.** The Axel service's sweep deletes saved notes
+  and nothing else: every note older than `--max-age-days`, then notes
+  oldest first until `--max-disk-bytes` is met. The command passed both to
+  it whether or not `--include-notes` was given (the help said the flag had
+  "no effect with Axel"), so a sweep meant for old sessions and logs
+  deleted notes. Without the flag the command now stops before the service
+  is asked, says that notes are all that sweep can delete, and deletes
+  nothing. With the flag it does what it did.
+- **`synaps retention sweep --max-disk-bytes`: a budget that cannot be met
+  deletes nothing (plain-file memory).** A budget smaller than what the
+  sweep may not delete (the sessions named chains point at, and saved notes
+  when `--include-notes` is not given) can never be met. The sweep still
+  deleted every other session, trace and log, oldest first, and only then
+  answered "disk budget unmet". It now adds up what it may not delete
+  before its first deletion and, when the budget is below that, stops
+  there: no file is removed or rewritten (an age given with the same
+  command is not applied either), and the error says how many bytes are
+  protected. A budget that can be met is met as before.
 - **Extensions: the context archive format page says what the store does.**
   `docs/extensions/context-archives.md` was wrong or silent in several
   places. It now states: a shelf is `s` and exactly six digits (`s000001` to

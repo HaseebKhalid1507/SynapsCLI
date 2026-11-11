@@ -244,23 +244,34 @@ itself records when the same run posts to the project forum:
 
 No other field is sent.
 
-- **How long it lasts.** As long as the run: every call a chat makes names
-  the same author until the host builds the chat anew (the daemon restarts
-  or reloads, the chat is parked and woken, or it is resumed with
-  `--continue`); then it has a new `actor` and a new `group`. A resumed
-  worker is a new run with a new `actor`. It is not the conversation's id:
-  that is `session_id`.
-- **When it is absent.** A host older than this field; a call made with no
-  memory binding behind it (a model an extension provides, called outside
-  a chat's turn); the host's own calls to a memory extension (capture and
-  recall), which no run makes. The host never makes one up, and never sends
-  one that is not of the shape above. Treat a missing key as "unknown
-  caller", not as some default caller.
-- **What it is not.** It is an identity, not a secret and not a proof. The
-  host states it; the same values appear in forum posts and tool results
-  that models read, so anything that can read them knows them. Use it to
-  tell runs apart and to attribute what a run does. Do not grant access
-  because a call carries a given `caller`.
+- **The host writes it, and only the host.** `caller` is a key of `params`
+  that the host writes beside `input`, never from it. A model cannot set it
+  or change it, and no run is ever given another run's. An extension may go
+  by it: the run `caller` names is the run that is calling.
+- **Its values are not secret.** The same `actor` and `group` appear in
+  forum posts and tool results that models read, so a model can know the
+  author of a run that is not its own. An extension must therefore never
+  accept an author from tool `input` (an `actor`, `group` or `parent`
+  argument, or anything else the model writes). Who is calling is
+  `params.caller` and nothing else.
+- **A call with no `caller` exists.** The key is absent for the host's own
+  calls to a memory extension (capture and recall), which no run makes;
+  for a call with no memory binding behind it (a model an extension
+  provides, called outside a chat's turn); and from a host older than this
+  field. The host never makes one up, and never sends one that is not of
+  the shape above. Such a call must get no access that depends on who is
+  calling: it is an unknown caller, not some default caller.
+- **It identifies one life of a run, not the chat.** Every call a chat
+  makes names the same author until the host builds the chat anew. After a
+  park and wake (the daemon parks a chat that no client is attached to), a
+  daemon reload or restart, or `--continue`, the same chat has a new
+  `actor` and a new `group`. A resumed worker is a new run with a new
+  `actor`. `session_id` is what stays the same for a chat: key on it what
+  must still belong to the chat afterwards. A worker's call has no
+  `session_id` (it is `null`), so `group` is what ties a worker to its
+  chat, and only within one life: an extension learns which chat a `group`
+  belongs to from a call the chat itself makes, which carries both, and
+  workers started after the chat is built anew are in its new group.
 - `SYNAPS_HOOK_SESSION_ID=0` does not affect it.
 
 **Response:**
