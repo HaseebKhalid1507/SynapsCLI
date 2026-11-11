@@ -56,6 +56,7 @@ use super::runtime::process::ProcessExtension;
 use super::runtime::ExtensionHandler;
 use crate::tools::activation::SessionId;
 use crate::tools::catalog::SchemaDigest;
+use agent_core::memory::forum::Author;
 
 /// Default idle bound for opportunistic reaping (parity with MCP leases).
 pub const DEFAULT_IDLE_MAX: Duration = Duration::from_secs(300);
@@ -730,6 +731,35 @@ impl ExtensionRuntimeManager {
         conversation_id: Option<&str>,
         cwd: Option<&Path>,
     ) -> Result<Value, ExtensionLeaseError> {
+        self.call_exact_as(
+            session,
+            plugin,
+            tool_name,
+            expected_digest,
+            params,
+            conversation_id,
+            cwd,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::call_exact_for`], naming the run that calls: `caller` is the
+    /// forum author of the calling run's memory binding, forwarded as
+    /// `tool.call` `params.caller` (`None` = the key is left out: the host's
+    /// own calls, a context with no binding).
+    #[allow(clippy::too_many_arguments)] // the exact call plus who it is for
+    pub async fn call_exact_as(
+        &self,
+        session: &SessionId,
+        plugin: &str,
+        tool_name: &str,
+        expected_digest: &SchemaDigest,
+        params: Value,
+        conversation_id: Option<&str>,
+        cwd: Option<&Path>,
+        caller: Option<&Author>,
+    ) -> Result<Value, ExtensionLeaseError> {
         // 1.-2. Record re-read + manifest re-validation (pure local).
         let (record, validated) = self.record_and_validate(session, plugin)?;
         // 3. Catalog-drift check: the CURRENT record must still declare
@@ -784,7 +814,7 @@ impl ExtensionRuntimeManager {
         }
         let result = inner
             .handler
-            .call_tool_once_no_spawn(tool_name, params, conversation_id, cwd)
+            .call_tool_once_no_spawn(tool_name, params, conversation_id, cwd, caller)
             .await;
         if inner.cancelled() {
             // Revoked while this already-started call ran: shut the child
@@ -982,6 +1012,33 @@ impl ExtensionLeaseCapability {
                 params,
                 conversation_id,
                 cwd,
+            )
+            .await
+    }
+
+    /// [`Self::call_exact_for`], naming the run that calls; see
+    /// [`ExtensionRuntimeManager::call_exact_as`].
+    #[allow(clippy::too_many_arguments)] // the exact call plus who it is for
+    pub async fn call_exact_as(
+        &self,
+        plugin: &str,
+        tool_name: &str,
+        expected_digest: &SchemaDigest,
+        params: Value,
+        conversation_id: Option<&str>,
+        cwd: Option<&Path>,
+        caller: Option<&Author>,
+    ) -> Result<Value, ExtensionLeaseError> {
+        self.manager
+            .call_exact_as(
+                &self.session,
+                plugin,
+                tool_name,
+                expected_digest,
+                params,
+                conversation_id,
+                cwd,
+                caller,
             )
             .await
     }

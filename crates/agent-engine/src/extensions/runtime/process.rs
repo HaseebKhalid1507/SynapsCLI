@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use super::{ExtensionHandler, ExtensionHealth, ExtensionLifecycle, RestartPolicy};
 use crate::extensions::hooks::events::{HookEvent, HookResult};
 use crate::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION;
+use agent_core::memory::forum::Author;
 
 #[derive(Serialize)]
 struct JsonRpcRequest {
@@ -1907,6 +1908,7 @@ impl ProcessExtension {
         input: Value,
         session_id: Option<&str>,
         cwd: Option<&Path>,
+        caller: Option<&Author>,
     ) -> Result<Value, String> {
         let fut = async {
             let _call_guard = self.call_lock.lock().await;
@@ -1928,7 +1930,7 @@ impl ProcessExtension {
                 .call_once_locked(
                     &mut state,
                     "tool.call",
-                    tool_call_params(name, input, session_id, cwd),
+                    tool_call_params(name, input, session_id, cwd, caller),
                     id,
                 )
                 .await;
@@ -2214,18 +2216,28 @@ impl ProcessExtension {
 /// ([`hook_cwd`]): set for workers too, and the kill switch leaves it alone.
 /// Both always present (`null`, never omitted), like hook fields.
 ///
+/// `caller` is the forum author of the run that makes the call: the one its
+/// memory binding holds, so the one the host's own `forum_post` records for
+/// that run. Serialised as [`Author`] serialises (`parent` absent for a
+/// chat). Unlike the two above the key is ABSENT when there is none (no
+/// binding in the tool context, the host's own calls) or when it does not
+/// validate: never `null`, never one made up here. The kill switch leaves
+/// it alone. An identity, not a secret and not a proof of who calls.
+///
 /// [`hook_cwd`]: crate::extensions::hooks::events::hook_cwd
 pub(crate) fn tool_call_params(
     name: &str,
     input: Value,
     session_id: Option<&str>,
     cwd: Option<&Path>,
+    caller: Option<&Author>,
 ) -> Value {
     tool_call_params_gated(
         name,
         input,
         session_id,
         cwd,
+        caller,
         crate::extensions::hooks::events::hook_session_id_enabled(),
     )
 }
@@ -2235,15 +2247,23 @@ fn tool_call_params_gated(
     input: Value,
     session_id: Option<&str>,
     cwd: Option<&Path>,
+    caller: Option<&Author>,
     session_id_enabled: bool,
 ) -> Value {
     let session_id = if session_id_enabled { session_id } else { None };
-    serde_json::json!({
+    let mut params = serde_json::json!({
         "name": name,
         "input": input,
         "session_id": session_id,
         "cwd": crate::extensions::hooks::events::hook_cwd(cwd),
-    })
+    });
+    if let Some(caller) = caller
+        .filter(|author| author.validate().is_ok())
+        .and_then(|author| serde_json::to_value(author).ok())
+    {
+        params["caller"] = caller;
+    }
+    params
 }
 
 #[async_trait]
@@ -2264,8 +2284,22 @@ impl ExtensionHandler for ProcessExtension {
         session_id: Option<&str>,
         cwd: Option<&Path>,
     ) -> Result<Value, String> {
-        self.call("tool.call", tool_call_params(name, input, session_id, cwd))
-            .await
+        self.call_tool_as(name, input, session_id, cwd, None).await
+    }
+
+    async fn call_tool_as(
+        &self,
+        name: &str,
+        input: Value,
+        session_id: Option<&str>,
+        cwd: Option<&Path>,
+        caller: Option<&Author>,
+    ) -> Result<Value, String> {
+        self.call(
+            "tool.call",
+            tool_call_params(name, input, session_id, cwd, caller),
+        )
+        .await
     }
 
     async fn provider_complete(
@@ -2629,7 +2663,7 @@ mod tool_call_params_tests {
     fn carries_caller_session_id_and_cwd() {
         let dir = chat_dir();
         assert_eq!(
-            tool_call_params_gated("echo", json!({"text": "hi"}), Some("sess-A"), Some(&dir), true),
+            tool_call_params_gated("echo", json!({"text": "hi"}), Some("sess-A"), Some(&dir), None, true),
             json!({
                 "name": "echo",
                 "input": {"text": "hi"},
@@ -2643,7 +2677,7 @@ mod tool_call_params_tests {
     #[test]
     fn worker_call_has_null_session_id_key_and_its_cwd() {
         let dir = chat_dir();
-        let params = tool_call_params_gated("echo", json!({}), None, Some(&dir), true);
+        let params = tool_call_params_gated("echo", json!({}), None, Some(&dir), None, true);
         assert_eq!(params.get("session_id"), Some(&Value::Null));
         assert_eq!(params["cwd"], json!(dir.to_str().unwrap()));
     }
@@ -2651,7 +2685,7 @@ mod tool_call_params_tests {
     #[test]
     fn kill_switch_forces_null_session_id_and_leaves_cwd() {
         let dir = chat_dir();
-        let params = tool_call_params_gated("echo", json!({}), Some("sess-A"), Some(&dir), false);
+        let params = tool_call_params_gated("echo", json!({}), Some("sess-A"), Some(&dir), None, false);
         assert_eq!(params.get("session_id"), Some(&Value::Null));
         assert_eq!(params["cwd"], json!(dir.to_str().unwrap()));
         assert_eq!(params["name"], json!("echo"));
@@ -2661,8 +2695,41 @@ mod tool_call_params_tests {
     #[test]
     fn no_session_folder_sends_the_process_folder() {
         let process = std::env::current_dir().unwrap();
-        let params = tool_call_params_gated("echo", json!({}), None, None, true);
+        let params = tool_call_params_gated("echo", json!({}), None, None, None, true);
         assert_eq!(params["cwd"], json!(process.to_str().unwrap()));
+    }
+
+    /// The value is the author as its type serialises, and reads back as it.
+    #[test]
+    fn caller_is_the_author_as_it_serialises() {
+        let chat = Author::fresh();
+        let worker = chat.child();
+        for (author, keys) in [(&chat, 2), (&worker, 3)] {
+            // The kill switch is for session_id only.
+            for enabled in [true, false] {
+                let params =
+                    tool_call_params_gated("echo", json!({}), None, None, Some(author), enabled);
+                assert_eq!(params["caller"], serde_json::to_value(author).unwrap());
+                assert_eq!(params["caller"].as_object().unwrap().len(), keys);
+                let read: Author = serde_json::from_value(params["caller"].clone()).unwrap();
+                read.validate().unwrap();
+                assert_eq!(&read, author);
+            }
+        }
+        let params = tool_call_params_gated("echo", json!({}), None, None, Some(&chat), true);
+        assert!(params["caller"].get("parent").is_none(), "a chat has no parent key");
+    }
+
+    /// No author: no key, not `null`. One that does not validate is not sent.
+    #[test]
+    fn no_caller_is_no_key() {
+        let params = tool_call_params_gated("echo", json!({}), Some("s"), None, None, true);
+        assert!(params.as_object().unwrap().get("caller").is_none());
+        assert_eq!(params.as_object().unwrap().len(), 4);
+        let mut bad = Author::fresh();
+        bad.actor = "me".into();
+        let params = tool_call_params_gated("echo", json!({}), None, None, Some(&bad), true);
+        assert!(params.as_object().unwrap().get("caller").is_none());
     }
 }
 

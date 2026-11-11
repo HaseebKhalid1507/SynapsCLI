@@ -172,9 +172,10 @@
           "name": "the extension's own tool name (not the plugin-id:name runtime name)",
           "input": "the model-supplied arguments object",
           "session_id": "owning conversation id; null for workers/subagents, for the host's own calls to a memory extension (capture and recall), and under SYNAPS_HOOK_SESSION_ID=0. Always present.",
-          "cwd": "the folder the caller runs in (the chat's; a worker's parent chat's; the chat's for the host's own memory calls), as the client gave it, not canonicalised by Synaps; null only when the path is not valid UTF-8, or when the folder to report is the host process's own and it cannot be read. The same value hook events carry as cwd. Always present."
+          "cwd": "the folder the caller runs in (the chat's; a worker's parent chat's; the chat's for the host's own memory calls), as the client gave it, not canonicalised by Synaps; null only when the path is not valid UTF-8, or when the folder to report is the host process's own and it cannot be read. The same value hook events carry as cwd. Always present.",
+          "caller": "optional object {actor: \"actor-<32 lowercase hex>\", group: \"group-<32 lowercase hex>\", parent?: \"actor-<32 lowercase hex>\"}: the forum author of the run that makes the call (a chat, or one worker of it), the one the host records when that run posts to the project forum. parent is absent for a chat and is the starting run's actor for a worker; workers share their chat's group. The key is absent, never null, when the call has no memory binding behind it and for the host's own memory calls (capture and recall). Lasts as long as the run: a chat the host builds anew (restart, reload, unpark, --continue) has a new actor and group. An identity, not a secret and not a proof of who is calling. Not affected by SYNAPS_HOOK_SESSION_ID."
         },
-        "compatibility": "session_id and cwd are additive params keys within extension_protocol_version 1; extensions must ignore params keys they do not know"
+        "compatibility": "session_id, cwd and caller are additive params keys within extension_protocol_version 1; extensions must ignore params keys they do not know"
       }
     },
     "providers": {

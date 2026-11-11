@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Extensions: `tool.call` carries `caller`**, the run that makes the call:
+  `{"actor", "group", "parent"}`, the author the host records when the same
+  run posts to the project forum. A chat and each of its workers is a run
+  of its own (workers share the chat's `group` and name the run that
+  started them as `parent`; a chat has no `parent` key), so an extension
+  can tell them apart. The key is absent when the call has no memory
+  binding behind it and for the host's own memory calls; the host never
+  invents one. An identity, not a secret or a proof. Additive: an extension
+  that ignores it is unaffected. See `docs/extensions/protocol.md`.
 - **Extensions: the context archive file format is a documented contract.**
   With the built-in file store (`memory.backend = legacy`), an extension may
   read the files under `context-archives/` directly.

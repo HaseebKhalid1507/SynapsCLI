@@ -32,6 +32,19 @@ impl ExtensionTool {
     }
 }
 
+/// Who an extension tool call is made by, for `tool.call` `params.caller`:
+/// the forum author of the memory binding the call's context came with,
+/// which is the author the host's own `forum_post` records for the same run
+/// (`tools/forum.rs` reads the same field of the same binding). `None` when
+/// the context has no binding: a binding made on the spot would carry an
+/// author no run has, so none is sent.
+fn caller_of(ctx: &ToolContext) -> Option<agent_core::memory::forum::Author> {
+    ctx.capabilities
+        .memory_backend
+        .as_ref()
+        .map(|binding| binding.forum_author().clone())
+}
+
 #[async_trait::async_trait]
 impl crate::tools::Tool for ExtensionTool {
     fn name(&self) -> &str {
@@ -47,6 +60,7 @@ impl crate::tools::Tool for ExtensionTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let caller = caller_of(&ctx);
         let binding = ctx
             .capabilities
             .memory_backend
@@ -56,11 +70,12 @@ impl crate::tools::Tool for ExtensionTool {
         }
         let value = self
             .handler
-            .call_tool_for(
+            .call_tool_as(
                 &self.tool_name,
                 params,
                 ctx.capabilities.session_id.as_deref(),
                 ctx.capabilities.cwd.as_deref(),
+                caller.as_ref(),
             )
             .await
             .map_err(RuntimeError::Tool)?;
@@ -224,5 +239,232 @@ mod tests {
             );
         }
         assert_eq!(handler.0.load(Ordering::SeqCst), 2);
+    }
+}
+
+/// `tool.call` `params.caller` over the real wire: a child process that
+/// keeps every `tool.call` it is sent, called through `ExtensionTool` with
+/// the contexts a chat and its workers have.
+#[cfg(all(test, unix))]
+mod caller_tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use agent_core::config::{MemoryBackendConfig, MemoryBackendKind};
+    use agent_core::memory::forum::Author;
+    use agent_core::memory::store::ProjectScope;
+    use serde_json::json;
+
+    use super::*;
+    use crate::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION;
+    use crate::extensions::runtime::process::ProcessExtension;
+    use crate::memory_backend::MemoryBinding;
+    use crate::tools::test_helpers::{context_with_memory, create_tool_context, fake_axel_service};
+    use crate::tools::Tool;
+
+    /// An extension process that appends the body of each `tool.call` to
+    /// `log` (one JSON-RPC request a line) and answers it `"ok"`. It reads
+    /// no param of the call: an extension that ignores `caller`.
+    async fn wire_tool(log: &Path) -> ExtensionTool {
+        let init = json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {}
+        });
+        let script = format!(
+            r#"while IFS= read -r header; do
+    length=${{header#Content-Length: }}
+    length=${{length%?}}
+    IFS= read -r blank || exit 1
+    body=$(dd bs=1 count="$length" 2>/dev/null) || exit 1
+    id=${{body##*\"id\":}}
+    id=${{id%%[!0-9]*}}
+    case "$body" in
+        *'"method":"initialize"'*) result='{init}' ;;
+        *'"method":"tool.call"'*) printf '%s\n' "$body" >> '{log}'; result='"ok"' ;;
+        *) result=null ;;
+    esac
+    reply='{{"jsonrpc":"2.0","id":'"$id"',"result":'"$result"'}}'
+    printf 'Content-Length: %s\r\n\r\n%s' "${{#reply}}" "$reply"
+done"#,
+            log = log.display(),
+        );
+        let process = ProcessExtension::spawn("caller-fixture", "/bin/sh", &["-c".into(), script])
+            .await
+            .expect("spawn the fixture");
+        tokio::time::timeout(Duration::from_secs(5), process.initialize_for_test(None))
+            .await
+            .expect("bounded initialize")
+            .expect("initialize the fixture");
+        ExtensionTool::new(
+            "fixture",
+            RegisteredExtensionToolSpec {
+                name: "whoami".into(),
+                description: "keeps the call".into(),
+                input_schema: json!({"type": "object"}),
+            },
+            Arc::new(process),
+        )
+    }
+
+    /// One call with `ctx`; the `params` the process was sent for it.
+    async fn params_sent(tool: &ExtensionTool, log: &Path, ctx: ToolContext) -> Value {
+        let before = sent(log).len();
+        let reply = tokio::time::timeout(Duration::from_secs(5), tool.execute(json!({}), ctx))
+            .await
+            .expect("bounded call")
+            .expect("the fixture answers");
+        assert_eq!(reply, "ok");
+        let all = sent(log);
+        assert_eq!(all.len(), before + 1, "one tool.call a call");
+        let params = all[before]["params"].clone();
+        assert_eq!(params["name"], json!("whoami"));
+        params
+    }
+
+    fn sent(log: &Path) -> Vec<Value> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a tool.call body"))
+            .collect()
+    }
+
+    /// A chat's binding: Axel, a project of its own in `dir`, served by the
+    /// stand-in service, which keeps what it is asked in `requests.jsonl`.
+    fn chat_binding(dir: &Path) -> MemoryBinding {
+        let binding = MemoryBinding::from_config_with_cwd(
+            &MemoryBackendConfig {
+                kind: MemoryBackendKind::Axel,
+                executable: Some(fake_axel_service(dir, "{}")),
+                brain: Some(dir.join("brain.r8")),
+                user_scope: false,
+            },
+            Some(dir.to_path_buf()),
+        )
+        .with_scope(ProjectScope::for_root(dir).unwrap());
+        assert!(binding.is_axel());
+        binding
+    }
+
+    /// The author the host's own `forum_post` gives the store for a run
+    /// with `binding`: the tool is run, and the request it made is read.
+    async fn author_forum_post_records(dir: &Path, binding: &MemoryBinding) -> Value {
+        let requests = dir.join("requests.jsonl");
+        let _ = std::fs::remove_file(&requests);
+        // The stand-in's `{}` is no receipt, so the tool reports a failure;
+        // the request it sent first is what is read here.
+        let _ = crate::tools::forum::ForumPostTool
+            .execute(
+                json!({"request_key": "k-1", "title": "Finding", "body": "Synthetic peer note"}),
+                context_with_memory(binding.clone()),
+            )
+            .await;
+        let posts: Vec<Value> = std::fs::read_to_string(&requests)
+            .expect("forum_post reached the service")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|request| request["operation"] == "forum_post")
+            .collect();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        posts[0]["payload"]["author"].clone()
+    }
+
+    /// What `tools/subagent` gives a worker runtime of a chat with `chat`:
+    /// oneshot, start and resume all go through this one function.
+    fn worker_binding(chat: &MemoryBinding) -> MemoryBinding {
+        let mut worker = crate::Runtime::new_headless();
+        crate::tools::subagent::apply_subagent_runtime_policy(
+            &mut worker,
+            &Default::default(),
+            Some(chat),
+            None,
+            None,
+            &Default::default(),
+        );
+        worker.memory_backend_for_test()
+    }
+
+    fn as_author(caller: &Value) -> Author {
+        let author: Author = serde_json::from_value(caller.clone()).expect("an Author");
+        author.validate().expect("a valid Author");
+        author
+    }
+
+    #[tokio::test]
+    async fn a_chats_tool_call_names_the_author_its_forum_post_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let log = dir.join("calls.jsonl");
+        let tool = wire_tool(&log).await;
+        let chat = chat_binding(&dir);
+
+        let params = params_sent(&tool, &log, context_with_memory(chat.clone())).await;
+        let posted = author_forum_post_records(&dir, &chat).await;
+        assert!(posted.is_object(), "{posted}");
+        assert_eq!(params["caller"], posted, "the same run, the same author, either route");
+
+        // As the type serialises: a chat has no `parent` key; it reads back
+        // as an `Author` and validates.
+        let caller = as_author(&params["caller"]);
+        assert_eq!(&caller, chat.forum_author());
+        assert!(caller.parent.is_none());
+        let mut keys: Vec<&str> =
+            params["caller"].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["actor", "group"]);
+        // The same run later: the same caller.
+        let again = params_sent(&tool, &log, context_with_memory(chat.clone())).await;
+        assert_eq!(again["caller"], params["caller"]);
+        // Another chat is another actor in another group.
+        let other = params_sent(&tool, &log, context_with_memory(chat_binding(&dir))).await;
+        let other = as_author(&other["caller"]);
+        assert_ne!(other.actor, caller.actor);
+        assert_ne!(other.group, caller.group);
+    }
+
+    #[tokio::test]
+    async fn a_workers_tool_call_names_its_own_actor_in_the_chats_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let log = dir.join("calls.jsonl");
+        let tool = wire_tool(&log).await;
+        let chat = chat_binding(&dir);
+        let (first, second) = (worker_binding(&chat), worker_binding(&chat));
+
+        let of_chat = params_sent(&tool, &log, context_with_memory(chat.clone())).await;
+        let of_chat = as_author(&of_chat["caller"]);
+        let mut actors = vec![of_chat.actor.clone()];
+        for worker in [&first, &second] {
+            let params = params_sent(&tool, &log, context_with_memory(worker.clone())).await;
+            assert_eq!(
+                params["caller"],
+                author_forum_post_records(&dir, worker).await,
+                "a worker's call and a worker's post name the same author"
+            );
+            let caller = as_author(&params["caller"]);
+            assert_eq!(caller.group, of_chat.group);
+            assert_eq!(caller.parent.as_deref(), Some(of_chat.actor.as_str()));
+            assert!(!actors.contains(&caller.actor), "each run its own actor");
+            actors.push(caller.actor);
+        }
+        // The chat's own author is what it was before it had workers.
+        let after = params_sent(&tool, &log, context_with_memory(chat.clone())).await;
+        assert_eq!(as_author(&after["caller"]), of_chat);
+    }
+
+    /// No binding in the context: no `caller` key at all, and the call is
+    /// otherwise the call it was.
+    #[tokio::test]
+    async fn a_call_with_no_binding_has_no_caller_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let log = dir.join("calls.jsonl");
+        let tool = wire_tool(&log).await;
+        let ctx = create_tool_context();
+        assert!(ctx.capabilities.memory_backend.is_none());
+        let params = params_sent(&tool, &log, ctx).await;
+        let mut keys: Vec<&str> = params.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["cwd", "input", "name", "session_id"]);
     }
 }

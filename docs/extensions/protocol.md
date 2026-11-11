@@ -207,7 +207,11 @@ Called when the model invokes an extension-provided tool declared during
     "name": "echo",
     "input": { "text": "hello" },
     "session_id": "20261014-050933-a06f",
-    "cwd": "/home/u/project"
+    "cwd": "/home/u/project",
+    "caller": {
+      "actor": "actor-0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "group": "group-00112233445566778899aabbccddeeff"
+    }
   }
 }
 ```
@@ -218,12 +222,46 @@ Called when the model invokes an extension-provided tool declared during
 | `input`      | object         | The arguments the model supplied. |
 | `session_id` | string \| null | The conversation that invoked the tool: the same value the hook events carry. `null` for workers/subagents, for the host's own calls to a memory extension (capture and recall), and when `SYNAPS_HOOK_SESSION_ID=0`. Always present. |
 | `cwd`        | string \| null | The folder the caller runs in: the same value the hook events carry. Set for workers too (their parent chat's folder) and for the host's own memory calls (the chat's folder). Not canonicalised by Synaps. `null` only when the path is not valid UTF-8, or when the folder to report is the host process's own and it cannot be read. Always present. |
+| `caller`     | object, optional | Which run makes the call; see below. The key is absent when the host has none to give: never `null`. |
 
 In daemon mode one extension process serves every session, so key any
 per-caller tool state on `params.session_id` (see
 [session-id.md](session-id.md)) and scope per-project behaviour on
 `params.cwd` (see [hooks.md](hooks.md#cwd-the-chats-working-folder)). Older
 hosts omit these fields; treat a missing key like `null`.
+
+#### `caller`: the run that makes the call
+
+A chat and each of its workers (subagents) is a run of its own, and the
+host gives every run an author. `caller` is that author, the one the host
+itself records when the same run posts to the project forum:
+
+| Field    | Type             | Description |
+|----------|------------------|-------------|
+| `actor`  | string           | `actor-` and 32 lowercase hex digits. The run. Two workers of one chat have different actors. |
+| `group`  | string           | `group-` and 32 lowercase hex digits. The chat and all the workers under it share one. |
+| `parent` | string, optional | The `actor` of the run that started this one. Absent for a chat (not `null`); a worker carries its chat's actor, a worker's worker its worker's. Never equal to `actor`. |
+
+No other field is sent.
+
+- **How long it lasts.** As long as the run: every call a chat makes names
+  the same author until the host builds the chat anew (the daemon restarts
+  or reloads, the chat is parked and woken, or it is resumed with
+  `--continue`); then it has a new `actor` and a new `group`. A resumed
+  worker is a new run with a new `actor`. It is not the conversation's id:
+  that is `session_id`.
+- **When it is absent.** A host older than this field; a call made with no
+  memory binding behind it (a model an extension provides, called outside
+  a chat's turn); the host's own calls to a memory extension (capture and
+  recall), which no run makes. The host never makes one up, and never sends
+  one that is not of the shape above. Treat a missing key as "unknown
+  caller", not as some default caller.
+- **What it is not.** It is an identity, not a secret and not a proof. The
+  host states it; the same values appear in forum posts and tool results
+  that models read, so anything that can read them knows them. Use it to
+  tell runs apart and to attribute what a run does. Do not grant access
+  because a call carries a given `caller`.
+- `SYNAPS_HOOK_SESSION_ID=0` does not affect it.
 
 **Response:**
 
