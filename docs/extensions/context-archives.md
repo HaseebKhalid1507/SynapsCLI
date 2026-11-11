@@ -354,8 +354,10 @@ While Synaps writes version 1:
    that a `digest` is in one file only: where Synaps cannot see the first
    copy (a shelf it cannot open, a file it will not read, a legacy slot
    file it cannot read), it stores the content again, and a project can
-   hold the same `id` on two shelves (a restored backup). See
-   [Tombstones](#tombstones) for what that means for a forget.
+   hold the same `id` on two shelves (a restored backup). An archive brought
+   in by an import ([Moving archives](#moving-archives-between-machines-or-projects))
+   keeps the id it had, so its content can afterwards exist under a second
+   id. See [Tombstones](#tombstones) for what that means for a forget.
 7. **No lock is needed to read.** Synaps reads archives in shelves without
    one.
 
@@ -688,6 +690,91 @@ has the exact payloads and what each event does and does not promise.
 complete, scan when you start: for each project directory you know, read it
 as [In short](#in-short) says, add the ids you do not have, and drop the ones
 that have become tombstones. Key everything on the archive `id`.
+
+## Moving archives between machines or projects
+
+Do not copy archive files into a project directory yourself: `scope` has to
+be the name of the directory, and a file dropped into a shelf is checked by
+nobody. `synaps memory import-archives` is the way in. It is a command for
+the person who owns the data, not something an extension calls for itself;
+it is described here because its input is the record of this page.
+
+```text
+synaps memory import-archives <FILE>... (--as-recorded | --cwd <DIR> | --project-key <KEY>) [--dry-run]
+synaps memory project [--cwd <DIR>]
+```
+
+**The input is JSON Lines: one record per line,** the same object an archive
+file holds ([The record](#the-record)), live or tombstone. `-` is standard
+input, blank lines are skipped, and lines are imported in the order given,
+across the files in the order they are named. A directory of archive files
+is the same thing, one file after another with a newline between them:
+
+```sh
+for f in "$dir"/*.json "$dir"/s*/*.json; do cat "$f"; echo; done | synaps memory import-archives - --as-recorded
+```
+
+**There is no default destination.** One of the three must be given:
+
+- `--as-recorded` files each record in the project directory its own
+  `scope` names, and changes nothing in it;
+- `--cwd DIR` files every record under the project of that folder, found as
+  for a chat started there;
+- `--project-key KEY` files every record under that project key.
+
+With the last two, `scope` is set to the new directory's name. That is the
+only field an import changes: `scope` is not part of the `digest`.
+`synaps memory project` prints the project key, the archive directory and
+the notes file of a folder, and creates nothing.
+
+What an import does with a record:
+
+- It is stored **under the id it has**, with its own `logical`, `digest` and
+  `created_ms`, as a new file in the newest shelf. Nothing is recomputed to
+  make it fit. So `id` need not be derived from `digest` (you were already
+  told not to rely on that), and the same content can be in the project
+  under a second id.
+- It is refused, and nothing is written for it, when Synaps would not read
+  it as a record of this page, when its `digest` is not the digest of its
+  content, when a `message` is not a JSON object, when a tombstone has
+  `created_ms`, when its id is already there with other content, when its
+  content was forgotten in this project, or when it is a tombstone of
+  content that is live in this project under another id (forget that
+  archive here, then import again).
+- The same record a second time changes nothing.
+- A tombstone that comes in for an archive that is live here forgets it, as
+  [Tombstones](#tombstones) describes. A live record that comes in for an
+  archive that is a tombstone here is not stored: **an import does not undo
+  a forget.**
+- No file is replaced, except by that forget.
+
+The command prints one JSON document: the totals (`read`, `stored`,
+`already_present`, `forgotten`, `kept_forgotten`, `refused`), then one entry
+for each line with its id, its outcome and, when it was refused, the name of
+the check that failed. Nothing in the document is content. The exit code is
+0 when nothing was refused, 1 when something was, and 2 when the run
+stopped (an input that cannot be read, a store that cannot be read or
+locked): what was imported before the stop is complete, and running the
+same command again continues. `--dry-run` writes nothing at all and prints
+what the real run would print.
+
+What to know before you rely on it:
+
+- **No hook is sent for an imported archive.** The command is not a chat:
+  `on_context_archived` and `on_memory_forgotten` do not fire for what it
+  stores or forgets. An index finds imported archives and their tombstones
+  the way [When to look](#when-to-look) says: by scanning.
+- **It writes the built-in file store whatever `memory.backend` says,** and
+  never talks to another backend.
+- **It may run while chats are running.** It takes the same lock a seal
+  takes, one record at a time.
+- **A record that names another project is moved, not shared.** Chats find
+  an archive by project: after `--cwd` or `--project-key`, only chats of
+  that project can fetch it, under the same `ctx-<id>`.
+- **A refused record leaves no directory behind:** a project directory is
+  made when the first record for it is stored.
+- **The longest line is 16 MiB and 4 KiB.** A longer one is refused without
+  being read into memory, and the run goes on.
 
 ## Untrusted data
 
