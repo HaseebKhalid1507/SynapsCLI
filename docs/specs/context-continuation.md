@@ -255,7 +255,12 @@ memory_fetch(ids=["ctx-<exact-returned-id>"], start=0, limit=8)
 ```
 
 `source=notes` (default) retains the existing note-store semantics. History
-results contain opaque IDs and bounded snippets. Fetch returns source indices;
+results contain opaque IDs and bounded snippets, newest archive first. When the
+file store's scan budget (below) stops a search before the oldest archive, the
+result ends with one line saying so, with the number actually read, for example
+`(searched the 1024 most recent archives; older ones were not scanned)`, so
+that an empty result is not read as "nothing older exists". Fetch returns
+source indices;
 large messages support `offset_bytes` within the message at `start`, with a
 continuation hint. Output is bounded to about 24 KiB. Existing note IDs remain
 unchanged. Fetch/search failures are not replaced with made-up history.

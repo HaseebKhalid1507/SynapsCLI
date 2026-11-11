@@ -138,6 +138,31 @@ impl MemoryBinding {
         }
         Ok(rows)
     }
+    /// [`history_search`](Self::history_search) that also reports a scan cut
+    /// short: `Some(n)` when the file store stopped after the `n` newest
+    /// archives and left older ones unread, otherwise `None`. With the Axel
+    /// backend the service does the search and reports no budget: always `None`.
+    pub async fn history_search_scan(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<(Vec<ArchiveDescriptor>, Option<usize>)> {
+        if self.exclusive() {
+            return Ok((self.history_search(query, limit).await?, None));
+        }
+        if query.len() > 512 || limit > 32 {
+            return Err(error("history search exceeds bounds"));
+        }
+        let scope = self.scope()?.clone();
+        let base = self.base().to_owned();
+        let query = query.to_owned();
+        archive_worker(move |abort| {
+            ArchiveStore::new(&base, scope.key(), "context-windows-v1")?
+                .with_abort(abort)
+                .search_scan(&query, limit)
+        })
+        .await
+    }
     pub async fn history_fetch(
         &self,
         id: &str,
@@ -298,6 +323,44 @@ mod budget_tests {
     async fn legacy_history_eligible_budget_roundtrip_and_atomic_refusal() {
         let temp = tempfile::tempdir().unwrap();
         roundtrip(&binding(temp.path(), MemoryBackendKind::Legacy, None)).await;
+    }
+
+    /// The file store keeps every archive: the 129th seal in a project used to
+    /// fail with "archive segment budget exhausted".
+    #[tokio::test]
+    async fn legacy_history_seals_past_128_archives_and_reports_a_complete_search() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = binding(temp.path(), MemoryBackendKind::Legacy, None);
+        let mut ids = Vec::new();
+        for index in 0..129 {
+            let messages = vec![Arc::new(
+                json!({"role":"user","content":format!("window {index}.")}),
+            )];
+            let (reference, _) = binding
+                .history_seal("synthetic-session", &messages, "")
+                .await
+                .unwrap();
+            ids.push(reference.id);
+        }
+        for id in &ids {
+            assert_eq!(binding.history_fetch(id, 0, 1).await.unwrap().len(), 1);
+        }
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 129);
+        // The oldest is found and nothing was left unread.
+        let (rows, stopped_after) = binding.history_search_scan("window 0.", 32).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(stopped_after, None);
+        assert_eq!(
+            binding.history_fetch(&rows[0].id, 0, 1).await.unwrap()[0].message["content"],
+            "window 0."
+        );
+        let (rows, stopped_after) = binding.history_search_scan("", 32).await.unwrap();
+        assert_eq!((rows.len(), stopped_after), (32, None));
+        assert_eq!(binding.history_search("", 32).await.unwrap(), rows);
+        assert!(binding.history_search_scan("", 33).await.is_err());
+        assert!(binding.history_search_scan(&"q".repeat(513), 1).await.is_err());
     }
 
     #[tokio::test]

@@ -46,8 +46,9 @@ All notable changes to this project will be documented in this file.
   `s000002/`, ..., 128 archives each, one `<archive id>.json` per archive)
   with no cap on count or total size. Fetching an archive opens one file
   instead of reading the whole store. History search returns the newest
-  matches first (it was oldest first) and reads at most 1,024 archives or
-  256 MiB. Existing `000.json` to `127.json` files keep working where they
+  matches first (it was oldest first) and stops after reading 1,024 archives
+  or 256 MiB; when that leaves older archives unread, `memory_search` with
+  `source=history` says so in one line with the number it did read. Existing `000.json` to `127.json` files keep working where they
   are, with no migration. The limits on a single archive (16 MiB, 4,096
   messages) are unchanged, and the files-to-Axel migration still carries at
   most 128 archives / 256 MiB: it refuses a larger store.

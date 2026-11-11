@@ -1657,6 +1657,58 @@ mod tests {
         assert_eq!(s.window, 2);
         assert!(!s.enabled());
     }
+    /// The file store used to hold 128 archives per project for good; with
+    /// those in place every further rollover failed with "archive commit
+    /// failed; history retained" and the turn ended.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn rollover_is_ready_when_the_project_already_holds_128_archives() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        for index in 0..128 {
+            let window = vec![Arc::new(
+                json!({"role":"assistant","content":format!("earlier window {index}")}),
+            )];
+            binding
+                .history_seal("earlier-session", &window, "")
+                .await
+                .unwrap();
+        }
+        let messages = history();
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            s.config.mode = ContextManagementMode::Auto;
+            s.checkpoint(WorkPhase::Execute, Some("keep this note"))
+                .unwrap();
+        }
+        let prepared = rollover_for_boundary(
+            &messages,
+            &state,
+            &binding,
+            100_000,
+            SuccessorBudget::UNBOUNDED,
+            &Default::default(),
+            false,
+            "",
+        )
+        .await
+        .unwrap();
+        let RolloverPreparation::Ready(prepared) = prepared else {
+            panic!("the 129th archive must be sealed and the window rolled");
+        };
+        prepared.commit(&state).unwrap();
+        let id = state.lock().unwrap().latest_archive.clone().unwrap();
+        assert_eq!(state.lock().unwrap().window, 2);
+        let sealed = binding.history_fetch(&id, 0, 10).await.unwrap();
+        assert_eq!(sealed.len(), messages.len());
+        // The earlier 128 are all still there, behind the new one.
+        let (rows, stopped_after) = binding.history_search_scan("earlier window", 32).await.unwrap();
+        assert_eq!((rows.len(), stopped_after), (32, None));
+        let (rows, _) = binding.history_search_scan("earlier window 0\"", 32).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn eligible_archive_budget_preserves_rollover_head_barrier_and_failure_state() {

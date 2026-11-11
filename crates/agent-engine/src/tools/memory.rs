@@ -194,12 +194,18 @@ impl Tool for MemorySearchTool {
         if params["source"] == "history" {
             let query = params["query"].as_str().unwrap_or("").to_owned();
             let limit = params["limit"].as_u64().unwrap_or(8).min(25) as usize;
-            let rows = binding.history_search(&query, limit).await?;
+            let (rows, stopped_after) = binding.history_search_scan(&query, limit).await?;
             let mut out = LOWER_AUTHORITY_HEADER.to_owned();
             for row in rows {
                 out.push_str(&format!(
                     "\nctx-{} messages={} source_messages={} snippet={}",
                     row.id, row.message_count, row.source_message_count, row.snippet
+                ));
+            }
+            // An empty or short result must not read as "nothing older exists".
+            if let Some(scanned) = stopped_after {
+                out.push_str(&format!(
+                    "\n(searched the {scanned} most recent archives; older ones were not scanned)"
                 ));
             }
             return Ok(out);
@@ -946,6 +952,46 @@ mod tests {
             .await
             .unwrap()
             .contains(&id));
+    }
+
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn history_search_says_how_many_archives_it_scanned_when_older_ones_were_not() {
+        use agent_core::context_archive::SEARCH_SCAN_FILES;
+        let _env = BaseDirGuard::new();
+        let store = crate::runtime::continuation::archive_store().unwrap();
+        let seal = |index: usize| {
+            let window = json!({"role":"assistant","content":format!("WINDOW_WORD {index}")});
+            store.seal(&[std::sync::Arc::new(window)], "").unwrap();
+        };
+        let search = |query: &'static str| async move {
+            MemorySearchTool
+                .execute(
+                    json!({"source":"history","query":query,"limit":8}),
+                    create_tool_context(),
+                )
+                .await
+                .unwrap()
+        };
+        // Exactly the scan budget: every archive is read, so there is no note.
+        (0..SEARCH_SCAN_FILES).for_each(&seal);
+        for query in ["WINDOW_WORD", "NO_SUCH_WORD"] {
+            assert!(!search(query).await.contains("not scanned"), "{query}");
+        }
+        // One more: a search that does not fill its page first leaves one unread.
+        seal(SEARCH_SCAN_FILES);
+        let missed = search("NO_SUCH_WORD").await;
+        assert_eq!(SEARCH_SCAN_FILES, 1024);
+        assert_eq!(
+            missed,
+            format!(
+                "{LOWER_AUTHORITY_HEADER}\n(searched the 1024 most recent archives; older ones were not scanned)"
+            )
+        );
+        // A full page stopped the search, not the budget.
+        let page = search("WINDOW_WORD").await;
+        assert_eq!(page.matches("\nctx-").count(), 8);
+        assert!(!page.contains("not scanned"));
     }
 
     #[tokio::test]
