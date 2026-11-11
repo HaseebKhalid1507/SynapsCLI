@@ -207,6 +207,11 @@ pub struct ToolCapabilities {
     /// `params.session_id` so a daemon-shared plugin knows its caller.
     /// Not the lease scope (`tool_session_id`, a random runtime id).
     pub session_id: Option<String>,
+    /// Extension hook bus, for the notify-only events a builtin tool sends
+    /// (`memory_forget`: `on_memory_forgotten`). A worker carries its own
+    /// view, which sends nothing. `None` wherever no bus exists; the tool
+    /// then works the same and nothing is announced.
+    pub hook_bus: Option<Arc<crate::extensions::hooks::HookBus>>,
 }
 
 impl ToolCapabilities {

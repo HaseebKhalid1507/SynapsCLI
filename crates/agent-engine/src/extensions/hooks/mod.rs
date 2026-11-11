@@ -2009,6 +2009,7 @@ mod tests {
                 env_stripped: Vec::new(),
                 env_warned: Default::default(),
                 session_id: None,
+                hook_bus: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30_000,
@@ -2878,5 +2879,26 @@ mod notify_tests {
         bus.subscribe(KIND, Listener::prompt("ok"), None, None, perms)
             .await
             .unwrap();
+    }
+
+    /// Ids only, no content: `session.lifecycle`, and nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn on_memory_forgotten_needs_session_lifecycle_and_is_delivered_by_notify() {
+        let forgotten = HookKind::OnMemoryForgotten;
+        let bus = Arc::new(HookBus::new());
+        let mut perms = PermissionSet::new();
+        perms.grant(Permission::LlmContent);
+        let err = bus
+            .subscribe(forgotten, Listener::prompt("nosy"), None, None, perms)
+            .await
+            .unwrap_err();
+        assert!(err.contains("session.lifecycle"), "{err}");
+
+        let listener = Listener::prompt("indexer");
+        listener.subscribe(&bus, forgotten).await;
+        bus.notify(HookEvent::on_memory_forgotten(Some("chat"), "mem-1", "note", "p0", "repository"));
+        settle().await;
+        assert_eq!(listener.calls(), (1, 1));
+        assert_eq!(listener.events()[0].data["id"], "mem-1");
     }
 }

@@ -99,6 +99,7 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 | `on_session_start`  | A new session has been initialized                       | ❌          | ❌            | ✅           |
 | `on_session_end`    | A session is being torn down                             | ❌          | ❌            | ❌           |
 | `on_context_archived` | A context window has been sealed into an archive file (notify-only) | ❌  | ❌            | ❌           |
+| `on_memory_forgotten` | `memory_forget` has forgotten an archive or a note (notify-only) | ❌     | ❌            | ❌           |
 
 **Notes:**
 
@@ -109,7 +110,7 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 - `before_message` supports `inject`; injected content from matching extensions is accumulated. It is attached to the newest user message as a trailing ephemeral text block, positioned after the conversational cache marker (never the system prompt).
 - `on_session_start` supports `inject`; the content is appended to the system prompt once and carried unchanged for the whole session (session-stable, cache-safe).
 - The remaining hooks are observation-oriented today. Returning an unsupported action is ignored by the current call site.
-- `on_context_archived` is notify-only: it is sent after the fact, the host does not wait for the answer, and a slow, failing or absent handler changes nothing. See `hooks.md`, "Notify-only hooks".
+- `on_context_archived` and `on_memory_forgotten` are notify-only: they are sent after the fact, the host does not wait for the answer, and a slow, failing or absent handler changes nothing. See `hooks.md`, "Notify-only hooks".
 
 ---
 
@@ -164,7 +165,7 @@ Extensions must declare the permissions they require. SynapsCLI rejects unknown 
 | `tools.intercept`    | Subscribe to `before_tool_call` / `after_tool_call` (observe, block, confirm, modify input) |
 | `tools.transform_output` | Rewrite tool output via `after_tool_call` → `replace` (required in addition to `tools.intercept`) |
 | `privacy.llm_content`| Access to message content for `before_message`                                 |
-| `session.lifecycle`  | Receipt of `on_session_start` and `on_session_end` events                      |
+| `session.lifecycle`  | Receipt of `on_session_start`, `on_session_end` and `on_memory_forgotten` events |
 | `tools.register`    | Register extension-provided tools during initialization                         |
 | `providers.register`| Register extension-provided provider metadata during initialization; chat routing is not wired yet |
 

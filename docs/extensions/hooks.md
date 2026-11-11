@@ -40,6 +40,7 @@ filters stay exact.
 | `on_session_start` | `session.lifecycle` | no | `continue`, `inject` | Observe session creation and optionally inject session-stable context |
 | `on_session_end` | `session.lifecycle` | no | `continue` | Observe session shutdown and transcript |
 | `on_context_archived` | `privacy.llm_content` | no | `continue` | [Notify-only](#notify-only-hooks): a context window was sealed into an archive file |
+| `on_memory_forgotten` | `session.lifecycle` | no | `continue` | [Notify-only](#notify-only-hooks): `memory_forget` forgot an archive or a note |
 
 Unsupported result actions are ignored fail-open and logged as warnings.
 
@@ -98,13 +99,14 @@ you accept this ordering behavior.
 
 ## Notify-only hooks
 
-`on_context_archived` tells you that something has already happened. It is
-sent after the fact, and Synaps does not wait for you:
+`on_context_archived` and `on_memory_forgotten` tell you that something has
+already happened. They are sent after the fact, and Synaps does not wait for
+you:
 
 - **Nothing you do changes or delays it.** The host hands the event to a
   background task and carries on at once. A handler that is slow, hangs,
   crashes, answers with an error, or is not there at all leaves the rollover
-  exactly as it would have been, and no slower.
+  or the forget exactly as it would have been, and no slower.
 - **Your answer is discarded.** Return `{"action": "continue"}`. Anything
   else is ignored.
 - **Best effort.** An event is sent once and not retried. It is lost when
@@ -198,6 +200,65 @@ What it means, and what it does not:
 - **Treat the file as read-only.** It is written once and never changed,
   except that forgetting the archive replaces its content with a tombstone.
 
+### `on_memory_forgotten`
+
+Fires after the `memory_forget` tool has forgotten something: an archived
+context window (the model calls it `ctx-<id>`) or a note. Requires
+`session.lifecycle`; the event carries ids only, no content. Use it to drop
+the thing from your own index.
+
+```json
+{
+  "kind": "on_memory_forgotten",
+  "tool_name": null,
+  "tool_runtime_name": null,
+  "tool_input": null,
+  "tool_output": null,
+  "message": null,
+  "session_id": "20260501-120000-abcd",
+  "cwd": "/home/u/project",
+  "transcript": null,
+  "data": {
+    "id": "9f2c1a7e04b35d6688c1f0a2b7d94e13",
+    "kind": "archive",
+    "project_key": "p0123456789abcdef",
+    "scope": "repository"
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `session_id` | The chat whose tool call did the forgetting; `null` when the call had no chat behind it. `SYNAPS_HOOK_SESSION_ID=0` does not apply. |
+| `cwd` | The folder that tool call ran in: the chat's working folder (see below). |
+| `data.kind` | `"archive"` or `"note"`. |
+| `data.id` | For an archive, the bare 32 hex characters: the same string as `archive_id` in `on_context_archived`, without the `ctx-` the model writes. For a note, its id exactly as stored. |
+| `data.project_key` | The project the archive or note belonged to. A user-wide note has the reserved key `p0000000000000000`. |
+| `data.scope` | `"repository"` or `"user"`. Archives are always `repository`. |
+
+What it means, and what it does not:
+
+- **Sent only when the forget happened.** The tombstone is written (or the
+  memory service has acknowledged it) before the event goes out. A forget
+  that fails sends nothing: an id that does not exist, one that belongs to
+  another project, a note already forgotten, a store error.
+- **Both memory backends.** It describes what the tool did and carries no
+  path. With `memory.backend = axel` the id is the one the tool was given.
+- **An archive can be announced twice.** Forgetting an archive that is
+  already forgotten succeeds again, and is announced again. Key your work on
+  `id`.
+- **Not every forget is announced.** No event is sent when the forget was
+  made by a subagent worker, by the tool loop of a model that an extension
+  provides, or by the `synaps retention` command, which runs without
+  extensions. And like every notify-only event it can be dropped.
+- **The tombstone is the record.** Whether or not you were told, the forget
+  is on disk: the archive's file now holds `"body": {"state": "tombstone"}`
+  instead of its messages, and with the plain-file backend a forgotten note
+  is a `{"tombstone": "<id>", ...}` line in the project's notes file. An
+  index that must be exact checks those when it starts.
+- **Removal is not announced.** When the retention sweep later deletes a
+  tombstoned note for good, no event is sent.
+
 ## `cwd`: the chat's working folder
 
 Every hook event carries `cwd`, and so does every `tool.call` request
@@ -212,6 +273,7 @@ for; `cwd` does.
 | `before_message`, `on_message_complete`, `before_tool_call`, `after_tool_call` | the folder of the chat that fired the hook |
 | `on_session_start`, `on_session_end`, `on_compaction` | the folder of that session |
 | `on_context_archived` | the folder of the chat whose window was archived |
+| `on_memory_forgotten` | the folder of the chat whose `memory_forget` call it was |
 | `tool.call` `params.cwd` | the folder of the chat (or worker) that called your tool |
 
 Which folder that is:

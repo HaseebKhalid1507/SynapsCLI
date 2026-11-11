@@ -553,6 +553,37 @@ impl Tool for MemoryStoreTool {
 
 pub struct MemoryForgetTool;
 
+/// What `memory_forget` needs to tell extensions about a forget
+/// (`on_memory_forgotten`): the caller's hook bus, chat and folder.
+struct ForgottenNotice {
+    hook_bus: Option<std::sync::Arc<crate::extensions::hooks::HookBus>>,
+    session_id: Option<String>,
+    cwd: Option<std::path::PathBuf>,
+}
+
+impl ForgottenNotice {
+    /// Announce a forget that has succeeded. Notify-only: it returns at
+    /// once, awaits nothing and cannot fail, so the tool's result and timing
+    /// never depend on an extension. Nothing is sent without a bus, from a
+    /// worker's bus, or when nobody subscribes.
+    fn send(&self, id: &str, kind: &str, scope: &ProjectScope, selected: MemoryScope) {
+        use crate::extensions::hooks::events::HookEvent;
+        let Some(hook_bus) = &self.hook_bus else {
+            return;
+        };
+        hook_bus.notify(
+            HookEvent::on_memory_forgotten(
+                self.session_id.as_deref(),
+                id,
+                kind,
+                scope.key(),
+                selected.label(),
+            )
+            .with_cwd(self.cwd.as_deref()),
+        );
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for MemoryForgetTool {
     fn effect(&self) -> crate::tools::catalog::ToolEffect {
@@ -594,6 +625,12 @@ impl Tool for MemoryForgetTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        // Who to tell afterwards (`select_binding` consumes the context).
+        let forgotten = ForgottenNotice {
+            hook_bus: ctx.capabilities.hook_bus.clone(),
+            session_id: ctx.capabilities.session_id.clone(),
+            cwd: ctx.capabilities.cwd.clone(),
+        };
         let (binding, selected) = select_binding(&params, ctx)?;
         let scope = binding.scope()?.clone();
         let id = params["id"]
@@ -601,9 +638,11 @@ impl Tool for MemoryForgetTool {
             .ok_or_else(|| RuntimeError::Tool("memory_forget requires an id".into()))?;
         if let Some(id) = id.strip_prefix("ctx-") {
             binding.history_forget(id).await?;
+            forgotten.send(id, "archive", &scope, selected);
             return Ok("Forgot this archived context window. Tombstone retained; other sessions/notes are not erased.".into());
         }
         binding.forget(id).await?;
+        forgotten.send(id, "note", &scope, selected);
         Ok(format!(
             "tombstoned memory {} in {} scope (project {})",
             id,
@@ -1346,5 +1385,394 @@ mod tests {
             .await
             .unwrap();
         assert!(ok.contains("stored memory"));
+    }
+
+    // ── on_memory_forgotten ──────────────────────────────────────────────────
+
+    use crate::extensions::hooks::events::{HookKind, HookResult};
+    use crate::extensions::hooks::test_support::Listener;
+    use crate::extensions::hooks::HookBus;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const CHAT: &str = "chat-under-test";
+
+    async fn forget_bus(listener: &Arc<Listener>) -> Arc<HookBus> {
+        let bus = Arc::new(HookBus::new());
+        listener.subscribe(&bus, HookKind::OnMemoryForgotten).await;
+        bus
+    }
+
+    /// The context of a `memory_forget` call made by chat `CHAT`, which runs
+    /// in `folder`.
+    fn chat_context(
+        binding: &MemoryBinding,
+        bus: Option<&Arc<HookBus>>,
+        folder: &std::path::Path,
+    ) -> ToolContext {
+        let mut ctx = context_with_binding(binding);
+        ctx.capabilities.hook_bus = bus.cloned();
+        ctx.capabilities.session_id = Some(CHAT.into());
+        ctx.capabilities.cwd = Some(folder.to_path_buf());
+        ctx
+    }
+
+    async fn stored_note(binding: &MemoryBinding) -> String {
+        let out = MemoryStoreTool
+            .execute(
+                json!({"content": "a synthetic note to forget"}),
+                context_with_binding(binding),
+            )
+            .await
+            .unwrap();
+        out.split_whitespace()
+            .find(|word| word.starts_with("mem-"))
+            .expect("store output carries the stable id")
+            .to_string()
+    }
+
+    fn tombstoned(id: &str, binding: &MemoryBinding) -> String {
+        format!(
+            "tombstoned memory {id} in repository scope (project {})",
+            binding.scope().unwrap().key()
+        )
+    }
+
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn forget_note_notifies_with_id_and_kind() {
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let listener = Listener::prompt("indexer");
+        let bus = forget_bus(&listener).await;
+        let id = stored_note(&binding).await;
+        // The chat's folder, not the process's: only a stamped event has it.
+        let folder = env.path().join("chat-folder");
+        assert_ne!(folder, std::env::current_dir().unwrap());
+
+        let out = MemoryForgetTool
+            .execute(json!({"id": id}), chat_context(&binding, Some(&bus), &folder))
+            .await
+            .unwrap();
+        assert_eq!(out, tombstoned(&id, &binding));
+
+        let event = listener.wait_for(1).await.remove(0);
+        assert_eq!(event.kind, HookKind::OnMemoryForgotten);
+        assert_eq!(event.session_id.as_deref(), Some(CHAT));
+        assert_eq!(event.cwd.as_deref(), folder.to_str());
+        assert!(event.message.is_none() && event.tool_input.is_none());
+        assert_eq!(
+            event.data,
+            json!({
+                "id": id,
+                "kind": "note",
+                "project_key": binding.scope().unwrap().key(),
+                "scope": "repository",
+            })
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(listener.events().len(), 1, "one forget, one event");
+    }
+
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn forget_archive_notifies_with_bare_id() {
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let listener = Listener::prompt("indexer");
+        let bus = forget_bus(&listener).await;
+        let (archive, _) = binding
+            .history_seal(
+                "synthetic-chat",
+                &[std::sync::Arc::new(json!({"role":"assistant","content":"a window to forget"}))],
+                "",
+            )
+            .await
+            .unwrap();
+        let forget = || {
+            MemoryForgetTool.execute(
+                json!({"id": format!("ctx-{}", archive.id)}),
+                chat_context(&binding, Some(&bus), env.path()),
+            )
+        };
+        assert!(forget().await.unwrap().starts_with("Forgot this archived context window."));
+        let event = listener.wait_for(1).await.remove(0);
+        assert_eq!(event.session_id.as_deref(), Some(CHAT));
+        assert_eq!(event.cwd.as_deref(), env.path().to_str());
+        // The id `on_context_archived` announced, without the model's prefix.
+        assert_eq!(
+            event.data,
+            json!({
+                "id": archive.id,
+                "kind": "archive",
+                "project_key": binding.scope().unwrap().key(),
+                "scope": "repository",
+            })
+        );
+        // Forgetting an archive again succeeds again, and is announced again.
+        forget().await.unwrap();
+        let events = listener.wait_for(2).await;
+        assert_eq!(events[0].data, events[1].data);
+    }
+
+    /// Nothing is announced unless the forget happened: an id that does not
+    /// exist, one already forgotten, a malformed one, a `project` argument
+    /// for another project. No delivery is even started.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn failed_forget_sends_nothing() {
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let listener = Listener::prompt("indexer");
+        let bus = forget_bus(&listener).await;
+        let id = stored_note(&binding).await;
+        let (archive, _) = binding
+            .history_seal(
+                "synthetic-chat",
+                &[std::sync::Arc::new(json!({"role":"assistant","content":"a window to keep"}))],
+                "",
+            )
+            .await
+            .unwrap();
+        for refused in [
+            json!({"id": "mem-does-not-exist"}),
+            json!({"id": format!("ctx-{}", "f".repeat(32))}),
+            json!({"id": "ctx-not-an-archive-id"}),
+            json!({"id": id, "project": "p0000000000000000"}),
+            json!({"id": format!("ctx-{}", archive.id), "project": "p0000000000000000"}),
+            json!({"id": id, "scope": "user"}),
+            json!({}),
+        ] {
+            let result = MemoryForgetTool
+                .execute(refused.clone(), chat_context(&binding, Some(&bus), env.path()))
+                .await;
+            assert!(result.is_err(), "{refused}: {result:?}");
+            assert_eq!(bus.notifies_in_flight(), 0, "{refused}");
+        }
+        // The note and the archive are still there. Forget the note for
+        // real (one event), then again: it no longer exists (no event).
+        binding.history_fetch(&archive.id, 0, 1).await.unwrap();
+        let forget = || {
+            MemoryForgetTool.execute(json!({"id": id}), chat_context(&binding, Some(&bus), env.path()))
+        };
+        forget().await.unwrap();
+        listener.wait_for(1).await;
+        assert!(forget().await.is_err(), "already forgotten");
+        assert_eq!(bus.notifies_in_flight(), 0);
+        assert_eq!(listener.events().len(), 1);
+    }
+
+    /// The tool does not wait for a handler that never answers. On Tokio's
+    /// paused clock a wait would show as the 5 s handler timeout; the tool
+    /// returns its usual result with the clock where it was, and the
+    /// detached delivery is gone once that timeout has passed.
+    #[tokio::test(start_paused = true)]
+    #[serial(synaps_base_dir)]
+    async fn forget_is_not_delayed_by_a_hanging_handler() {
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let stuck = Listener::hanging("stuck");
+        let bus = forget_bus(&stuck).await;
+        let id = stored_note(&binding).await;
+
+        let started = tokio::time::Instant::now();
+        let out = MemoryForgetTool
+            .execute(json!({"id": id}), chat_context(&binding, Some(&bus), env.path()))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert_eq!(out, tombstoned(&id, &binding));
+        assert_eq!(bus.notifies_in_flight(), 1);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(stuck.calls(), (1, 0), "sent, and never answered");
+        assert_eq!(bus.notifies_in_flight(), 1);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(bus.notifies_in_flight(), 0, "the delivery ended at the handler timeout");
+    }
+
+    /// A handler that panics, and one that answers `block`, change nothing:
+    /// the forget succeeds with its usual result, and so does the next one.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn forget_succeeds_when_the_handler_panics_or_refuses() {
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let bad = Listener::panicking("bad");
+        let refusing = Listener::answering("refusing", HookResult::Block { reason: "keep it".into() });
+        let bus = forget_bus(&bad).await;
+        refusing.subscribe(&bus, HookKind::OnMemoryForgotten).await;
+        for _ in 0..2 {
+            let id = stored_note(&binding).await;
+            let out = MemoryForgetTool
+                .execute(json!({"id": id}), chat_context(&binding, Some(&bus), env.path()))
+                .await
+                .unwrap();
+            assert_eq!(out, tombstoned(&id, &binding));
+            let gone = MemoryFetchTool
+                .execute(json!({"ids": [id]}), context_with_binding(&binding))
+                .await
+                .unwrap_err();
+            assert!(gone.to_string().contains("not found"), "{gone}");
+        }
+        bad.wait_for(2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    /// No bus (every context built without one), a worker's bus, and a bus
+    /// nobody subscribes to: the same forget, the same result, nothing sent.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn forget_without_a_bus_or_from_a_worker_still_works_and_sends_nothing() {
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let listener = Listener::prompt("indexer");
+        let host = forget_bus(&listener).await;
+        let worker = HookBus::worker_transforms(&host);
+        let silent = Arc::new(HookBus::new());
+        for bus in [None, Some(&worker), Some(&silent)] {
+            let id = stored_note(&binding).await;
+            let out = MemoryForgetTool
+                .execute(json!({"id": id}), chat_context(&binding, bus, env.path()))
+                .await
+                .unwrap();
+            assert_eq!(out, tombstoned(&id, &binding));
+        }
+        assert_eq!(
+            (host.notifies_in_flight(), worker.notifies_in_flight(), silent.notifies_in_flight()),
+            (0, 0, 0)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(listener.events().is_empty());
+    }
+
+    /// An Axel binding in `dir` served by the stand-in service, which
+    /// answers every operation with `result`.
+    #[cfg(unix)]
+    fn axel_binding(dir: &std::path::Path, result: &str) -> MemoryBinding {
+        use agent_core::config::{MemoryBackendConfig, MemoryBackendKind};
+        let dir = dir.canonicalize().unwrap();
+        let binding = MemoryBinding::from_config(&MemoryBackendConfig {
+            kind: MemoryBackendKind::Axel,
+            executable: Some(super::super::test_helpers::fake_axel_service(&dir.join(result), result)),
+            brain: Some(dir.join("brain.r8")),
+            user_scope: true,
+        });
+        assert!(binding.is_axel());
+        binding
+    }
+
+    /// The operations the stand-in service was asked for, in order.
+    #[cfg(unix)]
+    fn axel_requests(dir: &std::path::Path, result: &str) -> Vec<Value> {
+        std::fs::read_to_string(dir.canonicalize().unwrap().join(result).join("requests.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// With the Axel backend the tool announces what it forgot, with the id
+    /// it was given, and still touches no file archive. That event is the
+    /// only thing this backend gains.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn forget_with_axel_backend_notifies_and_creates_no_archive_dir() {
+        let env = BaseDirGuard::new();
+        let _root = EnvVarGuard::set("SYNAPS_PROJECT_ROOT", env.path().to_str().unwrap());
+        let binding = axel_binding(env.path(), "true");
+        let key = binding.scope().unwrap().key().to_owned();
+        let listener = Listener::prompt("indexer");
+        let bus = forget_bus(&listener).await;
+        let archive = "b".repeat(32);
+
+        let out = MemoryForgetTool
+            .execute(json!({"id": "mem-axel-1"}), chat_context(&binding, Some(&bus), env.path()))
+            .await
+            .unwrap();
+        assert_eq!(out, tombstoned("mem-axel-1", &binding));
+        MemoryForgetTool
+            .execute(
+                json!({"id": format!("ctx-{archive}")}),
+                chat_context(&binding, Some(&bus), env.path()),
+            )
+            .await
+            .unwrap();
+
+        let events = listener.wait_for(2).await;
+        let data: Vec<&Value> = events.iter().map(|event| &event.data).collect();
+        let note = json!({"id": "mem-axel-1", "kind": "note", "project_key": key, "scope": "repository"});
+        let window = json!({"id": archive, "kind": "archive", "project_key": key, "scope": "repository"});
+        assert!(data.contains(&&note) && data.contains(&&window), "{data:?}");
+        for event in &events {
+            assert_eq!(event.session_id.as_deref(), Some(CHAT));
+            assert_eq!(event.cwd.as_deref(), env.path().to_str());
+        }
+        // The service did the forgetting; nothing else was asked of it.
+        let asked: Vec<(Value, Value)> = axel_requests(env.path(), "true")
+            .into_iter()
+            .map(|request| (request["operation"].clone(), request["payload"]["id"].clone()))
+            .collect();
+        assert_eq!(
+            asked,
+            [(json!("forget"), json!("mem-axel-1")), (json!("history_forget"), json!(archive))]
+        );
+        assert!(!env.path().join("context-archives").exists());
+        assert!(!env.path().join("brain.r8").exists());
+
+        // A forget the service refuses is an error, and is not announced.
+        let refusing = axel_binding(env.path(), "false");
+        for id in ["mem-axel-2".to_owned(), format!("ctx-{archive}")] {
+            let result = MemoryForgetTool
+                .execute(json!({"id": id}), chat_context(&refusing, Some(&bus), env.path()))
+                .await;
+            assert!(result.is_err(), "{id}: {result:?}");
+            assert_eq!(bus.notifies_in_flight(), 0);
+        }
+        assert_eq!(axel_requests(env.path(), "false").len(), 2);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(listener.events().len(), 2);
+    }
+
+    /// A user-wide note (Axel, host opt-in) is reported with `scope: user`
+    /// and the reserved user project key.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn forget_user_scope_note_reports_user_scope() {
+        let env = BaseDirGuard::new();
+        let _root = EnvVarGuard::set("SYNAPS_PROJECT_ROOT", env.path().to_str().unwrap());
+        let binding = axel_binding(env.path(), "true");
+        let listener = Listener::prompt("indexer");
+        let bus = forget_bus(&listener).await;
+
+        let out = MemoryForgetTool
+            .execute(
+                json!({"scope": "user", "id": "mem-user-1"}),
+                chat_context(&binding, Some(&bus), env.path()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            format!("tombstoned memory mem-user-1 in user scope (project {})", crate::memory_backend::USER_SCOPE)
+        );
+        let event = listener.wait_for(1).await.remove(0);
+        assert_eq!(
+            event.data,
+            json!({
+                "id": "mem-user-1",
+                "kind": "note",
+                "project_key": crate::memory_backend::USER_SCOPE,
+                "scope": "user",
+            })
+        );
+        assert_eq!(event.session_id.as_deref(), Some(CHAT));
+        let requests = axel_requests(env.path(), "true");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["project"], json!(crate::memory_backend::USER_SCOPE));
+        assert_eq!(requests[0]["operation"], "forget");
     }
 }

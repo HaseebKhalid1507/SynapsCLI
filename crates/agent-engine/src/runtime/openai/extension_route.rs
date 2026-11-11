@@ -360,6 +360,9 @@ pub(crate) async fn route_extension_provider(
                         env_stripped: Vec::new(),
                         env_warned: Default::default(),
                         session_id: None,
+                        // This loop knows neither the chat nor its folder, so
+                        // a tool's notify-only event would name the host's.
+                        hook_bus: None,
                     },
                     limits: ToolLimits {
                         max_tool_output: 30000,

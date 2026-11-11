@@ -238,6 +238,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     env_stripped: Vec::new(),
                     env_warned: Default::default(),
                     session_id: None,
+                    hook_bus: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -415,6 +416,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     env_stripped: Vec::new(),
                     env_warned: Default::default(),
                     session_id: None,
+                    hook_bus: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -469,6 +471,7 @@ fn whoami_ctx(session_id: Option<&str>, cwd: Option<&std::path::Path>) -> ToolCo
             env_stripped: Vec::new(),
             env_warned: Default::default(),
             session_id: session_id.map(str::to_string),
+            hook_bus: None,
         },
         limits: synaps_cli::tools::ToolLimits {
             max_tool_output: 30_000,
@@ -2356,4 +2359,163 @@ async fn on_context_archived_reaches_its_subscriber_and_nobody_else() {
     assert_eq!(notify_hooks::logged(&log).len(), 1, "delivered once");
 
     manager.shutdown_all().await;
+}
+
+/// A legacy (plain-file) memory binding for the project at `project`, with
+/// its store under the test's base dir.
+fn file_memory(project: &std::path::Path) -> agent_engine::memory_backend::MemoryBinding {
+    agent_engine::memory_backend::MemoryBinding::from_config_with_cwd(
+        &Default::default(),
+        Some(project.to_path_buf()),
+    )
+}
+
+/// A `memory_*` tool call by chat `session_id`, which runs in `chat`.
+fn memory_ctx(
+    binding: &agent_engine::memory_backend::MemoryBinding,
+    hook_bus: &Arc<HookBus>,
+    session_id: &str,
+    chat: &std::path::Path,
+) -> ToolContext {
+    let mut ctx = whoami_ctx(Some(session_id), Some(chat));
+    ctx.capabilities.memory_backend = Some(binding.clone());
+    ctx.capabilities.hook_bus = Some(hook_bus.clone());
+    ctx
+}
+
+/// Store one note through `memory_store`; returns its id.
+async fn store_note(ctx: ToolContext) -> String {
+    let out = synaps_cli::tools::memory::MemoryStoreTool
+        .execute(json!({"content": "a synthetic note to forget"}), ctx)
+        .await
+        .unwrap();
+    out.split_whitespace()
+        .find(|word| word.starts_with("mem-"))
+        .expect("store output carries the stable id")
+        .to_string()
+}
+
+/// `on_memory_forgotten` as a process extension receives it: the full
+/// `hook.handle` params for a note the `memory_forget` tool forgot, with the
+/// calling chat's id and folder.
+#[tokio::test(flavor = "current_thread")]
+async fn on_memory_forgotten_reaches_its_subscriber_over_the_wire() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let log = notify_hooks::load(
+        &mut manager,
+        home.path(),
+        "forget-indexer",
+        "record",
+        &["on_memory_forgotten"],
+    )
+    .await;
+
+    let (project, chat) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    assert_ne!(chat.path(), std::env::current_dir().unwrap());
+    let binding = file_memory(project.path());
+    let id = store_note(memory_ctx(&binding, &hook_bus, "sess-A", chat.path())).await;
+    assert!(notify_hooks::logged(&log).is_empty(), "storing announces nothing");
+
+    synaps_cli::tools::memory::MemoryForgetTool
+        .execute(json!({"id": id}), memory_ctx(&binding, &hook_bus, "sess-A", chat.path()))
+        .await
+        .unwrap();
+
+    let seen = notify_hooks::wait_for(&log, 1).await;
+    assert_eq!(
+        seen[0]["params"],
+        json!({
+            "kind": "on_memory_forgotten",
+            "tool_name": null,
+            "tool_runtime_name": null,
+            "tool_input": null,
+            "tool_output": null,
+            "message": null,
+            "session_id": "sess-A",
+            "cwd": chat.path().to_str().unwrap(),
+            "transcript": null,
+            "data": {
+                "id": id,
+                "kind": "note",
+                "project_key": binding.scope().unwrap().key(),
+                "scope": "repository"
+            }
+        })
+    );
+    manager.shutdown_all().await;
+    assert_eq!(notify_hooks::logged(&log).len(), 1, "one forget, one event");
+}
+
+/// Fail-open, by result and by time. With a subscriber that never answers,
+/// answers with an error, answers `block`, or exits mid-call, `memory_forget`
+/// returns what it returns with no extension at all, the note is gone, and
+/// the call does not wait: waiting on the hung one would cost the 5 s
+/// handler timeout; the bound is half of that over the baseline.
+#[tokio::test(flavor = "current_thread")]
+async fn no_hook_can_change_or_hold_up_a_forget() {
+    use synaps_cli::tools::memory::{MemoryFetchTool, MemoryForgetTool};
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let chat = tempfile::tempdir().unwrap();
+    let mut baseline: Option<(String, Duration)> = None;
+
+    for mode in [None, Some("hang"), Some("error"), Some("block"), Some("exit")] {
+        let home = tempfile::tempdir().unwrap();
+        config::set_base_dir_for_tests(home.path().to_path_buf());
+        let hook_bus = Arc::new(HookBus::new());
+        let mut manager = ExtensionManager::new(hook_bus.clone());
+        let log = match mode {
+            Some(mode) => Some(
+                notify_hooks::load(&mut manager, home.path(), "forget-indexer", mode, &["on_memory_forgotten"])
+                    .await,
+            ),
+            None => None,
+        };
+        let project = tempfile::tempdir().unwrap();
+        let binding = file_memory(project.path());
+        let ctx = || memory_ctx(&binding, &hook_bus, "sess-A", chat.path());
+        let id = store_note(ctx()).await;
+
+        let started = std::time::Instant::now();
+        let out = MemoryForgetTool.execute(json!({"id": id}), ctx()).await;
+        let elapsed = started.elapsed();
+        // The same words whatever the note and project are called.
+        let out = out
+            .unwrap()
+            .replace(&id, "<id>")
+            .replace(binding.scope().unwrap().key(), "<project>");
+
+        // The forget happened.
+        let gone = MemoryFetchTool.execute(json!({"ids": [id]}), ctx()).await.unwrap_err();
+        assert!(gone.to_string().contains("not found"), "{mode:?}: {gone}");
+
+        match (&baseline, &log) {
+            (None, _) => {
+                assert_eq!(out, "tombstoned memory <id> in repository scope (project <project>)");
+                baseline = Some((out, elapsed));
+            }
+            (Some((expected, without)), log) => {
+                assert_eq!(&out, expected, "{mode:?}");
+                assert!(
+                    elapsed < *without + Duration::from_millis(2500),
+                    "{mode:?}: the forget took {elapsed:?}, {without:?} without an extension"
+                );
+                // The hook was really sent, to a process that then did as
+                // its mode says.
+                let log = log.as_ref().expect("a mode has a log");
+                let events = notify_hooks::wait_for(log, 1).await;
+                assert_eq!(events[0]["params"]["kind"], "on_memory_forgotten", "{mode:?}");
+                assert_eq!(events[0]["params"]["data"]["id"], json!(id), "{mode:?}");
+                manager.shutdown_all().await;
+                // Nothing is left running, the hung process included.
+                #[cfg(target_os = "linux")]
+                for logged in notify_hooks::logged(log) {
+                    assert!(notify_hooks::exited(logged["pid"].as_u64().unwrap()).await, "{mode:?}");
+                }
+            }
+        }
+    }
 }

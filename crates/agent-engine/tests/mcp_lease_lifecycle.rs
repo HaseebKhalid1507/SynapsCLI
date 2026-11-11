@@ -178,6 +178,7 @@ fn ctx_with(cap: Option<McpLeaseCapability>) -> ToolContext {
             env_stripped: Vec::new(),
             env_warned: Default::default(),
             session_id: None,
+            hook_bus: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,

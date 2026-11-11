@@ -35,6 +35,7 @@ pub(crate) fn create_tool_context() -> ToolContext {
             env_stripped: Vec::new(),
             env_warned: Default::default(),
             session_id: None,
+            hook_bus: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -68,4 +69,38 @@ pub(crate) fn context_with_memory(binding: crate::memory_backend::MemoryBinding)
     let mut ctx = create_tool_context();
     ctx.capabilities.memory_backend = Some(binding);
     ctx
+}
+
+/// A stand-in for the Axel memory service, written into `dir` (created if
+/// missing): like the real one it serves one operation per process. It
+/// greets, appends the request it is sent to `<dir>/requests.jsonl`, and
+/// answers it with `result` (JSON). Returns the executable. It opens no
+/// brain file.
+#[cfg(unix)]
+pub(crate) fn fake_axel_service(dir: &std::path::Path, result: &str) -> std::path::PathBuf {
+    use crate::memory_backend::{AXEL_REVISION, CONTRACT};
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let service = dir.join("fake-axel-service");
+    let script = format!(
+        r#"#!/bin/sh
+project=
+while [ $# -gt 0 ]; do
+  if [ "$1" = --project ]; then project=$2; fi
+  shift
+done
+reply() {{
+  printf '{{"schema":"{CONTRACT}","project":"%s","ok":true,"result":%s}}\n' "$project" "$1"
+}}
+IFS= read -r hello
+reply '{{"backend":"axel","revision":"{AXEL_REVISION}","contract":"{CONTRACT}"}}'
+IFS= read -r request
+printf '%s\n' "$request" >> '{requests}'
+reply '{result}'
+"#,
+        requests = dir.join("requests.jsonl").display(),
+    );
+    std::fs::write(&service, script).unwrap();
+    std::fs::set_permissions(&service, std::fs::Permissions::from_mode(0o755)).unwrap();
+    service
 }

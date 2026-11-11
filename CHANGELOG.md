@@ -44,6 +44,15 @@ All notable changes to this project will be documented in this file.
   archive can be announced more than once. Plain-file memory backend only.
   Additive: existing extensions are unaffected, and an extension that names
   the hook does not load on an older Synaps. See `docs/extensions/hooks.md`.
+- **Extensions: `on_memory_forgotten` hook.** After the `memory_forget` tool
+  has forgotten an archived context window or a note, extensions that
+  subscribe (`session.lifecycle`) are told its id, whether it was an archive
+  or a note, the project and scope, and the calling chat's `session_id` and
+  `cwd`. Ids only, no content. Notify-only like `on_context_archived`: the
+  tool's result and timing never depend on an extension, and a forget that
+  failed is not announced. Sent with both memory backends. Not sent for a
+  forget made by a subagent worker, by an extension-provided model's tool
+  loop or by `synaps retention`; the tombstone on disk is the record.
 
 ### Changed
 

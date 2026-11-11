@@ -84,6 +84,16 @@
       "delivery": "notify-only: sent after a context rollover has written and synced the archive file, never awaited, result discarded; best effort (dropped on a 5 s timeout, when 64 notify-only deliveries are in flight, or when the host exits), unordered, and one archive_id may be announced more than once; plain-file memory backend only, never for subagent workers",
       "compatibility": "additive hook kind within extension_protocol_version 1 (no version bump): extensions that do not name it are unaffected; an extension that subscribes to it fails to load on a host that predates it (unknown hook kind)",
       "event_data": "{archive_id: 32 lowercase hex, path: absolute path of the archive file | null, project_key: string, message_count: int, source_message_count: int, window: int (the window that starts after the archive), part: int (1-based), parts: int, first_source_index: int, reduced_messages: int}; a window is one archive today, so part = parts = 1, first_source_index = 0 and reduced_messages = 0; session_id is the chat the window belonged to and is always set"
+    },
+    "on_memory_forgotten": {
+      "permission": "session.lifecycle",
+      "tool_filter": false,
+      "actions": [
+        "continue"
+      ],
+      "delivery": "notify-only: sent after the memory_forget tool has forgotten an archive or a note, never awaited, result discarded; best effort (dropped on a 5 s timeout, when 64 notify-only deliveries are in flight, or when the host exits), unordered, and a forgotten archive may be announced more than once; both memory backends; not sent for a forget that failed, nor for one made by a subagent worker, by an extension-provided model's tool loop, or by `synaps retention`",
+      "compatibility": "additive hook kind within extension_protocol_version 1 (no version bump): extensions that do not name it are unaffected; an extension that subscribes to it fails to load on a host that predates it (unknown hook kind)",
+      "event_data": "{id: string, kind: \"archive\"|\"note\", project_key: string, scope: \"repository\"|\"user\"}; for an archive id is the bare 32 lowercase hex (archive_id of on_context_archived, no ctx- prefix), for a note the id as stored; scope user implies project_key p0000000000000000; session_id is the chat whose tool call it was, null when the call had no chat behind it"
     }
   },
   "permissions": [

@@ -49,6 +49,9 @@ pub enum HookKind {
     /// Fires after a context rollover has sealed a window into an archive
     /// file. Notify-only ([`Self::is_notification`]).
     OnContextArchived,
+    /// Fires after `memory_forget` has forgotten an archive or a note.
+    /// Notify-only ([`Self::is_notification`]).
+    OnMemoryForgotten,
 }
 
 impl HookKind {
@@ -67,6 +70,7 @@ impl HookKind {
         Self::OnSessionStart,
         Self::OnSessionEnd,
         Self::OnContextArchived,
+        Self::OnMemoryForgotten,
     ];
 
     /// Canonical string identifier for this kind, suitable for serialization
@@ -81,6 +85,7 @@ impl HookKind {
             Self::OnSessionStart => "on_session_start",
             Self::OnSessionEnd => "on_session_end",
             Self::OnContextArchived => "on_context_archived",
+            Self::OnMemoryForgotten => "on_memory_forgotten",
         }
     }
 
@@ -99,6 +104,7 @@ impl HookKind {
             "on_session_start" => Some(Self::OnSessionStart),
             "on_session_end" => Some(Self::OnSessionEnd),
             "on_context_archived" => Some(Self::OnContextArchived),
+            "on_memory_forgotten" => Some(Self::OnMemoryForgotten),
             _ => None,
         }
     }
@@ -119,7 +125,10 @@ impl HookKind {
             // `context_checkpoint` tool without a note). Never capacity or
             // permission authority.
             Self::OnMessageComplete => &["continue", "context_phase"],
-            Self::OnCompaction | Self::OnSessionEnd | Self::OnContextArchived => &["continue"],
+            Self::OnCompaction
+            | Self::OnSessionEnd
+            | Self::OnContextArchived
+            | Self::OnMemoryForgotten => &["continue"],
         }
     }
 
@@ -129,7 +138,7 @@ impl HookKind {
     /// slow, failing or absent handler cannot delay or change what the
     /// event reports.
     pub fn is_notification(&self) -> bool {
-        matches!(self, Self::OnContextArchived)
+        matches!(self, Self::OnContextArchived | Self::OnMemoryForgotten)
     }
 
     /// Whether this hook can be filtered by tool name in a manifest.
@@ -166,7 +175,10 @@ impl HookKind {
             | Self::OnMessageComplete
             | Self::OnCompaction
             | Self::OnContextArchived => Permission::LlmContent,
-            Self::OnSessionStart | Self::OnSessionEnd => Permission::SessionLifecycle,
+            // `on_memory_forgotten` carries ids only, no content.
+            Self::OnSessionStart | Self::OnSessionEnd | Self::OnMemoryForgotten => {
+                Permission::SessionLifecycle
+            }
         }
     }
 }
@@ -209,11 +221,16 @@ pub fn hook_cwd(cwd: Option<&Path>) -> Option<String> {
 /// | `on_session_start`    |           |            |             |         | ✓          | ✓   |
 /// | `on_session_end`      |           |            |             |         | ✓          | ✓   |
 /// | `on_context_archived` |           |            |             |         | ✓          | ✓   |
+/// | `on_memory_forgotten` |           |            |             |         | ✓†         | ✓   |
 ///
-/// `on_context_archived` carries its payload in `data`.
+/// `on_context_archived` and `on_memory_forgotten` carry their payload in
+/// `data`.
 ///
 /// `✓*` — set via [`HookEvent::with_session`] for foreground sessions; `null`
 /// for workers (no conversation id) and when `SYNAPS_HOOK_SESSION_ID=0`.
+///
+/// `✓†` — the chat whose tool call did the forgetting; `null` when the call
+/// had no chat behind it.
 ///
 /// `cwd` is stamped by [`HookEvent::with_cwd`] where the event is emitted,
 /// workers included. The constructors leave it `None`: only the emitter
@@ -434,6 +451,38 @@ impl HookEvent {
                 "parts": 1,
                 "first_source_index": 0,
                 "reduced_messages": 0,
+            }),
+        }
+    }
+
+    /// Construct an `on_memory_forgotten` event: `memory_forget` forgot the
+    /// archive or note `id` in project `project_key`. `kind` is `"archive"`
+    /// or `"note"`, `scope` is `"repository"` or `"user"`. `session_id` is
+    /// the chat whose tool call it was (`None`: no chat behind the call). An
+    /// archive's `id` is the bare id, as in `on_context_archived`, without
+    /// the model-facing `ctx-` prefix.
+    pub fn on_memory_forgotten(
+        session_id: Option<&str>,
+        id: &str,
+        kind: &str,
+        project_key: &str,
+        scope: &str,
+    ) -> Self {
+        Self {
+            kind: HookKind::OnMemoryForgotten,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            message: None,
+            session_id: session_id.map(str::to_string),
+            cwd: None,
+            tool_runtime_name: None,
+            transcript: None,
+            data: serde_json::json!({
+                "id": id,
+                "kind": kind,
+                "project_key": project_key,
+                "scope": scope,
             }),
         }
     }
@@ -694,6 +743,7 @@ mod tests {
             HookKind::OnSessionStart,
             HookKind::OnSessionEnd,
             HookKind::OnContextArchived,
+            HookKind::OnMemoryForgotten,
         ];
         for kind in all {
             let s = kind.as_str();
@@ -758,6 +808,10 @@ mod tests {
             HookKind::OnContextArchived.required_permission(),
             Permission::LlmContent
         );
+        assert_eq!(
+            HookKind::OnMemoryForgotten.required_permission(),
+            Permission::SessionLifecycle
+        );
     }
 
     /// The notify-only kinds: no tool filter, and `continue` is the only
@@ -769,7 +823,10 @@ mod tests {
             .copied()
             .filter(HookKind::is_notification)
             .collect();
-        assert_eq!(notifications, [HookKind::OnContextArchived]);
+        assert_eq!(
+            notifications,
+            [HookKind::OnContextArchived, HookKind::OnMemoryForgotten]
+        );
         for kind in notifications {
             assert_eq!(kind.allowed_action_names(), ["continue"], "{kind:?}");
             assert!(!kind.allows_tool_filter(), "{kind:?}");
@@ -911,6 +968,42 @@ mod tests {
         assert_eq!(lost.data["archive_id"], json!(id));
     }
 
+    /// The wire shape of `on_memory_forgotten`: ids only, in `data`.
+    #[test]
+    fn hook_event_on_memory_forgotten() {
+        let id = "9f2c".repeat(8);
+        let ev =
+            HookEvent::on_memory_forgotten(Some("chat-1"), &id, "archive", "p0123456789abcdef", "repository");
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            json!({
+                "kind": "on_memory_forgotten",
+                "tool_name": null,
+                "tool_runtime_name": null,
+                "tool_input": null,
+                "tool_output": null,
+                "message": null,
+                "session_id": "chat-1",
+                "cwd": null,
+                "transcript": null,
+                "data": {
+                    "id": id,
+                    "kind": "archive",
+                    "project_key": "p0123456789abcdef",
+                    "scope": "repository",
+                },
+            })
+        );
+        // A user-wide note, forgotten by a call with no chat behind it.
+        let note =
+            HookEvent::on_memory_forgotten(None, "mem-1", "note", "p0000000000000000", "user");
+        assert_eq!(note.session_id, None);
+        assert_eq!(
+            note.data,
+            json!({"id": "mem-1", "kind": "note", "project_key": "p0000000000000000", "scope": "user"})
+        );
+    }
+
     #[test]
     fn hook_event_on_session_start() {
         let ev = HookEvent::on_session_start("sess-abc-123");
@@ -976,6 +1069,7 @@ mod tests {
             HookEvent::on_session_start("s"),
             HookEvent::on_session_end("s", None),
             HookEvent::on_context_archived("s", "a", None, "p", 1, 1, 2),
+            HookEvent::on_memory_forgotten(Some("s"), "a", "archive", "p", "repository"),
         ] {
             let wire = serde_json::to_value(&ev).unwrap();
             assert_eq!(wire.get("cwd"), Some(&Value::Null), "{:?}", ev.kind);
@@ -1114,12 +1208,13 @@ mod tests {
                 | HookKind::OnCompaction
                 | HookKind::OnSessionStart
                 | HookKind::OnSessionEnd
-                | HookKind::OnContextArchived => {}
+                | HookKind::OnContextArchived
+                | HookKind::OnMemoryForgotten => {}
             }
         }
         assert_eq!(
             HookKind::ALL.len(),
-            8,
+            9,
             "a HookKind variant was added or removed -- update HookKind::ALL \
              and docs/extensions/contract.json to match"
         );

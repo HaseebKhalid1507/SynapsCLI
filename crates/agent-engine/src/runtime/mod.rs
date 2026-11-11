@@ -4588,6 +4588,7 @@ impl Runtime {
                                         env_stripped: self.env_stripped.clone(),
                                         env_warned: self.env_warned.clone(),
                                         session_id: self.session_id.clone(),
+                                        hook_bus: Some(self.hook_bus.clone()),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -4762,6 +4763,7 @@ impl Runtime {
                                                     env_stripped: env_stripped_inner,
                                                     env_warned: env_warned_inner,
                                                     session_id: session_id_inner.clone(),
+                                                    hook_bus: Some(hook_bus_inner.clone()),
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
