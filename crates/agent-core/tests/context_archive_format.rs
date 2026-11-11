@@ -14,7 +14,8 @@
 //!   (origin/dev `c8ee5623`), for [`legacy_window`]. Its id is random, as
 //!   every id was then, so it cannot be written again; it is only read.
 //! - the files in `s000001/` are what today's store writes for
-//!   [`live_window`], [`forgotten_window`] and [`reduced_window`]. After a
+//!   [`live_window`], [`forgotten_window`], [`reduced_window`] and
+//!   [`json_text_window`]. After a
 //!   change that the document allows without a new `version` (growth inside
 //!   `message`), print them again with
 //!   `cargo test -p synaps-core --test context_archive_format -- --ignored --nocapture print_fixtures`
@@ -26,8 +27,8 @@
 //! still run.
 
 use agent_core::context_archive::{
-    archive_file, ArchiveStore, MAX_INPUT_BYTES, MAX_MESSAGES, MAX_NOTE_BYTES, MAX_SEGMENT_BYTES,
-    REDUCED_KEY, SHELF_FILES,
+    archive_file, ArchiveStore, INPUT_JSON_KEY, MAX_INPUT_BYTES, MAX_MESSAGES, MAX_NOTE_BYTES,
+    MAX_SEGMENT_BYTES, REDUCED_KEY, SHELF_FILES,
 };
 use agent_core::memory::store::ProjectScope;
 use agent_core::SharedMessage;
@@ -45,11 +46,12 @@ const SESSION_ID: &str = "20260501-120000-abcd";
 /// `<project dir>` for [`PROJECT_KEY`], and `logical` for [`SESSION_ID`].
 const PROJECT_DIR: &str = "01a8f6fb3ec12e1d59d07bd6e3943c84c18415e3111dd5cba218b7ce9218b0c7";
 const LOGICAL: &str = "900c08a5903292975711f75ce85a7b6e30fab1b1223378ab1111cdbb7bc3d809";
-/// The fixtures: three archives on the first shelf and one in a legacy slot.
+/// The fixtures: four archives on the first shelf and one in a legacy slot.
 const SHELF: &str = "s000001";
 const LIVE: &str = "b436b6196e6ca0758c70d5faed628f29";
 const TOMBSTONE: &str = "693c14d38641fb504a642f0e7cbfaac9";
 const REDUCED: &str = "3fe5a51ef0d405efec79538b7717e255";
+const JSON_TEXT: &str = "5ad68965a84888ab221823f5b4490804";
 const LEGACY_SLOT: &str = "000.json";
 const LEGACY: &str = "4c459668c1384294b09674c915b29c2d";
 
@@ -57,6 +59,7 @@ const LIVE_NOTE: &str = "Goal: find where the retry limit is set. Done: MAX_RETR
                          src/net/retry.rs. Next: nothing.";
 const FORGOTTEN_NOTE: &str = "The user asked for this to be forgotten.";
 const REDUCED_NOTE: &str = "The build log was pasted whole.";
+const JSON_TEXT_NOTE: &str = "Evaluated a deeply nested expression.";
 const LEGACY_NOTE: &str = "Answered a question about the Makefile. Nothing pending.";
 
 const RECORD_DRIFT: &str = "the store no longer writes the record that \
@@ -127,6 +130,27 @@ fn reduced_window() -> Vec<SharedMessage> {
         {"type":"text","text":log},
         {"type":"tool_use","id":"toolu_04","name":"write",
          "input":{"path":"build.log","content":"(the log above)"}}
+    ]}))]
+}
+
+/// What the tool of [`json_text_window`] was called with: twenty groups, one
+/// inside the other, around a leaf. Forty levels of JSON, more than an
+/// archive stores as a value.
+fn nested_input() -> Value {
+    let mut nested = json!({"op":"leaf","value":1});
+    for _ in 0..20 {
+        nested = json!({"op":"group","of":[nested]});
+    }
+    nested
+}
+
+/// One message that is over a limit of one archive by its shape alone: a
+/// tool input that is nested too deep, beside one that is not.
+fn json_text_window() -> Vec<SharedMessage> {
+    vec![message(json!({"role":"assistant","content":[
+        {"type":"text","text":"Evaluating the nested expression."},
+        {"type":"tool_use","id":"toolu_08","name":"evaluate","input":nested_input()},
+        {"type":"tool_use","id":"toolu_09","name":"read","input":{"path":"src/eval.rs"}}
     ]}))]
 }
 
@@ -344,14 +368,15 @@ fn one_part(store: &ArchiveStore, messages: &[SharedMessage], note: &str) -> Str
     window.parts[0].archive.id.clone()
 }
 
-/// Seal the three fixed windows and forget the second: what `s000001/` in the
+/// Seal the four fixed windows and forget the second: what `s000001/` in the
 /// fixtures was made by. Returns their ids.
-fn seal_fixture_windows(store: &ArchiveStore) -> [String; 3] {
+fn seal_fixture_windows(store: &ArchiveStore) -> [String; 4] {
     let live = one_part(store, &live_window(), LIVE_NOTE);
     let forgotten = one_part(store, &forgotten_window(), FORGOTTEN_NOTE);
     store.forget(&forgotten).unwrap();
     let reduced = one_part(store, &reduced_window(), REDUCED_NOTE);
-    [live, forgotten, reduced]
+    let json_text = one_part(store, &json_text_window(), JSON_TEXT_NOTE);
+    [live, forgotten, reduced, json_text]
 }
 
 /// A marker with its numbers replaced by `N`, as the document spells it.
@@ -402,7 +427,7 @@ fn the_store_writes_the_published_fixtures() {
     };
     let ids = seal_fixture_windows(&store);
     let written = archive_files(&project_dir(&base));
-    assert_eq!(written.len(), 3, "three archives, each in a file named by its id: {RECORD_DRIFT}");
+    assert_eq!(written.len(), 4, "four archives, each in a file named by its id: {RECORD_DRIFT}");
 
     // A record without `id` and `digest`, which follow from its content.
     let shape = |record: &Value| {
@@ -411,7 +436,7 @@ fn the_store_writes_the_published_fixtures() {
         record["digest"] = Value::Null;
         record
     };
-    for (id, published_id) in ids.iter().zip([LIVE, TOMBSTONE, REDUCED]) {
+    for (id, published_id) in ids.iter().zip([LIVE, TOMBSTONE, REDUCED, JSON_TEXT]) {
         let bytes = written
             .get(&shelf_path(id))
             .unwrap_or_else(|| panic!("no file named by the id {id}: {RECORD_DRIFT}"));
@@ -639,6 +664,7 @@ fn the_parts_of_a_window_do_not_name_each_other() {
 #[test]
 fn reduced_messages_carry_the_documented_markers() {
     assert_eq!(REDUCED_KEY, "_archive_reduced", "{MESSAGE_DRIFT}");
+    assert_eq!(INPUT_JSON_KEY, "_archive_json", "{MESSAGE_DRIFT}");
     let document = document();
     let tmp = tempfile::tempdir().unwrap();
     let base = base_in(&tmp);
@@ -657,43 +683,63 @@ fn reduced_messages_carry_the_documented_markers() {
         let template = template(marker);
         assert!(document.contains(&format!("`{template}`")), "not in the document: {template}");
     };
-    let says = |stored: &Value, omissions: usize| {
+    // What a reduced message says of itself: how many things were left out,
+    // how many tool inputs are stored as text, or both.
+    let says = |stored: &Value, omissions: usize, as_text: usize| {
+        let changed = match (omissions, as_text) {
+            (omissions, 0) => format!("{omissions} omission(s)"),
+            (0, as_text) => format!("{as_text} tool input(s) as JSON text"),
+            _ => format!("{omissions} omission(s) and {as_text} tool input(s) as JSON text"),
+        };
         let expected = format!(
-            "this message alone is over the per-archive limit; it is stored with {omissions} \
-             omission(s), each marked in place"
+            "this message alone is over the per-archive limit; it is stored with {changed}, each \
+             marked in place"
         );
         assert_eq!(stored[REDUCED_KEY], expected.as_str(), "{MESSAGE_DRIFT}");
         documented(&expected);
     };
 
-    // A tool input that is over a limit by itself (nested too deep) is the
-    // only thing left out; the text and the other input stay exact.
+    // A tool input that is over a limit by its shape alone (nested too
+    // deep) is stored as one string, its JSON text: nothing is left out.
+    // The text and the other input stay exact.
     let mut deep = json!("leaf");
     for _ in 0..40 {
         deep = json!([deep]);
     }
-    let input_bytes = serde_json::to_string(&deep).unwrap().len();
     let (stored, indices) = reduced(&[message(json!({"role":"assistant","content":[
         {"type":"text","text":"running both"},
         {"type":"tool_use","id":"toolu_05","name":"nest","input":deep},
         {"type":"tool_use","id":"toolu_06","name":"read","input":{"path":"src/lib.rs"}}
     ]}))]);
-    let omitted_input = format!(
-        "[archive: tool input of {input_bytes} bytes omitted, over the per-archive limit]"
-    );
     let expected = json!({
         "_archive_reduced": stored[REDUCED_KEY],
         "role": "assistant",
         "content": [
             {"type":"text","text":"running both"},
             {"type":"tool_use","id":"toolu_05","name":"nest",
-             "input":{"_archive_omitted":omitted_input}},
+             "input":{"_archive_json":serde_json::to_string(&deep).unwrap()}},
             {"type":"tool_use","id":"toolu_06","name":"read","input":{"path":"src/lib.rs"}}
         ]
     });
     assert_eq!(stored, expected, "{MESSAGE_DRIFT}");
     assert_eq!(indices, [0, 1, 2]);
-    says(&stored, 1);
+    says(&stored, 0, 1);
+
+    // One that is too large as text as well is the only thing left out,
+    // beside one that is stored as text.
+    let large = json!([["x".repeat(MAX_INPUT_BYTES + 1)]]);
+    let input_bytes = serde_json::to_string(&large).unwrap().len();
+    let (stored, _) = reduced(&[message(json!({"role":"assistant","content":[
+        {"type":"tool_use","id":"toolu_05","name":"nest","input":deep},
+        {"type":"tool_use","id":"toolu_06","name":"write","input":large}
+    ]}))]);
+    let omitted_input = format!(
+        "[archive: tool input of {input_bytes} bytes omitted, over the per-archive limit]"
+    );
+    assert!(stored["content"][0]["input"][INPUT_JSON_KEY].is_string(), "{MESSAGE_DRIFT}");
+    let omitted = json!({"_archive_omitted":omitted_input});
+    assert_eq!(stored["content"][1]["input"], omitted, "{MESSAGE_DRIFT}");
+    says(&stored, 1, 1);
     documented(&omitted_input);
 
     // A message that is still too large without its tool inputs: long
@@ -728,7 +774,7 @@ fn reduced_messages_carry_the_documented_markers() {
     );
     assert_eq!(content[kept_blocks], json!({"type":"text","text":rest}), "{MESSAGE_DRIFT}");
     assert_eq!(indices, (0..=kept_blocks).collect::<Vec<_>>());
-    says(&stored, 3);
+    says(&stored, 3, 0);
     for marker in [cut.as_str(), followed, rest.as_str()] {
         documented(marker);
     }
@@ -761,6 +807,7 @@ fn the_store_reads_every_published_fixture() {
     let live = [
         (LIVE, shelf_path(LIVE), LIVE_NOTE),
         (REDUCED, shelf_path(REDUCED), REDUCED_NOTE),
+        (JSON_TEXT, shelf_path(JSON_TEXT), JSON_TEXT_NOTE),
         (LEGACY, LEGACY_SLOT.to_owned(), LEGACY_NOTE),
     ];
     for (id, path, note) in &live {
@@ -787,21 +834,22 @@ fn the_store_reads_every_published_fixture() {
     );
     let mut listed: Vec<_> = store.search("", 8).unwrap().into_iter().map(|row| row.id).collect();
     listed.sort();
-    let mut expected = vec![LEGACY, LIVE, REDUCED];
+    let mut expected = vec![LEGACY, LIVE, REDUCED, JSON_TEXT];
     expected.sort_unstable();
     assert_eq!(listed, expected);
 
     // Sealing the same windows again finds the fixtures and writes nothing.
-    assert_eq!(seal_fixture_windows_again(&store), [LIVE, REDUCED, LEGACY]);
+    assert_eq!(seal_fixture_windows_again(&store), [LIVE, REDUCED, JSON_TEXT, LEGACY]);
     let denied = store.seal(&forgotten_window(), FORGOTTEN_NOTE).unwrap_err();
     assert_eq!(denied.kind(), ErrorKind::PermissionDenied, "a forgotten archive stays forgotten");
     assert_eq!(archive_files(&project), published, "reading and sealing again rewrote a fixture");
 }
 
-fn seal_fixture_windows_again(store: &ArchiveStore) -> [String; 3] {
+fn seal_fixture_windows_again(store: &ArchiveStore) -> [String; 4] {
     [
         one_part(store, &live_window(), "a later note"),
         one_part(store, &reduced_window(), "a later note"),
+        one_part(store, &json_text_window(), "a later note"),
         // Found in its slot by its content, under the random id it was given.
         one_part(store, &legacy_window(), "a later note"),
     ]
@@ -815,10 +863,10 @@ fn seal_fixture_windows_again(store: &ArchiveStore) -> [String; 3] {
 fn the_fixtures_have_exactly_the_documented_fields() {
     let files = archive_files(&fixture_project());
     let paths: Vec<_> = files.keys().map(String::as_str).collect();
-    let mut expected = vec![shelf_path(LIVE), shelf_path(TOMBSTONE), shelf_path(REDUCED)];
+    let mut expected: Vec<_> = [LIVE, TOMBSTONE, REDUCED, JSON_TEXT].map(shelf_path).to_vec();
     expected.sort();
     expected.insert(0, LEGACY_SLOT.to_owned());
-    assert_eq!(paths, expected, "the fixtures are these four files");
+    assert_eq!(paths, expected, "the fixtures are these five files");
     assert_eq!(PROJECT_DIR, hash(PROJECT_KEY));
     assert_eq!(LOGICAL, hash(SESSION_ID));
     // The sizes the document tells a reader it can count on.
@@ -887,6 +935,16 @@ fn the_fixtures_have_exactly_the_documented_fields() {
     assert_eq!(stored[5]["message"]["content"], "[archive: withheld]");
     let reduced = fixture(&shelf_path(REDUCED));
     assert!(reduced["body"]["messages"][0]["message"][REDUCED_KEY].is_string());
+    // A tool input stored as its JSON text: one string that is the whole
+    // input, in a message that says it is reduced. The other input is exact.
+    let json_text = fixture(&shelf_path(JSON_TEXT));
+    let stored = &json_text["body"]["messages"][0]["message"];
+    assert!(stored[REDUCED_KEY].is_string());
+    let input = &stored["content"][1]["input"];
+    assert_eq!(keys(input), [INPUT_JSON_KEY]);
+    let text = input[INPUT_JSON_KEY].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), nested_input());
+    assert_eq!(stored["content"][2]["input"], json!({"path":"src/eval.rs"}));
     let legacy = fixture(LEGACY_SLOT);
     assert_eq!(legacy["id"], LEGACY);
     assert_ne!(legacy["digest"].as_str().unwrap()[..32], *LEGACY, "a legacy id is random");
@@ -918,6 +976,7 @@ fn the_document_names_everything_the_fixtures_contain() {
         collect(&parse(bytes), false, &mut found);
     }
     let expected = [
+        "_archive_json",
         "_archive_omitted",
         "_archive_reduced",
         "_archive_withheld",
@@ -971,10 +1030,14 @@ fn the_document_names_everything_the_fixtures_contain() {
     let reduced = fixture(&shelf_path(REDUCED));
     let stored = &reduced["body"]["messages"][0]["message"];
     let text = stored["content"][0]["text"].as_str().unwrap();
+    // And what the fixture with an input as JSON text says of itself.
+    let json_text = fixture(&shelf_path(JSON_TEXT));
+    let as_text = &json_text["body"]["messages"][0]["message"];
     let markers = [
         stored[REDUCED_KEY].as_str().unwrap(),
         text.rsplit('\n').next().unwrap(),
         stored["content"][1]["input"]["_archive_omitted"].as_str().unwrap(),
+        as_text[REDUCED_KEY].as_str().unwrap(),
     ];
     for marker in markers {
         let template = template(marker);
@@ -1125,15 +1188,16 @@ fn the_reference_reader_reads_the_fixtures_and_skips_everything_else() {
         return;
     };
     let mut rows: Vec<_> = [
-        format!("live\t{LIVE}\t{SHELF}/{LIVE}.json\t6\t7\t0"),
+        format!("live\t{LIVE}\t{SHELF}/{LIVE}.json\t6\t7\t0\t0"),
         format!("tombstone\t{TOMBSTONE}\t{SHELF}/{TOMBSTONE}.json"),
-        format!("live\t{REDUCED}\t{SHELF}/{REDUCED}.json\t1\t1\t1"),
+        format!("live\t{REDUCED}\t{SHELF}/{REDUCED}.json\t1\t1\t1\t0"),
+        format!("live\t{JSON_TEXT}\t{SHELF}/{JSON_TEXT}.json\t1\t1\t1\t1"),
     ]
     .into_iter()
     .map(|line| (line.split('\t').nth(1).unwrap().to_owned(), line))
     .collect();
     rows.sort();
-    let mut expected = vec![format!("live\t{LEGACY}\t{LEGACY_SLOT}\t2\t2\t0")];
+    let mut expected = vec![format!("live\t{LEGACY}\t{LEGACY_SLOT}\t2\t2\t0\t0")];
     expected.extend(rows.into_iter().map(|(_, line)| line));
 
     // The published directory, where it is.

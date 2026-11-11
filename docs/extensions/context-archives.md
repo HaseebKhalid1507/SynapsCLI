@@ -186,7 +186,7 @@ field in the record, in `body`, or in an entry of `messages`.
 |---|---|---|
 | `role` | string | `user` or `assistant`. |
 | `content` | string, or array of blocks | The text of the message, or its content blocks. |
-| `_archive_reduced` | string, usually absent | Present when the message was too large to store whole. See [Reduced messages](#reduced-messages). |
+| `_archive_reduced` | string, usually absent | Present when the message was over a limit by itself and is not stored exactly as it was. See [Reduced messages](#reduced-messages). |
 
 A block is an object with a `type`:
 
@@ -258,8 +258,9 @@ read them.
   reader holds itself to this: it rejects a version 1 file with an unknown
   record-level field.
 - **The contents of `message` may grow** without a new version: a new block
-  `type`, a new key in a block or in the message. A reader must ignore what
-  it does not know.
+  `type`, a new key in a block or in the message, a new marker in a
+  [reduced message](#reduced-messages) (`_archive_json` was added this way).
+  A reader must ignore what it does not know.
 - **The layout is part of the version.** The directory and file names on
   this page belong to version 1.
 - There is no version 2 today, and nothing in Synaps rewrites a file from
@@ -431,30 +432,48 @@ was already stored, no file holds it.
 
 ## Reduced messages
 
-A single message can be too large for an archive all by itself, so that no
-cut between messages helps. Synaps then stores it **reduced**: with as
-little left out as makes it fit, and a marker in the place of everything
-left out. A reduced message is alone in its archive.
+A single message can be over a limit of an archive all by itself, so that no
+cut between messages helps. Synaps then stores it **reduced**: changed by as
+little as makes it fit, with a marker in the place of everything it changed.
+A reduced message is alone in its archive.
 
 A reduced message has the key `_archive_reduced` beside `role` and
-`content`. Its value is a sentence:
-`this message alone is over the per-archive limit; it is stored with N omission(s), each marked in place`,
-where N is the number of markers in the message. **Test for the key.** Only
-Synaps sets it: a key of that name in the original message is not copied, so
-a message that has it is reduced and a message without it is stored whole.
-The markers inside the content are ordinary text, and a conversation can
-contain the same words.
+`content`. Its value is one of three sentences, where each N is a count of
+markers in the message:
 
-Synaps leaves out as little as it can, in three steps, and takes a step only
-when the one before was not enough:
+- `this message alone is over the per-archive limit; it is stored with N omission(s), each marked in place`
+- `this message alone is over the per-archive limit; it is stored with N tool input(s) as JSON text, each marked in place`
+- `this message alone is over the per-archive limit; it is stored with N omission(s) and N tool input(s) as JSON text, each marked in place`
 
-1. **Tool inputs that are over a limit by themselves** (too large, or too
-   deeply nested). The `input` becomes an object with the one key
-   `_archive_omitted`, whose value is the marker
+**Test for the key.** Only Synaps sets it: a key of that name in the
+original message is not copied, so a message that has it is reduced and a
+message without it is stored exactly. The markers inside the content are
+ordinary values, and a conversation can contain the same words and the same
+keys: they are Synaps's markers only in a message that has
+`_archive_reduced`.
+
+Synaps changes as little as it can, in four steps, and takes a step only
+when the one before was not enough. The first two leave nothing out when the
+trouble is only the shape of a tool input:
+
+1. **Tool inputs that are over a limit by themselves.** An archive limits
+   how deeply a tool input may be nested (29 levels) and how many values it
+   may hold. An input over one of those limits is stored as one string: the
+   `input` becomes an object with the one key `_archive_json`, whose value
+   is the whole input as JSON text, screened like every other string.
+   Nothing of it is missing. Parsing the string gives the input back, unless
+   the screen changed the text, so be ready for a string that does not
+   parse. An input that is too large as text as well is left out: the
+   `input` becomes an object with the one key `_archive_omitted`, whose
+   value is the marker
    `[archive: tool input of N bytes omitted, over the per-archive limit]`,
    where N is the size of the input as JSON. Everything else stays exact.
-2. **Every tool input** of the message, with the same marker.
-3. **Every tool input, long strings and long block lists:**
+2. **Every tool input** of the message as JSON text, under `_archive_json`
+   in the same way: for inputs that each fit and together hold too many
+   values. One that is too large as text by itself is left out, with the
+   `_archive_omitted` marker.
+3. **Every tool input** left out, each with the `_archive_omitted` marker.
+4. **Every tool input left out, long strings and long block lists cut:**
    - a string longer than 4,096 bytes is cut to its first 4,096 bytes (a few
      less if a character would be split), followed by a line break and
      `[archive: N bytes omitted, over the per-archive limit]`, where N is the
@@ -470,7 +489,10 @@ when the one before was not enough:
      followed, a line break and the same marker, where N counts the blocks
      after that text.
 
-The numbers 4,096 and 256 are today's; read the markers rather than count.
+The numbers 29, 4,096 and 256 are today's; read the markers rather than
+count. An input that is withheld (see [Withheld content](#withheld-content))
+stays withheld in every step: it is `{"_archive_withheld": true}`, never
+text.
 
 This is the message of the reduced fixture. Its text was a 16 MiB build log
 and is shortened here once more, at the `...`; the file has all 4,096 bytes:
@@ -481,6 +503,23 @@ and is shortened here once more, at the `...`; the file has all 4,096 bytes:
   "content": [
     {"text": "build log line 0000001\nbuild log line 0000002\n...\nbu\n[archive: 16773139 bytes omitted, over the per-archive limit]", "type": "text"},
     {"id": "toolu_04", "input": {"_archive_omitted": "[archive: tool input of 48 bytes omitted, over the per-archive limit]"}, "name": "write", "type": "tool_use"}
+  ],
+  "role": "assistant"
+}
+```
+
+And this is the message of the fixture with a tool input stored as JSON
+text. The tool was called with twenty groups nested one inside the other,
+which is forty levels of JSON. The string is shortened here at the `...`;
+the file has all 463 bytes of it. The second input is stored as it was:
+
+```text
+{
+  "_archive_reduced": "this message alone is over the per-archive limit; it is stored with 1 tool input(s) as JSON text, each marked in place",
+  "content": [
+    {"text": "Evaluating the nested expression.", "type": "text"},
+    {"id": "toolu_08", "input": {"_archive_json": "{\"of\":[{\"of\":[{\"of\":[ ... {\"op\":\"leaf\",\"value\":1} ... ],\"op\":\"group\"}],\"op\":\"group\"}"}, "name": "evaluate", "type": "tool_use"},
+    {"id": "toolu_09", "input": {"path": "src/eval.rs"}, "name": "read", "type": "tool_use"}
   ],
   "role": "assistant"
 }
@@ -547,6 +586,7 @@ shelves. Nothing in them is from a real conversation.
     000.json                                         a legacy slot file
     s000001/
         3fe5a51ef0d405efec79538b7717e255.json        holds a reduced message
+        5ad68965a84888ab221823f5b4490804.json        holds a tool input as JSON text
         693c14d38641fb504a642f0e7cbfaac9.json        a tombstone
         b436b6196e6ca0758c70d5faed628f29.json        a live archive
 ```
@@ -650,8 +690,10 @@ the start of the `digest`:
 }
 ```
 
-**A reduced message** is in `3fe5a51ef0d405efec79538b7717e255.json`; it is
-shown [above](#reduced-messages).
+**A reduced message** is in `3fe5a51ef0d405efec79538b7717e255.json`, and
+**a tool input stored as JSON text** in
+`5ad68965a84888ab221823f5b4490804.json`; both are shown
+[above](#reduced-messages).
 
 ## A reference reader
 
@@ -663,16 +705,18 @@ full of things a reader must skip.
 ```text
 $ python3 examples/extensions/context_archive_reader.py \
     docs/extensions/fixtures/context-archives/01a8f6fb3ec12e1d59d07bd6e3943c84c18415e3111dd5cba218b7ce9218b0c7
-live       4c459668c1384294b09674c915b29c2d  000.json                                       2  2  0
-live       3fe5a51ef0d405efec79538b7717e255  s000001/3fe5a51ef0d405efec79538b7717e255.json  1  1  1
+live       4c459668c1384294b09674c915b29c2d  000.json                                       2  2  0  0
+live       3fe5a51ef0d405efec79538b7717e255  s000001/3fe5a51ef0d405efec79538b7717e255.json  1  1  1  0
+live       5ad68965a84888ab221823f5b4490804  s000001/5ad68965a84888ab221823f5b4490804.json  1  1  1  1
 tombstone  693c14d38641fb504a642f0e7cbfaac9  s000001/693c14d38641fb504a642f0e7cbfaac9.json
-live       b436b6196e6ca0758c70d5faed628f29  s000001/b436b6196e6ca0758c70d5faed628f29.json  6  7  0
+live       b436b6196e6ca0758c70d5faed628f29  s000001/b436b6196e6ca0758c70d5faed628f29.json  6  7  0  0
 ```
 
 The columns are separated by tabs (shown aligned here): the state, the id,
 the file, and for a live archive the number of messages stored,
-`source_message_count`, and the number of reduced messages. Files it skips are named on standard error with
-the reason.
+`source_message_count`, the number of reduced messages and the number of
+tool inputs stored as JSON text. Files it skips are named on standard error
+with the reason.
 
 ```python
 #!/usr/bin/env python3
@@ -727,13 +771,24 @@ def read(path, scope, name):
     return record
 
 
+def inputs_as_text(message):
+    """The tool inputs of a message that are stored as one string, their JSON text."""
+    if "_archive_reduced" not in message or not isinstance(message["content"], list):
+        return []  # only Synaps sets that key; without it an input is the tool's own
+    blocks = [block for block in message["content"] if isinstance(block, dict)]
+    inputs = [block.get("input") for block in blocks if block.get("type") == "tool_use"]
+    texts = [value.get("_archive_json") for value in inputs if isinstance(value, dict) and len(value) == 1]
+    return [text for text in texts if isinstance(text, str)]  # json.loads(text) is the input
+
+
 def describe(record, relative):
     body = record["body"]
     if body["state"] == "tombstone":
         return "tombstone", record["id"], relative
-    messages = body["messages"]
-    reduced = sum("_archive_reduced" in entry["message"] for entry in messages)
-    return "live", record["id"], relative, len(messages), body["source_message_count"], reduced
+    messages = [entry["message"] for entry in body["messages"]]
+    reduced = sum("_archive_reduced" in message for message in messages)
+    as_text = sum(len(inputs_as_text(message)) for message in messages)
+    return "live", record["id"], relative, len(messages), body["source_message_count"], reduced, as_text
 
 
 def main(project):

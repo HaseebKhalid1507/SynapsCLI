@@ -50,13 +50,24 @@ def read(path, scope, name):
     return record
 
 
+def inputs_as_text(message):
+    """The tool inputs of a message that are stored as one string, their JSON text."""
+    if "_archive_reduced" not in message or not isinstance(message["content"], list):
+        return []  # only Synaps sets that key; without it an input is the tool's own
+    blocks = [block for block in message["content"] if isinstance(block, dict)]
+    inputs = [block.get("input") for block in blocks if block.get("type") == "tool_use"]
+    texts = [value.get("_archive_json") for value in inputs if isinstance(value, dict) and len(value) == 1]
+    return [text for text in texts if isinstance(text, str)]  # json.loads(text) is the input
+
+
 def describe(record, relative):
     body = record["body"]
     if body["state"] == "tombstone":
         return "tombstone", record["id"], relative
-    messages = body["messages"]
-    reduced = sum("_archive_reduced" in entry["message"] for entry in messages)
-    return "live", record["id"], relative, len(messages), body["source_message_count"], reduced
+    messages = [entry["message"] for entry in body["messages"]]
+    reduced = sum("_archive_reduced" in message for message in messages)
+    as_text = sum(len(inputs_as_text(message)) for message in messages)
+    return "live", record["id"], relative, len(messages), body["source_message_count"], reduced, as_text
 
 
 def main(project):

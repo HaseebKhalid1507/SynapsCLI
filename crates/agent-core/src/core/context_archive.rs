@@ -21,12 +21,15 @@
 //! by [`ArchiveStore::seal_window`] as consecutive parts: it is halved until
 //! each part fits, each part is an ordinary segment, and the returned part
 //! list is what puts the window back together. Only a single message that is
-//! over a limit by itself is stored reduced, by as little as makes it fit:
-//! without the tool inputs that are too large, then without any tool input,
-//! then with long strings and block lists cut short. Each omission is marked
-//! in place with its size, and a reduced message carries `_archive_reduced`
-//! ([`REDUCED_KEY`]), which no source message can supply, so it is never read
-//! back as a complete one.
+//! over a limit by itself is stored reduced, by as little as makes it fit.
+//! First nothing is left out: a tool input that is nested too deep or has
+//! too many nodes is stored as one string, its JSON text
+//! ([`INPUT_JSON_KEY`]). Then what is too large as text too goes: the tool
+//! inputs that are too large, then every tool input, then long strings and
+//! block lists are cut short. Each omission is marked in place with its
+//! size, and a reduced message carries `_archive_reduced` ([`REDUCED_KEY`]),
+//! which no source message can supply, so it is never read back as an exact
+//! one.
 //!
 //! The store keeps every segment: there is no cap on how many a project holds
 //! or on their total size, and no seal deletes, moves or replaces another
@@ -162,6 +165,12 @@ pub const MAX_SEARCH_RESULTS: usize = 32;
 /// left something out of it, and marked each omission in place. Only the
 /// store sets it; a message without it is exactly what the projection gives.
 pub const REDUCED_KEY: &str = "_archive_reduced";
+/// Key of a tool input that is stored as one string: the input's JSON text,
+/// screened like any string. [`ArchiveStore::seal_window`] stores an input
+/// this way when it is nested too deep or has too many nodes for a segment,
+/// instead of leaving it out. Content can imitate the key; only in a message
+/// that carries [`REDUCED_KEY`] is it the store's.
+pub const INPUT_JSON_KEY: &str = "_archive_json";
 /// The most a reduced message keeps of one string that is cut short...
 const REDUCED_TEXT_BYTES: usize = 4096;
 /// ...and of its content blocks.
@@ -292,20 +301,28 @@ pub fn project_archive(
     )
 }
 
-/// What is left out of a message that is over a segment budget by itself: it
+/// What is changed in a message that is over a segment budget by itself: it
 /// cannot be stored whole, and being alone it cannot be cut out of its part.
 /// A step is tried only when the one before it still does not fit, and
-/// whatever a step does not name stays exact. Each omission is replaced by a
-/// marker that says how large it was, and the stored message carries
-/// [`REDUCED_KEY`].
+/// whatever a step does not name stays exact. The first two steps leave
+/// nothing out: the structural budgets (depth, nodes) are about the shape of
+/// a tool input, and as one string, its JSON text under
+/// [`INPUT_JSON_KEY`], the same input has no shape to count. Only what is
+/// over the byte budget as text too is left out. Each omission is replaced
+/// by a marker that says how large it was, and the stored message carries
+/// [`REDUCED_KEY`] in every case.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reduce {
     /// Nothing: the exact projection, the only one `seal` and
     /// [`project_archive`] ever make.
     None,
-    /// Each tool input that is over a budget by itself.
+    /// Each tool input that is over a budget by itself: stored as its JSON
+    /// text, or left out if that text is over the byte budget.
     LargeInputs,
-    /// Every tool input.
+    /// Every tool input as its JSON text: for inputs that each fit and
+    /// together have too many nodes.
+    InputsAsText,
+    /// Every tool input left out.
     Inputs,
     /// Every tool input; of each string, what follows its first
     /// [`REDUCED_TEXT_BYTES`]; the content blocks that follow the first
@@ -318,23 +335,55 @@ impl Reduce {
     fn next(self) -> Option<Self> {
         match self {
             Reduce::None => Some(Reduce::LargeInputs),
-            Reduce::LargeInputs => Some(Reduce::Inputs),
+            Reduce::LargeInputs => Some(Reduce::InputsAsText),
+            Reduce::InputsAsText => Some(Reduce::Inputs),
             Reduce::Inputs => Some(Reduce::Text),
             Reduce::Text => None,
         }
     }
 
-    /// Whether the preflight passes over a tool input instead of walking it.
-    /// Under `LargeInputs` the projector also leaves out an input whose
-    /// screened form is over a budget; the preflight has then charged for it,
-    /// which errs on the strict side.
-    fn skips(self, input: &Value) -> bool {
+    /// What the preflight charges for a tool input that this step does not
+    /// store exact, instead of walking it: the bytes of its JSON text, or 0
+    /// when it is left out. `None` when the input is stored exact. Under
+    /// `LargeInputs` the projector also stores as text an input whose
+    /// screened form is over a budget; the preflight has then charged for it
+    /// exact, which errs on the strict side.
+    fn in_place_of(self, input: &Value) -> Option<usize> {
+        let as_text = || input_text_cost(input).unwrap_or(0);
         match self {
-            Reduce::None => false,
-            Reduce::LargeInputs => InputBudget::alone(input).is_err(),
-            Reduce::Inputs | Reduce::Text => true,
+            Reduce::None => None,
+            Reduce::LargeInputs => InputBudget::alone(input).is_err().then(as_text),
+            Reduce::InputsAsText => Some(as_text()),
+            Reduce::Inputs | Reduce::Text => Some(0),
         }
     }
+}
+
+/// What a tool input costs against the byte budget when it is stored as one
+/// string, its JSON text under [`INPUT_JSON_KEY`]. `None` when that is over
+/// the budget of one segment by itself: such an input is left out.
+fn input_text_cost(input: &Value) -> Option<usize> {
+    let cost = json_len(input).saturating_add(INPUT_JSON_KEY.len() + 16);
+    (cost <= MAX_INPUT_BYTES).then_some(cost)
+}
+
+/// Whether nothing anywhere in a tool input is marked as not to be stored:
+/// the rule of [`InputBudget::input`], which withholds the whole input for
+/// one such object, without its structural budget. Not recursive, so it does
+/// not matter how deep the input is.
+fn input_eligible(input: &Value) -> bool {
+    let mut pending = vec![input];
+    while let Some(value) = pending.pop() {
+        if eligible_class(value).is_none() {
+            return false;
+        }
+        match value {
+            Value::Array(values) => pending.extend(values),
+            Value::Object(values) => pending.extend(values.values()),
+            _ => {}
+        }
+    }
+    true
 }
 
 fn project_hashed(
@@ -368,6 +417,7 @@ fn project_hashed(
         redactor,
         reduce,
         omitted: Cell::new(0),
+        as_text: Cell::new(0),
     };
     let mut eligible = Vec::new();
     for (source_index, message) in messages.iter().enumerate() {
@@ -398,6 +448,8 @@ struct Projector {
     reduce: Reduce,
     /// Omissions made so far in the message being projected.
     omitted: Cell<usize>,
+    /// Tool inputs of that message stored as their JSON text so far.
+    as_text: Cell<usize>,
 }
 
 /// No Debug implementation: do not accidentally log redactor state or content.
@@ -1768,19 +1820,27 @@ impl Projector {
         format!("[archive: {what} omitted, over the per-archive limit]")
     }
 
-    /// The stored form of a message. One that a reduction left something out
-    /// of says so under [`REDUCED_KEY`], which a source message cannot
-    /// supply: only its role and content are ever taken. The markers inside
-    /// the content can be imitated by content; this key cannot.
+    /// The stored form of a message. One that a reduction changed says so
+    /// under [`REDUCED_KEY`], which a source message cannot supply: only its
+    /// role and content are ever taken. The markers inside the content can
+    /// be imitated by content; this key cannot. It says how many things were
+    /// left out and how many tool inputs are stored as text, of which only
+    /// the first is a loss.
     fn stored(&self, role: &str, content: Value) -> Value {
         let mut message = json!({"role": role, "content": content});
-        let omitted = self.omitted.replace(0);
-        if omitted > 0 {
-            message[REDUCED_KEY] = json!(format!(
-                "this message alone is over the per-archive limit; it is stored with \
-                 {omitted} omission(s), each marked in place"
-            ));
-        }
+        let (omitted, as_text) = (self.omitted.replace(0), self.as_text.replace(0));
+        let changed = match (omitted, as_text) {
+            (0, 0) => return message,
+            (omitted, 0) => format!("{omitted} omission(s)"),
+            (0, as_text) => format!("{as_text} tool input(s) as JSON text"),
+            (omitted, as_text) => {
+                format!("{omitted} omission(s) and {as_text} tool input(s) as JSON text")
+            }
+        };
+        message[REDUCED_KEY] = json!(format!(
+            "this message alone is over the per-archive limit; it is stored with {changed}, \
+             each marked in place"
+        ));
         message
     }
 
@@ -1789,6 +1849,7 @@ impl Projector {
             return Ok(None);
         };
         self.omitted.set(0);
+        self.as_text.set(0);
         if let Some(text) = content.as_str() {
             let content = json!(self.text(text, class)?);
             return Ok(Some((self.stored(role, content), Vec::new())));
@@ -1870,21 +1931,53 @@ impl Projector {
         }
     }
 
-    /// A tool input as stored: exact, or, where a reduction leaves it out, a
-    /// marker with its size as JSON.
+    /// A tool input as stored: exact, or, where a reduction says so, as its
+    /// JSON text or left out with a marker.
     fn tool_input(&self, input: Option<&Value>, class: DisclosureClass) -> io::Result<Value> {
-        let omit = |input: &Value| {
-            let bytes = json_len(input);
-            let marker = self.omission(format_args!("tool input of {bytes} bytes"));
-            Ok(json!({"_archive_omitted": marker}))
-        };
         match (self.reduce, input) {
-            (Reduce::Inputs | Reduce::Text, Some(input)) => omit(input),
+            (Reduce::Inputs | Reduce::Text, Some(input)) => Ok(self.omitted_input(input)),
+            (Reduce::InputsAsText, Some(input)) => self.input_as_text(input, class),
             (Reduce::LargeInputs, Some(value)) => match self.exact_input(input, class) {
-                Err(error) if over_budget(&error) => omit(value),
+                Err(error) if over_budget(&error) => self.input_as_text(value, class),
                 exact => exact,
             },
             _ => self.exact_input(input, class),
+        }
+    }
+
+    /// What stands in place of a tool input that is left out: a marker with
+    /// its size as JSON.
+    fn omitted_input(&self, input: &Value) -> Value {
+        let bytes = json_len(input);
+        let marker = self.omission(format_args!("tool input of {bytes} bytes"));
+        json!({"_archive_omitted": marker})
+    }
+
+    /// A tool input as one string under [`INPUT_JSON_KEY`]: its JSON text,
+    /// screened as a whole like the exact form is. The depth and node
+    /// budgets do not apply to a string, so an input that is only too deep
+    /// or has too many nodes is all there. It is withheld on the terms of
+    /// the exact form (something in it is marked as not to be stored, or the
+    /// screen withholds it), and left out only when the text is over the
+    /// byte budget. The screened text is stored as it is: the redactor may
+    /// have changed it, and nothing here needs it to parse.
+    fn input_as_text(&self, input: &Value, class: DisclosureClass) -> io::Result<Value> {
+        if !input_eligible(input) {
+            return Ok(json!({"_archive_withheld":true}));
+        }
+        if input_text_cost(input).is_none() {
+            return Ok(self.omitted_input(input));
+        }
+        let encoded = bounded_json(input, MAX_INPUT_BYTES)?;
+        let text = std::str::from_utf8(&encoded).map_err(|_| corrupt())?;
+        match self.screen(text, class) {
+            Ok(text) if text == WITHHELD => Ok(json!({"_archive_withheld":true})),
+            Ok(text) => {
+                self.as_text.set(self.as_text.get() + 1);
+                Ok(json!({INPUT_JSON_KEY: text}))
+            }
+            Err(error) if over_budget(&error) => Ok(self.omitted_input(input)),
+            Err(error) => Err(error),
         }
     }
 
@@ -2210,8 +2303,19 @@ impl InputBudget {
                         self.field("name", name, 3)?;
                         if name != "context_checkpoint" && redactor {
                             let input = block.get("input");
-                            if let Some(input) = input.filter(|input| !self.reduce.skips(input)) {
-                                if let Some(bytes) = self.input(input, 3)? {
+                            let in_place = input.and_then(|input| self.reduce.in_place_of(input));
+                            match (input, in_place) {
+                                // Stored exact: walked.
+                                (Some(input), None) => {
+                                    if let Some(bytes) = self.input(input, 3)? {
+                                        self.charge("input".len().saturating_add(bytes))?;
+                                    }
+                                }
+                                // Left out: its marker is not charged.
+                                (_, None | Some(0)) => {}
+                                // One string in its place.
+                                (_, Some(bytes)) => {
+                                    self.node(4)?;
                                     self.charge("input".len().saturating_add(bytes))?;
                                 }
                             }
@@ -6132,8 +6236,10 @@ mod tests {
         assert_whole(&reassemble(&store, &window, messages.len()), &messages);
     }
 
+    /// The depth and node limits are about the shape of a tool input. As one
+    /// string it has none, so an input that is only too deep is all there.
     #[test]
-    fn single_deep_input_is_withheld_not_failed() {
+    fn single_deep_input_is_stored_as_its_json_text_not_left_out() {
         let (_tmp, store) = setup();
         let store = store.with_redactor(Arc::new(str::to_owned));
         let messages = vec![
@@ -6170,56 +6276,117 @@ mod tests {
             assert_eq!(read[index].source_index, index);
             assert_eq!(read[index].message, messages[index]);
         }
-        // Of that message only the one input that is too deep is left out:
-        // its text and the other call's input are exact.
-        let bytes = serde_json::to_string(&deep_input()).unwrap().len();
-        let omitted = format!("[archive: tool input of {bytes} bytes omitted, {OVER_LIMIT}");
+        // Of that message only the one input that is too deep is not stored
+        // as it was, and nothing of it is missing: it is one string. The
+        // text and the other call's input are exact.
+        let as_text = serde_json::to_string(&deep_input()).unwrap();
         let expected = json!({
             "role":"assistant",
             "_archive_reduced":"this message alone is over the per-archive limit; it is stored \
-                with 1 omission(s), each marked in place",
+                with 1 tool input(s) as JSON text, each marked in place",
             "content":[
                 {"type":"text","text":"running both"},
-                {"type":"tool_use","id":"t1","name":"nest","input":{"_archive_omitted":omitted}},
+                {"type":"tool_use","id":"t1","name":"nest","input":{"_archive_json":as_text}},
                 {"type":"tool_use","id":"t2","name":"read","input":{"path":"src/lib.rs"}}
             ]
         });
         assert_eq!(*read[1].message, expected);
         assert_eq!(read[1].block_indices, [0, 1, 2]);
+        // What was stored is the input: it reads back equal.
+        let stored = read[1].message["content"][1]["input"][INPUT_JSON_KEY].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(stored).unwrap(), deep_input());
         // However it is read back it says so first: the key sorts before
         // `content` and `role`.
         let found = store.search("running both", 1).unwrap();
         assert!(found[0].snippet.starts_with("{\"_archive_reduced\":\"this message alone"));
     }
 
+    /// One message with three tool calls, sealed alone and read back.
+    fn sealed_calls(store: &ArchiveStore, text: &str, inputs: [&Value; 3]) -> SharedMessage {
+        let mut blocks = vec![json!({"type":"text","text":text})];
+        for (index, input) in inputs.into_iter().enumerate() {
+            let id = format!("t{}", index + 1);
+            blocks.push(json!({"type":"tool_use","id":id,"name":"plot","input":input}));
+        }
+        let window = store.seal_window(&[msg("assistant", json!(blocks))], "").unwrap();
+        assert_eq!(window.parts.len(), 1);
+        assert_eq!(window.parts[0].reduced_messages, 1);
+        store.fetch(&window.parts[0].archive.id, 0, 1).unwrap().remove(0)
+    }
+
+    #[test]
+    fn inputs_with_too_many_nodes_together_are_all_stored_as_text() {
+        let (_tmp, store) = setup();
+        let store = store.with_redactor(Arc::new(str::to_owned));
+        // 30,001 visited nodes each: every input fits by itself, the three
+        // together do not. As three strings they are three nodes.
+        let wide = json!(vec![0; 30_000]);
+        let long = "exact words ".repeat(1000);
+        let stored = sealed_calls(&store, &long, [&wide; 3]);
+        assert_eq!(stored["content"][0]["text"], long);
+        let as_text = serde_json::to_string(&wide).unwrap();
+        for block in 1..=3 {
+            assert_eq!(stored["content"][block]["input"], json!({"_archive_json":as_text}));
+        }
+        assert_eq!(
+            stored[REDUCED_KEY],
+            "this message alone is over the per-archive limit; it is stored with 3 tool input(s) \
+             as JSON text, each marked in place"
+        );
+    }
+
     #[test]
     fn inputs_too_large_together_are_all_omitted_and_text_stays_exact() {
         let (_tmp, store) = setup();
         let store = store.with_redactor(Arc::new(str::to_owned));
-        // 30,001 visited nodes each: every input fits by itself, the three
-        // together do not.
-        let wide = json!(vec![0; 30_000]);
+        // 6 MiB each: every input fits by itself, the three together are
+        // over the byte budget, as values and as text alike.
+        let large = json!("x".repeat(6 * 1024 * 1024));
         let long = "exact words ".repeat(1000);
-        let message = msg(
-            "assistant",
-            json!([
-                {"type":"text","text":long},
-                {"type":"tool_use","id":"t1","name":"plot","input":wide},
-                {"type":"tool_use","id":"t2","name":"plot","input":wide},
-                {"type":"tool_use","id":"t3","name":"plot","input":wide}
-            ]),
-        );
-        let window = store.seal_window(&[message], "").unwrap();
-        assert_eq!(window.parts.len(), 1);
-        assert_eq!(window.parts[0].reduced_messages, 1);
-        let stored = &store.fetch(&window.parts[0].archive.id, 0, 1).unwrap()[0];
+        let stored = sealed_calls(&store, &long, [&large; 3]);
         assert_eq!(stored["content"][0]["text"], long);
-        let bytes = serde_json::to_string(&wide).unwrap().len();
+        let bytes = serde_json::to_string(&large).unwrap().len();
         let omitted = format!("[archive: tool input of {bytes} bytes omitted, {OVER_LIMIT}");
         for block in 1..=3 {
             assert_eq!(stored["content"][block]["input"], json!({"_archive_omitted":omitted}));
         }
-        assert!(stored[REDUCED_KEY].as_str().unwrap().contains("with 3 omission(s)"));
+        assert!(stored[REDUCED_KEY].as_str().unwrap().ends_with("with 3 omission(s), each marked in place"));
+    }
+
+    /// Text is tried for each input by itself. One that is over the byte
+    /// budget as text too is left out; one the screen would not store is
+    /// withheld whole, as it would be if it were stored exact.
+    #[test]
+    fn an_input_over_the_byte_budget_is_left_out_and_a_withheld_one_stays_withheld() {
+        let (_tmp, store) = setup();
+        let store = store.with_redactor(Arc::new(str::to_owned));
+        let nested = |leaf: Value| (0..40).fold(leaf, |deep, _| json!([deep]));
+        // Too deep and too large; too deep around a word the screen
+        // withholds; too deep around an object marked as not to be stored.
+        let large = nested(json!("x".repeat(MAX_INPUT_BYTES + 1)));
+        let credential = nested(json!("the password is example-only"));
+        let private = nested(json!({"private":true,"value":"kept out"}));
+        let stored = sealed_calls(&store, "three calls", [&large, &credential, &private]);
+        let bytes = serde_json::to_string(&large).unwrap().len();
+        let omitted = format!("[archive: tool input of {bytes} bytes omitted, {OVER_LIMIT}");
+        assert_eq!(stored["content"][1]["input"], json!({"_archive_omitted":omitted}));
+        for block in [2, 3] {
+            assert_eq!(stored["content"][block]["input"], json!({"_archive_withheld":true}));
+        }
+        assert!(stored[REDUCED_KEY].as_str().unwrap().ends_with("with 1 omission(s), each marked in place"));
+        // And both in one message: one input left out, one as text.
+        let deep = deep_input();
+        let small = json!({"path":"src/lib.rs"});
+        let stored = sealed_calls(&store, "three calls", [&large, &deep, &small]);
+        assert_eq!(stored["content"][1]["input"], json!({"_archive_omitted":omitted}));
+        let as_text = serde_json::to_string(&deep).unwrap();
+        assert_eq!(stored["content"][2]["input"], json!({"_archive_json":as_text}));
+        assert_eq!(stored["content"][3]["input"], small);
+        assert_eq!(
+            stored[REDUCED_KEY],
+            "this message alone is over the per-archive limit; it is stored with 1 omission(s) \
+             and 1 tool input(s) as JSON text, each marked in place"
+        );
     }
 
     #[test]
@@ -6290,7 +6457,8 @@ mod tests {
         let marker = format!("[archive: 9 bytes omitted, {OVER_LIMIT}");
         let source = Arc::new(json!({"role":"assistant","_archive_reduced":"imitation","content":[
             {"type":"text","text":format!("cut short\n{marker}")},
-            {"type":"tool_use","id":"t1","name":"read","input":{"_archive_omitted":marker}}
+            {"type":"tool_use","id":"t1","name":"read","input":{"_archive_omitted":marker}},
+            {"type":"tool_use","id":"t2","name":"read","input":{"_archive_json":"[1]"}}
         ]}));
         let window = store.seal_window(std::slice::from_ref(&source), "").unwrap();
         assert_eq!(window.parts[0].reduced_messages, 0);
