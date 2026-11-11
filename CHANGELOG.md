@@ -335,6 +335,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`synaps retention sweep` with Axel memory: an age or a budget is refused
+  without `--include-notes`.** The Axel service's sweep deletes saved notes
+  and nothing else: every note older than `--max-age-days`, then notes
+  oldest first until `--max-disk-bytes` is met. The command passed both to
+  it whether or not `--include-notes` was given (the help said the flag had
+  "no effect with Axel"), so a sweep meant for old sessions and logs
+  deleted notes. Without the flag the command now stops before the service
+  is asked, says that notes are all that sweep can delete, and deletes
+  nothing. With the flag it does what it did.
 - **`synaps retention sweep --max-disk-bytes`: a budget that cannot be met
   deletes nothing (plain-file memory).** A budget smaller than what the
   sweep may not delete (the sessions named chains point at, and saved notes

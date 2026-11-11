@@ -21,21 +21,25 @@ pub enum RetentionAction {
         /// Delete sessions, traces and logs older than this many days. Plain-file
         /// memory: saved notes are NOT deleted by age unless --include-notes is
         /// given; a note saved with its own expiry still expires by that.
-        /// Axel: the age applies to notes.
+        /// Axel: the age applies to notes, which is all its sweep can delete,
+        /// so it is refused without --include-notes.
         #[arg(long)]
         max_age_days: Option<u32>,
         /// Requested disk budget: deletes derived indexes, then the oldest
         /// sessions, traces and logs (never protected chain heads). Plain-file
         /// memory: it does NOT delete notes unless --include-notes is given;
         /// without it an unmet budget is an error and every note is kept.
+        /// Axel: the budget deletes notes, oldest first, and nothing else, so
+        /// it is refused without --include-notes.
         #[arg(long)]
         max_disk_bytes: Option<u64>,
         /// Plain-file memory: let this sweep delete saved notes of any class.
         /// With --max-age-days, every note older than that goes; with
         /// --max-disk-bytes, notes are evicted oldest first until the budget
         /// is met or no note is left. Without this flag only notes past their
-        /// own expiry and forgotten notes are removed. No effect with Axel,
-        /// whose sweep is notes only.
+        /// own expiry and forgotten notes are removed. Axel: required, because
+        /// notes are all its sweep can delete; without it the sweep is refused
+        /// and nothing is deleted.
         #[arg(long)]
         include_notes: bool,
     },
@@ -313,8 +317,10 @@ async fn run_memory_action(action: RetentionAction, config: &MemoryBackendConfig
             let stats = binding.rpc("stats", json!({})).await?;
             print_json(&selected_report(&binding, stats)?)?;
         }
-        RetentionAction::Sweep { max_age_days, max_disk_bytes, include_notes: _ } => {
+        RetentionAction::Sweep { max_age_days, max_disk_bytes, include_notes } => {
             require_policy(max_age_days, max_disk_bytes)?;
+            // Before the service is asked for anything.
+            require_include_notes_for_axel(max_age_days, max_disk_bytes, include_notes)?;
             let stats = binding.rpc("sweep", json!({"max_age_days":max_age_days,"max_disk_bytes":max_disk_bytes})).await?;
             let budget_met = max_disk_bytes.map(|limit| stats["bytes"].as_u64().is_some_and(|bytes| bytes <= limit));
             let mut report = selected_report(&binding, stats)?;
@@ -515,6 +521,31 @@ fn require_policy(age: Option<u32>, bytes: Option<u64>) -> Result<()> {
     }
     Ok(())
 }
+/// The Axel service's sweep deletes saved notes and nothing else: every note
+/// older than `max_age_days`, then notes oldest first until `max_disk_bytes`
+/// is met (`sidecars/axel-memory-service/src/retention.rs`, `sweep`). It has
+/// no flag of its own for that, so an age or a budget reaches it only when
+/// the command said `--include-notes`.
+fn require_include_notes_for_axel(
+    age: Option<u32>,
+    bytes: Option<u64>,
+    include_notes: bool,
+) -> Result<()> {
+    if include_notes {
+        return Ok(());
+    }
+    let asked = match (age, bytes) {
+        (Some(_), Some(_)) => "--max-age-days and --max-disk-bytes",
+        (Some(_), None) => "--max-age-days",
+        (None, Some(_)) => "--max-disk-bytes",
+        (None, None) => return Ok(()),
+    };
+    bail!(
+        "{asked} refused: with the Axel memory backend saved notes are all a sweep can \
+         delete (history and tombstones are kept), so an age or a budget deletes notes. \
+         Give --include-notes to allow that. Nothing was deleted."
+    )
+}
 fn parse_domain(domain: &str) -> Result<RetentionDomain> {
     Ok(match domain {
         "sessions" => RetentionDomain::Sessions,
@@ -615,6 +646,48 @@ mod tests {
                 include_notes: true,
             }
         ));
+    }
+    /// Axel's sweep deletes notes and nothing else, so an age or a budget
+    /// without `--include-notes` is refused before the service is asked: the
+    /// service here does not exist, and only the sweep that is let through
+    /// gets as far as finding that out.
+    #[tokio::test]
+    async fn the_axel_sweep_refuses_an_age_or_a_budget_without_include_notes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = MemoryBackendConfig {
+            kind: MemoryBackendKind::Axel,
+            executable: Some(tmp.path().join("missing-service")),
+            brain: Some(tmp.path().join("brain.r8")),
+            user_scope: false,
+        };
+        let sweep = |max_age_days, max_disk_bytes, include_notes| {
+            let config = &config;
+            async move {
+                let action = RetentionAction::Sweep {
+                    max_age_days,
+                    max_disk_bytes,
+                    include_notes,
+                };
+                run_memory_action(action, config).await.unwrap_err().to_string()
+            }
+        };
+        for (age, bytes, named) in [
+            (Some(30), None, "--max-age-days refused"),
+            (None, Some(1_000), "--max-disk-bytes refused"),
+            (Some(30), Some(1_000), "--max-age-days and --max-disk-bytes refused"),
+        ] {
+            let refused = sweep(age, bytes, false).await;
+            assert!(refused.starts_with(named), "{refused}");
+            assert!(refused.contains("notes are all a sweep can delete"), "{refused}");
+            assert!(refused.contains("--include-notes"), "{refused}");
+            // With the flag the sweep is not refused here: it goes on to
+            // the service, which is not there.
+            let let_through = sweep(age, bytes, true).await;
+            assert!(!let_through.contains("--include-notes"), "{let_through}");
+        }
+        assert!(!tmp.path().join("brain.r8").exists(), "nothing was provisioned");
+        // No age and no budget is still the first refusal.
+        assert!(sweep(None, None, false).await.contains("sweep needs"));
     }
     #[cfg(unix)]
     fn write_axel_export(dest: &Path, value: &Value) -> Result<()> {
