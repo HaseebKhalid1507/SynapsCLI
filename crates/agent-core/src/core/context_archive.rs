@@ -72,7 +72,14 @@
 //! complete temporary file onto its name, a live record is never modified, and
 //! forget renames a complete tombstone over it, so a reader sees a whole live
 //! record or a whole tombstone and nothing else. Legacy slot files are read
-//! under the lock.
+//! under the lock, shared, if the directory has a lock file.
+//!
+//! A read writes nothing. [`ArchiveStore::new`] is for a seal or a forget: it
+//! creates the directories, makes them private and syncs them.
+//! [`ArchiveStore::open_existing`] is for a fetch or a search: it opens what
+//! is there, and a project with no directory has nothing to read. Whichever
+//! opened the store, a fetch, a note read and a search create no file (not
+//! the lock file either), change no mode and sync nothing.
 //!
 //! Unix-only private, handle-relative no-symlink filesystem; other platforms
 //! fail Unsupported. Live records are immutable; forget atomically replaces a
@@ -164,6 +171,9 @@ const PROCESS_LOCK_POLL: Duration = Duration::from_millis(25);
 /// left by a write that never finished.
 const STALE_TEMP: Duration = Duration::from_secs(60 * 60);
 const WITHHELD: &str = "[archive: withheld]";
+/// What a fetch says of an archive that is not there, was forgotten, or is in
+/// another project: the three are not told apart.
+pub const NOT_FOUND: &str = "archive not available in this scope";
 const BUSY: &str = "archive busy; retain source and retry";
 const BUSY_EXPORT: &str = "archive busy; retry export";
 
@@ -579,14 +589,47 @@ impl Record {
 }
 
 impl ArchiveStore {
+    /// Open a project's archive for a seal or a forget. Creates the base,
+    /// `context-archives` and project directories if they are missing, makes
+    /// them private again and syncs them, every time. A read must not go
+    /// through here: see [`open_existing`](Self::open_existing).
     pub fn new(base: &Path, scope_key: &str, logical_id: &str) -> io::Result<Self> {
+        let (scope, logical) = Self::keys(scope_key, logical_id)?;
+        let fs = PrivateDir::new(base, &scope)?;
+        Ok(Self::opened(fs, scope, logical))
+    }
+
+    /// Open a project's archive for a read (fetch, fetch_note, search), if
+    /// it is there. Nothing is created, no mode is changed and nothing is
+    /// synced, so this also works where nothing can be written. `None` when
+    /// the project has no archive directory: a search of it finds nothing and
+    /// a fetch is [`NOT_FOUND`]. A link anywhere on the way is an error, as
+    /// it is for `new`.
+    pub fn open_existing(
+        base: &Path,
+        scope_key: &str,
+        logical_id: &str,
+    ) -> io::Result<Option<Self>> {
+        let (scope, logical) = Self::keys(scope_key, logical_id)?;
+        match PrivateDir::open_existing(base, &scope) {
+            Ok(fs) => Ok(Some(Self::opened(fs, scope, logical))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The directory name of a project and the stored name of a
+    /// conversation: the hashes of the two keys.
+    fn keys(scope_key: &str, logical_id: &str) -> io::Result<(String, String)> {
         for key in [scope_key, logical_id] {
             validate_key(key)?;
         }
         let scope = digest_parts(&[scope_key.as_bytes()]);
-        let logical = digest_parts(&[logical_id.as_bytes()]);
-        let fs = PrivateDir::new(base, &scope)?;
-        Ok(Self {
+        Ok((scope, digest_parts(&[logical_id.as_bytes()])))
+    }
+
+    fn opened(fs: PrivateDir, scope: String, logical: String) -> Self {
+        Self {
             fs,
             scope,
             logical,
@@ -594,7 +637,7 @@ impl ArchiveStore {
             abort: None,
             wait: LOCK_WAIT,
             process_wait: PROCESS_LOCK_WAIT,
-        })
+        }
     }
 
     /// Opt in to screened tool evidence. Install the SAME trusted policy when
@@ -623,25 +666,38 @@ impl ArchiveStore {
     /// operations behind it would meet the same lock. Leaving early (busy,
     /// abandoned, any other error) releases the gate.
     fn exclusive(&self) -> io::Result<Locked> {
+        self.locked(|fs| fs.lock().map(Some))
+    }
+
+    /// What a read of the legacy slots holds instead: the gate and, with the
+    /// same wait, the lock shared. The lock file is opened only if it is
+    /// there and only for reading, because a read creates nothing and
+    /// changes no mode. Where there is none the read goes on without it: a
+    /// slot name points at a whole file either way.
+    fn shared(&self) -> io::Result<Locked> {
+        self.locked(PrivateDir::lock_existing)
+    }
+
+    fn locked(
+        &self,
+        lock: impl Fn(&PrivateDir) -> io::Result<Option<FlockGuard>>,
+    ) -> io::Result<Locked> {
         let gate = self.enter(BUSY)?;
         let deadline = Instant::now() + self.process_wait;
         let file = loop {
-            match self.fs.lock() {
+            match lock(&self.fs) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.check_abort()?;
                     let now = Instant::now();
                     if now >= deadline {
-                        return Err(error);
+                        return Err(io::Error::new(io::ErrorKind::WouldBlock, BUSY));
                     }
                     std::thread::sleep(PROCESS_LOCK_POLL.min(deadline - now));
                 }
                 result => break result?,
             }
         };
-        Ok(Locked {
-            file: Some(file),
-            _gate: gate,
-        })
+        Ok(Locked { file, _gate: gate })
     }
 
     /// `Interrupted` once the caller has abandoned this operation.
@@ -940,8 +996,9 @@ impl ArchiveStore {
     /// record is skipped (one corrupt file must not hide the rest), and so is
     /// a legacy slot that cannot be read at all. On a shelf, a link, a FIFO
     /// or a file that is not ours alone where a segment belongs still fails
-    /// the search. Shelf files are read without the lock; it is taken only
-    /// if the search gets as far as reading a legacy slot.
+    /// the search. Shelf files are read without the lock; it is taken,
+    /// shared and only if there is a lock file, when the search gets as far
+    /// as reading a legacy slot. Nothing is written either way.
     pub fn search_scan(
         &self,
         query: &str,
@@ -986,9 +1043,9 @@ impl ArchiveStore {
                     return Ok((rows, Some(files)));
                 }
                 if shelf.is_none() && legacy_lock.is_none() {
-                    legacy_lock = Some(self.exclusive()?);
+                    legacy_lock = Some(self.shared()?);
                 }
-                let raw = match dir.read_with(&name, MAX_SEGMENT_BYTES, shelf.is_some()) {
+                let raw = match dir.read_with(&name, MAX_SEGMENT_BYTES, true) {
                     Ok(Some(raw)) => raw,
                     Ok(None) => continue,
                     // Too large to be a segment: not read, and no record below.
@@ -1197,7 +1254,8 @@ impl ArchiveStore {
     /// The record of segment `id`, for a caller that holds no lock: one file
     /// when it is on a shelf, read without the gate or the lock. Only when no
     /// shelf has it and the directory has legacy slot files are those read,
-    /// under the lock, one at a time until one of them is the segment.
+    /// under the shared lock, one at a time until one of them is the
+    /// segment. Nothing is written: no lock file, no mode.
     fn find(&self, id: &str) -> io::Result<Record> {
         self.check_abort()?;
         let (shelves, slots) = self.layout()?;
@@ -1206,8 +1264,8 @@ impl ArchiveStore {
             return Ok(record);
         }
         if !slots.is_empty() {
-            let _lock = self.exclusive()?;
-            if let Some((_, record)) = self.legacy_segment(&slots, id, false, &mut unread) {
+            let _lock = self.shared()?;
+            if let Some((_, record)) = self.legacy_segment(&slots, id, true, &mut unread) {
                 return Ok(record);
             }
         }
@@ -1610,11 +1668,15 @@ impl Projector {
     }
 }
 
+/// The conversation name of a store that is opened only to read a project:
+/// a read finds the segments of every conversation in it.
+const READER: &str = "project-reader";
+
 /// Read-only migration preview for an existing project archive. A missing
 /// archive is empty; corrupt, unsafe or locked paths fail closed. In particular,
 /// this never invokes `ArchiveStore::new`, mkdir, chmod, or lock-file creation.
 pub fn export_in(base: &Path, scope_key: &str) -> io::Result<Vec<Value>> {
-    match existing_store(base, scope_key)? {
+    match ArchiveStore::open_existing(base, scope_key, READER)? {
         Some(store) => store.export_records(),
         None => Ok(Vec::new()),
     }
@@ -1626,7 +1688,7 @@ pub fn export_in(base: &Path, scope_key: &str) -> io::Result<Vec<Value>> {
 /// tombstone, or become one later; a corrupt or unsafe path fails closed.
 pub fn archive_file(base: &Path, scope_key: &str, id: &str) -> io::Result<Option<PathBuf>> {
     validate_id(id)?;
-    let Some(store) = existing_store(base, scope_key)? else {
+    let Some(store) = ArchiveStore::open_existing(base, scope_key, READER)? else {
         return Ok(None);
     };
     let directory = base.join("context-archives").join(&store.scope);
@@ -1642,39 +1704,24 @@ pub fn archive_file(base: &Path, scope_key: &str, id: &str) -> io::Result<Option
     }
 }
 
-/// A project archive that is already there, opened read-only: unlike
-/// `ArchiveStore::new` this never runs mkdir, chmod or lock-file creation.
-fn existing_store(base: &Path, scope_key: &str) -> io::Result<Option<ArchiveStore>> {
-    validate_key(scope_key)?;
-    let scope = digest_parts(&[scope_key.as_bytes()]);
-    let fs = match PrivateDir::open_existing(base, &scope) {
-        Ok(fs) => fs,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    Ok(Some(ArchiveStore {
-        fs,
-        scope,
-        logical: String::new(), // reads all logical conversations in this scope
-        redactor: None,
-        abort: None,
-        wait: LOCK_WAIT,
-        process_wait: PROCESS_LOCK_WAIT,
-    }))
-}
-
 /// Project-wide archive lookup; base and scope are trusted host values, never
-/// model-supplied paths. The same budgets and disclosure policy apply.
+/// model-supplied paths. The same budgets and disclosure policy apply. A
+/// read: nothing is created, and a project without archives has no rows.
 pub fn project_search(
     base: &Path,
     scope_key: &str,
     query: &str,
     limit: usize,
 ) -> io::Result<Vec<ArchiveDescriptor>> {
-    ArchiveStore::new(base, scope_key, "project-reader")?.search(query, limit)
+    match ArchiveStore::open_existing(base, scope_key, READER)? {
+        Some(store) => store.search(query, limit),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Fetch an opaque reference from any logical conversation in this project.
+/// A read: nothing is created, and in a project without archives nothing is
+/// found.
 pub fn project_fetch(
     base: &Path,
     scope_key: &str,
@@ -1682,7 +1729,11 @@ pub fn project_fetch(
     start: usize,
     limit: usize,
 ) -> io::Result<Vec<SharedMessage>> {
-    ArchiveStore::new(base, scope_key, "project-reader")?.fetch(id, start, limit)
+    validate_id(id)?;
+    match ArchiveStore::open_existing(base, scope_key, READER)? {
+        Some(store) => store.fetch(id, start, limit),
+        None => Err(not_found()),
+    }
 }
 
 fn eligible_class(value: &Value) -> Option<DisclosureClass> {
@@ -2153,10 +2204,7 @@ fn corrupt() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid archive record")
 }
 fn not_found() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::NotFound,
-        "archive not available in this scope",
-    )
+    io::Error::new(io::ErrorKind::NotFound, NOT_FOUND)
 }
 fn forgotten() -> io::Error {
     io::Error::new(
@@ -3008,9 +3056,11 @@ mod tests {
     }
     fn setup() -> (tempfile::TempDir, ArchiveStore) {
         let tmp = tempfile::tempdir().unwrap();
-        let store =
-            ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-logical").unwrap();
+        let store = setup_in(tmp.path(), "synthetic-project");
         (tmp, store)
+    }
+    fn setup_in(base: &Path, project: &str) -> ArchiveStore {
+        ArchiveStore::new(base, project, "synthetic-logical").unwrap()
     }
     fn directory(tmp: &tempfile::TempDir, store: &ArchiveStore) -> std::path::PathBuf {
         tmp.path().join("context-archives").join(&store.scope)
@@ -3661,73 +3711,170 @@ mod tests {
         assert_eq!((mode(&shelf), mode(&file)), (0o700, 0o600));
     }
 
-    /// A fetch and a search write nothing: no mode, no change time, no lock
-    /// file. So they also work where nothing can be written.
-    #[test]
-    fn lock_free_reads_write_nothing_and_work_in_unwritable_directories() {
-        use std::collections::BTreeMap;
+    /// Mode, change time and modification time.
+    type Stamp = (u32, (i64, i64), (i64, i64));
+    /// The stamp of everything under `root`, itself included: equal only if
+    /// nothing was created, removed, written, renamed or had its mode set
+    /// (even to what it already was).
+    fn stamps(root: &Path) -> std::collections::BTreeMap<PathBuf, Stamp> {
         use std::os::unix::fs::MetadataExt;
-        type Stamp = (u32, (i64, i64), (i64, i64));
-        /// Mode, change time and modification time of everything under
-        /// `root`, itself included.
-        fn stamps(root: &Path) -> BTreeMap<PathBuf, Stamp> {
-            let mut found = BTreeMap::new();
-            let mut pending = vec![root.to_path_buf()];
-            while let Some(path) = pending.pop() {
-                let meta = std::fs::symlink_metadata(&path).unwrap();
-                if meta.is_dir() {
-                    let entries = std::fs::read_dir(&path).unwrap();
-                    pending.extend(entries.map(|entry| entry.unwrap().path()));
-                }
-                let changed = (meta.ctime(), meta.ctime_nsec());
-                let modified = (meta.mtime(), meta.mtime_nsec());
-                found.insert(path, (meta.mode(), changed, modified));
+        let mut found = std::collections::BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                let entries = std::fs::read_dir(&path).unwrap();
+                pending.extend(entries.map(|entry| entry.unwrap().path()));
             }
-            found
+            let changed = (meta.ctime(), meta.ctime_nsec());
+            let modified = (meta.mtime(), meta.mtime_nsec());
+            found.insert(path, (meta.mode(), changed, modified));
         }
-        /// Lets the temporary directory be removed again, on every path.
-        struct Writable(Vec<PathBuf>);
-        impl Drop for Writable {
-            fn drop(&mut self) {
-                for dir in &self.0 {
-                    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-                }
+        found
+    }
+
+    /// Every read there is, each through a store opened for it there and
+    /// then: what the first read in a process does.
+    fn read_everything(
+        base: &Path,
+        live: &[(&ArchiveRef, &str, &str)],
+        gone: &[String],
+        rows: usize,
+    ) {
+        let open = || ArchiveStore::open_existing(base, "synthetic-project", "any-reader");
+        for (reference, words, note) in live {
+            let id = &reference.id;
+            assert_eq!(open().unwrap().unwrap().fetch(id, 0, 1).unwrap(), text(words));
+            assert_eq!(&open().unwrap().unwrap().fetch_note(id).unwrap(), note);
+            let found = project_fetch(base, "synthetic-project", id, 0, 1);
+            assert_eq!(found.unwrap(), text(words));
+            let located = archive_file(base, "synthetic-project", id).unwrap().unwrap();
+            assert!(std::fs::read_to_string(located).unwrap().contains(words));
+            let found = open().unwrap().unwrap().search(words, 8).unwrap();
+            assert_eq!(found.len(), 1, "{words}");
+            assert_eq!(found[0].id, *id);
+        }
+        for id in gone {
+            for result in [
+                open().unwrap().unwrap().fetch(id, 0, 1).map(drop),
+                open().unwrap().unwrap().fetch_note(id).map(drop),
+                project_fetch(base, "synthetic-project", id, 0, 1).map(drop),
+            ] {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+                assert_eq!(error.to_string(), NOT_FOUND);
             }
         }
+        assert_eq!(open().unwrap().unwrap().search("", 8).unwrap().len(), rows);
+        assert_eq!(project_search(base, "synthetic-project", "", 8).unwrap().len(), rows);
+        assert_eq!(open().unwrap().unwrap().search_scan("", 8).unwrap().1, None);
+    }
+
+    /// A read writes nothing, the first one included: no directory, no lock
+    /// file, no mode, no change time, no sync. So reads also work where
+    /// nothing can be written. `ArchiveStore::new` did all of that on every
+    /// open, and the legacy slots were read with the lock file created and
+    /// their modes set.
+    #[test]
+    fn reads_write_nothing_and_work_where_nothing_can_be_written() {
         let (tmp, store) = setup();
         let dir = directory(&tmp, &store);
-        let reference = store.seal(&text("read only"), "note").unwrap();
+        let shelved = store.seal(&text("read only"), "note").unwrap();
         let forgotten = store.seal(&text("forgotten"), "").unwrap();
         store.forget(&forgotten.id).unwrap();
-        let file = dir.join("s000001").join(archive_name(&reference.id));
-        // With no lock file, taking the lock would mean creating one.
-        std::fs::remove_file(dir.join("lock")).unwrap();
+        let legacy = seal_legacy_slot(&store, 0, &text("sealed long ago"), "old note");
+        let old_forgotten = seal_legacy_slot(&store, 1, &text("forgotten long ago"), "");
+        store.forget(&old_forgotten.id).unwrap();
+        drop(store);
+        let live = [(&shelved, "read only", "note"), (&legacy, "sealed long ago", "old note")];
+        let gone = [forgotten.id.clone(), old_forgotten.id.clone(), "a".repeat(32)];
         let context = tmp.path().join("context-archives");
         let dirs = vec![tmp.path().to_path_buf(), context, dir.clone(), dir.join("s000001")];
-        let _writable = Writable(dirs.clone());
-        for path in &dirs {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let _reopen = Reopen(dirs.clone());
+        // Once with the lock file a seal left, and once without one: taking
+        // the lock as a seal does would then mean creating it.
+        for lock in [true, false] {
+            if !lock {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+                std::fs::remove_file(dir.join("lock")).unwrap();
+            }
+            // Looser than the store makes them: a read does not repair.
+            for path in &dirs {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            for path in shelf_files(&dir).into_iter().chain([dir.join("000.json")]) {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            // Whatever is changed from here on gets a later change time.
+            std::thread::sleep(Duration::from_millis(50));
+            let before = stamps(tmp.path());
+            assert_eq!(before.len(), if lock { 9 } else { 8 }, "4 directories, 4 files, lock");
+            read_everything(tmp.path(), &live, &gone, 2);
+            // The export wants the lock file a seal leaves, and does not
+            // make one.
+            let exported = export_in(tmp.path(), "synthetic-project");
+            assert_eq!(exported.map(|rows| rows.len()).ok(), lock.then_some(4));
+            assert_eq!(stamps(tmp.path()), before, "lock file: {lock}");
+
+            // And where nothing could be written at all.
+            for path in &dirs {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+            }
+            for path in shelf_files(&dir).into_iter().chain([dir.join("000.json")]) {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            if lock {
+                let read_only = std::fs::Permissions::from_mode(0o400);
+                std::fs::set_permissions(dir.join("lock"), read_only).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            let before = stamps(tmp.path());
+            read_everything(tmp.path(), &live, &gone, 2);
+            assert_eq!(stamps(tmp.path()), before, "read-only, lock file: {lock}");
         }
-        for path in shelf_files(&dir) {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
-        }
-        // Whatever is changed from here on gets a later change time.
+        // What a read must not go through: opening the store to write makes
+        // its three directories private again, whoever asked.
+        ArchiveStore::new(tmp.path(), "synthetic-project", "any").unwrap();
+        assert_eq!((mode(tmp.path()), mode(&dir), mode(&dir.join("s000001"))), (0o700, 0o700, 0o500));
+    }
+
+    /// A read of a project that has archived nothing, or of a base that
+    /// does not exist: nothing is found, and nothing is created to say so.
+    #[test]
+    fn a_read_of_a_project_without_archives_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "a".repeat(32);
+        let absent = |base: &Path, project: &str| {
+            assert!(ArchiveStore::open_existing(base, project, "reader").unwrap().is_none());
+            assert!(project_search(base, project, "", 8).unwrap().is_empty());
+            let error = project_fetch(base, project, &id, 0, 1).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            assert_eq!(error.to_string(), NOT_FOUND);
+            assert_eq!(archive_file(base, project, &id).unwrap(), None);
+            assert!(export_in(base, project).unwrap().is_empty());
+        };
+        absent(&tmp.path().join("missing"), "synthetic-project");
+        absent(tmp.path(), "synthetic-project");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        // Another project of the same base has archives; this one still has
+        // no directory, before and after it is read.
+        let other = setup_in(tmp.path(), "another-project");
+        other.seal(&text("elsewhere"), "").unwrap();
         std::thread::sleep(Duration::from_millis(50));
         let before = stamps(tmp.path());
-        assert_eq!(before.len(), 6, "four directories and two segment files");
-
-        assert_eq!(store.fetch(&reference.id, 0, 1).unwrap(), text("read only"));
-        assert_eq!(store.fetch_note(&reference.id).unwrap(), "note");
-        let rows = store.search("", 8).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, reference.id);
-        for id in [forgotten.id.clone(), "a".repeat(32)] {
-            let error = store.fetch(&id, 0, 1).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        }
-        let located = archive_file(tmp.path(), "synthetic-project", &reference.id);
-        assert_eq!(located.unwrap(), Some(file));
+        absent(tmp.path(), "synthetic-project");
         assert_eq!(stamps(tmp.path()), before);
+        assert_eq!(std::fs::read_dir(tmp.path().join("context-archives")).unwrap().count(), 1);
+        // The same checks of its arguments as a store that exists makes.
+        for (project, id) in [("", id.as_str()), ("synthetic-project", "../x")] {
+            let error = project_fetch(tmp.path(), project, id, 0, 1).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        // A link on the way is refused, not followed and not "nothing there".
+        let alias = tmp.path().join("alias");
+        symlink(tmp.path(), &alias).unwrap();
+        assert!(ArchiveStore::open_existing(&alias, "another-project", "reader").is_err());
+        assert!(project_search(&alias, "another-project", "", 8).is_err());
     }
 
     #[test]

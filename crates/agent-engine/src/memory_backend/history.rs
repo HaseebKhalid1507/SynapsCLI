@@ -23,15 +23,33 @@ fn redactor() -> Arc<ArchiveRedactor> {
 fn valid_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
+/// The file store opened for a read: fetch, note or search. Unlike
+/// `ArchiveStore::new`, which a seal and a forget go through, this creates no
+/// directory, changes no mode and syncs nothing. `None` when the project has
+/// no archive directory: there is nothing in it to find.
+fn reader(
+    base: &std::path::Path,
+    scope_key: &str,
+    abort: Arc<AtomicBool>,
+) -> std::io::Result<Option<ArchiveStore>> {
+    let store = ArchiveStore::open_existing(base, scope_key, "context-windows-v1")?;
+    Ok(store.map(|store| store.with_abort(abort)))
+}
+/// What a fetch from a project without archives is told: what the store
+/// says of an archive it does not have.
+fn no_archive() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::NotFound, context_archive::NOT_FOUND)
+}
 /// Run one local archive operation on a blocking worker. The archive queues
 /// operations within this process, so a worker that outlives its dropped
 /// caller delays later operations rather than making them fail as busy.
 ///
 /// Dropping the caller sets the abort flag. A worker that sees it before it
 /// starts does nothing; one that sees it while waiting for admission reads and
-/// writes no records, although opening the store (creating the private
-/// directories) and projecting a seal may already have happened. Once admitted
-/// an operation always completes, so an abandoned seal may still be published.
+/// writes no records, although for a seal or a forget opening the store
+/// (creating the private directories) and projecting may already have
+/// happened. A read creates nothing at any point. Once admitted an operation
+/// always completes, so an abandoned seal may still be published.
 async fn archive_worker<T: Send + 'static>(
     work: impl FnOnce(Arc<AtomicBool>) -> std::io::Result<T> + Send + 'static,
 ) -> Result<T> {
@@ -159,10 +177,9 @@ impl MemoryBinding {
         if !self.exclusive() {
             let base = self.base().to_owned();
             let query = query.to_owned();
-            return archive_worker(move |abort| {
-                ArchiveStore::new(&base, scope.key(), "context-windows-v1")?
-                    .with_abort(abort)
-                    .search(&query, limit)
+            return archive_worker(move |abort| match reader(&base, scope.key(), abort)? {
+                Some(store) => store.search(&query, limit),
+                None => Ok(Vec::new()),
             })
             .await;
         }
@@ -201,10 +218,9 @@ impl MemoryBinding {
         let scope = self.scope()?.clone();
         let base = self.base().to_owned();
         let query = query.to_owned();
-        archive_worker(move |abort| {
-            ArchiveStore::new(&base, scope.key(), "context-windows-v1")?
-                .with_abort(abort)
-                .search_scan(&query, limit)
+        archive_worker(move |abort| match reader(&base, scope.key(), abort)? {
+            Some(store) => store.search_scan(&query, limit),
+            None => Ok((Vec::new(), None)),
         })
         .await
     }
@@ -222,8 +238,8 @@ impl MemoryBinding {
             let base = self.base().to_owned();
             let id = id.to_owned();
             return archive_worker(move |abort| {
-                ArchiveStore::new(&base, scope.key(), "context-windows-v1")?
-                    .with_abort(abort)
+                reader(&base, scope.key(), abort)?
+                    .ok_or_else(no_archive)?
                     .fetch_with_provenance(&id, start, limit)
             })
             .await;
@@ -250,8 +266,8 @@ impl MemoryBinding {
             let base = self.base().to_owned();
             let id = id.to_owned();
             return archive_worker(move |abort| {
-                ArchiveStore::new(&base, scope.key(), "context-windows-v1")?
-                    .with_abort(abort)
+                reader(&base, scope.key(), abort)?
+                    .ok_or_else(no_archive)?
                     .fetch_note(&id)
             })
             .await;
@@ -406,6 +422,66 @@ mod budget_tests {
         assert_eq!(binding.history_search("", 32).await.unwrap(), rows);
         assert!(binding.history_search_scan("", 33).await.is_err());
         assert!(binding.history_search_scan(&"q".repeat(513), 1).await.is_err());
+    }
+
+    /// A history read with the file backend creates nothing: not for a
+    /// project that has never archived anything, and not on the first read
+    /// of one that has. Opening the store as a seal does made the base,
+    /// `context-archives` and project directories and set their modes on
+    /// every call.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_history_reads_create_nothing_and_change_nothing() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let binding = binding(&root, MemoryBackendKind::Legacy, None);
+        let missing = "a".repeat(32);
+        let not_there = context_archive::NOT_FOUND;
+        // No archive yet: nothing is made to find that out.
+        assert!(binding.history_search("", 8).await.unwrap().is_empty());
+        let (rows, stopped_after) = binding.history_search_scan("", 8).await.unwrap();
+        assert!(rows.is_empty() && stopped_after.is_none());
+        let error = binding.history_fetch(&missing, 0, 1).await.unwrap_err();
+        assert!(error.to_string().contains(not_there), "{error}");
+        let error = binding.history_note(&missing).await.unwrap_err();
+        assert!(error.to_string().contains(not_there), "{error}");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let message = vec![Arc::new(json!({"role":"user","content":"kept words"}))];
+        let (reference, _) = binding
+            .history_seal("synthetic-session", &message, "kept note")
+            .await
+            .unwrap();
+        // Mode, change time and modification time of everything there is.
+        let stamps = || {
+            let mut found = Vec::new();
+            let mut pending = vec![root.clone()];
+            while let Some(path) = pending.pop() {
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                if meta.is_dir() {
+                    let entries = std::fs::read_dir(&path).unwrap();
+                    pending.extend(entries.map(|entry| entry.unwrap().path()));
+                }
+                let times = (meta.ctime(), meta.ctime_nsec(), meta.mtime(), meta.mtime_nsec());
+                found.push((path, meta.mode(), times));
+            }
+            found.sort();
+            found
+        };
+        // Whatever is changed from here on gets a later change time.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let before = stamps();
+        assert_eq!(before.len(), 6, "base, context-archives, project, lock, shelf, archive");
+        let fetched = binding.history_fetch(&reference.id, 0, 1).await.unwrap();
+        assert_eq!(fetched[0].message["content"], "kept words");
+        assert_eq!(binding.history_note(&reference.id).await.unwrap(), "kept note");
+        assert_eq!(binding.history_search("kept", 8).await.unwrap().len(), 1);
+        let (rows, _) = binding.history_search_scan("", 8).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        // The same answer as from a project with no archive at all.
+        let error = binding.history_fetch(&missing, 0, 1).await.unwrap_err();
+        assert!(error.to_string().contains(not_there), "{error}");
+        assert_eq!(stamps(), before);
     }
 
     #[tokio::test]

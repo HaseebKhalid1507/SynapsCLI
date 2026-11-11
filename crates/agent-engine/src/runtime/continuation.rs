@@ -359,6 +359,17 @@ pub(crate) fn archive_store() -> std::io::Result<ArchiveStore> {
     archive_store_in(&agent_core::config::base_dir(), &scope)
 }
 
+/// A project's file store opened for a read: unlike [`archive_store_in`]
+/// this creates no directory, changes no mode and syncs nothing. `None` when
+/// the project has no archive. The caller names the project, as for
+/// [`archive_store_in`]; nothing here reads the process folder.
+fn existing_archive_store_in(
+    base: &std::path::Path,
+    scope: &agent_core::memory::store::ProjectScope,
+) -> std::io::Result<Option<ArchiveStore>> {
+    ArchiveStore::open_existing(base, scope.key(), ARCHIVE_NAMESPACE)
+}
+
 /// Caller resolves scope before crossing a thread boundary. An ambient cwd or
 /// environment change during a blocking operation must not redirect its data.
 pub(crate) fn archive_store_in(
@@ -1227,12 +1238,13 @@ pub fn restore_window(
     let Some(id) = marker["archive"].as_str() else {
         return;
     };
-    let found = binding
+    // A read: the chat's store is opened as it is, and nothing is created
+    // for a project that has no archive.
+    let store = binding
         .scope()
         .map_err(|e| std::io::Error::other(e.to_string()))
-        .and_then(|scope| archive_store_in(binding.base(), scope))
-        .and_then(|store| store.fetch(id, 0, 1));
-    if found.is_ok() {
+        .and_then(|scope| existing_archive_store_in(binding.base(), scope));
+    if matches!(store, Ok(Some(store)) if store.fetch(id, 0, 1).is_ok()) {
         s.latest_archive = Some(id.into());
         s.window = marker["window"].as_u64().unwrap_or(1);
     }
@@ -1906,6 +1918,27 @@ mod tests {
         assert_eq!(s.window, 2);
         assert!(!s.enabled());
     }
+    /// Resuming a chat whose head names an archive looks the archive up,
+    /// which is a read: in a project with no archive it creates nothing to
+    /// find that out. It used to open the store as a seal does, and made
+    /// `context-archives` and the project directory.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn restore_window_creates_nothing_in_a_project_without_archives() {
+        let env = BaseDirGuard::new();
+        let marker = json!({"schema": MARKER, "archive": "a".repeat(32), "window": 3});
+        let head = vec![Arc::new(
+            json!({"role":"user","content":"resumed","_synaps_context":marker}),
+        )];
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        let window = state.lock().unwrap().window;
+        restore_window(&head, &state, &MemoryBinding::legacy_current());
+        let s = state.lock().unwrap();
+        assert!(s.initialized);
+        assert_eq!((s.latest_archive.as_deref(), s.window), (None, window));
+        assert_eq!(std::fs::read_dir(env.path()).unwrap().count(), 0);
+    }
+
     /// The file store used to hold 128 archives per project for good; with
     /// those in place every further rollover failed with "archive commit
     /// failed; history retained" and the turn ended.
