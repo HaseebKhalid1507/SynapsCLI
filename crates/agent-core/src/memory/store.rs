@@ -171,7 +171,9 @@ fn namespace_path(dir: &Path, ns: &str) -> PathBuf {
     dir.join(format!("{ns}.jsonl"))
 }
 
-/// Append one record. Validates namespace, content size. Atomic per-line via O_APPEND.
+/// Append one record. Validates namespace, content size. One line is one
+/// `write` to a file opened for append, and the file is synced before this
+/// returns (see `append_jsonl_line`).
 pub fn append(record: &MemoryRecord) -> Result<(), MemoryError> {
     append_to(&crate::config::base_dir(), record)
 }
@@ -191,32 +193,136 @@ pub fn append_to(base: &Path, record: &MemoryRecord) -> Result<(), MemoryError> 
     append_jsonl_line(&path, &line)
 }
 
-/// Append one JSONL line with torn-tail healing: if a previous writer
-/// crashed mid-line (file does not end in a newline), a leading newline
-/// isolates the torn fragment on its own line — lenient readers skip the
-/// fragment and every subsequent record stays parseable.
+/// Append one JSONL line and make it durable before returning: the line goes
+/// to the file whole ([`write_whole_line`]), the file is synced, and when
+/// this append found no file or an empty one, its directory is synced too,
+/// because nothing else puts the new file's name on disk.
+///
+/// An error means the save is NOT acknowledged. It does not mean nothing was
+/// written: after a short write or a failed sync, part or all of the line can
+/// be in the file.
+///
+/// Torn-tail healing: if a previous writer died mid-line (the file does not
+/// end in a newline), a leading newline isolates the torn fragment on its
+/// own line. Lenient readers skip the fragment and every later record stays
+/// parseable. Nothing is ever cut off the file, so healing cannot drop a
+/// line, and a line that only lacked its newline becomes a good line.
+///
+/// There is no lock. Appenders in other processes are kept apart by the
+/// append mode alone, which is enough for whole lines: each is one `write`.
+/// What it does not cover is the look at the last byte, which is a separate
+/// step from the write. If another writer's line is torn between the two (it
+/// died, or its write was short), this line lands on that fragment and is
+/// lost with it. Looking and finding a line that another writer has only
+/// half written costs nothing: the newline it adds makes an empty line.
 fn append_jsonl_line(path: &Path, line: &str) -> Result<(), MemoryError> {
-    let needs_heal = match fs::metadata(path) {
+    let (had_bytes, needs_heal) = match fs::metadata(path) {
         Ok(meta) if meta.len() > 0 => {
             use std::io::{Read, Seek, SeekFrom};
             let mut f = fs::File::open(path)?;
             f.seek(SeekFrom::End(-1))?;
             let mut last = [0u8; 1];
             f.read_exact(&mut last)?;
-            last[0] != b'\n'
+            (true, last[0] != b'\n')
         }
-        _ => false,
+        _ => (false, false),
     };
     let mut f = crate::core::private_fs::open_private_append(path).map_err(std::io::Error::from)?;
-    let mut out = String::with_capacity(line.len() + 2);
-    if needs_heal {
-        out.push('\n');
+    write_whole_line(&mut f, line, needs_heal)?;
+    sync_file(&f)?;
+    if !had_bytes {
+        if let Some(dir) = path.parent() {
+            sync_dir(dir)?;
+        }
     }
-    out.push_str(line);
-    out.push('\n');
-    f.write_all(out.as_bytes())?;
     Ok(())
 }
+
+/// How many `write` calls one line may take before the append gives up.
+const LINE_WRITE_ATTEMPTS: usize = 3;
+
+/// Write `line` and its newline with ONE `write` call, so that no other
+/// appender's bytes can land inside a line that was acknowledged.
+///
+/// `write_all` is not used: after a short write it sends the REST of the
+/// line in a second call, and whatever another appender wrote in between
+/// would sit in the middle of this line. Here a short write is abandoned
+/// where it is (bytes are never taken back out of the file) and the whole
+/// line is written again, led by a newline that ends the fragment, which a
+/// reader then skips like any torn line. If the fragment was the whole
+/// record short of its newline, the record is in the file twice, same id and
+/// same bytes: a duplicate rather than a line this call cannot vouch for.
+/// A regular file takes a short write when the disk or a quota is full, so
+/// the retry normally fails and the caller gets that error.
+fn write_whole_line<W: Write>(
+    file: &mut W,
+    line: &str,
+    mut lead_newline: bool,
+) -> std::io::Result<()> {
+    let mut attempts = 0;
+    while attempts < LINE_WRITE_ATTEMPTS {
+        let mut out = Vec::with_capacity(line.len() + 2);
+        if lead_newline {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
+        step("write");
+        match file.write(&out) {
+            Ok(n) if n == out.len() => return Ok(()),
+            Ok(n) => {
+                attempts += 1;
+                lead_newline |= n > 0;
+            }
+            // Nothing was written; the same call again.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WriteZero,
+        "a line could not be appended with one write",
+    ))
+}
+
+/// Sync a notes file: its bytes and its length.
+fn sync_file(file: &fs::File) -> std::io::Result<()> {
+    step("sync file");
+    file.sync_all()
+}
+
+/// Sync a directory, so that the name of a file just created in it is on
+/// disk.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    step("sync dir");
+    #[cfg(unix)]
+    {
+        fs::File::open(dir)?.sync_all()
+    }
+    // Windows cannot open a directory to flush it, and NTFS journals the new
+    // name itself: the choice `session_journal::sync_sessions_dir` makes.
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The write and sync calls this thread's appends made, in order.
+    static IO_STEPS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Notes a write or a sync for the tests that check their order.
+#[cfg(test)]
+fn step(name: &'static str) {
+    IO_STEPS.with(|steps| steps.borrow_mut().push(name));
+}
+
+#[cfg(not(test))]
+fn step(_name: &'static str) {}
 
 /// Query records in a namespace, applying filters, returning most-recent-first up to limit.
 pub fn query(namespace: &str, q: &MemoryQuery) -> Result<Vec<MemoryRecord>, MemoryError> {
@@ -900,6 +1006,352 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let got = query_in(tmp.path(), "nope", &MemoryQuery::default()).unwrap();
         assert!(got.is_empty());
+    }
+
+    // ─── Durable, whole-line appends ────────────────────────────────────────
+
+    fn project_scope(tmp: &TempDir) -> ProjectScope {
+        let root = tmp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        ProjectScope::for_root(&root).unwrap()
+    }
+
+    fn note(content: &str) -> NewMemoryRecord {
+        NewMemoryRecord {
+            content: content.to_string(),
+            tags: vec!["t".into()],
+            provenance: MemoryProvenance {
+                source: "model".into(),
+                session: None,
+            },
+            sensitivity: MemorySensitivity::Normal,
+            retention: MemoryRetention::Standard,
+        }
+    }
+
+    /// The write and sync calls this thread's appends made since the last
+    /// call, in order.
+    fn take_steps() -> Vec<&'static str> {
+        IO_STEPS.with(|steps| std::mem::take(&mut *steps.borrow_mut()))
+    }
+
+    /// What this shows: the ORDER of the calls a save makes. One write of the
+    /// line, then a sync of the file, then (only when the file was new) a
+    /// sync of its directory, all before the call returns, and the same for
+    /// the line a forget appends. What it cannot show: that the bytes are on
+    /// the platter. A test cannot cut the power, and whether a sync reaches
+    /// the medium is up to the system and the disk.
+    #[test]
+    fn a_save_and_a_forget_are_synced_before_they_return() {
+        let tmp = TempDir::new().unwrap();
+        let scope = project_scope(&tmp);
+        take_steps();
+
+        let first = store_record_in(tmp.path(), &scope, note("first")).unwrap();
+        assert_eq!(
+            take_steps(),
+            ["write", "sync file", "sync dir"],
+            "the save that creates the file syncs the file, then its directory"
+        );
+
+        store_record_in(tmp.path(), &scope, note("second")).unwrap();
+        assert_eq!(
+            take_steps(),
+            ["write", "sync file"],
+            "a later save syncs the file; its name is already on disk"
+        );
+
+        forget_in(tmp.path(), &scope, first.id.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            take_steps(),
+            ["write", "sync file"],
+            "a tombstone line is synced like a note"
+        );
+
+        // The plain namespace path (the extension `memory.append` call).
+        append_to(tmp.path(), &rec("ns", 1, "x", vec![])).unwrap();
+        assert_eq!(take_steps(), ["write", "sync file", "sync dir"]);
+
+        // A file that is there but empty has no line whose save synced the
+        // directory, so the first line does.
+        fs::write(memory_dir_in(tmp.path()).join("empty.jsonl"), "").unwrap();
+        append_to(tmp.path(), &rec("empty", 1, "x", vec![])).unwrap();
+        assert_eq!(take_steps(), ["write", "sync file", "sync dir"]);
+    }
+
+    /// A file opened for append that another writer shares, as far as a
+    /// writer can tell: every `write` lands at the end, whole. It takes at
+    /// most the scripted number of bytes per call, and after its first short
+    /// write the other writer appends `interloper`.
+    struct SharedAppendFile {
+        bytes: Vec<u8>,
+        accept: std::collections::VecDeque<usize>,
+        interloper: Option<String>,
+        calls: Vec<Vec<u8>>,
+    }
+
+    impl SharedAppendFile {
+        fn taking(accept: &[usize], interloper: Option<String>) -> Self {
+            Self {
+                bytes: Vec::new(),
+                accept: accept.iter().copied().collect(),
+                interloper,
+                calls: Vec::new(),
+            }
+        }
+
+        fn lines(&self) -> Vec<&str> {
+            std::str::from_utf8(&self.bytes).unwrap().lines().collect()
+        }
+    }
+
+    impl Write for SharedAppendFile {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = self.accept.pop_front().unwrap_or(buf.len()).min(buf.len());
+            self.calls.push(buf.to_vec());
+            self.bytes.extend_from_slice(&buf[..n]);
+            if n < buf.len() {
+                if let Some(other) = self.interloper.take() {
+                    self.bytes.extend_from_slice(other.as_bytes());
+                }
+            }
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const LINE: &str = r#"{"namespace":"ns","timestamp_ms":1,"content":"mine","tags":[]}"#;
+    const OTHER: &str = r#"{"namespace":"ns","timestamp_ms":2,"content":"theirs","tags":[]}"#;
+
+    #[test]
+    fn a_line_is_one_write_call() {
+        let mut file = SharedAppendFile::taking(&[], None);
+        write_whole_line(&mut file, LINE, false).unwrap();
+        assert_eq!(file.calls, [format!("{LINE}\n").into_bytes()]);
+
+        // The newline that ends a torn tail goes in the same call.
+        let mut file = SharedAppendFile::taking(&[], None);
+        write_whole_line(&mut file, LINE, true).unwrap();
+        assert_eq!(file.calls, [format!("\n{LINE}\n").into_bytes()]);
+    }
+
+    /// What this shows: after a short write the rest of the line is never
+    /// sent as a second call, so a line another writer appends in between
+    /// cannot end up inside this one. The writer is a script, not a file: a
+    /// real file gives a short write only when the disk or a quota is full,
+    /// which a hermetic test cannot arrange. What it cannot show: how a given
+    /// file system behaves at that point.
+    #[test]
+    fn a_short_write_is_abandoned_and_the_whole_line_written_again() {
+        // The other writer saw the torn tail and led with a newline.
+        let mut file = SharedAppendFile::taking(&[20], Some(format!("\n{OTHER}\n")));
+        write_whole_line(&mut file, LINE, false).unwrap();
+        assert_eq!(file.lines(), [&LINE[..20], OTHER, "", LINE]);
+        assert_eq!(
+            file.calls,
+            [format!("{LINE}\n").into_bytes(), format!("\n{LINE}\n").into_bytes()],
+            "each call carries the whole line; none carries a remainder"
+        );
+
+        // The other writer looked before the fragment was there and did not
+        // lead with a newline. Its line is lost on the fragment, which no
+        // writer can prevent without a lock; this writer's line is whole.
+        let mut file = SharedAppendFile::taking(&[20], Some(format!("{OTHER}\n")));
+        write_whole_line(&mut file, LINE, false).unwrap();
+        let merged = format!("{}{OTHER}", &LINE[..20]);
+        assert_eq!(file.lines(), [merged.as_str(), "", LINE]);
+
+        // Every reader keeps the good lines and skips the fragment.
+        for line in file.lines() {
+            let parsed = serde_json::from_str::<MemoryRecord>(line);
+            assert_eq!(parsed.is_ok(), line == LINE, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_that_cannot_go_in_one_write_is_an_error_not_a_split_line() {
+        // Every call is short: the save fails; it is never reported as done.
+        let mut file = SharedAppendFile::taking(&[5, 5, 5, 5, 5, 5], None);
+        let err = write_whole_line(&mut file, LINE, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(file.calls.len(), LINE_WRITE_ATTEMPTS);
+        assert!(
+            file.lines().iter().all(|line| line.len() <= 5),
+            "only fragments, each on a line of its own: {:?}",
+            file.lines()
+        );
+
+        // A writer that takes nothing fails the same way.
+        let mut file = SharedAppendFile::taking(&[0, 0, 0, 0], None);
+        assert!(write_whole_line(&mut file, LINE, false).is_err());
+        assert!(file.bytes.is_empty());
+    }
+
+    /// What this shows: on the machine and file system the test runs on,
+    /// writers that each open the file for append and start together do not
+    /// tear or lose each other's lines, for lines from a few bytes to several
+    /// pages. Threads with a handle each stand in for processes: the kernel
+    /// orders appends by file, not by who holds the handle. What it cannot
+    /// show: the same for every file system (a network one may not keep
+    /// append writes whole), or what happens when a write is short; the
+    /// scripted-writer tests above cover that.
+    #[test]
+    fn concurrent_appends_keep_every_line_whole_and_lose_none() {
+        const WRITERS: usize = 8;
+        const ROUNDS: usize = 24;
+        let tmp = TempDir::new().unwrap();
+        let scope = project_scope(&tmp);
+        let start = std::sync::Barrier::new(WRITERS);
+        let mut forgotten: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        std::thread::scope(|threads| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|writer| {
+                    let (base, scope, start) = (tmp.path(), &scope, &start);
+                    threads.spawn(move || {
+                        let (mut ids, mut errors) = (Vec::new(), Vec::new());
+                        for round in 0..ROUNDS {
+                            // 9 bytes to about 15 KiB, so some lines span
+                            // several pages.
+                            let pad = "x".repeat((round % 6) * 3_000);
+                            let content = format!("w{writer}-r{round}-{pad}");
+                            // Every writer comes to every round and none
+                            // panics in between: one that stopped early would
+                            // leave the others waiting here for good, and a
+                            // torn line would hang the test, not fail it.
+                            start.wait();
+                            let stored = match store_record_in(base, scope, note(&content)) {
+                                Ok(stored) => stored,
+                                Err(e) => {
+                                    errors.push(format!("save w{writer}-r{round}: {e}"));
+                                    continue;
+                                }
+                            };
+                            if round % 8 == 7 {
+                                let id = stored.id.unwrap_or_default();
+                                match forget_in(base, scope, &id) {
+                                    Ok(()) => ids.push(id),
+                                    Err(e) => errors.push(format!("forget w{writer}-r{round}: {e}")),
+                                }
+                            }
+                        }
+                        (ids, errors)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let (ids, errors) = handle.join().unwrap();
+                forgotten.extend(ids);
+                failures.extend(errors);
+            }
+        });
+        assert!(
+            failures.is_empty(),
+            "a save or a forget failed among concurrent writers: {failures:?}"
+        );
+
+        let raw = fs::read_to_string(namespace_file(tmp.path(), &scope.namespace())).unwrap();
+        assert!(raw.ends_with('\n'));
+        let mut contents = std::collections::HashSet::new();
+        let mut tombstones = std::collections::HashSet::new();
+        for line in raw.lines().filter(|line| !line.is_empty()) {
+            if let Ok(tomb) = serde_json::from_str::<TombstoneLine>(line) {
+                assert!(tombstones.insert(tomb.tombstone), "a tombstone twice");
+                continue;
+            }
+            let record: MemoryRecord = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("a line does not parse ({e}): {:.80}", line));
+            let head: String = record.content.chars().take(12).collect();
+            assert!(contents.insert(record.content), "a note twice: {head}");
+        }
+        assert_eq!(contents.len(), WRITERS * ROUNDS, "no note is lost");
+        for writer in 0..WRITERS {
+            for round in 0..ROUNDS {
+                let pad = "x".repeat((round % 6) * 3_000);
+                assert!(contents.contains(&format!("w{writer}-r{round}-{pad}")));
+            }
+        }
+        assert_eq!(forgotten.len(), WRITERS * ROUNDS / 8);
+        assert_eq!(
+            tombstones,
+            forgotten.iter().cloned().collect(),
+            "no tombstone is lost"
+        );
+        let live = load_live_project_records(tmp.path(), &scope).unwrap();
+        assert_eq!(live.len(), WRITERS * ROUNDS - forgotten.len());
+    }
+
+    // ─── The torn last line ─────────────────────────────────────────────────
+
+    /// What this shows: what the next append does with a last line that a
+    /// dead writer left unfinished, cut inside a multi-byte character. No
+    /// byte before the tear changes, the fragment ends up alone on a line
+    /// every reader skips, and the new note is whole. The tear is made by
+    /// writing the file, not by killing a process mid-write.
+    #[test]
+    fn a_torn_last_line_is_fenced_off_and_no_good_line_is_touched() {
+        let tmp = TempDir::new().unwrap();
+        let scope = project_scope(&tmp);
+        let kept = store_record_in(tmp.path(), &scope, note("kept")).unwrap();
+        let path = namespace_file(tmp.path(), &scope.namespace());
+        let before = fs::read(&path).unwrap();
+
+        let mut whole = MemoryRecord {
+            content: "caf\u{e9}".into(),
+            ..kept.clone()
+        };
+        whole.id = Some("mem-torn".into());
+        let torn_line = serde_json::to_string(&whole).unwrap();
+        let cut = torn_line.find('\u{e9}').unwrap() + 1;
+        let fragment = &torn_line.as_bytes()[..cut];
+        assert!(std::str::from_utf8(fragment).is_err(), "cut inside a character");
+        let mut torn = before.clone();
+        torn.extend_from_slice(fragment);
+        fs::write(&path, &torn).unwrap();
+
+        let after = store_record_in(tmp.path(), &scope, note("after the tear")).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&torn), "nothing before the append changed");
+        let mut expected = torn.clone();
+        expected.push(b'\n');
+        expected.extend_from_slice(serde_json::to_string(&after).unwrap().as_bytes());
+        expected.push(b'\n');
+        assert_eq!(bytes, expected, "fragment, newline, the new line, newline");
+
+        let live = load_live_project_records(tmp.path(), &scope).unwrap();
+        assert_eq!(live, [kept.clone(), after.clone()]);
+        let ids = [kept.id.as_deref().unwrap(), after.id.as_deref().unwrap()];
+        assert_eq!(fetch_exact_in(tmp.path(), &scope, &ids).unwrap().len(), 2);
+        assert_eq!(
+            query_in(tmp.path(), &scope.namespace(), &MemoryQuery::default())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// A last line that is complete but for its newline is a good line. The
+    /// next append ends it; it is neither dropped nor run into the new one.
+    #[test]
+    fn a_last_line_missing_only_its_newline_is_kept() {
+        let tmp = TempDir::new().unwrap();
+        let scope = project_scope(&tmp);
+        let first = store_record_in(tmp.path(), &scope, note("first")).unwrap();
+        let path = namespace_file(tmp.path(), &scope.namespace());
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&path, bytes).unwrap();
+
+        let second = store_record_in(tmp.path(), &scope, note("second")).unwrap();
+
+        let live = load_live_project_records(tmp.path(), &scope).unwrap();
+        assert_eq!(live, [first, second]);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 2, "no empty line, nothing merged");
     }
 
     /// Private-mode tests (spec §5.4). Umask isolation: see

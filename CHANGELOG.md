@@ -300,6 +300,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Notes: a saved note is on disk before `memory_store` says it is saved.**
+  With the plain-file memory backend a note was written to
+  `memory/project-<key>.jsonl` but not synced, so a crash or a power cut
+  straight after the tool reported success could lose it. A save now syncs
+  the file before it returns, and the `memory/` directory too when the file
+  is new; so does the line `memory_forget` appends, and an extension's
+  `memory.append`. A save costs one file sync more than before. The file
+  format is unchanged, and older versions read the files as before.
 - **Daemon: an extension tool run by a plugin slash command is told the
   chat.** A tool-backed `/plugin:command` typed in a daemon-hosted chat sent
   its `tool.call` with `session_id: null` and the daemon's folder as `cwd`.
