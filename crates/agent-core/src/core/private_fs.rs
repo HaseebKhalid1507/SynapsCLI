@@ -139,15 +139,27 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
 ///   reading (a write-and-search-only mode such as `0300`). The rename or
 ///   the append into it has worked; only the open for the sync is refused.
 ///
-/// Such a directory is not a reason to call a finished write failed. Any
-/// other error is returned. A no-op on Windows (not unix), which cannot open
+/// Such a directory is not a reason to call a finished write failed; the
+/// `PermissionDenied` is logged as a warning with the directory. Any other
+/// error is returned. A no-op on Windows (not unix), which cannot open
 /// a directory to flush it, and where NTFS journals the new name itself.
 pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
         match File::open(dir).and_then(|dir| dir.sync_all()) {
-            Err(e) if matches!(e.kind(), InvalidInput | PermissionDenied | Unsupported) => Ok(()),
+            Err(e) if e.kind() == PermissionDenied => {
+                // Left as it is, but not in silence: after a power cut a
+                // name newly made in this directory may be missing.
+                tracing::warn!(
+                    directory = %dir.display(),
+                    error = %e,
+                    "a directory could not be opened to be synced; what was written into it \
+                     stays, but a new name in it is not confirmed to be on disk"
+                );
+                Ok(())
+            }
+            Err(e) if matches!(e.kind(), InvalidInput | Unsupported) => Ok(()),
             result => result,
         }
     }
@@ -418,7 +430,43 @@ mod tests {
             File::open(&gate).unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
-        sync_dir(&gate).unwrap();
+        // Tolerated, and said: one warning with the directory and the error.
+        #[derive(Clone, Default)]
+        struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .finish();
+        let lines = |log: &Log| {
+            let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+            text.lines().map(str::to_owned).collect::<Vec<_>>()
+        };
+        {
+            let _capture = tracing::subscriber::set_default(subscriber);
+            sync_dir(&gate).unwrap();
+            let said = lines(&log);
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(said[0].contains("WARN"), "{said:?}");
+            assert!(said[0].contains(&gate.display().to_string()), "{said:?}");
+            assert!(said[0].contains("Permission denied"), "{said:?}");
+            // A directory that syncs says nothing; one that is missing is
+            // an error, not a warning.
+            sync_dir(tmp.path()).unwrap();
+            sync_dir(&tmp.path().join("missing")).unwrap_err();
+            assert_eq!(lines(&log).len(), 1);
+        }
     }
 
     #[cfg(target_os = "linux")]

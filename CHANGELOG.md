@@ -335,6 +335,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A directory that cannot be opened for its sync is logged.** A save into
+  a directory that may be written but not opened for reading (mode `0300`,
+  for example) succeeds without the directory being synced, for notes and
+  for every private file. That was silent. Each such save now logs one
+  warning with the directory and the error: after a power cut the name of a
+  file newly created there may be missing. Nothing else changes: the save
+  still answers as it did.
 - **`synaps retention sweep` with Axel memory: an age or a budget is refused
   without `--include-notes`.** The Axel service's sweep deletes saved notes
   and nothing else: every note older than `--max-age-days`, then notes
