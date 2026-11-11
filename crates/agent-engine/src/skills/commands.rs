@@ -178,6 +178,7 @@ fn command_tool_context(session_id: Option<&str>, cwd: Option<&Path>) -> ToolCon
             env_warned: Default::default(),
             session_id: session_id.map(str::to_string),
             hook_bus: None,
+            continuation: None,
         },
         limits: ToolLimits {
             max_tool_output: 30_000,

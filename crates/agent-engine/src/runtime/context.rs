@@ -1102,7 +1102,7 @@ mod tests {
         let via_runtime = runtime.assess_context(&messages).await;
 
         let system = runtime.effective_system_prompt().await;
-        let schema = runtime.tools_shared().read().await.tools_schema();
+        let schema = runtime.offered_tools_schema().await;
         let direct = assess(&ContextBudgetInputs {
             model: runtime.model(),
             provider_window: runtime.context_window(),

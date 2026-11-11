@@ -374,6 +374,34 @@ All notable changes to this project will be documented in this file.
   is new; so does the line `memory_forget` appends, and an extension's
   `memory.append`. A save costs one file sync more than before. The file
   format is unchanged, and older versions read the files as before.
+- **Daemon: a chat's `context_checkpoint` reaches that chat, and no chat
+  takes a tool away from another.** Every chat on a daemon shares one tool
+  registry, and three things that belong to one chat were kept in it. A chat
+  with context management on registered `context_checkpoint`, bound to its
+  own rollover state, at the start of every turn, replacing the last chat's:
+  with two such chats mid-turn, the phase and note one reported (the note is
+  its unfinished work, up to 8,192 bytes) were written into the other's
+  state, the reporter was answered "recorded", and its own state got
+  nothing. A chat with context management off removed the tool from the
+  registry, so a chat that had it got "Unknown tool" mid-turn. And a chat
+  whose folder's project cannot be resolved (a `.git` Git cannot verify, a
+  folder that is gone) removed `forum_post`, `forum_read` and `forum_forget`
+  for every chat until the daemon restarted. Now the registry holds one
+  `context_checkpoint`, which writes to the state of the chat that called
+  it, and a chat with no use for a tool is not offered it; the registry is
+  never changed for one chat. Also gone with this: every such turn start
+  advanced the shared catalog generation, which made every other chat
+  rebuild its tool set mid-turn. A chat still sees exactly the tools it saw
+  when it was alone on a host, with three differences. `synaps tools export`
+  and `docs/tools.json` list `context_checkpoint` (30 built-ins). `disabled_tools
+  = context_checkpoint` is now obeyed; it was undone at every turn start.
+  With `progressive_tool_disclosure`, a chat with no forum no longer has the
+  three forum tools in its list of tools to activate, where they could show
+  up and then fail to activate. Engine API: `ToolCapabilities` has a
+  `continuation` field (the calling chat's rollover state),
+  `ContextCheckpointTool` holds no state, `SessionToolSet::withholding`
+  records what a session is not offered, and `Runtime::offered_tools_schema`
+  is the registry's schema as one chat is offered it.
 - **Daemon: an extension tool run by a plugin slash command is told the
   chat.** A tool-backed `/plugin:command` typed in a daemon-hosted chat sent
   its `tool.call` with `session_id: null` and the daemon's folder as `cwd`.

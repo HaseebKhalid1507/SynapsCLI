@@ -613,17 +613,20 @@ impl Runtime {
                 .map_err(RuntimeError::Config)?;
         let (request_messages, _) = round_images.views(&request);
 
-        // Tools: a snapshot of the live registry (the previous turn already
-        // applied its idempotent setup), projected exactly like a stream round
-        // when progressive disclosure is on — read-only: the retained session
+        // Tools: a snapshot of the live registry, as this chat's next turn
+        // will be offered it (`chat_tools::chat_tool_set`: the same tools
+        // withheld), and projected exactly like a stream round when
+        // progressive disclosure is on — read-only: the retained session
         // tool set is never written.
         let tools_snapshot = self.tools.read().await.clone();
+        let forum_ready = self.memory_backend.is_axel();
         let (request_tools_schema, anthropic_tool_split) = if self.progressive_tool_disclosure {
-            let fresh = super::continuation::context_tool_set(
+            let fresh = super::chat_tools::chat_tool_set(
                 self.host_tool_session.clone(),
                 tools_snapshot.catalog(),
                 true,
                 context_enabled,
+                forum_ready,
             );
             // The SAME selection a turn start makes (`retain_session_tool_set`),
             // through its pure half: nothing is written back.
@@ -670,7 +673,8 @@ impl Runtime {
             });
             (Some(Arc::new(schema)), split)
         } else {
-            (None, None)
+            let withheld = super::chat_tools::withheld_tools(context_enabled, forum_ready);
+            (tools_snapshot.tools_schema_without(&withheld), None)
         };
 
         let options = ApiOptions {

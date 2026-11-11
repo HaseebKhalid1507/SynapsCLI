@@ -214,6 +214,12 @@ pub struct ToolCapabilities {
     /// view, which sends nothing. `None` wherever no bus exists; the tool
     /// then works the same and nothing is announced.
     pub hook_bus: Option<Arc<crate::extensions::hooks::HookBus>>,
+    /// The calling chat's rollover state, where `context_checkpoint` records
+    /// its phase and note. The tool is one instance shared by every chat on
+    /// the host and has no state of its own. `None` for a context with no
+    /// chat: the tool refuses there. (A worker carries its own state, which
+    /// is never enabled, and its registry has no such tool.)
+    pub continuation: Option<crate::runtime::continuation::SharedContinuation>,
 }
 
 impl ToolCapabilities {

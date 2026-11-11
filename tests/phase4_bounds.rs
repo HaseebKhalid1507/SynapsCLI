@@ -598,6 +598,7 @@ async fn production_bash_handoff_conserves_bytes_for_large_generated_output() {
             env_warned: Default::default(),
             session_id: None,
             hook_bus: None,
+            continuation: None,
         },
         limits: ToolLimits {
             max_tool_output: 4096,
@@ -828,6 +829,7 @@ async fn cancellation_closes_forwarder_and_releases_live_delegation_leases() {
             env_warned: Default::default(),
             session_id: None,
             hook_bus: None,
+            continuation: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,

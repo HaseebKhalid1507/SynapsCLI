@@ -39,6 +39,33 @@
     }
   },
   {
+    "description": "Report a substantial task boundary (plan, execute, wrap_up, new_task) to automatic context management. Call alone at such a boundary or when requested by the host, not for routine progress logging. Note optional; no summary required. Host checks capacity automatically. Does not grant permissions or forget history.",
+    "name": "context_checkpoint",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "note": {
+          "description": "Optional few lines of unfinished state, next action and essential source references. Do not repeat the transcript, settled requirements or completed work; no secrets.",
+          "maxLength": 8192,
+          "type": "string"
+        },
+        "phase": {
+          "enum": [
+            "plan",
+            "execute",
+            "wrap_up",
+            "new_task"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "phase"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "description": "Make a surgical edit to a file by replacing an exact string match. The old_string must appear exactly once in the file. Provide enough surrounding context to make the match unique.",
     "name": "edit",
     "parameters": {

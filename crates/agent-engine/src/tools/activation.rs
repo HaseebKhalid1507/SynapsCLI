@@ -16,7 +16,7 @@
 //!   mutation);
 //! - catalog drift is represented (`is_stale`), never silently absorbed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use agent_core::BoundedText;
@@ -257,6 +257,11 @@ pub struct SessionToolSet {
     /// activation is a batch of one). Deterministic bookkeeping only; it
     /// exposes nothing and grants nothing.
     schema_generation: u64,
+    /// Tools this session is not offered although the registry has them
+    /// ([`Self::withholding`]). The registry is shared by every session on
+    /// the host, so what one session may not see is recorded here, on its
+    /// own set, and never removed there.
+    withheld: BTreeSet<ToolId>,
 }
 
 impl SessionToolSet {
@@ -289,7 +294,34 @@ impl SessionToolSet {
             core: validated,
             activated: BTreeMap::new(),
             schema_generation: 0,
+            withheld: BTreeSet::new(),
         })
+    }
+
+    /// This set without `ids`, for good: each leaves the core and the
+    /// activations, and from then on is to this session a tool that does
+    /// not exist. It cannot be activated, carried or restored into the set
+    /// ([`Self::validate_grant`], [`Self::admit_pinned`]), so the execution
+    /// gate denies it and no schema projection of this set lists it, while
+    /// the registry and every other session keep it. Ids the catalog does
+    /// not know are remembered too: a later registration under one of them
+    /// stays withheld.
+    pub fn withholding(mut self, ids: impl IntoIterator<Item = ToolId>) -> Self {
+        for id in ids {
+            self.core.remove(&id);
+            self.activated.remove(&id);
+            self.withheld.insert(id);
+        }
+        self
+    }
+
+    /// The tools this session is not offered ([`Self::withholding`]).
+    pub fn withheld(&self) -> impl Iterator<Item = &ToolId> {
+        self.withheld.iter()
+    }
+
+    pub fn is_withheld(&self, id: &ToolId) -> bool {
+        self.withheld.contains(id)
     }
 
     pub fn session(&self) -> &SessionId {
@@ -364,6 +396,7 @@ impl SessionToolSet {
         } else {
             Self::default_core_for_catalog(self.session.clone(), catalog)
         };
+        let next = next.withholding(self.withheld.iter().cloned());
         self.carry_activations_into(next, catalog)
     }
 
@@ -422,6 +455,10 @@ impl SessionToolSet {
         catalog: &ToolCatalog,
         pin_matches: impl FnOnce(&CapabilityRecord) -> bool,
     ) -> Result<(), DropReason> {
+        // Withheld from this session: to it, a tool that is not there.
+        if self.withheld.contains(id) {
+            return Err(DropReason::Removed);
+        }
         let Some(rec) = catalog.get(id) else {
             return Err(DropReason::Removed);
         };
@@ -607,6 +644,11 @@ impl SessionToolSet {
             return Err(ActivationError::SessionMismatch);
         }
         let tool_id = grant.tool_id().clone();
+        // Withheld from this session: refused as a tool that is not there,
+        // which is what it was when it was removed from the registry instead.
+        if self.withheld.contains(&tool_id) {
+            return Err(ActivationError::UnknownTool(tool_id));
+        }
         let record = catalog
             .get(&tool_id)
             .ok_or_else(|| ActivationError::UnknownTool(tool_id.clone()))?;

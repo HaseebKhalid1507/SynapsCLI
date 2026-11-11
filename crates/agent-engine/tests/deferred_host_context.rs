@@ -121,6 +121,7 @@ fn ctx(cap: ExtensionLeaseCapability) -> ToolContext {
             env_warned: Default::default(),
             session_id: None,
             hook_bus: None,
+            continuation: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,

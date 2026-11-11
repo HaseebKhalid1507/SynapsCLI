@@ -50,6 +50,7 @@ mod request_encoding;
 mod sse;
 mod sse_types;
 mod stream;
+mod chat_tools;
 pub mod subagent;
 pub mod subagent_watch;
 pub mod telemetry;
@@ -1530,18 +1531,20 @@ impl Runtime {
             if registry.get("activate_tools").is_none() {
                 None
             } else {
-                let core_set = continuation::context_tool_set(
+                let core_set = chat_tools::chat_tool_set(
                     self.host_tool_session.clone(),
                     registry.catalog(),
                     true,
                     self.context_management_enabled(),
+                    self.memory_backend.is_axel(),
                 );
                 let core: std::collections::HashSet<String> = core_set
                     .core_ids()
                     .map(|id| id.as_str().to_string())
                     .collect();
+                // What this chat is not offered it cannot activate either.
                 crate::tools::prompt_catalog::render(
-                    registry.catalog(),
+                    &registry.catalog().without(core_set.withheld()),
                     &core,
                     crate::tools::activation::is_activatable_record,
                 )
@@ -2024,9 +2027,35 @@ impl Runtime {
         &self.env_stripped
     }
 
+    /// Test seam: the work phase and the note this chat's rollover state
+    /// holds, as its last `context_checkpoint` left them.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn context_checkpoint_for_harness(&self) -> (&'static str, String) {
+        let state = self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.policy.phase().as_str(), state.note.clone())
+    }
+
     /// Get a shared reference to the tool registry (for MCP lazy loading).
     pub fn tools_shared(&self) -> Arc<RwLock<ToolRegistry>> {
         Arc::clone(&self.tools)
+    }
+
+    /// The registry's tool schema as this chat is offered it: without the
+    /// tools its turns withhold (`chat_tools::withheld_tools`). The registry is
+    /// the host's and holds every chat's tools, so its own
+    /// [`ToolRegistry::tools_schema`] is not what any one chat sends.
+    pub async fn offered_tools_schema(&self) -> Arc<Vec<Value>> {
+        let withheld = chat_tools::withheld_tools(
+            self.context_management_enabled(),
+            self.memory_backend.is_axel(),
+        );
+        let registry = self.tools.read().await;
+        registry
+            .tools_schema_without(&withheld)
+            .unwrap_or_else(|| registry.tools_schema())
     }
 
     pub fn model(&self) -> &str {
@@ -2588,7 +2617,7 @@ impl Runtime {
         messages: &[crate::SharedMessage],
     ) -> context::ContextAssessment {
         let system = self.effective_system_prompt().await;
-        let schema = self.tools.read().await.tools_schema();
+        let schema = self.offered_tools_schema().await;
         // Task A7 (spec §10.1/§10.3): the T29 memory lane is fed by the
         // validated recall segment held for this turn, if any. No held
         // segment ⇒ the lane stays empty — byte-identical to the pre-A7
@@ -4595,6 +4624,7 @@ impl Runtime {
                                         env_warned: self.env_warned.clone(),
                                         session_id: self.session_id.clone(),
                                         hook_bus: Some(self.hook_bus.clone()),
+                                        continuation: Some(self.continuation.clone()),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -4695,6 +4725,7 @@ impl Runtime {
                             let registry_inner = cfg_subagent_registry.clone();
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
+                            let continuation_inner = self.continuation.clone();
                             let session_allow_all_inner = self.session_allow_all.clone();
                             let orchestration_inner = cfg_orchestration.clone();
                             let memory_backend_inner = self.memory_backend.clone();
@@ -4770,6 +4801,7 @@ impl Runtime {
                                                     env_warned: env_warned_inner,
                                                     session_id: session_id_inner.clone(),
                                                     hook_bus: Some(hook_bus_inner.clone()),
+                                                    continuation: Some(continuation_inner.clone()),
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,

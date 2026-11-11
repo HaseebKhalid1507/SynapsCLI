@@ -342,6 +342,7 @@ mod tests {
                 env_warned: Default::default(),
                 session_id: None,
                 hook_bus: None,
+                continuation: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30000,

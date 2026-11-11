@@ -375,6 +375,7 @@ pub(crate) async fn route_extension_provider(
                         // The chat's bus, not the manager's: a worker's view
                         // sends no notify-only event, here as in its stream.
                         hook_bus: tool_hook_bus.cloned(),
+                        continuation: None,
                     },
                     limits: ToolLimits {
                         max_tool_output: 30000,

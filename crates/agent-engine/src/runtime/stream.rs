@@ -504,8 +504,11 @@ pub(super) fn rebuild_stale_tool_set(
     crate::tools::activation::SessionToolSet,
     Vec<crate::tools::activation::DroppedActivation>,
 ) {
+    // What the chat is not offered was settled at turn start and holds for
+    // the turn: the rebuilt set withholds what the stale one did.
     let fresh =
-        super::continuation::context_tool_set(session, catalog, progressive, context_enabled);
+        super::continuation::context_tool_set(session, catalog, progressive, context_enabled)
+            .withholding(set.withheld().cloned());
     if crate::tools::activation::carry_forward_enabled() {
         set.carry_activations_into(fresh, catalog)
     } else {
@@ -812,10 +815,7 @@ impl StreamMethods {
             if !memory_backend.exclusive() {
                 super::continuation::restore_window(&messages, &continuation, &memory_backend);
             }
-            let mut registry = prepare_or_cancel!(tools.write());
-            registry.register(Arc::new(
-                crate::tools::context_checkpoint::ContextCheckpointTool(continuation.clone()),
-            ));
+            let registry = prepare_or_cancel!(tools.read());
             for name in ["memory_search", "memory_fetch"] {
                 if registry.get(name).is_none_or(|tool| {
                     tool.origin() != crate::tools::ToolOrigin::Builtin
@@ -824,22 +824,16 @@ impl StreamMethods {
                 }
             }
         } else {
-            prepare_or_cancel!(tools.write()).disable(&["context_checkpoint".into()]);
             continuation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .update_advisory(None);
         }
-        // DARK (§7): the project forum lives in the Axel backend. Under the
-        // legacy backend every forum_* call errors in `require_forum`, so do
-        // not spend catalog tokens advertising tools the model can never use.
-        if !memory_backend.is_axel() {
-            prepare_or_cancel!(tools.write()).disable(&[
-                "forum_post".into(),
-                "forum_read".into(),
-                "forum_forget".into(),
-            ]);
-        }
+        // The registry is the host's and every chat on it shares it, so
+        // nothing of this chat is registered into it or removed from it.
+        // What this chat is not offered (`chat_tools::withheld_tools`) is
+        // withheld from its own session tool set below.
+        let forum_ready = memory_backend.is_axel();
         let system_prompt = if context_enabled {
             Some(format!(
                 "{}\n\n{}",
@@ -882,11 +876,12 @@ impl StreamMethods {
         // pins), never silently absorbed.
         let session_tool_set: crate::tools::activation::SharedSessionToolSet = {
             let registry = tools.read().await;
-            let fresh = super::continuation::context_tool_set(
+            let fresh = super::chat_tools::chat_tool_set(
                 tool_session_id.clone(),
                 registry.catalog(),
                 progressive_tool_disclosure,
                 context_enabled,
+                forum_ready,
             );
             retain_session_tool_set(
                 &retained_tool_set,
@@ -1337,7 +1332,17 @@ impl StreamMethods {
                 };
                 &projected_options
             } else {
+                // Flag off: the whole registry, minus what this chat is not
+                // offered. `None` (it withholds nothing the registry has)
+                // keeps the registry's cached Arc.
+                let offered = {
+                    let session_set = session_tool_set
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    tools_snapshot.tools_schema_without(session_set.withheld())
+                };
                 metered_options = super::api::ApiOptions {
+                    request_tools_schema: offered.or_else(|| options.request_tools_schema.clone()),
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
                     request_correlation: request_correlation.clone(),
                     retention_frontier,
@@ -2229,7 +2234,7 @@ impl StreamMethods {
                                     );
                                     match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), telemetry: Some(worker_telemetry.clone()), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone(), hook_bus: Some(hook_bus.clone()) },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), telemetry: Some(worker_telemetry.clone()), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone(), hook_bus: Some(hook_bus.clone()), continuation: Some(continuation.clone()) },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -2581,6 +2586,7 @@ impl StreamMethods {
                         let registry_inner = subagent_registry.clone();
                         let eq_inner = event_queue.clone();
                         let hook_bus_inner = hook_bus.clone();
+                        let continuation_inner = continuation.clone();
                         let prompt_inner = secret_prompt.clone();
                         let model_inner = model.clone();
                         let cwd_inner = cwd.clone();
@@ -2697,7 +2703,7 @@ impl StreamMethods {
 
                                     match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), telemetry: Some(worker_telemetry_inner.clone()), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), session_id: session_id_inner.clone(), hook_bus: Some(hook_bus_inner.clone()) },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), telemetry: Some(worker_telemetry_inner.clone()), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), session_id: session_id_inner.clone(), hook_bus: Some(hook_bus_inner.clone()), continuation: Some(continuation_inner.clone()) },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {

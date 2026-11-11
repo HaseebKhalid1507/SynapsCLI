@@ -80,6 +80,14 @@ impl ToolRegistry {
             Arc::new(crate::tools::forum::ForumPostTool),
             Arc::new(crate::tools::forum::ForumReadTool),
             Arc::new(crate::tools::forum::ForumForgetTool),
+            // Automatic context management's phase report. Registered here,
+            // once, and stateless: it writes to the calling chat's rollover
+            // state, which the call's context carries. A chat without
+            // context management is not offered it (its session tool set
+            // withholds it); it is never registered or removed per chat,
+            // because every chat on the host shares this registry. Primary
+            // registry only: a worker has no rollover state of this kind.
+            Arc::new(crate::tools::context_checkpoint::ContextCheckpointTool {}),
         ];
         // Arbitrary command-execution tools are only present when the
         // `command-exec` feature is enabled (default). A `--no-default-features`
@@ -605,6 +613,32 @@ impl ToolRegistry {
         Arc::clone(&self.cached_schema)
     }
 
+    /// The exposed schema without the tools a session is not offered
+    /// ([`crate::tools::activation::SessionToolSet::withholding`]): what a
+    /// request of that session carries when it sends the whole registry
+    /// (progressive disclosure off): the cached entries, in cached order
+    /// and under their cached API-safe names, minus those tools. `None`
+    /// when none of them is registered: the caller keeps
+    /// [`Self::tools_schema`]'s cached Arc.
+    pub fn tools_schema_without<'a>(
+        &self,
+        withheld: impl IntoIterator<Item = &'a crate::tools::catalog::ToolId>,
+    ) -> Option<Arc<Vec<Value>>> {
+        let withheld: HashSet<&crate::tools::catalog::ToolId> = withheld.into_iter().collect();
+        if !withheld.iter().any(|id| self.catalog.get(id).is_some()) {
+            return None;
+        }
+        let offered = |entry: &&Value| {
+            let tool = entry["name"]
+                .as_str()
+                .and_then(|api_name| self.tools.get(self.runtime_name_for_api(api_name)));
+            !tool.is_some_and(|tool| withheld.contains(&tool_id_for(tool.as_ref())))
+        };
+        Some(Arc::new(
+            self.cached_schema.iter().filter(offered).cloned().collect(),
+        ))
+    }
+
     /// Deterministic session schema projection (Task 17, spec §7.7): select
     /// from the EXISTING cached exposed schema exactly the entries whose
     /// capability identity is core or exactly-activated in `session`,
@@ -665,10 +699,11 @@ impl ToolRegistry {
                 } else {
                     split.deferred.push(deferred_entry(entry));
                 }
-            } else if self
-                .catalog
-                .get(&id)
-                .is_some_and(crate::tools::activation::is_activatable_record)
+            } else if !session.is_withheld(&id)
+                && self
+                    .catalog
+                    .get(&id)
+                    .is_some_and(crate::tools::activation::is_activatable_record)
             {
                 split.deferred.push(deferred_entry(entry));
             } else {
@@ -1097,13 +1132,14 @@ mod tests {
         let registry = ToolRegistry::new();
 
         // Includes model discovery/authorization, project memory primitives,
-        // memory-context control, and the three explicit forum tools. Forum
-        // tools remain outside the progressive essential foreground core.
+        // memory-context control, the three explicit forum tools and
+        // `context_checkpoint`. Forum tools remain outside the progressive
+        // essential foreground core.
         assert_eq!(
             registry.tools_schema().len(),
-            29 + usize::from(cfg!(windows))
+            30 + usize::from(cfg!(windows))
         );
-        for name in ["forum_post", "forum_read", "forum_forget"] {
+        for name in ["forum_post", "forum_read", "forum_forget", "context_checkpoint"] {
             assert!(registry.get(name).is_some(), "missing {name}");
         }
 
