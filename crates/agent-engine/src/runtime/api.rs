@@ -832,8 +832,11 @@ fn classify_stream_outcome(
 /// Extensible — new flags go here instead of adding parameters to 4 signatures.
 #[derive(Debug, Clone, Default)]
 pub struct ApiOptions {
-    /// Immutable host binding for extension-provider interior tool execution.
-    /// `None` is only for internal/test callers without a runtime capability.
+    /// Immutable host binding for extension-provider interior tool execution:
+    /// the chat's, so a memory tool in that loop acts on the chat's project.
+    /// The stream loop installs the binding its own tools get; `run_single`
+    /// sets the runtime's. `None` (keep-warm pings, compaction, tests): the
+    /// memory tools in that loop refuse rather than guess a project.
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     /// Opt into the 1M context window beta header.
     pub use_1m_context: bool,

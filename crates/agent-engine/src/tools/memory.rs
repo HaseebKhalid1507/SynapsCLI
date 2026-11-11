@@ -101,10 +101,11 @@ fn select_binding(params: &Value, ctx: ToolContext) -> Result<(MemoryBinding, Me
     // Reject history before resolving config or opening any backend. This also
     // rejects a mixed notes/history ID batch before any partial fetch/forget.
     selected.validate_notes_only(params)?;
-    let repository = ctx
-        .capabilities
-        .memory_backend
-        .unwrap_or_else(MemoryBinding::configured_current);
+    // The host's binding or nothing. A project guessed from the process
+    // folder is the daemon's under the daemon, not the calling chat's.
+    let repository = ctx.capabilities.memory_backend.ok_or_else(|| {
+        RuntimeError::Tool("memory: host memory binding required; no process-folder fallback".into())
+    })?;
     let binding = match selected {
         MemoryScope::Repository => repository,
         MemoryScope::User => repository.for_user_notes()?,
@@ -681,6 +682,12 @@ mod tests {
         ctx
     }
 
+    /// Bound as the runtime binds an in-process chat: the plain-file store,
+    /// in the project of the process folder.
+    fn host_context() -> ToolContext {
+        context_with_binding(&MemoryBinding::legacy_current())
+    }
+
     #[test]
     fn scope_defaults_to_repository_and_accepts_only_exact_enum_strings() {
         assert_eq!(
@@ -719,6 +726,28 @@ mod tests {
                 "{scope}"
             );
         }
+    }
+
+    /// A context that carries no host binding is refused. The tools never
+    /// pick a project from the folder the process runs in: under the daemon
+    /// that is the daemon's, not the chat's.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn a_context_without_the_hosts_binding_is_refused_not_guessed() {
+        let base = BaseDirGuard::new();
+        for tool in short_tools() {
+            let params = json!({"content":"synthetic note","ids":["mem-synthetic"],"id":"mem-synthetic"});
+            let err = tool
+                .execute(params, create_tool_context())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("host memory binding required"),
+                "{}: {err}",
+                tool.name()
+            );
+        }
+        assert_eq!(std::fs::read_dir(base.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -927,7 +956,7 @@ mod tests {
                     "tags": ["t32"],
                     "sensitivity": sensitivity
                 }),
-                create_tool_context(),
+                host_context(),
             )
             .await
             .unwrap();
@@ -955,13 +984,13 @@ mod tests {
         let search = MemorySearchTool
             .execute(
                 json!({"source":"history","query":"HISTORY_NEEDLE"}),
-                create_tool_context(),
+                host_context(),
             )
             .await
             .unwrap();
         assert!(search.contains(&id));
         let first = MemoryFetchTool
-            .execute(json!({"ids":[id],"limit":1}), create_tool_context())
+            .execute(json!({"ids":[id],"limit":1}), host_context())
             .await
             .unwrap();
         assert!(first.contains("HISTORY_NEEDLE"));
@@ -970,23 +999,23 @@ mod tests {
         let tail = MemoryFetchTool
             .execute(
                 json!({"ids":[id],"limit":1,"offset_bytes":48000}),
-                create_tool_context(),
+                host_context(),
             )
             .await
             .unwrap();
         assert!(tail.contains("HISTORY_TAIL"));
         MemoryForgetTool
-            .execute(json!({"id":id}), create_tool_context())
+            .execute(json!({"id":id}), host_context())
             .await
             .unwrap();
         assert!(MemoryFetchTool
-            .execute(json!({"ids":[id]}), create_tool_context())
+            .execute(json!({"ids":[id]}), host_context())
             .await
             .is_err());
         assert!(!MemorySearchTool
             .execute(
                 json!({"source":"history","query":"HISTORY_NEEDLE"}),
-                create_tool_context()
+                host_context()
             )
             .await
             .unwrap()
@@ -1007,7 +1036,7 @@ mod tests {
             MemorySearchTool
                 .execute(
                     json!({"source":"history","query":query,"limit":8}),
-                    create_tool_context(),
+                    host_context(),
                 )
                 .await
                 .unwrap()
@@ -1296,7 +1325,7 @@ mod tests {
         let id = store_body("normal").await;
 
         let search = MemorySearchTool
-            .execute(json!({"query": "full body"}), create_tool_context())
+            .execute(json!({"query": "full body"}), host_context())
             .await
             .unwrap();
         assert!(search.starts_with(LOWER_AUTHORITY_HEADER));
@@ -1307,7 +1336,7 @@ mod tests {
         );
 
         let fetch = MemoryFetchTool
-            .execute(json!({"ids": [id]}), create_tool_context())
+            .execute(json!({"ids": [id]}), host_context())
             .await
             .unwrap();
         assert!(fetch.starts_with(LOWER_AUTHORITY_HEADER));
@@ -1318,18 +1347,18 @@ mod tests {
         assert!(fetch.contains("source model"), "provenance is labeled");
 
         let forget = MemoryForgetTool
-            .execute(json!({"id": id}), create_tool_context())
+            .execute(json!({"id": id}), host_context())
             .await
             .unwrap();
         assert!(forget.contains(&id));
 
         let after = MemorySearchTool
-            .execute(json!({"query": "full body"}), create_tool_context())
+            .execute(json!({"query": "full body"}), host_context())
             .await
             .unwrap();
         assert!(after.contains("no matching memory records"));
         let err = MemoryFetchTool
-            .execute(json!({"ids": [id]}), create_tool_context())
+            .execute(json!({"ids": [id]}), host_context())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
@@ -1344,7 +1373,7 @@ mod tests {
         // Search descriptors must not leak the secret body either (CP-13
         // fix1 I1): no snippet text, and content probes find nothing.
         let search = MemorySearchTool
-            .execute(json!({}), create_tool_context())
+            .execute(json!({}), host_context())
             .await
             .unwrap();
         assert!(
@@ -1353,13 +1382,13 @@ mod tests {
         );
         assert!(search.contains("[withheld: secret-class body]"));
         let probe = MemorySearchTool
-            .execute(json!({"query": "full body"}), create_tool_context())
+            .execute(json!({"query": "full body"}), host_context())
             .await
             .unwrap();
         assert!(probe.contains("no matching memory records"));
 
         let fetch = MemoryFetchTool
-            .execute(json!({"ids": [id]}), create_tool_context())
+            .execute(json!({"ids": [id]}), host_context())
             .await
             .unwrap();
         assert!(
@@ -1396,13 +1425,13 @@ mod tests {
         let foreign_id = record.id.unwrap();
 
         let err = MemoryFetchTool
-            .execute(json!({"ids": [foreign_id]}), create_tool_context())
+            .execute(json!({"ids": [foreign_id]}), host_context())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"), "fail closed: {err}");
 
         let search = MemorySearchTool
-            .execute(json!({"query": "other-project"}), create_tool_context())
+            .execute(json!({"query": "other-project"}), host_context())
             .await
             .unwrap();
         assert!(!search.contains(BODY_SENTINEL));
@@ -1415,7 +1444,7 @@ mod tests {
         let err = MemoryStoreTool
             .execute(
                 json!({"content": "x", "project": "p0000000000000000"}),
-                create_tool_context(),
+                host_context(),
             )
             .await
             .unwrap_err();
@@ -1433,7 +1462,7 @@ mod tests {
         let ok = MemoryStoreTool
             .execute(
                 json!({"content": "confirmed", "project": scope.key()}),
-                create_tool_context(),
+                host_context(),
             )
             .await
             .unwrap();

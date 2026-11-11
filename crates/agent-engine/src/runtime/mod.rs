@@ -4445,7 +4445,9 @@ impl Runtime {
                 &messages,
                 self.api_retries,
                 &api::ApiOptions {
-                    memory_backend: None,
+                    // An extension-provided model's own tool loop acts on
+                    // this runtime's project, like the tool calls below.
+                    memory_backend: Some(self.memory_backend.clone()),
                     use_1m_context: self.context_window_override == Some(1_000_000),
                     cache_ttl: self.cache_ttl,
                     ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
@@ -5030,6 +5032,8 @@ impl Runtime {
         let capture_state = self.memory_context_state.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
+            // Placeholder: the stream loop installs the binding its own
+            // tools get before the first provider round.
             memory_backend: None,
             use_1m_context: self.context_window_override == Some(1_000_000),
             cache_ttl: self.cache_ttl,

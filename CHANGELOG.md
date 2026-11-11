@@ -292,6 +292,16 @@ All notable changes to this project will be documented in this file.
   silently started counting windows from 1 again and reported no archive.
   The check now uses the chat's project, where its rollover wrote the
   archive. No file moves; in-process hosts are unchanged.
+- **Daemon: memory tools called by an extension-provided model act on the
+  chat's project.** A model served by an extension (`plugin:provider:model`)
+  runs its tool calls in a loop of its own, and that loop gave the memory
+  tools no project. They fell back to the project of the process folder, so
+  in a daemon-hosted chat `memory_store`, `memory_search`, `memory_fetch` and
+  `memory_forget` read, wrote and forgot notes in the daemon's project. They
+  now use the chat's project, as tool calls in any other turn do, with either
+  memory backend. With `memory.backend = axel` the `forum_*` tools, which
+  refused there for want of a project, work for the same reason. A memory
+  tool run with no project at all now refuses instead of guessing one.
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
   program names: a stock Windows has no `grep` or `ls` ("program not
   found"), and `find` resolved to `System32\find.exe`, an unrelated string

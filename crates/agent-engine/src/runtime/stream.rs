@@ -903,6 +903,10 @@ impl StreamMethods {
         // minting a fresh set.
         let mut options = options;
         options.session_tool_set = Some(std::sync::Arc::clone(&session_tool_set));
+        // That loop's tools are this chat's: they get the binding this
+        // stream's own tools get, so a memory tool there acts on the chat's
+        // project.
+        options.memory_backend = Some(memory_backend.clone());
         let options = options;
         // Host activation policy for MODEL-INITIATED `activate_tools`:
         // confirmation authority comes exclusively from host configuration
@@ -7377,6 +7381,186 @@ mod rich_output_tests {
         assert_eq!(second.history[0]["content"], BRIEF, "the original brief survives the resume");
         let text = second.history.iter().map(|m| m.to_string()).collect::<String>();
         assert!(text.contains("RESUME: now the docs"), "the resume instructions survive the rollover");
+    }
+
+    // ── An extension-provided model runs its own tool loop inside one
+    // provider round (`openai::extension_route`). Those are the chat's tool
+    // calls too: the stream is the chat's, as `Runtime::run_stream` builds
+    // it, in a folder that is not the host process's.
+    mod extension_model_tools {
+        use super::*;
+        use crate::extensions::hooks::HookBus;
+        use crate::extensions::manager::ExtensionManager;
+        use crate::extensions::runtime::process::{
+            ProviderCompleteParams, ProviderCompleteResult, RegisteredProviderModelSpec,
+            RegisteredProviderSpec,
+        };
+        use crate::memory_backend::MemoryBinding;
+        use crate::test_env::{BaseDirGuard, EnvVarGuard};
+
+        /// A provider whose model first asks for `calls`, then answers. It
+        /// keeps the tool results the host hands back.
+        struct Scripted {
+            calls: Vec<Value>,
+            results: std::sync::Mutex<Vec<Value>>,
+        }
+        #[async_trait::async_trait]
+        impl crate::extensions::runtime::ExtensionHandler for Scripted {
+            fn id(&self) -> &str {
+                "plug"
+            }
+            async fn handle(&self, _event: &HookEvent) -> HookResult {
+                HookResult::Continue
+            }
+            async fn shutdown(&self) {}
+            async fn provider_complete(
+                &self,
+                params: ProviderCompleteParams,
+            ) -> std::result::Result<ProviderCompleteResult, String> {
+                let results: Vec<Value> = params
+                    .messages
+                    .iter()
+                    .filter_map(|m| m["content"].as_array())
+                    .flatten()
+                    .filter(|block| block["type"] == "tool_result")
+                    .cloned()
+                    .collect();
+                let content = if results.is_empty() {
+                    self.calls.clone()
+                } else {
+                    *self.results.lock().unwrap() = results;
+                    vec![json!({"type": "text", "text": "done"})]
+                };
+                Ok(ProviderCompleteResult {
+                    content,
+                    stop_reason: None,
+                    usage: None,
+                })
+            }
+        }
+
+        fn call(id: &str, tool: &str, input: Value) -> Value {
+            json!({"type": "tool_use", "id": id, "name": tool, "input": input})
+        }
+
+        /// One turn on the extension's model; `configure` makes the stream
+        /// the chat's. Returns the tool results the model was handed.
+        async fn turn(
+            calls: Vec<Value>,
+            extra_tools: Vec<Arc<dyn Tool>>,
+            bus: Arc<HookBus>,
+            configure: impl FnOnce(&mut StreamSession),
+        ) -> Vec<Value> {
+            let mut registry = ToolRegistry::new();
+            for tool in extra_tools {
+                registry.register(tool);
+            }
+            let tools = Arc::new(RwLock::new(registry));
+            let provider = Arc::new(Scripted {
+                calls,
+                results: Default::default(),
+            });
+            // As the host wires it: the manager shares the bus and the tools.
+            let mut manager = ExtensionManager::new_with_tools(bus.clone(), tools.clone());
+            manager
+                .register_provider_handler_for_tests(
+                    "plug",
+                    RegisteredProviderSpec {
+                        id: "prov".into(),
+                        display_name: "Scripted".into(),
+                        description: "scripted provider".into(),
+                        models: vec![RegisteredProviderModelSpec {
+                            id: "model-x".into(),
+                            display_name: None,
+                            capabilities: json!({"streaming": false, "tool_use": true}),
+                            context_window: None,
+                        }],
+                        config_schema: None,
+                    },
+                    provider.clone(),
+                )
+                .unwrap();
+            crate::runtime::openai::set_extension_manager_for_routing(Arc::new(RwLock::new(
+                manager,
+            )));
+            let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+            let mut session = harness_session(
+                // Never dialled: the model is not Anthropic's.
+                "http://127.0.0.1:9".into(),
+                tools,
+                tx,
+                crate::tools::shell::SessionManager::new(
+                    crate::tools::shell::ShellConfig::default(),
+                ),
+                bus,
+                crate::tools::activation::SessionId::parse(&format!(
+                    "test-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ))
+                .unwrap(),
+                Default::default(),
+                false,
+                "plug:prov:model-x",
+            );
+            configure(&mut session);
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let run = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                StreamMethods::run_stream_internal(session, initial),
+            )
+            .await;
+            crate::runtime::openai::clear_extension_manager_for_routing();
+            run.expect("the stream loop finishes").expect("the turn completes");
+            let results = provider.results.lock().unwrap().clone();
+            results
+        }
+
+        /// A note the model stores from that loop is filed under the chat's
+        /// project, the one the stream's own tools use, and the project of
+        /// the folder the process runs in is left alone.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn its_memory_tools_act_on_the_chats_project_not_the_hosts() {
+            let _base = BaseDirGuard::new();
+            let _root = EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+            // The chat's folder is a project of its own, apart from the host's.
+            let chat = tempfile::tempdir().unwrap();
+            std::fs::write(chat.path().join(".synaps-project"), "").unwrap();
+            let chats = crate::tools::test_helpers::memory_binding(
+                agent_core::config::MemoryBackendKind::Legacy,
+                chat.path(),
+            );
+            let hosts = MemoryBinding::legacy_current();
+            assert_ne!(chats.scope().unwrap().key(), hosts.scope().unwrap().key());
+
+            let results = turn(
+                vec![call("call-1", "memory_store", json!({"content": "NOTE_FROM_THE_CHAT"}))],
+                vec![],
+                Arc::new(HookBus::new()),
+                |session| {
+                    session.session_id = Some("chat-A".into());
+                    session.cwd = Some(chat.path().to_path_buf());
+                    session.memory_backend = chats.clone();
+                },
+            )
+            .await;
+            assert_eq!(results[0].get("is_error"), None, "{results:?}");
+
+            let query = || agent_core::memory::store::ProjectMemoryQuery {
+                content_contains: Some("NOTE_FROM_THE_CHAT".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                chats.search(query()).await.unwrap().len(),
+                1,
+                "filed under the chat's project"
+            );
+            assert!(
+                hosts.search(query()).await.unwrap().is_empty(),
+                "nothing written to the host's project"
+            );
+        }
     }
 
     // ── Read dedupe, through the real tool-result → history path (single

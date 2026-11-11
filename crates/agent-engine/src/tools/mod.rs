@@ -139,7 +139,9 @@ pub struct ToolCapabilities {
     /// parent session.
     pub session_allow_all: Option<Arc<SessionConfirmLatch>>,
     /// Host-owned note storage binding. Runtime contexts always provide the
-    /// same binding; `None` is reserved for manually constructed contexts.
+    /// same binding; `None` is reserved for manually constructed contexts,
+    /// where the memory and forum tools refuse (they never derive a project
+    /// from the process folder).
     /// A present binding is exclusive: errors never permit legacy fallback.
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     /// Parent-session telemetry for the subagents this context spawns: they

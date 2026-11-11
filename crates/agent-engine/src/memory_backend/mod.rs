@@ -70,6 +70,11 @@ impl MemoryBinding {
     /// Production bootstrap without a Runtime capability (legacy extensions).
     /// Selection is captured before any subprocess starts; never flips to legacy
     /// when an explicitly selected Axel service is unavailable.
+    ///
+    /// Its project is the process folder's, which under the daemon is the
+    /// daemon's and no chat's: never store, search or forget through it for
+    /// a chat. Its callers read only [`Self::exclusive`], the configured
+    /// backend kind, which is the same in every folder.
     pub fn configured_current() -> Self {
         Self::from_config(&agent_core::config::load_config().memory_backend)
     }

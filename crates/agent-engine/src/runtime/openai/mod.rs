@@ -736,7 +736,9 @@ mod tests {
         }
     }
 
+    // The routing manager is process-wide: tests that install one share a key.
     #[test]
+    #[serial_test::serial(extension_routing)]
     fn set_extension_manager_for_routing_overwrites_previous_manager() {
         clear_extension_manager_for_routing();
         let first = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(Arc::new(
