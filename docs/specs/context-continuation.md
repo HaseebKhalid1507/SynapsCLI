@@ -294,7 +294,8 @@ and media payloads and ignored metadata do not consume eligible byte budget;
 their opaque descendants are not traversed. Admitted tool arguments/results
 still count, and genuinely oversized eligible evidence fails without truncation.
 See [eligible-input budgeting](archive-eligible-input-budget.md).
-A full disk, a permission error or an archive locked by another process still
+A full disk, a permission error or an archive that another process keeps locked
+for more than five seconds still
 stops rollover with history retained; there is no automatic source eviction or
 tombstoning. History search is a bounded scan, not a large-corpus search
 engine: it reads archives newest first and stops after 1,024 archives or
@@ -302,15 +303,29 @@ engine: it reads archives newest first and stops after 1,024 archives or
 and refuses a larger store rather than importing part of it.
 Non-Unix archive operations fail explicitly; enabling via the command is refused.
 
-Concurrency: operations on one project's archive (rollover seals, parallel
-history tool calls, subagents in the same process) wait for each other
+Concurrency: seals and forgets on one project's archive (rollover seals,
+`memory_forget`, subagents in the same process) wait for each other
 in-process (not in FIFO order) and fail as busy if not admitted within 30
-seconds; a seal and its stored note are one operation. Another process holding
-the archive lock still fails closed without waiting for it ("archive busy";
-history retained). The lock is released explicitly, so a child process forked
-concurrently by another thread cannot keep it held. A caller canceled before
-its operation is admitted reads and writes no records (opening the store may
-already have happened); an admitted operation completes.
+seconds; a seal and its stored note are one operation. A lock held by another
+process is tried again for up to 5 seconds; only after that does the operation
+fail closed ("archive busy"; history retained). The lock is released
+explicitly, so a child process forked concurrently by another thread cannot
+keep it held. A caller canceled before its operation holds both locks reads and
+writes no records (opening the store may already have happened); after that the
+operation completes.
+
+Fetch and search take no lock for archives on shelves, so they are never busy
+and never wait behind a seal. That is safe because of how the files are
+written: an archive is written to a temporary file and renamed onto its name
+only when it is complete, a live archive is never modified, and forget renames
+a complete tombstone over it. A read that overlaps a forget of the same archive
+therefore returns the whole archive (the read came first) or "not found" (the
+forget came first), never part of one; once forget has returned, every read is
+"not found". These reads change nothing on disk, so a file or directory whose
+mode was loosened by hand stays that way until the next seal or forget touches
+it. The old `000.json` to `127.json` slot files are still read under the lock,
+with the same 5 second wait: a fetch of an id that is on no shelf, and a search
+that the shelves did not fill, take it when such files exist.
 
 ## Axel integration: one selected memory authority
 

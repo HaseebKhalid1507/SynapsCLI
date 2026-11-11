@@ -55,6 +55,17 @@ All notable changes to this project will be documented in this file.
   **Downgrading:** an older Synaps pointed at the same directory sees only
   the old slot files. Archives sealed by this version stay on disk but it
   cannot fetch them, and a chat resumed there restarts its window count.
+- **A rollover waits for a busy archive store instead of failing, and reading
+  history takes no lock.** With `memory.backend = legacy`, a rollover whose
+  project archive was locked by another Synaps process failed at once with
+  "archive busy". Saving an archive and `memory_forget` now wait up to 5
+  seconds for the other process and only then report "archive busy" (history
+  is kept, as before). `memory_fetch` and `memory_search` with
+  `source=history` no longer take the lock for archives in shelf directories:
+  they are never busy, never wait behind a save, and change nothing on disk.
+  A fetch that overlaps a `memory_forget` of the same archive returns the
+  whole archive or "not found". Old `000.json` to `127.json` files are still
+  read under the lock, with the same wait.
 - **Daemon sessions: the interactive shell (`shell_start`) starts from the
   session's env**, like `bash`, instead of the daemon's own. It no longer
   sees the env the daemon inherited, nor the secrets the daemon strips from
