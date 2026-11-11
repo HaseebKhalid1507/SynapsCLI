@@ -81,11 +81,15 @@ Unsupported result actions are ignored fail-open and logged as warnings.
   - Replacement output larger than 1 MiB is clamped.
 
 `on_message_complete` fires after an assistant response is added to session
-history. It requires `privacy.llm_content` and is observe-only. The `message`
-field contains concatenated assistant text blocks when present; tool-use blocks
+history (an empty reply after tool calls is not added, and still fires). It
+requires `privacy.llm_content` and is observe-only. The `message` field contains concatenated assistant text blocks when present; tool-use blocks
 are not serialized into `message`. Summary metadata is available in `data`,
-including `content_block_count` and `has_tool_use`. The last event of a turn is
-the one with `has_tool_use: false`, and its `message` may be empty.
+including `content_block_count` and `has_tool_use`. It fires once per assistant
+message. `has_tool_use: false` marks a message that asked for no tools; its
+`message` may be empty. It is not a reliable "turn done" signal: a turn can have
+more than one such message (a steering message, or the Muse nudge, continues the
+turn after one), and a turn that stops after a tool round (cancelled, out of a
+turn budget, or on an error) ends on an event with `has_tool_use: true`.
 
 `on_compaction` fires after manual conversation compaction creates a replacement
 session. It requires `privacy.llm_content` and is observe-only. The `message`

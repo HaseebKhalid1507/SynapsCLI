@@ -447,6 +447,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Extensions: the `on_message_complete` pages say what `has_tool_use: false`
+  means.** It marks an assistant message that asked for no tools, not the end
+  of a turn: steering or the Muse nudge can continue a turn after one, and a
+  turn that stops after a tool round (a cancel, a turn budget, an error) ends
+  on an event with `has_tool_use: true`. `protocol.md` also says an empty
+  reply is not added to history. Documentation only.
 - **`on_message_complete` fires for a reply that crosses a usage budget, and
   for a rejected `context_checkpoint` batch.** Both replies are kept in
   history, but the turn stopped (`max_cost_usd`, `max_context_tokens`) or
