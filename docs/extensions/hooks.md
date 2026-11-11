@@ -84,7 +84,8 @@ Unsupported result actions are ignored fail-open and logged as warnings.
 history. It requires `privacy.llm_content` and is observe-only. The `message`
 field contains concatenated assistant text blocks when present; tool-use blocks
 are not serialized into `message`. Summary metadata is available in `data`,
-including `content_block_count` and `has_tool_use`.
+including `content_block_count` and `has_tool_use`. The last event of a turn is
+the one with `has_tool_use: false`, and its `message` may be empty.
 
 `on_compaction` fires after manual conversation compaction creates a replacement
 session. It requires `privacy.llm_content` and is observe-only. The `message`

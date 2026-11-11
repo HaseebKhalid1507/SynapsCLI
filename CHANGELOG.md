@@ -390,6 +390,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A turn that ends on an empty reply after tool calls now fires
+  `on_message_complete`.** When the model had nothing to add after its tool
+  results, the turn was marked complete without the event, so an extension
+  that waits for `has_tool_use: false` to act "when the turn is done" never
+  saw that turn end. It now gets one event with `message: ""`,
+  `content_block_count: 0` and `has_tool_use: false`, built by the same code
+  as every other one. A normal turn still gets exactly one such event.
 - **Context archives: a forgotten archive stays forgotten whatever id it is
   stored under.** An archive brought in by `ArchiveStore::import` keeps the
   id it had, which is not one of the two ids a seal derives from the

@@ -493,6 +493,11 @@ never block, modify, or inject. `message` contains concatenated assistant text
 blocks when present; tool-use blocks are summarized in `data` instead of being
 serialized into `message`.
 
+A turn fires one event per assistant message, and the turn's last one is the
+one with `has_tool_use: false`. Its `message` may be empty: a model that has
+nothing to add after its tool calls ends the turn on an empty reply, and that
+reply is still reported (`message: ""`, `content_block_count: 0`).
+
 ```json
 {
   "kind": "on_message_complete",
