@@ -251,13 +251,12 @@ fn is_slot_name(name: &str) -> bool {
         && digits.parse::<usize>().is_ok_and(|slot| slot < 128)
 }
 
-/// `s` and the shelf number, padded with zeros to six digits.
+/// `s` and exactly six digits: the shelf number, padded with zeros.
 fn is_shelf_name(name: &str) -> bool {
     let Some(digits) = name.strip_prefix('s') else {
         return false;
     };
-    digits.bytes().all(|b| b.is_ascii_digit())
-        && (digits.len() == 6 || (digits.len() > 6 && !digits.starts_with('0')))
+    digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// SHA-256 over each part, every part preceded by its length as eight
@@ -1271,7 +1270,7 @@ fn the_reference_reader_reads_the_fixtures_and_skips_everything_else() {
         write(shelf.join(name), &live);
     }
     // Directories that are not shelves, and a shelf's name on a file.
-    for name in ["s1", "s0000002", "S000003", "shelf", "000001"] {
+    for name in ["s1", "s0000002", "s1000000", "S000003", "shelf", "000001"] {
         std::fs::create_dir(project.join(name)).unwrap();
         write(project.join(name).join(format!("{LIVE}.json")), &live);
     }

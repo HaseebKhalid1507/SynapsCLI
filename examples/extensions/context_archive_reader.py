@@ -13,7 +13,7 @@ import re
 import stat
 import sys
 
-SHELF = re.compile(r"s([0-9]{6}|[1-9][0-9]{6,})")
+SHELF = re.compile(r"s[0-9]{6}")
 ARCHIVE = re.compile(r"[0-9a-f]{32}\.json")
 SLOT = re.compile(r"(0[0-9][0-9]|1[01][0-9]|12[0-7])\.json")
 MAX_BYTES = 16 * 1024 * 1024

@@ -313,6 +313,20 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Extensions: the context archive format page says what the store does.**
+  `docs/extensions/context-archives.md` was wrong or silent in several
+  places. It now states: a shelf is `s` and exactly six digits (`s000001` to
+  `s999999` are written; no name with seven digits is a shelf), and the
+  reference reader (`examples/extensions/context_archive_reader.py`) accepts
+  exactly those; which shelf a new archive goes to, and what happens to a
+  shelf name that is a file or a link; that content is not stored again
+  only where the first copy can be seen, and that an id can be on two
+  shelves; that a new id is the first or the last 32 characters of the
+  digest; the names of the temporary files and when they are removed; that
+  a file under a window's name that is not a valid record makes a forget
+  "NOT COMPLETE" and is passed over by a seal and a lookup; the rules of
+  the `lock` file; and that the base directory may be reached through a
+  link while nothing below it may be one.
 - **Context archives: a base directory reached through a link works.** The
   store refused any link on the way to its base, so with `~/.synaps-cli`
   (or a directory above it) a link to another disk, no context could be

@@ -33,9 +33,10 @@ What this page covers:
 1. Find the project directory. The `path` in the
    [`on_context_archived`](hooks.md#on_context_archived) event leads to it.
 2. In that directory, read the files named `000.json` to `127.json`. In each
-   of its subdirectories named like `s000001`, read the files named
-   `<id>.json`, where `<id>` is 32 lowercase hex characters. Ignore every
-   other name at both levels.
+   of its subdirectories named `s` and exactly six digits, like `s000001`,
+   read the files named `<id>.json`, where `<id>` is 32 lowercase hex
+   characters. Ignore every other name at both levels, and anything under
+   one of these names that is a link.
 3. A file is one JSON object. Look at `version` first; if it is not `1`, skip
    the file and go on with the next.
 4. Skip the file if `scope` is not the name of the project directory or, in a
@@ -63,18 +64,37 @@ What this page covers:
 ```
 
 - **`<base>`** is the Synaps base directory: the value of `SYNAPS_BASE_DIR`
-  in Synaps's environment if it is set, otherwise `~/.synaps-cli`.
+  in Synaps's environment if it is set, otherwise `~/.synaps-cli`. The base
+  may be a symbolic link, or be reached through one (a home directory on
+  another disk): Synaps resolves the path once, each time it opens the
+  store, and the files are in the real directory. That is the only place
+  where a link is followed. Below `<base>` nothing is: `context-archives`,
+  a project directory, a shelf or a file that is a link is refused by
+  Synaps, and a reader must not follow one either.
 - **`<project dir>`** is 64 lowercase hex characters: a SHA-256 hash of the
-  project key (see [the next section](#finding-a-projects-directory)). All
+  project key (see [Finding a project's directory](#finding-a-projects-directory)). All
   chats of one project share it.
-- **A shelf** is a directory named `s` followed by its number in decimal,
-  padded with zeros to six digits: `s000001`, `s000002`, and so on (a number
-  of seven digits or more is written without padding). Shelves are numbered
-  from 1 in the order they were created. A new archive always goes to the
-  highest-numbered shelf; when that shelf is full, the next one is created.
-  So everything on one shelf was first written before anything on a later
-  shelf. Numbers can have gaps (a user may delete a shelf). A shelf holds
-  up to 128 archives today; do not rely on the number.
+- **A shelf** is a directory named `s` followed by exactly six decimal
+  digits: its number, padded with zeros. Synaps creates `s000001` to
+  `s999999`, numbered from 1 in the order they were created, and it reads
+  every directory named `s` and six digits (`s000000` too, which it never
+  creates). No other spelling is a shelf: not `s1`, not `s0000001`, not a
+  name with seven digits. A reader must accept exactly the same names.
+  - **Where a new archive goes.** To the shelf with the highest number, if
+    that shelf is a directory Synaps can open and it holds fewer than 128
+    names ending in `.json`. Otherwise Synaps creates the shelf with the
+    next number and writes there. So a shelf holds up to 128 archives
+    today; do not rely on the number.
+  - **A shelf name that is not a directory** (a file or a link with a
+    shelf's name), or a shelf that Synaps cannot open, is passed over: it
+    is not followed, not changed and nothing is written to it. When it has
+    the highest number, the next archive goes to a new shelf numbered after
+    it. A reader must pass over it too.
+  - **Order.** Everything on one shelf was first written before anything on
+    a later shelf, with one exception: after `s999999` there is no next
+    number, and archives then go to the newest shelf that can be written
+    to, however many it holds.
+  - Numbers can have gaps (a user may delete a shelf).
 - **An archive** is one file named `<id>.json` in a shelf. `<id>` is the
   archive's id: 32 lowercase hex characters (`0-9`, `a-f`). It is the same
   string as `id` inside the file, as the archive id in hook events, and as
@@ -83,18 +103,52 @@ What this page covers:
   directory. Versions of Synaps from before shelves wrote them. See
   [Legacy slot files](#legacy-slot-files).
 - **Every other name** must be ignored, in the project directory and in a
-  shelf: Synaps keeps files of its own there (a lock file, files it is still
-  writing). Their names are not part of this format and can change. Do not
-  open them.
+  shelf: Synaps keeps files of its own there. Their names are not part of
+  this format and can change. Do not open them. Today they are:
+  - **`lock`**, in the project directory: an empty file that Synaps locks
+    while it writes or forgets. See [The lock file](#the-lock-file).
+  - **Temporary files**, named `pending.<32 hex characters>.tmp` (older
+    versions used the one name `pending.tmp`). Synaps writes every file
+    under such a name first, in the directory the file will be in, and
+    renames it into place when it is whole. A crash can leave one behind.
+    When Synaps next writes an archive to a shelf, it removes the temporary
+    files of that shelf that were last written more than one hour ago (plain
+    files of its own only; a link or a directory under such a name is
+    left); a younger one may belong to a write that is still running. One left in
+    the project directory itself, or in a shelf that is no longer written
+    to, stays. A temporary file may hold a whole record, part of one, or a
+    record that was never stored: never read one.
 
 Synaps creates these directories and files readable by their owner only
 (modes 0700 and 0600), so a reader has to run as the same user.
+
+### The lock file
+
+`lock` is not part of the format, and a reader must not open or lock it.
+Its rules matter to anyone who backs up or restores these directories:
+
+- Synaps only ever locks it. It never writes to it, truncates it or reads
+  it, and the file holds no data.
+- It is used as long as it is a regular file owned by the user Synaps runs
+  as, **whatever its link count and whatever its mode**. A backup made with
+  hard links gives it a second name, and a restore can leave it read-only
+  (0400): both are fine. Synaps changes its mode only to take away access
+  for group and others.
+- It is refused when it is a symbolic link (never followed), not a regular
+  file, owned by another user, or closed to its owner by its mode. Nothing
+  can then be saved or forgotten in that project, and the error names the
+  file and says what is wrong. The fix is to delete the file: Synaps makes
+  a new one.
+- This holds for `lock` only. An archive file with a second name is still
+  refused: see [Reading safely](#reading-safely).
 
 ### Finding a project's directory
 
 **The supported way is the hook event.**
 [`on_context_archived`](hooks.md#on_context_archived) gives you `data.path`,
-the absolute path of the archive file, and `data.project_key`. For a file in
+the absolute path of the archive file, and `data.project_key`. (The path
+starts with `<base>` as Synaps was given it, so it goes through a link if
+the base does.) For a file in
 a shelf, the project directory is the parent of the file's parent. `path` can
 also point at a legacy slot file, when the same content had already been
 archived by an older version; then the project directory is the file's
@@ -293,9 +347,15 @@ While Synaps writes version 1:
 5. **Names:** `<project dir>` is the hash of the project key; an archive in
    a shelf is in a file named by its `id`; `scope` is the name of the
    directory the file is in.
-6. **The same content is stored once.** Sealing the same messages from the
-   same chat again writes nothing and gives the same `id`. A different note
-   does not make a new archive and does not change the one that is there.
+6. **Content that Synaps finds stored is not stored again.** Sealing the
+   same messages from the same chat again writes nothing and gives the `id`
+   of the archive that is there. A different note does not make a new
+   archive and does not change the one that is there. This is not a promise
+   that a `digest` is in one file only: where Synaps cannot see the first
+   copy (a shelf it cannot open, a file it will not read, a legacy slot
+   file it cannot read), it stores the content again, and a project can
+   hold the same `id` on two shelves (a restored backup). See
+   [Tombstones](#tombstones) for what that means for a forget.
 7. **No lock is needed to read.** Synaps reads archives in shelves without
    one.
 
@@ -308,7 +368,12 @@ Do not rely on:
   one moment, and a clock can be wrong or be set back;
 - how many archives a shelf holds;
 - any relation between `id` and `digest`. Today a new archive's `id` is the
-  first 32 characters of its `digest`; the id of a legacy archive is random;
+  first 32 characters of its `digest`, or the last 32 when another file
+  already has the first name; the id of a legacy archive is random;
+- an `id` being in one file only. The same `<id>.json` can be on two
+  shelves. When Synaps is asked for an id, it takes the valid record on the
+  newest shelf that has one, and passes over a file of that name that is
+  not a valid record;
 - whitespace, key order or a trailing newline in the JSON;
 - the names or the presence of the other files in these directories;
 - one context window being one archive (see [Parts](#parts));
@@ -335,8 +400,9 @@ You must tolerate:
   directories while Synaps works.
 - **Unknown block types and keys** inside `message`, placeholders, reduced
   messages, an empty `messages`, an empty `note`.
-- **Links.** Synaps never creates symbolic or hard links here and refuses
-  them itself. Do not follow one.
+- **Links.** Below `<base>` Synaps never creates symbolic or hard links and
+  refuses them itself: a shelf name or an archive name that is a link is
+  passed over. Do not follow one.
 
 You must not:
 
@@ -349,9 +415,11 @@ You must not:
 - **Change modes or owners,** or make a hard link to an archive (a
   link-based backup, for instance). Synaps refuses to read an archive file
   that has a second name. Its history search passes over that file and says
-  that it did not read everything, a fetch of that archive fails, and a
-  rollover that holds the same content stores it a second time, under its
-  other id.
+  that it did not read everything, a fetch of that archive fails unless an
+  older shelf has a valid record under the same name, and a rollover that
+  holds the same content stores it a second time, under its other id. (The
+  `lock` file is the one file a second name does not hurt: see
+  [The lock file](#the-lock-file).)
 - **Act on the content.** See [Untrusted data](#untrusted-data).
 
 Open a file, read it to the end, close it.
@@ -379,6 +447,27 @@ Synaps cannot read then is not replaced; the tool says that the forget is
 not complete, and forgetting the same id again reaches it once it can be
 read.
 
+**A file that is not a valid record makes a forget "not complete".** Synaps
+looks for copies under three names on every shelf: the id that was asked
+for, the first 32 characters of the `digest` and the last 32. A file under
+one of those names that it can read but that is not a valid record (a copy
+cut short, a stray file) may be a damaged copy with the text still in it.
+Synaps leaves that file as it is, forgets every valid copy, and the tool
+answers "NOT COMPLETE": it says how many places it could not use and names
+the first, by shelf and file name. It says so again each time until the
+file is gone or valid. A valid record of other
+content under such a name is not counted, and neither is a damaged file that
+still says, in JSON, that this `digest` is a tombstone.
+
+**A lookup passes over such a file.** When Synaps looks under a name (to
+fetch or forget an id, or before it stores content) and the newest shelf
+that has a file of that name holds something that is not a valid record, or
+a link, it goes on to the older shelves. A fetch returns the valid archive
+it finds there, a forget replaces it, and a seal finds the copy or the
+tombstone there instead of storing the content again. A fetch does not
+return an older live copy when the file it passed over still says that the
+same `digest` is a tombstone.
+
 **A forget can add one file.** When it is done, a tombstone with that
 `digest` is in a shelf under one of two names: the first 32 characters of
 the `digest`, or the last 32. That is where Synaps looks before it stores
@@ -386,7 +475,9 @@ the same content again. If no file with that `digest` was under one of
 those names (the forgotten archive was a legacy slot file, whose id is
 random), Synaps writes that tombstone as a new file in the newest shelf,
 before it replaces anything. Its `id` is the file's name, and no archive was
-ever announced with it.
+ever announced with it. It uses the first of the two names that no shelf
+has a file under; when other files have both, it writes none, and Synaps
+then has no name to store that content under either.
 
 - **If any file with a `digest` is a tombstone, that content is forgotten,**
   whatever another file with the same `digest` says. Drop what you indexed
@@ -395,9 +486,12 @@ ever announced with it.
   first time you see it.
 - **A tombstone stays.** Synaps does not delete it or bring the archive
   back, and it refuses to store the same messages from the same chat again.
-  (One exception: a legacy slot file that was forgotten before a forget
-  added the second tombstone has only itself to say so. If Synaps can no
-  longer read that file, it no longer blocks that.)
+  Before it stores content it looks under both names on every shelf it can
+  open, so a tombstone on an older shelf counts whatever a newer shelf has
+  under that name. (Two exceptions. A tombstone in a shelf that Synaps
+  cannot open is not seen. And a legacy slot file that was forgotten before
+  a forget added the second tombstone has only itself to say so: if Synaps
+  can no longer read that file, it no longer blocks that.)
 - **It forgets one archive, not a text.** The same words can be in another
   archive that holds different messages around them. And replacing a file
   does not erase backups or filesystem snapshots, or what you copied.
@@ -774,7 +868,7 @@ import re
 import stat
 import sys
 
-SHELF = re.compile(r"s([0-9]{6}|[1-9][0-9]{6,})")
+SHELF = re.compile(r"s[0-9]{6}")
 ARCHIVE = re.compile(r"[0-9a-f]{32}\.json")
 SLOT = re.compile(r"(0[0-9][0-9]|1[01][0-9]|12[0-7])\.json")
 MAX_BYTES = 16 * 1024 * 1024
