@@ -1071,7 +1071,19 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
                         Some(c) => c.recv().await,
                         None => std::future::pending().await,
                     }
-                } => tracing::info!("daemon: {ev}"),
+                } => {
+                    tracing::info!("daemon: {ev}");
+                    // Windows ends the process about 5 s after a close,
+                    // logoff or shutdown event, whatever the daemon is still
+                    // doing; the winding-down of the sessions may not finish.
+                    // Take the registry file down first, so a client never
+                    // finds `daemon.json` for a daemon that is gone
+                    // (`Daemon::wait` repeats it: harmless).
+                    let lock = state.lock_fd.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(lock) = lock.as_ref() {
+                        state.meta.cleanup(lock);
+                    }
+                }
                 _ = state.shutdown.cancelled() => return,
             }
         }
