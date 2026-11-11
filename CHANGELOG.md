@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The api-log can record how much of a subscription's usage windows is
+  used** (`telemetry = full`). On a subscription login the provider
+  reports usage windows in `anthropic-ratelimit-unified-*` response
+  headers. Only the per-minute limits of an API key were kept, so a
+  subscription's records had no `ratelimit` at all. When a response
+  carries those headers, its record now has `ratelimit.unified_utilization`
+  (the used share of each window under the provider's own name, e.g.
+  `{"5h": 0.31, "7d": 0.62}`), `unified_status`, `unified_claim` and
+  `unified_reset`. With that the log shows how fast a run is using up the
+  weekly allowance, before the provider starts refusing requests. Nothing
+  is recorded when the headers are absent.
 - **Owned daemon sessions.** A client can create a session bound to its
   connection (`Attach::Create{owned}`; `SocketTransport::create_owned`;
   `synaps attach --owned`). When the owner disconnects for any reason
