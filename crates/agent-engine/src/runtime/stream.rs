@@ -98,7 +98,7 @@ where
 /// Cancellation wins over a ready tool, and the last precheck is inside the
 /// execution future, immediately before its first poll. Track whether it was
 /// polled: an unstarted non-idempotent tool is NOT an interrupted side effect.
-async fn await_tool_call<F: std::future::Future>(
+pub(crate) async fn await_tool_call<F: std::future::Future>(
     cancel: &CancellationToken,
     call: F,
 ) -> (Option<F::Output>, bool) {

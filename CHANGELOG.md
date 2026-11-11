@@ -313,6 +313,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Extension models: stop ends a tool call in their tool loop.** On a
+  `plugin:provider:model` model the loop that runs the model's tool calls
+  did not watch the turn's cancel, so after stop the turn waited for the
+  running command to finish (now up to the configured limits, not 30 s).
+  The loop is now raced against the cancel the way the ordinary tool loop
+  races each call: stop drops the running call and the turn ends as
+  cancelled at once (trace and audit record it as cancelled). The loop's
+  own rounds are not part of the chat's history, so nothing is added there.
 - **Memory: a chat whose folder has no project gets no memory lease.** Such
   a chat (no folder, or a folder that cannot be resolved) was granted
   leases under the one id `project-unresolved`, so two of them sent a
