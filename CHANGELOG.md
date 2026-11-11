@@ -319,6 +319,15 @@ All notable changes to this project will be documented in this file.
   the note stored it again. Every rewrite now keeps every tombstone line
   (about 70 bytes each), including when the disk budget evicts notes. A
   sweep that finds only live notes and tombstones leaves the file alone.
+- **Notes: `synaps retention sweep` and `retention forget memory` read a
+  notes file that has a line which is not UTF-8.** A save cut off inside a
+  multi-byte character leaves such a line in `memory/<ns>.jsonl` for good,
+  and the sweep, the eviction under a disk budget and `retention forget
+  memory` then failed on the whole file, on every run. They now read the
+  file line by line and treat that line as any line that does not parse:
+  the sweep and the eviction drop it when they rewrite (the sweep counts
+  it in `memory_records_dropped`), and `retention forget memory` writes it
+  back unchanged.
 - **Notes: a saved note is on disk before `memory_store` says it is saved.**
   With the plain-file memory backend a note was written to
   `memory/project-<key>.jsonl` but not synced, so a crash or a power cut

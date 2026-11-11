@@ -504,10 +504,10 @@ fn evict_oldest_memory_records(
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let raw = fs::read_to_string(&path).map_err(RetentionError::Io)?;
+        let raw = fs::read(&path).map_err(RetentionError::Io)?;
         let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut records: Vec<(u64, String, usize)> = Vec::new();
-        for line in raw.lines() {
+        for line in notes_lines(&raw).flatten() {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
                 continue;
             };
@@ -548,10 +548,12 @@ fn evict_oldest_memory_records(
         // Held from this read through the rename. The pass above looked
         // without it: this one decides by id on what it reads here.
         let _lock = lock_notes(&path)?;
-        let raw = fs::read_to_string(&path).map_err(RetentionError::Io)?;
+        let raw = fs::read(&path).map_err(RetentionError::Io)?;
         rewrite_read_done();
-        let kept: Vec<&str> = raw
-            .lines()
+        let kept: Vec<&str> = notes_lines(&raw)
+            // A line that is not UTF-8 goes the way of any line that does
+            // not parse.
+            .flatten()
             .filter(|line| {
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
                     return false; // garbage compacts away
@@ -573,6 +575,23 @@ fn evict_oldest_memory_records(
             .map_err(RetentionError::Io)?;
     }
     Ok(dropped)
+}
+
+/// The lines of a notes file, read as bytes: `None` for a line that is not
+/// UTF-8. A tail torn inside a multi-byte character stays in the file as
+/// such a line (a later save fences it off with a newline, nothing removes
+/// it), and `read_to_string` would fail on the whole file because of it, on
+/// every run. Like `str::lines`, without the line ends and without an empty
+/// piece after the last newline.
+fn notes_lines(raw: &[u8]) -> impl Iterator<Item = Option<&str>> {
+    let empty = raw.is_empty();
+    let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
+    raw.split(|byte| *byte == b'\n')
+        .filter(move |_| !empty)
+        .map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            std::str::from_utf8(line).ok()
+        })
 }
 
 /// The lock every appender and rewriter of a notes file holds
@@ -702,7 +721,8 @@ fn delete_session_artifact(path: &Path, outcome: &mut SweepOutcome) -> io::Resul
 /// the number of records physically removed. Tombstone lines are kept, in
 /// place, on every rewrite.
 ///
-/// A line that does not parse is dropped and counted too. The file's lock is
+/// A line that does not parse is dropped and counted too, and so is a line
+/// that is not UTF-8 (a tail torn inside a character). The file's lock is
 /// held here, so such a line is never a save caught half written: it is a
 /// fragment a writer left behind (a torn tail that a later save fenced off).
 fn compact_memory_file(
@@ -713,7 +733,7 @@ fn compact_memory_file(
     // Held from the read through the rename, so no save lands in the file
     // this replaces, and no line is read half written.
     let _lock = lock_notes(path)?;
-    let raw = fs::read_to_string(path)?;
+    let raw = fs::read(path)?;
     rewrite_read_done();
     /// A line of the file: a tombstone, or a record with what decides
     /// whether it stays.
@@ -725,7 +745,11 @@ fn compact_memory_file(
     let mut lines: Vec<Line> = Vec::new();
     let mut dropped = 0usize;
 
-    for line in raw.lines() {
+    for line in notes_lines(&raw) {
+        let Some(line) = line else {
+            dropped += 1; // not UTF-8: a torn line, dropped like one
+            continue;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -1017,7 +1041,7 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
             fs::metadata(&path)?;
             // Held from the read through the rename.
             let _lock = lock_notes(&path)?;
-            let raw = fs::read_to_string(&path)?;
+            let raw = fs::read(&path)?;
             rewrite_read_done();
 
             // EXACT live-id match (CP-13 fix1 M4): parse every line;
@@ -1025,7 +1049,7 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
             // closed.
             let mut live = false;
             let mut tombstoned = false;
-            for line in raw.lines() {
+            for line in notes_lines(&raw).flatten() {
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
                     continue;
                 };
@@ -1045,13 +1069,15 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
                 "tombstone": record_id,
                 "timestamp_ms": crate::epoch_millis(),
             });
+            // Every byte that was read is written back, a line that is not
+            // UTF-8 included: a forget removes nothing.
             let mut body = raw;
-            if !body.ends_with('\n') && !body.is_empty() {
-                body.push('\n');
+            if !body.ends_with(b"\n") && !body.is_empty() {
+                body.push(b'\n');
             }
-            body.push_str(&line.to_string());
-            body.push('\n');
-            crate::core::private_fs::write_atomic_private(&path, body.as_bytes())
+            body.extend_from_slice(line.to_string().as_bytes());
+            body.push(b'\n');
+            crate::core::private_fs::write_atomic_private(&path, &body)
                 .map_err(io::Error::from)
         }
     }
@@ -1391,6 +1417,69 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 3);
         assert_eq!(text.matches(r#""tombstone":"#).count(), 3);
+    }
+
+    /// A notes file with a line that is not UTF-8 (a tail torn inside a
+    /// character, fenced off by the next save) is still read by the sweep,
+    /// the eviction and `retention forget memory`. The forget keeps the
+    /// line's bytes; the two that compact drop it as they drop any line
+    /// that does not parse, and the sweep counts it.
+    #[test]
+    fn a_line_that_is_not_utf8_does_not_stop_a_rewriter() {
+        let torn = b"{\"namespace\":\"ns\",\"content\":\"caf\xc3";
+        let file_with_fragment = |roots: &RetentionRoots| {
+            save(roots, "ns", "mem-a", 10);
+            let path = notes_file(roots, "ns");
+            let mut bytes = fs::read(&path).unwrap();
+            bytes.extend_from_slice(torn);
+            fs::write(&path, bytes).unwrap();
+            // The next saves fence the fragment off on a line of its own.
+            save(roots, "ns", "mem-b", 20);
+            save(roots, "ns", "mem-c", crate::epoch_millis());
+            assert!(fs::read_to_string(&path).is_err(), "the file is not UTF-8");
+            path
+        };
+        let has_fragment = |path: &Path| {
+            let bytes = fs::read(path).unwrap();
+            bytes.windows(torn.len()).any(|window| window == torn)
+        };
+
+        // `retention forget memory`: the note is forgotten, no byte is lost.
+        let tmp = TempDir::new().unwrap();
+        let roots = roots(&tmp);
+        let path = file_with_fragment(&roots);
+        let before = fs::read(&path).unwrap();
+        forget(&roots, RetentionDomain::Memory, "ns:mem-b").unwrap();
+        let after = fs::read(&path).unwrap();
+        assert!(after.starts_with(&before));
+        assert!(has_fragment(&path));
+        let added = std::str::from_utf8(&after[before.len()..]).unwrap();
+        assert!(added.contains(r#""tombstone":"mem-b""#) && added.ends_with('\n'));
+        assert_eq!(added.lines().count(), 1);
+
+        // The sweep: it reads the file, drops the forgotten note and the
+        // fragment, counts both, and leaves a file that is UTF-8.
+        let outcome = sweep_at(&roots, &RetentionPolicy::default(), 30).unwrap();
+        assert_eq!(outcome.memory_records_dropped, 2);
+        assert!(!has_fragment(&path));
+        assert_eq!(ids(&path), ["mem-a", "mem-c"]);
+        assert!(fs::read_to_string(&path).unwrap().contains(r#""tombstone":"mem-b""#));
+
+        // Eviction: both passes read the file; the rewrite drops the oldest
+        // note and the fragment.
+        let tmp = TempDir::new().unwrap();
+        let roots = self::roots(&tmp);
+        let path = file_with_fragment(&roots);
+        assert_eq!(evict_oldest_memory_records(&roots, 1).unwrap(), 1);
+        assert!(!has_fragment(&path));
+        assert_eq!(ids(&path), ["mem-b", "mem-c"]);
+
+        // Lines as `str::lines` gives them, but for the one that is not text.
+        let lines: Vec<_> = notes_lines(b"a\r\n\n\xff\nb").collect();
+        assert_eq!(lines, [Some("a"), Some(""), None, Some("b")]);
+        assert_eq!(notes_lines(b"").count(), 0);
+        assert_eq!(notes_lines(b"a\n").collect::<Vec<_>>(), [Some("a")]);
+        assert_eq!(notes_lines(b"\n").collect::<Vec<_>>(), [Some("")]);
     }
 
     /// The lock file sits in `memory/` beside the notes file and is not one:
