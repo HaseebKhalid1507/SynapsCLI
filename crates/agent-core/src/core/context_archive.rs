@@ -250,8 +250,8 @@ pub struct Forgotten {
     /// read had been forgotten before.
     pub ids: Vec<String>,
     /// `Some` when a shelf, a legacy slot or a file that may hold another
-    /// copy could not be read: how many such places, and the first with its
-    /// error. A copy there was not reached and is still live. Forgetting
+    /// copy could not be read, or was read and is not a valid record: how
+    /// many such places, and the first with its error. A copy there was not reached and is still live. Forgetting
     /// the id again once the place can be read reaches it.
     pub unread: Option<String>,
 }
@@ -1376,9 +1376,10 @@ impl ArchiveStore {
     /// to a seal, and forgetting again finishes. An id that is already a
     /// tombstone is not an early return for the same reason.
     ///
-    /// A shelf that cannot be opened, a legacy slot that cannot be read or
-    /// validated and an unreadable file under one of the names may hold a
-    /// copy that was not reached. That is never silent: [`Forgotten::unread`]
+    /// A shelf that cannot be opened, and a legacy slot or a file under one
+    /// of the names that cannot be read or is not a valid record (and does
+    /// not say "forgotten" for this projection), may hold a copy that was
+    /// not reached: a damaged copy can still have the window's text in it. That is never silent: [`Forgotten::unread`]
     /// says so, and forgetting again when the place can be read reaches it.
     pub fn forget(&self, id: &str) -> io::Result<Forgotten> {
         validate_id(id)?;
@@ -1435,10 +1436,13 @@ impl ArchiveStore {
                     Ok(record) if record.digest == digest => {
                         copies.push((Some(shelf), name.clone(), record));
                     }
+                    // Another projection: not a copy.
+                    Ok(_) => {}
                     // What a seal of this projection takes for a tombstone.
                     Err(_) if says_forgotten(&raw, digest) => guarded |= index < 2,
-                    // Another projection, or not a record: not a copy.
-                    _ => {}
+                    // Not a record, under the window's own name: it may be
+                    // a damaged copy, with the window's text still in it.
+                    Err(error) => unread.pass(&format!("{shelf}/{name}"), error),
                 }
             }
         }
@@ -5189,14 +5193,21 @@ mod tests {
         assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
         // Forgetting again finishes, and writes no second tombstone.
         let files = shelf_files(&dir).len();
-        assert_eq!(store.forget(imported).unwrap(), forgotten(&[imported]));
+        // The file that has the first name is not a record: it may be a
+        // damaged copy, so neither forget calls itself complete.
+        let place = format!("1 place(s) could not be read, first s000001/{}: ", archive_name(&digest[..32]));
+        let done = store.forget(imported).unwrap();
+        assert_eq!(done.ids, [imported]);
+        assert!(done.unread.unwrap().starts_with(&place));
         assert!(is_tombstone_of(&store, &file, &digest));
         assert_eq!(shelf_files(&dir).len(), files);
         assert_eq!(std::fs::read(shelf.join(archive_name(&digest[..32]))).unwrap(), b"not a record");
         // An archive that was forgotten before this rule gets its tombstone
         // the next time it is forgotten.
         std::fs::remove_file(&guard).unwrap();
-        assert_eq!(store.forget(imported).unwrap(), forgotten(&[]));
+        let done = store.forget(imported).unwrap();
+        assert!(done.ids.is_empty());
+        assert!(done.unread.unwrap().starts_with(&place));
         assert!(is_tombstone_of(&store, &guard, &digest));
 
         // Stored under one of its two ids, the archive's own tombstone is
@@ -5251,6 +5262,51 @@ mod tests {
         let place = format!("first s000002/{}: ", archive_name(&digest[32..]));
         assert!(done.unread.unwrap().contains(&place));
         assert_eq!(std::fs::read(&linked).unwrap(), b"x");
+    }
+
+    /// A file under one of the window's own names that was read and is not
+    /// a valid record may be a damaged copy, with the window's text still on
+    /// disk. The forget does not call itself complete over it: `unread` is
+    /// what `memory_forget` turns into "NOT COMPLETE".
+    #[test]
+    fn a_forget_is_not_complete_over_a_damaged_copy_under_the_windows_name() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let shelf = dir.join("s000001");
+        let words = "a window with a damaged copy";
+        let digest = digest_of(words);
+        let (first, second) = (&digest[..32], &digest[32..]);
+        assert_eq!(store.seal(&text(words), "").unwrap().id, first);
+        // A second copy, cut short: not a record, and the text is in it.
+        let copy = record_bytes(&store, second, &text(words), |_| {});
+        let damaged = &copy[..copy.len() - 2];
+        assert!(String::from_utf8_lossy(damaged).contains(words));
+        let file = shelf.join(archive_name(second));
+        std::fs::write(&file, damaged).unwrap();
+
+        let done = store.forget(first).unwrap();
+        assert_eq!(done.ids, [first]);
+        assert_ne!(done, forgotten(&[first]), "not a plain 'forgot'");
+        let unread = done.unread.unwrap();
+        let place = format!("1 place(s) could not be read, first s000001/{}: ", archive_name(second));
+        assert!(unread.starts_with(&place), "{unread}");
+        assert!(is_tombstone_of(&store, &shelf.join(archive_name(first)), &digest));
+        assert_eq!(std::fs::read(&file).unwrap(), damaged, "left as it is");
+        // Said again for as long as the file is there.
+        assert!(store.forget(first).unwrap().unread.is_some());
+
+        // A file there that is a valid record of another window is not a
+        // copy, and a damaged tombstone of this one says "forgotten":
+        // neither makes the forget incomplete.
+        let other = record_bytes(&store, second, &text("another window"), |_| {});
+        std::fs::write(&file, other).unwrap();
+        assert_eq!(store.forget(first).unwrap(), forgotten(&[]));
+        let tombstone = record_bytes(&store, second, &text(words), |record| {
+            record.body = Body::Tombstone;
+            record.version = 2;
+        });
+        std::fs::write(&file, tombstone).unwrap();
+        assert_eq!(store.forget(first).unwrap(), forgotten(&[]));
     }
 
     const PASSING: [i32; 5] = [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EINTR, libc::EAGAIN];

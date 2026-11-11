@@ -313,6 +313,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: forget is not "complete" over a damaged copy.** A file
+  under one of the window's own names that could be read but is not a valid
+  record (a copy cut short, say) can still hold the window's text.
+  Forgetting the window used to pass over such a file in silence and
+  `memory_forget` answered a plain "Forgot". The file is now counted with
+  the places that could not be read, as a legacy slot in that state already
+  was: the answer says "NOT COMPLETE" and names the file. The file itself is
+  left as it is. A valid record of another window under that name, and a
+  damaged tombstone of this one, do not count.
 - **Context archives: a forgotten window stays forgotten when a newer shelf
   has another file under its name.** A save looks for the window under its
   id on every shelf, newest first, and used to stop at the first shelf that
