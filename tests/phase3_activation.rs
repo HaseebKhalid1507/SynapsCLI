@@ -129,7 +129,6 @@ fn ctx_full(
             tool_activation: activation,
             mcp_leases: mcp,
             extension_leases: ext,
-            memory_context: None,
             cwd: None,
             env: None,
             env_stripped: Vec::new(),

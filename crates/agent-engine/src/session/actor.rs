@@ -671,13 +671,6 @@ pub struct SessionActor {
     pub(crate) reload_fence: Option<ReloadFence>,
     /// Owned sessions only (`SessionConfig::owned`): see `session::owned`.
     pub(crate) owned: Option<super::owned::OwnedState>,
-    /// Shared with the handle: `config.memory_mode`, readable by a reload
-    /// that gets no checkpoint reply.
-    pub(crate) memory_mode_slot: super::handle::MemoryModeSlot,
-    /// This runtime's memory has been seen active (a grant took effect).
-    /// Only then does "memory is off" mean consent was revoked; see
-    /// `effective_memory_mode`. Reset whenever the runtime is rebuilt.
-    pub(crate) memory_seen_active: bool,
     /// While parked: the exact tool activations the dropped runtime held,
     /// handed to the runtime the unpark builds (and to a reload record
     /// written while parked). Empty while live.
@@ -723,14 +716,7 @@ impl SessionActor {
     ) -> Result<(SessionHandle, SessionTask)> {
         // cwd goes in BEFORE apply_config (inside foreground_runtime_for) so the
         // one-shot memory binding scopes to the session's project (§4).
-        // A session that made its own `/memory` choice (carried by a reload)
-        // gets that, not the operator default.
-        let mut runtime = host
-            .foreground_runtime_with(cfg.cwd.clone(), cfg.memory_mode.is_none())
-            .await?;
-        if let Some(mode) = cfg.memory_mode {
-            runtime.restore_session_memory_mode(mode);
-        }
+        let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
         let config: crate::SynapsConfig = (**host.config()).clone();
         let client_input = cfg.client_input.unwrap_or(config.client_input);
 
@@ -940,7 +926,6 @@ impl SessionActor {
                 name,
                 keep_warm: keep_warm_cell,
                 cache_keepwarm,
-                memory_mode,
             },
         ) = SessionHandle::new(meta.clone(), view);
         let handle = handle.with_owner_token(cfg.owned.as_ref().map(|o| o.token.clone()));
@@ -954,7 +939,6 @@ impl SessionActor {
             client_input: Some(client_input),
             ..Default::default()
         }));
-        *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
         let session_start = if cfg.await_extensions {
             super::session_start::SessionStart::Done
@@ -971,7 +955,7 @@ impl SessionActor {
             )
         };
 
-        let mut actor = SessionActor {
+        let actor = SessionActor {
             id,
             meta,
             config: cfg,
@@ -1046,12 +1030,8 @@ impl SessionActor {
             },
             reload_fence: None,
             owned,
-            memory_mode_slot: memory_mode,
-            memory_seen_active: false,
             parked_tool_activations: Vec::new(),
         };
-        // Whether the build's grant (default or restored choice) took.
-        actor.observe_memory();
         if actor.keep_warm {
             actor.note_pin();
         }
@@ -1247,10 +1227,6 @@ impl SessionActor {
     /// hands off on `Idle` must never see the previous state. Per-round
     /// saves stay in the background; this waits once per turn.
     pub(crate) async fn announce_idle(&mut self) {
-        // A turn may have revoked memory consent (the `memory_context`
-        // tool): keep the handle's slot current for a reload that gets no
-        // checkpoint reply.
-        self.sync_memory_choice();
         self.flush_saves().await;
         // Before `Idle`, so a test that saw `Idle` knows the hook is in line.
         #[cfg(any(test, feature = "testing"))]
@@ -1325,11 +1301,7 @@ impl SessionActor {
     pub(crate) fn reload_record(&self) -> SessionReloadRecord {
         let view = self.view.load();
         SessionReloadRecord {
-            // A consent revocation since the last record counts.
-            config: SessionConfig {
-                memory_mode: self.effective_memory_mode(),
-                ..self.config.clone()
-            },
+            config: self.config.clone(),
             keep_warm: self.keep_warm,
             lifecycle: SessionLifecycle::from_u8(
                 self.lifecycle.load(std::sync::atomic::Ordering::Acquire),
@@ -2609,9 +2581,6 @@ impl SessionActor {
         }
         self.runtime.session_manager().shutdown_all();
         self.turn_replay.clear();
-        // The unparked runtime is built from `config.memory_mode`: a
-        // revocation made without `/memory` must be recorded first.
-        self.sync_memory_choice();
         // The runtime's exact tool activations outlive it: the unparked
         // runtime restores them, so the tools array (the start of the cached
         // prompt prefix) and the model's tools are what they were.
@@ -2690,14 +2659,8 @@ impl SessionActor {
         let view = self.view.load_full();
         let build = async move {
             let config: crate::SynapsConfig = (**host.config()).clone();
-            // §4: cwd before apply_config — see `create`. The session's own
-            // `/memory` choice, if it made one, instead of the default.
-            let mut runtime = host
-                .foreground_runtime_with(cfg.cwd.clone(), cfg.memory_mode.is_none())
-                .await?;
-            if let Some(mode) = cfg.memory_mode {
-                runtime.restore_session_memory_mode(mode);
-            }
+            // §4: cwd before apply_config — see `create`.
+            let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
             runtime.set_event_queue(queue);
             let mut sb = if journal_present {
                 crate::engine::setup::resolve_session_and_prompt(
@@ -2775,9 +2738,6 @@ impl SessionActor {
             let name = self.conv.session.name.clone();
             self.mirror_name(name);
         }
-        // A fresh runtime: whether its grant took effect is its own.
-        self.memory_seen_active = false;
-        self.observe_memory();
         self.publish_view().await;
         self.state = AttachState::Detached { running: false };
         self.set_lifecycle(SessionLifecycle::Live);
@@ -3016,9 +2976,6 @@ impl SessionActor {
         // any foreground turn that starts while armed.)
         let auto_approve = self.config.auto_approve_confirms && self.driver.is_none();
         // Stamp this turn's worker launches before the stream can start any.
-        // A grant made since the last turn (e.g. while the session was
-        // being rebuilt) is seen before this turn can revoke it.
-        self.observe_memory();
         self.turn_worker_generation = self
             .runtime
             .subagent_registry()

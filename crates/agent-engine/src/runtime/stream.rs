@@ -132,7 +132,6 @@ fn validated_tool_output(model: &str, output: crate::ToolOutput) -> (String, Opt
 pub(super) struct StreamSession {
     // Context continuation
     pub(super) memory_backend: crate::memory_backend::MemoryBinding,
-    pub(super) memory_context: Option<super::memory_context::MemoryContextCapability>,
     /// Set only at a successful, non-cancelled terminal assistant boundary.
     /// Error/budget/cancel paths leave this empty, even when they return Ok.
     pub(super) final_capture_history: Arc<Mutex<Option<Vec<SharedMessage>>>>,
@@ -674,7 +673,6 @@ impl StreamMethods {
     ) -> Result<()> {
         let StreamSession {
             memory_backend,
-            memory_context,
             final_capture_history,
             turn_completion,
             context_window,
@@ -942,7 +940,6 @@ impl StreamMethods {
                 orchestration: orchestration.clone(),
                 mcp_leases: mcp_lease_capability,
                 extension_leases: extension_lease_capability,
-                memory_context,
                 cwd: cwd.clone(),
                 env,
                 env_stripped,
@@ -4378,7 +4375,6 @@ mod rich_output_tests {
     ) -> StreamSession {
         StreamSession {
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
-            memory_context: None,
             final_capture_history: Arc::new(Mutex::new(None)),
             turn_completion: Default::default(),
             context_window: 200_000,
@@ -6473,7 +6469,6 @@ mod rich_output_tests {
 
         let session = StreamSession {
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
-            memory_context: None,
             final_capture_history: Arc::new(Mutex::new(None)),
             turn_completion: Default::default(),
             context_window: 200_000,

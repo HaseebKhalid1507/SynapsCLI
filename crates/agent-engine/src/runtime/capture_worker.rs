@@ -180,6 +180,7 @@ impl CaptureWorker {
     /// Submit a capture already built by the C1 builder. Historical import
     /// uses this narrow seam so it shares the same bounded C3 queue and exact
     /// leased provider dispatch as live terminal capture.
+    #[allow(dead_code)] // its caller `/memory` is gone; the module goes next
     pub(crate) fn submit_built(
         &self,
         lease: &MemoryContextLease,

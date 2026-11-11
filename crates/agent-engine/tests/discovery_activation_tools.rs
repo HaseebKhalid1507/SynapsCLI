@@ -139,7 +139,6 @@ fn ctx_with_prompt(
             tool_activation: cap,
             mcp_leases: None,
             extension_leases: None,
-            memory_context: None,
             cwd: None,
             env: None,
             env_stripped: Vec::new(),

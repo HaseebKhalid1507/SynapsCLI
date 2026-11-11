@@ -107,6 +107,7 @@ impl ConfirmedUserIntent {
     /// Host-only constructor for a slash-command confirmation. Frontends call
     /// this only after presenting the preview; model JSON cannot construct a
     /// `RequestId` or reach this crate-private gate.
+    #[allow(dead_code)] // its caller `/memory` is gone; the module goes next
     pub(crate) fn from_explicit_command(
         command_id: crate::runtime::memory_context::RequestId,
     ) -> Self {
@@ -360,6 +361,7 @@ pub fn authorize_import_for_tests(
 /// bodies then load exclusively through [`agent_core::session::Session`]'s
 /// canonical legacy+journal API and become C1-shaped, bounded captures sent
 /// through the existing C3 worker/provider seam.
+#[allow(dead_code)] // its caller `/memory` is gone; the module goes next
 pub(crate) fn import_history_from_dir(
     plan: &ImportPlan,
     lease: &crate::runtime::memory_context::MemoryContextLease,
@@ -899,6 +901,7 @@ fn load_import_checkpoint_for_test(
     Ok(checkpoint.committed_source_digests.into_iter().collect())
 }
 
+#[allow(dead_code)] // its caller `/memory` is gone; the module goes next
 fn submit_import_batch(
     worker: &crate::runtime::capture_worker::CaptureWorker,
     lease: &crate::runtime::memory_context::MemoryContextLease,

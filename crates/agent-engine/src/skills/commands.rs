@@ -198,7 +198,6 @@ fn command_tool_context(chat: CommandChat<'_>) -> ToolContext {
             tool_activation: None,
             mcp_leases: None,
             extension_leases: None,
-            memory_context: None,
             cwd: chat.cwd.map(Path::to_path_buf),
             env: chat.env.cloned(),
             env_stripped: Vec::new(),

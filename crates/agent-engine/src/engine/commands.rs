@@ -218,7 +218,7 @@ pub fn handle_engine_command(
         "budget" => return Some(budget_command(arg, runtime)),
         "workers" => return Some(workers_command(arg, runtime)),
         "confirms" => return Some(confirms_command(arg, runtime)),
-        "memory" => return Some(memory_command(arg, runtime)),
+        "memory" => return Some(CommandResult::Output(memory_removed_line())),
         _ => {}
     }
     let mut result = evaluate_engine_command(cmd, arg)?;
@@ -633,68 +633,14 @@ pub fn trace_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
     }
 }
 
-/// `/memory on|recall|capture|once|status|off|index-history|why` (task A5,
-/// spec §7.3): the ONE deterministic engine entry point every frontend —
-/// TUI, headless chat, RPC, server — shares via
-/// [`handle_engine_command`]. Frontends must not duplicate lease or budget
-/// logic.
-///
-/// Every enabling arm mints host-owned
-/// [`crate::runtime::memory_context::UserIntentProof::ExplicitCommand`]
-/// proof right here: a deterministic slash command is authoritative (spec
-/// assumption 5), and proof never derives from model text.
-pub fn memory_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
-    use crate::runtime::memory_context::{mint_explicit_command_proof, MemoryContextMode};
-    let enable = |mode: MemoryContextMode| match runtime
-        .memory_context_enable(mode, mint_explicit_command_proof())
-    {
-        Ok(status) => CommandResult::Output(status.render()),
-        Err(e) => CommandResult::Error(e.to_string()),
-    };
-    match arg.trim() {
-        "on" => enable(MemoryContextMode::CaptureAndRecall),
-        "recall" => enable(MemoryContextMode::RecallEachPrompt),
-        "capture" => enable(MemoryContextMode::CaptureOnly),
-        "once" => match runtime.memory_context_recall_once(mint_explicit_command_proof()) {
-            Ok(status) => CommandResult::Output(status.render()),
-            Err(e) => CommandResult::Error(e.to_string()),
-        },
-        "" | "status" => CommandResult::Output(runtime.memory_context_status().render()),
-        // Disable is applied to session state BEFORE this returns: `render`
-        // runs on the post-revocation status snapshot.
-        "off" => CommandResult::Output(runtime.memory_context_disable().render()),
-        "index-history" => match runtime.memory_history_preview() {
-            Ok(preview) => CommandResult::Output(preview.render()),
-            Err(error) => CommandResult::Error(error.to_string()),
-        },
-        "index-history confirm" => match runtime.memory_history_confirm() {
-            Ok(report) => CommandResult::Output(format!(
-                "History import complete: {} session(s) loaded, {} bounded capture record(s) submitted in {} batch(es).",
-                report.sessions_loaded, report.captures_built, report.batches_submitted,
-            )),
-            Err(error) => CommandResult::Error(error.to_string()),
-        },
-        "index-history decline" => {
-            if runtime.memory_history_decline() {
-                CommandResult::Output(
-                    "History import declined; no session content was read and no Axel data was written."
-                        .to_string(),
-                )
-            } else {
-                CommandResult::Error(
-                    "history import requires a pending disclosure preview before decline"
-                        .to_string(),
-                )
-            }
-        }
-        "why" => CommandResult::Output(crate::runtime::memory_context::render_recall_why(
-            runtime.memory_recall_why().as_ref(),
-        )),
-        other => CommandResult::Error(format!(
-            "unknown /memory subcommand: `{other}` \
-             (try: on, recall, capture, once, status, off, index-history, why)"
-        )),
-    }
+/// What `/memory` answers, whatever its argument, since built-in automatic
+/// memory left core. Kept so a user who types it (or an older TUI that
+/// sends it) gets this line instead of "unknown command".
+fn memory_removed_line() -> String {
+    format!(
+        "/memory was removed in {}: automatic memory is provided by an extension now (Axel). Nothing was recording.",
+        agent_core::AXEL_BACKEND_REMOVED_IN
+    )
 }
 
 /// Persist a config key and return a user-visible status suffix.
@@ -1552,233 +1498,26 @@ mod tests {
         assert!(crate::skills::BUILTIN_COMMANDS.contains(&"budget"));
     }
 
-    // ── /memory (task A5, spec §7.3) ────────────────────────────────────────
-
-    use crate::runtime::memory_context::{
-        DurableStatus, MemoryContextMode, OneShotStatus, UserIntentProof,
-    };
-
-    fn output_text(result: CommandResult) -> String {
-        match result {
-            CommandResult::Output(text) => text,
-            other => panic!("expected Output, got {other:?}"),
-        }
-    }
-
-    /// Spec §7.3: every enabling arg form transitions the session state to
-    /// its exact mode — `on` → CaptureAndRecall, `recall` →
-    /// RecallEachPrompt, `capture` → CaptureOnly.
+    /// `/memory`, with any argument, answers the one removal line and turns
+    /// nothing on.
     #[test]
-    fn memory_enable_args_transition_to_exact_modes() {
-        for (arg, mode) in [
-            ("on", MemoryContextMode::CaptureAndRecall),
-            ("recall", MemoryContextMode::RecallEachPrompt),
-            ("capture", MemoryContextMode::CaptureOnly),
-        ] {
-            let runtime = crate::Runtime::new_headless();
-            let text = output_text(memory_command(arg, &runtime));
-            assert!(
-                text.contains(&format!("mode {}", mode.as_str())),
-                "/memory {arg} output must name the mode; got: {text}"
-            );
-            match runtime.memory_context_status().durable {
-                DurableStatus::Active { mode: active, .. } => {
-                    assert_eq!(active, mode, "/memory {arg} must install exactly {mode:?}")
-                }
-                DurableStatus::Off => panic!("/memory {arg} must install a session lease"),
-            }
-        }
-    }
-
-    /// `/memory once` installs a pending one-shot recall and leaves the
-    /// durable slot untouched.
-    #[test]
-    fn memory_once_installs_pending_one_shot_only() {
-        let runtime = crate::Runtime::new_headless();
-        let text = output_text(memory_command("once", &runtime));
-        assert!(text.contains("one-shot recall: pending"), "got: {text}");
-        let status = runtime.memory_context_status();
-        assert_eq!(status.durable, DurableStatus::Off, "durable slot untouched");
-        assert!(matches!(status.one_shot, OneShotStatus::Pending { .. }));
-        // A second grant while one is pending fails typed, not silently.
-        assert!(matches!(
-            memory_command("once", &runtime),
-            CommandResult::Error(e) if e.contains("already pending")
-        ));
-    }
-
-    /// Rendering: `/memory status` (and the empty default) mentions the
-    /// mode and the lease expiry.
-    #[test]
-    fn memory_status_render_mentions_mode_and_lease_expiry() {
-        let runtime = crate::Runtime::new_headless();
-        // Off default (spec §21): status names the off mode.
-        let text = output_text(memory_command("status", &runtime));
-        assert!(text.contains("mode off"), "got: {text}");
-
-        output_text(memory_command("on", &runtime));
-        for arg in ["status", ""] {
-            let text = output_text(memory_command(arg, &runtime));
-            assert!(
-                text.contains("mode capture_and_recall"),
-                "status must mention the mode; got: {text}"
-            );
-            assert!(
-                text.contains("expiry"),
-                "status must mention the lease expiry; got: {text}"
-            );
-        }
-    }
-
-    /// `/memory off` revokes session state BEFORE returning: the runtime
-    /// state check and the returned render both show Off.
-    #[test]
-    fn memory_off_takes_effect_before_returning() {
-        let runtime = crate::Runtime::new_headless();
-        output_text(memory_command("on", &runtime));
-        assert!(matches!(
-            runtime.memory_context_status().durable,
-            DurableStatus::Active { .. }
-        ));
-        let text = output_text(memory_command("off", &runtime));
-        // State check: revocation already applied when the command returned.
-        assert_eq!(runtime.memory_context_status().durable, DurableStatus::Off);
-        // The returned render is the post-revocation snapshot.
-        assert!(text.contains("mode off"), "got: {text}");
-    }
-
-    /// Task B5 (spec §10.4): `/memory why` with no accepted recall this
-    /// session is clear OUTPUT (never `CommandResult::Error`) explaining the
-    /// three no-metadata causes — both while memory is off and after enable
-    /// but before any eligible prompt has run.
-    #[test]
-    fn memory_why_without_recall_metadata_is_clear_output_not_error() {
-        let runtime = crate::Runtime::new_headless();
-        let text = output_text(memory_command("why", &runtime));
-        assert!(text.contains("no recall metadata available"), "got: {text}");
-        assert!(text.contains("memory is off"), "got: {text}");
-        assert!(text.contains("no eligible prompt"), "got: {text}");
-        assert!(text.contains("skipped"), "got: {text}");
-
-        // Enabled but no eligible prompt yet: still the clear non-error text.
-        output_text(memory_command("on", &runtime));
-        let text = output_text(memory_command("why", &runtime));
-        assert!(text.contains("no recall metadata available"), "got: {text}");
-    }
-
-    /// Spec §6.3 / assumption 5: every enable path grants under host-minted
-    /// `ExplicitCommand` proof — never model-supplied text.
-    #[test]
-    fn memory_enable_always_uses_explicit_command_proof() {
-        for arg in ["on", "recall", "capture"] {
-            let runtime = crate::Runtime::new_headless();
-            output_text(memory_command(arg, &runtime));
-            assert!(
-                matches!(
-                    runtime.memory_durable_proof_for_test(),
-                    Some(UserIntentProof::ExplicitCommand { .. })
-                ),
-                "/memory {arg} must grant under ExplicitCommand proof"
-            );
-        }
-        let runtime = crate::Runtime::new_headless();
-        output_text(memory_command("once", &runtime));
-        assert!(
-            matches!(
-                runtime.memory_one_shot_proof_for_test(),
-                Some(UserIntentProof::ExplicitCommand { .. })
-            ),
-            "/memory once must grant under ExplicitCommand proof"
-        );
-    }
-
-    /// Unknown args are a typed error naming the valid forms.
-    #[test]
-    fn memory_unknown_arg_is_typed_error() {
-        let runtime = crate::Runtime::new_headless();
-        match memory_command("bogus", &runtime) {
-            CommandResult::Error(e) => {
-                assert!(e.contains("unknown /memory subcommand"), "got: {e}");
-                assert!(e.contains("index-history"), "hint lists forms; got: {e}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-        assert_eq!(runtime.memory_context_status().durable, DurableStatus::Off);
-    }
-
-    /// `index-history` (task D1) returns the host-computed disclosure preview
-    /// and does not begin import.
-    #[test]
-    fn memory_index_history_surfaces_disclosure_preview() {
-        let runtime = crate::Runtime::new_headless();
-        match memory_command("index-history", &runtime) {
-            CommandResult::Output(text) => {
-                assert!(text.contains("History import preview"), "got: {text}");
-                assert!(text.contains("project:"), "got: {text}");
-                assert!(text.contains("sessions:"), "got: {text}");
-                assert!(text.contains("approximate bytes:"), "got: {text}");
-                assert!(text.contains("included date range:"), "got: {text}");
-                assert!(text.contains("included classes:"), "got: {text}");
-                assert!(text.contains("excluded classes:"), "got: {text}");
-                assert!(text.contains("retention policy:"), "got: {text}");
-                assert!(text.contains("redaction policy:"), "got: {text}");
-                assert!(text.contains("destination .r8:"), "got: {text}");
-                assert!(
-                    text.contains("explicit confirmation required: true"),
-                    "got: {text}"
-                );
-                assert!(text.contains("no import has started"), "got: {text}");
-            }
-            other => panic!("expected Output, got {other:?}"),
-        }
-        let status = runtime.memory_context_status();
-        assert_eq!(status.durable, DurableStatus::Off);
-        assert_eq!(status.one_shot, OneShotStatus::Idle);
-    }
-
-    #[test]
-    fn memory_index_history_decline_clears_pending_preview() {
-        let runtime = crate::Runtime::new_headless();
-        assert!(matches!(
-            memory_command("index-history", &runtime),
-            CommandResult::Output(_)
-        ));
-        assert!(matches!(
-            memory_command("index-history decline", &runtime),
-            CommandResult::Output(text) if text.contains("no session content was read")
-        ));
-        assert!(matches!(
-            memory_command("index-history confirm", &runtime),
-            CommandResult::Error(error) if error.contains("explicit user confirmation")
-        ));
-    }
-
-    #[test]
-    fn memory_index_history_confirmation_requires_prior_preview() {
-        let runtime = crate::Runtime::new_headless();
-        assert!(matches!(
-            memory_command("index-history confirm", &runtime),
-            CommandResult::Error(error) if error.contains("explicit user confirmation")
-        ));
-    }
-
-    /// All frontends route `/memory` through the single
-    /// `handle_engine_command` dispatch point (spec §7.3: one engine API).
-    #[test]
-    fn memory_dispatches_through_handle_engine_command() {
+    fn memory_answers_the_removal_line_and_changes_nothing() {
         let mut runtime = crate::Runtime::new_headless();
-        match handle_engine_command("memory", "on", &mut runtime) {
-            Some(CommandResult::Output(text)) => {
-                assert!(text.contains("mode capture_and_recall"), "got: {text}");
+        for arg in ["", "on", "status", "off", "index-history confirm", "bogus"] {
+            match handle_engine_command("memory", arg, &mut runtime) {
+                Some(CommandResult::Output(text)) => assert_eq!(
+                    text,
+                    format!(
+                        "/memory was removed in {}: automatic memory is provided by an extension now (Axel). Nothing was recording.",
+                        agent_core::AXEL_BACKEND_REMOVED_IN
+                    )
+                ),
+                other => panic!("/memory {arg}: expected the removal line, got {other:?}"),
             }
-            other => panic!("expected Some(Output), got {other:?}"),
         }
-        match handle_engine_command("memory", "", &mut runtime) {
-            Some(CommandResult::Output(text)) => {
-                assert!(text.contains("mode capture_and_recall"), "got: {text}");
-                assert!(text.contains("expiry"), "got: {text}");
-            }
-            other => panic!("expected Some(Output), got {other:?}"),
-        }
+        assert_eq!(
+            runtime.memory_context_status().durable,
+            crate::runtime::memory_context::DurableStatus::Off
+        );
     }
 }

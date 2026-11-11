@@ -20,7 +20,6 @@ pub mod forum;
 mod grep;
 mod ls;
 pub mod memory;
-mod memory_context;
 mod multi_edit;
 #[cfg(feature = "command-exec")]
 mod powershell;
@@ -69,7 +68,6 @@ pub use extension::ExtensionTool;
 pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
-pub use memory_context::MemoryContextTool;
 pub use multi_edit::MultiEditTool;
 pub(crate) use multi_edit::{label as multi_edit_label, paths as multi_edit_paths};
 #[cfg(feature = "command-exec")]
@@ -183,13 +181,6 @@ pub struct ToolCapabilities {
     /// (default for non-stream contexts) means deferred extension tools
     /// fail typed and start nothing.
     pub extension_leases: Option<crate::extensions::lease::ExtensionLeaseCapability>,
-    /// Session-scoped continuous-memory context capability (task A4, spec
-    /// §7.2): shared per-session memory state + host-owned grant scope.
-    /// `None` (default for non-stream contexts) means the `memory_context`
-    /// builtin can commit nothing — lease-granting actions fail typed,
-    /// while `status`/`disable` still answer deterministically `Off`
-    /// (memory off requires no infrastructure).
-    pub memory_context: Option<crate::runtime::memory_context::MemoryContextCapability>,
     /// Per-session working directory (Phase 2 daemons serve sessions from N
     /// directories in one process). `None` = inherit the process cwd — the
     /// only value Phase 1 ever sets, so behaviour is byte-identical.

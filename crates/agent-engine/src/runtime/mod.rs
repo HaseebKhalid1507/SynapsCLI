@@ -3698,6 +3698,7 @@ impl Runtime {
     /// `None`: nothing to apply (default off, consent latch unset, or the
     /// session already has memory state). `/memory off` still revokes the
     /// default for the rest of the session.
+    #[allow(dead_code)] // its caller, the host's session build, no longer applies it; the module goes next
     pub(crate) fn apply_memory_default_mode(
         &self,
         config: &agent_core::config::MemoryConfig,
@@ -3741,27 +3742,6 @@ impl Runtime {
             ),
         }
         Some(result)
-    }
-
-    /// Restore a session's own `/memory` choice on a rebuilt runtime (unpark,
-    /// daemon reload) instead of the operator default. The choice was the
-    /// user's explicit command for this session, so it is re-granted under
-    /// the same `ExplicitCommand` proof the command minted; `Off` grants
-    /// nothing (the runtime was built without the default). A failed grant
-    /// is logged and leaves memory off.
-    pub(crate) fn restore_session_memory_mode(&self, mode: crate::session::SessionMemoryMode) {
-        let Some(lease) = mode.lease_mode() else {
-            return;
-        };
-        if let Err(e) =
-            self.memory_context_enable(lease, memory_context::mint_explicit_command_proof())
-        {
-            tracing::warn!(
-                mode = lease.as_str(),
-                error = %e,
-                "session memory mode not restored; memory stays off"
-            );
-        }
     }
 
     /// Install a one-shot recall lease (`/memory once`, spec §7.3) under
@@ -3993,6 +3973,7 @@ impl Runtime {
     /// Bind the pending, already-presented history preview to an explicit
     /// frontend command. D1 returns only a typed plan; D2 owns all content
     /// streaming.
+    #[allow(dead_code)] // its caller `/memory` is gone; the module goes next
     pub(crate) fn memory_history_confirm(
         &self,
     ) -> std::result::Result<memory_history::HistoryImportReport, memory_history::HistoryImportError>
@@ -4044,6 +4025,7 @@ impl Runtime {
     }
 
     /// Decline and clear a pending preview without any content reads or writes.
+    #[allow(dead_code)] // its caller `/memory` is gone; the module goes next
     pub(crate) fn memory_history_decline(&self) -> bool {
         self.pending_history_import_preview
             .lock()
@@ -4474,7 +4456,6 @@ impl Runtime {
                 tool_activation: None,
                 mcp_leases: None,
                 extension_leases: None,
-                memory_context: self.memory_tool_capability(),
                 cwd: self.cwd.clone(),
                 env: self.env.clone(),
                 env_stripped: self.env_stripped.clone(),
@@ -5067,7 +5048,6 @@ impl Runtime {
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
         let session = crate::runtime::stream::StreamSession {
             memory_backend: self.memory_backend.clone(),
-            memory_context: self.memory_tool_capability(),
             final_capture_history: final_capture_history.clone(),
             turn_completion: completion,
             context_window: self.context_window(),
@@ -7991,8 +7971,6 @@ mod memory_context_provider_tests {
             assert!(runtime
                 .memory_context_recall_once(memory_context::mint_explicit_command_proof())
                 .is_err());
-            runtime.restore_session_memory_mode(crate::session::SessionMemoryMode::CaptureAndRecall);
-            assert_memory_off_no_lease(&runtime);
             assert!(runtime.memory_tool_capability().is_none());
             // Disable is still a clean no-op.
             runtime.memory_context_disable();

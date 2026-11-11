@@ -36,6 +36,11 @@ pub use core::session_lock;
 /// one-release CLI stubs and the warnings for their config keys name it.
 pub const REMOVED_IN: &str = "0.12.0";
 
+/// The release that removed the built-in Axel memory backend and built-in
+/// automatic memory. Separate from [`REMOVED_IN`]: that one moves when the
+/// command stubs go, this removal must not move with it.
+pub const AXEL_BACKEND_REMOVED_IN: &str = "0.12.0";
+
 /// Current time as Unix epoch milliseconds. Panics only if system clock is before 1970.
 #[inline]
 pub fn epoch_millis() -> u64 {

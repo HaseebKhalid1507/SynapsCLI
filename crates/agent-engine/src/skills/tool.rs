@@ -335,7 +335,6 @@ mod tests {
                 tool_activation: None,
                 mcp_leases: None,
                 extension_leases: None,
-                memory_context: None,
                 cwd: None,
                 env: None,
                 env_stripped: Vec::new(),
