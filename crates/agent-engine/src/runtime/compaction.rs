@@ -933,7 +933,8 @@ pub async fn apply_compaction(
         &outcome.summary_text,
         api_messages.len(),
         json!({"source": transition.hook_source}),
-    );
+    )
+    .with_cwd(runtime.cwd());
     let _ = runtime.hook_bus().emit(&hook_event).await;
 
     // Capture is emitted only after the transition and its source provenance
@@ -1552,6 +1553,7 @@ mod transition_tests {
         #[derive(Debug)]
         struct Recorder {
             hits: Arc<AtomicUsize>,
+            cwd: Arc<std::sync::Mutex<Option<String>>>,
         }
         #[async_trait::async_trait]
         impl crate::extensions::runtime::ExtensionHandler for Recorder {
@@ -1561,21 +1563,26 @@ mod transition_tests {
             async fn handle(&self, event: &HookEvent) -> HookResult {
                 assert_eq!(event.kind, HookKind::OnCompaction);
                 self.hits.fetch_add(1, Ordering::SeqCst);
+                *self.cwd.lock().unwrap() = event.cwd.clone();
                 HookResult::Continue
             }
             async fn shutdown(&self) {}
         }
 
         let _base = BaseDirGuard::new();
-        let runtime = crate::Runtime::new_headless();
+        // A session folder that is not the process's (a daemon chat).
+        let chat_dir = tempfile::tempdir().unwrap();
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_cwd(Some(chat_dir.path().to_path_buf()));
         let hits = Arc::new(AtomicUsize::new(0));
+        let cwd = Arc::new(std::sync::Mutex::new(None));
         let mut perms = crate::extensions::permissions::PermissionSet::new();
         perms.grant(HookKind::OnCompaction.required_permission());
         runtime
             .hook_bus()
             .subscribe(
                 HookKind::OnCompaction,
-                Arc::new(Recorder { hits: hits.clone() }),
+                Arc::new(Recorder { hits: hits.clone(), cwd: cwd.clone() }),
                 None,
                 None,
                 perms,
@@ -1597,6 +1604,11 @@ mod transition_tests {
             hits.load(Ordering::SeqCst),
             1,
             "on_compaction must fire once"
+        );
+        assert_eq!(
+            cwd.lock().unwrap().as_deref(),
+            chat_dir.path().to_str(),
+            "on_compaction reports the session's folder, not the process's"
         );
     }
 }

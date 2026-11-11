@@ -860,6 +860,7 @@ mod tests {
             "RAW 10k lines".to_string(),
             30_000,
             None,
+            None,
         )
         .await;
 
@@ -882,6 +883,7 @@ mod tests {
             serde_json::json!({}),
             "RAW".to_string(),
             30_000,
+            None,
             None,
         )
         .await;
@@ -968,6 +970,7 @@ mod tests {
             serde_json::json!({}),
             "ORIGINAL".to_string(),
             30_000,
+            None,
             None,
         )
         .await;
@@ -1941,6 +1944,7 @@ mod tests {
             output,
             30_000,
             None,
+            None,
         )
         .await;
 
@@ -1981,6 +1985,7 @@ mod tests {
             "tiny original".to_string(),
             30_000,
             None,
+            None,
         )
         .await;
 
@@ -2005,6 +2010,7 @@ mod tests {
             serde_json::json!({}),
             huge.clone(),
             30_000,
+            None,
             None,
         )
         .await;
@@ -2036,6 +2042,7 @@ mod tests {
             multibyte,
             30_000,
             None,
+            None,
         )
         .await;
         assert!(result.is_char_boundary(result.len()));
@@ -2062,6 +2069,7 @@ mod tests {
             serde_json::json!({}),
             "orig".to_string(),
             30_000,
+            None,
             None,
         )
         .await;
@@ -2199,6 +2207,7 @@ mod worker_view_tests {
             output.to_string(),
             30_000,
             None,
+            None,
         )
         .await
     }
@@ -2266,6 +2275,7 @@ mod worker_view_tests {
             "bash",
             None,
             serde_json::json!({"command": "rm -rf /"}),
+            None,
             None,
         )
         .await;

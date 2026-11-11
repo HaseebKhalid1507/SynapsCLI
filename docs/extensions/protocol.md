@@ -42,7 +42,7 @@ Content-Length: <byte-length-of-body>\r\n
 ```
 Content-Length: <byte-length>\r\n
 \r\n
-{"jsonrpc":"2.0","id":"evt-001","method":"hook.handle","params":{"kind":"before_tool_call","tool_name":"bash","tool_runtime_name":"bash","tool_input":{"command":"ls -la"},"tool_output":null,"message":null,"session_id":null,"transcript":null,"data":null}}
+{"jsonrpc":"2.0","id":"evt-001","method":"hook.handle","params":{"kind":"before_tool_call","tool_name":"bash","tool_runtime_name":"bash","tool_input":{"command":"ls -la"},"tool_output":null,"message":null,"session_id":null,"cwd":"/home/u/project","transcript":null,"data":null}}
 ```
 
 **Example frame (extension → runtime):**
@@ -206,7 +206,8 @@ Called when the model invokes an extension-provided tool declared during
   "params": {
     "name": "echo",
     "input": { "text": "hello" },
-    "session_id": "20261014-050933-a06f"
+    "session_id": "20261014-050933-a06f",
+    "cwd": "/home/u/project"
   }
 }
 ```
@@ -216,11 +217,13 @@ Called when the model invokes an extension-provided tool declared during
 | `name`       | string         | The extension's own tool name, as declared in `capabilities.tools` (not the `plugin-id:name` runtime name). |
 | `input`      | object         | The arguments the model supplied. |
 | `session_id` | string \| null | The conversation that invoked the tool: the same value the hook events carry. `null` for workers/subagents, the extension-provider tool route, contexts with no conversation, and when `SYNAPS_HOOK_SESSION_ID=0`. Always present. |
+| `cwd`        | string \| null | The folder the caller runs in: the same value the hook events carry. Set for workers too (their parent chat's folder); the host process's folder when the call has no chat behind it. Not canonicalised. `null` only when the folder is not valid UTF-8 or cannot be read. Always present. |
 
 In daemon mode one extension process serves every session, so key any
 per-caller tool state on `params.session_id` (see
-[session-id.md](session-id.md)). Older hosts omit the field; treat a
-missing key like `null`.
+[session-id.md](session-id.md)) and scope per-project behaviour on
+`params.cwd` (see [hooks.md](hooks.md#cwd-the-chats-working-folder)). Older
+hosts omit these fields; treat a missing key like `null`.
 
 **Response:**
 
@@ -315,6 +318,7 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
   "tool_output": null,
   "message": null,
   "session_id": null,
+  "cwd": "/home/u/project",
   "transcript": null,
   "data": null
 }
@@ -329,6 +333,7 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 | `tool_output`       | string \| null  | `after_tool_call`                             | The result returned by the tool (size-limited preview: ~32 KB prefix + marker) |
 | `message`           | string \| null  | `before_message`, `on_message_complete`, `on_compaction` | User/assistant/summary message content for message hooks         |
 | `session_id`        | string \| null  | `on_compaction`, `on_session_start`, `on_session_end` | Stable identifier for the current or newly-created session       |
+| `cwd`               | string \| null  | all                                           | The chat's working folder, as the client gave it (not canonicalised); see [hooks.md](hooks.md#cwd-the-chats-working-folder) |
 | `transcript`        | array \| null   | `on_session_end`                              | Conversation transcript delivered at session end                 |
 | `data`              | any             | all                                           | Extension-defined pass-through data; `null` in runtime events    |
 
@@ -351,6 +356,7 @@ messages compacted.
   "tool_output": null,
   "message": "Compacted summary text...",
   "session_id": "20260501-120000-abcd",
+  "cwd": "/home/u/project",
   "transcript": null,
   "data": {
     "old_session_id": "20260501-110000-wxyz",
@@ -379,6 +385,7 @@ serialized into `message`.
   "tool_output": null,
   "message": "The build passed.",
   "session_id": null,
+  "cwd": "/home/u/project",
   "transcript": null,
   "data": {
     "content_block_count": 1,

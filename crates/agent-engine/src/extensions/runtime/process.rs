@@ -4,7 +4,7 @@
 //! Content-Length framing (LSP-style) over stdin/stdout.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -255,6 +255,8 @@ pub async fn execute_provider_tool_use(
 
     let runtime_name = authorized.runtime_name().to_string();
     let input = registry.translate_input_for_api_tool(&tool_name, input);
+    // The folder this call runs in, kept for the hook after `ctx` is spent.
+    let cwd = ctx.capabilities.cwd.clone();
     let decision = crate::runtime::resolve_before_tool_call_decision(
         input.clone(),
         crate::runtime::emit_before_tool_call(
@@ -265,6 +267,7 @@ pub async fn execute_provider_tool_use(
             // Extension-originated tool.invoke: no owning conversation on this
             // path (ToolContext carries none) → `null`, as before.
             None,
+            cwd.as_deref(),
         )
         .await,
         ctx.capabilities.secret_prompt.as_ref(),
@@ -300,6 +303,7 @@ pub async fn execute_provider_tool_use(
         result,
         max_tool_output,
         None,
+        cwd.as_deref(),
     )
     .await;
 
@@ -1895,6 +1899,7 @@ impl ProcessExtension {
         name: &str,
         input: Value,
         session_id: Option<&str>,
+        cwd: Option<&Path>,
     ) -> Result<Value, String> {
         let fut = async {
             let _call_guard = self.call_lock.lock().await;
@@ -1916,7 +1921,7 @@ impl ProcessExtension {
                 .call_once_locked(
                     &mut state,
                     "tool.call",
-                    tool_call_params(name, input, session_id),
+                    tool_call_params(name, input, session_id, cwd),
                     id,
                 )
                 .await;
@@ -2198,12 +2203,22 @@ impl ProcessExtension {
 /// `tool.call` params. `session_id` is the owning conversation id, `null`
 /// for workers/no conversation and under the `SYNAPS_HOOK_SESSION_ID=0`
 /// kill switch, so plugins can key tool state on the same value the hook
-/// events carry. Always present (`null`, never omitted), like hook fields.
-pub(crate) fn tool_call_params(name: &str, input: Value, session_id: Option<&str>) -> Value {
+/// events carry. `cwd` is the folder the caller runs in, as on hook events
+/// ([`hook_cwd`]): set for workers too, and the kill switch leaves it alone.
+/// Both always present (`null`, never omitted), like hook fields.
+///
+/// [`hook_cwd`]: crate::extensions::hooks::events::hook_cwd
+pub(crate) fn tool_call_params(
+    name: &str,
+    input: Value,
+    session_id: Option<&str>,
+    cwd: Option<&Path>,
+) -> Value {
     tool_call_params_gated(
         name,
         input,
         session_id,
+        cwd,
         crate::extensions::hooks::events::hook_session_id_enabled(),
     )
 }
@@ -2212,6 +2227,7 @@ fn tool_call_params_gated(
     name: &str,
     input: Value,
     session_id: Option<&str>,
+    cwd: Option<&Path>,
     session_id_enabled: bool,
 ) -> Value {
     let session_id = if session_id_enabled { session_id } else { None };
@@ -2219,6 +2235,7 @@ fn tool_call_params_gated(
         "name": name,
         "input": input,
         "session_id": session_id,
+        "cwd": crate::extensions::hooks::events::hook_cwd(cwd),
     })
 }
 
@@ -2234,7 +2251,7 @@ impl ExtensionHandler for ProcessExtension {
     }
 
     async fn call_tool(&self, name: &str, input: Value) -> Result<Value, String> {
-        self.call_tool_for(name, input, None).await
+        self.call_tool_for(name, input, None, None).await
     }
 
     async fn call_tool_for(
@@ -2242,8 +2259,9 @@ impl ExtensionHandler for ProcessExtension {
         name: &str,
         input: Value,
         session_id: Option<&str>,
+        cwd: Option<&Path>,
     ) -> Result<Value, String> {
-        self.call("tool.call", tool_call_params(name, input, session_id))
+        self.call("tool.call", tool_call_params(name, input, session_id, cwd))
             .await
     }
 
@@ -2599,25 +2617,49 @@ mod tool_call_params_tests {
     use super::*;
     use serde_json::json;
 
+    /// A folder in the host's own path shape; it need not exist.
+    fn chat_dir() -> PathBuf {
+        std::env::temp_dir().join("tool-call-cwd")
+    }
+
     #[test]
-    fn carries_caller_session_id() {
+    fn carries_caller_session_id_and_cwd() {
+        let dir = chat_dir();
         assert_eq!(
-            tool_call_params_gated("echo", json!({"text": "hi"}), Some("sess-A"), true),
-            json!({"name": "echo", "input": {"text": "hi"}, "session_id": "sess-A"})
+            tool_call_params_gated("echo", json!({"text": "hi"}), Some("sess-A"), Some(&dir), true),
+            json!({
+                "name": "echo",
+                "input": {"text": "hi"},
+                "session_id": "sess-A",
+                "cwd": dir.to_str().unwrap(),
+            })
         );
     }
 
+    /// A worker has no conversation id but does run in a folder.
     #[test]
-    fn worker_call_has_null_session_id_key() {
-        let params = tool_call_params_gated("echo", json!({}), None, true);
+    fn worker_call_has_null_session_id_key_and_its_cwd() {
+        let dir = chat_dir();
+        let params = tool_call_params_gated("echo", json!({}), None, Some(&dir), true);
         assert_eq!(params.get("session_id"), Some(&Value::Null));
+        assert_eq!(params["cwd"], json!(dir.to_str().unwrap()));
     }
 
     #[test]
-    fn kill_switch_forces_null() {
-        let params = tool_call_params_gated("echo", json!({}), Some("sess-A"), false);
+    fn kill_switch_forces_null_session_id_and_leaves_cwd() {
+        let dir = chat_dir();
+        let params = tool_call_params_gated("echo", json!({}), Some("sess-A"), Some(&dir), false);
         assert_eq!(params.get("session_id"), Some(&Value::Null));
+        assert_eq!(params["cwd"], json!(dir.to_str().unwrap()));
         assert_eq!(params["name"], json!("echo"));
+    }
+
+    /// No session folder: the process folder, never an absent key.
+    #[test]
+    fn no_session_folder_sends_the_process_folder() {
+        let process = std::env::current_dir().unwrap();
+        let params = tool_call_params_gated("echo", json!({}), None, None, true);
+        assert_eq!(params["cwd"], json!(process.to_str().unwrap()));
     }
 }
 

@@ -37,6 +37,7 @@
 //!   only), and no launch-record (secret) config ever appears anywhere.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -690,7 +691,8 @@ impl ExtensionRuntimeManager {
 
     /// Execute one EXACT already-gate-authorized extension tool call. See
     /// module docs for the lease/single-flight/validation contract.
-    /// Host-originated: the wire `session_id` is `null`.
+    /// Host-originated with no chat: the wire `session_id` is `null` and
+    /// `cwd` is the process folder.
     pub async fn call_exact(
         &self,
         session: &SessionId,
@@ -699,13 +701,15 @@ impl ExtensionRuntimeManager {
         expected_digest: &SchemaDigest,
         params: Value,
     ) -> Result<Value, ExtensionLeaseError> {
-        self.call_exact_for(session, plugin, tool_name, expected_digest, params, None)
+        self.call_exact_for(session, plugin, tool_name, expected_digest, params, None, None)
             .await
     }
 
     /// [`Self::call_exact`] on behalf of a conversation: `conversation_id`
     /// is forwarded as `tool.call` `params.session_id` (the owning
-    /// conversation, not the lease scope `session`).
+    /// conversation, not the lease scope `session`) and `cwd`, the folder
+    /// that conversation runs in, as `params.cwd`.
+    #[allow(clippy::too_many_arguments)] // the exact call plus who it is for
     pub async fn call_exact_for(
         &self,
         session: &SessionId,
@@ -714,6 +718,7 @@ impl ExtensionRuntimeManager {
         expected_digest: &SchemaDigest,
         params: Value,
         conversation_id: Option<&str>,
+        cwd: Option<&Path>,
     ) -> Result<Value, ExtensionLeaseError> {
         // 1.-2. Record re-read + manifest re-validation (pure local).
         let (record, validated) = self.record_and_validate(session, plugin)?;
@@ -769,7 +774,7 @@ impl ExtensionRuntimeManager {
         }
         let result = inner
             .handler
-            .call_tool_once_no_spawn(tool_name, params, conversation_id)
+            .call_tool_once_no_spawn(tool_name, params, conversation_id, cwd)
             .await;
         if inner.cancelled() {
             // Revoked while this already-started call ran: shut the child
@@ -953,6 +958,7 @@ impl ExtensionLeaseCapability {
         expected_digest: &SchemaDigest,
         params: Value,
         conversation_id: Option<&str>,
+        cwd: Option<&Path>,
     ) -> Result<Value, ExtensionLeaseError> {
         self.manager
             .call_exact_for(
@@ -962,6 +968,7 @@ impl ExtensionLeaseCapability {
                 expected_digest,
                 params,
                 conversation_id,
+                cwd,
             )
             .await
     }

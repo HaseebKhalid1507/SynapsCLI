@@ -863,7 +863,13 @@ impl SessionActor {
                     "extensions_ready timed out — on_session_start may miss late extensions"
                 );
             }
-            super::session_start::run_at_create(host, runtime.hook_bus(), &sb.session.id).await;
+            super::session_start::run_at_create(
+                host,
+                runtime.hook_bus(),
+                &sb.session.id,
+                cfg.cwd.as_deref(),
+            )
+            .await;
         }
 
         let id = SessionId::from(sb.session.id.clone());
@@ -953,6 +959,7 @@ impl SessionActor {
                 host,
                 Arc::clone(&hook_bus),
                 Arc::clone(&journal_id),
+                cfg.cwd.clone(),
                 ext_ready_timeout,
             )
         };
@@ -2926,6 +2933,7 @@ impl SessionActor {
             &self.host,
             Arc::clone(&self.hook_bus),
             Arc::clone(&self.journal_id),
+            self.config.cwd.clone(),
             extensions_ready_timeout(&self.host.config()),
         );
     }
@@ -5619,6 +5627,7 @@ impl SessionActor {
         crate::extensions::loader::emit_session_end(
             &hook_bus,
             &session_id,
+            self.config.cwd.as_deref(),
             api_messages,
             budgets::HOOKS_TIMEOUT,
         )

@@ -1207,7 +1207,8 @@ impl StreamMethods {
             let turn_injected_context: Option<String> = if let Some(ref msg_text) = last_user_msg {
                 let hook_event =
                     crate::extensions::hooks::events::HookEvent::before_message(msg_text)
-                        .with_session(session_id.as_deref());
+                        .with_session(session_id.as_deref())
+                        .with_cwd(cwd.as_deref());
                 if let crate::extensions::hooks::events::HookResult::Inject { content } =
                     hook_bus.emit(&hook_event).await
                 {
@@ -1925,7 +1926,8 @@ impl StreamMethods {
                         "context_management": context_management,
                     }),
                 )
-                .with_session(session_id.as_deref());
+                .with_session(session_id.as_deref())
+                .with_cwd(cwd.as_deref());
                 // An extension may report an advisory work phase; it is
                 // applied exactly like the model's own `context_checkpoint`
                 // (no note) and is never capacity or permission authority.
@@ -2177,6 +2179,7 @@ impl StreamMethods {
                                         Some(&runtime_name),
                                         input.clone(),
                                         session_id.as_deref(),
+                                        cwd.as_deref(),
                                     )
                                     .await,
                                     secret_prompt.as_ref(),
@@ -2231,6 +2234,7 @@ impl StreamMethods {
                                                 output.clone(),
                                                 max_tool_output,
                                                 session_id.as_deref(),
+                                                cwd.as_deref(),
                                                 tool_spill.is_enabled(),
                                             ).await;
                                             // Hook policy: a Replace transform wins over the rich
@@ -2624,6 +2628,7 @@ impl StreamMethods {
                                             Some(&runtime_name_for_hook),
                                             input.clone(),
                                             session_id_inner.as_deref(),
+                                            cwd_inner.as_deref(),
                                         ).await,
                                         prompt_inner.as_ref(),
                                         auto_approve_inner,
@@ -2691,6 +2696,7 @@ impl StreamMethods {
                                                 output.clone(),
                                                 max_tool_output,
                                                 session_id_inner.as_deref(),
+                                                cwd_inner.as_deref(),
                                                 tool_spill_inner.is_enabled(),
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
@@ -4166,6 +4172,7 @@ mod rich_output_tests {
                     summary.clone(),
                     10,
                     None,
+                    None,
                     keep_uncut,
                 )
                 .await;
@@ -4192,6 +4199,7 @@ mod rich_output_tests {
                         json!({}),
                         summary,
                         10,
+                        None,
                         None,
                     )
                     .await
@@ -5459,6 +5467,90 @@ mod rich_output_tests {
                 "{} tool use(s) under {conversation:?}",
                 uses.len()
             );
+        }
+    }
+
+    /// A hook event's kind, `session_id` and `cwd`.
+    type Who = (HookKind, Option<String>, Option<String>);
+    /// Records what each hook event says about who it is for.
+    struct WhoProbe(std::sync::Mutex<Vec<Who>>);
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for WhoProbe {
+        fn id(&self) -> &str {
+            "who-probe"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.0.lock().unwrap().push((
+                event.kind,
+                event.session_id.clone(),
+                event.cwd.clone(),
+            ));
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+    }
+
+    /// Every hook the stream loop emits names the stream's folder, on the
+    /// serial and the parallel tool lane: a daemon chat's own folder (never
+    /// the process's), a worker's parent folder although a worker has no
+    /// conversation id, and the process folder for a stream with none of
+    /// its own (in-process hosts).
+    #[tokio::test]
+    async fn stream_hooks_carry_the_streams_cwd() {
+        const KINDS: [HookKind; 4] = [
+            HookKind::BeforeMessage,
+            HookKind::BeforeToolCall,
+            HookKind::AfterToolCall,
+            HookKind::OnMessageComplete,
+        ];
+        let chat = tempfile::tempdir().unwrap();
+        let process = std::env::current_dir().unwrap();
+        assert_ne!(chat.path(), process.as_path());
+        let one = &[("toolu_1", "session_probe")][..];
+        let two = &[("toolu_1", "session_probe"), ("toolu_2", "session_probe")][..];
+        for (conversation, cwd, uses) in [
+            (Some("conv-1"), Some(chat.path()), one),
+            (Some("conv-2"), Some(chat.path()), two),
+            (None, Some(chat.path()), two),
+            (Some("conv-3"), None, one),
+        ] {
+            let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+            let probe = Arc::new(WhoProbe(Default::default()));
+            for kind in KINDS {
+                let mut perms = PermissionSet::new();
+                perms.grant(kind.required_permission());
+                bus.subscribe(kind, probe.clone(), None, None, perms)
+                    .await
+                    .unwrap();
+            }
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let _ = drive_configured(
+                "claude-sonnet-4-6",
+                initial,
+                vec![Arc::new(SessionProbe(Default::default()))],
+                uses,
+                bus,
+                std::time::Duration::from_secs(20),
+                |session| {
+                    session.session_id = conversation.map(str::to_string);
+                    session.cwd = cwd.map(std::path::Path::to_path_buf);
+                },
+            )
+            .await;
+            let seen = probe.0.lock().unwrap().clone();
+            let folder = cwd.unwrap_or(&process).to_str().map(str::to_string);
+            for kind in KINDS {
+                let events: Vec<_> = seen.iter().filter(|e| e.0 == kind).collect();
+                let per_call = matches!(kind, HookKind::BeforeToolCall | HookKind::AfterToolCall);
+                assert!(
+                    if per_call { events.len() == uses.len() } else { !events.is_empty() },
+                    "{kind:?} under {conversation:?}: {seen:?}"
+                );
+                for (_, session_id, event_cwd) in events {
+                    assert_eq!(session_id.as_deref(), conversation, "{kind:?}");
+                    assert_eq!(event_cwd, &folder, "{kind:?} under {conversation:?}");
+                }
+            }
         }
     }
 

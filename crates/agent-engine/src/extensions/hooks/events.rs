@@ -8,6 +8,8 @@
 //! every `HookKind` declares a [`required_permission`][HookKind::required_permission]
 //! so the runtime can gate subscriptions before any payload is delivered.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -162,22 +164,39 @@ pub fn hook_session_id_enabled() -> bool {
     )
 }
 
+/// The chat's working folder as extensions get it: `cwd` on hook events and
+/// in `tool.call` params. The session's folder when there is one (daemon
+/// chats, workers), else the host process's (in-process hosts, where the two
+/// are the same). As the client gave it: not canonicalised, not walked up to
+/// a repository root. `None` (JSON `null`) when that path is not valid UTF-8
+/// or the process folder cannot be read. No off switch, unlike `session_id`.
+pub fn hook_cwd(cwd: Option<&Path>) -> Option<String> {
+    match cwd {
+        Some(dir) => dir.to_str().map(str::to_string),
+        None => std::env::current_dir().ok()?.to_str().map(str::to_string),
+    }
+}
+
 /// A hook event payload dispatched to extension handlers.
 ///
 /// Fields are optional and populated only when relevant to the hook kind:
 ///
-/// | Kind                  | tool_name | tool_input | tool_output | message | session_id |
-/// |-----------------------|-----------|------------|-------------|---------|------------|
-/// | `before_tool_call`    | ✓         | ✓          |             |         | ✓*         |
-/// | `after_tool_call`     | ✓         | ✓          | ✓           |         | ✓*         |
-/// | `before_message`      |           |            |             | ✓       | ✓*         |
-/// | `on_message_complete` |           |            |             | ✓       | ✓*         |
-/// | `on_compaction`       |           |            |             | ✓       | ✓          |
-/// | `on_session_start`    |           |            |             |         | ✓          |
-/// | `on_session_end`      |           |            |             |         | ✓          |
+/// | Kind                  | tool_name | tool_input | tool_output | message | session_id | cwd |
+/// |-----------------------|-----------|------------|-------------|---------|------------|-----|
+/// | `before_tool_call`    | ✓         | ✓          |             |         | ✓*         | ✓   |
+/// | `after_tool_call`     | ✓         | ✓          | ✓           |         | ✓*         | ✓   |
+/// | `before_message`      |           |            |             | ✓       | ✓*         | ✓   |
+/// | `on_message_complete` |           |            |             | ✓       | ✓*         | ✓   |
+/// | `on_compaction`       |           |            |             | ✓       | ✓          | ✓   |
+/// | `on_session_start`    |           |            |             |         | ✓          | ✓   |
+/// | `on_session_end`      |           |            |             |         | ✓          | ✓   |
 ///
 /// `✓*` — set via [`HookEvent::with_session`] for foreground sessions; `null`
 /// for workers (no conversation id) and when `SYNAPS_HOOK_SESSION_ID=0`.
+///
+/// `cwd` is stamped by [`HookEvent::with_cwd`] where the event is emitted,
+/// workers included. The constructors leave it `None`: only the emitter
+/// knows which chat the event is for.
 ///
 /// The `data` field is available on all events for extensions that need to
 /// attach arbitrary structured context when constructing synthetic events.
@@ -200,6 +219,9 @@ pub struct HookEvent {
     pub message: Option<String>,
     /// Session identifier for session lifecycle hooks.
     pub session_id: Option<String>,
+    /// The chat's working folder ([`hook_cwd`]).
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// Session message history for `on_session_end`.
     /// Contains the conversation transcript so extensions (like Stelline)
     /// can extract memories without reaching into runtime internals.
@@ -225,6 +247,15 @@ impl HookEvent {
         self
     }
 
+    /// Stamp the chat's working folder (builder). `None` = the session has
+    /// no folder of its own, so the process folder; see [`hook_cwd`].
+    ///
+    /// Additive: extensions that ignore `cwd` are unaffected.
+    pub fn with_cwd(mut self, cwd: Option<&Path>) -> Self {
+        self.cwd = hook_cwd(cwd);
+        self
+    }
+
     /// Construct a `before_tool_call` event.
     pub fn before_tool_call(tool_name: &str, input: Value) -> Self {
         Self {
@@ -234,6 +265,7 @@ impl HookEvent {
             tool_output: None,
             message: None,
             session_id: None,
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -264,6 +296,7 @@ impl HookEvent {
             tool_output: Some(truncated_output),
             message: None,
             session_id: None,
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -279,6 +312,7 @@ impl HookEvent {
             tool_output: None,
             message: Some(message.to_string()),
             session_id: None,
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -294,6 +328,7 @@ impl HookEvent {
             tool_output: None,
             message: Some(message.to_string()),
             session_id: None,
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data,
@@ -332,6 +367,7 @@ impl HookEvent {
             tool_output: None,
             message: Some(summary.to_string()),
             session_id: Some(new_session_id.to_string()),
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data,
@@ -347,6 +383,7 @@ impl HookEvent {
             tool_output: None,
             message: None,
             session_id: Some(session_id.to_string()),
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -362,6 +399,7 @@ impl HookEvent {
             tool_output: None,
             message: None,
             session_id: Some(session_id.to_string()),
+            cwd: None,
             tool_runtime_name: None,
             transcript,
             data: Value::Null,
@@ -757,6 +795,73 @@ mod tests {
         assert_eq!(back.kind, ev.kind);
         assert_eq!(back.tool_name, ev.tool_name);
         assert_eq!(back.tool_input, ev.tool_input);
+    }
+
+    // ── cwd ───────────────────────────────────────────────────────────────────
+
+    /// A session folder is sent as given: not canonicalised, not required to
+    /// exist. Built from the platform temp dir so the shape is the host's.
+    #[test]
+    fn with_cwd_serialises_the_session_folder_as_given() {
+        let dir = std::env::temp_dir().join("hook-cwd").join("..").join("proj");
+        let ev = HookEvent::before_message("hi").with_cwd(Some(&dir));
+        let wire = serde_json::to_value(&ev).unwrap();
+        assert_eq!(wire["cwd"], json!(dir.to_str().unwrap()));
+    }
+
+    /// No session folder (in-process hosts): the process folder.
+    #[test]
+    fn with_cwd_none_serialises_the_process_folder() {
+        let process = std::env::current_dir().unwrap();
+        let ev = HookEvent::on_session_start("s").with_cwd(None);
+        let wire = serde_json::to_value(&ev).unwrap();
+        assert_eq!(wire["cwd"], json!(process.to_str().unwrap()));
+    }
+
+    /// Every kind has the key on the wire, `null` until an emitter stamps it.
+    #[test]
+    fn cwd_key_is_always_present() {
+        for ev in [
+            HookEvent::before_tool_call("bash", json!({})),
+            HookEvent::after_tool_call("bash", json!({}), "o".into()),
+            HookEvent::before_message("m"),
+            HookEvent::on_message_complete("m", json!({})),
+            HookEvent::on_compaction("a", "b", "s", 1, json!({})),
+            HookEvent::on_session_start("s"),
+            HookEvent::on_session_end("s", None),
+        ] {
+            let wire = serde_json::to_value(&ev).unwrap();
+            assert_eq!(wire.get("cwd"), Some(&Value::Null), "{:?}", ev.kind);
+        }
+    }
+
+    /// An event serialised before the field existed still parses.
+    #[test]
+    fn event_json_without_cwd_deserialises() {
+        let old = json!({
+            "kind": "before_message",
+            "tool_name": null,
+            "tool_input": null,
+            "tool_output": null,
+            "message": "hi",
+            "session_id": "sess-A",
+            "data": null,
+        });
+        let ev: HookEvent = serde_json::from_value(old).unwrap();
+        assert_eq!(ev.cwd, None);
+        assert_eq!(ev.session_id.as_deref(), Some("sess-A"));
+    }
+
+    /// A folder that cannot be written as a JSON string is `null`, never a
+    /// lossy rewrite and never the process folder.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_cwd_is_null() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/hook-cwd-\xff"));
+        assert_eq!(hook_cwd(Some(dir)), None);
+        let ev = HookEvent::before_message("hi").with_cwd(Some(dir));
+        assert_eq!(serde_json::to_value(&ev).unwrap()["cwd"], Value::Null);
     }
 
     // ── HookResult ────────────────────────────────────────────────────────────

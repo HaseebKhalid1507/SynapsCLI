@@ -76,16 +76,19 @@ pub enum BeforeToolCallDecision {
 
 /// Emit a `before_tool_call` event and include the runtime tool name when it
 /// differs from the API-safe name. `session_id` is the owning conversation
-/// (`None` for workers → JSON `null`, unchanged).
+/// (`None` for workers → JSON `null`, unchanged). `cwd` is the folder the
+/// call runs in (`ToolCapabilities.cwd`; `None` = the process folder).
 pub async fn emit_before_tool_call(
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     tool_name: &str,
     runtime_tool_name: Option<&str>,
     input: Value,
     session_id: Option<&str>,
+    cwd: Option<&Path>,
 ) -> crate::extensions::hooks::events::HookResult {
     let mut event = crate::extensions::hooks::events::HookEvent::before_tool_call(tool_name, input)
-        .with_session(session_id);
+        .with_session(session_id)
+        .with_cwd(cwd);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
@@ -380,6 +383,7 @@ const MAX_REPLACE_OUTPUT: usize = 1024 * 1024; // 1 MiB
 /// `max_tool_output` (the context budget) — compress-then-truncate ordering,
 /// so a transform extension sees the full buffered output and decides what to
 /// keep before the hard cap is applied.
+#[allow(clippy::too_many_arguments)] // the hook event's fields
 pub async fn emit_after_tool_call(
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     tool_name: &str,
@@ -388,6 +392,7 @@ pub async fn emit_after_tool_call(
     output: String,
     max_tool_output: usize,
     session_id: Option<&str>,
+    cwd: Option<&Path>,
 ) -> String {
     emit_after_tool_call_outcome(
         hook_bus,
@@ -397,6 +402,7 @@ pub async fn emit_after_tool_call(
         output,
         max_tool_output,
         session_id,
+        cwd,
         false,
     )
     .await
@@ -431,6 +437,7 @@ pub(super) async fn emit_after_tool_call_outcome(
     output: String,
     max_tool_output: usize,
     session_id: Option<&str>,
+    cwd: Option<&Path>,
     keep_uncut: bool,
 ) -> AfterToolCallOutcome {
     use crate::extensions::hooks::events::HookResult;
@@ -438,7 +445,8 @@ pub(super) async fn emit_after_tool_call_outcome(
     let original = output.clone();
     let mut event =
         crate::extensions::hooks::events::HookEvent::after_tool_call(tool_name, input, output)
-            .with_session(session_id);
+            .with_session(session_id)
+            .with_cwd(cwd);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
@@ -915,6 +923,9 @@ struct ExtensionCaptureProvider {
     plugin: String,
     digest: crate::tools::catalog::SchemaDigest,
     handle: tokio::runtime::Handle,
+    /// The chat's folder, sent as `tool.call` `params.cwd`: these calls are
+    /// host-originated (`session_id: null`) but made for one chat.
+    cwd: Option<PathBuf>,
 }
 
 impl capture_worker::CaptureProvider for ExtensionCaptureProvider {
@@ -929,11 +940,13 @@ impl capture_worker::CaptureProvider for ExtensionCaptureProvider {
                     self.session.clone(),
                     self.manager.clone(),
                 )
-                .call_exact(
+                .call_exact_for(
                     &self.plugin,
                     memory_context::MEMORY_CAPTURE_TOOL_NAME,
                     &self.digest,
                     params,
+                    None,
+                    self.cwd.as_deref(),
                 ),
             )
             .map(|_| ())
@@ -955,11 +968,13 @@ impl capture_worker::CaptureProvider for ExtensionCaptureProvider {
                     self.session.clone(),
                     self.manager.clone(),
                 )
-                .call_exact(
+                .call_exact_for(
                     &self.plugin,
                     memory_context::MEMORY_CAPTURE_TOOL_NAME,
                     &self.digest,
                     memory_context::capture_query_wire(&capture_id),
+                    None,
+                    self.cwd.as_deref(),
                 ),
             )
             .map_err(|_| capture_worker::CaptureFailure {
@@ -989,11 +1004,13 @@ impl capture_worker::CaptureProvider for ExtensionCaptureProvider {
                     self.session.clone(),
                     self.manager.clone(),
                 )
-                .call_exact(
+                .call_exact_for(
                     &self.plugin,
                     memory_context::MEMORY_CAPTURE_TOOL_NAME,
                     &self.digest,
                     params,
+                    None,
+                    self.cwd.as_deref(),
                 ),
             )
             .map(|_| ())
@@ -2697,6 +2714,7 @@ impl Runtime {
         let extension_runtime = self.extension_runtime.clone();
         let binding = self.memory_backend.clone();
         let session = self.host_tool_session.clone();
+        let cwd = self.cwd.clone();
         let outcome = memory_context::resolve_turn_recall(
             &self.memory_context_state,
             &self.retained_recall_turn,
@@ -2725,11 +2743,13 @@ impl Runtime {
                 };
                 let mut response =
                     crate::extensions::lease::ExtensionLeaseCapability::new(session, manager)
-                        .call_exact(
+                        .call_exact_for(
                             plugin,
                             memory_context::MEMORY_RECALL_TOOL_NAME,
                             &digest,
                             memory_context::recall_request_wire(&request),
+                            None,
+                            cwd.as_deref(),
                         )
                         .await
                         .map_err(|_| memory_context::RecallCallError::CallFailed)?;
@@ -3909,6 +3929,7 @@ impl Runtime {
             plugin: plugin.to_owned(),
             digest,
             handle,
+            cwd: self.cwd.clone(),
         }))
     }
 
@@ -4584,6 +4605,7 @@ impl Runtime {
                                         Some(&runtime_name),
                                         input.clone(),
                                         self.session_id.as_deref(),
+                                        self.cwd.as_deref(),
                                     )
                                     .await,
                                     None,
@@ -4611,6 +4633,7 @@ impl Runtime {
                                         output.clone(),
                                         self.max_tool_output,
                                         self.session_id.as_deref(),
+                                        self.cwd.as_deref(),
                                     )
                                     .await;
                                     let rich_blocks = retain_single_tool_blocks(rich_blocks, &output, &hooked_output);
@@ -4692,6 +4715,7 @@ impl Runtime {
                                                     Some(&runtime_name_for_hook),
                                                     input.clone(),
                                                     session_id_inner.as_deref(),
+                                                    cwd_inner.as_deref(),
                                                 )
                                                 .await,
                                                 None,
@@ -4733,7 +4757,7 @@ impl Runtime {
                                                     mcp_leases: None,
                                                     extension_leases: None,
                                                     memory_context: memory_context_inner,
-                                                    cwd: cwd_inner,
+                                                    cwd: cwd_inner.clone(),
                                                     env: env_inner,
                                                     env_stripped: env_stripped_inner,
                                                     env_warned: env_warned_inner,
@@ -4765,6 +4789,7 @@ impl Runtime {
                                                     output.clone(),
                                                     cfg_max_tool_output,
                                                     session_id_inner.as_deref(),
+                                                    cwd_inner.as_deref(),
                                                 )
                                                 .await;
                                             let rich_blocks = retain_single_tool_blocks(

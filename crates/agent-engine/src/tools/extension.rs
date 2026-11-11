@@ -60,6 +60,7 @@ impl crate::tools::Tool for ExtensionTool {
                 &self.tool_name,
                 params,
                 ctx.capabilities.session_id.as_deref(),
+                ctx.capabilities.cwd.as_deref(),
             )
             .await
             .map_err(RuntimeError::Tool)?;

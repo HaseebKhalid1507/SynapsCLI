@@ -658,7 +658,8 @@ async fn run_inline(
 
     // Fire on_session_end hook
     let hook_event =
-        synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&conv.session.id, None);
+        synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&conv.session.id, None)
+            .with_cwd(runtime.cwd());
     let _ = runtime.hook_bus().emit(&hook_event).await;
 
     boot.background.shutdown();

@@ -173,6 +173,16 @@ impl Fixture {
             .map(|line| serde_json::from_str(line).expect("fixture capture JSON"))
             .collect()
     }
+    /// Who the host said each `tool.call` was for (`.callers.jsonl`).
+    fn callers(&self) -> Vec<Value> {
+        let mut path = self.spy.as_os_str().to_os_string();
+        path.push(".callers.jsonl");
+        std::fs::read_to_string(PathBuf::from(path))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("fixture caller JSON"))
+            .collect()
+    }
     fn cleanup(&self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -308,6 +318,57 @@ async fn cancellation_releases_memory_extension_lease_and_blocked_capture_call()
         .await
         .expect("blocked capture call must be released on cancellation")
         .expect("capture task join");
+    fx.cleanup();
+}
+
+/// Recall and capture are host-originated (`session_id: null`) but made for
+/// one chat: their `tool.call` params carry that chat's folder, not the
+/// folder of the process hosting it (a daemon serves many chats). A call
+/// with no chat behind it (the warm-up ping) reports the process folder.
+#[tokio::test]
+#[serial_test::serial]
+async fn recall_and_capture_tool_calls_carry_the_chats_folder() {
+    let fx = fixture("chat-cwd", "memory-store");
+    let mut engine = engine(&fx).await;
+    let chat_dir = fx.dir.join("chat");
+    std::fs::create_dir_all(&chat_dir).unwrap();
+    let process_dir = std::env::current_dir().unwrap();
+    assert_ne!(chat_dir, process_dir);
+    engine.runtime.set_cwd(Some(chat_dir.clone()));
+    memory_command_ok(&engine.runtime, "on");
+    warm_lease(&engine).await;
+
+    let mut prompt = shared(vec![json!({"role": "user", "content": "Which folder?"})]);
+    engine
+        .runtime
+        .apply_turn_memory_recall_for_harness(&mut prompt)
+        .await;
+    engine
+        .runtime
+        .capture_completed_turn_for_harness(
+            shared(vec![
+                json!({"role": "user", "content": "Which folder?"}),
+                json!({"role": "assistant", "content": "The chat's own."}),
+            ]),
+            1,
+        )
+        .expect("completed turn enters bounded capture queue");
+    wait_for_capture_calls(&fx, 1).await;
+
+    let callers = fx.callers();
+    for (tool, dir) in [
+        ("memory_ping", &process_dir),
+        ("memory_recall", &chat_dir),
+        ("memory_capture", &chat_dir),
+    ] {
+        let calls: Vec<&Value> = callers.iter().filter(|c| c["name"] == tool).collect();
+        assert!(!calls.is_empty(), "no {tool} call recorded: {callers:?}");
+        for call in calls {
+            assert_eq!(call["has_cwd"], json!(true), "{call}");
+            assert_eq!(call["cwd"], json!(dir.to_str().unwrap()), "{tool}: {call}");
+            assert_eq!(call["session_id"], Value::Null, "{tool} is host-originated");
+        }
+    }
     fx.cleanup();
 }
 

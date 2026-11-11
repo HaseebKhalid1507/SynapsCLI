@@ -27,6 +27,13 @@ All notable changes to this project will be documented in this file.
   the secret env vars the daemon normally strips to the session's tools
   (`bash`, `grep`/`find`/`ls`, the interactive shell), in memory only.
   Plain sessions are unchanged, except for the interactive shell below.
+- **Extensions: every hook event and `tool.call` carries `cwd`**, the
+  working folder of the chat it is for, so an extension can scope what it
+  does by project. Under the daemon one extension process serves every
+  chat, and `cwd` is the chat's folder, not the daemon's. Subagent workers
+  report their parent chat's folder. Always present (`null` only if the
+  path is not valid UTF-8), not canonicalised, additive: an extension that
+  ignores it is unaffected. See `docs/extensions/hooks.md`.
 
 ### Changed
 

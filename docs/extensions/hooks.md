@@ -95,6 +95,57 @@ registration order. Put high-priority security policy extensions earlier in plug
 load order, and avoid granting trust to plugins that can modify tool inputs unless
 you accept this ordering behavior.
 
+## `cwd`: the chat's working folder
+
+Every hook event carries `cwd`, and so does every `tool.call` request
+(`params.cwd`). It is the folder the chat runs in: the one its tools resolve
+relative paths against and start commands in. Use it to scope what your
+extension does by project. In daemon mode one extension process serves every
+chat, so your own process folder says nothing about which project a call is
+for; `cwd` does.
+
+| Where | `cwd` |
+|---|---|
+| `before_message`, `on_message_complete`, `before_tool_call`, `after_tool_call` | the folder of the chat that fired the hook |
+| `on_session_start`, `on_session_end`, `on_compaction` | the folder of that session |
+| `tool.call` `params.cwd` | the folder of the chat (or worker) that called your tool |
+
+Which folder that is:
+
+- **A chat hosted by the daemon** (`synaps daemon`, the TUI attached to it):
+  the folder the client was started in, or the one it asked for; not the
+  daemon's own folder.
+- **An in-process host** (`synaps chat`, `synaps rpc`, the TUI without a
+  daemon): the folder Synaps was started in.
+- **A subagent worker:** the folder its parent chat runs in. A worker resumed
+  with `subagent_resume` keeps the folder it was first started in, while that
+  folder exists.
+- **A resumed chat:** `--continue` of a chat that is not running takes the
+  folder of the client that resumed it, which is where its tools now run and
+  can differ from the folder the chat was created in. Attaching to a chat
+  that is still running, or waking a parked one, does not change its folder.
+- **No folder of its own:** the host process's folder, which is also where
+  the tools run. That covers tools run by an extension-provided model's own
+  tool loop, a `tool.call` with no chat behind it, and a pinned chat the
+  daemon restores after its folder was deleted.
+
+Rules:
+
+- **Always present.** A string, or `null` when the folder is not valid
+  UTF-8 or cannot be read. Never omitted. `SYNAPS_HOOK_SESSION_ID=0` does not
+  touch it, and workers have it although their `session_id` is `null`.
+- **As given, not canonical.** The path is the client's spelling: symlinks
+  are not resolved and it is not walked up to a repository root. On macOS
+  `/tmp/x` and `/private/tmp/x` are one folder; on Windows case and `\` vs
+  `/` vary. If you key state on `cwd`, canonicalise it yourself, and find the
+  repository root yourself if that is what you mean by "project".
+- **Additive.** Hosts before this field omit the key. Treat a missing key
+  like `null`. An extension that ignores `cwd` is unaffected.
+
+`cwd` is not the same thing as the `host_context: "project_root"` config
+value: that one is resolved once per extension process from the host's own
+folder, so under the daemon it is the daemon's folder for every chat.
+
 ## Subagent workers
 
 A subagent worker's tool calls run only one kind of hook: `after_tool_call`
@@ -113,6 +164,8 @@ without `tools.transform_output`), no message or session hooks.
   spill file holds your output), then read dedupe.
 - **`session_id` is `null`.** A worker has no conversation id (see
   `session-id.md`). Treat `null` as "a worker or no session".
+- **`cwd` is set.** It is the folder the worker runs in: its parent chat's
+  (see "`cwd`: the chat's working folder" above).
 - **One process for everyone.** The main session and all its workers call the
   same extension process; calls are serialized per extension and matched by
   JSON-RPC id, so parallel workers each get the reply to their own call. A

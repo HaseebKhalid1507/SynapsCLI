@@ -652,6 +652,7 @@ impl Tool for DeferredExtensionTool {
                 &self.expected_digest,
                 params,
                 ctx.capabilities.session_id.as_deref(),
+                ctx.capabilities.cwd.as_deref(),
             )
             .await
         {

@@ -19,6 +19,11 @@ The field already existed as `Option<String>` in the JSON schema
 (`docs/extensions/contract.json`), so the change is **additive**: an
 extension that ignores `session_id` sees the same shape it always did.
 
+`session_id` says which chat; it does not say which project. For that, every
+hook event and `tool.call` also carries `cwd`, the chat's working folder
+(set for workers too, and not affected by `SYNAPS_HOOK_SESSION_ID`). See
+`hooks.md`, "`cwd`: the chat's working folder".
+
 ## When it is still `null`
 
 - **Workers / subagents.** A worker runtime has no conversation id
@@ -50,8 +55,9 @@ two sessions interleave their hooks on the same stdin. Key per-session state
 on `params.session_id`, and treat `null` as "no session (worker)".
 
 The in-tree helper is `HookEvent::with_session(Option<&str>)`; the runtime
-emitters `emit_before_tool_call` / `emit_after_tool_call` take a trailing
-`session_id: Option<&str>`.
+emitters `emit_before_tool_call` / `emit_after_tool_call` take
+`session_id: Option<&str>` followed by `cwd: Option<&Path>`
+(`HookEvent::with_cwd`).
 
 ## Plugin contract (daemon-mode phase 3, C2)
 

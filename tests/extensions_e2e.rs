@@ -186,6 +186,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         None,
         serde_json::json!({"command": "rm -rf /tmp/nope"}),
         None,
+        None,
     )
     .await;
     let decision = synaps_cli::runtime::resolve_before_tool_call_decision(
@@ -256,6 +257,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         output,
         256 * 1024,
         None,
+        None,
     )
     .await;
     // No after_tool_call transform handler registered → output unchanged.
@@ -312,6 +314,7 @@ async fn after_tool_call_replace_substitutes_output_via_real_extension() {
         json!({"command": "echo big"}),
         raw,
         256 * 1024,
+        None,
         None,
     )
     .await;
@@ -435,7 +438,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
     manager.shutdown_all().await;
 }
 
-fn whoami_ctx(session_id: Option<&str>) -> ToolContext {
+fn whoami_ctx(session_id: Option<&str>, cwd: Option<&std::path::Path>) -> ToolContext {
     ToolContext {
         channels: synaps_cli::tools::ToolChannels {
             tx_delta: None,
@@ -458,7 +461,7 @@ fn whoami_ctx(session_id: Option<&str>) -> ToolContext {
             mcp_leases: None,
             extension_leases: None,
             memory_context: None,
-            cwd: None,
+            cwd: cwd.map(std::path::Path::to_path_buf),
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
@@ -474,14 +477,11 @@ fn whoami_ctx(session_id: Option<&str>) -> ToolContext {
     }
 }
 
-/// A daemon-shared plugin must learn which conversation invoked its tool:
-/// `tool.call` params carry the caller's `session_id` (the value hook events
-/// already carry), `null` for workers. The key is always present.
-#[tokio::test]
-async fn extension_tool_call_carries_caller_session_id() {
-    // Serialise with hook_json_carries_session_id, which flips the
-    // SYNAPS_HOOK_SESSION_ID kill switch process-wide.
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// The `whoami` fixture loaded as one plugin process, as a daemon shares it.
+async fn load_whoami_plugin() -> (
+    ExtensionManager,
+    Arc<tokio::sync::RwLock<synaps_cli::ToolRegistry>>,
+) {
     let fixture = std::env::current_dir()
         .unwrap()
         .join("tests/fixtures/whoami_tool_extension.py")
@@ -506,6 +506,18 @@ async fn extension_tool_call_carries_caller_session_id() {
         config: vec![],
     };
     manager.load("whoami-test", &manifest).await.unwrap();
+    (manager, tools)
+}
+
+/// A daemon-shared plugin must learn which conversation invoked its tool:
+/// `tool.call` params carry the caller's `session_id` (the value hook events
+/// already carry), `null` for workers. The key is always present.
+#[tokio::test]
+async fn extension_tool_call_carries_caller_session_id() {
+    // Serialise with hook_json_carries_session_id, which flips the
+    // SYNAPS_HOOK_SESSION_ID kill switch process-wide.
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut manager, tools) = load_whoami_plugin().await;
 
     let registry = tools.read().await;
     let tool = registry
@@ -515,7 +527,7 @@ async fn extension_tool_call_carries_caller_session_id() {
     // Two sessions sharing one plugin process → each call names its caller.
     for caller in [Some("sess-A"), Some("sess-B"), None] {
         let output = tool
-            .execute(json!({"k": 1}), whoami_ctx(caller))
+            .execute(json!({"k": 1}), whoami_ctx(caller, None))
             .await
             .unwrap();
         let seen: Value = serde_json::from_str(&output).unwrap();
@@ -534,6 +546,49 @@ async fn extension_tool_call_carries_caller_session_id() {
             json!({"k": 1}),
             "input must be unchanged: {seen}"
         );
+    }
+    drop(registry);
+
+    manager.shutdown_all().await;
+}
+
+/// ... and which folder that conversation runs in: `tool.call` params carry
+/// `cwd`, the caller's session folder when it has one (two chats in one
+/// daemon, a worker in its parent's folder), else the process folder. Never
+/// absent, and not the process folder when the caller has its own.
+#[tokio::test]
+async fn extension_tool_call_carries_caller_cwd() {
+    // Serialise with the test that moves the process folder.
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut manager, tools) = load_whoami_plugin().await;
+    let (chat_a, chat_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let process = std::env::current_dir().unwrap();
+
+    let registry = tools.read().await;
+    let tool = registry
+        .get("whoami-test:whoami")
+        .expect("whoami tool registered");
+
+    for (caller, cwd, expected) in [
+        (Some("sess-A"), Some(chat_a.path()), chat_a.path()),
+        (Some("sess-B"), Some(chat_b.path()), chat_b.path()),
+        // A worker: no conversation id, but its parent's folder.
+        (None, Some(chat_a.path()), chat_a.path()),
+        // No session folder (in-process host): the process folder.
+        (Some("sess-C"), None, process.as_path()),
+    ] {
+        let output = tool
+            .execute(json!({}), whoami_ctx(caller, cwd))
+            .await
+            .unwrap();
+        let seen: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(seen["has_cwd"], json!(true), "cwd key must be present: {seen}");
+        assert_eq!(
+            seen["cwd"],
+            json!(expected.to_str().unwrap()),
+            "caller {caller:?} in {cwd:?}: {seen}"
+        );
+        assert_eq!(seen["session_id"], json!(caller), "{seen}");
     }
     drop(registry);
 
@@ -1907,13 +1962,16 @@ async fn hook_json_carries_session_id() {
     assert_eq!(loaded, vec!["session-id-test".to_string()]);
     assert!(failed.is_empty(), "unexpected discovery failures: {failed:?}");
 
-    // Two sessions in one process → distinct ids on the wire.
+    // Two sessions in one process → distinct ids, and folders, on the wire.
+    let (chat_a, chat_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let process = std::env::current_dir().unwrap();
     let _ = synaps_cli::runtime::emit_before_tool_call(
         &hook_bus,
         "bash",
         None,
         json!({"command": "true"}),
         Some("sess-A"),
+        Some(chat_a.path()),
     )
     .await;
     let _ = synaps_cli::runtime::emit_after_tool_call(
@@ -1924,13 +1982,22 @@ async fn hook_json_carries_session_id() {
         "ok".to_string(),
         1024,
         Some("sess-B"),
+        Some(chat_b.path()),
     )
     .await;
     let _ = hook_bus
-        .emit(&HookEvent::before_message("hi").with_session(Some("sess-A")))
+        .emit(
+            &HookEvent::before_message("hi")
+                .with_session(Some("sess-A"))
+                .with_cwd(Some(chat_a.path())),
+        )
         .await;
     let _ = hook_bus
-        .emit(&HookEvent::on_message_complete("done", json!({})).with_session(Some("sess-B")))
+        .emit(
+            &HookEvent::on_message_complete("done", json!({}))
+                .with_session(Some("sess-B"))
+                .with_cwd(Some(chat_b.path())),
+        )
         .await;
     // Worker path: no owning conversation → still null.
     let _ = synaps_cli::runtime::emit_before_tool_call(
@@ -1938,6 +2005,7 @@ async fn hook_json_carries_session_id() {
         "bash",
         None,
         json!({"command": "true"}),
+        None,
         None,
     )
     .await;
@@ -1970,6 +2038,16 @@ async fn hook_json_carries_session_id() {
             ("before_tool_call".into(), None),
         ],
         "hook JSON must carry the owning session id (log: {seen:?})"
+    );
+    // ... and the folder: each session's own, the process folder for the
+    // call with none, and the key present even on an event nobody stamped.
+    assert!(seen.iter().all(|e| e["has_cwd"] == json!(true)), "{seen:?}");
+    let folders: Vec<Value> = seen.iter().map(|e| e["cwd"].clone()).collect();
+    let (a, b) = (chat_a.path().to_str().unwrap(), chat_b.path().to_str().unwrap());
+    assert_eq!(
+        folders,
+        vec![json!(a), json!(b), json!(a), json!(b), json!(process.to_str().unwrap()), Value::Null],
+        "hook JSON must carry the session's folder (log: {seen:?})"
     );
 
     manager.shutdown_all().await;
@@ -2060,18 +2138,18 @@ async fn session_start_end_per_session() {
 
     use synaps_cli::extensions::loader::{emit_session_end, emit_session_start};
     // Two sessions in one host: two starts with distinct ids …
-    assert!(!emit_session_start(&hook_bus, "sess-A").await, "fixture does not inject");
-    assert!(!emit_session_start(&hook_bus, "sess-B").await);
+    assert!(!emit_session_start(&hook_bus, "sess-A", None).await, "fixture does not inject");
+    assert!(!emit_session_start(&hook_bus, "sess-B", None).await);
     // … keyed injections stay isolated (phase 1 keyed injection) …
     hook_bus.set_session_injection_for("sess-A", "A-only".into()).await;
     hook_bus.set_session_injection_for("sess-B", "B-only".into()).await;
     assert_eq!(hook_bus.session_injection_for("sess-A").await.as_deref(), Some("A-only"));
     assert_eq!(hook_bus.session_injection_for("sess-B").await.as_deref(), Some("B-only"));
     // … and two ends, each clearing only its own injection.
-    assert!(emit_session_end(&hook_bus, "sess-A", None, Duration::from_secs(5)).await);
+    assert!(emit_session_end(&hook_bus, "sess-A", None, None, Duration::from_secs(5)).await);
     assert_eq!(hook_bus.session_injection_for("sess-A").await, None);
     assert_eq!(hook_bus.session_injection_for("sess-B").await.as_deref(), Some("B-only"));
-    assert!(emit_session_end(&hook_bus, "sess-B", None, Duration::from_secs(5)).await);
+    assert!(emit_session_end(&hook_bus, "sess-B", None, None, Duration::from_secs(5)).await);
     assert_eq!(hook_bus.session_injection_for("sess-B").await, None);
 
     let seen = read_jsonl(&log_path);

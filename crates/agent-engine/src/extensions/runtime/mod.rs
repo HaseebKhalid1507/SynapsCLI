@@ -137,17 +137,19 @@ pub trait ExtensionHandler: Send + Sync {
     /// Call an extension-provided tool on behalf of a conversation.
     ///
     /// `session_id` is the owning conversation id (`None` = worker/subagent
-    /// or no conversation). Runtimes that put it on the wire override this;
-    /// the default drops it and calls [`Self::call_tool`], so handlers that
-    /// predate the field (and wrappers that fail closed) keep their exact
-    /// behaviour.
+    /// or no conversation); `cwd` is the folder the caller runs in (`None` =
+    /// the process folder). Runtimes that put them on the wire override
+    /// this; the default drops both and calls [`Self::call_tool`], so
+    /// handlers that predate the fields (and wrappers that fail closed) keep
+    /// their exact behaviour.
     async fn call_tool_for(
         &self,
         name: &str,
         input: Value,
         session_id: Option<&str>,
+        cwd: Option<&std::path::Path>,
     ) -> Result<Value, String> {
-        let _ = session_id;
+        let _ = (session_id, cwd);
         self.call_tool(name, input).await
     }
 
