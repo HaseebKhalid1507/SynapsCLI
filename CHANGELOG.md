@@ -313,6 +313,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Memory: a chat whose folder has no project gets no memory lease.** Such
+  a chat (no folder, or a folder that cannot be resolved) was granted
+  leases under the one id `project-unresolved`, so two of them sent a
+  memory extension the same project id for capture and recall, and one
+  could be handed what the other captured. Now no id is invented: memory
+  is off for that chat. `/memory` answers that it is unavailable, the
+  default mode and a restored `/memory` choice log one warning, and the
+  turn runs without recall. A chat woken from park after its folder was
+  deleted wakes without that folder (in the daemon's folder and its
+  project), as a daemon reload and a pinned restore already did; a folder
+  that exists but cannot be checked right now is kept.
 - **Notes: a save made while a notes file is rewritten is no longer lost.**
   `synaps retention sweep` and `synaps retention forget memory` rewrite
   `memory/<ns>.jsonl` and rename the new file over the old one. A note saved

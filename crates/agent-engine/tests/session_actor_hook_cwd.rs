@@ -422,6 +422,38 @@ async fn a_chat_woken_from_park_still_names_its_folder() {
     assert_names(&recorder, id, dir.path(), &kinds);
 }
 
+/// A chat whose folder was deleted while it was parked wakes without it, as
+/// a reload restores it: in the host's folder, never naming the dead path
+/// (which has no project, so memory and notes would have nowhere to go).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_chat_whose_folder_was_deleted_while_parked_wakes_without_it() {
+    let (_h, host, recorder) = setup().await;
+    let parent = tempfile::tempdir().unwrap();
+    let folder = parent.path().join("chat");
+    std::fs::create_dir(&folder).unwrap();
+    let (handle, mut t) = session(&host, cfg_in(&folder)).await;
+    let id = handle.id.as_str();
+    turn(&mut t).await;
+    detach(t).await;
+    handle.send(SessionCommand::Park).await.unwrap();
+    wait_parked(&handle).await;
+    std::fs::remove_dir(&folder).unwrap();
+    recorder.clear();
+
+    let mut t = attach(&handle).await;
+    assert_eq!(handle.lifecycle(), SessionLifecycle::Live);
+    turn(&mut t).await;
+    end_and_close(&recorder, &handle, t).await;
+    let host_dir = std::env::current_dir().unwrap();
+    let seen = recorder.all();
+    assert!(seen.iter().any(|s| s.kind.is_none()), "no tool.call: {seen:#?}");
+    for s in &seen {
+        assert_eq!(s.session_id.as_deref(), Some(id), "{seen:#?}");
+        assert_eq!(s.cwd.as_deref(), host_dir.to_str(), "{:?} names {:?}", s.kind, s.cwd);
+    }
+}
+
 /// `--continue` of a chat that is not running takes the folder of the client
 /// that resumed it: that is where its tools now run, so that is what its
 /// hooks and tool calls name. Not the folder it was created in, and not the
