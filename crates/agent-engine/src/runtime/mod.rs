@@ -2306,14 +2306,6 @@ impl Runtime {
         .anchored(anchor.as_ref(), messages)
     }
 
-    /// C5 lease-release assertion seam (metadata only).
-    #[cfg(any(test, feature = "testing"))]
-    pub fn extension_lease_count_for_harness(&self) -> usize {
-        self.extension_runtime
-            .as_ref()
-            .map_or(0, |manager| manager.lease_count())
-    }
-
     /// Inherit storage authority only, with a fresh worker execution author.
     /// Oneshot, start, and resume share this path; even resume must not reuse
     /// a prior actor. Off/no-lease context state and tool grants stay untouched.

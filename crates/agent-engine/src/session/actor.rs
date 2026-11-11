@@ -5780,8 +5780,8 @@ impl SessionTask {
     }
 
     /// Test seam: a clone of this session's runtime. Clones share the
-    /// memory-consent state, so a harness can revoke consent the way the
-    /// `memory_context` tool's capability does (`memory_context_disable`).
+    /// session's state (continuation, tool set), so a harness can change a
+    /// setting on it before the task runs.
     #[cfg(any(test, feature = "testing"))]
     pub fn runtime_for_harness(&self) -> crate::Runtime {
         (*self.0.runtime).clone()
