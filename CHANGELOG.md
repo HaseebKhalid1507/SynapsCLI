@@ -275,6 +275,20 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **Built-in automatic memory (capture and recall) is out of the engine.**
+  The runtime no longer holds a memory lease, asks a context provider for
+  recalled text before a turn, or sends a finished turn or a compaction
+  summary to a capture provider; the history-import preview went with them
+  (`runtime/memory_context.rs`, `memory_history.rs`, `chat_capture.rs`,
+  `capture_worker.rs`, `axel_context.rs`). Nothing could switch this on
+  since `/memory` and the `memory_context` tool were removed, so a turn
+  behaves as before. An extension does this work now, on the hook bus: no
+  hook kind, hook event field or protocol method changed. Unchanged too:
+  context rollover and the archive store, the four memory tools, the
+  memory backend setting, context-provider declarations in a manifest
+  (still loaded, no longer consulted) and the `memory.*` config keys
+  (still parsed; the automatic-memory ones have no effect). The context
+  budget's memory lane is always empty.
 - **The per-session memory mode.** A session no longer records a memory
   choice (`SessionConfig::memory_mode`), a rebuilt runtime (unpark, daemon
   reload) no longer restores one, and no session runtime applies

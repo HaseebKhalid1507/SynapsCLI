@@ -1515,9 +1515,5 @@ mod tests {
                 other => panic!("/memory {arg}: expected the removal line, got {other:?}"),
             }
         }
-        assert_eq!(
-            runtime.memory_context_status().durable,
-            crate::runtime::memory_context::DurableStatus::Off
-        );
     }
 }

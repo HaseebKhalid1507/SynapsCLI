@@ -132,9 +132,6 @@ fn validated_tool_output(model: &str, output: crate::ToolOutput) -> (String, Opt
 pub(super) struct StreamSession {
     // Context continuation
     pub(super) memory_backend: crate::memory_backend::MemoryBinding,
-    /// Set only at a successful, non-cancelled terminal assistant boundary.
-    /// Error/budget/cancel paths leave this empty, even when they return Ok.
-    pub(super) final_capture_history: Arc<Mutex<Option<Vec<SharedMessage>>>>,
     /// Marked at the turn's normal end (see `TurnCompletion`).
     pub(super) turn_completion: super::types::TurnCompletion,
     pub(super) context_window: u64,
@@ -673,7 +670,6 @@ impl StreamMethods {
     ) -> Result<()> {
         let StreamSession {
             memory_backend,
-            final_capture_history,
             turn_completion,
             context_window,
             continuation,
@@ -1889,13 +1885,7 @@ impl StreamMethods {
                     let after_tool_result = budget_meter.rounds_used() > 1;
                     if after_tool_result && !cancel.is_cancelled() {
                         // Legitimate empty end_turn after tool results — clean finish.
-                        // A clean finish is a terminal completion: publish the
-                        // history for memory capture like the normal end_turn path.
                         turn_completion.mark_completed();
-                        *final_capture_history
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(messages.clone());
                         send_history!();
                         return Ok(());
                     }
@@ -2054,12 +2044,6 @@ impl StreamMethods {
                                     )));
                                 }
                             }
-                        }
-                        if !cancel.is_cancelled() {
-                            *final_capture_history
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(messages.clone());
                         }
                         if !response_cancelled {
                             turn_completion.mark_completed();
@@ -4375,7 +4359,6 @@ mod rich_output_tests {
     ) -> StreamSession {
         StreamSession {
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
-            final_capture_history: Arc::new(Mutex::new(None)),
             turn_completion: Default::default(),
             context_window: 200_000,
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
@@ -6469,7 +6452,6 @@ mod rich_output_tests {
 
         let session = StreamSession {
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
-            final_capture_history: Arc::new(Mutex::new(None)),
             turn_completion: Default::default(),
             context_window: 200_000,
             continuation: std::sync::Arc::new(std::sync::Mutex::new(

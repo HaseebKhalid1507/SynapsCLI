@@ -15,13 +15,10 @@ mod api;
 mod api_sync;
 pub mod attachments;
 mod auth;
-mod axel_context;
 #[cfg(test)]
 mod body_golden;
 pub mod budget;
 mod cache_diagnosis;
-pub mod capture_worker;
-pub mod chat_capture;
 pub(crate) mod cloud_invoke;
 pub mod compaction;
 pub mod context;
@@ -40,8 +37,6 @@ pub mod tool_keepwarm;
 #[cfg(test)]
 #[path = "../../tests/support/cache_sim.rs"]
 pub(crate) mod cache_sim;
-pub mod memory_context;
-pub mod memory_history;
 pub mod message_time;
 pub mod openai;
 pub mod relay;
@@ -651,18 +646,6 @@ pub struct Runtime {
     /// exactly the next outgoing provider request, even when telemetry is
     /// Off, then auto-disarms. Shared across clones.
     trace_controls: std::sync::Arc<trace::TraceControls>,
-    /// Session-scoped continuous-memory context state (task A5, spec §7.3):
-    /// the single state machine every frontend's `/memory` command and the
-    /// task-A4 `memory_context` tool observe. Shared across `Clone`s —
-    /// clones are the same session, so all its streams see one truth — but
-    /// NEVER inherited by subagents: every subagent spawn path constructs a
-    /// brand-new `Runtime::new()` (then `apply_subagent_runtime_policy`,
-    /// see `tools/subagent/mod.rs`), and every `Runtime` constructor
-    /// initializes this slot to the Off/no-lease default via
-    /// [`fresh_memory_context_state`]. Do not add any code path that copies
-    /// memory-context state from a parent runtime into a freshly
-    /// constructed one.
-    memory_context_state: std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>>,
     /// Immutable host-owned note backend and captured project scope (#112).
     /// DARK by default: `MemoryBinding::legacy_current()`.
     memory_backend: crate::memory_backend::MemoryBinding,
@@ -670,40 +653,6 @@ pub struct Runtime {
     memory_backend_config: Option<crate::config::MemoryBackendConfig>,
     /// Sticky across same-session clones: live extension policy needs restart.
     memory_backend_reconfigure_denied: Arc<std::sync::atomic::AtomicBool>,
-    /// Production resolves the exact leased extension provider at dispatch.
-    /// Tests may install this in-process provider to observe the same worker
-    /// boundary without spawning an extension process.
-    #[cfg(any(test, feature = "testing"))]
-    capture_provider_for_test: std::sync::Arc<
-        std::sync::Mutex<Option<std::sync::Arc<dyn capture_worker::CaptureProvider>>>,
-    >,
-    /// Pending D1 disclosure awaiting an explicit `/memory index-history
-    /// confirm|decline` decision. Same-session clones share one pending preview;
-    /// fresh runtimes and subagents start with none.
-    pending_history_import_preview:
-        std::sync::Arc<std::sync::Mutex<Option<memory_history::HistoryImportPreview>>>,
-    /// The last explicitly confirmed D1 plan, retained for D2 to consume.
-    history_import_plan: std::sync::Arc<std::sync::Mutex<Option<memory_history::ImportPlan>>>,
-    /// The validated recall contribution held for the CURRENT turn, if any
-    /// (task A7, spec §10.1): a typed [`memory_context::ContextSegment`] —
-    /// never raw text — admitted only through the
-    /// [`memory_context::validate_contribution`] gate. It feeds the T29
-    /// context-budget `memory_contents` lane in [`Runtime::assess_context`];
-    /// as of task B4 the per-turn recall flow keeps it in sync with the
-    /// injected wire segment. Shared across `Clone`s (same session, one
-    /// truth) but NEVER inherited by subagents — every constructor
-    /// initializes the slot empty, same invariant as `memory_context_state`
-    /// above.
-    pending_memory_segment:
-        std::sync::Arc<std::sync::Mutex<Option<memory_context::ContextSegment>>>,
-    /// Task B4 (spec §7.4): the accepted recall retained for the CURRENT
-    /// logical request — the contribution reused verbatim by retries of the
-    /// same request (never a second provider call) plus the §10.4
-    /// explainability metadata behind `/memory why` (task B5). Shared
-    /// across `Clone`s; never inherited by subagents (fresh empty slot in
-    /// every constructor, same invariant as `pending_memory_segment`).
-    retained_recall_turn:
-        std::sync::Arc<std::sync::Mutex<Option<memory_context::RetainedRecallTurn>>>,
     /// Writer handle backing the most recent armed one-shot ephemeral
     /// trace context (telemetry Off + `/trace next`). Retained here — not
     /// only inside the request's cloned context — so the session exit
@@ -865,268 +814,6 @@ fn fresh_host_tool_session() -> crate::tools::activation::SessionId {
         uuid::Uuid::new_v4()
     ))
     .expect("generated runtime session id is always valid")
-}
-
-/// Fresh Off/no-lease memory-context state for a newly constructed runtime
-/// (task A5). CRITICAL INVARIANT: every `Runtime` constructor calls this,
-/// and subagent spawn paths build a brand-new `Runtime::new()` before
-/// `apply_subagent_runtime_policy` runs — so subagents always start with no
-/// memory lease. Memory-context state must never be copied from a parent
-/// runtime into a freshly constructed one.
-fn fresh_memory_context_state(
-) -> std::sync::Arc<std::sync::Mutex<memory_context::SessionMemoryState>> {
-    let session = memory_context::SessionId::parse(&format!(
-        "memctx-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ))
-    .expect("generated memory session id is always valid");
-    std::sync::Arc::new(std::sync::Mutex::new(
-        memory_context::SessionMemoryState::new(session),
-    ))
-}
-
-/// The spec-canonical continuous-memory provider identity (spec §17.3,
-/// Axel memory-manager). FALLBACK ONLY as of task A6: it is recorded on
-/// command-granted leases exclusively when NO extension subsystem is wired
-/// into the runtime (legacy/flag-off construction — see
-/// [`Runtime::resolve_memory_provider`]). When the extension runtime is
-/// installed, enable-time validation resolves the exact declared provider
-/// from the loaded catalog instead, failing closed on zero or ambiguous
-/// matches.
-fn memory_capture_worker() -> &'static capture_worker::CaptureWorker {
-    static WORKER: std::sync::OnceLock<capture_worker::CaptureWorker> = std::sync::OnceLock::new();
-    WORKER.get_or_init(|| capture_worker::CaptureWorker::new(32))
-}
-
-struct ExtensionCaptureProvider {
-    manager: std::sync::Arc<crate::extensions::lease::ExtensionRuntimeManager>,
-    session: crate::tools::activation::SessionId,
-    plugin: String,
-    digest: crate::tools::catalog::SchemaDigest,
-    handle: tokio::runtime::Handle,
-    /// The chat's folder, sent as `tool.call` `params.cwd`: these calls are
-    /// host-originated (`session_id: null`) but made for one chat.
-    cwd: Option<PathBuf>,
-}
-
-impl capture_worker::CaptureProvider for ExtensionCaptureProvider {
-    fn capture(
-        &self,
-        capture: chat_capture::ChatTurnCapture,
-    ) -> std::result::Result<(), capture_worker::CaptureFailure> {
-        let params = memory_context::capture_request_wire(&capture);
-        self.handle
-            .block_on(
-                crate::extensions::lease::ExtensionLeaseCapability::new(
-                    self.session.clone(),
-                    self.manager.clone(),
-                )
-                .call_exact_for(
-                    &self.plugin,
-                    memory_context::MEMORY_CAPTURE_TOOL_NAME,
-                    &self.digest,
-                    params,
-                    None,
-                    self.cwd.as_deref(),
-                ),
-            )
-            .map(|_| ())
-            .map_err(|_| capture_worker::CaptureFailure {
-                code: "provider_call_failed",
-            })
-    }
-
-    fn contains_capture(
-        &self,
-        capture_id: &[u8; 32],
-    ) -> std::result::Result<capture_worker::CaptureCommitState, capture_worker::CaptureFailure>
-    {
-        let capture_id = chat_capture::CaptureId::from_bytes(*capture_id);
-        let response = self
-            .handle
-            .block_on(
-                crate::extensions::lease::ExtensionLeaseCapability::new(
-                    self.session.clone(),
-                    self.manager.clone(),
-                )
-                .call_exact_for(
-                    &self.plugin,
-                    memory_context::MEMORY_CAPTURE_TOOL_NAME,
-                    &self.digest,
-                    memory_context::capture_query_wire(&capture_id),
-                    None,
-                    self.cwd.as_deref(),
-                ),
-            )
-            .map_err(|_| capture_worker::CaptureFailure {
-                code: "provider_query_failed",
-            })?;
-        Ok(
-            if response
-                .get("committed")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            {
-                capture_worker::CaptureCommitState::Committed
-            } else {
-                capture_worker::CaptureCommitState::Absent
-            },
-        )
-    }
-
-    fn capture_summary(
-        &self,
-        capture: chat_capture::ConversationSummaryCapture,
-    ) -> std::result::Result<(), capture_worker::CaptureFailure> {
-        let params = memory_context::summary_capture_request_wire(&capture);
-        self.handle
-            .block_on(
-                crate::extensions::lease::ExtensionLeaseCapability::new(
-                    self.session.clone(),
-                    self.manager.clone(),
-                )
-                .call_exact_for(
-                    &self.plugin,
-                    memory_context::MEMORY_CAPTURE_TOOL_NAME,
-                    &self.digest,
-                    params,
-                    None,
-                    self.cwd.as_deref(),
-                ),
-            )
-            .map(|_| ())
-            .map_err(|_| capture_worker::CaptureFailure {
-                code: "provider_call_failed",
-            })
-    }
-}
-
-fn terminal_capture_history(
-    lease: &memory_context::MemoryContextLease,
-    messages: &[crate::SharedMessage],
-    started_at: std::time::SystemTime,
-) -> chat_capture::TerminalTurnHistory {
-    use agent_core::core::disclosure::DisclosureClass;
-    let mut items = Vec::new();
-    for message in messages {
-        let Some(role) = message.get("role").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let class = match role {
-            "user" => chat_capture::CaptureContentClass::UserMessage,
-            "assistant" => chat_capture::CaptureContentClass::AssistantFinal,
-            _ => continue,
-        };
-        let text = message
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                message
-                    .get("content")
-                    .map(ToString::to_string)
-                    .unwrap_or_default()
-            });
-        items.push(chat_capture::CanonicalCaptureItem {
-            project_id: lease.project_id.clone(),
-            class,
-            disclosure: DisclosureClass::ModelVisible,
-            sensitivity: chat_capture::Sensitivity::Normal,
-            text,
-            tool_name: None,
-        });
-    }
-    chat_capture::TerminalTurnHistory {
-        project_id: lease.project_id.clone(),
-        session_id: lease.session_id.clone(),
-        turn_id: memory_context::TurnId::parse(&format!("turn-{}", uuid::Uuid::new_v4()))
-            .expect("generated turn id"),
-        turn_ordinal: 0,
-        started_at,
-        completed_at: std::time::SystemTime::now(),
-        outcome: agent_core::TurnOutcome::Completed,
-        items,
-        compaction: None,
-    }
-}
-
-fn memory_provider_id() -> memory_context::ContextProviderId {
-    memory_context::ContextProviderId::parse("axel-memory")
-        .expect("static provider id is always valid")
-}
-
-fn terminal_capture_start(messages: &[crate::SharedMessage]) -> Option<crate::SharedMessage> {
-    messages
-        .iter()
-        .rfind(|message| {
-            message["role"] == "user"
-                && (message["content"].is_string()
-                    || message["content"].as_array().is_some_and(|blocks| {
-                        blocks.iter().any(|block| block["type"] != "tool_result")
-                    }))
-        })
-        .cloned()
-}
-
-fn terminal_capture_messages<'a>(
-    messages: &'a [crate::SharedMessage],
-    start: &crate::SharedMessage,
-) -> Option<&'a [crate::SharedMessage]> {
-    // Identity, not an index (recall may prepend) or text equality (old turns
-    // can have identical prompts). If rollover removed the source, fail closed
-    // rather than recapturing its summary or unrelated earlier history.
-    let index = messages
-        .iter()
-        .position(|message| Arc::ptr_eq(message, start))?;
-    Some(&messages[index..])
-}
-
-/// The stream publishes history only after a valid terminal completion. Consume
-/// it once, never capture the pre-inference prompt or reselect a changed lease.
-fn dispatch_completed_terminal_capture(
-    completed: bool,
-    final_history: &std::sync::Mutex<Option<Vec<crate::SharedMessage>>>,
-    state: &std::sync::Mutex<memory_context::SessionMemoryState>,
-    selected: Option<(
-        memory_context::MemoryContextLease,
-        Arc<dyn capture_worker::CaptureProvider>,
-    )>,
-    started_at: std::time::SystemTime,
-    turn_start: Option<&crate::SharedMessage>,
-) -> bool {
-    let history = final_history
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    let (Some(messages), Some((lease, provider))) = (history, selected) else {
-        return false;
-    };
-    if !completed {
-        return false;
-    }
-    let Some(messages) = turn_start.and_then(|start| terminal_capture_messages(&messages, start))
-    else {
-        return false;
-    };
-    let state = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if state
-        .capture_lease_at(std::time::SystemTime::now())
-        .as_ref()
-        != Some(&lease)
-    {
-        return false;
-    }
-    memory_capture_worker()
-        .submit_terminal(
-            &lease,
-            terminal_capture_history(&lease, messages, started_at),
-            memory_context::RetentionClass::Standard,
-            provider,
-        )
-        .unwrap_or(false)
 }
 
 /// Idle timeout for the runtime HTTP client: how long a request may go
@@ -1344,23 +1031,12 @@ impl Runtime {
             telemetry_writer: None,
             trace_ctx: trace::TraceContext::disabled(),
             trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
-            // Off/no-lease default — subagents get a FRESH construction of
-            // this state (task A5 invariant), never a copy of the parent's.
-            memory_context_state: fresh_memory_context_state(),
             // DARK defaults: legacy memory backend, continuation off (#112).
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
             memory_backend_config: None,
             memory_backend_reconfigure_denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             continuation: Arc::new(Mutex::new(continuation::ContinuationState::default())),
             worker_context: Default::default(),
-            pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            #[cfg(any(test, feature = "testing"))]
-            capture_provider_for_test: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            // Empty per construction — a held recall segment is turn-scoped
-            // session state and is never copied into a fresh runtime.
-            pending_memory_segment: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            retained_recall_turn: std::sync::Arc::new(std::sync::Mutex::new(None)),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             capture_dir: host.capture_dir,
             cache_diagnostics: false,
@@ -2601,27 +2277,14 @@ impl Runtime {
     ///
     /// Skill bodies that reach the request do so through the system prompt
     /// or history today, so they are already accounted there; the skill lane
-    /// is fed once loaders hand the engine distinct segments. The memory
-    /// lane is live as of task A7: a validated recall segment held for the
-    /// current turn is charged to `ContextBreakdown::memory_tokens` (spec
-    /// §10.3 — memory competes for budget headroom only, never reserves).
+    /// is fed once loaders hand the engine distinct segments. Nothing in
+    /// core feeds the memory lane any more: it stays empty.
     pub async fn assess_context(
         &self,
         messages: &[crate::SharedMessage],
     ) -> context::ContextAssessment {
         let system = self.effective_system_prompt().await;
         let schema = self.offered_tools_schema().await;
-        // Task A7 (spec §10.1/§10.3): the T29 memory lane is fed by the
-        // validated recall segment held for this turn, if any. No held
-        // segment ⇒ the lane stays empty — byte-identical to the pre-A7
-        // assessment. Cloned out so no lock is held across the estimate.
-        let memory_rendered: Option<String> = self
-            .pending_memory_segment
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|segment| segment.rendered_text().to_string());
-        let memory_contents: Vec<&str> = memory_rendered.as_deref().into_iter().collect();
         let anchor = self
             .continuation
             .lock()
@@ -2635,299 +2298,12 @@ impl Runtime {
             tools_schema: &schema,
             messages,
             skill_contents: &[],
-            memory_contents: &memory_contents,
+            memory_contents: &[],
             thinking_budget_tokens: self.thinking_budget as u64,
             next_tool_result_bytes: self.max_tool_output as u64,
             max_output_tokens: HelperMethods::max_tokens_for_model(&self.model),
         })
         .anchored(anchor.as_ref(), messages)
-    }
-
-    /// Task A7: hold a validated recall contribution for the current turn as
-    /// a typed [`memory_context::ContextSegment`] (spec §10.1 — typed
-    /// segment, never raw text). Fail-closed acceptance gate:
-    ///
-    /// - the §10.3 budget must clear its minimum floor for the session's
-    ///   provider window ([`memory_context::memory_budget_tokens`]) —
-    ///   otherwise recall is skipped and nothing is held;
-    /// - [`memory_context::validate_contribution`] must pass — project
-    ///   identity (spec §5.2), schema, and bounds — otherwise nothing is
-    ///   held.
-    ///
-    /// Phase A scope: a held segment feeds ONLY the T29 budget lane in
-    /// [`Self::assess_context`]; per-provider wire injection is task B4.
-    /// Hold-time uses the provider window as the capacity input — the
-    /// conservative upper bound available before a request exists; B4's
-    /// injection path re-checks against the request-aware effective budget.
-    #[allow(dead_code)] // exercised by tests until task B4 routes real recall
-    pub(crate) fn hold_memory_contribution(
-        &self,
-        contribution: memory_context::MemoryContextContribution,
-    ) -> std::result::Result<(), memory_context::MemoryContextError> {
-        let budget = memory_context::memory_budget_tokens(self.context_window())
-            .ok_or(memory_context::MemoryContextError::RecallBudgetBelowMinimum)?;
-        let project_id = self
-            .memory_context_project_id()
-            .ok_or(memory_context::MemoryContextError::ContributionProjectMismatch)?;
-        // Phase A hold path: until task B3 threads a real `RecallRequest`
-        // through dispatch, the host's conservative default grant applies —
-        // only baseline model-visible records are accepted back.
-        memory_context::validate_contribution(
-            &contribution,
-            &project_id,
-            budget,
-            &memory_context::DisclosureGrantSet::model_visible_only(),
-        )?;
-        *self
-            .pending_memory_segment
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(memory_context::ContextSegment::Memory(contribution));
-        Ok(())
-    }
-
-    /// Task A7: drop any recall segment held for the current turn. Idempotent.
-    /// Task B4 calls this on every turn that carries no accepted recall; the
-    /// disable/revocation path may also use it defensively.
-    pub(crate) fn clear_memory_contribution(&self) {
-        *self
-            .pending_memory_segment
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    }
-
-    /// Task B4 (spec §10.4): explainability metadata retained for the
-    /// current turn's accepted recall, if any. Metadata only — selected IDs,
-    /// source classes, rank reasons, byte/token accounting, latency, and
-    /// withheld/skipped counts; never memory content. Rendered for
-    /// `/memory why` by [`memory_context::render_recall_why`] (task B5).
-    pub fn memory_recall_why(&self) -> Option<memory_context::RecallTurnMetadata> {
-        self.retained_recall_turn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|retained| retained.why.clone())
-    }
-
-    /// Task B4 (spec §7.4): the ONE provider-agnostic per-prompt recall
-    /// point, run on the owned turn `messages` BEFORE any per-provider wire
-    /// translation forks. Delegates every decision to
-    /// [`memory_context::resolve_turn_recall`] (eligibility, retry-exact
-    /// reuse, §10.3 budget floor, §16.2 hard timeout, fail-open skips) and
-    /// then syncs the T29 budget lane:
-    ///
-    /// - accepted/reused recall ⇒ the held segment mirrors the injected
-    ///   synthetic message;
-    /// - everything else ⇒ the held segment is cleared, so `messages` and
-    ///   the assessment are byte-identical to the pre-task behavior.
-    ///
-    /// Dispatch routes through the granted provider's
-    /// [`crate::extensions::lease::ExtensionLeaseCapability::call_exact_for`]
-    /// (task A6 wiring): the lease's composed `extension:<plugin>:<id>`
-    /// address plus the plugin's declared recall tool digest — an unroutable
-    /// provider fails open as `provider_unavailable` without ever spawning.
-    async fn apply_turn_memory_recall(&self, messages: &mut Vec<crate::SharedMessage>) {
-        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
-            || self
-                .memory_backend_reconfigure_denied
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            self.clear_memory_contribution();
-            tracing::debug!("memory recall unavailable for the selected host backend");
-            return;
-        }
-        // No project: no lease was granted, so there is nothing to recall.
-        let Some(project_id) = self.memory_context_project_id() else {
-            self.clear_memory_contribution();
-            return;
-        };
-        let extension_runtime = self.extension_runtime.clone();
-        let binding = self.memory_backend.clone();
-        let session = self.host_tool_session.clone();
-        let cwd = self.cwd.clone();
-        let outcome = memory_context::resolve_turn_recall(
-            &self.memory_context_state,
-            &self.retained_recall_turn,
-            &project_id,
-            self.context_window(),
-            messages,
-            memory_context::RECALL_HARD_TIMEOUT,
-            move |lease: memory_context::MemoryContextLease,
-                  request: memory_context::RecallRequest| async move {
-                if binding.is_axel() {
-                    return axel_context::recall(binding, lease, request).await;
-                }
-                let Some(manager) = extension_runtime else {
-                    return Err(memory_context::RecallCallError::ProviderUnavailable);
-                };
-                let mut parts = lease.provider_id.as_str().splitn(3, ':');
-                let (Some("extension"), Some(plugin), Some(local)) =
-                    (parts.next(), parts.next(), parts.next())
-                else {
-                    return Err(memory_context::RecallCallError::ProviderUnavailable);
-                };
-                let Some(digest) =
-                    manager.declared_tool_digest(plugin, memory_context::MEMORY_RECALL_TOOL_NAME)
-                else {
-                    return Err(memory_context::RecallCallError::ProviderUnavailable);
-                };
-                let mut response =
-                    crate::extensions::lease::ExtensionLeaseCapability::new(session, manager)
-                        .call_exact_for(
-                            plugin,
-                            memory_context::MEMORY_RECALL_TOOL_NAME,
-                            &digest,
-                            memory_context::recall_request_wire(&request),
-                            None,
-                            cwd.as_deref(),
-                        )
-                        .await
-                        .map_err(|_| memory_context::RecallCallError::CallFailed)?;
-                // Legacy extension wire names the local declared provider;
-                // bind it to the exact host-qualified lease after validation.
-                if response["provider_id"] != local
-                    && response["provider_id"] != lease.provider_id.as_str()
-                {
-                    return Err(memory_context::RecallCallError::CallFailed);
-                }
-                response["provider_id"] = json!(lease.provider_id.as_str());
-                Ok(response)
-            },
-        )
-        .await;
-        match outcome {
-            memory_context::TurnRecallOutcome::Injected
-            | memory_context::TurnRecallOutcome::ReusedRetained => {
-                let contribution = self
-                    .retained_recall_turn
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_ref()
-                    .map(|retained| retained.contribution.clone());
-                if let Some(contribution) = contribution {
-                    *self
-                        .pending_memory_segment
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(memory_context::ContextSegment::Memory(contribution));
-                }
-            }
-            memory_context::TurnRecallOutcome::NotEligible => {
-                self.clear_memory_contribution();
-            }
-            memory_context::TurnRecallOutcome::SkippedOpen(reason) => {
-                self.clear_memory_contribution();
-                // Bounded metadata diagnostic (spec §13.1) — reason key
-                // only, never content. Fail open: the turn proceeds.
-                tracing::debug!(
-                    reason = reason.as_str(),
-                    "memory recall skipped; turn proceeds without memory"
-                );
-            }
-        }
-    }
-
-    /// Task B6 harness seam: the EXACT per-prompt recall entry point the
-    /// stream path runs ([`Self::apply_turn_memory_recall`], the single
-    /// hook `run_stream_with_messages` calls before any per-provider wire
-    /// translation), exposed so the headless Phase B end-to-end harness
-    /// (`tests/memory_context_e2e.rs`) can drive the REAL engine recall
-    /// flow — real [`crate::extensions::lease::ExtensionLeaseCapability`],
-    /// real child process, real §16.2 timeout — without provider
-    /// credentials for the outer HTTP call. Compiled only for tests and
-    /// `testing` builds, mirroring [`Runtime::new_headless`].
-    #[cfg(any(test, feature = "testing"))]
-    pub async fn apply_turn_memory_recall_for_harness(
-        &self,
-        messages: &mut Vec<crate::SharedMessage>,
-    ) {
-        self.apply_turn_memory_recall(messages).await;
-    }
-
-    /// F1 headless seam for the production C3 terminal-capture path. The caller
-    /// supplies the canonical completed turn; lease selection, typed building,
-    /// bounded queueing, and exact extension dispatch are unchanged.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn capture_completed_turn_for_harness(
-        &self,
-        messages: Vec<crate::SharedMessage>,
-        turn_ordinal: u64,
-    ) -> std::result::Result<(), &'static str> {
-        let started_at = std::time::SystemTime::now();
-        let lease = self
-            .memory_context_lock()
-            .capture_lease_at(started_at)
-            .ok_or("capture lease unavailable")?;
-        let provider = self
-            .extension_capture_provider(&lease)
-            .ok_or("capture provider unavailable")?;
-        let mut history = terminal_capture_history(&lease, &messages, started_at);
-        history.turn_ordinal = turn_ordinal;
-        memory_capture_worker()
-            .submit_terminal(
-                &lease,
-                history,
-                memory_context::RetentionClass::Standard,
-                provider,
-            )
-            .map_err(|_| "capture build failed")?;
-        Ok(())
-    }
-
-    /// F1 headless seam for C4 summary capture with explicit source-range
-    /// provenance. All identifiers still come from the active host lease.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn capture_compaction_summary_for_harness(
-        &self,
-        first_turn_ordinal: u64,
-        last_turn_ordinal: u64,
-        source_digest: &str,
-        source_message_count: usize,
-        summary_text: &str,
-    ) -> std::result::Result<(), &'static str> {
-        let summarized_at = std::time::SystemTime::now();
-        let lease = self
-            .memory_context_lock()
-            .capture_lease_at(summarized_at)
-            .ok_or("capture lease unavailable")?;
-        let source_digest = chat_capture::MessageRangeDigest::from_hex(source_digest)
-            .ok_or("invalid source digest")?;
-        let provider = self
-            .extension_capture_provider(&lease)
-            .ok_or("capture provider unavailable")?;
-        let source = chat_capture::CompactionSource {
-            schema: chat_capture::CompactionSchemaVersion::V1,
-            project_id: lease.project_id.clone(),
-            source_session_id: lease.session_id.clone(),
-            first_turn_ordinal,
-            last_turn_ordinal,
-            source_digest,
-            summary_origin: chat_capture::CompactionSummaryOrigin::LocalOnly,
-            prompt_stack_digest: chat_capture::PromptStackDigest::from_bytes([7; 32]),
-            redaction: chat_capture::RedactionPolicy::HostRedacted,
-            content_classes: vec![agent_core::compaction::ContentClass::UserText],
-            summarized_at,
-        };
-        memory_capture_worker()
-            .submit_summary(
-                &lease,
-                source,
-                source_message_count,
-                summary_text,
-                agent_core::compaction::RedactionPolicy::PolicyExclusions,
-                memory_context::RetentionClass::Standard,
-                provider,
-            )
-            .map_err(|_| "summary capture build failed")?;
-        Ok(())
-    }
-
-    /// C5 cancellation seam: closes memory recall/capture authority and the
-    /// backing extension lease synchronously from the caller's perspective.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn cancel_memory_forwarding_for_harness(&self) {
-        self.clear_memory_contribution();
-        self.memory_context_disable();
     }
 
     /// C5 lease-release assertion seam (metadata only).
@@ -2952,13 +2328,8 @@ impl Runtime {
                 self.memory_backend_reconfigure_denied
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::warn!("memory backend change denied: live extension processes cannot be reconfigured at runtime; original binding retained; restart required");
-                self.memory_context_disable();
-                self.clear_memory_contribution();
             }
             return;
-        }
-        if config.kind != crate::config::MemoryBackendKind::Legacy {
-            self.memory_context_disable();
         }
         // merge(112) §4: under the daemon the session cwd differs from
         // process cwd; use it when available so project-scope resolution
@@ -2988,37 +2359,6 @@ impl Runtime {
         self.memory_backend.exclusive()
     }
 
-    /// The project isolation identity (spec §5.2) recorded on this chat's
-    /// memory leases and sent with its capture and recall requests: the key
-    /// of the chat's memory binding, whichever the backend. The binding is
-    /// made from the chat's folder (or `SYNAPS_PROJECT_ROOT`); the process
-    /// folder is the daemon's under the daemon, so it is never asked here.
-    ///
-    /// `None` when the binding has no project (its folder could not be
-    /// resolved): no id is invented, so no lease is granted and memory is
-    /// off for this chat. A shared stand-in id would let two such chats
-    /// capture into and recall from one another.
-    fn memory_context_project_id(&self) -> Option<memory_context::ProjectId> {
-        self.memory_backend
-            .scope()
-            .ok()
-            .and_then(|scope| memory_context::ProjectId::parse(scope.key()).ok())
-    }
-
-    pub fn memory_tool_capability(&self) -> Option<memory_context::MemoryContextCapability> {
-        if !self.memory_backend.exclusive() {
-            return None;
-        }
-        let project_id = self.memory_context_project_id()?;
-        let runtime = self.clone();
-        Some(memory_context::MemoryContextCapability::control_only(
-            self.memory_context_state.clone(),
-            project_id,
-            memory_context::ContextProviderId::parse(axel_context::PROVIDER_ID).expect("static id"),
-            Arc::new(move || runtime.memory_context_disable()),
-        ))
-    }
-
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
     /// Includes the `disabled_tools` pass on this runtime's registry — the
     /// fresh-`Runtime::new()` path, where the registry holds builtins only.
@@ -3039,19 +2379,6 @@ impl Runtime {
     fn apply_config_inner(&mut self, config: &crate::config::SynapsConfig, disable_tools: bool) {
         // #112: apply memory backend config early (binding is immutable once set).
         self.apply_memory_backend_config(&config.memory_backend);
-        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
-            || self
-                .memory_backend_reconfigure_denied
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            // Unavailable selections revoke grants; never retain an extension escape hatch.
-            self.memory_context_disable();
-            self.clear_memory_contribution();
-            *self
-                .retained_recall_turn
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        }
         if let Some(ref model) = config.model {
             self.set_model(model.clone());
         }
@@ -3484,573 +2811,6 @@ impl Runtime {
             writer_stats: self.telemetry_writer.as_ref().map(|w| w.stats()),
             degraded_records: self.trace_ctx.degraded_records(),
         }
-    }
-
-    /// Lock the session-scoped memory-context state (task A5). Poison
-    /// recovery is sound for the same reason as
-    /// `memory_context::MemoryContextCapability::lock`: every
-    /// `SessionMemoryState` transition is check-then-single-assignment with
-    /// no panicking code between, so a poisoned lock still holds a
-    /// consistent state.
-    fn memory_context_lock(&self) -> std::sync::MutexGuard<'_, memory_context::SessionMemoryState> {
-        self.memory_context_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Typed `/memory status` snapshot — metadata-only, never spawns a
-    /// provider process (spec §7.2 "status does not spawn").
-    pub fn memory_context_status(&self) -> memory_context::MemoryContextStatus {
-        self.memory_context_lock().status()
-    }
-
-    /// Revoke this session's memory context (`/memory off`). Always locally
-    /// allowed (spec §7.2); idempotent — disabling an already-off session
-    /// reports `Off`.
-    ///
-    /// Task A6 revocation wiring: after the session state transition, the
-    /// extension runtime lease backing each bound provider is defensively
-    /// revoked through the SAME [`ExtensionRuntimeManager`] mechanism the
-    /// deferred tool/handler lifecycle uses ([`Self::install_extension_runtime`]
-    /// / `ExtensionSessionEndGuard`). While Phase A never spawns, this is an
-    /// idempotent no-op; once Phase B routes real recall/capture calls under
-    /// this runtime's tool session, disable reaps the provider child exactly.
-    ///
-    /// [`ExtensionRuntimeManager`]: crate::extensions::lease::ExtensionRuntimeManager
-    pub fn memory_context_disable(&self) -> memory_context::MemoryContextStatus {
-        let (status, bound, session) = {
-            let mut state = self.memory_context_lock();
-            let session = state.session_id().clone();
-            let bound = state.bound_provider_ids();
-            let status = match memory_context::apply_memory_context_action(
-                &mut state,
-                memory_context::AuthorizedMemoryAction::Disable {
-                    session: session.clone(),
-                },
-            ) {
-                Ok(status) => status,
-                // Unreachable by construction (the session identity is read
-                // from the state itself and `Disable` is total), but never
-                // panic on the fallback: report current status.
-                Err(_) => state.status(),
-            };
-            (status, bound, session)
-        };
-        // §15 `memory_context.disabled` (task B5): emitted after the state
-        // transition applied — session + project digest identities only.
-        // A chat with no project never had a lease to disable.
-        if let Some(project_id) = self.memory_context_project_id() {
-            memory_context::emit_memory_observability_event(
-                &memory_context::MemoryObservabilityEvent::context_disabled(&session, &project_id),
-            );
-        }
-        // State mutex released before touching the lease manager: the
-        // revocation below locks only the lease map (idempotent no-op when
-        // nothing was ever spawned).
-        self.revoke_memory_provider_leases(&bound);
-        status
-    }
-
-    /// Task A6: defensively revoke the extension runtime lease backing each
-    /// bound memory provider for THIS runtime's tool session. Confirmed
-    /// idempotent — `ExtensionRuntimeManager::revoke_plugin_lease` is a map
-    /// remove that finds nothing when no lease was ever acquired, so calling
-    /// it before Phase B ever spawns is a safe no-op. Provider identities
-    /// that are not composed `extension:<plugin>:<id>` runtime addresses
-    /// (the legacy canonical fallback) name no plugin child and are skipped.
-    fn revoke_memory_provider_leases(&self, bound: &[memory_context::ContextProviderId]) {
-        let Some(extension_runtime) = &self.extension_runtime else {
-            return;
-        };
-        for provider in bound {
-            let mut parts = provider.as_str().splitn(3, ':');
-            if let (Some("extension"), Some(plugin), Some(_local_id)) =
-                (parts.next(), parts.next(), parts.next())
-            {
-                if !plugin.is_empty() {
-                    extension_runtime.revoke_plugin_lease(&self.host_tool_session, plugin);
-                }
-            }
-        }
-    }
-
-    /// Task A6 enable-time provider validation: resolve the provider a
-    /// `/memory` grant binds to. With the extension runtime installed
-    /// ([`Self::install_extension_runtime`] — the same wiring point that
-    /// backs `extension_leases` capabilities), resolution is MANDATORY and
-    /// fail-closed against the loaded context-provider catalog (pure
-    /// catalog read, never spawns): exactly one matching declared provider
-    /// resolves to its composed `extension:<plugin>:<id>` runtime address;
-    /// zero matches fail [`memory_context::MemoryContextError::ProviderNotRegistered`]
-    /// and overlapping declarations without an exact requested id fail
-    /// [`memory_context::MemoryContextError::ProviderAmbiguous`] — the
-    /// exact-scope precedent of `validate_deferred` and
-    /// `crate::orchestration::validate_user_authorizable_model`.
-    ///
-    /// Without an extension subsystem (legacy/flag-off constructions and
-    /// headless unit runtimes) the A5 spec-canonical identity is kept:
-    /// there is no catalog to validate against, Phase A grants are inert
-    /// metadata, and Phase B activation independently re-validates through
-    /// `ExtensionLeaseCapability::call_exact_for` against retained launch
-    /// records — an unbacked identity can never start a process.
-    fn resolve_memory_provider(
-        &self,
-        requested: Option<&str>,
-    ) -> std::result::Result<memory_context::ContextProviderId, memory_context::MemoryContextError>
-    {
-        use crate::extensions::context_provider as ext_cp;
-        if memory_context::provider_unavailable_for_test() {
-            return Err(memory_context::MemoryContextError::ProviderNotRegistered);
-        }
-        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
-            || self
-                .memory_backend_reconfigure_denied
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            // Invalid exclusive configurations never fall back to extensions.
-            return Err(memory_context::MemoryContextError::ProviderNotRegistered);
-        }
-        if self.memory_backend.is_axel() {
-            self.memory_backend
-                .validate_axel_config()
-                .map_err(|_| memory_context::MemoryContextError::ProviderNotRegistered)?;
-            if requested.is_some_and(|id| id != axel_context::PROVIDER_ID) {
-                return Err(memory_context::MemoryContextError::ProviderNotRegistered);
-            }
-            return memory_context::ContextProviderId::parse(axel_context::PROVIDER_ID);
-        }
-        let Some(extension_runtime) = &self.extension_runtime else {
-            return Ok(memory_provider_id());
-        };
-        let requested_id = match requested {
-            None => None,
-            // An id that cannot even parse as a declared provider identity
-            // can never be registered: fail closed as not-registered.
-            Some(raw) => Some(
-                ext_cp::ContextProviderId::parse(raw)
-                    .map_err(|_| memory_context::MemoryContextError::ProviderNotRegistered)?,
-            ),
-        };
-        match extension_runtime.resolve_context_provider(requested_id.as_ref()) {
-            Ok(descriptor) => {
-                memory_context::ContextProviderId::parse(&descriptor.runtime_address())
-            }
-            Err(ext_cp::ContextProviderLookupError::NotRegistered) => {
-                Err(memory_context::MemoryContextError::ProviderNotRegistered)
-            }
-            Err(ext_cp::ContextProviderLookupError::Ambiguous) => {
-                Err(memory_context::MemoryContextError::ProviderAmbiguous)
-            }
-        }
-    }
-
-    /// Install a durable session-lease memory mode (`/memory on|recall|
-    /// capture`, spec §7.3) under the caller-supplied host-owned intent
-    /// proof (spec §6.3). Task A6: the target provider is resolved and
-    /// validated FIRST ([`Self::resolve_memory_provider`], fail-closed) —
-    /// then the lease is minted and the exhaustive
-    /// [`memory_context::apply_memory_context_action`] transition applied.
-    /// On any typed failure no lease is installed.
-    pub(crate) fn memory_context_enable(
-        &self,
-        mode: memory_context::MemoryContextMode,
-        proof: memory_context::UserIntentProof,
-    ) -> std::result::Result<memory_context::MemoryContextStatus, memory_context::MemoryContextError>
-    {
-        self.memory_context_enable_resolved(mode, proof, None)
-    }
-
-    /// [`Self::memory_context_enable`] with an explicit requested provider
-    /// id (exact declared id; `None` requires a uniquely-declared provider
-    /// when the extension subsystem is installed). Crate-internal: the
-    /// `/memory` frontend forms currently pass `None`.
-    pub(crate) fn memory_context_enable_resolved(
-        &self,
-        mode: memory_context::MemoryContextMode,
-        proof: memory_context::UserIntentProof,
-        requested_provider: Option<&str>,
-    ) -> std::result::Result<memory_context::MemoryContextStatus, memory_context::MemoryContextError>
-    {
-        let mut state = self.memory_context_lock();
-        let lease = self.grant_command_memory_lease(&state, mode, proof, requested_provider)?;
-        // §15 `memory_context.enabled` (task B5): metadata-only snapshot of
-        // the lease identities, captured before `apply` consumes the lease
-        // and emitted only on a successful install.
-        let enabled_event = memory_context::MemoryObservabilityEvent::context_enabled(&lease);
-        let result = memory_context::apply_memory_context_action(
-            &mut state,
-            memory_context::AuthorizedMemoryAction::Enable { lease },
-        );
-        if result.is_ok() {
-            memory_context::emit_memory_observability_event(&enabled_event);
-        }
-        result
-    }
-
-    /// Start this fresh foreground session in the operator's confirmed
-    /// `memory.default_mode` (spec §12). Called once per session runtime by
-    /// [`crate::host::EngineHost::foreground_runtime_for`], after the memory
-    /// backend is bound; workers never call it, so they inherit storage but
-    /// not the default lease. The grant takes the exact `/memory` path —
-    /// provider resolution and validation first, fail-closed — under
-    /// [`memory_context::UserIntentProof::OperatorConfig`].
-    ///
-    /// `None`: nothing to apply (default off, consent latch unset, or the
-    /// session already has memory state). `/memory off` still revokes the
-    /// default for the rest of the session.
-    #[allow(dead_code)] // its caller, the host's session build, no longer applies it; the module goes next
-    pub(crate) fn apply_memory_default_mode(
-        &self,
-        config: &agent_core::config::MemoryConfig,
-    ) -> Option<
-        std::result::Result<
-            memory_context::MemoryContextStatus,
-            memory_context::MemoryContextError,
-        >,
-    > {
-        use memory_context::MemoryContextMode as Mode;
-        // The parser already reverts an unconfirmed mode to off; re-check so
-        // a directly constructed config can never fail open.
-        if !config.default_mode_confirmed {
-            return None;
-        }
-        let mode = match config.default_mode.as_str() {
-            "recall_once" => Mode::RecallOnce,
-            "recall_each_prompt" => Mode::RecallEachPrompt,
-            "capture_only" => Mode::CaptureOnly,
-            "capture_and_recall" => Mode::CaptureAndRecall,
-            _ => return None,
-        };
-        if self.memory_context_status().durable != memory_context::DurableStatus::Off {
-            return None;
-        }
-        let proof = memory_context::UserIntentProof::OperatorConfig;
-        let result = if mode == Mode::RecallOnce {
-            self.memory_context_recall_once(proof)
-        } else {
-            self.memory_context_enable(mode, proof)
-        };
-        match &result {
-            Ok(_) => tracing::info!(
-                mode = mode.as_str(),
-                "memory.default_mode applied to session"
-            ),
-            Err(e) => tracing::warn!(
-                mode = mode.as_str(),
-                error = %e,
-                "memory.default_mode not applied; session starts with memory off"
-            ),
-        }
-        Some(result)
-    }
-
-    /// Install a one-shot recall lease (`/memory once`, spec §7.3) under
-    /// the caller-supplied host-owned intent proof. Provider-validated
-    /// exactly like [`Self::memory_context_enable`] (task A6). Fails typed
-    /// (e.g. a one-shot already pending) without installing anything.
-    pub(crate) fn memory_context_recall_once(
-        &self,
-        proof: memory_context::UserIntentProof,
-    ) -> std::result::Result<memory_context::MemoryContextStatus, memory_context::MemoryContextError>
-    {
-        let mut state = self.memory_context_lock();
-        let lease = self.grant_command_memory_lease(
-            &state,
-            memory_context::MemoryContextMode::RecallOnce,
-            proof,
-            None,
-        )?;
-        // §15 `memory_context.enabled` (task B5): the one-shot grant is an
-        // enable of `recall_once` — emitted only on a successful install.
-        let enabled_event = memory_context::MemoryObservabilityEvent::context_enabled(&lease);
-        let result = memory_context::apply_memory_context_action(
-            &mut state,
-            memory_context::AuthorizedMemoryAction::RecallOnce { lease },
-        );
-        if result.is_ok() {
-            memory_context::emit_memory_observability_event(&enabled_event);
-        }
-        result
-    }
-
-    /// Mint one host-owned lease for a `/memory` command grant: host-minted
-    /// lease ID, the state's own session identity, host-derived project
-    /// identity, and the task-A6 catalog-validated provider identity
-    /// ([`Self::resolve_memory_provider`] — fail-closed; on a resolution
-    /// error nothing is minted). Session leases carry no hard expiry (until
-    /// revoked or session end); `/memory` has no expiry argument (spec §7.3).
-    fn grant_command_memory_lease(
-        &self,
-        state: &memory_context::SessionMemoryState,
-        mode: memory_context::MemoryContextMode,
-        proof: memory_context::UserIntentProof,
-        requested_provider: Option<&str>,
-    ) -> std::result::Result<memory_context::MemoryContextLease, memory_context::MemoryContextError>
-    {
-        // No project for this chat's folder: no lease, memory stays off.
-        // The callers report it (`/memory` answers the user; the default
-        // mode and the restored mode log one warning).
-        let project_id = self
-            .memory_context_project_id()
-            .ok_or(memory_context::MemoryContextError::CapabilityUnavailable)?;
-        let provider_id = self.resolve_memory_provider(requested_provider)?;
-        memory_context::MemoryContextLease::grant(
-            memory_context::MemoryLeaseId::parse(&format!("memctx-cmd-{}", uuid::Uuid::new_v4()))?,
-            state.session_id().clone(),
-            project_id,
-            provider_id,
-            mode,
-            memory_context::CapturePolicy::default(),
-            memory_context::RecallPolicy::default(),
-            proof,
-            std::time::SystemTime::now(),
-            None,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_capture_provider_for_test(
-        &self,
-        provider: std::sync::Arc<dyn capture_worker::CaptureProvider>,
-    ) {
-        *self
-            .capture_provider_for_test
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(provider);
-    }
-
-    pub(crate) fn compaction_capture_lease_at(
-        &self,
-        now: std::time::SystemTime,
-    ) -> Option<memory_context::MemoryContextLease> {
-        self.memory_context_lock().capture_lease_at(now)
-    }
-
-    pub(crate) fn submit_compaction_summary_capture(
-        &self,
-        capture_lease: Option<memory_context::MemoryContextLease>,
-        current: &agent_core::session::Session,
-        api_messages: &[crate::SharedMessage],
-        outcome: &compaction::CompactionOutcome,
-        summarized_at: std::time::SystemTime,
-    ) {
-        let Some(lease) = capture_lease else {
-            return;
-        };
-        let Ok(source_session_id) = memory_context::SessionId::parse(&current.id) else {
-            return;
-        };
-        // A compaction source range is the exact pre-transition message range.
-        // Legacy session messages have no durable turn ordinals, so this
-        // inclusive range uses canonical message positions and the digest
-        // binds the exact ordered content.
-        if api_messages.is_empty() {
-            return;
-        }
-        let first_turn_ordinal = 0;
-        let last_turn_ordinal = (api_messages.len() - 1) as u64;
-        let Some(source_digest) = chat_capture::MessageRangeDigest::from_hex(
-            &agent_core::compaction::message_range_digest(api_messages),
-        ) else {
-            return;
-        };
-        let Some(prompt_stack_digest) =
-            chat_capture::PromptStackDigest::from_hex(&outcome.prompt_stack_digest)
-        else {
-            return;
-        };
-        let summary_origin = if outcome.local_only {
-            chat_capture::CompactionSummaryOrigin::LocalOnly
-        } else {
-            chat_capture::CompactionSummaryOrigin::Provider {
-                provider_id: outcome.summary_provider.clone(),
-                model_id: outcome.summary_model.clone(),
-            }
-        };
-        let content_classes = outcome.included_classes.clone();
-        let source = chat_capture::CompactionSource {
-            schema: chat_capture::CompactionSchemaVersion::V1,
-            project_id: lease.project_id.clone(),
-            source_session_id,
-            first_turn_ordinal,
-            last_turn_ordinal,
-            source_digest,
-            summary_origin,
-            prompt_stack_digest,
-            redaction: match outcome.redaction_policy {
-                agent_core::compaction::RedactionPolicy::TruncationOnly => {
-                    chat_capture::RedactionPolicy::None
-                }
-                agent_core::compaction::RedactionPolicy::PolicyExclusions => {
-                    chat_capture::RedactionPolicy::HostRedacted
-                }
-            },
-            content_classes,
-            summarized_at,
-        };
-
-        #[cfg(any(test, feature = "testing"))]
-        let test_provider = self
-            .capture_provider_for_test
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        #[cfg(not(any(test, feature = "testing")))]
-        let test_provider: Option<std::sync::Arc<dyn capture_worker::CaptureProvider>> = None;
-        let provider = test_provider.or_else(|| self.extension_capture_provider(&lease));
-        if let Some(provider) = provider {
-            let _ = memory_capture_worker().submit_summary(
-                &lease,
-                source,
-                api_messages.len(),
-                &outcome.summary_text,
-                outcome.redaction_policy,
-                memory_context::RetentionClass::Standard,
-                provider,
-            );
-        }
-    }
-
-    fn extension_capture_provider(
-        &self,
-        lease: &memory_context::MemoryContextLease,
-    ) -> Option<std::sync::Arc<dyn capture_worker::CaptureProvider>> {
-        if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
-            || self
-                .memory_backend_reconfigure_denied
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return None;
-        }
-        if self.memory_backend.is_axel() {
-            if lease.provider_id.as_str() != axel_context::PROVIDER_ID
-                || Some(&lease.project_id) != self.memory_context_project_id().as_ref()
-            {
-                return None;
-            }
-            return Some(Arc::new(axel_context::AxelCaptureProvider {
-                binding: self.memory_backend.clone(),
-                state: self.memory_context_state.clone(),
-                lease: lease.clone(),
-            }));
-        }
-        let manager = self.extension_runtime.clone()?;
-        let mut parts = lease.provider_id.as_str().splitn(3, ':');
-        let (Some("extension"), Some(plugin), Some(_)) = (parts.next(), parts.next(), parts.next())
-        else {
-            return None;
-        };
-        let digest =
-            manager.declared_tool_digest(plugin, memory_context::MEMORY_CAPTURE_TOOL_NAME)?;
-        let handle = tokio::runtime::Handle::try_current().ok()?;
-        Some(std::sync::Arc::new(ExtensionCaptureProvider {
-            manager,
-            session: self.host_tool_session.clone(),
-            plugin: plugin.to_owned(),
-            digest,
-            handle,
-            cwd: self.cwd.clone(),
-        }))
-    }
-
-    /// Return the history-import disclosure preview. This is D1's production
-    /// entry point: metadata is scanned, but session bodies and Axel are never
-    /// opened. All frontends share this runtime implementation.
-    pub fn memory_history_preview(
-        &self,
-    ) -> std::result::Result<memory_history::HistoryImportPreview, memory_history::HistoryImportError>
-    {
-        let host = memory_history::HistoryImportHostState::from_current_host()?;
-        let mut io = memory_history::CanonicalHistoryMetadataIo::new();
-        let preview = memory_history::preview_history_import(&host, &mut io)?;
-        *self
-            .pending_history_import_preview
-            .lock()
-            .expect("history preview mutex poisoned") = Some(preview.clone());
-        Ok(preview)
-    }
-
-    /// Bind the pending, already-presented history preview to an explicit
-    /// frontend command. D1 returns only a typed plan; D2 owns all content
-    /// streaming.
-    #[allow(dead_code)] // its caller `/memory` is gone; the module goes next
-    pub(crate) fn memory_history_confirm(
-        &self,
-    ) -> std::result::Result<memory_history::HistoryImportReport, memory_history::HistoryImportError>
-    {
-        let preview = self
-            .pending_history_import_preview
-            .lock()
-            .expect("history preview mutex poisoned")
-            .take()
-            .ok_or(memory_history::HistoryImportError::ConsentRequired)?;
-        let intent = memory_history::ConfirmedUserIntent::from_explicit_command(
-            memory_context::mint_explicit_command_id(),
-        );
-        let mut io = memory_history::CanonicalHistoryMetadataIo::new();
-        match memory_history::authorize_history_import(
-            preview,
-            memory_history::HistoryImportConsent::Confirmed(intent),
-            memory_history::RequestAuthority::UserFrontend,
-            &mut io,
-        )? {
-            memory_history::HistoryImportOutcome::Ready(plan) => {
-                *self
-                    .history_import_plan
-                    .lock()
-                    .expect("history plan mutex poisoned") = Some(plan.clone());
-                let lease = self
-                    .memory_context_lock()
-                    .capture_lease_at(std::time::SystemTime::now())
-                    .ok_or(memory_history::HistoryImportError::CaptureLeaseUnavailable)?;
-                // This resolves only a manifest-declared extension sidecar. No
-                // HTTP client or network transport is built by history import.
-                let provider = self
-                    .extension_capture_provider(&lease)
-                    .ok_or(memory_history::HistoryImportError::CaptureProviderUnavailable)?;
-                let sessions_dir = agent_core::config::get_active_config_dir().join("sessions");
-                memory_history::import_history_from_dir(
-                    &plan,
-                    &lease,
-                    &sessions_dir,
-                    memory_history::IMPORT_BATCH_MAX_RECORDS,
-                    memory_capture_worker(),
-                    provider,
-                )
-            }
-            memory_history::HistoryImportOutcome::Declined => {
-                Err(memory_history::HistoryImportError::ConsentRequired)
-            }
-        }
-    }
-
-    /// Decline and clear a pending preview without any content reads or writes.
-    #[allow(dead_code)] // its caller `/memory` is gone; the module goes next
-    pub(crate) fn memory_history_decline(&self) -> bool {
-        self.pending_history_import_preview
-            .lock()
-            .expect("history preview mutex poisoned")
-            .take()
-            .is_some()
-    }
-
-    /// Test-only: intent proof recorded on the current durable lease.
-    #[cfg(test)]
-    pub(crate) fn memory_durable_proof_for_test(&self) -> Option<memory_context::UserIntentProof> {
-        self.memory_context_lock().durable_proof().cloned()
-    }
-
-    /// Test-only: intent proof recorded on the pending one-shot lease.
-    #[cfg(test)]
-    pub(crate) fn memory_one_shot_proof_for_test(&self) -> Option<memory_context::UserIntentProof> {
-        self.memory_context_lock().one_shot_pending_proof().cloned()
-    }
-
-    /// Test-only: provider identities bound to the currently granted
-    /// leases (durable + pending one-shot), in that order.
-    #[cfg(test)]
-    pub(crate) fn memory_bound_providers_for_test(&self) -> Vec<memory_context::ContextProviderId> {
-        self.memory_context_lock().bound_provider_ids()
     }
 
     /// Structured `/context` report (Task 12): counts, byte lengths, cache
@@ -4951,26 +3711,6 @@ impl Runtime {
             return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
         }
 
-        // Task B4 (spec §7.4): resolve this turn's memory recall HERE — the
-        // single provider-agnostic point where the owned turn Vec exists but
-        // has not yet been read, borrowed, or forked into any per-provider
-        // wire translation (`run_stream_internal` and everything below it
-        // only ever borrows from this Vec). When no contribution applies the
-        // Vec is returned byte-identical — no empty or no-op synthetic
-        // message is ever inserted — and the disabled path performs zero
-        // extension calls. Every recall failure fails OPEN: the turn itself
-        // is never blocked or failed by memory.
-        let capture_started_at = std::time::SystemTime::now();
-        let capture_turn_start = terminal_capture_start(&messages);
-        // Snapshot the full prompt-time lease: terminal dispatch must never
-        // reselect a provider after the user changes memory state.
-        let capture_lease = self
-            .memory_context_lock()
-            .capture_lease_at(capture_started_at);
-        let mut messages = messages;
-        self.apply_turn_memory_recall(&mut messages).await;
-        let messages = messages;
-
         // Clone the Arc, not the whole Runtime — the spawned task shares the
         // same AuthState so mid-loop token refreshes are visible immediately.
         let auth = Arc::clone(&self.auth);
@@ -4997,10 +3737,6 @@ impl Runtime {
         // original clone above; this one is captured separately by the spawn closure.
         let reaper_registry = Arc::clone(&subagent_registry);
         let reaper_orchestration = self.orchestration.clone();
-        let capture_provider = capture_lease
-            .as_ref()
-            .and_then(|lease| self.extension_capture_provider(lease));
-        let capture_state = self.memory_context_state.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
             // Placeholder: the stream loop installs the tool context its
@@ -5045,10 +3781,8 @@ impl Runtime {
             context_rollover: None,
         };
 
-        let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
         let session = crate::runtime::stream::StreamSession {
             memory_backend: self.memory_backend.clone(),
-            final_capture_history: final_capture_history.clone(),
             turn_completion: completion,
             context_window: self.context_window(),
             continuation: self.continuation.clone(),
@@ -5110,25 +3844,11 @@ impl Runtime {
         };
 
         tokio::spawn(async move {
-            let completed = match StreamMethods::run_stream_internal(session, messages).await {
-                Ok(()) => true,
-                Err(e) => {
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
-                        helpers::turn_error_for(&e, &turn_correlation_id),
-                    )));
-                    false
-                }
-            };
-            // The stream publishes its FINAL history only on a valid terminal
-            // completion; capture that, never the pre-inference prompt.
-            dispatch_completed_terminal_capture(
-                completed,
-                &final_capture_history,
-                &capture_state,
-                capture_lease.zip(capture_provider),
-                capture_started_at,
-                capture_turn_start.as_ref(),
-            );
+            if let Err(e) = StreamMethods::run_stream_internal(session, messages).await {
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                    helpers::turn_error_for(&e, &turn_correlation_id),
+                )));
+            }
             // Engine-owned housekeeping: reap finished subagent handles before
             // signalling Done.  Runs on the tokio thread pool — no public sync
             // caller becomes async.  Poison-safe via reap_finished internals.
@@ -5190,27 +3910,9 @@ impl Clone for Runtime {
             telemetry_writer: self.telemetry_writer.clone(),
             trace_ctx: self.trace_ctx.clone(),
             trace_controls: Arc::clone(&self.trace_controls),
-            // Clones are the SAME session: `/memory` state is one truth
-            // across a session's streams. Subagents are NOT clones — they
-            // are constructed via a fresh `Runtime::new()` (see
-            // `tools/subagent/mod.rs::apply_subagent_runtime_policy`), so
-            // they always start Off/no-lease (task A5 invariant).
-            memory_context_state: std::sync::Arc::clone(&self.memory_context_state),
             memory_backend: self.memory_backend.clone(),
             memory_backend_config: self.memory_backend_config.clone(),
             memory_backend_reconfigure_denied: Arc::clone(&self.memory_backend_reconfigure_denied),
-            pending_history_import_preview: std::sync::Arc::clone(
-                &self.pending_history_import_preview,
-            ),
-            history_import_plan: std::sync::Arc::clone(&self.history_import_plan),
-            #[cfg(any(test, feature = "testing"))]
-            capture_provider_for_test: std::sync::Arc::clone(&self.capture_provider_for_test),
-            // Clones are the same session: they observe the same held
-            // recall segment (one truth), like memory_context_state above.
-            pending_memory_segment: std::sync::Arc::clone(&self.pending_memory_segment),
-            // Same-session truth for retry-exact reuse and `/memory why`
-            // (task B4): clones share ONE retained recall per request.
-            retained_recall_turn: std::sync::Arc::clone(&self.retained_recall_turn),
             one_shot_trace_writer: Arc::clone(&self.one_shot_trace_writer),
             capture_dir: self.capture_dir.clone(),
             cache_diagnostics: self.cache_diagnostics,
@@ -5257,7 +3959,7 @@ impl Clone for Runtime {
             tool_catalog_prompt: Arc::clone(&self.tool_catalog_prompt),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
             pending_tool_restore: std::sync::Arc::clone(&self.pending_tool_restore),
-            // Clones serve the same conversation (see memory_context_state).
+            // Clones serve the same conversation.
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
             env: self.env.clone(),
@@ -7683,10 +6385,12 @@ mod http_client_timeout_tests {
     }
 }
 
-/// Task A6: memory-context provider validation + revocation wiring.
+/// Memory-backend configuration on a runtime with context-provider
+/// extensions loaded. (The module keeps its old name; the automatic-memory
+/// tests that shared it are gone with their subject.)
 #[cfg(test)]
 mod memory_context_provider_tests {
-    use super::{memory_context, Runtime};
+    use super::Runtime;
     use std::sync::Arc;
 
     // ── task A6: memory-context provider validation + revocation wiring ──
@@ -7733,24 +6437,6 @@ mod memory_context_provider_tests {
         (runtime, extension_runtime)
     }
 
-    fn assert_memory_off_no_lease(runtime: &Runtime) {
-        let status = runtime.memory_context_status();
-        assert_eq!(
-            status.durable,
-            memory_context::DurableStatus::Off,
-            "state must stay Off"
-        );
-        assert_eq!(
-            status.one_shot,
-            memory_context::OneShotStatus::Idle,
-            "no one-shot lease may exist"
-        );
-        assert!(
-            runtime.memory_bound_providers_for_test().is_empty(),
-            "no provider may be bound"
-        );
-    }
-
     // ── memory-backend configuration tests (ported from upstream) ────────
 
     #[tokio::test]
@@ -7758,33 +6444,10 @@ mod memory_context_provider_tests {
         for selector in ["axel", "invalid-selector"] {
             let (mut runtime, _manager) =
                 memory_runtime_with_providers(&[("memory-test", "notes")]).await;
-            let provider = runtime.resolve_memory_provider(None).unwrap();
             runtime.apply_config(&agent_core::config::load_config_from_str(&format!(
                 "memory.backend = {selector}\n"
             )));
             assert!(runtime.memory_backend.exclusive());
-            assert!(matches!(
-                runtime.resolve_memory_provider(None),
-                Err(memory_context::MemoryContextError::ProviderNotRegistered)
-            ));
-            assert!(matches!(
-                runtime.resolve_memory_provider(Some(provider.as_str())),
-                Err(memory_context::MemoryContextError::ProviderNotRegistered)
-            ));
-            assert!(matches!(
-                runtime.memory_history_confirm(),
-                Err(
-                    super::memory_history::HistoryImportError::CaptureProviderUnavailable
-                        | super::memory_history::HistoryImportError::ConsentRequired
-                )
-            ));
-            assert_memory_off_no_lease(&runtime);
-            let mut messages = vec![Arc::new(
-                serde_json::json!({"role": "user", "content": "test"}),
-            )];
-            let original = messages.clone();
-            runtime.apply_turn_memory_recall(&mut messages).await;
-            assert_eq!(messages, original);
             let clone = runtime.clone();
             assert!(clone.memory_backend.exclusive());
             assert_eq!(clone.memory_backend.base(), runtime.memory_backend.base());
@@ -7822,7 +6485,6 @@ mod memory_context_provider_tests {
                     .unwrap_err()
                     .to_string();
                 assert!(error.contains("restart required"), "{error}");
-                assert!(denied.resolve_memory_provider(None).is_err());
             }
             runtime.apply_config(&config);
             assert!(runtime.validate_request_preflight().await.is_err());
@@ -7851,93 +6513,12 @@ mod memory_context_provider_tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("restart required"), "{error}");
-            assert!(runtime.resolve_memory_provider(None).is_err());
         }
     }
 
-    fn default_mode_config(mode: &str, confirmed: bool) -> agent_core::config::MemoryConfig {
-        agent_core::config::MemoryConfig {
-            default_mode: mode.to_string(),
-            default_mode_confirmed: confirmed,
-            ..Default::default()
-        }
-    }
-
-    /// Spec §12: a confirmed non-off `memory.default_mode` starts the
-    /// session in that mode under the host-owned `OperatorConfig` proof.
-    #[test]
-    fn memory_default_mode_confirmed_grants_session_lease() {
-        for (name, mode) in [
-            (
-                "recall_each_prompt",
-                memory_context::MemoryContextMode::RecallEachPrompt,
-            ),
-            (
-                "capture_only",
-                memory_context::MemoryContextMode::CaptureOnly,
-            ),
-            (
-                "capture_and_recall",
-                memory_context::MemoryContextMode::CaptureAndRecall,
-            ),
-        ] {
-            let runtime = Runtime::new_headless();
-            let status = runtime
-                .apply_memory_default_mode(&default_mode_config(name, true))
-                .expect("a confirmed non-off default applies")
-                .expect("legacy backend grants");
-            assert!(
-                matches!(status.durable, memory_context::DurableStatus::Active { mode: m, .. } if m == mode),
-                "{name}: got {:?}",
-                status.durable
-            );
-            assert_eq!(
-                runtime.memory_durable_proof_for_test(),
-                Some(memory_context::UserIntentProof::OperatorConfig),
-                "{name}"
-            );
-        }
-
-        let runtime = Runtime::new_headless();
-        runtime
-            .apply_memory_default_mode(&default_mode_config("recall_once", true))
-            .expect("applies")
-            .expect("grants");
-        assert_eq!(
-            runtime.memory_context_status().durable,
-            memory_context::DurableStatus::Off
-        );
-        assert_eq!(
-            runtime.memory_one_shot_proof_for_test(),
-            Some(memory_context::UserIntentProof::OperatorConfig)
-        );
-    }
-
-    /// Off, unknown, or unconfirmed defaults grant nothing (fail closed).
-    #[test]
-    fn memory_default_mode_off_unknown_or_unconfirmed_grants_nothing() {
-        for (mode, confirmed) in [
-            ("off", true),
-            ("off", false),
-            ("capture_and_recall", false),
-            ("recall_once", false),
-            ("recall_everything_forever", true),
-        ] {
-            let runtime = Runtime::new_headless();
-            assert!(
-                runtime
-                    .apply_memory_default_mode(&default_mode_config(mode, confirmed))
-                    .is_none(),
-                "{mode}/{confirmed} must not apply"
-            );
-            assert_memory_off_no_lease(&runtime);
-        }
-    }
-
-    /// Two chats whose binding has no project (no folder, a deleted folder)
-    /// get no memory lease at all: no default mode, no `/memory`, no tool
-    /// capability, no recall project. Nothing invents a shared id they
-    /// could capture into and recall from together.
+    /// A binding made with no folder, or with a deleted one, has no project:
+    /// no id is invented for it. (The lease half of this test went with
+    /// automatic memory.)
     #[test]
     fn memory_binding_without_project_grants_no_lease() {
         let gone = tempfile::tempdir().unwrap();
@@ -7951,103 +6532,7 @@ mod memory_context_provider_tests {
                 cwd.clone(),
             );
             assert!(runtime.memory_backend.scope().is_err(), "{cwd:?} must have no project");
-            assert_eq!(runtime.memory_context_project_id(), None);
-
-            let defaulted = runtime
-                .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
-                .expect("a confirmed default is attempted");
-            assert!(matches!(
-                defaulted,
-                Err(memory_context::MemoryContextError::CapabilityUnavailable)
-            ));
-            assert_memory_off_no_lease(&runtime);
-
-            assert!(runtime
-                .memory_context_enable(
-                    memory_context::MemoryContextMode::CaptureAndRecall,
-                    memory_context::mint_explicit_command_proof(),
-                )
-                .is_err());
-            assert!(runtime
-                .memory_context_recall_once(memory_context::mint_explicit_command_proof())
-                .is_err());
-            assert!(runtime.memory_tool_capability().is_none());
-            // Disable is still a clean no-op.
-            runtime.memory_context_disable();
-            assert_memory_off_no_lease(&runtime);
         }
-    }
-
-    /// The default never overrides memory state the session already has,
-    /// and `/memory off` still revokes a defaulted lease.
-    #[test]
-    fn memory_default_mode_keeps_existing_state_and_off_revokes() {
-        let runtime = Runtime::new_headless();
-        runtime
-            .memory_context_enable(
-                memory_context::MemoryContextMode::RecallEachPrompt,
-                memory_context::mint_explicit_command_proof(),
-            )
-            .unwrap();
-        assert!(runtime
-            .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
-            .is_none());
-        assert!(matches!(
-            runtime.memory_context_status().durable,
-            memory_context::DurableStatus::Active {
-                mode: memory_context::MemoryContextMode::RecallEachPrompt,
-                ..
-            }
-        ));
-        assert!(matches!(
-            runtime.memory_durable_proof_for_test(),
-            Some(memory_context::UserIntentProof::ExplicitCommand { .. })
-        ));
-
-        let runtime = Runtime::new_headless();
-        runtime
-            .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
-            .unwrap()
-            .unwrap();
-        runtime.memory_context_disable();
-        assert_memory_off_no_lease(&runtime);
-    }
-
-    /// A default whose backend cannot serve fails closed: typed error,
-    /// memory stays off, no fallback provider.
-    #[test]
-    fn memory_default_mode_unusable_backend_fails_closed() {
-        let mut runtime = Runtime::new_headless();
-        runtime.apply_config(&agent_core::config::load_config_from_str(
-            "memory.backend = invalid-not-axel-not-legacy\n",
-        ));
-        assert!(runtime
-            .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
-            .expect("a confirmed default is attempted")
-            .is_err());
-        assert_memory_off_no_lease(&runtime);
-    }
-
-    #[test]
-    fn memory_backend_apply_config_revokes_preexisting_legacy_lease() {
-        let mut runtime = Runtime::new_headless();
-        runtime
-            .memory_context_enable(
-                memory_context::MemoryContextMode::CaptureAndRecall,
-                memory_context::UserIntentProof::ExplicitCommand {
-                    command_id: memory_context::mint_explicit_command_id(),
-                },
-            )
-            .unwrap();
-        let lease = runtime
-            .memory_context_lock()
-            .capture_lease_at(std::time::SystemTime::now())
-            .unwrap();
-        runtime.apply_config(&agent_core::config::load_config_from_str(
-            "memory.backend = axel\n",
-        ));
-        assert_memory_off_no_lease(&runtime);
-        assert!(runtime.extension_capture_provider(&lease).is_none());
     }
 
     #[test]
@@ -8057,243 +6542,16 @@ mod memory_context_provider_tests {
             "memory.backend = invalid-not-axel-not-legacy\n",
         ));
         assert!(runtime.memory_backend.exclusive());
-        assert!(runtime.resolve_memory_provider(None).is_err());
-        assert_memory_off_no_lease(&runtime);
     }
 
-    /// Task A6: enabling against a catalog that does not contain the
-    /// requested provider fails closed — typed error, nothing granted,
-    /// `SessionMemoryState` unchanged (Off/no-lease) — both for an
-    /// explicitly requested nonexistent id and for an id-less request
-    /// against an empty catalog.
-    #[tokio::test]
-    async fn memory_enable_unregistered_provider_fails_closed_grants_nothing() {
-        // Explicit nonexistent id against a catalog with one real provider.
-        let (runtime, _ext) =
-            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
-        for requested in ["no-such-provider", "bad:id"] {
-            let err = runtime
-                .memory_context_enable_resolved(
-                    memory_context::MemoryContextMode::CaptureAndRecall,
-                    memory_context::mint_explicit_command_proof(),
-                    Some(requested),
-                )
-                .expect_err("unregistered provider must fail closed");
-            assert_eq!(
-                err,
-                memory_context::MemoryContextError::ProviderNotRegistered
-            );
-            assert_memory_off_no_lease(&runtime);
-        }
-
-        // Id-less request against an EMPTY catalog (extension subsystem
-        // installed, no context-provider extension loaded).
-        let (runtime, _ext) = memory_runtime_with_providers(&[]).await;
-        let err = runtime
-            .memory_context_enable(
-                memory_context::MemoryContextMode::CaptureAndRecall,
-                memory_context::mint_explicit_command_proof(),
-            )
-            .expect_err("empty catalog must fail closed");
-        assert_eq!(
-            err,
-            memory_context::MemoryContextError::ProviderNotRegistered
-        );
-        assert_memory_off_no_lease(&runtime);
-        // One-shot grants run the same validation.
-        let err = runtime
-            .memory_context_recall_once(memory_context::mint_explicit_command_proof())
-            .expect_err("one-shot grant must validate the provider too");
-        assert_eq!(
-            err,
-            memory_context::MemoryContextError::ProviderNotRegistered
-        );
-        assert_memory_off_no_lease(&runtime);
-    }
-
-    /// Task A6: with exactly one matching declared provider the grant
-    /// succeeds and records THAT provider's exact composed runtime
-    /// address — for the default id-less request and the explicit exact id.
-    #[tokio::test]
-    async fn memory_enable_exactly_one_declared_provider_records_exact_identity() {
-        const ADDRESS: &str = "extension:axel-memory-manager:project-memory";
-        // Default (id-less) request.
-        let (runtime, _ext) =
-            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
-        let status = runtime
-            .memory_context_enable(
-                memory_context::MemoryContextMode::CaptureAndRecall,
-                memory_context::mint_explicit_command_proof(),
-            )
-            .expect("unique declared provider must resolve");
-        assert!(matches!(
-            status.durable,
-            memory_context::DurableStatus::Active { .. }
-        ));
-        let bound = runtime.memory_bound_providers_for_test();
-        assert_eq!(bound.len(), 1);
-        assert_eq!(bound[0].as_str(), ADDRESS, "exact runtime address recorded");
-
-        // Explicit exact id resolves to the same identity.
-        let (runtime, _ext) =
-            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
-        runtime
-            .memory_context_enable_resolved(
-                memory_context::MemoryContextMode::RecallEachPrompt,
-                memory_context::mint_explicit_command_proof(),
-                Some("project-memory"),
-            )
-            .expect("explicit exact id must resolve");
-        assert_eq!(
-            runtime.memory_bound_providers_for_test()[0].as_str(),
-            ADDRESS
-        );
-    }
-
-    /// Task A6: two installed extensions declaring overlapping context
-    /// providers make both the id-less request AND a request for the
-    /// overlapping id ambiguous — fail closed, nothing granted.
-    #[tokio::test]
-    async fn memory_enable_ambiguous_overlapping_declarations_fails_closed() {
-        let (runtime, _ext) = memory_runtime_with_providers(&[
-            ("mem-a", "project-memory"),
-            ("mem-b", "project-memory"),
-        ])
-        .await;
-        let err = runtime
-            .memory_context_enable(
-                memory_context::MemoryContextMode::CaptureAndRecall,
-                memory_context::mint_explicit_command_proof(),
-            )
-            .expect_err("overlapping declarations must fail closed");
-        assert_eq!(err, memory_context::MemoryContextError::ProviderAmbiguous);
-        assert_memory_off_no_lease(&runtime);
-
-        // The overlapping exact id cannot disambiguate two owners either.
-        let err = runtime
-            .memory_context_enable_resolved(
-                memory_context::MemoryContextMode::CaptureOnly,
-                memory_context::mint_explicit_command_proof(),
-                Some("project-memory"),
-            )
-            .expect_err("same id declared by two plugins is ambiguous");
-        assert_eq!(err, memory_context::MemoryContextError::ProviderAmbiguous);
-        assert_memory_off_no_lease(&runtime);
-    }
-
-    /// Task A6 revocation wiring: disable revokes the granted lease from
-    /// `SessionMemoryState` AND defensively calls
-    /// `ExtensionRuntimeManager::revoke_plugin_lease` for the bound
-    /// plugin/session pair — an idempotent no-op (no panic) when nothing
-    /// was ever spawned.
-    #[tokio::test]
-    async fn memory_disable_revokes_runtime_lease_without_spawn_no_panic() {
-        let (runtime, ext) =
-            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
-        runtime
-            .memory_context_enable(
-                memory_context::MemoryContextMode::CaptureAndRecall,
-                memory_context::mint_explicit_command_proof(),
-            )
-            .expect("enable succeeds");
-        assert_eq!(
-            ext.lease_count(),
-            0,
-            "granting a memory lease spawns nothing"
-        );
-
-        let status = runtime.memory_context_disable();
-        assert_eq!(status.durable, memory_context::DurableStatus::Off);
-        assert_memory_off_no_lease(&runtime);
-        assert_eq!(
-            ext.lease_count(),
-            0,
-            "revocation of a never-spawned lease is a no-op"
-        );
-
-        // Idempotent: disabling again is safe and stays Off.
-        let status = runtime.memory_context_disable();
-        assert_eq!(status.durable, memory_context::DurableStatus::Off);
-        assert_eq!(ext.lease_count(), 0);
-    }
-
-    /// Task B5 (spec §15): enable and disable emit metadata-only
-    /// `memory_context.enabled` / `memory_context.disabled` events — mode +
-    /// identities with the host-derived project DIGEST, never the raw
-    /// project path; a failed enable emits nothing.
-    #[test]
-    fn memory_context_enable_disable_emit_metadata_only_events() {
-        memory_context::drain_captured_memory_events_for_test();
-
-        let runtime = Runtime::new_headless();
-        // A rejected enable (Off is not a session-lease mode) emits nothing.
-        runtime
-            .memory_context_enable(
-                memory_context::MemoryContextMode::Off,
-                memory_context::mint_explicit_command_proof(),
-            )
-            .expect_err("Off is not an enable mode");
-        assert!(
-            memory_context::drain_captured_memory_events_for_test().is_empty(),
-            "failed enable must emit no event"
-        );
-
-        runtime
-            .memory_context_enable(
-                memory_context::MemoryContextMode::CaptureAndRecall,
-                memory_context::mint_explicit_command_proof(),
-            )
-            .expect("enable succeeds");
-        runtime.memory_context_disable();
-
-        let events = memory_context::drain_captured_memory_events_for_test();
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| (event.event, event.outcome))
-                .collect::<Vec<_>>(),
-            vec![
-                ("memory_context.enabled", "enabled"),
-                ("memory_context.disabled", "disabled"),
-            ],
-        );
-        assert_eq!(events[0].mode, Some("capture_and_recall"));
-        assert_eq!(events[1].mode, Some("off"));
-
-        // §15: the project identity in every event is the digest form,
-        // never the raw working-directory path.
-        let cwd = std::env::current_dir()
-            .expect("cwd")
-            .to_string_lossy()
-            .into_owned();
-        for event in &events {
-            let json = serde_json::to_string(event).expect("event serializes");
-            assert!(
-                json.contains("\"project_digest\":\"p") || json.contains("project-cwd-"),
-                "digest identity expected; got: {json}"
-            );
-            assert!(
-                !json.contains(&cwd),
-                "raw project path leaked into event JSON: {json}"
-            );
-        }
-    }
-
-    /// Task A6 session-end plumbing: dropping the LAST runtime owner runs
-    /// the shared `ExtensionSessionEndGuard` (terminate_session — the SAME
+    /// Session-end plumbing: dropping the LAST runtime owner runs the
+    /// shared `ExtensionSessionEndGuard` (terminate_session — the SAME
     /// reap mechanism deferred tools/handlers use), and a fresh
-    /// construction against the same extension runtime starts Off with no
-    /// lease of any kind.
+    /// construction against the same extension runtime has no lease.
     #[tokio::test]
     async fn memory_session_end_guard_drop_fresh_construction_is_off_no_lease() {
         let (runtime, ext) =
             memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
-        runtime
-            .memory_context_enable(
-                memory_context::MemoryContextMode::CaptureAndRecall,
-                memory_context::mint_explicit_command_proof(),
-            )
-            .expect("enable succeeds");
         // True session end: the last owner drop fires the guard.
         drop(runtime);
         assert_eq!(
@@ -8302,10 +6560,9 @@ mod memory_context_provider_tests {
             "session end must leave no runtime lease (never-spawned reap is a no-op)"
         );
 
-        // A fresh construction (what any new session does) is Off/no-lease.
+        // A fresh construction (what any new session does) holds no lease.
         let mut fresh = Runtime::new_headless();
         fresh.install_extension_runtime(std::sync::Arc::clone(&ext));
-        assert_memory_off_no_lease(&fresh);
         assert_eq!(ext.lease_count(), 0);
     }
 }
