@@ -20,6 +20,9 @@ use std::io;
 use std::path::Path;
 
 pub use imp::*;
+// The Windows security tests' token helpers, for `events::socket`'s tests.
+#[cfg(all(test, windows))]
+pub(crate) use imp::security_tests;
 
 #[cfg(unix)]
 mod imp {
@@ -330,8 +333,8 @@ mod imp {
             SE_KERNEL_OBJECT,
         };
         use windows_sys::Win32::Security::{
-            EqualSid, GetAce, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsTokenRestricted,
-            RevertToSelf, TokenIntegrityLevel, TokenIsAppContainer, TokenUser, ACE_HEADER, ACL, LABEL_SECURITY_INFORMATION,
+            EqualSid, GetAce, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf,
+            TokenIntegrityLevel, TokenIsAppContainer, TokenIsRestricted, TokenUser, ACE_HEADER, ACL, LABEL_SECURITY_INFORMATION,
             PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
             TOKEN_USER,
         };
@@ -474,11 +477,6 @@ mod imp {
         /// the first instance's for the whole name), read through the client's
         /// handle (`READ_CONTROL`): no process id to race. `None`: no label ACE.
         pub(super) fn pipe_label(pipe: HANDLE) -> io::Result<Option<u32>> {
-            /// `SYSTEM_MANDATORY_LABEL_ACE_TYPE` (winnt.h); its windows-sys
-            /// constant needs the `Win32_System_SystemServices` feature.
-            const LABEL_ACE: u8 = 17;
-            /// An ACE is its 4-byte header, a 4-byte mask, then the label SID.
-            const SID_OFFSET: usize = 8;
             let mut sd: PSECURITY_DESCRIPTOR = null_mut();
             let mut sacl: *mut ACL = null_mut();
             // SAFETY: a connected client pipe handle opened with READ_CONTROL; sacl points into sd.
@@ -488,11 +486,13 @@ mod imp {
             if rc != 0 {
                 return Err(io::Error::from_raw_os_error(rc as i32));
             }
-            let label = (|| {
+            let label = (|| -> io::Result<Option<u32>> {
                 if sacl.is_null() {
                     return Ok(None);
                 }
                 // SAFETY: a valid ACL, owned by sd, which lives until after this closure.
+                let acl_end = sacl as usize + usize::from(unsafe { (*sacl).AclSize });
+                // SAFETY: as above.
                 for i in 0..u32::from(unsafe { (*sacl).AceCount }) {
                     let mut ace: *mut c_void = null_mut();
                     // SAFETY: i < AceCount; ace receives a pointer into the ACL.
@@ -500,25 +500,51 @@ mod imp {
                         return Err(io::Error::last_os_error());
                     }
                     // SAFETY: every ACE starts with an ACE_HEADER.
-                    if unsafe { (*(ace as *const ACE_HEADER)).AceType } != LABEL_ACE {
-                        continue;
+                    let size = usize::from(unsafe { (*(ace as *const ACE_HEADER)).AceSize });
+                    // The ACE's bytes, never past the end of the ACL.
+                    let len = size.min(acl_end.saturating_sub(ace as usize));
+                    // SAFETY: `len` bytes from an ACE inside the ACL, which sd owns.
+                    let bytes = unsafe { std::slice::from_raw_parts(ace as *const u8, len) };
+                    if let Some(rid) = label_rid(bytes)? {
+                        return Ok(Some(rid));
                     }
-                    // SAFETY: a label ACE ends with its label SID (S-1-16-<rid>), whose last sub-authority is the RID.
-                    return unsafe {
-                        let sid = (ace as *const u8).add(SID_OFFSET) as PSID;
-                        let n = *GetSidSubAuthorityCount(sid);
-                        if n == 0 {
-                            Err(io::Error::other("integrity label without a RID"))
-                        } else {
-                            Ok(Some(*GetSidSubAuthority(sid, u32::from(n) - 1)))
-                        }
-                    };
                 }
                 Ok(None)
             })();
             // SAFETY: allocated by GetSecurityInfo.
             unsafe { LocalFree(sd) };
             label
+        }
+
+        /// The integrity RID one ACE of a SACL carries. `Ok(None)`: not a
+        /// label ACE, or one that is `INHERIT_ONLY` (it labels children, not
+        /// the pipe). A label ACE is its 4-byte header, a 4-byte mask and the
+        /// label SID `S-1-16-<rid>` (revision 1, one sub-authority, authority 16),
+        /// and anything else is an error: the bytes come from the kernel, and
+        /// are still checked before they are trusted.
+        pub(super) fn label_rid(ace: &[u8]) -> io::Result<Option<u32>> {
+            /// `SYSTEM_MANDATORY_LABEL_ACE_TYPE` (winnt.h); its windows-sys
+            /// constant needs the `Win32_System_SystemServices` feature.
+            const LABEL_ACE: u8 = 17;
+            const INHERIT_ONLY_ACE: u8 = 0x08;
+            const SID_OFFSET: usize = 8;
+            let bad = |why: &str| io::Error::other(format!("malformed integrity label ACE: {why}"));
+            if ace.len() < 4 {
+                return Err(bad("shorter than its header"));
+            }
+            if ace[0] != LABEL_ACE || ace[1] & INHERIT_ONLY_ACE != 0 {
+                return Ok(None);
+            }
+            let size = usize::from(u16::from_le_bytes([ace[2], ace[3]]));
+            // The header, the mask, and a SID with one sub-authority (8 + 4 bytes).
+            if size < SID_OFFSET + 12 || size > ace.len() {
+                return Err(bad("its size does not hold the label SID"));
+            }
+            let sid = &ace[SID_OFFSET..size];
+            if sid[0] != 1 || sid[1] != 1 || sid[2..8] != [0, 0, 0, 0, 0, 16] {
+                return Err(bad("not an S-1-16-<rid> SID"));
+            }
+            Ok(Some(u32::from_le_bytes([sid[8], sid[9], sid[10], sid[11]])))
         }
 
         /// Refuse a pipe created below integrity `min`, or whose label can't
@@ -563,6 +589,26 @@ mod imp {
             if unsafe { EqualSid(ours, theirs.sid()) } == 0 {
                 return Err(refuse("which runs as another user".into()));
             }
+            // The same user is not enough. The pipe's DACL grants this user's
+            // SID, which is the restricting SID a sandboxed process of this user
+            // carries, and a new instance of a name gets the label of the
+            // first: such a process can add an instance to a live daemon's
+            // name, or take the name before one starts, and receive what
+            // clients send. `GetNamedPipeServerProcessId` names the creator of
+            // this very instance.
+            let theirs = process_identity(process.0).map_err(|e| refuse(format!("whose token cannot be read ({e})")))?;
+            verify_server_unconfined(pid, &theirs)
+        }
+
+        /// Refuse a server whose token is restricted or AppContainer
+        /// (`admit_client`, the other way round).
+        pub(super) fn verify_server_unconfined(pid: u32, theirs: &super::Identity) -> io::Result<()> {
+            if theirs.confined {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("daemon pipe is served by pid {pid}, which runs with a restricted or AppContainer token; refusing to connect"),
+                ));
+            }
             Ok(())
         }
 
@@ -598,28 +644,46 @@ mod imp {
                 }
                 *GetSidSubAuthority(il, u32::from(n) - 1)
             };
-            // `IsTokenRestricted`, not `TokenHasRestrictions`: the UAC-filtered
-            // token of a non-elevated admin has the latter, and is an ordinary
-            // client. A restricted token (restricting SIDs) passes every access
-            // check as the user's SID, so only this query tells it apart.
-            // SAFETY: a token handle opened with TOKEN_QUERY.
-            let restricted = unsafe { IsTokenRestricted(token) } != 0;
-            let (mut app_container, mut len) = (0u32, 0u32);
-            // SAFETY: TokenIsAppContainer is a DWORD. A failed query fails the identity: closed, never open.
-            if unsafe { GetTokenInformation(token, TokenIsAppContainer, (&mut app_container as *mut u32).cast(), 4, &mut len) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(super::Identity { sid, integrity, confined: restricted || app_container != 0 })
+            // A failed query fails the identity: closed, never open.
+            let confined = token_is_restricted(token)? || token_dword(token, TokenIsAppContainer)? != 0;
+            Ok(super::Identity { sid, integrity, confined })
         }
 
-        pub fn current_process_identity() -> io::Result<super::Identity> {
+        /// One DWORD of token information. A failed query is an error, never a 0.
+        fn token_dword(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<u32> {
+            let (mut value, mut len) = (0u32, 0u32);
+            // SAFETY: the classes asked for (TokenIsRestricted, TokenIsAppContainer) are DWORDs.
+            if unsafe { GetTokenInformation(token, class, (&mut value as *mut u32).cast(), 4, &mut len) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(value)
+        }
+
+        /// Whether a token has restricting SIDs. `TokenIsRestricted` through
+        /// `GetTokenInformation`, not `IsTokenRestricted` (which returns FALSE
+        /// on a failed query as well, so an error would read as "unrestricted")
+        /// and not `TokenHasRestrictions` (the UAC-filtered token of a
+        /// non-elevated administrator has it, and is an ordinary client). A
+        /// restricted token passes every access check as the user's SID, so
+        /// only this query tells it apart.
+        pub(super) fn token_is_restricted(token: HANDLE) -> io::Result<bool> {
+            token_dword(token, TokenIsRestricted).map(|v| v != 0)
+        }
+
+        /// The identity of a process, from its token (`TOKEN_QUERY`).
+        fn process_identity(process: HANDLE) -> io::Result<super::Identity> {
             let mut token: HANDLE = null_mut();
-            // SAFETY: the pseudo-handle needs no close; token is an out-pointer.
-            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            // SAFETY: a valid process handle and an out-pointer.
+            if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
                 return Err(io::Error::last_os_error());
             }
             let token = Handle(token);
             token_identity(token.0)
+        }
+
+        pub fn current_process_identity() -> io::Result<super::Identity> {
+            // SAFETY: the pseudo-handle needs no close.
+            process_identity(unsafe { GetCurrentProcess() })
         }
 
         /// Ends this thread's impersonation when dropped, on every path out.
@@ -658,7 +722,8 @@ mod imp {
     }
 
     #[cfg(test)]
-    mod security_tests {
+    // `pub(crate)`: `events::socket`'s tests wear the same tokens.
+    pub(crate) mod security_tests {
         use super::*;
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use std::ptr::{null, null_mut};
@@ -686,7 +751,10 @@ mod imp {
             TOKEN_MANDATORY_LABEL,
         };
         use windows_sys::Win32::Storage::FileSystem::{SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT};
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken};
+        use windows_sys::Win32::System::Threading::{
+            CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, SetThreadToken, TerminateProcess,
+            CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW,
+        };
 
         fn endpoint() -> (tempfile::TempDir, std::path::PathBuf) {
             let d = tempfile::tempdir().unwrap();
@@ -709,7 +777,7 @@ mod imp {
         /// A raw, synchronous client open (no tokio), what any local program
         /// can do. `flags` 0 is "no SQOS" (.NET's default, libuv);
         /// `SECURITY_SQOS_PRESENT | …` picks an impersonation level.
-        fn open_raw(name: &str, access: u32, flags: u32) -> io::Result<OwnedHandle> {
+        pub(crate) fn open_raw(name: &str, access: u32, flags: u32) -> io::Result<OwnedHandle> {
             let n = wide(name);
             // SAFETY: NUL-terminated name; no security attributes or template.
             let h = unsafe { CreateFileW(n.as_ptr(), access, 0, null(), OPEN_EXISTING, flags, null_mut()) };
@@ -894,7 +962,7 @@ mod imp {
         }
 
         /// A synchronous write on a raw client handle, from the calling thread.
-        fn write_line(client: &OwnedHandle, line: &[u8]) -> io::Result<()> {
+        pub(crate) fn write_line(client: &OwnedHandle, line: &[u8]) -> io::Result<()> {
             std::fs::File::from(client.try_clone()?).write_all(line)
         }
 
@@ -1094,7 +1162,7 @@ mod imp {
 
         /// Run `f` on a fresh thread that wears the impersonation token
         /// `make` builds, and reverts when `f` returns.
-        fn wearing<T: Send>(make: impl FnOnce() -> io::Result<OwnedHandle> + Send, f: impl FnOnce() -> T + Send) -> T {
+        pub(crate) fn wearing<T: Send>(make: impl FnOnce() -> io::Result<OwnedHandle> + Send, f: impl FnOnce() -> T + Send) -> T {
             std::thread::scope(|s| {
                 s.spawn(move || {
                     let token = make().unwrap();
@@ -1112,12 +1180,13 @@ mod imp {
             })
         }
 
-        /// This process's token with its own user SID as the one restricting
-        /// SID, duplicated for impersonation: same user, same integrity, and
-        /// every access check it faces is also run against the user SID, so
-        /// it passes the pipe's DACL and label. What `CreateRestrictedToken`
-        /// sandboxes (browsers, Chrome-style launchers) build, and needs no privilege.
-        fn restricted_token() -> io::Result<OwnedHandle> {
+        /// A primary token made from this process's own, restricted to this
+        /// user's SID and `groups` (restricting SIDs): same user, same
+        /// integrity, and every access check it faces is also run against
+        /// those SIDs, so with the user's SID among them it passes the pipe's
+        /// DACL and label. What `CreateRestrictedToken` sandboxes (browsers,
+        /// Chrome-style launchers) build, and needs no privilege.
+        fn restricted_primary(groups: &[&str]) -> io::Result<OwnedHandle> {
             let mut process_token: HANDLE = null_mut();
             // SAFETY: the pseudo-handle and an out-pointer.
             if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut process_token) } == 0 {
@@ -1125,15 +1194,25 @@ mod imp {
             }
             // SAFETY: a token handle we own.
             let process_token = unsafe { OwnedHandle::from_raw_handle(process_token) };
-            let user = Sid::parse(&win::current_user_sid()?);
-            let restrict = SID_AND_ATTRIBUTES { Sid: user.0, Attributes: 0 };
+            let user = win::current_user_sid()?;
+            let sids: Vec<Sid> = std::iter::once(user.as_str()).chain(groups.iter().copied()).map(Sid::parse).collect();
+            let restrict: Vec<SID_AND_ATTRIBUTES> = sids.iter().map(|s| SID_AND_ATTRIBUTES { Sid: s.0, Attributes: 0 }).collect();
             let mut restricted: HANDLE = null_mut();
-            // SAFETY: a valid token with TOKEN_DUPLICATE; one restricting SID that outlives the call.
-            if unsafe { CreateRestrictedToken(process_token.as_raw_handle() as HANDLE, 0, 0, null(), 0, null(), 1, &restrict, &mut restricted) } == 0 {
+            // SAFETY: a valid token with TOKEN_DUPLICATE; the restricting SIDs outlive the call.
+            if unsafe {
+                CreateRestrictedToken(process_token.as_raw_handle() as HANDLE, 0, 0, null(), 0, null(), restrict.len() as u32, restrict.as_ptr(), &mut restricted)
+            } == 0
+            {
                 return Err(io::Error::last_os_error());
             }
             // SAFETY: a token handle we own.
-            let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
+            Ok(unsafe { OwnedHandle::from_raw_handle(restricted) })
+        }
+
+        /// [`restricted_primary`] with only the user's SID, duplicated for
+        /// impersonation: what a thread wears to act as such a client.
+        pub(crate) fn restricted_token() -> io::Result<OwnedHandle> {
+            let restricted = restricted_primary(&[])?;
             let mut dup: HANDLE = null_mut();
             // SAFETY: a valid token; dup receives an impersonation token a thread can wear.
             if unsafe { DuplicateTokenEx(restricted.as_raw_handle() as HANDLE, TOKEN_QUERY | TOKEN_IMPERSONATE, null(), SecurityImpersonation, TokenImpersonation, &mut dup) } == 0 {
@@ -1193,7 +1272,11 @@ mod imp {
             read_hello(&mut server).await;
             let err = admit_client(PeerHandle::of(&server), &own_identity()).unwrap_err();
             eprintln!("anonymous-token client: {err}");
-            assert!(err.contains("is not the daemon's user") || err.contains("peer identity unreadable"), "{err}");
+            if err.contains("peer identity unreadable") {
+                skipped(&format!("the anonymous token can't be read here, so there is no second account to compare: {err}"));
+                return;
+            }
+            assert!(err.contains("is not the daemon's user"), "{err}");
         }
 
         /// A Low-integrity process of this user can create the pipe name
@@ -1235,8 +1318,174 @@ mod imp {
                     let e = win::verify_server_integrity(client.as_raw_handle(), 0x2000).unwrap_err();
                     assert!(e.to_string().contains("no integrity label"), "{e}");
                 }
-                Some(rid) => eprintln!("a default pipe of this process carries the label {rid:#x}: nothing to test"),
+                Some(rid) => skipped(&format!("a default pipe of this process carries the label {rid:#x}: nothing to test")),
             }
+        }
+
+        /// The label ACE parse trusts nothing it can check: it takes only a
+        /// live label ACE (not an inherit-only one, which labels children),
+        /// and only a well-formed `S-1-16-<rid>` SID that fits in the ACE.
+        #[test]
+        fn the_label_ace_parse_checks_what_it_reads() {
+            // header (type, flags, size), mask, SID: revision 1, one sub-authority, authority 16, rid.
+            let ace = |ty: u8, flags: u8, size: u16, sid: &[u8]| {
+                let mut v = vec![ty, flags];
+                v.extend(size.to_le_bytes());
+                v.extend([0u8; 4]);
+                v.extend(sid);
+                v
+            };
+            let label = |rid: u32| {
+                let mut sid = vec![1u8, 1, 0, 0, 0, 0, 0, 16];
+                sid.extend(rid.to_le_bytes());
+                sid
+            };
+            assert_eq!(win::label_rid(&ace(17, 0, 20, &label(0x2000))).unwrap(), Some(0x2000));
+            assert_eq!(win::label_rid(&ace(17, 0x10, 20, &label(0x1000))).unwrap(), Some(0x1000), "other flags don't matter");
+            // Not a live label: another ACE type, or inherit-only.
+            assert_eq!(win::label_rid(&ace(0, 0, 20, &label(0x2000))).unwrap(), None);
+            assert_eq!(win::label_rid(&ace(17, 0x08, 20, &label(0x2000))).unwrap(), None);
+            // Malformed: a size that doesn't hold the SID, one that runs past the bytes, a SID of
+            // two sub-authorities, another authority, another revision, and a stub.
+            assert!(win::label_rid(&ace(17, 0, 16, &label(0x2000))).is_err());
+            assert!(win::label_rid(&ace(17, 0, 24, &label(0x2000))).is_err());
+            let mut two = vec![1u8, 2, 0, 0, 0, 0, 0, 16];
+            two.extend([0u8; 8]);
+            assert!(win::label_rid(&ace(17, 0, 24, &two)).is_err());
+            let mut nt = label(0x2000);
+            nt[7] = 5;
+            assert!(win::label_rid(&ace(17, 0, 20, &nt)).is_err());
+            let mut rev = label(0x2000);
+            rev[0] = 2;
+            assert!(win::label_rid(&ace(17, 0, 20, &rev)).is_err());
+            assert!(win::label_rid(&[17, 0]).is_err());
+        }
+
+        /// `IsTokenRestricted` answers FALSE when it fails, so a query that
+        /// failed would read as "unrestricted". A token handle opened without
+        /// `TOKEN_QUERY` can't be asked: that must be an error, and the real
+        /// answers must still come out right.
+        #[test]
+        fn a_failed_restriction_query_is_an_error() {
+            let mut token: HANDLE = null_mut();
+            // SAFETY: the pseudo-handle and an out-pointer; no TOKEN_QUERY, on purpose.
+            assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &mut token) }, 0, "{}", io::Error::last_os_error());
+            // SAFETY: a token handle we own.
+            let blind = unsafe { OwnedHandle::from_raw_handle(token) };
+            let e = win::token_is_restricted(blind.as_raw_handle() as HANDLE);
+            assert!(e.is_err(), "a failed query must not read as unrestricted: {e:?}");
+            let sandboxed = restricted_token().unwrap();
+            assert!(win::token_is_restricted(sandboxed.as_raw_handle() as HANDLE).unwrap());
+            let mine = win::current_process_identity().unwrap();
+            assert!(!mine.confined);
+        }
+
+        /// The client reads the server's token too: a confined server is refused.
+        #[test]
+        fn a_confined_server_is_refused() {
+            let own = own_identity().unwrap();
+            win::verify_server_unconfined(7, &own).unwrap();
+            let e = win::verify_server_unconfined(7, &Identity { confined: true, ..own }).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            assert!(e.to_string().contains("restricted or AppContainer"), "{e}");
+        }
+
+        /// The server half of `a_server_process_with_a_restricted_token_is_refused`.
+        /// Does nothing unless that test started this binary, through a
+        /// restricted token, with the endpoint, the user's SID and integrity
+        /// level as arguments (a restricted process can't always open its own
+        /// token, so it is told who it is).
+        #[test]
+        fn restricted_token_server_child() {
+            let arg = |key: &str| std::env::args().find_map(|a| a.strip_prefix(key).map(str::to_owned));
+            let (Some(endpoint), Some(sid), Some(il)) = (arg("W1UENDPOINT:"), arg("W1USID:"), arg("W1UIL:")) else {
+                return;
+            };
+            let il: u32 = il.parse().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let _first = win::PipeSecurity::labelled(&sid, il)
+                    .unwrap()
+                    .create(ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true), &pipe_name(Path::new(&endpoint)))
+                    .unwrap();
+                tokio::time::sleep(Duration::from_secs(120)).await;
+            });
+        }
+
+        /// Ends the process it holds when dropped.
+        struct KillOnDrop(OwnedHandle);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                // SAFETY: a process handle we own.
+                unsafe { TerminateProcess(self.0.as_raw_handle() as HANDLE, 1) };
+            }
+        }
+
+        /// A same-user process with a restricted token serves the endpoint
+        /// (its DACL grants the user's SID, which is its restricting SID, and
+        /// it gets the daemon's label: what it could do before a daemon starts,
+        /// or as one more instance of a live daemon's name). The client reads
+        /// that server process's own token and refuses it.
+        #[tokio::test]
+        async fn a_server_process_with_a_restricted_token_is_refused() {
+            let (_d, path) = endpoint();
+            let me = win::current_process_identity().unwrap();
+            // The user, and the groups system files are readable by: a
+            // restricted process starts only if its restricting SIDs pass the
+            // file checks too.
+            let token = match restricted_primary(&["S-1-1-0", "S-1-5-32-545", "S-1-5-11", "S-1-5-12"]) {
+                Ok(t) => t,
+                Err(e) => {
+                    skipped(&format!("CreateRestrictedToken: {e}"));
+                    return;
+                }
+            };
+            let exe = std::env::current_exe().unwrap();
+            let mut cmd: Vec<u16> = format!(
+                "\"{}\" --exact ipc::imp::security_tests::restricted_token_server_child --nocapture \"W1UENDPOINT:{}\" W1USID:{} W1UIL:{}",
+                exe.display(),
+                path.display(),
+                me.sid,
+                me.integrity
+            )
+            .encode_utf16()
+            .chain([0])
+            .collect();
+            // SAFETY: plain-data structs, all zero.
+            let (mut si, mut pi): (STARTUPINFOW, PROCESS_INFORMATION) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+            si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+            // SAFETY: a primary token, a NUL-terminated command line the call may write to, no handles inherited.
+            let started = unsafe {
+                CreateProcessAsUserW(token.as_raw_handle() as HANDLE, null(), cmd.as_mut_ptr(), null(), null(), 0, CREATE_NO_WINDOW, null(), null(), &si, &mut pi)
+            };
+            if started == 0 {
+                skipped(&format!("cannot start a process with a restricted token: {}", io::Error::last_os_error()));
+                return;
+            }
+            // SAFETY: the handles CreateProcessAsUserW returned, which we own.
+            let (child, _thread) = unsafe { (OwnedHandle::from_raw_handle(pi.hProcess), OwnedHandle::from_raw_handle(pi.hThread)) };
+            let child = KillOnDrop(child);
+            let deadline = Instant::now() + Duration::from_secs(40);
+            let result = loop {
+                match connect(&path).await {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        let mut code = 0u32;
+                        // SAFETY: a process handle we own.
+                        let known = unsafe { GetExitCodeProcess(child.0.as_raw_handle() as HANDLE, &mut code) };
+                        // 259 = STILL_ACTIVE.
+                        if known != 0 && code != 259 {
+                            skipped(&format!("the restricted-token process exited with {code:#x} before it served the pipe"));
+                            return;
+                        }
+                        assert!(Instant::now() < deadline, "the restricted-token process never bound the pipe");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    other => break other,
+                }
+            };
+            let e = result.expect_err("a server with a restricted token must be refused");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            assert!(e.to_string().contains("restricted or AppContainer"), "{e}");
         }
     }
 
