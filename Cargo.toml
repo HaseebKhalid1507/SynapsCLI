@@ -130,6 +130,10 @@ signal-hook = { version = "0.3", features = ["iterator"] }
 [target.'cfg(all(unix, not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
+# tests/daemon_console_events.rs: send a console control event to the daemon.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [workspace]
 members = ["crates/agent-core", "crates/agent-engine", "crates/agent-tui"]
 resolver = "2"
