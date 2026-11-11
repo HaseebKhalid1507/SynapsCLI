@@ -27,9 +27,8 @@ pub enum EngineStreamEvent {
     /// Tool use finalized.
     ///
     /// `input` is the parsed JSON value, not a stringified version. Renderers
-    /// that need a string preview (chat.rs, server's HistoryEntry::ToolUse)
-    /// can call `serde_json::to_string` themselves; the wire-format ToolUse
-    /// in server mode passes the Value through directly.
+    /// that need a string preview (chat.rs) can call `serde_json::to_string`
+    /// themselves.
     ToolFinalized {
         tool_id: String,
         tool_name: String,

@@ -52,15 +52,9 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("memory.auto_consolidate", NOT_READ_YET),
     ("memory.local_embeddings", NOT_READ_YET),
     ("memory.gliner", NOT_READ_YET),
-    ("server.token", "secret: never echoed in a TUI"),
     ("auth.machine_token", "secret: never echoed in a TUI"),
     ("auth.remote_endpoint", "credential-broker wiring set by deployment, not a preference"),
-    ("server.allowed_origins", "WebSocket server mode only"),
-    ("server.auto_approve_confirms", "security-sensitive WebSocket server-mode policy"),
-    ("server.max_message_size", "WebSocket server mode only"),
-    ("bridge.uds_path", "internal sidecar plumbing"),
-    ("bridge.heartbeat_mirror", "internal sidecar plumbing"),
-    ("bridge.heartbeat_timeout_ms", "internal sidecar plumbing"),
+    ("server.auto_approve_confirms", "security-sensitive: approves every extension confirm unasked"),
     ("memory.default_mode_confirmed", "operator consent marker: must be set by hand"),
     ("subagent_max_concurrent", "legacy flat alias of subagent.max_concurrent (edit that row)"),
     ("subagent_max_total", "legacy flat alias of subagent.max_total (edit that row)"),
@@ -597,41 +591,6 @@ define_settings! {
         EditorKind::Text { numeric: false },
         "Total bytes of tool results one turn may accumulate; a positive number, or unlimited (default: no limit) — turns you type or queue, plugin commands and session-driver turns, in the TUI, daemon sessions, synaps chat and rpc (event-started turns also apply the event budget). Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| turn_limit("turn_budget.foreground.max_accumulated_tool_result_bytes", value);
-
-    "turn_budget.autonomous.max_cost_usd", "Autonomous cost (USD)", Budgets,
-        EditorKind::Text { numeric: false },
-        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| budget_usd("turn_budget.autonomous.max_cost_usd", value);
-
-    "turn_budget.autonomous.max_elapsed_secs", "Autonomous time (s)", Budgets,
-        EditorKind::Text { numeric: true },
-        "Wall-clock seconds one turn may run; 0 = no limit (the default) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.autonomous.max_elapsed_secs", value);
-
-    "turn_budget.autonomous.max_tool_calls", "Autonomous tool calls", Budgets,
-        EditorKind::Text { numeric: false },
-        "Tool calls allowed in one turn; a positive number, or unlimited (default: 96) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| turn_limit("turn_budget.autonomous.max_tool_calls", value);
-
-    "turn_budget.autonomous.max_provider_rounds", "Autonomous rounds", Budgets,
-        EditorKind::Text { numeric: false },
-        "Model round-trips allowed in one turn before the allowance runs out; a positive number, or unlimited (default: 24) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| turn_limit("turn_budget.autonomous.max_provider_rounds", value);
-
-    "turn_budget.autonomous.max_round_renewals", "Autonomous renewals", Budgets,
-        EditorKind::Text { numeric: true },
-        "Automatic renewals of the round allowance after it runs out mid-turn (only with a round limit set); 0 = hard stop at the first exhaustion — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.autonomous.max_round_renewals", value);
-
-    "turn_budget.autonomous.max_context_tokens", "Autonomous ctx tokens", Budgets,
-        EditorKind::Text { numeric: true },
-        "Context tokens one turn may use — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.autonomous.max_context_tokens", value);
-
-    "turn_budget.autonomous.max_accumulated_tool_result_bytes", "Autonomous tool bytes", Budgets,
-        EditorKind::Text { numeric: false },
-        "Total bytes of tool results one turn may accumulate; a positive number, or unlimited (default: 8 MiB) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| turn_limit("turn_budget.autonomous.max_accumulated_tool_result_bytes", value);
 
     "turn_budget.event.max_cost_usd", "Event cost (USD)", Budgets,
         EditorKind::Text { numeric: false },
@@ -1341,8 +1300,8 @@ mod tests {
             assert!(is_err(d("turn_budget.worker.max_provider_rounds", "0")));
             assert!(is_ok(d("turn_budget.worker.max_provider_rounds", "unlimited")));
             assert!(is_ok(d("turn_budget.worker.max_provider_rounds", "128")));
-            assert!(is_err(d("turn_budget.autonomous.max_accumulated_tool_result_bytes", "0")));
-            assert!(is_ok(d("turn_budget.autonomous.max_accumulated_tool_result_bytes", "unlimited")));
+            assert!(is_err(d("turn_budget.event.max_accumulated_tool_result_bytes", "0")));
+            assert!(is_ok(d("turn_budget.event.max_accumulated_tool_result_bytes", "unlimited")));
             assert!(is_ok(d("max_fps", "144")));
             assert!(is_err(d("max_fps", "0")));
             assert!(is_err(d("scroll_lines", "21")));

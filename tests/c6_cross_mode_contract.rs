@@ -327,7 +327,7 @@ fn claim_auto_turn_uniform_boundary_semantics() {
 
 // ─── T3 (request-lifecycle hardening): typed TurnOutcome cross-mode contract ──
 //
-// Spec §5.2: every frontend (chat, server, TUI, RPC, watcher, subagents)
+// Spec §5.2: every frontend (chat, server, TUI, RPC, subagents)
 // receives the SAME typed terminal outcome — variant + correlation ID — for
 // the same failure. The engine derives it exactly once
 // (`runtime::helpers::turn_error_for`); adapters forward it verbatim.
@@ -388,7 +388,7 @@ fn turn_failure_outcome_identical_across_frontend_seams() {
     let round_trip: TurnOutcome = serde_json::from_value(body["outcome"].clone()).unwrap();
     assert_eq!(round_trip, fixture.outcome, "RPC outcome must round-trip");
 
-    // ── TUI / watcher / subagent seam — the shared category label carries
+    // ── TUI / subagent seam — the shared category label carries
     //    the identical terminal category + correlation ID ──
     let label = fixture.category_label();
     assert!(label.contains("provider_failed"), "label: {label}");

@@ -192,7 +192,7 @@ the preceding failed attempt was already recorded.
   auth, where it is not what is billed. All of these are optional and
   absent when unknown.
 - **Shutdown flush:** every clean process/runtime exit path that owns a
-  `Runtime` (headless chat, TUI teardown, autonomous agent, RPC, server)
+  `Runtime` (headless chat, TUI teardown, RPC, server)
   calls `Runtime::shutdown_observability_async` under a short bounded budget
   (`DEFAULT_SHUTDOWN_FLUSH_TIMEOUT`, 2 s). "Flushed" means every queued
   record was appended into OS file buffers (`write(2)` returned) — there is

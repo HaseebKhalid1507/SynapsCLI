@@ -51,10 +51,19 @@ async fn refused_continue_leaves_the_live_owners_card_alone() {
         .await
         .unwrap();
     until(&mut a, |e| matches!(e, SessionEventWire::Ended { .. })).await;
+    // `Ended` comes before the ended actor is gone, and the actor releases
+    // the journal lock before `Ended` (so whoever waits for `closed` can take
+    // it). Wait until it's gone: until then this host still counts it as
+    // live, and the `--continue` below would attach to it instead of being
+    // refused. (Waiting only for the lock was enough while the drop released
+    // it; since the early release it fails about one run in five.)
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle.closed())
+        .await
+        .expect("the ended session's actor never went away");
 
     // Another process owns the session now: it holds the journal lock and
-    // has published its card. `Ended` is emitted before the ended actor is
-    // dropped, and the drop is what releases its lock, so wait for it.
+    // has published its card. The lock is free by now; the retry is a
+    // backstop.
     let sessions = agent_engine::core::session_lock::sessions_dir();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let _owner_lock = loop {

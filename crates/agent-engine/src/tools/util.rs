@@ -116,11 +116,11 @@ pub(crate) fn resolve_path_in(raw: &str, cwd: Option<&std::path::Path>) -> PathB
     }
 }
 
-/// A path handed to an external command (`find`, `ls`) must never be parsed
-/// as an option. With no session cwd a relative path reaches argv verbatim,
-/// so `-delete` would become a `find` expression (01 I3). GNU find also ends
-/// its start points at `!`, `(`, `)` and `,`. It has no `--` for start points,
-/// so prefix `./` instead: same file, never an option or expression.
+/// A path handed to an external command (`ls`) must never be parsed as an
+/// option. With no session cwd a relative path reaches argv verbatim, so
+/// `-R` would become an option (01 I3). Prefix `./` instead of relying on
+/// `--`: same file, never an option. (`!`, `(`, `)` and `,` are covered too:
+/// GNU find, which this once guarded, read them as expressions.)
 pub(crate) fn path_arg_never_option(path: std::path::PathBuf) -> std::path::PathBuf {
     let first = path.as_os_str().as_encoded_bytes().first().copied();
     if matches!(first, Some(b'-' | b'!' | b'(' | b')' | b',')) {

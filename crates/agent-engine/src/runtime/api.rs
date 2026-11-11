@@ -76,6 +76,9 @@ struct ParseState {
     telem_stop_reason: Option<String>,
     telem_usage: telemetry::UsageRecord,
     first_event_seen: bool,
+    /// Liveness, counts and timings only: the progress deadlines and the
+    /// end-of-stream DEBUG line.
+    progress: super::http_phases::StreamProgress,
     // ── Usage captured from message_start (single-emission protocol) ──
     // Live API shape (probed 2024+): message_start carries the full
     // `cache_creation` sub-object; message_delta carries ONLY the aggregate
@@ -185,6 +188,7 @@ impl ParseState {
             telem_stop_reason: None,
             telem_usage: telemetry::UsageRecord::default(),
             first_event_seen: false,
+            progress: super::http_phases::StreamProgress::new(),
             msg_start_input: None,
             msg_start_output: None,
             msg_start_cache_read: None,
@@ -320,6 +324,16 @@ fn process_data_line(line: &str, state: &mut ParseState, ctx: &EventCtx) {
     process_event(event, data_part, state, ctx);
 }
 
+/// True for Anthropic's keep-alive `ping` frame (it parses as `Unknown`).
+fn is_ping(raw: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Tag<'a> {
+        #[serde(rename = "type")]
+        kind: &'a str,
+    }
+    serde_json::from_str::<Tag>(raw).is_ok_and(|tag| tag.kind == "ping")
+}
+
 /// Handle one parsed SSE event. The TTFT capture rides along so the main and
 /// tail paths are uniform. `raw` is the un-parsed data line — `#[serde(other)]`
 /// discards the tag on Unknown events, so the raw line is the only forensics.
@@ -329,6 +343,13 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
     if !state.first_event_seen {
         state.first_event_seen = true;
         state.first_event_elapsed_ms = Some(ctx.request_start.elapsed().as_millis() as u64);
+    }
+    // Liveness: every parsed event but a ping is progress.
+    match &event {
+        AnthropicEvent::Unknown if is_ping(raw) => state.progress.ping(),
+        event => state
+            .progress
+            .event(matches!(event, AnthropicEvent::MessageStart { .. })),
     }
 
     match event {
@@ -1640,6 +1661,10 @@ impl ApiMethods {
         let mut anthropic_failovers: u32 = 0;
         let mut anthropic_attempted: Vec<crate::auth::CredentialRef> = Vec::new();
         let mut quota_headers_logged = false;
+        // `first_event_relaxed`: an attempt of this request ended at the
+        // first-event deadline, so every later attempt waits the progress
+        // window for `message_start` (a cold prefill can be that slow).
+        let mut first_event_relaxed = false;
         // Accounts this request reported exhausted: if one of them then
         // serves (the ordinary retry outlived a short reset), its cooldown
         // goes (`report_served`).
@@ -2313,6 +2338,9 @@ impl ApiMethods {
                 let _ = tx.send(StreamEvent::Llm(LlmEvent::ResponseStart));
             }
             let mut state = ParseState::new();
+            if first_event_relaxed {
+                state.progress.relax_first_event();
+            }
             let ctx = EventCtx {
                 model,
                 tx: &tx,
@@ -2334,12 +2362,18 @@ impl ApiMethods {
 
             // Cancellation exits through the normal finalization below: partial
             // content, residual Usage and attempt telemetry must not be dropped.
-            while let Ok(Some(chunk)) = await_or_cancel(
-                cancel,
-                super::http_phases::next(&mut stream, super::http_phases::STREAM_IDLE),
-            )
-            .await
-            {
+            // Besides the raw-byte idle timer, a progress deadline (no first
+            // event, no progress: pings only) ends a read as a timeout, and
+            // the transport arm below retries it like a lost connection.
+            loop {
+                let read = super::http_phases::next_or_deadline(
+                    &mut stream,
+                    super::http_phases::STREAM_IDLE,
+                    &mut state.progress,
+                );
+                let Ok(Some(chunk)) = await_or_cancel(cancel, read).await else {
+                    break;
+                };
                 if cancel.is_cancelled() {
                     break;
                 }
@@ -2380,6 +2414,23 @@ impl ApiMethods {
             // partial final line are handled.
             let remaining = line_buffer.take_remaining().unwrap_or_default();
             process_data_line(&remaining, &mut state, &ctx);
+            // One line per stream, however it ended: counts and timings only.
+            let progress = &state.progress;
+            tracing::debug!(
+                "Stream ended: chunks={} pings={} events={} message_start={} first_event_ms={} max_event_gap_ms={} deadline={}",
+                progress.chunks,
+                progress.pings,
+                progress.events,
+                progress.message_start_seen,
+                progress
+                    .message_start_after
+                    .map_or_else(|| "none".to_owned(), |d| d.as_millis().to_string()),
+                progress.max_gap.as_millis(),
+                progress
+                    .fired
+                    .map_or("none", super::http_phases::Deadline::label),
+            );
+            first_event_relaxed |= progress.fired == Some(super::http_phases::Deadline::FirstEvent);
 
             // Flush any partial block and return accumulated content
             state.finalize();
@@ -3494,6 +3545,19 @@ mod tests {
             state.first_event_elapsed_ms, first,
             "TTFT must not be overwritten by later events"
         );
+    }
+
+    /// A lone ping is a parsed frame (a later 429 must not hop accounts)
+    /// but never progress: no event, no message_start.
+    #[test]
+    fn ping_sets_first_event_seen_but_is_not_progress() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(&[r#"data: {"type":"ping"}"#], &mut state, &ctx);
+        assert!(state.first_event_seen);
+        assert_eq!(state.progress.pings, 1);
+        assert_eq!(state.progress.events, 0);
+        assert!(!state.progress.message_start_seen);
     }
 
     /// Regression test for the double-emit bug fixed in the slice-2 pre-work
@@ -6931,5 +6995,273 @@ mod cancellation_tests {
         assert_eq!(usage_events, 1);
         assert_eq!(counters.totals(), (12, 1, 5, 3));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    // ── Progress deadlines: a stream that only pings is retried ──────────
+
+    /// Anthropic's keep-alive frame.
+    const PING: &str = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+
+    /// A complete reply: the text "second attempt", end_turn.
+    const COMPLETE: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"second attempt"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+
+    /// Text, then a tool_use whose input is cut off mid-JSON.
+    const PARTIAL_TOOL: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"first attempt"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_partial","name":"bash"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\": \"rm"}}"#,
+        "\n\n",
+    );
+
+    const THINKING_START: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        "\n\n",
+    );
+
+    const THINKING_DELTA: &str = concat!(
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}"#,
+        "\n\n",
+    );
+
+    const THINKING_END: &str = concat!(
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"done"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":1}"#,
+        "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+
+    /// One attempt's body: each frame after its delay in ms; then, when
+    /// `pings` is set, a ping every `pings` ms forever, else the body's end.
+    fn scripted(frames: Vec<(u64, &'static str)>, pings: Option<u64>) -> Body {
+        let script = futures::stream::iter(frames).then(|(ms, frame)| async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(frame.as_bytes()))
+        });
+        let pings = futures::stream::unfold((), move |()| async move {
+            let every = match pings {
+                Some(every) => every,
+                None => return None,
+            };
+            tokio::time::sleep(Duration::from_millis(every)).await;
+            Some((Ok(bytes::Bytes::from_static(PING.as_bytes())), ()))
+        });
+        Body::from_stream(script.chain(pings))
+    }
+
+    /// Loopback only: answers attempt `n` (from 0) with a 200 SSE body,
+    /// `script(n)`.
+    async fn scripted_server(
+        script: fn(usize) -> Body,
+    ) -> (ApiOptions, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let body = script(counter.fetch_add(1, Ordering::SeqCst));
+                async move {
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            ApiOptions {
+                anthropic_base_url: Some(url),
+                ..Default::default()
+            },
+            hits,
+            task,
+        )
+    }
+
+    /// `call` under shrunk (first event, progress) deadlines: its result
+    /// and every event it sent, in order.
+    async fn call_within(
+        options: &ApiOptions,
+        limits: (Duration, Duration),
+    ) -> (Result<Value>, Vec<StreamEvent>) {
+        let auth = test_auth();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::runtime::http_phases::STREAM_PROGRESS_FOR_TEST
+                .scope(limits, call(&auth, &cancel, tx, options)),
+        )
+        .await
+        .expect("the request must end well within 10 s");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    /// The live symptom: headers, then only pings, which keep the raw-byte
+    /// idle timer alive. The first-event deadline (the only limit in reach:
+    /// progress is 60 s) ends the attempt, the request is retried, and the
+    /// result is the second attempt's reply.
+    #[tokio::test]
+    async fn ping_only_stream_is_retried_after_the_first_event_deadline() {
+        let (options, hits, server) = scripted_server(|attempt| match attempt {
+            0 => scripted(Vec::new(), Some(20)),
+            _ => scripted(vec![(0, COMPLETE)], None),
+        })
+        .await;
+        let limits = (Duration::from_millis(300), Duration::from_secs(60));
+        let (result, events) = call_within(&options, limits).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap()["content"],
+            json!([{"type": "text", "text": "second attempt"}])
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Llm(LlmEvent::ResponseReset))));
+    }
+
+    /// The first-event deadline is spent once per request: a cold prefill of
+    /// a huge prompt may outlast it, so later attempts wait the progress
+    /// window for message_start. Attempt 2 pings past the first-event limit,
+    /// under the progress one, then replies: two requests, one retry.
+    #[tokio::test]
+    async fn first_event_deadline_relaxes_after_it_fires_once() {
+        let (options, hits, server) = scripted_server(|attempt| match attempt {
+            0 => scripted(Vec::new(), Some(20)),
+            _ => {
+                let mut frames = vec![(100, PING); 7];
+                frames.push((0, COMPLETE));
+                scripted(frames, None)
+            }
+        })
+        .await;
+        let limits = (Duration::from_millis(300), Duration::from_secs(2));
+        let (result, events) = call_within(&options, limits).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap()["content"],
+            json!([{"type": "text", "text": "second attempt"}])
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let retries = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Session(SessionEvent::Retry(_))))
+            .count();
+        assert_eq!(retries, 1, "no second deadline");
+    }
+
+    /// Text and a tool_use cut off mid-input, then only pings: the progress
+    /// deadline (the only limit in reach once message_start came) ends the
+    /// attempt and it is retried. The result is the second attempt's reply
+    /// alone, the previews are reset before the retry, and the partial call
+    /// never completed: no ToolUse event and no tool_use block for the tool
+    /// loop to run.
+    #[tokio::test]
+    async fn partial_tool_use_then_pings_is_retried_after_the_progress_deadline() {
+        let (options, hits, server) = scripted_server(|attempt| match attempt {
+            0 => scripted(vec![(0, PARTIAL_TOOL)], Some(20)),
+            _ => scripted(vec![(0, COMPLETE)], None),
+        })
+        .await;
+        let limits = (Duration::from_secs(60), Duration::from_millis(300));
+        let (result, events) = call_within(&options, limits).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap()["content"],
+            json!([{"type": "text", "text": "second attempt"}])
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let at = |wanted: fn(&StreamEvent) -> bool| events.iter().position(wanted).unwrap();
+        let first =
+            at(|e| matches!(e, StreamEvent::Llm(LlmEvent::Text(t)) if t == "first attempt"));
+        let tool_start = at(
+            |e| matches!(e, StreamEvent::Llm(LlmEvent::ToolUseStart { tool_id, .. }) if tool_id == "toolu_partial"),
+        );
+        let reset = at(|e| matches!(e, StreamEvent::Llm(LlmEvent::ResponseReset)));
+        let second =
+            at(|e| matches!(e, StreamEvent::Llm(LlmEvent::Text(t)) if t == "second attempt"));
+        assert!(first < tool_start && tool_start < reset && reset < second);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Llm(LlmEvent::ToolUse { .. }))),
+            "the partial call never completed"
+        );
+    }
+
+    /// No false fire: thinking deltas 700 ms apart with pings between them,
+    /// under a 2 s progress limit, for 2.8 s in all. Each delta is
+    /// progress, so the stream completes on its first attempt.
+    #[tokio::test]
+    async fn spaced_thinking_deltas_with_pings_never_reach_the_progress_deadline() {
+        let (options, hits, server) = scripted_server(|_| {
+            let mut frames = vec![(0, THINKING_START)];
+            for _ in 0..4 {
+                frames.extend([(100, PING); 6]);
+                frames.push((100, THINKING_DELTA));
+            }
+            frames.push((0, THINKING_END));
+            scripted(frames, None)
+        })
+        .await;
+        let limit = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let (result, events) = call_within(&options, (limit, limit)).await;
+        server.abort();
+        assert!(started.elapsed() > limit, "the stream outlasted the limit");
+        assert_eq!(
+            result.unwrap()["content"],
+            json!([
+                {"type": "thinking", "thinking": "hmhmhmhm", "signature": "sig"},
+                {"type": "text", "text": "done"}
+            ])
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            StreamEvent::Llm(LlmEvent::ResponseReset)
+                | StreamEvent::Session(SessionEvent::Retry(_))
+        )));
     }
 }

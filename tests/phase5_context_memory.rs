@@ -190,7 +190,6 @@ fn s9_1_no_frontend_splices_summaries_locally() {
     for rel in [
         "src/cmd/chat.rs",
         "src/cmd/rpc.rs",
-        "src/cmd/server.rs",
         // The TUI compacts on the SessionActor since phase 3 (A2).
         "crates/agent-engine/src/session/actor.rs",
     ] {

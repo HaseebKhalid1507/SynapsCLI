@@ -106,6 +106,9 @@ jobs:
       # The macOS Git resolution (`git_program`: PATH, the /usr/bin/git
       # shim, developer directories) only takes its real branch here.
       - run: cargo test --locked -p synaps-core --lib git_program
+      # grep's and find's in-process search (FIFOs, symlinks, O_NONBLOCK) on
+      # BSD libc.
+      - run: cargo test --locked -p synaps-engine --lib -- tools::search tools::grep tools::find
 
   # Nothing else compiles for Windows, so Windows-only breakage landed
   # unnoticed: `dev` stopped building there when the Unix-socket daemon
@@ -134,7 +137,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
       - run: cargo test --locked --no-fail-fast --test "daemon_*"
       - run: cargo test --locked --no-fail-fast -p synaps-tui --lib
-      - run: 'cargo test --locked --no-fail-fast -p synaps-engine --lib -- events::socket ipc:: tools::unix_programs tools::grep tools::find tools::ls'
+      - run: 'cargo test --locked --no-fail-fast -p synaps-engine --lib -- events::socket ipc:: tools::unix_programs tools::search tools::grep tools::find tools::ls'
 
   # The Axel memory sidecar is its own workspace (its own Cargo.lock and
   # dependency graph), so nothing above builds it. Its `axel` dependency is

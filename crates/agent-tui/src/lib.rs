@@ -11,7 +11,7 @@ pub mod tui;
 
 // ── agent-core re-exports ──────────────────────────────────────────────────────
 pub use agent_core::{
-    auth, chain, config, error, logging, models, protocol, session, watcher_types,
+    auth, chain, config, error, logging, models, session,
 };
 pub use agent_core::{core, memory, pricing};
 pub use agent_core::{epoch_millis, truncate_str, BoundedText};

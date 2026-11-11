@@ -1338,16 +1338,20 @@ impl TestHarness {
 
     /// Resolve every line typed while streaming through the production
     /// `commands::resolve_streaming_input`, then apply the result the way
-    /// the dispatch `StreamingInput` arm does. Steers and refusals are
-    /// recorded as `streaming-steer:<text>` / `streaming-refused:<text>`.
+    /// the dispatch `StreamingInput` arm does. Steers, refusals and unknown
+    /// commands are recorded as `streaming-steer:<steered text>` /
+    /// `streaming-refused:<text>` / `streaming-unknown:<text>`.
     pub fn drive_streaming_input(&mut self) -> &mut Self {
         use super::commands::{CommandAction, StreamingSlash};
         for text in std::mem::take(&mut self.pending_streaming) {
             match super::commands::resolve_streaming_input(&text, &mut self.app, &self.registry) {
-                StreamingSlash::Steer => self.actions.push(format!("streaming-steer:{text}")),
+                StreamingSlash::Steer(steer) => {
+                    self.actions.push(format!("streaming-steer:{steer}"))
+                }
                 StreamingSlash::Refused => {
                     self.actions.push(format!("streaming-refused:{text}"))
                 }
+                StreamingSlash::Unknown => self.actions.push(format!("streaming-unknown:{text}")),
                 StreamingSlash::Ran(CommandAction::OpenSettings) => {
                     super::settings::open_modal(&mut self.app);
                 }

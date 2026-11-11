@@ -65,10 +65,14 @@
     }
   },
   {
-    "description": "Find files by name using glob patterns. Searches recursively from the given path. Excludes .git directories.",
+    "description": "Find files by name: a glob matched against file names, searched recursively from the given path. Respects .gitignore (use no_ignore to include ignored files, node_modules and target); hidden files are listed, VCS dirs (.git) never.",
     "name": "find",
     "parameters": {
       "properties": {
+        "no_ignore": {
+          "description": "Also list files skipped by .gitignore/.ignore, node_modules and target (default false)",
+          "type": "boolean"
+        },
         "path": {
           "description": "Directory to search in (default: current directory)",
           "type": "string"
@@ -261,7 +265,7 @@
     }
   },
   {
-    "description": "Search file contents using regex patterns. Returns matching lines with file paths and line numbers. Supports file type filtering and context lines.",
+    "description": "Search file contents with a regex (Rust regex syntax, as in ripgrep). Returns matching lines with file paths and line numbers. Respects .gitignore (use no_ignore to include ignored files); hidden files are searched, binary files skipped.",
     "name": "grep",
     "parameters": {
       "properties": {
@@ -272,6 +276,10 @@
         "include": {
           "description": "Glob pattern to filter files (e.g. \"*.rs\", \"*.py\")",
           "type": "string"
+        },
+        "no_ignore": {
+          "description": "Also search files skipped by .gitignore/.ignore, node_modules and target (default false)",
+          "type": "boolean"
         },
         "path": {
           "description": "File or directory to search in (default: current directory)",
@@ -629,12 +637,12 @@
     }
   },
   {
-    "description": "Search locally known tools by keyword. Returns bounded compact descriptors with stable tool ids (never full schemas). Use activate_tools with an exact returned id to request activation.",
+    "description": "Search locally known tools by keywords, in any order. Ranked: exact id or name first, then the whole query as a substring, then the most keywords matched. Returns compact descriptors with stable tool ids (never full schemas). Use activate_tools with an exact returned id to request activation.",
     "name": "search_tools",
     "parameters": {
       "properties": {
         "query": {
-          "description": "Case-insensitive keyword matched against tool ids, summaries, and tags.",
+          "description": "Case-insensitive keywords matched against tool ids, summaries and tags. _ - : . also separate words: web_fetch and web fetch both work.",
           "type": "string"
         }
       },
@@ -743,17 +751,6 @@
           "description": "Short display name for an inline (system_prompt) subagent, e.g. \"gif-recorder\". Shown in the subagent panel and in status/collect output. Letters, digits, - and _ only, max 32. Ignored when agent is set; defaults to \"inline\".",
           "type": "string"
         },
-        "role": {
-          "enum": [
-            "planner",
-            "implementer",
-            "tester",
-            "reviewer",
-            "researcher",
-            "debugger"
-          ],
-          "type": "string"
-        },
         "system_prompt": {
           "description": "Inline system prompt for the subagent. Use when you don't have a named agent file.",
           "type": "string"
@@ -776,50 +773,6 @@
         "timeout": {
           "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit.",
           "type": "integer"
-        },
-        "write_policy": {
-          "oneOf": [
-            {
-              "properties": {
-                "mode": {
-                  "const": "read_only"
-                }
-              },
-              "required": [
-                "mode"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "mode": {
-                  "const": "isolated_worktree"
-                }
-              },
-              "required": [
-                "mode"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "mode": {
-                  "const": "non_overlapping_paths"
-                },
-                "scopes": {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                }
-              },
-              "required": [
-                "mode",
-                "scopes"
-              ],
-              "type": "object"
-            }
-          ]
         }
       },
       "required": [
@@ -937,18 +890,6 @@
           "description": "Short display name for an inline (system_prompt) subagent, e.g. \"gif-recorder\". Shown in the subagent panel and in status/collect output. Letters, digits, - and _ only, max 32. Ignored when agent is set; defaults to \"inline\".",
           "type": "string"
         },
-        "role": {
-          "description": "Typed orchestration role.",
-          "enum": [
-            "planner",
-            "implementer",
-            "tester",
-            "reviewer",
-            "researcher",
-            "debugger"
-          ],
-          "type": "string"
-        },
         "system_prompt": {
           "description": "Inline system prompt for the subagent. Use when you don't have a named agent file.",
           "type": "string"
@@ -971,51 +912,6 @@
         "timeout": {
           "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit. A timed-out worker keeps its full conversation: subagent_resume continues it where it stopped.",
           "type": "integer"
-        },
-        "write_policy": {
-          "description": "Declared write isolation and path scopes.",
-          "oneOf": [
-            {
-              "properties": {
-                "mode": {
-                  "const": "read_only"
-                }
-              },
-              "required": [
-                "mode"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "mode": {
-                  "const": "isolated_worktree"
-                }
-              },
-              "required": [
-                "mode"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "mode": {
-                  "const": "non_overlapping_paths"
-                },
-                "scopes": {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                }
-              },
-              "required": [
-                "mode",
-                "scopes"
-              ],
-              "type": "object"
-            }
-          ]
         }
       },
       "required": [

@@ -2,7 +2,8 @@
 
 How Synaps measures startup latency and memory footprint, how to reproduce it,
 and what the numbers were on the reference machine. Prompt-cache hit rates from
-real use are in [`benchmarks/prompt-cache/`](benchmarks/prompt-cache/).
+real use are in [`benchmarks/prompt-cache/`](benchmarks/prompt-cache/). Task success on
+Terminal-Bench 4.1 is in [`benchmarks/terminal-bench/`](benchmarks/terminal-bench/).
 
 The harnesses live in [`benchmarks/`](benchmarks/). Methodology and portions of
 their source are adapted from [jcode](https://github.com/1jehuang/jcode)'s
@@ -17,11 +18,20 @@ Measured 2026-10-26 on one machine, same day, current versions (details in
   echo ~8 ms.
 - **Cold start ~41 ms** (the first launch spawns the daemon).
 - **~4 MB per additional session.** The daemon amortizes.
+- **Linear to 1000 sessions:** 1000 idle sessions in 4.7 GB, 4.1–4.8 MB each
+  (0.11.1, 2026-11-05, [Scaling](#scaling-to-1000-sessions--synaps-0111)).
+  Past ~170 sessions the daemon needs a higher open-files limit
+  ([Limits seen at scale](#limits-seen-at-scale)).
 - At 10 concurrent sessions Synaps used **less RAM than every other harness
   tested**: 79 MB, against 165 MB for jcode and 525–1197 MB for the rest.
 - **97.9% of prompt tokens served from the Anthropic prompt cache** since
   v0.8.0, over 127k real requests (median request 99.4%). See
   [Prompt cache](#prompt-cache).
+- **Terminal-Bench 4.1: 39/63 (61.9%)** (2026-11-05/06) with Claude Opus 5.5, one trial per
+  task. Claude Code with the same model would be expected to pass 40.0 of
+  the same tasks (public TB 4.0 board). The API refused 3 tasks for Synaps;
+  without them it is 39/60 (65.0%) against 38.2 (63.7%). See
+  [Terminal-Bench](#terminal-bench).
 
 ## Methodology
 
@@ -88,6 +98,12 @@ python3 benchmarks/bench_memory.py --sessions 1 10 --reps 3 --timeout 10 \
 
 # A specific binary
 SYNAPS_BIN=./target/release/synaps python3 benchmarks/bench_memory.py --sessions 10
+
+# Scaling past 10 sessions (synaps only). The harness raises its open-files
+# limit for the daemon it spawns; 1000 sessions also use ~1000 inotify
+# instances of the running user (see Scaling)
+python3 benchmarks/bench_memory.py --sessions 20 200 500 1000 --launch-wait 0.1 \
+  --json-out scaling.json
 ```
 
 ## Results
@@ -148,6 +164,60 @@ Notes on individual rows:
   (2.24.0, Electron) is installed here, not a terminal CLI.
 - Not installed on this machine: `cursor-agent`, GitHub Copilot CLI.
 
+### Scaling to 1000 sessions — synaps 0.11.1
+
+**Date:** 2026-11-05, same machine, CachyOS on Linux 7.3.0-4-cachyos. Idle
+`--attach --new --keep-warm` sessions, no extensions, total PSS + SwapPss of
+the daemon and every client. Raw data and the exact setup of each run:
+[`benchmarks/results/memory-scaling-2026-11-05/`](benchmarks/results/memory-scaling-2026-11-05/).
+
+| Sessions | Total | Per added session | Runs |
+|---------:|------:|------------------:|------|
+| 1 | 35.9 MB | – | median of 3 |
+| 10 | 72.6 MB | 4.1 MB | median of 3 |
+| 20 | 117.2 MB | 4.5 MB | 1 |
+| 200 | 889.8 MB | 4.3 MB | 1 |
+| 500 | 2,271 MB | 4.6 MB | 1 |
+| 1000 | 4,674 MB | 4.8 MB | 1, in a container |
+
+"Per added session" is the step from the row above. The cost per session
+creeps up with the count (4.1 → 4.8 MB) but stays close to linear. Every
+launched client was still running at each sample. For scale: 200 idle Synaps
+sessions (890 MB) fit in what 10 Claude Code sessions used in the 2026-10-26
+table above (894 MB). 1 and 10 sessions read lower here than in the 0.11.0
+table above (41.5 / 78.6 MB), on a newer kernel too, so the drop isn't
+attributed to either.
+
+How these differ from the table above:
+
+- **Single repetitions from 20 up,** and 20+ were launched 0.1 s apart
+  (`--launch-wait 0.1`) instead of 4 s, so 1000 sessions take minutes and not
+  over an hour. The sample is still taken 3 s after the last launch. Check:
+  10 sessions read 72.6 MB at 4 s and 71.0 MB at 0.1 s.
+- **Open-files limit raised to 65536** for 200 and up (below).
+- **1000 ran in a container** (`ubuntu:24.04`, the same binary bind-mounted,
+  same kernel, a separate uid), because every session holds an inotify
+  instance and 1000 of them would use up the running user's
+  `fs.inotify.max_user_instances` (1024 here) for every other program of that
+  user. 10 sessions read 73.0 MB in the container.
+
+#### Limits seen at scale
+
+- **Open files.** The daemon holds about 5 file descriptors per session and
+  doesn't raise its own `RLIMIT_NOFILE`. At the usual soft limit of 1024 it
+  refuses new sessions at about 170 (`attach: refused: create session: Session
+  error: Too many open files (os error 24)`), and the pins file stops being
+  written (`pins: pin not written` in the log), so pins set after that point
+  aren't saved. Workaround: `ulimit -n 65536` in the shell that starts
+  the daemon. At 1000 sessions the daemon held 4,547 fds.
+- **Inbox watchers.** Each session runs its inbox watcher
+  (`crates/agent-engine/src/events/ingest.rs`) as a `spawn_blocking` task that
+  never returns, holding one inotify instance and one blocking-pool thread that
+  wakes every 500 ms. Tokio's blocking pool stops at 512 threads, and the
+  1000-session run had 512 inotify instances: sessions past 512 get no watcher.
+  From the code (not reproduced as a hang), any later `spawn_blocking` or
+  `tokio::fs` work in the daemon then waits behind those 512 tasks.
+
 ### Compared with the previous table (Sept 2026)
 
 The previous numbers came from older tool versions and a harness that had three
@@ -179,6 +249,32 @@ The dollar figures are list-price equivalents, not money spent.
 
 ![weekly prompt-cache hit rate](benchmarks/prompt-cache/charts/1-weekly-hit-rate.png)
 
+## Terminal-Bench
+
+One pass of Terminal-Bench 4.1.0 (63 tasks, 1 trial each) on 2026-11-05/06:
+Synaps 0.11.1 in its daemon mode inside each task container, Claude Opus 5.5
+at `thinking = xhigh`, the same prompt and config for every task. The
+comparison is Claude Code + Opus 5.5 (`max`) from the public TB 4.0
+leaderboard, as expected passes over the same 63 tasks (the sum of its
+per-task pass rates over 5 trials). Full write-up, per-task table, harness
+and raw data: [`benchmarks/terminal-bench/`](benchmarks/terminal-bench/README.md).
+
+| | Synaps (TB 4.1, 1 trial) | Claude Code (TB 4.0 board, same tasks) |
+|---|--:|--:|
+| Passed | **39 / 63 (61.9%)** | 40.0 expected (63.5%) |
+| Excluding 3 API refusals | **39 / 60 (65.0%)** | 38.2 (63.7%) |
+| Median agent time per task | 23 min | 55 min |
+| List-price cost per trial | $7.94 | $13.77 |
+
+The refusals (`uefi-bootkit`, `formal-crypto`, `kv-live-surgery`) cost 1.8
+expected passes, more than the whole 1.0 gap. Claude Code was refused at the
+same steps and passes those tasks by falling back to Claude Opus 5; Synaps
+ends the turn. Most other failures miss one or two checks, and in 13 of 21 the
+agent's own summary named the decision that failed. Every failure has a
+write-up with general fixes in
+[`benchmarks/terminal-bench/failures/`](benchmarks/terminal-bench/failures/README.md).
+One trial per task is noisy, and versions, effort and hosts differ.
+
 ## Caveats (read these)
 
 - **Single machine.** Cross-machine comparison to any vendor's *published*
@@ -198,8 +294,10 @@ The dollar figures are list-price equivalents, not money spent.
   September 2026 (v0.9.x) and was not re-measured.
 - **Latency vs other daemon harnesses is not settled here.** Only Synaps
   latency was re-measured.
-- **What is *not* measured here:** time-to-first-token, cost-per-task, and task
-  success. First-frame latency and idle RAM are necessary, not sufficient.
+- **What the latency and memory runs do *not* measure:** time-to-first-token,
+  cost per task, and task success. First-frame latency and idle RAM are
+  necessary, not sufficient. Task success and cost are covered separately by
+  [Terminal-Bench](#terminal-bench).
 - **The prompt-cache numbers are one heavy user's workload** (daily
   development of Synaps itself, mostly Claude, many subagents). Your hit rate
   depends on how you work: long pauses past the cache TTL cost a rebuild.

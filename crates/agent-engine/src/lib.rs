@@ -23,9 +23,7 @@ pub mod tools;
 // ── agent-core facade ──────────────────────────────────────────────────────────
 // Re-export core so that internal `crate::core::X`, `crate::config`, etc.
 // resolve inside agent-engine (mirrors root lib.rs approach).
-pub use agent_core::{
-    auth, chain, config, error, logging, models, protocol, watcher_types,
-};
+pub use agent_core::{auth, chain, config, error, logging, models};
 pub use agent_core::{core, memory, pricing};
 pub use agent_core::{epoch_millis, truncate_str, BoundedText};
 
@@ -49,9 +47,5 @@ pub use agent_core::session::{
 };
 pub use tokio_util::sync::CancellationToken;
 pub use tools::{Tool, ToolContext, ToolOutput, ToolRegistry};
-pub use watcher_types::{
-    AgentConfig, AgentStatusInfo, ExitReason, HandoffState, HooksConfig, SessionLimits, SessionStats,
-    WatcherCommand, WatcherResponse,
-};
 
 pub mod orchestration;

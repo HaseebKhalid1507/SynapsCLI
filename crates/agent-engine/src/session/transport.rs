@@ -47,6 +47,11 @@ pub enum TransportError {
     /// `synaps daemon reload` brings it up to this binary.
     #[error("daemon {daemon_version} predates `{request}`; run `synaps daemon reload`")]
     DaemonTooOld { daemon_version: String, request: &'static str },
+    /// Owned sessions: this connection, the owner, fell behind the event
+    /// stream; the daemon closed it (`Bye{owner_lagged}`) and the session
+    /// ended rather than lose frames silently.
+    #[error("owner connection lagged: {dropped} event(s) dropped; the daemon closed it and ended the session")]
+    OwnerLagged { dropped: u64 },
 }
 
 #[async_trait::async_trait]
@@ -229,6 +234,7 @@ impl LocalTransport {
             .send(SessionCommand::Attach {
                 client: meta,
                 mode,
+                owner: None,
             })
             .await?;
 

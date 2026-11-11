@@ -1,20 +1,19 @@
-//! The programs behind the `grep`, `find` and `ls` tools.
+//! The program behind the `ls` tool. (`grep` and `find` no longer run a
+//! program: they walk in-process, see `tools::search`.)
 //!
-//! Unix: `grep`, `find` and `ls` from PATH, as always.
+//! Unix: `ls` from PATH, as always.
 //!
-//! Windows has none of them on a stock install, and the `find` that PATH (and
-//! the system search order) does give is `System32\find.exe`, an unrelated
-//! string search that answers "no files found" instead of failing. So the
-//! tools run a GNU build: from a PATH directory outside the Windows directory
-//! (e.g. Git's `usr\bin` when the user put it there), else from Git for
-//! Windows' own `usr\bin`, found next to `git.exe` on PATH or in the standard
-//! install folders. With neither, the call fails with a message pointing at
-//! Git for Windows and the `powershell` tool.
+//! Windows has no `ls` on a stock install, so the tool runs a GNU build: from
+//! a PATH directory outside the Windows directory (e.g. Git's `usr\bin` when
+//! the user put it there), else from Git for Windows' own `usr\bin`, found
+//! next to `git.exe` on PATH or in the standard install folders. With
+//! neither, the call fails with a message pointing at Git for Windows and the
+//! `powershell` tool.
 //!
 //! Git's GNU tools are MSYS programs. When a non-MSYS process starts one, the
 //! MSYS runtime expands wildcards in its arguments against its working
-//! directory, which turns `-name "*.rs"` or `-not -path "*/.git/*"` into file
-//! names. The child therefore gets `noglob` added to `MSYS`.
+//! directory. The child therefore gets `noglob` added to `MSYS`, so a path
+//! with `*` or `?` in it reaches `ls` as written.
 
 use std::ffi::OsString;
 #[cfg(any(windows, test))]
@@ -29,14 +28,14 @@ use crate::Result;
 #[cfg(windows)]
 use crate::RuntimeError;
 
-/// A `Command` for `name` (`grep`, `find` or `ls`) with the session's env
-/// snapshot applied, ready for the caller's arguments.
+/// A `Command` for `name` (`ls`) with the session's env snapshot applied,
+/// ready for the caller's arguments.
 pub(crate) fn unix_tool_command(name: &str, ctx: &ToolContext) -> Result<Command> {
     let env = ctx.capabilities.env.as_ref();
     #[cfg(windows)]
     let program = {
         let path_var = match env {
-            Some(env) => env_lookup(env, "PATH").map(OsString::from),
+            Some(env) => env_lookup(&env.vars, "PATH").map(OsString::from),
             None => std::env::var_os("PATH"),
         };
         let system_root = std::env::var_os("SystemRoot").map(PathBuf::from);
@@ -49,12 +48,12 @@ pub(crate) fn unix_tool_command(name: &str, ctx: &ToolContext) -> Result<Command
 
     let mut cmd = Command::new(program);
     if let Some(env) = env {
-        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        cmd.env_clear().envs(env.spawn_vars());
     }
     #[cfg(windows)]
     {
         let current = match env {
-            Some(env) => env_lookup(env, "MSYS").map(OsString::from),
+            Some(env) => env_lookup(&env.vars, "MSYS").map(OsString::from),
             None => std::env::var_os("MSYS"),
         };
         cmd.env("MSYS", msys_with_noglob(current.as_deref()));
@@ -181,31 +180,33 @@ mod tests {
         std::env::join_paths(dirs).unwrap()
     }
 
+    /// A program of that name in the Windows directory (as `find.exe`, an
+    /// unrelated string search, was for the old GNU find) is skipped.
     #[test]
-    fn the_windows_find_is_skipped_for_git_usr_bin() {
+    fn the_windows_dir_is_skipped_for_git_usr_bin() {
         let tmp = tempfile::tempdir().unwrap();
         let windows = tmp.path().join("Windows");
         let system32 = windows.join("System32");
-        touch(&system32.join("find.exe"));
+        touch(&system32.join("ls.exe"));
         let git = tmp.path().join("Git");
-        touch(&git.join(r"usr").join("bin").join("find.exe"));
+        touch(&git.join(r"usr").join("bin").join("ls.exe"));
 
         let path = path_of(&[&system32]);
-        let found = resolve_windows("find", Some(&path), Some(&windows), std::slice::from_ref(&git));
-        assert_eq!(found, Some(git.join("usr").join("bin").join("find.exe")));
+        let found = resolve_windows("ls", Some(&path), Some(&windows), std::slice::from_ref(&git));
+        assert_eq!(found, Some(git.join("usr").join("bin").join("ls.exe")));
     }
 
     #[test]
     fn a_gnu_tool_on_path_outside_the_windows_dir_wins() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = tmp.path().join("gnu");
-        touch(&tools.join("grep.exe"));
+        touch(&tools.join("ls.exe"));
         let git = tmp.path().join("Git");
-        touch(&git.join("usr").join("bin").join("grep.exe"));
+        touch(&git.join("usr").join("bin").join("ls.exe"));
 
         let path = path_of(&[&tools]);
-        let found = resolve_windows("grep", Some(&path), None, &[git]);
-        assert_eq!(found, Some(tools.join("grep.exe")));
+        let found = resolve_windows("ls", Some(&path), None, &[git]);
+        assert_eq!(found, Some(tools.join("ls.exe")));
     }
 
     #[test]
@@ -213,12 +214,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let windows = tmp.path().join("Windows");
         let system32 = windows.join("System32");
-        touch(&system32.join("find.exe"));
+        touch(&system32.join("ls.exe"));
         let path = path_of(&[&system32]);
-        assert_eq!(resolve_windows("find", Some(&path), Some(&windows), &[]), None);
+        assert_eq!(resolve_windows("ls", Some(&path), Some(&windows), &[]), None);
         assert_eq!(resolve_windows("ls", None, None, &[tmp.path().join("NoGit")]), None);
 
-        let msg = missing_message("find");
+        let msg = missing_message("ls");
         assert!(msg.contains("Git for Windows") && msg.contains("powershell"), "{msg}");
     }
 
@@ -260,7 +261,7 @@ mod tests {
     #[test]
     fn unix_command_is_the_plain_program_name() {
         let ctx = super::super::test_helpers::create_tool_context();
-        let cmd = unix_tool_command("grep", &ctx).unwrap();
-        assert_eq!(cmd.as_std().get_program(), OsStr::new("grep"));
+        let cmd = unix_tool_command("ls", &ctx).unwrap();
+        assert_eq!(cmd.as_std().get_program(), OsStr::new("ls"));
     }
 }

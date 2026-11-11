@@ -184,6 +184,7 @@ pub(crate) async fn run_setup(
             memory_mode: None,
             restore_parked: false,
             message_clock: None,
+            owned: None,
         })
         .await?;
     let (transport, snapshot) =

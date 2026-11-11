@@ -6,7 +6,7 @@ exact ordered favorites, retries, failover and cooldown. There are no provider
 clients, subprocess tools, network requests, dependencies or setup scripts.
 
 **First release: local interactive TUI only**, on a Synaps build implementing
-`session.drive` and the session-driver API. Headless chat, RPC, server and
+`session.drive` and the session-driver API. Headless chat, RPC and
 subagents do not gain driver authority. Older hosts must not activate a run
 from printed output. This example does not install or bundle a Synaps binary.
 

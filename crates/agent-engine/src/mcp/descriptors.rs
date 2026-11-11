@@ -661,7 +661,8 @@ impl Tool for DeferredMcpTool {
                 // drift, and live name/schema mismatch poison the pinned
                 // descriptor, so the EXACT session grant must fall with the
                 // lease. Transport/capacity/revocation-race failures are
-                // transient and must NOT revoke.
+                // transient and must NOT revoke; nor must a tool's own
+                // `isError` refusal (`ToolError`).
                 use super::lease::McpLeaseError;
                 if matches!(
                     err,

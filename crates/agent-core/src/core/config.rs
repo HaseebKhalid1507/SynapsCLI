@@ -454,55 +454,24 @@ fn parse_daemon_config_key(
     Ok(())
 }
 
-/// Server security configuration parsed from `server.*` keys.
+/// Configuration parsed from `server.*` keys. The family outlived the
+/// removed `synaps server`: only `auto_approve_confirms` is read.
 #[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
-    /// Comma-separated list of allowed Origin headers. Empty = allow all (localhost-only protection).
-    pub allowed_origins: Vec<String>,
-    /// Pre-shared authentication token. If set, clients must provide it on WebSocket upgrade
-    /// via `?token=X` query param or `Authorization: Bearer X` header. If None, auto-generated on boot.
-    pub token: Option<String>,
-    /// When true, `HookResult::Confirm` is auto-approved without prompting (useful for headless/agent mode).
+    /// When true, `HookResult::Confirm` is auto-approved without prompting (useful for headless clients).
     pub auto_approve_confirms: bool,
-    /// Maximum inbound message size in bytes. Defaults to context_window * 4 (rough token→byte estimate).
-    /// None means no artificial cap.
-    pub max_message_size: Option<usize>,
 }
 
-/// Bridge daemon configuration parsed from `bridge.*` keys.
-///
-/// Controls best-effort mirroring of watcher heartbeats over the bridge
-/// daemon's UDS `ControlSocket` (`heartbeat_emit` op). All keys are optional
-/// and the feature is OFF by default.
-#[derive(Debug, Clone)]
-pub struct BridgeConfig {
-    /// Path to the bridge daemon's UDS control socket.
-    /// When `None`, defaults to `base_dir().join("bridge/control.sock")`.
-    pub uds_path: Option<PathBuf>,
-    /// When true, every watcher heartbeat tick mirrors a `heartbeat_emit`
-    /// JSON-RPC call over the UDS socket. Errors are logged at debug only.
-    pub heartbeat_mirror: bool,
-    /// Per-call timeout in milliseconds (covers connect + write + read).
-    pub heartbeat_timeout_ms: u64,
-}
-
-impl Default for BridgeConfig {
-    fn default() -> Self {
-        Self {
-            uds_path: None,
-            heartbeat_mirror: false,
-            heartbeat_timeout_ms: 250,
-        }
-    }
-}
-
-impl BridgeConfig {
-    /// Resolve the UDS path, falling back to the default under `base_dir()`.
-    pub fn resolved_uds_path(&self) -> PathBuf {
-        self.uds_path
-            .clone()
-            .unwrap_or_else(|| base_dir().join("bridge/control.sock"))
-    }
+/// Keys only `synaps server` read. Ignored with one warning so an old
+/// config still loads.
+const REMOVED_SERVER_KEYS: [&str; 3] =
+    ["server.allowed_origins", "server.token", "server.max_message_size"];
+fn removed_server_warning() -> String {
+    format!(
+        "server.allowed_origins, server.token and server.max_message_size are ignored: they \
+         configured `synaps server`, removed in {}. Remove these lines",
+        crate::REMOVED_IN
+    )
 }
 
 /// Auth configuration parsed from `auth.*` keys. Controls whether this client
@@ -1117,17 +1086,17 @@ impl<T> TurnLimit<T> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnBudgetOverrides {
     /// Provider rounds per turn: N or `unlimited`. Unset = the role default
-    /// (foreground unlimited, autonomous 24, worker 64 per allowance). `0` =
+    /// (foreground unlimited, event 24, worker 64 per allowance). `0` =
     /// none allowed (deprecated).
     pub max_provider_rounds: Option<TurnLimit<u32>>,
     /// Tool calls per turn: N or `unlimited`. Unset = the role default
-    /// (autonomous 96, otherwise unlimited). `0` = none allowed (deprecated).
+    /// (event 96, otherwise unlimited). `0` = none allowed (deprecated).
     pub max_tool_calls: Option<TurnLimit<u32>>,
     /// Wall-clock limit for one turn, in seconds. Unset = no limit (the
     /// default for every role); `0` also means no limit.
     pub max_elapsed_secs: Option<u64>,
     /// Accumulated tool-result bytes per turn: N or `unlimited`. Unset = the
-    /// role default (autonomous 8 MiB, otherwise unlimited). `0` = none
+    /// role default (event 8 MiB, otherwise unlimited). `0` = none
     /// allowed (deprecated).
     pub max_accumulated_tool_result_bytes: Option<TurnLimit<usize>>,
     pub max_context_tokens: Option<u64>,
@@ -1139,21 +1108,41 @@ pub struct TurnBudgetOverrides {
     pub max_round_renewals: Option<u32>,
 }
 
-/// Per-role turn budgets (foreground, autonomous/watcher, worker).
+/// Per-role turn budgets (foreground, event, worker).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnBudgetsConfig {
     pub foreground: TurnBudgetOverrides,
-    pub autonomous: TurnBudgetOverrides,
     /// Turns a session starts by itself because events arrived.
     pub event: TurnBudgetOverrides,
     pub worker: TurnBudgetOverrides,
 }
 
+/// The one warning for any number of `turn_budget.autonomous.*` lines.
+fn removed_autonomous_budget_warning() -> String {
+    format!(
+        "turn_budget.autonomous.* is ignored: `synaps agent` was removed in {}. Remove these \
+         lines (turns started by events use turn_budget.event.*)",
+        crate::REMOVED_IN
+    )
+}
+
+/// Watcher-only keys (heartbeat mirroring to the bridge daemon). Ignored
+/// with one warning so an old config still loads.
+const REMOVED_BRIDGE_KEYS: [&str; 3] =
+    ["bridge.uds_path", "bridge.heartbeat_mirror", "bridge.heartbeat_timeout_ms"];
+fn removed_bridge_warning() -> String {
+    format!(
+        "bridge.uds_path, bridge.heartbeat_mirror and bridge.heartbeat_timeout_ms are ignored: \
+         they configured `synaps watcher`, removed in {}. Remove these lines",
+        crate::REMOVED_IN
+    )
+}
+
 /// Parse `turn_budget.<role>.<field>` keys. Invalid values warn and keep
 /// the default (parity with shell.* parsing). `Err` carries the stderr
 /// diagnostic. `Ok(Some(warning))`: applied, with a deprecation warning for
-/// `config.warnings` (shown at TUI startup, in watcher logs and on stderr
-/// for headless hosts).
+/// `config.warnings` (shown at TUI startup and on stderr for headless
+/// hosts).
 fn parse_turn_budget_config_key(
     budgets: &mut TurnBudgetsConfig,
     key: &str,
@@ -1169,12 +1158,13 @@ fn parse_turn_budget_config_key(
     };
     let overrides = match role {
         "foreground" => &mut budgets.foreground,
-        "autonomous" => &mut budgets.autonomous,
+        // Only `synaps agent` read it: an old config still loads.
+        "autonomous" => return Ok(Some(removed_autonomous_budget_warning())),
         "event" => &mut budgets.event,
         "worker" => &mut budgets.worker,
         other => {
             return Err(format!(
-                "Warning: unknown turn_budget role '{other}' (expected foreground|autonomous|event|worker)"
+                "Warning: unknown turn_budget role '{other}' (expected foreground|event|worker)"
             ));
         }
     };
@@ -1584,7 +1574,6 @@ pub struct SynapsConfig {
     pub disabled_tools: Vec<String>,
     pub shell: ShellConfig,
     pub server: ServerConfig,
-    pub bridge: BridgeConfig,
     pub auth: AuthConfig,
     pub events: EventsConfig,
     pub provider_keys: BTreeMap<String, String>,
@@ -1663,7 +1652,6 @@ impl Default for SynapsConfig {
             disabled_tools: Vec::new(),
             shell: ShellConfig::default(),
             server: ServerConfig::default(),
-            bridge: BridgeConfig::default(),
             auth: AuthConfig::default(),
             events: EventsConfig::default(),
             provider_keys: BTreeMap::new(),
@@ -1797,7 +1785,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
 
 /// Every key accepted by the namespaced family parsers that is NOT in
 /// [`KNOWN_CONFIG_KEYS`] (`shell.*`, `events.*`, `turn_budget.*`,
-/// `memory.*`, `server.*`, `bridge.*`, `auth.*`). Open-ended families whose
+/// `memory.*`, `server.*`, `auth.*`). Open-ended families whose
 /// suffix is user-chosen are listed as `prefix.*`. Keep this in sync when a
 /// parser learns a key: the /settings coverage test requires each entry to
 /// have a settings row or an explicit exclusion.
@@ -1822,13 +1810,6 @@ pub const FAMILY_CONFIG_KEYS: &[&str] = &[
     "turn_budget.foreground.max_context_tokens",
     "turn_budget.foreground.max_cost_usd",
     "turn_budget.foreground.max_round_renewals",
-    "turn_budget.autonomous.max_provider_rounds",
-    "turn_budget.autonomous.max_tool_calls",
-    "turn_budget.autonomous.max_elapsed_secs",
-    "turn_budget.autonomous.max_accumulated_tool_result_bytes",
-    "turn_budget.autonomous.max_context_tokens",
-    "turn_budget.autonomous.max_cost_usd",
-    "turn_budget.autonomous.max_round_renewals",
     "turn_budget.event.max_provider_rounds",
     "turn_budget.event.max_tool_calls",
     "turn_budget.event.max_elapsed_secs",
@@ -1861,14 +1842,7 @@ pub const FAMILY_CONFIG_KEYS: &[&str] = &[
     "memory.local_embeddings",
     "memory.gliner",
     // parse_server_config_key
-    "server.allowed_origins",
-    "server.token",
     "server.auto_approve_confirms",
-    "server.max_message_size",
-    // parse_bridge_config_key
-    "bridge.uds_path",
-    "bridge.heartbeat_mirror",
-    "bridge.heartbeat_timeout_ms",
     // parse_auth_config_key
     "auth.remote_endpoint",
     "auth.machine_token",
@@ -1961,63 +1935,22 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
 }
 
 /// Parse server.* configuration keys and update the ServerConfig.
-#[allow(clippy::collapsible_match)]
-fn parse_server_config_key(server_config: &mut ServerConfig, key: &str, val: &str) {
-    match key {
-        "server.allowed_origins" => {
-            server_config.allowed_origins = parse_comma_list(val);
-        }
-        "server.token" => {
-            if !val.is_empty() {
-                server_config.token = Some(val.to_string());
-            }
-        }
-        "server.auto_approve_confirms" => {
-            server_config.auto_approve_confirms = matches!(val, "true" | "1" | "yes");
-        }
-        "server.max_message_size" => {
-            if let Ok(size) = val.parse::<usize>() {
-                server_config.max_message_size = Some(size);
-            } else {
-                eprintln!(
-                    "Warning: invalid value for server.max_message_size: '{}', ignored",
-                    val
-                );
-            }
-        }
-        _ => {
-            // Unknown server.* keys preserved (not rejected)
-        }
+/// `Some(warning)`: a key of the removed `synaps server`, ignored; the
+/// caller must surface it (once) in `config.warnings`.
+#[must_use]
+fn parse_server_config_key(
+    server_config: &mut ServerConfig,
+    key: &str,
+    val: &str,
+) -> Option<String> {
+    if REMOVED_SERVER_KEYS.contains(&key) {
+        return Some(removed_server_warning());
     }
-}
-
-/// Parse bridge.* configuration keys and update the BridgeConfig.
-fn parse_bridge_config_key(bridge_config: &mut BridgeConfig, key: &str, val: &str) {
-    match key {
-        "bridge.uds_path" => {
-            if val.is_empty() {
-                bridge_config.uds_path = None;
-            } else {
-                bridge_config.uds_path = Some(PathBuf::from(val));
-            }
-        }
-        "bridge.heartbeat_mirror" => {
-            bridge_config.heartbeat_mirror = matches!(val, "true" | "1" | "yes");
-        }
-        "bridge.heartbeat_timeout_ms" => {
-            if let Ok(ms) = val.parse::<u64>() {
-                bridge_config.heartbeat_timeout_ms = ms;
-            } else {
-                eprintln!(
-                    "Warning: invalid value for bridge.heartbeat_timeout_ms: '{}', using default",
-                    val
-                );
-            }
-        }
-        _ => {
-            // Unknown bridge.* keys preserved (not rejected)
-        }
+    if key == "server.auto_approve_confirms" {
+        server_config.auto_approve_confirms = matches!(val, "true" | "1" | "yes");
     }
+    // Unknown server.* keys preserved (not rejected)
+    None
 }
 
 /// Warning for an `auth.*` key no parser reads (a typo would otherwise
@@ -2618,9 +2551,16 @@ fn apply_config_content_with(
                         family_diagnostic(diagnostic);
                     }
                 } else if key.starts_with("server.") {
-                    parse_server_config_key(&mut config.server, key, val);
-                } else if key.starts_with("bridge.") {
-                    parse_bridge_config_key(&mut config.bridge, key, val);
+                    if let Some(warning) = parse_server_config_key(&mut config.server, key, val) {
+                        if !config.warnings.contains(&warning) {
+                            config.warnings.push(warning);
+                        }
+                    }
+                } else if REMOVED_BRIDGE_KEYS.contains(&key) {
+                    let warning = removed_bridge_warning();
+                    if !config.warnings.contains(&warning) {
+                        config.warnings.push(warning);
+                    }
                 } else if key.starts_with("auth.") {
                     parse_auth_config_key(&mut config.auth, key, val);
                     if let Some(key) = key.strip_prefix("auth.auto.").filter(|k| !k.trim().is_empty()) {
@@ -2648,7 +2588,11 @@ fn apply_config_content_with(
                 } else if key.starts_with("turn_budget.") {
                     match parse_turn_budget_config_key(&mut config.turn_budgets, key, val) {
                         Ok(None) => {}
-                        Ok(Some(warning)) => config.warnings.push(warning),
+                        Ok(Some(warning)) => {
+                            if !config.warnings.contains(&warning) {
+                                config.warnings.push(warning);
+                            }
+                        }
                         Err(diagnostic) => family_diagnostic(diagnostic),
                     }
                 } else if key.starts_with("memory.") {
@@ -2754,14 +2698,6 @@ fn apply_config_content_with(
             config.memory.default_mode
         ));
         config.memory.default_mode = "off".to_string();
-    }
-
-    // Derive max_message_size from context_window if not explicitly set.
-    // Rough estimate: 1 token ≈ 4 bytes. Context window in tokens → bytes.
-    if config.server.max_message_size.is_none() {
-        if let Some(ctx_tokens) = config.context_window {
-            config.server.max_message_size = Some((ctx_tokens as usize) * 4);
-        }
     }
 }
 
@@ -3776,7 +3712,6 @@ mod tests {
         let config = super::load_config_from_str(
             "turn_budget.worker.max_provider_rounds = 3\n\
              turn_budget.worker.max_cost_usd = 0.25\n\
-             turn_budget.autonomous.max_elapsed_secs = 90\n\
              turn_budget.foreground.max_tool_calls = 7\n\
              turn_budget.foreground.max_round_renewals = 12\n\
              turn_budget.worker.max_provider_rounds_bogus = 1\n\
@@ -3787,7 +3722,6 @@ mod tests {
             Some(super::TurnLimit::Max(3))
         );
         assert_eq!(config.turn_budgets.worker.max_cost_usd, Some(0.25));
-        assert_eq!(config.turn_budgets.autonomous.max_elapsed_secs, Some(90));
         assert_eq!(
             config.turn_budgets.foreground.max_tool_calls,
             Some(super::TurnLimit::Max(7))
@@ -3801,16 +3735,33 @@ mod tests {
     }
 
     #[test]
+    fn removed_autonomous_turn_budget_role_still_loads_with_one_warning() {
+        let content = "turn_budget.autonomous.max_tool_calls = 5\n\
+                       turn_budget.autonomous.max_elapsed_secs = 90\n\
+                       turn_budget.worker.max_tool_calls = 7\n";
+        let config = super::load_config_from_str(content);
+        assert_eq!(config.warnings, [super::removed_autonomous_budget_warning()]);
+        assert_eq!(
+            config.turn_budgets.worker.max_tool_calls,
+            Some(super::TurnLimit::Max(7))
+        );
+        assert_eq!(
+            super::config_content_problems(content),
+            [super::removed_autonomous_budget_warning()]
+        );
+    }
+
+    #[test]
     fn turn_budget_count_limits_accept_unlimited() {
         let config = super::load_config_from_str(
-            "turn_budget.autonomous.max_provider_rounds = unlimited\n\
-             turn_budget.autonomous.max_tool_calls = \"unlimited\"\n\
+            "turn_budget.event.max_provider_rounds = unlimited\n\
+             turn_budget.event.max_tool_calls = \"unlimited\"\n\
              turn_budget.worker.max_accumulated_tool_result_bytes = Unlimited\n",
         );
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
         let unlimited = Some(super::TurnLimit::Unlimited);
-        assert_eq!(config.turn_budgets.autonomous.max_provider_rounds, unlimited);
-        assert_eq!(config.turn_budgets.autonomous.max_tool_calls, unlimited);
+        assert_eq!(config.turn_budgets.event.max_provider_rounds, unlimited);
+        assert_eq!(config.turn_budgets.event.max_tool_calls, unlimited);
         assert_eq!(
             config.turn_budgets.worker.max_accumulated_tool_result_bytes,
             Some(super::TurnLimit::Unlimited)
@@ -3824,7 +3775,7 @@ mod tests {
         // 0.10.2 read `0` as "none allowed". For one release it keeps that
         // meaning in every role (also where the default is unlimited), and
         // says it will be rejected later.
-        for role in ["foreground", "autonomous", "event", "worker"] {
+        for role in ["foreground", "event", "worker"] {
             for field in [
                 "max_provider_rounds",
                 "max_tool_calls",
@@ -3835,7 +3786,6 @@ mod tests {
                 let config = super::load_config_from_str(&content);
                 let overrides = match role {
                     "foreground" => &config.turn_budgets.foreground,
-                    "autonomous" => &config.turn_budgets.autonomous,
                     "event" => &config.turn_budgets.event,
                     _ => &config.turn_budgets.worker,
                 };
@@ -4703,14 +4653,7 @@ mod tests {
         assert_eq!(config.shell.max_sessions, 5);
         assert_eq!(config.shell.idle_timeout.as_secs(), 600);
         // Server config defaults
-        assert!(config.server.allowed_origins.is_empty());
-        assert_eq!(config.server.token, None);
         assert!(!config.server.auto_approve_confirms);
-        assert_eq!(config.server.max_message_size, None);
-        // Bridge config defaults
-        assert!(config.bridge.uds_path.is_none());
-        assert!(!config.bridge.heartbeat_mirror);
-        assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
     }
 
     #[test]
@@ -4817,63 +4760,16 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn test_load_config_bridge_keys() {
-        let home = make_test_home("bridge-keys");
-        let cfg = home.join(".synaps-cli/config");
-        std::fs::write(
-            &cfg,
-            "\
-bridge.uds_path = /tmp/some/control.sock\n\
-bridge.heartbeat_mirror = true\n\
-bridge.heartbeat_timeout_ms = 750\n\
-",
-        )
-        .unwrap();
-
-        with_home(&home, || {
-            let config = load_config();
-            assert_eq!(
-                config.bridge.uds_path,
-                Some(std::path::PathBuf::from("/tmp/some/control.sock")),
-            );
-            assert!(config.bridge.heartbeat_mirror);
-            assert_eq!(config.bridge.heartbeat_timeout_ms, 750);
-            assert_eq!(
-                config.bridge.resolved_uds_path(),
-                std::path::PathBuf::from("/tmp/some/control.sock"),
-            );
-        });
-
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn test_bridge_config_defaults() {
-        let cfg = BridgeConfig::default();
-        assert!(cfg.uds_path.is_none());
-        assert!(!cfg.heartbeat_mirror);
-        assert_eq!(cfg.heartbeat_timeout_ms, 250);
-        // resolved path falls under base_dir()/bridge/control.sock
-        let resolved = cfg.resolved_uds_path();
-        assert!(resolved.ends_with("bridge/control.sock"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_bridge_heartbeat_mirror_defaults_off_when_unset() {
-        let home = make_test_home("bridge-default-off");
-        let cfg = home.join(".synaps-cli/config");
-        std::fs::write(&cfg, "model = claude-sonnet-4-6\n").unwrap();
-
-        with_home(&home, || {
-            let config = load_config();
-            assert!(!config.bridge.heartbeat_mirror);
-            assert!(config.bridge.uds_path.is_none());
-            assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
-        });
-
-        let _ = std::fs::remove_dir_all(&home);
+    fn removed_watcher_bridge_keys_still_load_with_one_warning() {
+        let config = load_config_from_str(
+            "bridge.uds_path = /tmp/some/control.sock\n\
+             bridge.heartbeat_mirror = true\n\
+             bridge.heartbeat_timeout_ms = 750\n\
+             bridge.plugin_key = kept\n\
+             model = claude-sonnet-4-6\n",
+        );
+        assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(config.warnings, [removed_bridge_warning()], "{:?}", config.warnings);
     }
 
     #[test]
@@ -4934,34 +4830,21 @@ context_window = 200k\n\
         .unwrap();
 
         with_home(&home, || {
+            // A config written for the removed `synaps server` still loads:
+            // its keys are ignored with one deprecation warning for all of
+            // them, and every other key (here context_window) still applies.
             let config = load_config();
-            assert_eq!(
-                config.server.allowed_origins,
-                vec![
-                    "http://localhost:3000".to_string(),
-                    "http://localhost:5193".to_string(),
-                ]
-            );
-            assert_eq!(config.server.token, Some("my-secret-token".to_string()));
             assert!(config.server.auto_approve_confirms);
-            // Explicit max_message_size takes precedence over context_window derivation
-            assert_eq!(config.server.max_message_size, Some(65536));
-        });
-
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    #[serial]
-    fn test_server_max_message_size_derived_from_context_window() {
-        let home = make_test_home("server-derive");
-        let cfg = home.join(".synaps-cli/config");
-        std::fs::write(&cfg, "context_window = 200k\n").unwrap();
-
-        with_home(&home, || {
-            let config = load_config();
-            // 200_000 tokens * 4 bytes/token = 800_000 bytes
-            assert_eq!(config.server.max_message_size, Some(800_000));
+            assert_eq!(config.context_window, Some(200_000));
+            assert_eq!(config.warnings, [removed_server_warning()], "{:?}", config.warnings);
+            // The warning names keys, never their values (the token is a secret).
+            for value in ["my-secret-token", "localhost:3000", "localhost:5193", "65536"] {
+                assert!(
+                    !config.warnings.iter().any(|w| w.contains(value)),
+                    "{value} echoed: {:?}",
+                    config.warnings
+                );
+            }
         });
 
         let _ = std::fs::remove_dir_all(&home);
@@ -5714,9 +5597,7 @@ api_retries = 5
                 "memory.auto_consolidate" | "memory.local_embeddings" | "memory.gliner" => "off",
                 "memory.axel.executable" | "memory.axel.brain" => ABSOLUTE_SAMPLE_PATH,
                 "events.auto_turn" => "on",
-                "server.allowed_origins" | "server.token" => "x",
-                "server.auto_approve_confirms" | "bridge.heartbeat_mirror" => "false",
-                "bridge.uds_path" => "/tmp/x.sock",
+                "server.auto_approve_confirms" => "false",
                 "auth.remote_endpoint" | "auth.machine_token" => "x",
                 _ => "7",
             }

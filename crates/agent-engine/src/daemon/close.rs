@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 use super::DaemonState;
-use crate::session::actor::CLOSE_COMMAND;
+use crate::session::actor::{CLOSE_COMMAND, CLOSE_UNATTACHED_ARG};
 use crate::session::wire::{DaemonFrame, RefuseReason, CLOSE_QUERY_ID_BASE};
 use crate::session::{EndReason, SessionCommand, SessionEventWire, SessionHandle, SessionId, SessionMeta, TransportError};
 
@@ -74,15 +74,37 @@ pub async fn close_session(state: &DaemonState, id: &SessionId, force: bool, att
             ),
         };
     }
+    // The check above is the friendly fast path; the actor decides (an
+    // attach already queued ahead of the close would race it).
+    close_in_actor(state, &handle, force, !attached).await
+}
 
+/// End `handle` only if no client is attached, decided inside the actor
+/// atomically with the close: an attach that reaches the actor first is
+/// never closed under. `Closed`, or `Refused`/`Error` with why.
+pub async fn close_if_unattached(state: &DaemonState, handle: &SessionHandle) -> DaemonFrame {
+    if state.reloading.load(Ordering::SeqCst) {
+        return DaemonFrame::Refused { reason: RefuseReason::Busy, message: "daemon reloading; retry in a moment".into() };
+    }
+    if let Some(holder) = handle.meta().locked_by.clone() {
+        return close_placeholder(state, handle, &holder).await;
+    }
+    close_in_actor(state, handle, false, true).await
+}
+
+/// Send the host `close` (`unattached`: refused while anyone is attached)
+/// and wait for the reply and the end.
+async fn close_in_actor(state: &DaemonState, handle: &SessionHandle, force: bool, unattached: bool) -> DaemonFrame {
+    let sid = handle.id.clone();
     // Subscribe before sending: the reply can land before we would look.
     let mut rx = handle.subscribe();
     let query_id = next_close_query_id();
-    let cmd = || SessionCommand::EngineCommand {
-        id: query_id,
-        name: CLOSE_COMMAND.into(),
-        arg: if force { "force".into() } else { String::new() },
-    };
+    let arg = [force.then_some("force"), unattached.then_some(CLOSE_UNATTACHED_ARG)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cmd = || SessionCommand::EngineCommand { id: query_id, name: CLOSE_COMMAND.into(), arg: arg.clone() };
     let deadline = tokio::time::Instant::now() + CLOSE_SEND_RETRY;
     loop {
         match handle.send(cmd()).await {

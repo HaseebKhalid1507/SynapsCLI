@@ -25,14 +25,16 @@ pub use core::error;
 pub use core::logging;
 pub use core::models;
 pub use core::private_fs;
-pub use core::protocol;
 pub use core::reasoning;
 pub use core::retention;
 pub use core::session;
 pub use core::session_catalog;
 pub use core::session_journal;
 pub use core::session_lock;
-pub use core::watcher_types;
+
+/// The release that removed `synaps agent` and `synaps watcher`. The
+/// one-release CLI stubs and the warnings for their config keys name it.
+pub const REMOVED_IN: &str = "0.12.0";
 
 /// Current time as Unix epoch milliseconds. Panics only if system clock is before 1970.
 #[inline]

@@ -4,19 +4,199 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Owned daemon sessions.** A client can create a session bound to its
+  connection (`Attach::Create{owned}`; `SocketTransport::create_owned`;
+  `synaps attach --owned`). When the owner disconnects for any reason
+  (clean detach, EOF, socket error, the process killed), the daemon
+  cancels a running turn as `Cancel` does, saves the journal and ends the
+  session (`Ended{owner_gone}` to observers): the in-process lifetime that
+  headless callers abort and time out by. Only the owner drives an owned
+  session (others watch); an owner that lags is disconnected
+  (`Bye{owner_lagged}`) rather than losing frames. Owned sessions never
+  park, idle-end or pin, and never keep the prompt cache warm
+  (`cache_keepwarm_headless` does not apply to them). After `synaps daemon
+  reload` the owner re-binds
+  with a token within `SYNAPS_DAEMON_OWNER_REBIND_SECS` (30 s, counted from
+  when the new daemon accepts connections; never later than
+  `SYNAPS_DAEMON_OWNER_RESTORE_CAP_SECS`, 300 s, plus the grace), else the
+  session ends.
+  Daemons advertise the capability in `Welcome.features`; a client asking an
+  older daemon fails loudly. Opt-in `forward_secrets` (owned only) passes
+  the secret env vars the daemon normally strips to the session's tools
+  (`bash`, `grep`/`find`/`ls`, the interactive shell), in memory only.
+  Plain sessions are unchanged, except for the interactive shell below.
+
+### Changed
+
+- **Daemon sessions: the interactive shell (`shell_start`) starts from the
+  session's env**, like `bash`, instead of the daemon's own. It no longer
+  sees the env the daemon inherited, nor the secrets the daemon strips from
+  a client's env; it says which secrets the session lacks, as `bash` does
+  when a failed command references one. As with `bash`, a pinned session
+  created over SSH keeps that login's `SSH_AUTH_SOCK`, which is dead once
+  you log out.
+- **`synaps daemon close` without `--attached`** is now decided by the
+  session itself, together with the close: a client that attaches between
+  the daemon's check and the close is no longer closed under.
+
+- **`grep` runs ripgrep's engine in-process, and understands `a|b`.** It ran
+  GNU grep in basic regex mode, where `a|b`, `+`, `?`, `{n}` and `( )` are
+  literal characters, and it ignored grep's exit status and stderr, so an
+  error also read "No matches found.". In local session history 336 of 448
+  grep tool calls (75%) returned "No matches found."; replaying the 256 of
+  those whose paths still exist with Rust regex finds matches in 228 (89%),
+  mostly `|` alternations. The tool no longer spawns `grep`: it walks and
+  searches with ripgrep's crates (`ignore`, `grep-regex`, `grep-searcher`),
+  so it behaves the same on Linux, macOS and Windows (no Git for Windows
+  needed for grep) and works in the hardened `--no-default-features` build.
+  The output format (`path:line:text`, `path-line-text` context, `--`
+  separators) is unchanged. Behaviour changes:
+  - **Regex dialect is Rust regex** (ripgrep's): `a|b`, `+`, `?`, `{n}`,
+    `\d`, `\b`, `(?i)` work as written; `\|` is a literal pipe; no
+    lookaround or backreferences. Escape `(` `[` `{` to match them
+    literally: `fn main() {`, which used to match, is now an invalid
+    pattern (write `fn main\(\) \{`). An invalid pattern is a tool error
+    with the parse error and a hint, and a missing path is a tool error,
+    instead of "No matches found.".
+  - **`.gitignore` is respected** (in a git repo), with `.ignore`,
+    `.git/info/exclude` and the global git excludes, as ripgrep does.
+    `node_modules` and `target` stay skipped everywhere. The new
+    `no_ignore: true` parameter searches all of them. `.git`, `.svn`, `.hg`,
+    `.bzr`, `.jj` and `.sl` are never searched.
+  - **Hidden files are searched** (`.github/`, `.env.example`, …).
+  - **Binary files are skipped**; the ones that match are listed in a note
+    instead of GNU's "Binary file … matches" lines (or nothing at all, as
+    GNU grep 3.5+ wrote those to stderr). Unreadable files are counted in a
+    note with the first error, beside the matches, instead of vanishing.
+  - Results are sorted by path. Lines over 500 characters are cut. A search
+    that hits the 15 s deadline (or is cancelled) returns what it found with
+    a note, instead of an error and nothing, and stops instead of running
+    on. Output stops at the 256 KiB tool buffer, on a whole line and with
+    the same truncation footer, instead of being read in full and cut
+    after. Links inside the tree are not followed, and FIFOs and devices
+    are never read.
+  - The `grep` schema gained `no_ignore` and a new description, so the
+    first request after upgrading rewrites the prompt cache once.
+- **`find` runs on the same in-process walker, and respects `.gitignore`.**
+  It ran GNU `find`, which on Windows needed Git for Windows and in the
+  hardened `--no-default-features` build still spawned a process. Its
+  `-not -path` filters hid the contents of `node_modules`, `.git` and
+  `target` only after walking every entry, so a big `node_modules` was
+  walked in full on every call, and a project whose own path ran through a
+  directory of one of those names (say `~/target/app`) found nothing. It now
+  walks with grep's walker (`ignore` and `globset`, no process), so it
+  behaves the same on Linux, macOS and Windows (no Git for Windows needed
+  for find) and works in the hardened build. The output is unchanged: one
+  path per line, as `find PATH` printed it. Behaviour changes:
+  - **`.gitignore` is respected** (in a git repo), with `.ignore`,
+    `.git/info/exclude` and the global git excludes, as grep does.
+    `node_modules` and `target` are pruned everywhere: not walked and no
+    longer listed themselves. The new `no_ignore: true` parameter lists all
+    of them. `.git`, `.svn`, `.hg`, `.bzr`, `.jj` and `.sl` are never listed
+    or entered; an explicit `path` is always walked. Hidden files are still
+    listed.
+  - Results are sorted (by name, a directory before its entries). Output
+    stops at the 256 KiB tool buffer, on a whole path and with grep's
+    truncation footer. A find that hits the 10 s deadline (or is cancelled)
+    returns what it found with a note, instead of an error and nothing, and
+    stops.
+  - A missing path is an error instead of "No files found.", and errors
+    such as an unreadable directory are reported in a note beside the
+    results. A `pattern` with a `/` (which never matched a name) is an
+    error pointing at `path`; an invalid glob is an error with the parse
+    error.
+  - The `find` schema gained `no_ignore` and a new description; it ships
+    with grep's schema change, so the prompt cache is rewritten once for
+    both.
+  - When `grep` or `find` under a directory finds nothing and ignore rules
+    applied, the result adds one line: ignored files and `node_modules`/
+    `target` weren't searched, and `no_ignore: true` includes them. A
+    gitignored `.env` used to be found by GNU grep and find; without the
+    note, the empty result reads as "it doesn't exist".
+
+### Removed
+
+- **Breaking: `synaps agent` and `synaps watcher` are gone.** The watcher
+  supervisor and the headless agents it started (`~/.synaps-cli/watcher/<name>/`
+  with `config.toml`, `soul.md`, `handoff.json`; `manual`/`always`/`watch`
+  triggers, `wake_if`, per-agent limits, the `watcher_exit` tool, heartbeat
+  mirroring to the bridge) are removed. Run long-lived headless work as a
+  pinned daemon session instead: `synaps daemon` runs the sessions,
+  `synaps --attach --keep-warm` (or `synaps daemon pin <ID|NAME>`) pins one
+  so it is never parked and survives a daemon restart, `turn_budget.*`
+  bounds each turn, and `synaps send --session <name>` starts event turns
+  in it (see `docs/daemon-mode.md`, *Pinning a session*). The watcher's
+  limits map to `turn_budget.event.max_tool_calls`,
+  `turn_budget.event.max_elapsed_secs` (per turn) and, for spend, the
+  session's `max_session_cost`: a hard USD ceiling checked after every
+  usage event that cancels the turn when crossed. It is set in the session
+  config a daemon client sends on create; no CLI flag or config key sets
+  it yet. `turn_budget.event.max_cost_usd` caps one turn. There is no
+  equivalent of `max_daily_cost_usd`, `max_session_tokens` or the
+  per-agent memory/CPU/nice limits. For this release both commands are
+  hidden stubs: with any arguments they print one line to stderr
+  ("`synaps agent` was removed in 0.12.0: pin a daemon session (synaps
+  --attach --keep-warm, or synaps daemon pin) and drive it with synaps
+  send --session <name>. See <docs/daemon-mode.md link>") and exit 2, on
+  every platform. The release after this one removes the stubs. Nothing
+  under `~/.synaps-cli/watcher/` is read or deleted; remove it by hand.
+- **Watcher-only config keys are ignored.** `turn_budget.autonomous.*`
+  (read only by `synaps agent`) and `bridge.uds_path`,
+  `bridge.heartbeat_mirror`, `bridge.heartbeat_timeout_ms` (watcher
+  heartbeat mirroring) no longer do anything. A config that sets them
+  still loads, with one startup warning per group saying to remove the
+  lines; their `/settings` rows are gone. Turns started by events keep
+  their own `turn_budget.event.*` keys, with the same defaults the
+  autonomous role had (24 rounds, no renewals, 96 tool calls, 8 MiB of
+  tool results).
+- **Engine API: watcher-only surface removed.** `TurnBudget::max_total_tokens`
+  (only the watcher set it) is gone; `BudgetDimension::TotalTokens` stays,
+  reserved, because its label and capture tag are on the wire. The inbox
+  filter (`events::InboxFilter`, `accept_all`, `watch_inbox_filtered`) is
+  gone and `watch_inbox_gated` no longer takes a filter: every consumer
+  took every file. Also gone: `TurnRole::Autonomous`, `BridgeConfig`, the
+  `watcher_exit` tool and `ToolContext`/`Runtime` `watcher_exit_path`.
+- **Breaking: `synaps server` (the WebSocket API server) is gone.** It ran
+  its own copy of the engine loop on one session, outside the daemon. The
+  session daemon is the API now: `synaps daemon`, a line-JSON protocol on a
+  local socket ("Protocol summary" in
+  [docs/daemon-mode.md](docs/daemon-mode.md)), shared by every client of a
+  session. For a browser UI, use
+  [synaps-dash](https://github.com/HaseebKhalid1507/synaps-dash), a plain
+  extension that serves the browser over HTTP/WebSocket and attaches to the
+  daemon as an ordinary client. `synaps rpc` is unchanged. For this release
+  `synaps server` is a hidden stub, like `synaps agent`: with any arguments
+  it prints one line to stderr pointing at the daemon protocol doc and
+  synaps-dash, and exits 2; it is not in `--help` or shell completions.
+- **The `server.token`, `server.allowed_origins` and
+  `server.max_message_size` config keys are ignored.** A config that still
+  sets them loads, with one startup warning saying to remove the lines (it
+  names the keys, never their values). `server.auto_approve_confirms` keeps
+  its meaning: it still approves every extension confirm in every mode. The
+  token file the old server wrote, `~/.synaps-cli/server-token` (or
+  `~/.synaps-cli/<profile>/server-token` under `--profile`), is no longer
+  read or written; delete it.
+- **Engine API: `agent_core::protocol` removed.** The server's WebSocket
+  wire types (`ClientMessage`, `ServerMessage`, `HistoryEntry`) had no other
+  user. The daemon protocol (`session::wire`, and `ClientKind::Server`,
+  which synaps-dash attaches as) is unchanged.
+
 ### Fixed
 
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
   program names: a stock Windows has no `grep` or `ls` ("program not
   found"), and `find` resolved to `System32\find.exe`, an unrelated string
   search, so the find tool reported "No files found" for files that exist.
-  They now run GNU builds: from a `PATH` directory outside the Windows
-  directory, else from Git for Windows' `usr\bin` (found next to `git.exe`
-  on `PATH` or in the standard install folders). Without one, the call says
-  to install Git for Windows or use the `powershell` tool. Git's tools are
-  MSYS programs, which expand wildcards in their own arguments when started
-  from a non-MSYS process (`-name "*.txt"` became file names), so they run
-  with `noglob` added to `MSYS`. Linux and macOS are unchanged.
+  `grep` and `find` now need no program (they search in-process, see
+  Changed). `ls` runs a GNU build: from a `PATH` directory outside the
+  Windows directory, else from Git for Windows' `usr\bin` (found next to
+  `git.exe` on `PATH` or in the standard install folders). Without one, the
+  call says to install Git for Windows or use the `powershell` tool. Git's
+  tools are MSYS programs, which expand wildcards in their own arguments
+  when started from a non-MSYS process, so `ls` runs with `noglob` added to
+  `MSYS`. Linux and macOS are unchanged.
 - **Windows: the `powershell` tool can run scripts.** A stock Windows
   client has the `Restricted` execution policy, so `.\test.ps1` failed with
   "running scripts is disabled on this system" and the model had to retry
@@ -39,6 +219,58 @@ All notable changes to this project will be documented in this file.
   the result (what the parent model reads, and the subagent card) ran
   sentences together: "…read them all.Found 2 files…". Each response now
   starts a new paragraph, as `subagent_start` workers already did.
+- **`subagent` and `subagent_start` no longer offer `role` and
+  `write_policy`.** Both tools advertised a worker role and a write policy
+  (`read_only`, `isolated_worktree`, or `non_overlapping_paths` with
+  scopes), but neither was ever read or enforced: every worker was
+  dispatched as an implementer, and a worker asked to be `read_only` could
+  still write files and run any command. Both parameters are gone from the
+  two schemas, about 1 KB off every request that lists the tools. A call
+  that still sends them runs as before: they are ignored, not refused. A
+  real read-only mode would have to restrict `bash` as well as the file
+  tools; that is tracked separately.
+- **`search_tools` matches keywords, not one literal string.** The whole
+  query had to appear verbatim in a tool's id, summary or tags: over six
+  weeks of sessions 30% of searches came back empty, every multi-word one
+  among them ("web fetch", "subagent start", "shell session"), and the
+  model then searched again, fell back to bash or guessed ids such as
+  `ext.web-tools:fetch`. The query is now split into keywords at spaces
+  and at `_`, `-`, `:` and `.`, so `web fetch`, `web_fetch` and `web-fetch`
+  find the same tools, in any order. Results are ranked: an exact id or
+  name first, then tools containing the whole query (everything that
+  matched before still matches, ahead of the rest), then the most keywords
+  matched, id hits above summary hits. In a query of several words,
+  one-letter and filler words (`a`, `the`, `for`, `tool`, …) are not
+  keywords, so "read a file" doesn't match every tool with an `a` in its
+  summary. An empty result says to try one
+  shorter keyword and not to guess ids, and `activate_tools` given an
+  unknown id says it needs an exact id from `search_tools`.
+- **Anthropic streams that send only keep-alive pings are retried.** A
+  stream that stayed connected but sent only pings waited indefinitely
+  (each ping reset the 90 s idle timer). It is now retried when no first
+  event arrives in 3 minutes, or no progress for 10 minutes.
+- **An unknown `/command` is never sent to the model.** Typed while a turn
+  was running, a `/name` the TUI didn't know (any plugin command in an
+  attached TUI) went to the model as steering text, arguments and all, so
+  `/nosuch secret-value` landed in the conversation and the session file.
+  `synaps attach` sent such lines idle too. Now nothing is sent: the TUI
+  says so (try it again when the turn ends), and `synaps attach` answers
+  "unknown command". To send text that starts with `/`, start it with
+  `//`: `//etc/hosts is wrong` sends `/etc/hosts is wrong`, idle or
+  mid-turn, in the TUI and in `synaps attach`.
+- **`bash` says when it stopped a command.** Output past the 256 KiB
+  tool buffer kills the command, but the result only ended
+  `[output truncated at N]`, which reads like a display cut of a command
+  that finished. It now says the command was stopped at that limit before
+  it finished and its exit status is unknown, and to redirect large output
+  to a file; the streamed output ends with the same notice and never shows
+  bytes past the cap. A timeout returned only `Command timed out after Ns`
+  and lost everything the command had printed; the error now says it was
+  stopped, notes when `bash_max_timeout` cut a timeout the model asked
+  for, and keeps the output from before the timeout (redacted, at most the
+  last 256 KiB). Caps, timeouts and kills are unchanged (the process group
+  on Unix, only the shell process on Windows); the same messages apply to
+  the Windows `powershell` tool.
 
 ## [0.11.1] — 2026-10-31
 
