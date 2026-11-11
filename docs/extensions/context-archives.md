@@ -70,7 +70,14 @@ What this page covers:
   store, and the files are in the real directory. That is the only place
   where a link is followed. Below `<base>` nothing is: `context-archives`,
   a project directory, a shelf or a file that is a link is refused by
-  Synaps, and a reader must not follow one either.
+  Synaps, and a reader must not follow one either. This is true of the
+  archive store only. Other parts of Synaps that keep files under `<base>`
+  (the session journal, saved drafts, the source of a memory migration) do
+  not follow a link on the way to their files and refuse such a base, so
+  with a linked base archives are saved while those are not. And a base
+  that is a link to a directory that is not there (a disk that is not
+  mounted) is an error to every read of the archives, not a project with
+  none.
 - **`<project dir>`** is 64 lowercase hex characters: a SHA-256 hash of the
   project key (see [Finding a project's directory](#finding-a-projects-directory)). All
   chats of one project share it.
@@ -93,7 +100,11 @@ What this page covers:
   - **Order.** Everything on one shelf was first written before anything on
     a later shelf, with one exception: after `s999999` there is no next
     number, and archives then go to the newest shelf that can be written
-    to, however many it holds.
+    to, however many it holds. This is the order of writing into this
+    store, not of `created_ms`: an archive imported from another store
+    keeps the `created_ms` it came with, and its file gets that time, so
+    it can be older than everything on the shelves before its own, and on
+    its shelf Synaps reads it after the files with newer times.
   - Numbers can have gaps (a user may delete a shelf).
 - **An archive** is one file named `<id>.json` in a shelf. `<id>` is the
   archive's id: 32 lowercase hex characters (`0-9`, `a-f`). It is the same
@@ -133,7 +144,7 @@ Its rules matter to anyone who backs up or restores these directories:
   as, **whatever its link count and whatever its mode**. A backup made with
   hard links gives it a second name, and a restore can leave it read-only
   (0400): both are fine. Synaps changes its mode only to take away access
-  for group and others.
+  for group and others, and not at all while it has a second name.
 - It is refused when it is a symbolic link (never followed), not a regular
   file, owned by another user, or closed to its owner by its mode. Nothing
   can then be saved or forgotten in that project, and the error names the
@@ -371,7 +382,8 @@ Do not rely on:
 - how many archives a shelf holds;
 - any relation between `id` and `digest`. Today a new archive's `id` is the
   first 32 characters of its `digest`, or the last 32 when another file
-  already has the first name; the id of a legacy archive is random;
+  already has the first name; the id of a legacy archive is random, and
+  an archive imported from another store keeps the id it came with;
 - an `id` being in one file only. The same `<id>.json` can be on two
   shelves. When Synaps is asked for an id, it takes the valid record on the
   newest shelf that has one, and passes over a file of that name that is
@@ -445,10 +457,15 @@ that content again.
 content (the same `digest`) in more than one file. Forgetting one id replaces
 every file with that `digest` that Synaps can read at that moment, each
 under its own name and with its own `id`, whatever that id is: it reads
-every archive file on the shelves for its `digest`. A copy in a shelf or a file that
-Synaps cannot read then is not replaced; the tool says that the forget is
-not complete, and forgetting the same id again reaches it once it can be
-read.
+every archive file on the shelves for its `digest`. So an imported archive
+and the same window saved here are two files under two ids: each id is
+fetched and listed by itself, and forgetting either one forgets both. Two
+archives with different content are never forgotten together. A copy in a
+shelf or a file that Synaps cannot read then is not replaced; the tool says
+that the forget is not complete, and forgetting the same id again reaches it
+once it can be read. A file under another id that Synaps never reads (a
+link, a file closed to its owner, one too large to be an archive) is not
+counted as a copy.
 
 **A file that is not a valid record makes a forget "not complete".** Synaps
 looks for copies under three names on every shelf: the id that was asked
@@ -456,8 +473,9 @@ for, the first 32 characters of the `digest` and the last 32. A file under
 one of those names that it can read but that is not a valid record (a copy
 cut short, a stray file) may be a damaged copy with the text still in it.
 Synaps leaves that file as it is, forgets every valid copy, and the tool
-answers "NOT COMPLETE": it says how many places it could not use and names
-the first, by shelf and file name. It says so again each time until the
+answers "NOT COMPLETE": it says how many places it could not use, names
+the first by shelf and file name, and says which project directory that
+is in. It says so again each time until the
 file is gone or valid. A valid record of other
 content under such a name is not counted, and neither is a damaged file that
 still says, in JSON, that this `digest` is a tombstone.

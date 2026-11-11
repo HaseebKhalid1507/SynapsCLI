@@ -674,7 +674,10 @@ impl Tool for MemoryForgetTool {
             if let Some(unread) = done.unread {
                 out.push_str(&format!(
                     " NOT COMPLETE: {unread}. A copy of this window there was not reached and can \
-                     still be read. Call memory_forget with this id again once it can be read."
+                     still be read. If that file is not a valid archive record (a damaged copy, \
+                     a stray file), forgetting again does not reach it: remove or repair that \
+                     file, then call memory_forget with this id again. If it only \
+                     could not be read this time, call memory_forget with this id again."
                 ));
             }
             return Ok(out);
@@ -1703,6 +1706,9 @@ mod tests {
         assert!(out.starts_with("Forgot this archived context window."), "{out}");
         assert!(out.contains("stored in 2 files; all of them are tombstones now"), "{out}");
         assert!(out.contains("NOT COMPLETE: 1 place(s) could not be read, first s000002: "), "{out}");
+        // Where that is, and what to do about a file that stays unreadable.
+        assert!(out.contains(&format!(" (in {}). A copy of this window", project.display())), "{out}");
+        assert!(out.contains("remove or repair that file, then call memory_forget"), "{out}");
         let events = listener.wait_for(2).await;
         let mut ids: Vec<_> = events.iter().map(|event| event.data["id"].as_str().unwrap()).collect();
         ids.sort_unstable();

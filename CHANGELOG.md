@@ -418,6 +418,61 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Extensions: the context archive format page says where a linked base
+  works, and what an import changes.** A base that is a symbolic link works
+  for the archive store only; the session journal, drafts and the source of
+  a memory migration still refuse it. An imported archive keeps its id and
+  its `created_ms`, so the same content can be under two ids (each fetched
+  by itself, both forgotten together), and a shelf is in the order of
+  writing, not of `created_ms`. Also: which unread files a forget passes
+  over, and that a lock file with a second name keeps its mode.
+- **Context archives: a lock file with a second name keeps its mode, and
+  `memory_forget` says what to do about a file it could not use.** A lock
+  file open to group or others was closed to them even when it had a
+  second name (a hard-link backup), which changed the backup's file too;
+  such a file is now used as it is. And when a forget is "NOT COMPLETE",
+  the tool said to call it again "once it can be read", which never comes
+  true for a file that is not a valid record. It now names the project
+  folder the file is in and says to remove or repair the file first.
+- **Context archives: a base that links to a folder that is away is an
+  error, not a project with no archives.** With the Synaps folder a link to
+  a disk that was not mounted, a search answered nothing, a fetch "not
+  found" and a resume "has no archive store", as for a project that never
+  saved anything. Reading now fails with `the archive base is a link to a
+  folder that is not there`. A base that does not exist is still no store.
+- **Context archives: an import that finds its record already stored
+  confirms it on disk.** A run cut by a power loss after a file was renamed
+  into place and before its directory was synced left a record the next
+  run answered "present" for, without the sync a forget does in the same
+  case. A real run now syncs the shelf (or the project directory, for a
+  legacy slot) before it answers that a record or its tombstone is already
+  there. A dry run still touches nothing.
+- **Context archives: an import refuses a `created_ms` that has not come,
+  and dates the file after it has its name.** A record dated more than a
+  day after this machine's clock is refused (`created_ms is more than a day
+  after this machine's clock`): its file would have been the newest on its
+  shelf in every search, for good. And the record's old time was put on the
+  temporary file before the rename, where a sweep of stale temporary files
+  by another writer could take it for a leftover. It is now set on the file
+  once it is under its id, and synced. A write stopped between the two
+  leaves the whole record with the time of the write.
+- **Context archives: forget is not "complete" over a copy it failed to
+  read.** When a forget read the other archive files of a project for the
+  window's digest, any file it could not read was passed over in silence.
+  That is right for a file the store never reads (a link, a FIFO, a file
+  closed to its owner, one too large to be an archive). A read that failed
+  for a passing reason (an I/O error, no descriptor or memory left) said
+  nothing about the file, which could be a live copy. Such a file now
+  counts as not reached: the forget answers "not complete" and names it.
+- **Context archives: an imported tombstone is refused while its content is
+  live under any other id.** A tombstone line whose own id held nothing was
+  checked only where a save looks for its content (the two ids cut from the
+  digest, and the legacy slots). The same content, live under another
+  imported id, was not seen: the tombstone was stored and that copy was
+  still fetched and searched. The import now reads every archive file of
+  the project for the digest, as a forget does, and refuses the line with
+  the id of the live copy; a dry run answers the same. If a file that may
+  hold such a copy cannot be read, the import stops instead of guessing.
 - **Context archives: a forgotten archive stays forgotten whatever id it is
   stored under.** An archive brought in by `ArchiveStore::import` keeps the
   id it had, which is not one of the two ids a seal derives from the

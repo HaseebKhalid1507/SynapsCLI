@@ -672,6 +672,13 @@ impl Unread {
         Some(format!("{places} place(s) could not be read, first {place}: {error}"))
     }
 
+    /// [`notice`](Self::notice) with the project's `directory`, which the
+    /// places are in: for a caller who has to go and look at the file.
+    fn notice_in(&self, directory: &Path) -> Option<String> {
+        let notice = self.notice()?;
+        Some(format!("{notice} (in {})", directory.display()))
+    }
+
     /// The error of a lookup that did not find its segment: "not found" when
     /// everything could be read, otherwise what could not be, with the kind
     /// of the first failure and never `NotFound`.
@@ -857,6 +864,10 @@ impl Record {
         }
     }
 }
+
+/// How far after this machine's clock the `created_ms` of an imported
+/// record may be: one day.
+const CREATED_AHEAD_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// What [`ArchiveStore::import`] did with one record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1903,32 +1914,8 @@ impl ArchiveStore {
             // can be here under any number of those. No name says which
             // files they are, so every segment file of the shelf is read
             // for its digest.
-            let listed = match dir.names() {
-                Ok(listed) => listed,
-                Err(error) => {
-                    unread.pass(shelf, error);
-                    continue;
-                }
-            };
-            for (name, is_dir, _) in listed {
-                if is_dir || archive_id(&name).is_none() || names.contains(&name) {
-                    continue;
-                }
-                // A file under another name that cannot be read, or holds
-                // no digest, says nothing about this content: passed over.
-                let Ok(Some(raw)) = dir.read_with(&name, MAX_SEGMENT_BYTES, false) else {
-                    continue;
-                };
-                if !names_digest(&raw, digest) {
-                    continue;
-                }
-                match self.record(&name, &raw) {
-                    Ok(record) => copies.push((Some(shelf), name, record)),
-                    Err(_) if says_forgotten(&raw, digest) => {}
-                    // It names this content and is not a record: it may be
-                    // a damaged copy.
-                    Err(error) => unread.pass(&format!("{shelf}/{name}"), error),
-                }
+            for (name, record) in self.twins(&dir, shelf, digest, &names, false, &mut unread) {
+                copies.push((Some(shelf), name, record));
             }
         }
         for slot in &slots {
@@ -1978,8 +1965,100 @@ impl ArchiveStore {
         ids.sort_by_key(|forgotten| forgotten != id);
         Ok(Forgotten {
             ids,
-            unread: unread.notice(),
+            unread: unread.notice_in(&self.directory),
         })
+    }
+
+    /// The records of `digest` on the shelf `dir` under file names other
+    /// than `names`, each with its file name: every segment file of the
+    /// shelf is read for its digest. What may be such a record and could
+    /// not be read as one goes to `unread`. `readonly` changes nothing on
+    /// disk.
+    fn twins(
+        &self,
+        dir: &PrivateDir,
+        shelf: &str,
+        digest: &str,
+        names: &[String],
+        readonly: bool,
+        unread: &mut Unread,
+    ) -> Vec<(String, Record)> {
+        let listed = match dir.names() {
+            Ok(listed) => listed,
+            Err(error) => {
+                unread.pass(shelf, error);
+                return Vec::new();
+            }
+        };
+        let mut twins = Vec::new();
+        for (name, is_dir, _) in listed {
+            if is_dir || archive_id(&name).is_none() || names.contains(&name) {
+                continue;
+            }
+            let raw = match dir.read_with(&name, MAX_SEGMENT_BYTES, readonly) {
+                Ok(Some(raw)) => raw,
+                // Gone since it was listed, or not a file the store reads
+                // (a link, a FIFO, closed to us, too large): no fetch gives
+                // out what is in it. Passed over.
+                Ok(None) => continue,
+                Err(error) if PrivateDir::not_a_segment(&error) => continue,
+                // A read that failed says nothing about what the file is:
+                // it may be a live copy.
+                Err(error) => {
+                    unread.pass(&format!("{shelf}/{name}"), error);
+                    continue;
+                }
+            };
+            // A file that holds another digest, or none, is not a copy.
+            if !names_digest(&raw, digest) {
+                continue;
+            }
+            match self.record(&name, &raw) {
+                Ok(record) => twins.push((name, record)),
+                Err(_) if says_forgotten(&raw, digest) => {}
+                // It names this content and is not a record: it may be
+                // a damaged copy.
+                Err(error) => unread.pass(&format!("{shelf}/{name}"), error),
+            }
+        }
+        twins
+    }
+
+    /// The id of a live record of `digest` on a shelf under an id that is
+    /// not one of `names`, found by the scan a forget uses
+    /// ([`Self::twins`]). A shelf or a file that may hold one and could not
+    /// be read is an error: "none" would be a guess.
+    fn live_twin(
+        &self,
+        shelves: &[String],
+        digest: &str,
+        names: &[String],
+        readonly: bool,
+    ) -> io::Result<Option<String>> {
+        let mut unread = Unread::default();
+        let mut live = None;
+        for shelf in shelves {
+            let dir = match self.fs.open_child(shelf, readonly) {
+                Ok(Some(dir)) => dir,
+                Ok(None) => continue,
+                Err(error) => {
+                    unread.pass(shelf, error);
+                    continue;
+                }
+            };
+            for (_, record) in self.twins(&dir, shelf, digest, names, readonly, &mut unread) {
+                if matches!(record.body, Body::Live { .. }) {
+                    live.get_or_insert(record.id);
+                }
+            }
+        }
+        match (live, unread.notice()) {
+            (Some(id), _) => Ok(Some(id)),
+            (None, None) => Ok(None),
+            (None, Some(notice)) => Err(io::Error::other(format!(
+                "a tombstone is not imported while a file that may hold its content live                  cannot be read: {notice}"
+            ))),
+        }
     }
 
     /// Migration-only export of validated eligible evidence and permanent
@@ -2198,6 +2277,14 @@ impl ArchiveStore {
                 return refuse(error.to_string(), id);
             }
             if let Some(created_ms) = record.created_ms {
+                // A time that has not come is no time of an archive. Its
+                // file would be the newest on its shelf in every search,
+                // for good. A day allows for another machine's clock.
+                let now = Written::now().created_ms.unwrap_or(0);
+                if created_ms > now.saturating_add(CREATED_AHEAD_MS) {
+                    let reason = "created_ms is more than a day after this machine's clock";
+                    return refuse(reason.to_owned(), id);
+                }
                 let time = std::time::UNIX_EPOCH.checked_add(Duration::from_millis(created_ms));
                 let Some(time) = time else {
                     return refuse("created_ms is not a time a file can have".to_owned(), id);
@@ -2324,6 +2411,20 @@ impl ArchiveStore {
                     ImportOutcome::Forgotten
                 }
             };
+            if let (false, Some(store)) = (dry_run, store) {
+                if outcome != ImportOutcome::Forgotten {
+                    // "It is here already" is an answer about the disk. An
+                    // earlier run may have been cut after its rename and
+                    // before the directory was synced: confirmed now, as a
+                    // forget confirms a tombstone it finds.
+                    match &held.shelf {
+                        Some(shelf) => {
+                            store.fs.open_child(shelf, false)?.ok_or_else(not_found)?.sync()?;
+                        }
+                        None => store.fs.sync()?,
+                    }
+                }
+            }
             return imported(outcome, held.shelf, None, unread);
         }
 
@@ -2335,7 +2436,9 @@ impl ArchiveStore {
                 return refuse("this content was forgotten in this store".to_owned(), id);
             }
             same_content_as = probe.live.take();
-        } else if let Some(other) = &probe.live {
+        } else if let Some(other) =
+            Self::live_copy(store, plan.as_deref(), &probe, &shelves, &record, dry_run)?
+        {
             // A tombstone for content that is live here under another id.
             // Publishing it would leave that copy readable beside it, and
             // forgetting a record the line does not name is not this
@@ -2386,6 +2489,39 @@ impl ArchiveStore {
             (None, None) => return Err(invalid("an import that writes needs a store")),
         };
         imported(ImportOutcome::Stored, Some(shelf), same_content_as, None)
+    }
+
+    /// The id of a live copy of the content of the tombstone `record`,
+    /// whose own id holds nothing: where a seal would look (`probe`), then
+    /// what the run would have written (`plan`), then every archive file on
+    /// the shelves, as a forget looks ([`Self::live_twin`]).
+    fn live_copy(
+        store: Option<&Self>,
+        plan: Option<&Planned>,
+        probe: &Probe,
+        shelves: &[String],
+        record: &Record,
+        readonly: bool,
+    ) -> io::Result<Option<String>> {
+        let digest = record.digest.as_str();
+        if probe.live.is_some() {
+            return Ok(probe.live.clone());
+        }
+        if let Some(plan) = plan {
+            if plan.forgotten.contains(digest) {
+                // The run would have forgotten every copy by now.
+                return Ok(None);
+            }
+            let live = |(_, held): &(&String, &Held)| held.digest == digest && held.note.is_some();
+            if let Some((id, _)) = plan.ids.iter().filter(live).min_by_key(|(id, _)| *id) {
+                return Ok(Some(id.clone()));
+            }
+        }
+        let Some(store) = store else {
+            return Ok(None);
+        };
+        let names = [&digest[..32], &digest[32..], &record.id].map(archive_name);
+        store.live_twin(shelves, digest, &names, readonly)
     }
 
     /// What is where a seal would look for `digest`, by the lookups a seal
@@ -3804,8 +3940,22 @@ impl PrivateDir {
     }
     fn open_existing(base: &Path, scope: &str) -> io::Result<Self> {
         Self::check_base(base)?;
-        // `NotFound` when the base, or a link on the way to it, is not there.
-        let real = std::fs::canonicalize(base)?;
+        // `NotFound` when the base, or a folder on the way to it, is not
+        // there: no store. A base that is there, as a link to a folder that
+        // is away (a disk that is not mounted), is not "no store": the
+        // archives are where it points, and cannot be reached.
+        let real = match std::fs::canonicalize(base) {
+            Ok(real) => real,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(match std::fs::symlink_metadata(base) {
+                    Ok(_) => io::Error::other(format!(
+                        "the archive base is a link to a folder that is not there: {error}"
+                    )),
+                    Err(_) => error,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         if real == Path::new("/") {
             return Err(invalid("archive base must be an absolute non-root path"));
         }
@@ -4009,8 +4159,8 @@ impl PrivateDir {
     /// Only ever locked: never written, truncated or read, so neither a
     /// second name nor its mode matters. With `create` it is made if it is
     /// missing and opened read-write, or for reading if its mode refuses
-    /// that; a group or other bit in its mode is cleared. Without `create`
-    /// nothing is changed. A link is not followed.
+    /// that; a group or other bit in its mode is cleared, unless the file
+    /// has a second name. Without `create` nothing is changed. A link is not followed.
     fn lock_file(&self, create: bool) -> io::Result<Option<std::fs::File>> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let refused = |what| io::Error::new(io::ErrorKind::PermissionDenied, LockRefused(what));
@@ -4048,7 +4198,10 @@ impl PrivateDir {
             return Err(refused("is owned by another user"));
         }
         let mode = meta.permissions().mode() & 0o7777;
-        if create && mode & 0o077 != 0 {
+        // A file with a second name is someone's copy of it too (a
+        // hard-link backup): its mode is theirs as much as ours. It is
+        // only ever locked, so it is used as it is.
+        if create && mode & 0o077 != 0 && meta.nlink() == 1 {
             file.set_permissions(std::fs::Permissions::from_mode(mode & 0o700))?;
         }
         Ok(Some(file))
@@ -4114,10 +4267,10 @@ impl PrivateDir {
     }
     /// [`publish`](Self::publish) that can also give the file a time of last
     /// access and modification, for a record that was first written
-    /// somewhere else. The time is set on the temporary file, through its
-    /// own descriptor, before it is synced and renamed: the file appears
-    /// under its name with that time, and the time is on disk with the
-    /// content. No directory's time is ever set.
+    /// somewhere else. The time is set after the rename, through the
+    /// descriptor the file was written by, and synced: a temporary file
+    /// always has the time of its write. A reader in between sees the whole
+    /// record with the time of the write. No directory's time is ever set.
     fn publish_dated(
         &self,
         name: &str,
@@ -4132,10 +4285,6 @@ impl PrivateDir {
         let mut file = self.open(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
         let result = (|| {
             file.write_all(bytes)?;
-            if let Some(time) = modified {
-                let times = std::fs::FileTimes::new().set_accessed(time).set_modified(time);
-                file.set_times(times)?;
-            }
             file.sync_all()?;
             if create_new {
                 self.rename_new(&tmp, &target)?;
@@ -4147,6 +4296,22 @@ impl PrivateDir {
                     Err(error) => return Err(error),
                 }
                 self.rename(&tmp, &target)?;
+            }
+            if let Some(time) = modified {
+                // The time goes on the file once it has its name, through
+                // the descriptor it was written by: a temporary file never
+                // has an old time, so the sweep of stale ones (which goes
+                // by their time) cannot take one that is being written.
+                // Stopped between the rename and here, the record is stored
+                // whole with the time of the write: it reads the same, and
+                // sorts on its shelf as written now.
+                #[cfg(test)]
+                if let Some(error) = fault("date", &target) {
+                    return Err(error);
+                }
+                let times = std::fs::FileTimes::new().set_accessed(time).set_modified(time);
+                file.set_times(times)?;
+                file.sync_all()?;
             }
             self.sync()
         })();
@@ -4245,6 +4410,10 @@ impl PrivateDir {
         }
     }
     fn sync(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(error) = fault("sync", c"") {
+            return Err(error);
+        }
         self.0.sync_all()
     }
 }
@@ -5423,6 +5592,11 @@ mod tests {
         let second = tmp.path().join("a-backup-of-the-lock");
         std::fs::hard_link(&lock, &second).unwrap();
         works("with two names");
+        // Open to others and with two names: the mode is the other name's
+        // too, and is left.
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        works("loosened, with two names");
+        assert_eq!((mode(&lock), mode(&second)), (0o644, 0o644));
         // Read-only, with the second name still there and then without.
         for links in [2, 1] {
             std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o400)).unwrap();
@@ -9493,7 +9667,7 @@ mod tests {
     /// The lines of a run that meets every outcome, for a dry run and the
     /// real run to agree on.
     fn a_run(chat: &ArchiveStore, scope: &str) -> Vec<Vec<u8>> {
-        let ids: Vec<_> = (0..5).map(|_| random_id()).collect();
+        let ids: Vec<_> = (0..7).map(|_| random_id()).collect();
         let line = |id: &String, words: &str, change: fn(&mut Record)| {
             record_bytes(chat, id, &text(words), |record| {
                 scope.clone_into(&mut record.scope);
@@ -9513,6 +9687,8 @@ mod tests {
             line(&ids[2], "third", tombstone),
             line(&ids[3], "fourth", tombstone),
             line(&ids[4], "fourth", live),
+            line(&ids[5], "fifth", live),
+            line(&ids[6], "fifth", tombstone),
             b"not a record".to_vec(),
         ]
     }
@@ -9579,7 +9755,10 @@ mod tests {
         assert_eq!(outcomes[9], "Stored");
         // The tombstone before it forgot the content under any id.
         assert_eq!(outcomes[10], "this content was forgotten in this store");
-        assert!(outcomes[11].starts_with("not an archive record"));
+        // A tombstone of content that is live under another imported id.
+        assert_eq!(outcomes[11], "Stored");
+        assert!(outcomes[12].starts_with("a tombstone of content that is live in this store as"));
+        assert!(outcomes[13].starts_with("not an archive record"));
 
         // A dry run over a store that exists: the same answers as running
         // it for real again, no mode changed, no lock file made, no byte
@@ -9840,7 +10019,242 @@ mod tests {
         let unread = done.unread.expect("not complete");
         let name = twin.file_name().unwrap().to_str().unwrap();
         assert!(unread.starts_with(&format!("1 place(s) could not be read, first s000001/{name}: ")), "{unread}");
+        // With the folder the place is in: the file can be gone to.
+        assert!(unread.ends_with(&format!(" (in {})", dir.display())), "{unread}");
         assert_eq!(std::fs::read(&stray).unwrap(), b"not json at all");
+    }
+
+    /// A tombstone line whose id holds nothing is refused while its content
+    /// is live under any other id, also one a seal does not look under: the
+    /// scan a forget uses finds it. In either order of the two lines, and
+    /// the dry run says the same.
+    #[test]
+    fn a_tombstone_line_is_refused_while_its_content_is_live_under_another_imported_id() {
+        let words = "live under an imported id";
+        let (a, b) = (random_id(), random_id());
+        let refusal = format!(
+            "a tombstone of content that is live in this store as {a}: forget that archive \
+             here, then import again"
+        );
+        for dry_first in [false, true] {
+            let (tmp, store) = setup();
+            let dir = directory(&tmp, &store);
+            let live = record_bytes(&store, &a, &text(words), |_| {});
+            let dead = record_bytes(&store, &b, &text(words), tombstone);
+            let mut seen = ImportSeen::default();
+            if dry_first {
+                // Both lines in one dry run: the live copy is in the plan.
+                let planned = store.import(&live, false, true, &mut seen).unwrap().unwrap();
+                assert_eq!(planned.outcome, ImportOutcome::Stored);
+                let refused = store.import(&dead, false, true, &mut seen).unwrap().unwrap_err();
+                assert_eq!(refused.reason, refusal);
+                assert_eq!(shelf_files(&dir), Vec::<PathBuf>::new());
+            }
+            assert_eq!(import(&store, &live).unwrap().outcome, ImportOutcome::Stored);
+            let before = snapshot(&dir);
+            // The live copy is on disk: a dry run and the real run find it.
+            for dry_run in [true, false] {
+                let mut seen = ImportSeen::default();
+                let refused = store.import(&dead, false, dry_run, &mut seen).unwrap().unwrap_err();
+                assert_eq!((refused.reason.as_str(), refused.id.as_deref()), (&*refusal, Some(&*b)));
+                assert_eq!(snapshot(&dir), before);
+            }
+            assert_eq!(store.fetch(&a, 0, 1).unwrap(), text(words));
+            // Also from a shelf that is not the newest.
+            std::fs::create_dir(dir.join("s000002")).unwrap();
+            assert_eq!(reason(&store, &dead), refusal);
+            assert_eq!(store.fetch(&a, 0, 1).unwrap(), text(words));
+        }
+        // The other order: the tombstone is stored, the live line is not.
+        let (_tmp, store) = setup();
+        let live = record_bytes(&store, &a, &text(words), |_| {});
+        let dead = record_bytes(&store, &b, &text(words), tombstone);
+        for dry_run in [true, false] {
+            let mut seen = ImportSeen::default();
+            let stored = store.import(&dead, false, dry_run, &mut seen).unwrap().unwrap();
+            assert_eq!(stored.outcome, ImportOutcome::Stored);
+            let refused = match dry_run {
+                true => store.import(&live, false, true, &mut seen).unwrap().unwrap_err(),
+                false => import(&store, &live).unwrap_err(),
+            };
+            assert_eq!(refused.reason, "this content was forgotten in this store");
+        }
+        assert_eq!(store.fetch(&a, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A file under another id that a forget fails to read may be a live
+    /// copy: the forget is "not complete" and names it, and an imported
+    /// tombstone of that content stops. What the file is (a link, closed to
+    /// its owner) is not such a failure and is passed over.
+    #[test]
+    fn a_forget_is_not_complete_over_a_file_under_another_id_it_failed_to_read() {
+        let words = "a twin that is not read";
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let sealed = store.seal(&text(words), "").unwrap();
+        let twin = random_id();
+        let line = record_bytes(&store, &twin, &text(words), |_| {});
+        assert_eq!(import(&store, &line).unwrap().outcome, ImportOutcome::Stored);
+        let name = archive_name(&twin);
+        let dead = record_bytes(&store, &random_id(), &text("only the twin"), tombstone);
+        let lone_id = random_id();
+        let lone = record_bytes(&store, &lone_id, &text("only the twin"), |_| {});
+        assert_eq!(import(&store, &lone).unwrap().outcome, ImportOutcome::Stored);
+        for code in [libc::EIO, libc::EMFILE, libc::ENOMEM] {
+            let failing = Fault::on("open", &twin, code);
+            let done = store.forget(&sealed.id).unwrap();
+            let unread = done.unread.expect("not complete");
+            let start = format!("1 place(s) could not be read, first s000001/{name}: ");
+            assert!(unread.starts_with(&start), "{unread}");
+            drop(failing);
+            assert_eq!(store.fetch(&twin, 0, 1).unwrap(), text(words), "error {code}");
+            // The import's scan is the same one: it does not answer "none".
+            let failing = Fault::on("open", &lone_id, code);
+            let before = snapshot(&dir);
+            let stopped = store.import(&dead, false, false, &mut ImportSeen::default());
+            let error = stopped.expect_err("the run stops").to_string();
+            assert!(error.starts_with("a tombstone is not imported while"), "{error}");
+            drop(failing);
+            assert_eq!(snapshot(&dir), before);
+        }
+        // Read again, the twin is reached.
+        let done = store.forget(&sealed.id).unwrap();
+        assert_eq!((done.ids, done.unread), (vec![twin.clone()], None));
+        assert_eq!(store.fetch(&twin, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
+
+        // A link under another id is no file of the store's.
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let sealed = store.seal(&text(words), "").unwrap();
+        let link = dir.join("s000001").join(archive_name(&random_id()));
+        std::os::unix::fs::symlink(only_archive_file(&dir), &link).unwrap();
+        // So is one that is closed to its owner (nothing is closed to root).
+        let closed = dir.join("s000001").join(archive_name(&random_id()));
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::write(&closed, record_bytes(&store, &random_id(), &text("x"), |_| {})).unwrap();
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let done = store.forget(&sealed.id).unwrap();
+        assert_eq!((done.ids, done.unread), (vec![sealed.id.clone()], None));
+    }
+
+    /// A `created_ms` more than a day after the clock is refused, and
+    /// nothing is written; one within the day is stored.
+    #[test]
+    fn a_created_ms_that_has_not_come_is_refused() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let hour = 60 * 60 * 1000;
+        let at = |ahead_ms: u64| {
+            record_bytes(&store, &random_id(), &text("dated ahead"), |record| {
+                record.created_ms = Some(now_ms() + ahead_ms);
+            })
+        };
+        for line in [at(25 * hour), at(u64::MAX / 2), at(366 * 24 * hour)] {
+            let refused = import(&store, &line).unwrap_err();
+            assert_eq!(refused.reason, "created_ms is more than a day after this machine's clock");
+            let mut seen = ImportSeen::default();
+            let dry = store.import(&line, false, true, &mut seen).unwrap().unwrap_err();
+            assert_eq!(dry, refused);
+        }
+        assert_eq!(shelf_files(&dir), Vec::<PathBuf>::new());
+        assert_eq!(import(&store, &at(23 * hour)).unwrap().outcome, ImportOutcome::Stored);
+    }
+
+    /// The old time goes on the file after it has its name. A write stopped
+    /// between the two leaves the whole record under its id with the time
+    /// of the write and no temporary file: nothing dated old was ever under
+    /// a temporary name. The next run finds it there.
+    #[test]
+    fn an_imported_file_gets_its_old_time_after_its_name() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let id = random_id();
+        let line = record_bytes(&store, &id, &text("dated after the rename"), |record| {
+            record.created_ms = Some(1_600_000_000_000);
+        });
+        let started = std::time::SystemTime::now() - Duration::from_secs(5);
+        let stopping = Fault::on("date", &id, libc::EIO);
+        let stopped = store.import(&line, false, false, &mut ImportSeen::default());
+        assert_eq!(stopped.expect_err("stopped").raw_os_error(), Some(libc::EIO));
+        drop(stopping);
+        let file = dir.join("s000001").join(archive_name(&id));
+        assert_eq!(shelf_files(&dir), std::slice::from_ref(&file));
+        assert_eq!(entries(&dir.join("s000001")), [archive_name(&id)]);
+        assert!(std::fs::metadata(&file).unwrap().modified().unwrap() >= started);
+        assert_eq!(std::fs::read(&file).unwrap(), line);
+        assert_eq!(store.fetch(&id, 0, 1).unwrap(), text("dated after the rename"));
+        let again = import(&store, &line).unwrap();
+        assert_eq!(again.outcome, ImportOutcome::Present { note_differs: false });
+        // Not stopped, the file has the record's time.
+        let other = random_id();
+        let line = record_bytes(&store, &other, &text("dated and not stopped"), |record| {
+            record.created_ms = Some(1_600_000_000_000);
+        });
+        assert_eq!(import(&store, &line).unwrap().outcome, ImportOutcome::Stored);
+        let file = dir.join("s000001").join(archive_name(&other));
+        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), at_ms(1_600_000_000_000));
+    }
+
+    /// A real run that answers "already here" syncs the shelf the file is
+    /// on first: a run before it may have been cut between its rename and
+    /// the sync. A dry run touches nothing, so it does not.
+    #[test]
+    fn an_import_that_finds_its_record_confirms_it_on_disk() {
+        let (_tmp, store) = setup();
+        let id = random_id();
+        let live = record_bytes(&store, &id, &text("found and confirmed"), |_| {});
+        let gone = random_id();
+        let dead = record_bytes(&store, &gone, &text("kept forgotten"), tombstone);
+        let kept = record_bytes(&store, &gone, &text("kept forgotten"), |_| {});
+        assert_eq!(import(&store, &live).unwrap().outcome, ImportOutcome::Stored);
+        assert_eq!(import(&store, &dead).unwrap().outcome, ImportOutcome::Stored);
+        let present = ImportOutcome::Present { note_differs: false };
+        for (line, outcome) in [(&live, present), (&kept, ImportOutcome::KeptForgotten)] {
+            let failing = Fault::on("sync", "", libc::EIO);
+            let mut seen = ImportSeen::default();
+            let stopped = store.import(line, false, false, &mut seen);
+            assert_eq!(stopped.expect_err("synced").raw_os_error(), Some(libc::EIO));
+            let dry = store.import(line, false, true, &mut seen).unwrap().unwrap();
+            assert_eq!(dry.outcome, outcome);
+            drop(failing);
+            assert_eq!(import(&store, line).unwrap().outcome, outcome);
+        }
+    }
+
+    /// A base that is a link to a folder that is away (a disk that is not
+    /// mounted) is an error to every read: not a project with no archives.
+    /// A base that is not there at all is still "no store".
+    #[test]
+    fn a_base_that_links_to_a_folder_that_is_away_is_an_error_not_an_empty_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let disk = root.join("disk");
+        let base = root.join("base");
+        std::fs::create_dir(&disk).unwrap();
+        symlink(&disk, &base).unwrap();
+        let store = setup_in(&base, "synthetic-project");
+        let sealed = store.seal(&text("on the other disk"), "").unwrap();
+        drop(store);
+        std::fs::rename(&disk, root.join("unmounted")).unwrap();
+        let away = ArchiveStore::open_existing(&base, "synthetic-project", "l").err().expect("away");
+        assert_ne!(away.kind(), io::ErrorKind::NotFound);
+        assert!(away.to_string().starts_with("the archive base is a link to a folder that is not there"));
+        assert!(ArchiveStore::existing_scope(&base, &project_scope("synthetic-project").unwrap()).is_err());
+        assert!(project_search(&base, "synthetic-project", "", 8).is_err());
+        let fetched = project_fetch(&base, "synthetic-project", &sealed.id, 0, 1).unwrap_err();
+        assert_ne!(fetched.kind(), io::ErrorKind::NotFound);
+        assert!(export_in(&base, "synthetic-project").is_err());
+        assert!(archive_file(&base, "synthetic-project", &sealed.id).is_err());
+        // Back again, it reads.
+        std::fs::rename(root.join("unmounted"), &disk).unwrap();
+        assert_eq!(project_search(&base, "synthetic-project", "", 8).unwrap().len(), 1);
+        // No base, and a base below a folder that is not there: no store.
+        for missing in [root.join("no-base"), root.join("no-folder/base")] {
+            assert!(ArchiveStore::open_existing(&missing, "synthetic-project", "l").unwrap().is_none());
+            assert!(project_search(&missing, "synthetic-project", "", 8).unwrap().is_empty());
+            assert!(export_in(&missing, "synthetic-project").unwrap().is_empty());
+        }
     }
 }
 
