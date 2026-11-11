@@ -113,8 +113,33 @@ pub enum MemoryError {
     /// and every reader sees it, but a sync after the write failed, so it is
     /// not confirmed to be on disk. Not a failed save: doing it again makes
     /// a second note under a new id, and a second forget answers
-    /// [`MemoryError::NotFound`]. Holds the sync's error.
-    WrittenUnconfirmed(String),
+    /// [`MemoryError::NotFound`]. Holds the id of the note saved or
+    /// forgotten, when there is one (a record without an id, or the end of
+    /// an import run, has none), and the sync's error.
+    WrittenUnconfirmed { id: Option<String>, cause: String },
+}
+
+impl MemoryError {
+    /// A sync failure after the write, before the caller knows the id.
+    fn unconfirmed(cause: impl std::fmt::Display) -> Self {
+        MemoryError::WrittenUnconfirmed {
+            id: None,
+            cause: cause.to_string(),
+        }
+    }
+
+    /// This error with `id` as the id of an unconfirmed write.
+    fn with_id(self, id: Option<&str>) -> Self {
+        match self {
+            MemoryError::WrittenUnconfirmed { id: None, cause } => {
+                MemoryError::WrittenUnconfirmed {
+                    id: id.map(str::to_string),
+                    cause,
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 impl std::fmt::Display for MemoryError {
@@ -130,10 +155,18 @@ impl std::fmt::Display for MemoryError {
                 write!(f, "memory record not found in this project scope: {id}")
             }
             MemoryError::InvalidProjectRoot(s) => write!(f, "invalid project root: {s}"),
-            MemoryError::WrittenUnconfirmed(s) => write!(
+            MemoryError::WrittenUnconfirmed { id: None, cause } => write!(
                 f,
-                "written, but not confirmed on disk (the sync failed: {s}); \
+                "written, but not confirmed on disk (the sync failed: {cause}); \
                  it is in the store now, so look before doing it again"
+            ),
+            MemoryError::WrittenUnconfirmed {
+                id: Some(id),
+                cause,
+            } => write!(
+                f,
+                "written, but not confirmed on disk (the sync failed: {cause}); \
+                 {id} is in the store now, so fetch {id} to check before doing it again"
             ),
         }
     }
@@ -222,7 +255,7 @@ fn append_record(base: &Path, record: &MemoryRecord, sync_now: bool) -> Result<(
     }
     let path = namespace_path(&dir, &record.namespace);
     let line = serde_json::to_string(record)?;
-    append_jsonl_line(&path, &line, sync_now)
+    append_jsonl_line(&path, &line, sync_now).map_err(|e| e.with_id(record.id.as_deref()))
 }
 
 /// Append one JSONL line and make it durable before returning: the line goes
@@ -276,7 +309,7 @@ fn append_jsonl_line(path: &Path, line: &str, sync_now: bool) -> Result<(), Memo
             Some(dir) => sync_dir(dir),
             None => Ok(()),
         });
-        synced.map_err(|e| MemoryError::WrittenUnconfirmed(e.to_string()))?;
+        synced.map_err(MemoryError::unconfirmed)?;
     }
     Ok(())
 }
@@ -318,7 +351,16 @@ pub(crate) fn lock_notes_file(
     let lock_path = notes_lock_path(path);
     let wait = notes_lock_wait();
     crate::core::lock_file::lock_within(wait, NOTES_LOCK_POLL, || {
-        crate::core::lock_file::try_lock(open_lock_file(&lock_path)?)
+        let file = open_lock_file(&lock_path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot open the notes lock file {}: {e}; nothing was written",
+                    lock_path.display()
+                ),
+            )
+        })?;
+        crate::core::lock_file::try_lock(file)
     })?
     .ok_or_else(|| {
         std::io::Error::new(
@@ -427,25 +469,10 @@ fn sync_file(file: &fs::File) -> std::io::Result<()> {
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     step("sync dir");
     failing("sync dir")?;
-    // A file system that cannot sync a directory at all says so with EINVAL
-    // or ENOTSUP. That is not a failed save: now that every save syncs the
-    // directory, it would fail every save there, each with its line already
-    // in the file.
-    #[cfg(unix)]
-    {
-        use std::io::ErrorKind::{InvalidInput, Unsupported};
-        match fs::File::open(dir)?.sync_all() {
-            Err(e) if matches!(e.kind(), InvalidInput | Unsupported) => Ok(()),
-            result => result,
-        }
-    }
-    // Windows cannot open a directory to flush it, and NTFS journals the new
-    // name itself: the choice `session_journal::sync_sessions_dir` makes.
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
+    // Every save syncs the directory, so a directory that cannot be synced
+    // at all must not fail every save, each with its line already in the
+    // file. Which errors say that is `private_fs::sync_dir`'s one rule.
+    crate::core::private_fs::sync_dir(dir)
 }
 
 #[cfg(test)]
@@ -1012,7 +1039,7 @@ fn append_tombstone(
     crate::core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::from)?;
     let path = namespace_path(&dir, namespace);
     let line = serde_json::to_string(tombstone)?;
-    append_jsonl_line(&path, &line, sync_now)
+    append_jsonl_line(&path, &line, sync_now).map_err(|e| e.with_id(Some(&tombstone.tombstone)))
 }
 
 /// Path of a project namespace's JSONL store file (index-module seam).
@@ -1199,17 +1226,21 @@ impl ImportRun {
     /// stops early too. Returns the files synced, sorted. A dry run has
     /// none.
     ///
-    /// An error is [`MemoryError::WrittenUnconfirmed`]: the lines the run
-    /// reported as stored are in their files, and a sync failed.
+    /// Every file and every directory is tried, also after one failed.
+    /// An error is [`MemoryError::WrittenUnconfirmed`] for the first sync
+    /// that failed, naming its file: the lines the run reported as stored
+    /// are in their files, and that sync failed.
     #[must_use = "an import is not durable unless `finish` returned Ok"]
     pub fn finish(mut self) -> Result<Vec<PathBuf>, MemoryError> {
         // Whatever the sync says, it was tried and the caller is told.
         self.finished = true;
         self.sync()
-            .map_err(|e| MemoryError::WrittenUnconfirmed(e.to_string()))
+            .map_err(|(path, e)| MemoryError::unconfirmed(format!("{}: {e}", path.display())))
     }
 
-    fn sync(&self) -> std::io::Result<Vec<PathBuf>> {
+    /// Sync every appended file, then every directory of one, trying all of
+    /// them. The first failure, with the path that failed.
+    fn sync(&self) -> Result<Vec<PathBuf>, (PathBuf, std::io::Error)> {
         let mut synced: Vec<PathBuf> = self
             .files
             .iter()
@@ -1217,17 +1248,29 @@ impl ImportRun {
             .map(|(path, _)| path.clone())
             .collect();
         synced.sort();
+        let mut first_error: Option<(PathBuf, std::io::Error)> = None;
         let mut dirs: std::collections::BTreeSet<&Path> = std::collections::BTreeSet::new();
         for path in &synced {
             // Opened for append, not for reading: Windows flushes only a
             // handle that may write.
-            sync_file(&fs::OpenOptions::new().append(true).open(path)?)?;
+            let result = fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .and_then(|file| sync_file(&file));
+            if let Err(e) = result {
+                first_error.get_or_insert((path.clone(), e));
+            }
             dirs.extend(path.parent());
         }
         for dir in dirs {
-            sync_dir(dir)?;
+            if let Err(e) = sync_dir(dir) {
+                first_error.get_or_insert((dir.to_path_buf(), e));
+            }
         }
-        Ok(synced)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(synced),
+        }
     }
 }
 
@@ -1238,8 +1281,11 @@ impl Drop for ImportRun {
         if self.finished || !self.files.values().any(|file| file.appended) {
             return;
         }
-        if let Err(error) = self.sync() {
-            tracing::warn!("an import run was dropped unfinished and its sync failed: {error}");
+        if let Err((path, error)) = self.sync() {
+            tracing::warn!(
+                "an import run was dropped unfinished and its sync of {} failed: {error}",
+                path.display()
+            );
         }
     }
 }
@@ -1860,10 +1906,18 @@ mod tests {
             let failing = Failing::step(step);
             let error = store_record_in(base, &scope, note(step)).unwrap_err();
             drop(failing);
-            assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+            // The error carries the id the note has in the file.
+            let live = load_live_project_records(base, &scope).unwrap();
+            let saved = live.iter().find(|r| r.content == step).unwrap();
+            let saved_id = saved.id.clone().unwrap();
+            assert!(
+                matches!(&error, MemoryError::WrittenUnconfirmed { id: Some(id), .. } if *id == saved_id),
+                "{error:?}"
+            );
             let message = error.to_string();
             assert!(message.starts_with("written, but not confirmed on disk"), "{message}");
             assert!(message.contains(&format!("{step} failed")), "{message}");
+            assert!(message.contains(&format!("fetch {saved_id} to check")), "{message}");
         }
         assert_eq!(contents(), ["kept", "sync file", "sync dir"], "both notes are there");
 
@@ -1873,7 +1927,10 @@ mod tests {
         let failing = Failing::step("sync file");
         let error = forget_in(base, &scope, id).unwrap_err();
         drop(failing);
-        assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+        assert!(
+            matches!(&error, MemoryError::WrittenUnconfirmed { id: Some(got), .. } if got == id),
+            "{error:?}"
+        );
         assert_eq!(contents(), ["sync file", "sync dir"]);
         assert!(matches!(forget_in(base, &scope, id), Err(MemoryError::NotFound(_))));
 
@@ -1881,7 +1938,11 @@ mod tests {
         let failing = Failing::step("sync dir");
         let error = append_to(base, &rec("ns", 1, "x", vec![])).unwrap_err();
         drop(failing);
-        assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+        // A record without an id: there is none to name.
+        assert!(
+            matches!(error, MemoryError::WrittenUnconfirmed { id: None, .. }),
+            "{error}"
+        );
         assert_eq!(query_in(base, "ns", &MemoryQuery::default()).unwrap().len(), 1);
 
         // An import: its lines are written, and `finish` is where the sync
@@ -1892,7 +1953,10 @@ mod tests {
         let failing = Failing::step("sync file");
         let error = run.finish().unwrap_err();
         drop(failing);
-        assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+        assert!(
+            matches!(error, MemoryError::WrittenUnconfirmed { id: None, .. }),
+            "{error}"
+        );
         assert_eq!(contents(), ["sync file", "sync dir", "imported"]);
 
         // Before the write: the sync of the folder a new `memory/` is in,
@@ -1904,6 +1968,47 @@ mod tests {
         drop(failing);
         assert!(matches!(error, MemoryError::Io(_)), "{error}");
         assert!(!namespace_file(fresh.path(), "ns").exists());
+    }
+
+    /// `finish` tries every file and every directory even after a sync has
+    /// failed, and the error names the file whose sync failed first.
+    #[test]
+    fn finish_syncs_every_file_and_names_the_one_that_failed() {
+        let tmp = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let base = tmp.path();
+        let keys = [
+            project_scope(&tmp).key().to_string(),
+            project_scope(&other).key().to_string(),
+        ];
+        let mut run = ImportRun::new(false);
+        for (n, key) in keys.iter().enumerate() {
+            let line = exported(&format!("mem-{n}"), key, 1, "imported");
+            let imported = import(base, &line, ImportTarget::AsRecorded, &mut run);
+            assert_eq!(imported.outcome, ImportOutcome::Stored);
+        }
+        let mut paths: Vec<PathBuf> = keys
+            .iter()
+            .map(|key| namespace_file(base, &project_namespace(key)))
+            .collect();
+        paths.sort();
+
+        take_steps();
+        FAILING_STEP.with(|step| step.set(Some("sync file")));
+        let error = run.finish().unwrap_err();
+        FAILING_STEP.with(|step| step.set(None));
+        let syncs: Vec<&str> = take_steps()
+            .into_iter()
+            .filter(|step| step.starts_with("sync"))
+            .collect();
+        assert_eq!(syncs, ["sync file", "sync file", "sync dir"], "all tried");
+        assert!(
+            matches!(error, MemoryError::WrittenUnconfirmed { id: None, .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&paths[0].display().to_string()), "{message}");
+        assert!(!message.contains(&paths[1].display().to_string()), "{message}");
     }
 
     /// A save that cannot get the file's lock in time fails and writes
@@ -2891,6 +2996,29 @@ mod tests {
                 "",
                 "no bytes may be written through the planted symlink"
             );
+        }
+
+        /// A lock file that cannot be opened (here a symlink, refused by
+        /// `O_NOFOLLOW`) fails the save, the error names the lock file, and
+        /// nothing is written.
+        #[test]
+        fn a_lock_file_that_cannot_be_opened_is_named_in_the_error() {
+            let tmp = TempDir::new().unwrap();
+            let dir = memory_dir_in(tmp.path());
+            fs::create_dir_all(&dir).unwrap();
+            let victim = tmp.path().join("victim.txt");
+            fs::write(&victim, "").unwrap();
+            let lock = dir.join("ns.jsonl.lock");
+            std::os::unix::fs::symlink(&victim, &lock).unwrap();
+            let error = append_to(tmp.path(), &rec("ns", 1, "x", vec![])).unwrap_err();
+            assert!(matches!(error, MemoryError::Io(_)), "{error}");
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("cannot open the notes lock file {}", lock.display())),
+                "{message}"
+            );
+            assert!(!dir.join("ns.jsonl").exists());
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "");
         }
 
         #[test]

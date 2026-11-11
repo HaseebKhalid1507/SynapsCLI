@@ -77,6 +77,19 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **`synaps retention sweep --max-disk-bytes N` no longer deletes saved notes
+  unless `--include-notes` is given (plain-file memory).** When the budget
+  was still exceeded after the derived indexes and the oldest sessions,
+  traces and logs were gone, the sweep evicted notes of every class, oldest
+  first, until none was left, and could then still fail because protected
+  sessions alone were over the budget. One mistyped number deleted every
+  note. Without `--include-notes` the budget now never touches a note: an
+  unmet budget is the error it was, saying no note was deleted, and the
+  notes files are left as they were. With `--include-notes` the budget
+  evicts notes as before. `--include-notes` no longer needs
+  `--max-age-days`; it can be given with `--max-disk-bytes` alone. The
+  `sweep` help says what can delete notes and what cannot.
+  `RetentionError::BudgetUnmet` has a new field, `notes_kept`.
 - **`synaps retention sweep --max-age-days N` no longer deletes saved notes
   (plain-file memory).** An age sweep, run to prune sessions, traces and
   logs, also deleted every note older than N days, whatever its retention
@@ -84,8 +97,8 @@ All notable changes to this project will be documented in this file.
   forgotten or swept by disk budget". The age now applies to sessions,
   traces, logs and tool-output spill only. A note saved with an expiry of
   its own (`max_age_days`) still expires by that on every sweep, a
-  forgotten note is still removed, and `--max-disk-bytes` still evicts
-  notes, oldest first. `--include-notes` (with `--max-age-days`) restores
+  forgotten note is still removed, and `--max-disk-bytes` evicts notes
+  only with `--include-notes` (entry above). `--include-notes` restores
   the old behaviour. The Axel backend's sweep is unchanged.
 - **The file archive store never refuses a rollover for being full, and never
   deletes or replaces an archive.** With `memory.backend = legacy`, a project
@@ -388,6 +401,29 @@ All notable changes to this project will be documented in this file.
   looks in the older shelves too: a tombstone there refuses the save, and a
   live copy there is returned instead of a second copy being written. The
   name counts as taken only when no shelf holds the window or its tombstone.
+
+- **Notes: one rule for a directory that cannot be synced, and a lock file
+  that cannot be opened is named.** The notes store tolerated `EINVAL` and
+  `ENOTSUP` from a directory sync, and `write_atomic_private` also
+  `PermissionDenied` (a directory that can be written but not opened for
+  reading). Both now call `private_fs::sync_dir`, which tolerates all three,
+  so such a directory no longer makes every save answer "written, not
+  confirmed". A notes lock file that cannot be opened (a symlink, another
+  owner) fails the save with "cannot open the notes lock file <path>"
+  instead of the bare OS error; nothing is written, as before.
+- **Notes: "written, not confirmed" names the note.** When the sync after a
+  save or a forget failed, `memory_store` and `memory_forget` told the model
+  to search, with nothing exact to search for. The error
+  (`MemoryError::WrittenUnconfirmed`, now `{ id, cause }`) carries the
+  note's id, and the tools say "fetch mem-… with memory_fetch to check". A
+  record without an id (an extension's `memory.append`) and the end of an
+  import run have none and keep the old text.
+- **Notes: the end of an import syncs every file, and says which one
+  failed.** `ImportRun::finish` stopped at the first file or directory
+  whose sync failed, so the files after it were not synced, and the error
+  did not say which file it was. It now tries every file and every
+  directory and returns the first failure as before
+  (`WrittenUnconfirmed`), with the path that failed.
 - **Notes: a save made while a notes file is rewritten is no longer lost.**
   `synaps retention sweep` and `synaps retention forget memory` rewrite
   `memory/<ns>.jsonl` and rename the new file over the old one. A note saved

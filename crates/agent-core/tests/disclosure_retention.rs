@@ -9,7 +9,8 @@
 
 use agent_core::disclosure::{gate_for_model, may_persist, DisclosureClass, ModelVisibility};
 use agent_core::retention::{
-    export, forget, inspect, sweep_at, RetentionDomain, RetentionPolicy, RetentionRoots,
+    export, forget, inspect, sweep_at, RetentionDomain, RetentionError, RetentionPolicy,
+    RetentionRoots,
 };
 use tempfile::TempDir;
 
@@ -638,7 +639,7 @@ fn disk_budget_evicts_derived_indexes_and_oldest_memory_records() {
         &RetentionPolicy {
             max_age_days: None,
             max_disk_bytes: Some(700),
-            include_notes: false,
+            include_notes: true,
         },
         now,
     )
@@ -687,6 +688,63 @@ fn unsatisfiable_disk_budget_returns_a_typed_unmet_error() {
         session_exists(&h.roots, "pinned"),
         "protected head untouched"
     );
+}
+
+/// A budget far below the protected sessions' size cannot be met. Without
+/// `include_notes` the notes files are not touched, byte for byte; with it
+/// the notes are evicted, oldest first, and the budget is still unmet.
+#[test]
+fn disk_budget_deletes_notes_only_with_include_notes() {
+    let h = harness();
+    let now = 100 * DAY_MS;
+    write_session(&h.roots, "pinned", 10 * DAY_MS, None);
+    write_chain(&h.roots, "keep", "pinned");
+    let memory = h.roots.base_dir.join("memory");
+    let notes = |ns: &str, id: &str, ts: u64| {
+        format!(
+            r#"{{"namespace":"{ns}","timestamp_ms":{ts},"content":"note {id}","tags":[],"id":"{id}","project":"p"}}"#
+        ) + "\n"
+    };
+    let files = [
+        (
+            memory.join("project-a.jsonl"),
+            notes("project-a", "mem-a1", DAY_MS) + &notes("project-a", "mem-a2", 99 * DAY_MS),
+        ),
+        (
+            memory.join("project-b.jsonl"),
+            notes("project-b", "mem-b1", 2 * DAY_MS),
+        ),
+    ];
+    for (path, text) in &files {
+        std::fs::write(path, text).unwrap();
+    }
+    let policy = |include_notes| RetentionPolicy {
+        max_age_days: None,
+        max_disk_bytes: Some(10),
+        include_notes,
+    };
+
+    let err = sweep_at(&h.roots, &policy(false), now).unwrap_err();
+    assert!(
+        matches!(err, RetentionError::BudgetUnmet { notes_kept: true, .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("no note was deleted"), "{err}");
+    for (path, text) in &files {
+        assert_eq!(std::fs::read(path).unwrap(), text.as_bytes(), "{}", path.display());
+    }
+    assert!(session_exists(&h.roots, "pinned"));
+
+    let err = sweep_at(&h.roots, &policy(true), now).unwrap_err();
+    assert!(
+        matches!(err, RetentionError::BudgetUnmet { notes_kept: false, .. }),
+        "{err}"
+    );
+    for (path, _) in &files {
+        let left = std::fs::read_to_string(path).unwrap();
+        assert!(!left.contains("mem-"), "every note evicted: {left}");
+    }
+    assert!(session_exists(&h.roots, "pinned"));
 }
 
 #[test]

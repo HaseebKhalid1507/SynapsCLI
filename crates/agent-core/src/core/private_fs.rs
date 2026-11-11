@@ -121,18 +121,31 @@ pub fn open_private_append(path: &Path) -> Result<File, PrivateFsError> {
 }
 
 /// Sync the directory `path` is in, so that a rename into it is on disk.
-/// A directory that cannot be synced at all (the file system refuses, or it
-/// may be written but not opened for reading) is left as it is: that is not
-/// a reason to call a finished replace failed. Any other error is returned.
 /// Nothing to do on Windows, which cannot open a directory to flush it.
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    sync_dir(dir)
+}
+
+/// Sync the directory `dir`, so that a name created or renamed in it is on
+/// disk. The one rule, for this module and the notes store, of which errors
+/// say "this directory cannot be synced at all" and are left as they are:
+///
+/// - `EINVAL` / `ENOTSUP`: the file system does not sync directories.
+/// - `PermissionDenied`: the directory may be written but not opened for
+///   reading (a write-and-search-only mode such as `0300`). The rename or
+///   the append into it has worked; only the open for the sync is refused.
+///
+/// Such a directory is not a reason to call a finished write failed. Any
+/// other error is returned. A no-op on Windows (not unix), which cannot open
+/// a directory to flush it, and where NTFS journals the new name itself.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
-        let dir = match path.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => dir,
-            _ => Path::new("."),
-        };
         match File::open(dir).and_then(|dir| dir.sync_all()) {
             Err(e) if matches!(e.kind(), InvalidInput | PermissionDenied | Unsupported) => Ok(()),
             result => result,
@@ -140,7 +153,7 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = dir;
         Ok(())
     }
 }
@@ -382,6 +395,30 @@ mod tests {
         let _g = ModeGuard::set(&gate, 0o111);
         assert!(ConfinedDir::create_absolute_no_symlinks(&gate.join("link/sessions")).is_err());
         assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+    }
+
+    /// The one directory-sync rule: a directory that can be written but not
+    /// opened for reading is left unsynced, not an error; a directory that is
+    /// not there is an error.
+    #[test]
+    fn sync_dir_tolerates_an_unreadable_directory_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        sync_dir(tmp.path()).unwrap();
+        assert_eq!(
+            sync_dir(&tmp.path().join("missing")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        if !dac_enforced() {
+            return;
+        }
+        let gate = tmp.path().join("gate");
+        std::fs::create_dir(&gate).unwrap();
+        let _g = ModeGuard::set(&gate, 0o311);
+        assert_eq!(
+            File::open(&gate).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        sync_dir(&gate).unwrap();
     }
 
     #[cfg(target_os = "linux")]

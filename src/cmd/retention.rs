@@ -24,14 +24,19 @@ pub enum RetentionAction {
         /// Axel: the age applies to notes.
         #[arg(long)]
         max_age_days: Option<u32>,
-        /// Requested disk budget; protected content can leave this unmet. With
-        /// plain-file memory the budget can evict notes, oldest first.
+        /// Requested disk budget: deletes derived indexes, then the oldest
+        /// sessions, traces and logs (never protected chain heads). Plain-file
+        /// memory: it does NOT delete notes unless --include-notes is given;
+        /// without it an unmet budget is an error and every note is kept.
         #[arg(long)]
         max_disk_bytes: Option<u64>,
-        /// Plain-file memory: apply --max-age-days to saved notes too, deleting
-        /// every note older than that. No effect with Axel, whose sweep is
-        /// notes only.
-        #[arg(long, requires = "max_age_days")]
+        /// Plain-file memory: let this sweep delete saved notes of any class.
+        /// With --max-age-days, every note older than that goes; with
+        /// --max-disk-bytes, notes are evicted oldest first until the budget
+        /// is met or no note is left. Without this flag only notes past their
+        /// own expiry and forgotten notes are removed. No effect with Axel,
+        /// whose sweep is notes only.
+        #[arg(long)]
         include_notes: bool,
     },
     /// Export privately. Axel: every linked original scope, including secrets.
@@ -590,6 +595,26 @@ mod tests {
         );
         assert!(selected_memory_id("project-p123", "project-proj_123:mem-a").is_err());
         assert!(selected_memory_id("project-p123", "other:mem-a").is_err());
+    }
+    #[test]
+    fn include_notes_parses_with_the_disk_budget_alone() {
+        use clap::Parser;
+        let parsed = Cli::try_parse_from([
+            "retention",
+            "sweep",
+            "--max-disk-bytes",
+            "1000",
+            "--include-notes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.action,
+            RetentionAction::Sweep {
+                max_age_days: None,
+                max_disk_bytes: Some(1000),
+                include_notes: true,
+            }
+        ));
     }
     #[cfg(unix)]
     fn write_axel_export(dest: &Path, value: &Value) -> Result<()> {
