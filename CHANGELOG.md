@@ -374,6 +374,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: a base that links to a folder that is away is an
+  error, not a project with no archives.** With the Synaps folder a link to
+  a disk that was not mounted, a search answered nothing, a fetch "not
+  found" and a resume "has no archive store", as for a project that never
+  saved anything. Reading now fails with `the archive base is a link to a
+  folder that is not there`. A base that does not exist is still no store.
 - **Context archives: an import that finds its record already stored
   confirms it on disk.** A run cut by a power loss after a file was renamed
   into place and before its directory was synced left a record the next

@@ -3933,8 +3933,22 @@ impl PrivateDir {
     }
     fn open_existing(base: &Path, scope: &str) -> io::Result<Self> {
         Self::check_base(base)?;
-        // `NotFound` when the base, or a link on the way to it, is not there.
-        let real = std::fs::canonicalize(base)?;
+        // `NotFound` when the base, or a folder on the way to it, is not
+        // there: no store. A base that is there, as a link to a folder that
+        // is away (a disk that is not mounted), is not "no store": the
+        // archives are where it points, and cannot be reached.
+        let real = match std::fs::canonicalize(base) {
+            Ok(real) => real,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(match std::fs::symlink_metadata(base) {
+                    Ok(_) => io::Error::other(format!(
+                        "the archive base is a link to a folder that is not there: {error}"
+                    )),
+                    Err(_) => error,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         if real == Path::new("/") {
             return Err(invalid("archive base must be an absolute non-root path"));
         }
@@ -10188,6 +10202,41 @@ mod tests {
             assert_eq!(dry.outcome, outcome);
             drop(failing);
             assert_eq!(import(&store, line).unwrap().outcome, outcome);
+        }
+    }
+
+    /// A base that is a link to a folder that is away (a disk that is not
+    /// mounted) is an error to every read: not a project with no archives.
+    /// A base that is not there at all is still "no store".
+    #[test]
+    fn a_base_that_links_to_a_folder_that_is_away_is_an_error_not_an_empty_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let disk = root.join("disk");
+        let base = root.join("base");
+        std::fs::create_dir(&disk).unwrap();
+        symlink(&disk, &base).unwrap();
+        let store = setup_in(&base, "synthetic-project");
+        let sealed = store.seal(&text("on the other disk"), "").unwrap();
+        drop(store);
+        std::fs::rename(&disk, root.join("unmounted")).unwrap();
+        let away = ArchiveStore::open_existing(&base, "synthetic-project", "l").err().expect("away");
+        assert_ne!(away.kind(), io::ErrorKind::NotFound);
+        assert!(away.to_string().starts_with("the archive base is a link to a folder that is not there"));
+        assert!(ArchiveStore::existing_scope(&base, &project_scope("synthetic-project").unwrap()).is_err());
+        assert!(project_search(&base, "synthetic-project", "", 8).is_err());
+        let fetched = project_fetch(&base, "synthetic-project", &sealed.id, 0, 1).unwrap_err();
+        assert_ne!(fetched.kind(), io::ErrorKind::NotFound);
+        assert!(export_in(&base, "synthetic-project").is_err());
+        assert!(archive_file(&base, "synthetic-project", &sealed.id).is_err());
+        // Back again, it reads.
+        std::fs::rename(root.join("unmounted"), &disk).unwrap();
+        assert_eq!(project_search(&base, "synthetic-project", "", 8).unwrap().len(), 1);
+        // No base, and a base below a folder that is not there: no store.
+        for missing in [root.join("no-base"), root.join("no-folder/base")] {
+            assert!(ArchiveStore::open_existing(&missing, "synthetic-project", "l").unwrap().is_none());
+            assert!(project_search(&missing, "synthetic-project", "", 8).unwrap().is_empty());
+            assert!(export_in(&missing, "synthetic-project").unwrap().is_empty());
         }
     }
 }
