@@ -291,7 +291,7 @@ fn serve_session_socket_inner(
                             // this process's integrity level, or with a
                             // restricted or AppContainer token is dropped. Its
                             // event would reach the model as `<event>` data
-                            // from a process that has less than the user's rights.
+                            // from a sandboxed process (defence in depth).
                             let mut head = vec![0u8; 8192];
                             let n = match connected.read(&mut head).await {
                                 Ok(n) if n > 0 => n,
@@ -683,8 +683,8 @@ mod windows_tests {
 
     /// A client of this user whose token carries restricting SIDs passes the
     /// pipe's DACL and label, so only the listener's admit stops it: its
-    /// event would reach the model as `<event>` data from a process that
-    /// has less than the user's rights (the same escape as on the daemon pipe).
+    /// event would reach the model as `<event>` data from a sandboxed
+    /// process (defence in depth, as on the daemon pipe).
     #[tokio::test]
     async fn a_restricted_token_client_cannot_push_events() {
         let tmp = tempfile::tempdir().unwrap();
