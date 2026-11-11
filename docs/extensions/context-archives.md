@@ -335,8 +335,10 @@ You must not:
   rollover waits, and after a few seconds it fails.
 - **Change modes or owners,** or make a hard link to an archive (a
   link-based backup, for instance). Synaps refuses to read an archive file
-  that has a second name, and while one is there its history search fails
-  for the whole project.
+  that has a second name. Its history search passes over that file and says
+  that it did not read everything, a fetch of that archive fails, and a
+  rollover that holds the same content stores it a second time, under its
+  other id.
 - **Act on the content.** See [Untrusted data](#untrusted-data).
 
 Open a file, read it to the end, close it.

@@ -536,9 +536,23 @@ enum Shelved {
     Other,
 }
 
-/// The shelves and legacy slots a lookup of one segment had to pass over
-/// because they could not be read. The segment may be in one of them, so
-/// when it is found nowhere else, "not found" would be a guess.
+/// What a search did not read, so that an empty or a short result is not
+/// taken for "the project holds nothing else".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unscanned {
+    /// `Some(n)`: the scan budget stopped the search after the `n` newest
+    /// segment files, and older ones were not read.
+    pub stopped_after: Option<usize>,
+    /// The shelves, legacy slots and segment files the search passed over
+    /// because they could not be read or do not hold a valid record: how
+    /// many, and the first by name with its error. Names and errors only,
+    /// never content.
+    pub unread: Option<String>,
+}
+
+/// The shelves, legacy slots and files an operation had to pass over
+/// because they could not be read. What it was looking for may be in one of
+/// them, so "not found" or "that is all" would be a guess.
 #[derive(Default)]
 struct Unread {
     places: usize,
@@ -1052,22 +1066,28 @@ impl ArchiveStore {
         self.search_scan(query, limit).map(|(rows, _)| rows)
     }
 
-    /// [`search`](Self::search) that also says whether the scan budget cut it
-    /// short: `Some(n)` when it stopped after reading the `n` newest segment
-    /// files and left older ones unread, `None` when nothing it was asked for
-    /// is missing. Shelves are read newest to oldest, a shelf's files by
-    /// modification time, the legacy slots last. A file that is not a valid
-    /// record is skipped (one corrupt file must not hide the rest), and so is
-    /// a legacy slot that cannot be read at all. On a shelf, a link, a FIFO
-    /// or a file that is not ours alone where a segment belongs still fails
-    /// the search. Shelf files are read without the lock; it is taken,
-    /// shared and only if there is a lock file, when the search gets as far
-    /// as reading a legacy slot. Nothing is written either way.
+    /// [`search`](Self::search) that also says what it did not read:
+    /// `None` when nothing it was asked for is missing, otherwise an
+    /// [`Unscanned`]. Shelves are read newest to oldest, a shelf's files by
+    /// modification time, the legacy slots last.
+    ///
+    /// One place that cannot be read hides only itself. A shelf name that is
+    /// not a directory that can be opened and listed, a link, a FIFO or a
+    /// file that is not ours alone where a segment belongs, a legacy slot
+    /// that cannot be read, and a file that is read and is not a valid
+    /// record are each passed over, and each is counted in
+    /// [`Unscanned::unread`]: the rows are what the rest of the project
+    /// holds, and the caller is told that they are not all of it. Only the
+    /// project directory itself failing to list fails the search.
+    ///
+    /// Shelf files are read without the lock; it is taken, shared and only
+    /// if there is a lock file, when the search gets as far as reading a
+    /// legacy slot. Nothing is written either way.
     pub fn search_scan(
         &self,
         query: &str,
         limit: usize,
-    ) -> io::Result<(Vec<ArchiveDescriptor>, Option<usize>)> {
+    ) -> io::Result<(Vec<ArchiveDescriptor>, Option<Unscanned>)> {
         if query.len() > 512 || limit > MAX_SEARCH_RESULTS {
             return Err(invalid("archive search query/result budget exceeded"));
         }
@@ -1080,15 +1100,35 @@ impl ArchiveStore {
         let mut rows = Vec::new();
         let (mut files, mut bytes) = (0, 0);
         let mut legacy_lock = None;
+        let mut unread = Unread::default();
+        // A full page and the end of the scan have nothing more to report
+        // than what was passed over on the way; the budget adds its count.
+        let done = |rows: Vec<ArchiveDescriptor>, stopped_after: Option<usize>, unread: &Unread| {
+            let unread = unread.notice();
+            let unscanned = (stopped_after.is_some() || unread.is_some()).then_some(Unscanned {
+                stopped_after,
+                unread,
+            });
+            Ok::<_, io::Error>((rows, unscanned))
+        };
         // `None` is the project directory itself: the legacy slots, oldest of all.
         for shelf in shelves.iter().map(Some).chain([None]) {
             let opened;
             let (dir, names) = match shelf {
                 Some(shelf) => {
-                    let Some(dir) = self.fs.open_child(shelf, true)? else {
-                        continue;
+                    let listed = self.fs.open_child(shelf, true).and_then(|dir| match dir {
+                        Some(dir) => Ok(Some((dir.names()?, dir))),
+                        None => Ok(None),
+                    });
+                    let (mut entries, dir) = match listed {
+                        Ok(Some(listed)) => listed,
+                        Ok(None) => continue,
+                        // The rest of the project is still searched.
+                        Err(error) => {
+                            unread.pass(shelf, error);
+                            continue;
+                        }
                     };
-                    let mut entries = dir.names()?;
                     entries.retain(|(name, ..)| archive_id(name).is_some());
                     // Modification time only orders the files of one shelf;
                     // nothing else depends on it.
@@ -1101,34 +1141,39 @@ impl ArchiveStore {
             };
             for name in names {
                 if rows.len() == limit {
-                    return Ok((rows, None));
+                    return done(rows, None, &unread);
                 }
                 if files == SEARCH_SCAN_FILES || bytes >= SEARCH_SCAN_BYTES {
-                    return Ok((rows, Some(files)));
+                    return done(rows, Some(files), &unread);
                 }
                 if shelf.is_none() && legacy_lock.is_none() {
                     legacy_lock = Some(self.shared()?);
                 }
+                let place = || match shelf {
+                    Some(shelf) => format!("{shelf}/{name}"),
+                    None => name.clone(),
+                };
                 let raw = match dir.read_with(&name, MAX_SEGMENT_BYTES, true) {
                     Ok(Some(raw)) => raw,
                     Ok(None) => continue,
-                    // Too large to be a segment: not read, and no record below.
-                    Err(error) if error.kind() == io::ErrorKind::InvalidData => Vec::new(),
-                    // A legacy slot that cannot be read hides only itself.
-                    Err(error) if shelf.is_none() => {
-                        tracing::warn!(slot = %name, %error, "search passed over a legacy archive slot");
+                    // Too large to be a segment, a link, a FIFO, a file that
+                    // is not ours alone, a read that failed: it hides only
+                    // itself. It still counts against the scan budget.
+                    Err(error) => {
+                        unread.pass(&place(), error);
+                        files += 1;
                         continue;
                     }
-                    Err(error) => return Err(error),
                 };
                 files += 1;
                 bytes += raw.len();
-                if let Ok(record) = self.record(&name, &raw) {
-                    rows.extend(describe(record, &query)?);
+                match self.record(&name, &raw) {
+                    Ok(record) => rows.extend(describe(record, &query)?),
+                    Err(error) => unread.pass(&place(), error),
                 }
             }
         }
-        Ok((rows, None))
+        done(rows, None, &unread)
     }
 
     /// Durable, idempotent deletion of the content of segment `id`, in every
@@ -1320,10 +1365,7 @@ impl ArchiveStore {
             file: self.fs.lock_existing()?,
             _gate: gate,
         };
-        let over_limit =
-            || invalid("archive store exceeds the migration limit (128 archives / 256 MiB)");
-        let (legacy, mut used) = self.scan_legacy(true)?;
-        let mut records: Vec<Record> = legacy.into_iter().map(|(_, record)| record).collect();
+        let (mut records, mut used) = self.scan_legacy(true)?;
         for shelf in self.shelves()?.iter().rev() {
             let Some(dir) = self.fs.open_child(shelf, true)? else {
                 continue;
@@ -1337,25 +1379,9 @@ impl ArchiveStore {
                 };
                 used += raw.len();
                 if used > MAX_STORE_BYTES {
-                    return Err(over_limit());
+                    return Err(over_migration_limit());
                 }
-                let record = self.record(&name, &raw)?;
-                let other_content = |r: &Record| r.id == record.id && r.digest != record.digest;
-                if records.iter().any(other_content) {
-                    return Err(corrupt());
-                }
-                // Another copy of a projection already read: one is kept,
-                // the tombstone if there is one.
-                if let Some(kept) = records.iter_mut().find(|r| r.digest == record.digest) {
-                    if matches!(kept.body, Body::Live { .. }) && matches!(record.body, Body::Tombstone) {
-                        *kept = record;
-                    }
-                    continue;
-                }
-                if records.len() == MAX_SEGMENTS {
-                    return Err(over_limit());
-                }
-                records.push(record);
+                carry(&mut records, self.record(&name, &raw)?)?;
             }
         }
         if lock.file.is_none() && !records.is_empty() {
@@ -1390,7 +1416,8 @@ impl ArchiveStore {
     /// first. One directory listing; nothing is opened, so a shelf name here
     /// may turn out to be a file or a link, or a directory that cannot be
     /// opened. A seal passes over such a name, a fetch reports it if it
-    /// finds its segment nowhere else, a search and an export fail on it.
+    /// finds its segment nowhere else, a search passes over it and says so
+    /// with its rows, and an export fails on it.
     fn layout(&self) -> io::Result<(Vec<String>, Vec<String>)> {
         let (mut shelves, mut slots) = (Vec::new(), Vec::new());
         for (name, ..) in self.fs.names()? {
@@ -1623,7 +1650,8 @@ impl ArchiveStore {
     /// Every legacy slot, read and validated together as before shelves
     /// existed: at most [`MAX_SEGMENTS`] files / [`MAX_STORE_BYTES`]. Only
     /// the migration export reads them this way; one bad slot fails it.
-    fn scan_legacy(&self, readonly: bool) -> io::Result<(Vec<(usize, Record)>, usize)> {
+    /// What it returns is what a migration carries of them ([`carry`]).
+    fn scan_legacy(&self, readonly: bool) -> io::Result<(Vec<Record>, usize)> {
         let mut records = Vec::new();
         let mut used = 0;
         for slot in 0..MAX_SEGMENTS {
@@ -1632,17 +1660,34 @@ impl ArchiveStore {
                 continue;
             };
             used += raw.len();
-            let record = self.record(&name, &raw)?;
-            if records
-                .iter()
-                .any(|(_, r): &(usize, Record)| r.id == record.id || r.digest == record.digest)
-            {
-                return Err(corrupt());
-            }
-            records.push((slot, record));
+            carry(&mut records, self.record(&name, &raw)?)?;
         }
         Ok((records, used))
     }
+}
+
+fn over_migration_limit() -> io::Error {
+    invalid("archive store exceeds the migration limit (128 archives / 256 MiB)")
+}
+
+/// Add `record` to what a migration carries. Another copy of a projection
+/// that is already there is not added: one is kept, the tombstone if either
+/// is one. Two records with one id and different content are an error.
+fn carry(records: &mut Vec<Record>, record: Record) -> io::Result<()> {
+    if records.iter().any(|r| r.id == record.id && r.digest != record.digest) {
+        return Err(corrupt());
+    }
+    if let Some(kept) = records.iter_mut().find(|r| r.digest == record.digest) {
+        if matches!(kept.body, Body::Live { .. }) && matches!(record.body, Body::Tombstone) {
+            *kept = record;
+        }
+        return Ok(());
+    }
+    if records.len() == MAX_SEGMENTS {
+        return Err(over_migration_limit());
+    }
+    records.push(record);
+    Ok(())
 }
 
 /// The search row of a live record that matches `query` (already lowercased).
@@ -4006,7 +4051,11 @@ mod tests {
         std::fs::write(&victim, "do not change").unwrap();
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
         let refused = || {
-            assert!(store.search("", 2).is_err());
+            // A search passes over the file and says so.
+            let (_, unscanned) = store.search_scan("", 2).unwrap();
+            let unread = unscanned.unwrap().unread.unwrap();
+            let place = format!("first s000001/{}: ", archive_name(&reference.id));
+            assert!(unread.starts_with("1 place(s) could not be read, ") && unread.contains(&place));
             assert!(store.fetch(&reference.id, 0, 1).is_err());
             assert!(store.fetch_note(&reference.id).is_err());
             assert!(store.forget(&reference.id).is_err());
@@ -4238,14 +4287,17 @@ mod tests {
             assert!(error.to_string().contains("could not be read"), "{error}");
         };
         // A segment that is found nowhere is not called "not found" while
-        // there is a shelf name that could not be looked into; and what
-        // reads every shelf fails on it.
+        // there is a shelf name that could not be looked into. A search
+        // answers from the other shelves and names this one; an export,
+        // which has to carry every shelf, fails on it.
         let refused = |id: &str| {
             unread(store.fetch(id, 0, 1).map(drop));
             unread(store.fetch_note(id).map(drop));
             unread(store.forget(id).map(drop));
             unread(archive_file(tmp.path(), "synthetic-project", id).map(drop));
-            assert!(store.search("", MAX_SEARCH_RESULTS).is_err());
+            let (_, unscanned) = store.search_scan("", MAX_SEARCH_RESULTS).unwrap();
+            let passed = unscanned.unwrap().unread.unwrap();
+            assert!(passed.starts_with("1 place(s) could not be read, first s000001: "), "{passed}");
             assert!(store.export_records().is_err());
             assert!(export_in(tmp.path(), "synthetic-project").is_err());
         };
@@ -5107,7 +5159,7 @@ mod tests {
         // The search budget is bytes as well as files: 17 files pass 256 MiB.
         let (rows, stopped) = store.search_scan("archive-00", 1).unwrap();
         assert!(rows.is_empty());
-        assert_eq!(stopped, Some(17));
+        assert_eq!(stopped, Some(Unscanned { stopped_after: Some(17), unread: None }));
         let (rows, stopped) = store.search_scan("archive-17", 1).unwrap();
         assert_eq!((rows[0].id.as_str(), stopped), (ids[17].as_str(), None));
         // A migration cannot carry it, and says so instead of exporting a part.
@@ -5398,7 +5450,8 @@ mod tests {
         ids.push(seal(SEARCH_SCAN_FILES));
         let (rows, stopped) = store.search_scan("oldest-only", 32).unwrap();
         assert!(rows.is_empty());
-        assert_eq!(stopped, Some(SEARCH_SCAN_FILES));
+        let budget = Unscanned { stopped_after: Some(SEARCH_SCAN_FILES), unread: None };
+        assert_eq!(stopped, Some(budget));
         assert_eq!(store.search("needle", 1).unwrap()[0].id, ids[SEARCH_SCAN_FILES]);
         assert_eq!(store.fetch(&ids[0], 0, 1).unwrap(), text("needle oldest-only"));
     }
@@ -5469,14 +5522,131 @@ mod tests {
         // Not segment names: never opened.
         std::fs::write(dir.join("s000001").join("notes.json"), b"stray").unwrap();
         std::fs::write(dir.join("s0000001"), b"stray").unwrap();
-        let (rows, stopped) = store.search_scan("", 10).unwrap();
+        let (rows, unscanned) = store.search_scan("", 10).unwrap();
         let mut found: Vec<_> = rows.into_iter().map(|row| row.id).collect();
         found.sort();
         let mut expected = vec![ids[0].clone(), ids[2].clone(), legacy.id];
         expected.sort();
         assert_eq!(found, expected);
-        assert_eq!(stopped, None);
+        // The budget did not stop it, and it says what it skipped: the
+        // corrupt file, the one too large to read and the slot.
+        let unscanned = unscanned.unwrap();
+        assert_eq!(unscanned.stopped_after, None);
+        let unread = unscanned.unread.unwrap();
+        assert!(unread.starts_with("3 place(s) could not be read, first s000001/"), "{unread}");
         assert_eq!(store.search("second", 10).unwrap(), []);
+    }
+
+    /// One place that cannot be read hides only itself from a search, and
+    /// the search says that its rows are not all the project holds.
+    #[test]
+    fn a_search_passes_over_what_it_cannot_read_and_says_so() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let old = store.seal(&text("on the oldest shelf"), "").unwrap();
+        let slot = seal_legacy_slot(&store, 0, &text("in a slot"), "");
+        let mut all = vec![old.id.clone(), slot.id.clone()];
+        // What the search still finds, and what it says it did not read.
+        let searched = |all: &[String], limit: usize| {
+            let (rows, unscanned) = store.search_scan("", limit).unwrap();
+            let mut found: Vec<_> = rows.into_iter().map(|row| row.id).collect();
+            found.sort();
+            let mut all = all.to_vec();
+            all.sort();
+            if limit >= all.len() {
+                assert_eq!(found, all);
+            } else {
+                assert_eq!(found.len(), limit);
+            }
+            match unscanned {
+                Some(unscanned) => {
+                    assert_eq!(unscanned.stopped_after, None);
+                    unscanned.unread.unwrap()
+                }
+                None => String::new(),
+            }
+        };
+        assert_eq!(searched(&all, 8), "");
+
+        // A shelf name that is a file. The seal after it takes the next number.
+        std::fs::write(dir.join("s000002"), b"not a directory").unwrap();
+        let unread = searched(&all, 8);
+        assert!(unread.starts_with("1 place(s) could not be read, first s000002: "), "{unread}");
+        let new = store.seal(&text("on the newest shelf"), "").unwrap();
+        let newest = dir.join("s000003");
+        assert!(newest.join(archive_name(&new.id)).is_file());
+        all.push(new.id.clone());
+        // The same with a link to a directory under that name.
+        std::fs::remove_file(dir.join("s000002")).unwrap();
+        symlink(&newest, dir.join("s000002")).unwrap();
+        let unread = searched(&all, 8);
+        assert!(unread.starts_with("1 place(s) could not be read, first s000002: "), "{unread}");
+
+        // Where a segment belongs: a link, a FIFO, a file with a second
+        // name and a file that is not a record.
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"do not change").unwrap();
+        let odd = |letter: &str| newest.join(archive_name(&letter.repeat(32)));
+        symlink(&victim, odd("a")).unwrap();
+        let fifo = std::ffi::CString::new(odd("b").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::fs::write(odd("c"), record_bytes(&store, &"c".repeat(32), &text("two names"), |_| {})).unwrap();
+        std::fs::hard_link(odd("c"), tmp.path().join("a-second-name")).unwrap();
+        std::fs::write(odd("d"), b"corrupt").unwrap();
+        let unread = searched(&all, 8);
+        assert!(unread.starts_with("5 place(s) could not be read, first s000003/"), "{unread}");
+        // A legacy slot that is a link.
+        symlink(&victim, dir.join("001.json")).unwrap();
+        let unread = searched(&all, 8);
+        assert!(unread.starts_with("6 place(s) could not be read, first s000003/"), "{unread}");
+        // A shelf that cannot be opened for an error that will pass: the
+        // search is a read, so the rest is still an answer.
+        let rest = [old.id.clone(), slot.id.clone()];
+        let failing = Fault::on("open", "s000003", libc::EMFILE);
+        let unread = searched(&rest, 8);
+        assert!(unread.starts_with("3 place(s) could not be read, first s000003: "), "{unread}");
+        // A page that fills is still not all there was to read on the way.
+        let unread = searched(&rest, 1);
+        assert!(unread.starts_with("2 place(s) could not be read, first s000003: "), "{unread}");
+        drop(failing);
+        // And one whose mode refuses it.
+        if unsafe { libc::geteuid() } != 0 {
+            let _reopen = Reopen(vec![newest.clone()]);
+            std::fs::set_permissions(&newest, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let unread = searched(&rest, 8);
+            assert!(unread.starts_with("3 place(s) could not be read, first s000003: "), "{unread}");
+        }
+        // Nothing was followed, read into or changed.
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not change");
+        assert!(std::fs::symlink_metadata(odd("a")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(odd("d")).unwrap(), b"corrupt");
+        // The plain search gives the same rows and no account of the rest.
+        assert_eq!(store.search("", 8).unwrap().len(), 3);
+    }
+
+    /// Legacy slots go by the same rule as shelves in an export: a window in
+    /// two of them is carried once, forgotten if either says so, and two
+    /// records with one id and different content are an error.
+    #[test]
+    fn export_carries_a_window_in_two_legacy_slots_once() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let slot = seal_legacy_slot(&store, 0, &text("in two slots"), "");
+        std::fs::copy(dir.join("000.json"), dir.join("001.json")).unwrap();
+        let rows = store.export_records().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((&rows[0]["id"], &rows[0]["tombstone"]), (&json!(slot.id), &json!(false)));
+        let live = std::fs::read_to_string(dir.join("000.json")).unwrap();
+        let body = &live[live.find("\"body\":").unwrap()..];
+        let tombstone = live.replace(body, "\"body\":{\"state\":\"tombstone\"}}");
+        std::fs::write(dir.join("001.json"), tombstone).unwrap();
+        let rows = store.export_records().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((&rows[0]["id"], &rows[0]["tombstone"]), (&json!(slot.id), &json!(true)));
+        let other = record_bytes(&store, &slot.id, &text("other content"), |_| {});
+        std::fs::write(dir.join("002.json"), other).unwrap();
+        let error = store.export_records().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

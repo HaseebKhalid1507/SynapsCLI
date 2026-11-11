@@ -4,7 +4,7 @@ use super::{error, MemoryBinding, Result};
 use crate::SharedMessage;
 use agent_core::context_archive::{
     self, ArchiveDescriptor, ArchivePart, ArchiveRedactor, ArchiveRef, ArchiveStore,
-    ArchivedMessage, Forgotten,
+    ArchivedMessage, Forgotten, Unscanned,
 };
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -200,15 +200,17 @@ impl MemoryBinding {
         }
         Ok(rows)
     }
-    /// [`history_search`](Self::history_search) that also reports a scan cut
-    /// short: `Some(n)` when the file store stopped after the `n` newest
-    /// archives and left older ones unread, otherwise `None`. With the Axel
-    /// backend the service does the search and reports no budget: always `None`.
+    /// [`history_search`](Self::history_search) that also reports what the
+    /// file store did not read: `None` when nothing is missing, otherwise an
+    /// [`Unscanned`] that says whether the scan budget stopped it
+    /// (`stopped_after`) and whether a shelf, a legacy slot or a file was
+    /// passed over because it could not be read (`unread`). With the Axel
+    /// backend the service does the search and reports neither: always `None`.
     pub async fn history_search_scan(
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<(Vec<ArchiveDescriptor>, Option<usize>)> {
+    ) -> Result<(Vec<ArchiveDescriptor>, Option<Unscanned>)> {
         if self.exclusive() {
             return Ok((self.history_search(query, limit).await?, None));
         }

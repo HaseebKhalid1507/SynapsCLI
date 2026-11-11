@@ -195,7 +195,7 @@ impl Tool for MemorySearchTool {
         if params["source"] == "history" {
             let query = params["query"].as_str().unwrap_or("").to_owned();
             let limit = params["limit"].as_u64().unwrap_or(8).min(25) as usize;
-            let (rows, stopped_after) = binding.history_search_scan(&query, limit).await?;
+            let (rows, unscanned) = binding.history_search_scan(&query, limit).await?;
             let mut out = LOWER_AUTHORITY_HEADER.to_owned();
             for row in rows {
                 out.push_str(&format!(
@@ -204,9 +204,20 @@ impl Tool for MemorySearchTool {
                 ));
             }
             // An empty or short result must not read as "nothing older exists".
+            let (stopped_after, unread) = match unscanned {
+                Some(unscanned) => (unscanned.stopped_after, unscanned.unread),
+                None => (None, None),
+            };
             if let Some(scanned) = stopped_after {
                 out.push_str(&format!(
                     "\n(searched the {scanned} most recent archives; older ones were not scanned)"
+                ));
+            }
+            // Nor as "nothing else exists" when a part of the store could
+            // not be read: the rows are from the rest of it.
+            if let Some(unread) = unread {
+                out.push_str(&format!(
+                    "\n(not all archives were searched: {unread}. Archives there may match.)"
                 ));
             }
             return Ok(out);
@@ -1086,6 +1097,37 @@ mod tests {
         let page = search("WINDOW_WORD").await;
         assert_eq!(page.matches("\nctx-").count(), 8);
         assert!(!page.contains("not scanned"));
+    }
+
+    /// A shelf that cannot be read hides only itself: the search answers
+    /// from the rest of the project, and says that it is not all of it.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn history_search_says_what_it_could_not_read() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let window = [std::sync::Arc::new(json!({"role":"assistant","content":"WINDOW_WORD kept"}))];
+        let (archive, _) = binding.history_seal("synthetic-chat", &window, "").await.unwrap();
+        let search = || async {
+            MemorySearchTool
+                .execute(json!({"source":"history","query":"WINDOW_WORD","limit":8}), host_context())
+                .await
+                .unwrap()
+        };
+        let row = format!("\nctx-{} messages=1 source_messages=1 snippet=", archive.id);
+        let whole = search().await;
+        assert!(whole.contains(&row) && !whole.contains("not all archives"), "{whole}");
+        // A shelf name that is not a shelf: archives could be behind it.
+        let key = binding.scope().unwrap().key().to_owned();
+        let file = agent_core::context_archive::archive_file(binding.base(), &key, &archive.id);
+        let file = file.unwrap().unwrap();
+        let project = file.parent().unwrap().parent().unwrap();
+        std::fs::write(project.join("s000002"), b"not a directory").unwrap();
+        let partial = search().await;
+        assert!(partial.contains(&row), "{partial}");
+        let notice = "\n(not all archives were searched: 1 place(s) could not be read, first s000002: ";
+        assert!(partial.contains(notice), "{partial}");
+        assert!(partial.ends_with(". Archives there may match.)"), "{partial}");
     }
 
     #[tokio::test]
