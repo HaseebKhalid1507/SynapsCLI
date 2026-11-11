@@ -2036,39 +2036,48 @@ impl PrivateDir {
             unsafe { libc::close(fd) };
             return Err(error);
         }
+        let names = self.read_names(stream);
+        unsafe { libc::closedir(stream) }; // closes its handle too
+        names
+    }
+    /// The rest of `names`: every entry `stream` has left, which must be a
+    /// stream on this directory.
+    fn read_names(&self, stream: *mut libc::DIR) -> io::Result<Vec<(String, bool, i64)>> {
         let mut names = Vec::new();
-        let mut entry: libc::dirent = unsafe { std::mem::zeroed() };
-        let mut next = std::ptr::null_mut();
-        let result = loop {
-            // readdir_r returns a failed read as an error; readdir's null is
-            // also the end of the directory.
-            let code = unsafe { libc::readdir_r(stream, &mut entry, &mut next) };
-            if code != 0 {
-                break Err(io::Error::from_raw_os_error(code));
+        loop {
+            // `readdir` returns null at the end of the directory and when the
+            // read failed, and only `errno` tells the two apart: clear it,
+            // call, look. (Not `readdir_r` into a `dirent` of our own: musl
+            // copies an entry of any length into it, and glibc fails the
+            // whole listing on a name that does not fit.)
+            unsafe { *errno() = 0 };
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                return match unsafe { *errno() } {
+                    0 => Ok(names),
+                    code => Err(io::Error::from_raw_os_error(code)),
+                };
             }
-            if next.is_null() {
-                break Ok(());
-            }
-            let name = unsafe { std::ffi::CStr::from_ptr(entry.d_name.as_ptr()) };
+            // The name is read where the C library keeps it, up to its NUL
+            // and however long it is. No `dirent` is copied, and no reference
+            // to a whole one is made: the entry may be shorter than the type.
+            let (raw, name) = unsafe {
+                let raw = std::ptr::addr_of!((*entry).d_name).cast::<libc::c_char>();
+                (raw, std::ffi::CStr::from_ptr(raw))
+            };
             let Some(name) = name.to_str().ok().filter(|name| c_name(name).is_ok()) else {
                 continue;
             };
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            let found = unsafe {
-                libc::fstatat(
-                    self.fd(),
-                    entry.d_name.as_ptr(),
-                    &mut stat,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
+            let found =
+                unsafe { libc::fstatat(self.fd(), raw, &mut stat, libc::AT_SYMLINK_NOFOLLOW) };
             if found != 0 {
                 let error = io::Error::last_os_error();
                 // Gone since it was listed: whoever opens it next decides.
                 if error.kind() == io::ErrorKind::NotFound {
                     continue;
                 }
-                break Err(error);
+                return Err(error);
             }
             let kind = stat.st_mode & libc::S_IFMT;
             #[allow(clippy::useless_conversion)]
@@ -2076,9 +2085,7 @@ impl PrivateDir {
                 .saturating_mul(1_000_000_000)
                 .saturating_add(i64::from(stat.st_mtime_nsec));
             names.push((name.to_owned(), kind == libc::S_IFDIR, modified));
-        };
-        unsafe { libc::closedir(stream) }; // closes its handle too
-        result.map(|()| names)
+        }
     }
     fn open(&self, name: &std::ffi::CStr, flags: i32) -> io::Result<std::fs::File> {
         use std::os::fd::FromRawFd;
@@ -2233,6 +2240,16 @@ impl PrivateDir {
         self.0.sync_all()
     }
 }
+// Where the C library keeps this thread's `errno`: the only thing that tells a
+// failed `readdir` from the end of a directory. Each platform names it
+// differently and `libc` has no common name for it; a Unix that is not listed
+// here does not compile until its name is added.
+#[cfg(target_os = "linux")]
+use libc::__errno_location as errno;
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+use libc::__error as errno;
+#[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+use libc::__errno as errno;
 #[cfg(unix)]
 fn c_name(name: &str) -> io::Result<std::ffi::CString> {
     if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\\']) {
@@ -4560,6 +4577,130 @@ mod tests {
         assert_eq!(store.fetch(&again.id, 0, 1).unwrap(), text("forgotten words"));
         assert_eq!(only_archive_file(&dir), dir.join("s000001").join(archive_name(&again.id)));
         assert_eq!(std::fs::read(&slot).unwrap(), torn);
+    }
+
+    /// `readdir` says that a read failed only through `errno`; its null is
+    /// also the end of the directory. A listing that did not look would come
+    /// back short, and a seal would take a full shelf for one with room.
+    #[test]
+    fn a_failed_directory_read_is_an_error_not_a_shorter_listing() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        let (tmp, store) = setup();
+        store.seal(&text("listed"), "").unwrap();
+        let shelf = store.fs.open_child("s000001", true).unwrap().unwrap();
+        assert_eq!(shelf.names().unwrap().len(), 1);
+        // A stream on the shelf, opened as `names` opens it...
+        let handle = shelf.open(c".", libc::O_RDONLY | libc::O_DIRECTORY);
+        let fd = handle.unwrap().into_raw_fd();
+        let stream = unsafe { libc::fdopendir(fd) };
+        assert!(!stream.is_null());
+        // ...whose handle is then one on a plain file: the read cannot work.
+        let file = std::fs::File::open(only_archive_file(&directory(&tmp, &store))).unwrap();
+        assert_eq!(unsafe { libc::dup2(file.as_raw_fd(), fd) }, fd);
+        let listed = shelf.read_names(stream);
+        unsafe { libc::closedir(stream) };
+        let error = listed.unwrap_err();
+        #[cfg(target_os = "linux")]
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+        assert_ne!(error.raw_os_error(), Some(0));
+    }
+
+    /// The other half of the same rule: `errno` is cleared before each read,
+    /// so what an earlier call left there does not fail a listing that worked.
+    #[test]
+    fn a_listing_is_not_failed_by_an_error_from_before_it() {
+        let (_tmp, store) = setup();
+        store.seal(&text("listed"), "").unwrap();
+        let shelf = store.fs.open_child("s000001", true).unwrap().unwrap();
+        assert_eq!(unsafe { libc::close(-1) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(shelf.names().unwrap().len(), 1);
+        // The same for a directory with nothing in it.
+        let empty = store.fs.child("s000002", true).unwrap();
+        assert_eq!(unsafe { libc::close(-1) }, -1);
+        assert!(empty.names().unwrap().is_empty());
+    }
+
+    /// A listing opens the directory again, and where that is refused it
+    /// fails; it does not come back empty.
+    #[test]
+    fn a_directory_that_cannot_be_opened_again_is_an_error_not_an_empty_listing() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // nothing is refused to root
+        }
+        let (tmp, store) = setup();
+        store.seal(&text("listed"), "").unwrap();
+        let path = directory(&tmp, &store).join("s000001");
+        let shelf = store.fs.open_child("s000001", true).unwrap().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let listed = shelf.names();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(listed.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(shelf.names().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn names_that_are_not_store_names_are_ignored_whatever_they_look_like() {
+        use std::os::unix::ffi::OsStringExt;
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let first = store.seal(&text("first"), "").unwrap();
+        let legacy = seal_legacy_slot(&store, 0, &text("legacy"), "");
+        let id = &first.id;
+        let odd: Vec<std::ffi::OsString> = vec![
+            // As long as a name can be, with and without the ending of a
+            // segment; not UTF-8; and what no path component may hold.
+            "x".repeat(255).into(),
+            format!("{}.json", "9".repeat(250)).into(),
+            std::ffi::OsString::from_vec(b"\xff\xfe.json".to_vec()),
+            "back\\slash.json".into(),
+            "new\nline.json".into(),
+            // Nearly a shelf, a slot, a segment, and a temporary file.
+            "s00001".into(),
+            "s0000001".into(),
+            "S000001".into(),
+            "s000001.json".into(),
+            "0.json".into(),
+            "128.json".into(),
+            "0000.json".into(),
+            format!("{}.json", &id[1..]).into(),
+            format!("{}.json", id.to_uppercase()).into(),
+            format!("{id}.json.tmp").into(),
+            format!("{id}.JSON").into(),
+            format!(".{id}.json").into(),
+            ".json".into(),
+            "lock.json".into(),
+        ];
+        let mut strays = Vec::new();
+        for parent in [dir.clone(), dir.join("s000001")] {
+            for name in &odd {
+                // A filesystem may refuse some of these names.
+                let path = parent.join(name);
+                if std::fs::write(&path, b"stray").is_ok() {
+                    strays.push(path);
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(strays.len(), 2 * odd.len());
+        assert!(strays.len() >= 2 * 10);
+
+        let second = store.seal(&text("second"), "").unwrap();
+        assert!(dir.join("s000001").join(archive_name(&second.id)).is_file());
+        assert_eq!(store.seal(&text("first"), "").unwrap(), first);
+        assert_eq!(store.fetch(&first.id, 0, 1).unwrap(), text("first"));
+        assert_eq!(store.fetch(&legacy.id, 0, 1).unwrap(), text("legacy"));
+        let mut found: Vec<_> = store.search("", 32).unwrap().into_iter().map(|row| row.id).collect();
+        found.sort();
+        let mut expected = vec![first.id.clone(), second.id.clone(), legacy.id.clone()];
+        expected.sort();
+        assert_eq!(found, expected);
+        assert_eq!(store.export_records().unwrap().len(), 3);
+        store.forget(&second.id).unwrap();
+        assert_eq!(store.shelves().unwrap(), ["s000001"]);
+        for stray in strays {
+            assert_eq!(std::fs::read(&stray).unwrap(), b"stray", "{stray:?}");
+        }
     }
 }
 
