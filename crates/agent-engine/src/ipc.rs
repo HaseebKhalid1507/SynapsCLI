@@ -211,8 +211,11 @@ mod imp {
     /// case-insensitive) — the daemon's run dir is canonical while a
     /// caller's may not be.
     pub fn pipe_name(path: &Path) -> String {
+        pipe_name_of_key(&endpoint_key(path))
+    }
+
+    fn pipe_name_of_key(key: &str) -> String {
         use sha2::{Digest, Sha256};
-        let key = endpoint_key(path);
         let digest = Sha256::digest(key.as_bytes());
         let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
         format!(r"\\.\pipe\synaps-daemon-{hex}")
@@ -224,7 +227,14 @@ mod imp {
             (Some(dir), Some(name)) => dir.canonicalize().map(|d| d.join(name)).unwrap_or_else(|_| abs.clone()),
             _ => abs,
         };
-        let s = resolved.to_string_lossy().replace('/', "\\");
+        normalize_key(&resolved.to_string_lossy())
+    }
+
+    /// The spelling rules of [`endpoint_key`] once the file system has
+    /// resolved the path: `\` separators, no `\\?\` (`\\?\UNC\` → `\\`),
+    /// lowercase.
+    fn normalize_key(resolved: &str) -> String {
+        let s = resolved.replace('/', "\\");
         let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
             format!(r"\\{rest}")
         } else if let Some(rest) = s.strip_prefix(r"\\?\") {
@@ -595,6 +605,42 @@ mod imp {
             let mut b = [0u8; 1];
             server.read_exact(&mut b).await.unwrap();
             assert_eq!(client_impersonation_level(&server).unwrap(), SecurityIdentification);
+        }
+    }
+
+    /// Third-party clients derive these names (the pipe has no other
+    /// discovery), so they are a contract: a change here breaks them.
+    #[cfg(test)]
+    mod golden_tests {
+        use super::*;
+
+        const DAEMON: &str = r"\\.\pipe\synaps-daemon-149c48c0c65b7de4dce27f2e01cf19eb";
+
+        #[test]
+        fn daemon_pipe_names_match_the_published_vectors() {
+            for spelling in [
+                r"C:\Users\Me\.synaps-cli\run\daemon.sock",
+                "c:/users/me/.synaps-cli/run/DAEMON.sock",
+                r"\\?\C:\Users\Me\.synaps-cli\run\daemon.sock",
+            ] {
+                assert_eq!(pipe_name(Path::new(spelling)), DAEMON, "{spelling}");
+            }
+            assert_eq!(
+                pipe_name(Path::new(r"C:\Users\Me\.synaps-cli\run\daemon-work.sock")),
+                r"\\.\pipe\synaps-daemon-1738620a231da3350250d3e8e0d36581"
+            );
+            assert_eq!(
+                pipe_name(Path::new("C:\\Users\\\u{c9}LODIE\\.synaps-cli\\run\\daemon.sock")),
+                r"\\.\pipe\synaps-daemon-a14db3bda4b8487626a820b0bf42be30"
+            );
+        }
+
+        /// UNC through the pure half: `canonicalize` on a UNC dir would go to the network.
+        #[test]
+        fn a_unc_endpoint_is_keyed_without_the_verbatim_prefix() {
+            let key = normalize_key(r"\\?\UNC\server\share\run\daemon.sock");
+            assert_eq!(key, r"\\server\share\run\daemon.sock");
+            assert_eq!(pipe_name_of_key(&key), r"\\.\pipe\synaps-daemon-89cd23ff91040f8e924ae5f009e8945c");
         }
     }
 }
