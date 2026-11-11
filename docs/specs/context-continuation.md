@@ -222,9 +222,9 @@ history retained", so the rollover failed, the turn ended, and the same window
 failed again on every later attempt.
 
 With the file store (`memory.backend = legacy`) such a window is now sealed as
-several consecutive archives, "parts". The window is halved until each part is
-within the limits, which are unchanged; every part is an ordinary archive,
-fetched by its own id. Together the parts hold each archivable message of the
+several consecutive archives, "parts". The store cuts the window so that each
+part is within the limits, which are unchanged; every part is an ordinary
+archive, fetched by its own id. Together the parts hold each archivable message of the
 window once, in order. The working note is stored with the last part. A window
 within the limits is one archive, and everything about it is as before: the
 same archive, the same continuation message, the same marker, the same hook
@@ -251,13 +251,18 @@ out), marks a part that holds a reduced message, and says how to read the
 indices:
 
 ```text
-Earlier eligible source evidence, in source order: ctx-<id A> (source messages #0-#2499, 2431 archived), ctx-<id B> (#2500-#2500, 1 archived, 1 reduced), ctx-<id C> (#2501-#4999, 2402 archived), available via memory_search(source=history) and memory_fetch if a specific needed fact is missing; within each archive memory_fetch's source_index starts again at 0, so add the first number of its range. 1 message was too large for one archive and is stored with its oversized payloads omitted, each marked in place.
+Earlier eligible source evidence, in source order: ctx-<id A> (source messages #0-#2499, 2431 archived), ctx-<id B> (#2500-#2500, 1 archived, 1 reduced), ctx-<id C> (#2501-#4999, 2402 archived), available via memory_search(source=history) and memory_fetch if a specific needed fact is missing; within each archive memory_fetch's source_index starts again at 0: source message #i is the row whose source_index is i minus the first number of its range, and since start counts archived messages it is at that start or a lower one. 1 message was too large for one archive and is stored with its oversized payloads omitted, each marked in place.
 ```
 
 - `memory_fetch(ids=["ctx-<id>"], start, limit)` works on each part by itself;
   `start` counts that part's stored messages from 0.
 - A `#i` in the list of dropped requests is an index in the window. The part
   whose range contains `i` holds that message, as `source_index = i - first`.
+  That is not the `start` to fetch it with: `start` counts stored messages,
+  and a part stores no more messages than it covers, so the row is at
+  `start = i - first` only when nothing before it in the part was left out,
+  and otherwise at a lower `start`. The message says so, because a model
+  that passes `i - first` as `start` reads a later message or none.
 - Two parts with identical content are one archive, listed once per range.
 - At most 32 parts are listed by id, always the last ones, which hold the
   newest messages. Earlier parts are counted with the range they cover (`5
@@ -341,9 +346,21 @@ for more than five seconds, a cancelled turn), the rollover fails with the
 history kept, exactly as a failed single seal does: no new window, no marker,
 no hook event, so a partial window is never recorded or announced as a whole
 one. The parts already written stay on disk as ordinary archives that no chat
-refers to; they are searchable and are not cleaned up. The cut is the same
-every time, so the next attempt finds those parts by id, writes only the
-missing ones, and continues with the same list.
+refers to; they are searchable and are not cleaned up. The next attempt seals
+the window as it then is. A part whose content is already on disk is found
+there and not written again, so an attempt on the same window writes only what
+is missing and returns the list the first one would have returned. After a
+failed turn the window has usually grown, by the user's message at least: the
+new attempt's parts need not be the earlier ones, and whichever of those it
+does not come to again stay on disk unreferenced. Only the list of the attempt
+that completes is recorded and announced.
+
+Extensions are told of a window's archives (`on_context_archived`, one event
+per part) only when the rollover is committed: every part is on disk, the new
+head is saved and acknowledged, and the engine has moved to it. A rollover
+given up before that announces nothing. If the process dies after the save and
+before the events are sent, the saved head names archives no extension was
+told of, and nothing sends the events later.
 
 Cancellation before head publication preserves active history. An already-running
 atomic archive write can finish after cancellation, leaving an unreferenced
@@ -417,7 +434,10 @@ per archive. A full shelf is followed by a new one. The store has no limit on
 how many archives a project holds or on their total size, and sealing never
 deletes, moves or replaces an older archive: only `memory_forget` rewrites a
 file, the one it names, and a forgotten archive keeps its place as a tombstone.
-An archive's id is the first 32 hex characters of its digest, so fetching one
+An archive's id is 32 hex characters, one half of its digest: the first half,
+or the second when something else already has the first as its name. Nothing
+may work an id out from a digest or the other way round; the id an archive has
+is the one its seal returned, and that is the name of its file. Fetching by id
 opens one file and never scans the store.
 
 A directory written by an earlier version keeps its `000.json` to `127.json`

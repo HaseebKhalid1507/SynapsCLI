@@ -53,7 +53,10 @@ All notable changes to this project will be documented in this file.
   the project, the message counts and the chat's `session_id` and `cwd`, so
   an extension that indexes history can keep up. It is notify-only: the host
   never waits for the handler, and a slow, hung, crashed or absent extension
-  cannot delay, fail or change a rollover. Best effort and unordered; one
+  cannot delay, fail or change a rollover. The events are sent once the
+  rollover is committed: every archive of the window is on disk and the new
+  window is saved. A rollover that is given up before that announces
+  nothing. Best effort and unordered; one
   archive can be announced more than once. Plain-file memory backend only.
   Additive: existing extensions are unaffected, and an extension that names
   the hook does not load on an older Synaps. A window sealed as several
@@ -103,13 +106,18 @@ All notable changes to this project will be documented in this file.
   covers and the number of messages stored, for example `ctx-<id> (source
   messages #0-#2499, 2431 archived), ctx-<id> (#2500-#4999, 2402 archived)`,
   and `memory_fetch` works on each part by its id; inside a part
-  `source_index` starts again at 0. A single message that is too large for
+  `source_index` starts again at 0, and the message says how to find source
+  message `#i` there. A single message that is too large for
   one archive by itself is stored with its oversized payloads left out,
   each marked in place, and the new window says so: the one case where an
-  archive is not exact. Up to 32 parts are listed by id (the newest); earlier
-  ones are counted with their range and found with `memory_search`. If sealing stops between two parts the
+  archive is not exact. Up to 32 parts are listed by id (the newest), and
+  fewer when naming them all would put the new window over the request
+  budget; the other
+  ones are counted with their range and found with `memory_search`. A list
+  of parts that is not the whole window, in order, fails the rollover with
+  the history kept. If sealing stops between two parts the
   rollover fails with the history kept, as before, and the next attempt
-  reuses the parts already written. A window that fits one archive is
+  does not write again a part whose content is already on disk. A window that fits one archive is
   unchanged: the same archive, the same message, the same saved session.
   The limits on one archive are unchanged, and `memory.backend = axel` still
   fails on an oversized window. See `docs/specs/context-continuation.md`.
