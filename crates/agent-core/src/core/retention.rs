@@ -1039,7 +1039,9 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
                 io::Error::other("invalid memory id: use \"<namespace>:<record-id>\"")
             })?;
             let namespace = sanitize_file_id(namespace)?;
-            if record_id.is_empty() || !record_id.starts_with("mem-") {
+            // The store's own check of an id, not the shape of the ids it
+            // makes: an imported note's id need not start with `mem-`.
+            if !crate::memory::store::valid_import_id(record_id) {
                 return Err(io::Error::other(format!(
                     "invalid memory record id: {record_id:?}"
                 )));
@@ -1551,6 +1553,36 @@ mod tests {
         };
         assert_eq!(sweep_at(&roots, &budget, now).unwrap().memory_records_dropped, 1);
         assert_eq!(ids(&path), ["mem-standard-newer"]);
+    }
+
+    /// `retention forget memory` takes any id the store would take, not only
+    /// one that starts with `mem-`: an imported note keeps the id it came
+    /// with. The match is still exact, and an id the store would not take is
+    /// still turned away before the file is read.
+    #[test]
+    fn a_note_with_an_imported_id_can_be_forgotten_from_the_command_line() {
+        let tmp = TempDir::new().unwrap();
+        let roots = roots(&tmp);
+        for id in ["note:2024/a", "note:2024/ab", "mem-x"] {
+            save(&roots, "ns", id, 5);
+        }
+        let path = notes_file(&roots, "ns");
+        forget(&roots, RetentionDomain::Memory, "ns:note:2024/a").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("tombstone").count(), 1);
+        assert!(text.contains(r#""tombstone":"note:2024/a""#));
+        let again = forget(&roots, RetentionDomain::Memory, "ns:note:2024/a").unwrap_err();
+        assert!(again.to_string().contains("not present as a live record"), "{again}");
+        let part = forget(&roots, RetentionDomain::Memory, "ns:note:2024").unwrap_err();
+        assert!(part.to_string().contains("not present as a live record"), "{part}");
+
+        let before = fs::read(&path).unwrap();
+        let long = format!("ns:{}", "i".repeat(129));
+        for bad in ["ns:", "ns:has space", "ns:tab\there", long.as_str()] {
+            let error = forget(&roots, RetentionDomain::Memory, bad).unwrap_err();
+            assert!(error.to_string().starts_with("invalid memory record id"), "{error}");
+        }
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     /// The lock file sits in `memory/` beside the notes file and is not one:

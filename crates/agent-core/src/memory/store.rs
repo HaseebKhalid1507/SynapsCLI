@@ -13,8 +13,9 @@ pub struct MemoryRecord {
     pub timestamp_ms: u64,
     /// Free-form text content.
     pub content: String,
-    /// Optional tag list (e.g. ["@user", "preference"]).
-    #[serde(default)]
+    /// Optional tag list (e.g. ["@user", "preference"]). Absent and `null`
+    /// both read as no tags.
+    #[serde(default, deserialize_with = "null_as_no_tags")]
     pub tags: Vec<String>,
     /// Optional structured metadata. Validated as JSON on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36,6 +37,11 @@ pub struct MemoryRecord {
     /// Retention class (consumed by the unified retention sweep).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<MemoryRetention>,
+}
+
+/// `"tags": null` says what an absent `tags` says.
+fn null_as_no_tags<'de, D: serde::Deserializer<'de>>(reader: D) -> Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(reader)?.unwrap_or_default())
 }
 
 /// Provenance of a memory record (spec §9.5).
@@ -1417,8 +1423,11 @@ fn import_tombstone(
     })
 }
 
-/// 1 to 128 bytes, no whitespace, no control characters.
-fn valid_import_id(id: &str) -> bool {
+/// The store's check of a record id that did not come from the store itself
+/// (an imported line, `retention forget memory`): 1 to 128 bytes, no
+/// whitespace, no control characters. An id the store makes is `mem-` and a
+/// UUID; an imported one need not look like that.
+pub(crate) fn valid_import_id(id: &str) -> bool {
     (1..=128).contains(&id.len()) && !id.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
@@ -1480,9 +1489,17 @@ fn parse_import_line(line: &str) -> Result<ImportLine, String> {
     Ok(ImportLine::Note(Box::new(note)))
 }
 
+/// The reason for a top-level key a line may not have. A key's name is text
+/// from the line like any value, so it is shown only when it looks like a
+/// field name (`[a-z_]{1,32}`), and not at all otherwise.
 fn unknown_field(name: &str) -> String {
-    let shown: String = name.chars().take(64).collect();
-    format!("unknown field {}", shown.escape_debug())
+    let plain = (1..=32).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    if plain {
+        format!("unknown field {name}")
+    } else {
+        "unknown field".to_string()
+    }
 }
 
 /// Why serde did not read a line, without quoting the line. Its "missing
@@ -2578,6 +2595,7 @@ mod tests {
         };
         let long_id = format!(r#""id":"{}""#, "i".repeat(129));
         let big = format!(r#""content":"{}""#, "c".repeat(MAX_CONTENT_BYTES + 1));
+        let long_key = format!(r#"{{"{}":1,"content""#, "secret".repeat(6));
         let wrong_value = "not a note: wrong value at column ";
         let cases: Vec<(String, &str)> = vec![
             // A time is never made up.
@@ -2586,6 +2604,17 @@ mod tests {
             // Nothing is dropped: not a field, not a part of one, not a
             // second copy of one.
             (with(r#"{"content""#, r#"{"extra":1,"content""#), "unknown field extra"),
+            // A key is text from the line too: one that does not look like a
+            // field name is not shown.
+            (with(r#"{"content""#, r#"{"secret words":1,"content""#), "unknown field"),
+            (with(r#"{"content""#, r#"{"Secret":1,"content""#), "unknown field"),
+            (with(r#"{"content""#, r#"{"secret-token-1234":1,"content""#), "unknown field"),
+            (with(r#"{"content""#, &long_key), "unknown field"),
+            (with(r#"{"content""#, r#"{"":1,"content""#), "unknown field"),
+            (
+                r#"{"tombstone":"mem-x","timestamp_ms":1,"secret words":2}"#.to_string(),
+                "unknown field",
+            ),
             (
                 with(r#""source":"model""#, r#""source":"model","host":"x""#),
                 "provenance holds something a note cannot keep",
@@ -2633,7 +2662,8 @@ mod tests {
                 *expected,
                 "{line:.70}"
             );
-            assert!(!reason.contains("secret"), "a reason quotes nothing: {reason}");
+            let quoted = reason.to_lowercase().contains("secret");
+            assert!(!quoted, "a reason quotes nothing: {reason}");
         }
         assert!(!memory_dir_in(base).exists(), "a refused line writes nothing");
 
@@ -2793,7 +2823,7 @@ mod tests {
         let scope = project_scope(&tmp);
         let key = scope.key();
         let line = format!(
-            r#"{{"namespace":"project-{key}","timestamp_ms":7,"content":"c","id":"mem-n","project":"{key}","meta":null,"provenance":{{"source":"model","session":null}}}}"#
+            r#"{{"namespace":"project-{key}","timestamp_ms":7,"content":"c","id":"mem-n","project":"{key}","tags":null,"meta":null,"provenance":{{"source":"model","session":null}}}}"#
         );
         let mut run = ImportRun::new(false);
         assert_eq!(
@@ -2803,6 +2833,17 @@ mod tests {
         let stored = fetch_exact_in(tmp.path(), &scope, &["mem-n"]).unwrap().remove(0);
         assert_eq!(stored, serde_json::from_str::<MemoryRecord>(&line).unwrap());
         assert_eq!(stored.timestamp_ms, 7);
+        assert!(stored.tags.is_empty(), "`\"tags\": null` is no tags");
+        // Absent tags as well, and tags that are not a list are still refused.
+        let absent = line.replace(r#""tags":null,"#, "").replace("mem-n", "mem-o");
+        assert_eq!(
+            import(tmp.path(), &absent, ImportTarget::AsRecorded, &mut run).outcome,
+            ImportOutcome::Stored
+        );
+        let wrong = line.replace(r#""tags":null"#, r#""tags":"one""#).replace("mem-n", "mem-p");
+        assert!(refusal(&import(tmp.path(), &wrong, ImportTarget::AsRecorded, &mut run))
+            .starts_with("not a note: wrong value at column "));
+        run.finish().unwrap();
     }
 
     /// Private-mode tests (spec §5.4). Umask isolation: see

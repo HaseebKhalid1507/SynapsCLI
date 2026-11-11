@@ -45,7 +45,7 @@ pub enum RetentionAction {
         /// sessions | memory | history (Axel) | memory-index | traces | logs
         domain: String,
         /// Axel memory/history: exact ID (optional exact project namespace prefix
-        /// for notes). Legacy memory: namespace:mem-id.
+        /// for notes). Legacy memory: namespace:record-id (the id as it is in the file).
         id: String,
     },
     /// Report verified repository/worktree identity metadata without opening memory.

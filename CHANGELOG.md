@@ -359,6 +359,13 @@ All notable changes to this project will be documented in this file.
   tools now say that it was written and tell the model to search before
   saving again. An extension's `memory.append` gets the same distinct
   message ("written, but not confirmed on disk").
+- **`synaps retention forget memory <ns>:<id>` takes any record id.** It
+  refused an id that did not start with `mem-`, so a note that was imported
+  with another kind of id could not be forgotten from the command line. It
+  now takes any id of 1 to 128 bytes without whitespace or control
+  characters, and still matches it exactly.
+- **Notes: a line with `"tags": null` is read as a note with no tags.** The
+  plain-file store skipped such a line.
 - **Notes: a saved note is on disk before `memory_store` says it is saved.**
   With the plain-file memory backend a note was written to
   `memory/project-<key>.jsonl` but not synced, so a crash or a power cut
