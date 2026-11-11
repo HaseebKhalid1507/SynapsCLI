@@ -805,8 +805,8 @@ fn a_note_tombstone_that_is_not_applied_is_counted_named_and_exits_1() {
     ];
     let file = env.file("notes.jsonl", &input);
 
-    // As recorded the tombstone line names no project and this run has not
-    // seen its id: refused, and so is the note it forgot.
+    // As recorded the tombstone line names no project and no project's
+    // notes hold its id: refused, and so is the note it forgot.
     let before = env.listing();
     let dry = env.run(&["import-notes", &file, "--as-recorded", "--dry-run"]);
     assert_eq!(env.listing(), before);
@@ -825,7 +825,7 @@ fn a_note_tombstone_that_is_not_applied_is_counted_named_and_exits_1() {
     assert_eq!(
         records[0],
         json!({"input": 0, "line": 1, "id": "mem-gone", "outcome": "refused", "tombstone": true,
-               "reason": "a tombstone line names no project and this run has not seen its id; \
+               "reason": "a tombstone line names no project and no project's notes hold its id; \
                           pass --cwd or --project-key"})
     );
     assert_eq!(records[1]["reason"], "its tombstone in this run could not be filed");
@@ -844,6 +844,84 @@ fn a_note_tombstone_that_is_not_applied_is_counted_named_and_exits_1() {
     assert_eq!(real.totals(), [3, 2, 0, 0, 1, 0]);
     assert_eq!(real.doc["tombstones_not_applied"]["count"], 0);
     assert!(real.stderr.is_empty(), "{}", real.stderr);
+}
+
+/// core-a5-review finding 1: the note is live on disk from an earlier
+/// command, in a file no earlier line of this command has named.
+#[test]
+fn a_note_tombstone_as_recorded_finds_the_note_an_earlier_command_stored() {
+    const NOT_APPLIED: &str = "a tombstone line names no project and no project's notes hold \
+                               its id; pass --cwd or --project-key";
+    let notes_of = |env: &Env, key: &str| {
+        let path = env.base().join("memory").join(format!("project-{key}.jsonl"));
+        std::fs::read_to_string(path).unwrap_or_default()
+    };
+
+    let env = Env::new();
+    let notes = env.file(
+        "notes.jsonl",
+        &[note("mem-a", KEY, "one"), note("mem-b", SOURCE_KEY, "two")],
+    );
+    let run = env.run(&["import-notes", &notes, "--as-recorded"]);
+    assert_eq!((run.code, run.totals()), (0, [2, 2, 0, 0, 0, 0]), "{}", run.stderr);
+
+    // The tombstone is the first line of its command. A note for another
+    // project follows it; a tombstone of an id no file holds ends it.
+    let later = env.file(
+        "later.jsonl",
+        &[note_tombstone("mem-a"), note("mem-c", SOURCE_KEY, "three"), note_tombstone("mem-zz")],
+    );
+    let before = env.listing();
+    let dry = env.run(&["import-notes", &later, "--as-recorded", "--dry-run"]);
+    assert_eq!(env.listing(), before, "a dry run wrote something");
+    let real = env.run(&["import-notes", &later, "--as-recorded"]);
+    assert_eq!((dry.code, real.code), (1, 1), "{}{}", real.stdout, real.stderr);
+    assert_eq!(real.totals(), [3, 1, 0, 1, 0, 1]);
+    assert_eq!(dry.totals(), real.totals());
+    assert_eq!(dry.doc["records"], real.doc["records"]);
+    assert_eq!(dry.doc["projects"], real.doc["projects"]);
+    assert_eq!(dry.doc["tombstones_not_applied"], real.doc["tombstones_not_applied"]);
+    assert_eq!(
+        real.doc["records"][0],
+        json!({"input": 0, "line": 1, "id": "mem-a", "outcome": "forgotten", "tombstone": true})
+    );
+    assert_eq!(real.doc["records"][2]["reason"], NOT_APPLIED);
+    assert_eq!(real.doc["tombstones_not_applied"], json!({"count": 1, "ids": ["mem-zz"]}));
+    assert_eq!(real.doc["projects"][0]["project_key"], KEY);
+    assert_eq!(notes_of(&env, KEY).lines().last(), Some(note_tombstone("mem-a").as_str()));
+    assert!(!notes_of(&env, SOURCE_KEY).contains("tombstone"));
+    // The note stays forgotten, and the tombstone is there already.
+    let again = env.run(&["import-notes", &notes, &later, "--as-recorded"]);
+    assert_eq!(again.totals(), [5, 0, 3, 0, 1, 1], "{}", again.stdout);
+
+    // The other order over two commands: the tombstone first, into a base
+    // that holds its id nowhere. It is refused and named, exit code 1; no
+    // notes file is made. Nothing of that outlives the command, so the note
+    // is stored by the next one. The tombstone's file again then forgets
+    // it: the two commands settle, in either order, when both are run again.
+    let env = Env::new();
+    let tombstones = env.file("tombstones.jsonl", &[note_tombstone("mem-a")]);
+    let notes = env.file("notes.jsonl", &[note("mem-a", KEY, "one")]);
+    let first = env.run(&["import-notes", &tombstones, "--as-recorded"]);
+    assert_eq!((first.code, first.totals()), (1, [1, 0, 0, 0, 0, 1]), "{}", first.stderr);
+    assert_eq!(first.doc["tombstones_not_applied"], json!({"count": 1, "ids": ["mem-a"]}));
+    assert_eq!(first.doc["records"][0]["reason"], NOT_APPLIED);
+    assert!(first.stderr.contains("mem-a"), "{}", first.stderr);
+    assert_eq!(notes_of(&env, KEY), "");
+    let second = env.run(&["import-notes", &notes, "--as-recorded"]);
+    assert_eq!((second.code, second.totals()), (0, [1, 1, 0, 0, 0, 0]), "{}", second.stderr);
+
+    let before = env.listing();
+    let dry = env.run(&["import-notes", &tombstones, "--as-recorded", "--dry-run"]);
+    assert_eq!(env.listing(), before, "a dry run wrote something");
+    let first = env.run(&["import-notes", &tombstones, "--as-recorded"]);
+    assert_eq!((first.code, first.totals()), (0, [1, 0, 0, 1, 0, 0]), "{}", first.stderr);
+    assert_eq!((dry.code, dry.totals()), (first.code, first.totals()));
+    assert_eq!(dry.doc["records"], first.doc["records"]);
+    assert_eq!(first.doc["tombstones_not_applied"]["count"], 0);
+    let second = env.run(&["import-notes", &notes, "--as-recorded"]);
+    assert_eq!((second.code, second.totals()), (0, [1, 0, 0, 0, 1, 0]), "{}", second.stderr);
+    assert_eq!(notes_of(&env, KEY).lines().count(), 2);
 }
 
 #[test]

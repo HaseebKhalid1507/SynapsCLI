@@ -28,7 +28,9 @@ All notable changes to this project will be documented in this file.
   real run prints. A real `import-notes` holds `memory/.import.lock` for the
   whole run and a second one stops with "another import is running"; a
   note tombstone that could not be applied is counted and named
-  (`tombstones_not_applied`). `synaps memory project [--cwd DIR]` prints a
+  (`tombstones_not_applied`); under `--as-recorded` its id is looked for in
+  every project's notes file under the base before it is refused, so a note
+  that an earlier command stored is forgotten. `synaps memory project [--cwd DIR]` prints a
   folder's project key, archive directory and notes file, and whether
   `SYNAPS_PROJECT_ROOT` is overriding the folder; it creates nothing. The
   command never reads `memory.backend` and sends no hook. New in the store:
