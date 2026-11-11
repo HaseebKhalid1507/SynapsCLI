@@ -858,6 +858,10 @@ impl Record {
     }
 }
 
+/// How far after this machine's clock the `created_ms` of an imported
+/// record may be: one day.
+const CREATED_AHEAD_MS: u64 = 24 * 60 * 60 * 1000;
+
 /// What [`ArchiveStore::import`] did with one record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportOutcome {
@@ -2266,6 +2270,14 @@ impl ArchiveStore {
                 return refuse(error.to_string(), id);
             }
             if let Some(created_ms) = record.created_ms {
+                // A time that has not come is no time of an archive. Its
+                // file would be the newest on its shelf in every search,
+                // for good. A day allows for another machine's clock.
+                let now = Written::now().created_ms.unwrap_or(0);
+                if created_ms > now.saturating_add(CREATED_AHEAD_MS) {
+                    let reason = "created_ms is more than a day after this machine's clock";
+                    return refuse(reason.to_owned(), id);
+                }
                 let time = std::time::UNIX_EPOCH.checked_add(Duration::from_millis(created_ms));
                 let Some(time) = time else {
                     return refuse("created_ms is not a time a file can have".to_owned(), id);
@@ -4217,10 +4229,10 @@ impl PrivateDir {
     }
     /// [`publish`](Self::publish) that can also give the file a time of last
     /// access and modification, for a record that was first written
-    /// somewhere else. The time is set on the temporary file, through its
-    /// own descriptor, before it is synced and renamed: the file appears
-    /// under its name with that time, and the time is on disk with the
-    /// content. No directory's time is ever set.
+    /// somewhere else. The time is set after the rename, through the
+    /// descriptor the file was written by, and synced: a temporary file
+    /// always has the time of its write. A reader in between sees the whole
+    /// record with the time of the write. No directory's time is ever set.
     fn publish_dated(
         &self,
         name: &str,
@@ -4235,10 +4247,6 @@ impl PrivateDir {
         let mut file = self.open(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
         let result = (|| {
             file.write_all(bytes)?;
-            if let Some(time) = modified {
-                let times = std::fs::FileTimes::new().set_accessed(time).set_modified(time);
-                file.set_times(times)?;
-            }
             file.sync_all()?;
             if create_new {
                 self.rename_new(&tmp, &target)?;
@@ -4250,6 +4258,22 @@ impl PrivateDir {
                     Err(error) => return Err(error),
                 }
                 self.rename(&tmp, &target)?;
+            }
+            if let Some(time) = modified {
+                // The time goes on the file once it has its name, through
+                // the descriptor it was written by: a temporary file never
+                // has an old time, so the sweep of stale ones (which goes
+                // by their time) cannot take one that is being written.
+                // Stopped between the rename and here, the record is stored
+                // whole with the time of the write: it reads the same, and
+                // sorts on its shelf as written now.
+                #[cfg(test)]
+                if let Some(error) = fault("date", &target) {
+                    return Err(error);
+                }
+                let times = std::fs::FileTimes::new().set_accessed(time).set_modified(time);
+                file.set_times(times)?;
+                file.sync_all()?;
             }
             self.sync()
         })();
@@ -10063,6 +10087,64 @@ mod tests {
         }
         let done = store.forget(&sealed.id).unwrap();
         assert_eq!((done.ids, done.unread), (vec![sealed.id.clone()], None));
+    }
+
+    /// A `created_ms` more than a day after the clock is refused, and
+    /// nothing is written; one within the day is stored.
+    #[test]
+    fn a_created_ms_that_has_not_come_is_refused() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let hour = 60 * 60 * 1000;
+        let at = |ahead_ms: u64| {
+            record_bytes(&store, &random_id(), &text("dated ahead"), |record| {
+                record.created_ms = Some(now_ms() + ahead_ms);
+            })
+        };
+        for line in [at(25 * hour), at(u64::MAX / 2), at(366 * 24 * hour)] {
+            let refused = import(&store, &line).unwrap_err();
+            assert_eq!(refused.reason, "created_ms is more than a day after this machine's clock");
+            let mut seen = ImportSeen::default();
+            let dry = store.import(&line, false, true, &mut seen).unwrap().unwrap_err();
+            assert_eq!(dry, refused);
+        }
+        assert_eq!(shelf_files(&dir), Vec::<PathBuf>::new());
+        assert_eq!(import(&store, &at(23 * hour)).unwrap().outcome, ImportOutcome::Stored);
+    }
+
+    /// The old time goes on the file after it has its name. A write stopped
+    /// between the two leaves the whole record under its id with the time
+    /// of the write and no temporary file: nothing dated old was ever under
+    /// a temporary name. The next run finds it there.
+    #[test]
+    fn an_imported_file_gets_its_old_time_after_its_name() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let id = random_id();
+        let line = record_bytes(&store, &id, &text("dated after the rename"), |record| {
+            record.created_ms = Some(1_600_000_000_000);
+        });
+        let started = std::time::SystemTime::now() - Duration::from_secs(5);
+        let stopping = Fault::on("date", &id, libc::EIO);
+        let stopped = store.import(&line, false, false, &mut ImportSeen::default());
+        assert_eq!(stopped.expect_err("stopped").raw_os_error(), Some(libc::EIO));
+        drop(stopping);
+        let file = dir.join("s000001").join(archive_name(&id));
+        assert_eq!(shelf_files(&dir), std::slice::from_ref(&file));
+        assert_eq!(entries(&dir.join("s000001")), [archive_name(&id)]);
+        assert!(std::fs::metadata(&file).unwrap().modified().unwrap() >= started);
+        assert_eq!(std::fs::read(&file).unwrap(), line);
+        assert_eq!(store.fetch(&id, 0, 1).unwrap(), text("dated after the rename"));
+        let again = import(&store, &line).unwrap();
+        assert_eq!(again.outcome, ImportOutcome::Present { note_differs: false });
+        // Not stopped, the file has the record's time.
+        let other = random_id();
+        let line = record_bytes(&store, &other, &text("dated and not stopped"), |record| {
+            record.created_ms = Some(1_600_000_000_000);
+        });
+        assert_eq!(import(&store, &line).unwrap().outcome, ImportOutcome::Stored);
+        let file = dir.join("s000001").join(archive_name(&other));
+        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), at_ms(1_600_000_000_000));
     }
 }
 

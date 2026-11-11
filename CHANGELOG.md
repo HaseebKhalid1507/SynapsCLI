@@ -374,6 +374,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context archives: an import refuses a `created_ms` that has not come,
+  and dates the file after it has its name.** A record dated more than a
+  day after this machine's clock is refused (`created_ms is more than a day
+  after this machine's clock`): its file would have been the newest on its
+  shelf in every search, for good. And the record's old time was put on the
+  temporary file before the rename, where a sweep of stale temporary files
+  by another writer could take it for a leftover. It is now set on the file
+  once it is under its id, and synced. A write stopped between the two
+  leaves the whole record with the time of the write.
 - **Context archives: forget is not "complete" over a copy it failed to
   read.** When a forget read the other archive files of a project for the
   window's digest, any file it could not read was passed over in silence.
