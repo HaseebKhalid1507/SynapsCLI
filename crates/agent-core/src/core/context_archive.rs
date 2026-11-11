@@ -67,9 +67,7 @@
 //! over a shelf or a legacy slot, the error says so instead of "not found".
 //! Neither is failed by a damaged neighbour: a segment that can be read is
 //! found whatever the shelf or slot next to it is, and a search passes over
-//! a legacy slot it cannot read as it passes over a corrupt shelf file. Only
-//! the migration export reads the legacy slots as a whole and fails as a
-//! whole.
+//! a legacy slot it cannot read as it passes over a corrupt shelf file.
 //!
 //! One segment is limited to 4096 messages, 16 MiB of eligible
 //! strings/structure, 65536 visited nodes and depth 32 on input (excluded
@@ -78,9 +76,7 @@
 //! <=32 with <=256-byte snippets. Search reads newest first, one file in
 //! memory at a time, and stops once it has read 1024 files or 256 MiB
 //! ([`ArchiveStore::search_scan`] says when that left older segments unread).
-//! The migration export carries at most 128 segments / 256 MiB and refuses a
-//! larger store. Budget exhaustion and corruption fail closed, never silently
-//! truncate seal.
+//! Budget exhaustion and corruption fail closed, never silently truncate seal.
 //!
 //! Seal and forget hold an advisory lock on the project directory. Fetch and
 //! search read shelf files without it: a file is published by renaming a
@@ -164,15 +160,13 @@ pub const SHELF_FILES: usize = 128;
 /// so the store gets here after 128 million segments; a directory named with
 /// a higher number was not made by the store and is not a shelf.
 const LAST_SHELF: u64 = 999_999;
-/// The number of legacy slots, and the most segments a migration export carries.
+/// The number of legacy slots.
 pub const MAX_SEGMENTS: usize = SHELF_FILES;
 pub const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
 /// A search stops once it has read this many segment files...
 pub const SEARCH_SCAN_FILES: usize = 1024;
 /// ...or this many bytes, whichever comes first.
 pub const SEARCH_SCAN_BYTES: usize = 256 * 1024 * 1024;
-/// The most bytes the legacy slots hold, and a migration export carries.
-pub const MAX_STORE_BYTES: usize = SEARCH_SCAN_BYTES;
 pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_MESSAGES: usize = 4096;
 pub const MAX_NOTE_BYTES: usize = 8192;
@@ -211,7 +205,6 @@ const WITHHELD: &str = "[archive: withheld]";
 /// another project: the three are not told apart.
 pub const NOT_FOUND: &str = "archive not available in this scope";
 const BUSY: &str = "archive busy; retain source and retry";
-const BUSY_EXPORT: &str = "archive busy; retry export";
 
 /// Host-owned sanitizer, never supplied by model input. Must not expand output
 /// beyond the archive budgets. Tool arguments are passed as serialized JSON;
@@ -498,7 +491,7 @@ struct Gate {
 
 /// Field order is drop order: unlock the file, then admit the next operation.
 struct Locked {
-    file: Option<FlockGuard>,
+    _file: Option<FlockGuard>,
     _gate: GateGuard,
 }
 
@@ -1167,7 +1160,7 @@ impl ArchiveStore {
             },
         )?
         .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, BUSY))?;
-        Ok(Locked { file, _gate: gate })
+        Ok(Locked { _file: file, _gate: gate })
     }
 
     /// `Interrupted` once the caller has abandoned this operation.
@@ -2061,76 +2054,6 @@ impl ArchiveStore {
         }
     }
 
-    /// Migration-only export of validated eligible evidence and permanent
-    /// tombstones. Includes hidden notes: this is HOST data, never a model tool.
-    /// No files, directories, permissions or archive contents are changed.
-    /// Legacy slots first, then shelves oldest to newest. A migration carries
-    /// at most [`MAX_SEGMENTS`] segments / [`MAX_STORE_BYTES`]; a larger store
-    /// is refused whole rather than exported in part.
-    ///
-    /// One projection can be in several files (under each half of its
-    /// digest, under one id on two shelves, in a slot and on a shelf). The
-    /// export carries it once: the first record read, or the tombstone if
-    /// any copy is one, because a forgotten projection must not come out of
-    /// a migration live. The ids of the other copies are not carried. Two
-    /// records with one id and different content are still an error: only
-    /// one of them could go under that id.
-    ///
-    /// Unlike a search, an export stays strict about what it cannot read: a
-    /// shelf name that is not a directory that can be opened, a link or a
-    /// FIFO where a segment belongs and a file that is not a valid record
-    /// each fail it whole. Its caller takes the rows for everything the
-    /// project holds and moves the project by them; rows that silently
-    /// lacked a shelf would leave that history behind with nothing to say
-    /// so.
-    pub fn export_records(&self) -> io::Result<Vec<Value>> {
-        let gate = self.enter(BUSY_EXPORT)?;
-        let lock = Locked {
-            file: self.fs.lock_existing().map_err(|error| self.lock_error(error))?,
-            _gate: gate,
-        };
-        let (mut records, mut used) = self.scan_legacy(true)?;
-        for shelf in self.shelves()?.iter().rev() {
-            let Some(dir) = self.fs.open_child(shelf, true)? else {
-                continue;
-            };
-            let mut names: Vec<_> = dir.names()?.into_iter().map(|(name, ..)| name).collect();
-            names.retain(|name| archive_id(name).is_some());
-            names.sort_unstable();
-            for name in names {
-                let Some(raw) = dir.read_with(&name, MAX_SEGMENT_BYTES, true)? else {
-                    continue;
-                };
-                used += raw.len();
-                if used > MAX_STORE_BYTES {
-                    return Err(over_migration_limit());
-                }
-                carry(&mut records, self.record(&name, &raw)?)?;
-            }
-        }
-        if lock.file.is_none() && !records.is_empty() {
-            return Err(corrupt());
-        }
-        Ok(records
-            .into_iter()
-            .map(|record| {
-                let (source_message_count, messages, note, tombstone) = match record.body {
-                    Body::Live {
-                        source_message_count,
-                        messages,
-                        note,
-                    } => (source_message_count, messages, note, false),
-                    Body::Tombstone => (0, Vec::new(), String::new(), true),
-                };
-                json!({
-                    "id": record.id, "digest": record.digest, "logical_id": record.logical,
-                    "source_message_count": source_message_count, "messages": messages,
-                    "note": note, "tombstone": tombstone,
-                })
-            })
-            .collect())
-    }
-
     /// Open the project directory named `scope` (64 lowercase hex
     /// characters, what a record's `scope` is), for an import. Creates what
     /// is missing and makes it private, as [`new`](Self::new) does. The
@@ -2854,9 +2777,8 @@ impl ArchiveStore {
 
     /// The legacy slot that holds the projection `digest`, live or forgotten:
     /// what a seal asks of the slots. A seal writes to none of them, so it
-    /// must not fail because of one. Unlike [`scan_legacy`](Self::scan_legacy),
-    /// which the export still uses and which fails as a whole, this passes
-    /// over a slot that cannot be read (a link, a FIFO, a file
+    /// must not fail because of one. It passes over a slot that cannot be
+    /// read (a link, a FIFO, a file
     /// that is not ours alone or is over the size of a segment, an I/O error)
     /// or that is not a valid record of this scope. Only an error that will
     /// pass ([`PrivateDir::passing`]) fails the seal. A slot passed over is
@@ -2897,48 +2819,6 @@ impl ArchiveStore {
         }
         Ok(None)
     }
-
-    /// Every legacy slot, read and validated together as before shelves
-    /// existed: at most [`MAX_SEGMENTS`] files / [`MAX_STORE_BYTES`]. Only
-    /// the migration export reads them this way; one bad slot fails it.
-    /// What it returns is what a migration carries of them ([`carry`]).
-    fn scan_legacy(&self, readonly: bool) -> io::Result<(Vec<Record>, usize)> {
-        let mut records = Vec::new();
-        let mut used = 0;
-        for slot in 0..MAX_SEGMENTS {
-            let name = slot_name(slot);
-            let Some(raw) = self.fs.read_with(&name, MAX_STORE_BYTES - used, readonly)? else {
-                continue;
-            };
-            used += raw.len();
-            carry(&mut records, self.record(&name, &raw)?)?;
-        }
-        Ok((records, used))
-    }
-}
-
-fn over_migration_limit() -> io::Error {
-    invalid("archive store exceeds the migration limit (128 archives / 256 MiB)")
-}
-
-/// Add `record` to what a migration carries. Another copy of a projection
-/// that is already there is not added: one is kept, the tombstone if either
-/// is one. Two records with one id and different content are an error.
-fn carry(records: &mut Vec<Record>, record: Record) -> io::Result<()> {
-    if records.iter().any(|r| r.id == record.id && r.digest != record.digest) {
-        return Err(corrupt());
-    }
-    if let Some(kept) = records.iter_mut().find(|r| r.digest == record.digest) {
-        if matches!(kept.body, Body::Live { .. }) && matches!(record.body, Body::Tombstone) {
-            *kept = record;
-        }
-        return Ok(());
-    }
-    if records.len() == MAX_SEGMENTS {
-        return Err(over_migration_limit());
-    }
-    records.push(record);
-    Ok(())
 }
 
 /// The search row of a live record that matches `query` (already lowercased).
@@ -3239,16 +3119,6 @@ impl Projector {
 /// The conversation name of a store that is opened only to read a project:
 /// a read finds the segments of every conversation in it.
 const READER: &str = "project-reader";
-
-/// Read-only migration preview for an existing project archive. A missing
-/// archive is empty; corrupt, unsafe or locked paths fail closed. In particular,
-/// this never invokes `ArchiveStore::new`, mkdir, chmod, or lock-file creation.
-pub fn export_in(base: &Path, scope_key: &str) -> io::Result<Vec<Value>> {
-    match ArchiveStore::open_existing(base, scope_key, READER)? {
-        Some(store) => store.export_records(),
-        None => Ok(Vec::new()),
-    }
-}
 
 /// Absolute path of the file holding segment `id`, or `None`. Opens nothing
 /// for writing, creates nothing and takes no lock (files are published by
@@ -4217,7 +4087,7 @@ impl PrivateDir {
             return Ok(None);
         };
         if !fs4::fs_std::FileExt::try_lock_shared(&file)? {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, BUSY_EXPORT));
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, BUSY));
         }
         Ok(Some(FlockGuard(file)))
     }
@@ -4987,176 +4857,6 @@ mod tests {
     }
 
     #[test]
-    fn export_preview_is_read_only_and_matches_projection_including_tombstones() {
-        use std::os::unix::fs::MetadataExt;
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(export_in(&tmp.path().join("missing"), "synthetic-project")
-            .unwrap()
-            .is_empty());
-        assert!(export_in(tmp.path(), "synthetic-project")
-            .unwrap()
-            .is_empty());
-        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
-        let store =
-            ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-logical").unwrap();
-        let dir = directory(&tmp, &store);
-        // Even a newly opened empty store has no lock until its first operation.
-        assert!(export_in(tmp.path(), "synthetic-project")
-            .unwrap()
-            .is_empty());
-        assert!(!dir.join("lock").exists());
-        let messages = vec![msg("user", json!("migration evidence"))];
-        let reference = store.seal(&messages, "hidden note").unwrap();
-        let projection =
-            project_archive("synthetic-logical", &messages, "hidden note", None).unwrap();
-        let tombstone = store
-            .seal(&[msg("assistant", json!("remove me"))], "remove note")
-            .unwrap();
-        store.forget(&tombstone.id).unwrap();
-        let mut paths = vec![
-            tmp.path().to_path_buf(),
-            tmp.path().join("context-archives"),
-            dir.clone(),
-        ];
-        paths.extend(std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()));
-        paths.extend(shelf_files(&dir));
-        assert_eq!(paths.len(), 7, "lock, one shelf and its two segments");
-        // Export must not silently repair permissions, unlike normal archive IO.
-        for path in &paths {
-            let mode = if path.is_dir() { 0o750 } else { 0o640 };
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-        }
-        let snapshot = || {
-            paths
-                .iter()
-                .map(|p| {
-                    let m = std::fs::metadata(p).unwrap();
-                    (
-                        m.mode(),
-                        m.mtime(),
-                        m.mtime_nsec(),
-                        if m.is_file() {
-                            std::fs::read(p).unwrap()
-                        } else {
-                            vec![]
-                        },
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let before = snapshot();
-        let rows = export_in(tmp.path(), "synthetic-project").unwrap();
-        assert_eq!(rows, store.export_records().unwrap());
-        assert_eq!(before, snapshot());
-        assert_eq!(rows.len(), 2);
-        let row = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap();
-        assert_eq!(
-            row(&reference.id),
-            &json!({"id":reference.id,"digest":projection.digest,"logical_id":projection.logical_id,
-            "source_message_count":1,"messages":projection.messages,"note":"hidden note","tombstone":false})
-        );
-        let forgotten = row(&tombstone.id);
-        assert_eq!(forgotten["tombstone"], true);
-        assert_eq!(forgotten["source_message_count"], 0);
-        assert_eq!(forgotten["messages"], json!([]));
-        assert_eq!(forgotten["note"], "");
-        let lock = store.fs.lock().unwrap();
-        assert_eq!(
-            export_in(tmp.path(), "synthetic-project")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::WouldBlock
-        );
-        drop(lock);
-        std::fs::write(&shelf_files(&dir)[0], b"corrupt").unwrap();
-        assert!(export_in(tmp.path(), "synthetic-project").is_err());
-    }
-
-    /// The store can hold one window in more than one file. The export
-    /// carries it once, and as forgotten if any copy is.
-    #[test]
-    fn export_carries_a_window_stored_twice_once_and_forgotten_if_any_copy_is() {
-        let (tmp, store) = setup();
-        let dir = directory(&tmp, &store);
-        let (older, newer) = (dir.join("s000001"), dir.join("s000002"));
-        let twice = store.seal(&text("one id on two shelves"), "").unwrap();
-        let halves = store.seal(&text("under both halves"), "the note").unwrap();
-        let alone = store.seal(&text("stored once"), "").unwrap();
-        std::fs::create_dir(&newer).unwrap();
-        let name = archive_name(&twice.id);
-        std::fs::copy(older.join(&name), newer.join(&name)).unwrap();
-        let digest = digest_of("under both halves");
-        assert_eq!(halves.id, digest[..32]);
-        let second = record_bytes(&store, &digest[32..], &text("under both halves"), |_| {});
-        std::fs::write(newer.join(archive_name(&digest[32..])), second).unwrap();
-        let exported = || {
-            let rows = store.export_records().unwrap();
-            assert_eq!(rows, export_in(tmp.path(), "synthetic-project").unwrap());
-            let mut rows: Vec<_> = rows
-                .iter()
-                .map(|row| (row["id"].as_str().unwrap().to_owned(), row["tombstone"] == true))
-                .collect();
-            rows.sort();
-            rows
-        };
-        let sorted = |rows: [(&str, bool); 3]| {
-            let mut rows = rows.map(|(id, gone)| (id.to_owned(), gone)).to_vec();
-            rows.sort();
-            rows
-        };
-        // The copy read first is the one carried: the oldest shelf's.
-        let (twice_id, alone_id) = (twice.id.as_str(), alone.id.as_str());
-        let live = sorted([(twice_id, false), (halves.id.as_str(), false), (alone_id, false)]);
-        assert_eq!(exported(), live);
-        let rows = store.export_records().unwrap();
-        let row = rows.iter().find(|row| row["id"] == halves.id.as_str()).unwrap();
-        assert_eq!(row["note"], "the note");
-        // A tombstone in any copy, whichever file it is, makes it forgotten.
-        let tombstone = |file: &Path| {
-            let mut record = json_of(file);
-            record["body"] = json!({"state":"tombstone"});
-            record.as_object_mut().unwrap().remove("created_ms");
-            std::fs::write(file, serde_json::to_vec(&record).unwrap()).unwrap();
-        };
-        tombstone(&newer.join(&name));
-        tombstone(&newer.join(archive_name(&digest[32..])));
-        let forgotten = sorted([(twice_id, true), (&digest[32..], true), (alone_id, false)]);
-        assert_eq!(exported(), forgotten);
-        // Two records with one id and different content are not one window
-        // stored twice: only one of them could go under that id.
-        let name = archive_name(&alone.id);
-        let other = record_bytes(&store, &alone.id, &text("other content"), |_| {});
-        std::fs::write(newer.join(&name), other).unwrap();
-        let error = store.export_records().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn export_preview_refuses_links_and_never_creates_a_missing_lock() {
-        let (tmp, store) = setup();
-        let dir = directory(&tmp, &store);
-        let r = store
-            .seal(&[msg("user", json!("evidence"))], "note")
-            .unwrap();
-        let path = only_archive_file(&dir);
-        let bytes = std::fs::read(&path).unwrap();
-        std::fs::remove_file(dir.join("lock")).unwrap();
-        assert!(export_in(tmp.path(), "synthetic-project").is_err());
-        assert!(!dir.join("lock").exists());
-        // The normal API may recreate its lock, but preview cannot.
-        assert!(store.fetch(&r.id, 0, 1).is_ok());
-        std::fs::remove_file(&path).unwrap();
-        let outside = tmp.path().join("outside");
-        std::fs::write(&outside, &bytes).unwrap();
-        symlink(&outside, &path).unwrap();
-        assert!(export_in(tmp.path(), "synthetic-project").is_err());
-        std::fs::remove_file(&path).unwrap();
-        std::fs::hard_link(&outside, &path).unwrap();
-        assert!(export_in(tmp.path(), "synthetic-project").is_err());
-        assert_eq!(std::fs::read(&outside).unwrap(), bytes);
-    }
-
-    #[test]
     fn attachments_remain_outside_eligible_memory_archive() {
         let (tmp, store) = setup();
         let messages = vec![msg(
@@ -5311,7 +5011,6 @@ mod tests {
                 io::ErrorKind::InvalidData
             );
             assert!(foreign.search("", 1).unwrap().is_empty());
-            assert!(foreign.export_records().is_err());
             std::fs::remove_file(&target).unwrap();
         }
         assert!(ArchiveStore::new(&tmp.path().join("../escape"), "p", "l").is_err());
@@ -5549,7 +5248,6 @@ mod tests {
             let other = store.seal(&text("private"), "").unwrap();
             assert_ne!(other.id, reference.id);
             assert_eq!(store.fetch(&other.id, 0, 1).unwrap(), text("private"));
-            assert!(store.export_records().is_err());
             assert!(archive_file(tmp.path(), "synthetic-project", &reference.id).is_err());
             assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not change");
             assert_eq!(mode(&victim), 0o644);
@@ -5583,7 +5281,6 @@ mod tests {
         let works = |words: &str| {
             let sealed = store.seal(&text(words), "").unwrap();
             assert_eq!(store.forget(&sealed.id).unwrap(), forgotten(&[&sealed.id]));
-            assert!(export_in(tmp.path(), "synthetic-project").is_ok(), "{words}");
             // And it still excludes: a save by another store is busy while
             // the lock is held, and goes through once it is not.
             let held = store.fs.lock().unwrap();
@@ -5629,7 +5326,6 @@ mod tests {
             let errors = [
                 store.seal(&text("refused"), "").unwrap_err(),
                 store.forget(&sealed.id).unwrap_err(),
-                export_in(tmp.path(), "synthetic-project").unwrap_err(),
             ];
             for error in errors {
                 assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{what}: {error}");
@@ -5783,10 +5479,6 @@ mod tests {
             let before = stamps(tmp.path());
             assert_eq!(before.len(), if lock { 10 } else { 9 }, "4 directories, 5 files, lock");
             read_everything(tmp.path(), &live, &gone, 2);
-            // The export wants the lock file a seal leaves, and does not
-            // make one.
-            let exported = export_in(tmp.path(), "synthetic-project");
-            assert_eq!(exported.map(|rows| rows.len()).ok(), lock.then_some(4));
             assert_eq!(stamps(tmp.path()), before, "lock file: {lock}");
 
             // And where nothing could be written at all.
@@ -5824,7 +5516,6 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::NotFound);
             assert_eq!(error.to_string(), NOT_FOUND);
             assert_eq!(archive_file(base, project, &id).unwrap(), None);
-            assert!(export_in(base, project).unwrap().is_empty());
         };
         absent(&tmp.path().join("missing"), "synthetic-project");
         absent(tmp.path(), "synthetic-project");
@@ -5885,7 +5576,6 @@ mod tests {
             // store on a base that now exists.
             assert_eq!(project_fetch(base, "synthetic-project", &sealed.id, 0, 1).unwrap(), text(words));
             assert_eq!(project_search(base, "synthetic-project", "through", 8).unwrap().len(), 1);
-            assert_eq!(export_in(base, "synthetic-project").unwrap().len(), 1);
             let located = archive_file(base, "synthetic-project", &sealed.id).unwrap().unwrap();
             assert_eq!(std::fs::canonicalize(located).unwrap(), file);
             let again = setup_in(base, "synthetic-project");
@@ -5961,8 +5651,7 @@ mod tests {
         };
         // A segment that is found nowhere is not called "not found" while
         // there is a shelf name that could not be looked into. A search
-        // answers from the other shelves and names this one; an export,
-        // which has to carry every shelf, fails on it.
+        // answers from the other shelves and names this one.
         let refused = |id: &str| {
             unread(store.fetch(id, 0, 1).map(drop));
             unread(store.fetch_note(id).map(drop));
@@ -5971,8 +5660,6 @@ mod tests {
             let (_, unscanned) = store.search_scan("", MAX_SEARCH_RESULTS).unwrap();
             let passed = unscanned.unwrap().unread.unwrap();
             assert!(passed.starts_with("1 place(s) could not be read, first s000001: "), "{passed}");
-            assert!(store.export_records().is_err());
-            assert!(export_in(tmp.path(), "synthetic-project").is_err());
         };
         symlink(&outside, &shelf).unwrap();
         refused(&reference.id);
@@ -6093,7 +5780,6 @@ mod tests {
         let second = seal(1);
         assert!(dir.join("s000001").join(archive_name(&second.id)).is_file());
         assert_eq!(store.search("", 8).unwrap().len(), 2);
-        assert_eq!(store.export_records().unwrap().len(), 2);
         let after = snapshot(&dir);
         assert!(before.iter().all(|(path, file)| after.get(path) == Some(file)));
         assert_eq!(after.len(), before.len() + 1);
@@ -7048,7 +6734,7 @@ mod tests {
             .collect();
         let files = shelf_files(&directory(&tmp, &store));
         let stored: u64 = files.iter().map(|f| f.metadata().unwrap().len()).sum();
-        assert!(stored > MAX_STORE_BYTES as u64 + MAX_SEGMENT_BYTES as u64);
+        assert!(stored > SEARCH_SCAN_BYTES as u64 + MAX_SEGMENT_BYTES as u64);
         for (index, id) in ids.iter().enumerate() {
             let fetched = store.fetch(id, 0, 1).unwrap();
             let content = fetched[0]["content"].as_str().unwrap();
@@ -7061,9 +6747,6 @@ mod tests {
         assert_eq!(stopped, Some(Unscanned { stopped_after: Some(17), unread: None }));
         let (rows, stopped) = store.search_scan("archive-17", 1).unwrap();
         assert_eq!((rows[0].id.as_str(), stopped), (ids[17].as_str(), None));
-        // A migration cannot carry it, and says so instead of exporting a part.
-        let error = store.export_records().unwrap_err();
-        assert!(error.to_string().contains("exceeds the migration limit"));
     }
 
     #[test]
@@ -7116,8 +6799,6 @@ mod tests {
         assert_eq!(std::fs::read(&slots[1]).unwrap(), kept);
         assert!(slots.iter().all(|slot| slot.is_file()));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 5);
-        // A forgotten window is carried once, though it has two tombstones.
-        assert_eq!(store.export_records().unwrap().len(), 4);
     }
 
     #[test]
@@ -7523,31 +7204,6 @@ mod tests {
         assert_eq!(store.search("", 8).unwrap().len(), 3);
     }
 
-    /// Legacy slots go by the same rule as shelves in an export: a window in
-    /// two of them is carried once, forgotten if either says so, and two
-    /// records with one id and different content are an error.
-    #[test]
-    fn export_carries_a_window_in_two_legacy_slots_once() {
-        let (tmp, store) = setup();
-        let dir = directory(&tmp, &store);
-        let slot = seal_legacy_slot(&store, 0, &text("in two slots"), "");
-        std::fs::copy(dir.join("000.json"), dir.join("001.json")).unwrap();
-        let rows = store.export_records().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!((&rows[0]["id"], &rows[0]["tombstone"]), (&json!(slot.id), &json!(false)));
-        let live = std::fs::read_to_string(dir.join("000.json")).unwrap();
-        let body = &live[live.find("\"body\":").unwrap()..];
-        let tombstone = live.replace(body, "\"body\":{\"state\":\"tombstone\"}}");
-        std::fs::write(dir.join("001.json"), tombstone).unwrap();
-        let rows = store.export_records().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!((&rows[0]["id"], &rows[0]["tombstone"]), (&json!(slot.id), &json!(true)));
-        let other = record_bytes(&store, &slot.id, &text("other content"), |_| {});
-        std::fs::write(dir.join("002.json"), other).unwrap();
-        let error = store.export_records().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
     #[test]
     fn file_name_must_match_record_id() {
         let (tmp, store) = setup();
@@ -7617,7 +7273,6 @@ mod tests {
         written_ago(&fresh[1], STALE_TEMP - minute);
         // No reader sees any of them, before or after.
         assert_eq!(store.search("", 10).unwrap().len(), 1);
-        assert_eq!(store.export_records().unwrap().len(), 1);
         assert_eq!(temporary_files(&dir).len(), 4);
         let next = store.seal(&text("after the crash"), "").unwrap();
         assert!(empty.join(archive_name(&next.id)).is_file());
@@ -7630,7 +7285,6 @@ mod tests {
         assert_eq!(store.fetch(&first.id, 0, 1).unwrap(), text("before the crash"));
         assert_eq!(store.fetch(&next.id, 0, 1).unwrap(), text("after the crash"));
         assert_eq!(store.search("", 10).unwrap().len(), 2);
-        assert_eq!(store.export_records().unwrap().len(), 2);
         // A forget writes beside them too, and leaves nothing of its own.
         store.forget(&next.id).unwrap();
         assert_eq!(temporary_files(&dir).len(), 2);
@@ -7772,37 +7426,6 @@ mod tests {
         shelf.publish(&name, b"tombstone", false).unwrap();
         assert_ne!(identity(&path), written);
         assert_eq!(std::fs::read(&path).unwrap(), b"tombstone");
-    }
-
-    #[test]
-    fn export_fails_closed_above_migration_limit() {
-        let (tmp, store) = setup();
-        // Legacy slots and shelves count together.
-        let mut ids: Vec<_> = (0..100)
-            .map(|slot| seal_legacy_slot(&store, slot, &text(&format!("legacy {slot}")), "").id)
-            .collect();
-        let seal = |index: usize| store.seal(&text(&format!("archive {index}")), "").unwrap().id;
-        ids.extend((100..MAX_SEGMENTS).map(seal));
-        let rows = export_in(tmp.path(), "synthetic-project").unwrap();
-        assert_eq!(rows, store.export_records().unwrap());
-        let exported: Vec<_> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
-        assert_eq!(exported.len(), MAX_SEGMENTS);
-        assert!(ids.iter().all(|id| exported.contains(&id.as_str())));
-        assert_eq!(exported[..100], ids[..100], "legacy slots first, in slot order");
-        seal(MAX_SEGMENTS);
-        for error in [
-            export_in(tmp.path(), "synthetic-project").unwrap_err(),
-            store.export_records().unwrap_err(),
-        ] {
-            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-            assert_eq!(
-                error.to_string(),
-                "archive store exceeds the migration limit (128 archives / 256 MiB)"
-            );
-        }
-        // Only the export is limited.
-        assert_eq!(store.fetch(&ids[0], 0, 1).unwrap(), text("legacy 0"));
-        assert!(store.seal(&text("and one more"), "").is_ok());
     }
 
     #[test]
@@ -8818,8 +8441,7 @@ mod tests {
     /// With slot 1 unusable a seal works, and still finds what the slots on
     /// either side of it hold. So does a read of the segment in slot 0. A
     /// read of a segment that is found nowhere says that slot 1 could not be
-    /// read (and how: `kind`), since it may be the one. Only the export,
-    /// which reads the legacy slots as a whole, fails as it always did.
+    /// read (and how: `kind`), since it may be the one.
     fn assert_slot_1_is_passed_over(
         tmp: &tempfile::TempDir,
         store: &ArchiveStore,
@@ -8855,8 +8477,6 @@ mod tests {
             assert!(error.to_string().contains("first 001.json"), "{words}: {error}");
             assert!(error.to_string().contains("could not be read"), "{words}: {error}");
         }
-        assert!(store.export_records().is_err(), "{words}");
-        assert!(export_in(tmp.path(), "synthetic-project").is_err(), "{words}");
     }
     /// A forget of the healthy segment in slot 0 works beside slot 1 too.
     /// It replaces slot 0, adds the tombstone a seal looks for on the shelf
@@ -9117,7 +8737,6 @@ mod tests {
         let mut expected = vec![first.id.clone(), second.id.clone(), legacy.id.clone()];
         expected.sort();
         assert_eq!(found, expected);
-        assert_eq!(store.export_records().unwrap().len(), 3);
         store.forget(&second.id).unwrap();
         assert_eq!(store.shelves().unwrap(), ["s000001"]);
         for stray in strays {
@@ -10255,7 +9874,6 @@ mod tests {
         assert!(project_search(&base, "synthetic-project", "", 8).is_err());
         let fetched = project_fetch(&base, "synthetic-project", &sealed.id, 0, 1).unwrap_err();
         assert_ne!(fetched.kind(), io::ErrorKind::NotFound);
-        assert!(export_in(&base, "synthetic-project").is_err());
         assert!(archive_file(&base, "synthetic-project", &sealed.id).is_err());
         // Back again, it reads.
         std::fs::rename(root.join("unmounted"), &disk).unwrap();
@@ -10264,7 +9882,6 @@ mod tests {
         for missing in [root.join("no-base"), root.join("no-folder/base")] {
             assert!(ArchiveStore::open_existing(&missing, "synthetic-project", "l").unwrap().is_none());
             assert!(project_search(&missing, "synthetic-project", "", 8).unwrap().is_empty());
-            assert!(export_in(&missing, "synthetic-project").unwrap().is_empty());
         }
     }
 }
@@ -10451,7 +10068,15 @@ mod lock_tests {
             result.unwrap();
         }
         let store = ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-reader").unwrap();
-        assert_eq!(store.export_records().unwrap().len(), workers * 8);
+        // Every seal is on a shelf.
+        let dir = tmp.path().join("context-archives").join(&store.scope);
+        let segments: usize = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .map(|shelf| std::fs::read_dir(shelf).unwrap().count())
+            .sum();
+        assert_eq!(segments, workers * 8);
     }
 
     /// A separate open file description is what another process holds. With
@@ -10477,7 +10102,6 @@ mod lock_tests {
         assert!(started.elapsed() < PROCESS_LOCK_WAIT);
         drop(foreign);
         assert_eq!(store.fetch(&reference.id, 0, 1).unwrap().len(), 1);
-        assert_eq!(store.export_records().unwrap().len(), 1);
     }
 
     fn other(tmp: &tempfile::TempDir) -> ArchiveStore {
@@ -10540,7 +10164,6 @@ mod lock_tests {
         let error = waiter.join().unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         drop(held);
-        assert!(store.export_records().unwrap().is_empty());
         assert!(store.search("", 1).unwrap().is_empty());
     }
 

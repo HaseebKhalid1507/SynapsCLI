@@ -1,7 +1,6 @@
 # Context continuation follow-up: Axel compatibility boundary
 
-Historical audit; implementation has since landed in the worktree. See
-[unified backend](../specs/axel-host-backend.md) for current behavior.
+Historical audit; implementation has since landed in the worktree.
 
 Status at audit time: source audit during checkpoint resume from `c12d603e`; **not an
 implemented adapter or migration**. The stored checkpoint accurately identified

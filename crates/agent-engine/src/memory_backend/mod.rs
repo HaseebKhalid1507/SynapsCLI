@@ -14,10 +14,8 @@ use std::sync::Arc;
 mod competing;
 pub mod forum;
 mod history;
-pub mod migration;
 mod process;
 mod provisioning;
-pub mod repository_migration;
 
 pub fn competing_note_tool(name: &str) -> bool {
     matches!(
@@ -210,7 +208,7 @@ impl MemoryBinding {
             ..(*self.0).clone()
         }))
     }
-    /// Operator-only rebinding for exact verified source scopes during migration.
+    /// Operator-only rebinding for exact verified scopes (the retention export).
     /// Never expose an arbitrary project selector through model tools.
     pub fn with_scope(&self, scope: ProjectScope) -> Self {
         Self(Arc::new(Binding {
@@ -260,14 +258,9 @@ impl MemoryBinding {
         &self.0.base
     }
     /// Exact host-only RPC, never selected by model-authored paths or projects.
-    /// Operator migration/export calls use this same backend and transaction boundary.
+    /// Operator retention calls use this same backend and transaction boundary.
     pub async fn rpc(&self, operation: &str, payload: Value) -> Result<Value> {
         self.call(operation, payload).await
-    }
-    /// Atomically import an operator-approved source manifest into this one backend.
-    /// The migration module owns preview/consent/source validation before this call.
-    pub async fn migration_apply(&self, payload: Value) -> Result<Value> {
-        self.rpc("migration_apply", payload).await
     }
     /// Query feature availability without touching any legacy memory surface.
     pub async fn capabilities(&self) -> Result<Value> {

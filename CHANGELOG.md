@@ -316,6 +316,18 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **The files-to-Axel migration.** `synaps retention memory-scope`,
+  `synaps retention upgrade-memory` and `synaps retention migrate-memory`
+  are gone, with the code behind them (`memory_backend::migration`,
+  `memory_backend::repository_migration`) and the archive store's
+  migration export (`ArchiveStore::export_records`,
+  `context_archive::export_in`, `MAX_STORE_BYTES`). Typing one of them is
+  now clap's `error: unrecognized subcommand '<name>'`, exit code 2. The
+  way to move archives and notes into the plain-file stores is `synaps
+  memory import-archives | import-notes`. `synaps retention inspect |
+  sweep | export | forget` are unchanged, on plain files and with
+  `memory.backend = axel`. The specs `docs/specs/memory-migration.md`,
+  `shared-axel-repositories.md` and `axel-host-backend.md` are removed.
 - **The automatic-memory config keys and extension context providers.**
   The eleven keys `memory.default_mode`, `memory.default_mode_confirmed`,
   `memory.recall_max_records`, `memory.recall_max_tokens`,

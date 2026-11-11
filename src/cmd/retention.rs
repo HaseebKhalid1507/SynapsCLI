@@ -1,11 +1,11 @@
-//! Operator-only retention and explicit, reversible memory migration.
+//! Operator-only retention.
 //!
 //! Legacy mode retains the original all-domain behavior. In Axel mode inventory,
 //! sweep and export cover ONLY selected project memory/history; each response
 //! lists omitted legacy domains. Explicit session/trace/log forget remains legacy.
 //! No operator export (which can contain secret bodies) is exposed as a model tool.
 
-use agent_engine::memory_backend::{migration, repository_migration, MemoryBinding};
+use agent_engine::memory_backend::MemoryBinding;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -57,67 +57,6 @@ pub enum RetentionAction {
         /// for notes). Legacy memory: namespace:record-id (the id as it is in the file).
         id: String,
     },
-    /// Report verified repository/worktree identity metadata without opening memory.
-    MemoryScope {
-        /// Query service membership too (opens selected brain); default is identity only.
-        #[arg(long, conflicts_with_all = ["link", "apply", "dry_run"])]
-        service: bool,
-        /// Explicit original verified scope key to link; repeat per source. Preview only by default.
-        #[arg(long, action = clap::ArgAction::Append)]
-        link: Vec<String>,
-        #[arg(long, conflicts_with = "apply")]
-        dry_run: bool,
-        #[arg(long, requires_all = ["link", "manifest_digest", "project"])]
-        apply: bool,
-        #[arg(long, requires = "apply")]
-        manifest_digest: Option<String>,
-        /// Exact canonical repository key from identity report.
-        #[arg(long)]
-        project: Option<String>,
-    },
-    /// Preview explicit schema-marker upgrade of the existing configured pinned .r8.
-    /// Stop/checkpoint writers first. Never imports data, links aliases or changes config.
-    UpgradeMemory {
-        #[arg(long, conflicts_with = "apply")]
-        dry_run: bool,
-        #[arg(long, requires = "manifest_digest")]
-        apply: bool,
-        #[arg(long, requires = "apply")]
-        manifest_digest: Option<String>,
-        /// Exact original pinned project key (must be a verified repository scope).
-        #[arg(long)]
-        project: String,
-    },
-    /// Preview legacy -> shared Axel migration; apply needs the exact preview digest.
-    /// Never switches config, deletes sources or enables dual writes. Stop legacy
-    /// writers before preview/apply. Sources and hidden archive notes stay private.
-    MigrateMemory {
-        /// Explicit preview (also the default); no destination is opened.
-        #[arg(long, conflicts_with = "apply")]
-        dry_run: bool,
-        /// Apply separate bounded source transactions, then explicit alias links; may partially complete.
-        #[arg(long, requires_all = ["manifest_digest", "project"])]
-        apply: bool,
-        /// Exact lowercase SHA-256 printed by the current preview.
-        #[arg(long, requires = "apply")]
-        manifest_digest: Option<String>,
-        /// Exact canonical repository key, never a proj_ prefix conversion.
-        #[arg(long)]
-        project: Option<String>,
-        /// Explicit absolute legacy plugin brain, opened read-only by the service.
-        #[arg(long, conflicts_with = "source_export", requires_all = ["source_project", "target_project", "project"])]
-        source_brain: Option<PathBuf>,
-        /// Private full JSON inventory from an operator-selected read-only exporter.
-        #[arg(long, conflicts_with = "source_brain", requires_all = ["source_project", "target_project", "project"])]
-        source_export: Option<PathBuf>,
-        /// Exact authoritative source project alias; required for plugin import.
-        #[arg(long)]
-        source_project: Option<String>,
-        /// Explicit verified original host scope receiving this source (not canonical rewriting).
-        /// Native host exports: must equal --source-project; plugin aliases map per source.
-        #[arg(long)]
-        target_project: Option<String>,
-    },
 }
 
 pub fn run(action: RetentionAction) -> Result<()> {
@@ -125,13 +64,7 @@ pub fn run(action: RetentionAction) -> Result<()> {
     if config.kind == MemoryBackendKind::Unavailable {
         bail!("selected memory backend is unavailable; no legacy retention fallback");
     }
-    if !matches!(
-        action,
-        RetentionAction::MigrateMemory { .. }
-            | RetentionAction::MemoryScope { .. }
-            | RetentionAction::UpgradeMemory { .. }
-    ) && config.kind == MemoryBackendKind::Legacy
-    {
+    if config.kind == MemoryBackendKind::Legacy {
         return run_legacy(action, &RetentionRoots::resolve());
     }
     // main already owns a Tokio runtime. Do not nest block_on in that runtime;
@@ -142,172 +75,11 @@ pub fn run(action: RetentionAction) -> Result<()> {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?
-                    .block_on(run_selected(action, &config))
+                    .block_on(run_memory_action(action, &config))
             })
             .join()
             .map_err(|_| anyhow::anyhow!("retention operator worker failed"))?
     })
-}
-
-async fn run_selected(action: RetentionAction, config: &MemoryBackendConfig) -> Result<()> {
-    // Operator operations may prepare cutover while selection remains legacy.
-    // This temporary binding never persists config or changes runtime selection.
-    match action {
-        RetentionAction::MemoryScope {
-            service,
-            link,
-            apply,
-            manifest_digest,
-            project,
-            ..
-        } => {
-            let binding = operator_binding(config);
-            confirm_project(&binding, project.as_deref(), apply)?;
-            if service {
-                let info = repository_migration::scope_info(&binding).await?;
-                return print_json(
-                    &json!({"identity":repository_migration::report(&binding)?, "service":info}),
-                );
-            }
-            if link.is_empty() {
-                return print_json(&serde_json::to_value(repository_migration::report(
-                    &binding,
-                )?)?);
-            }
-            if apply {
-                return print_apply(
-                    &repository_migration::apply_link(
-                        &binding,
-                        &link,
-                        manifest_digest
-                            .as_deref()
-                            .context("apply requires preview digest")?,
-                    )
-                    .await?,
-                );
-            }
-            print_json(&serde_json::to_value(repository_migration::preview_link(
-                &binding, &link,
-            )?)?)
-        }
-        RetentionAction::UpgradeMemory {
-            apply,
-            manifest_digest,
-            project,
-            ..
-        } => {
-            let binding = operator_binding(config);
-            if apply {
-                let info = repository_migration::apply_upgrade(
-                    &binding,
-                    &project,
-                    manifest_digest
-                        .as_deref()
-                        .context("apply requires preview digest")?,
-                )
-                .await?;
-                return print_json(
-                    &json!({"upgraded":true,"service":info,"config_unchanged":true,
-                    "identities_unchanged":true,"aliases_linked":false,"data_imported":false}),
-                );
-            }
-            print_json(&serde_json::to_value(
-                repository_migration::preview_upgrade(&binding, &project)?,
-            )?)
-        }
-        RetentionAction::MigrateMemory {
-            apply,
-            manifest_digest,
-            project,
-            source_brain,
-            source_export,
-            source_project,
-            target_project,
-            ..
-        } => {
-            let binding = operator_binding(config);
-            confirm_project(&binding, project.as_deref(), apply)?;
-            let source = match (source_brain, source_export) {
-                (Some(path), None) => migration::MigrationSource::Brain {
-                    path,
-                    project: source_project.context("--source-project required")?,
-                },
-                (None, Some(path)) => migration::MigrationSource::Export {
-                    path,
-                    project: source_project.context("--source-project required")?,
-                },
-                (None, None) => {
-                    if source_project.is_some() || target_project.is_some() {
-                        bail!("source/target mapping requires an explicit --source-brain or --source-export");
-                    }
-                    migration::MigrationSource::Builtin
-                }
-                _ => bail!("choose exactly one external source"),
-            };
-            if matches!(source, migration::MigrationSource::Builtin) {
-                if apply {
-                    return print_apply(
-                        &repository_migration::apply_migration(
-                            &binding,
-                            manifest_digest
-                                .as_deref()
-                                .context("apply requires preview digest")?,
-                        )
-                        .await?,
-                    );
-                }
-                return print_json(&serde_json::to_value(
-                    repository_migration::preview_migration(&binding)?,
-                )?);
-            }
-            if project.is_none() {
-                bail!("external import requires explicit canonical --project");
-            }
-            let target = target_project
-                .context("external import requires per-source --target-project mapping")?;
-            if apply {
-                return print_apply(
-                    &repository_migration::apply_external(
-                        &binding,
-                        &source,
-                        &target,
-                        manifest_digest
-                            .as_deref()
-                            .context("apply requires preview digest")?,
-                    )
-                    .await?,
-                );
-            }
-            return print_json(&serde_json::to_value(
-                repository_migration::preview_external(&binding, &source, &target).await?,
-            )?);
-        }
-        action => return run_memory_action(action, config).await,
-    }
-}
-
-fn operator_binding(config: &MemoryBackendConfig) -> MemoryBinding {
-    let mut destination = config.clone();
-    destination.kind = MemoryBackendKind::Axel;
-    MemoryBinding::from_config(&destination)
-}
-fn confirm_project(binding: &MemoryBinding, project: Option<&str>, required: bool) -> Result<()> {
-    if (required && project.is_none())
-        || project.is_some_and(|p| p != binding.scope().map(|s| s.key()).unwrap_or(""))
-    {
-        bail!(
-            "--project must exactly match the canonical repository key {}",
-            binding.scope()?.key()
-        );
-    }
-    Ok(())
-}
-fn print_apply(report: &repository_migration::ApplyReport) -> Result<()> {
-    print_json(&serde_json::to_value(report)?)?;
-    if !report.complete {
-        bail!("operation incomplete; partial progress/unknown commit possible; reconcile the metadata report before retry");
-    }
-    Ok(())
 }
 
 async fn run_memory_action(action: RetentionAction, config: &MemoryBackendConfig) -> Result<()> {
@@ -356,7 +128,6 @@ async fn run_memory_action(action: RetentionAction, config: &MemoryBackendConfig
                 print_json(&json!({"backend":"legacy-files","domain":domain,"forgotten":true}))?;
             }
         },
-        RetentionAction::MigrateMemory { .. } | RetentionAction::MemoryScope { .. } | RetentionAction::UpgradeMemory { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -399,7 +170,7 @@ fn print_json(value: &Value) -> Result<()> {
 #[cfg(unix)]
 async fn export_members(binding: &MemoryBinding, dest: &Path) -> Result<Value> {
     use agent_core::{core::private_fs::ConfinedDir, memory::store::ProjectScope};
-    let info = repository_migration::scope_info(binding).await?;
+    let info = scope_info(binding).await?;
     let mut members = info.members.clone();
     members.sort();
     let names: Vec<_> = members
@@ -429,7 +200,7 @@ async fn export_members(binding: &MemoryBinding, dest: &Path) -> Result<Value> {
         let file = write_export_file(&root, name, &inventory)?;
         files.push(json!({"project":project,"file":name,"bytes":file.0,"sha256":file.1}));
     }
-    let after = repository_migration::scope_info(binding).await?;
+    let after = scope_info(binding).await?;
     let mut after_members = after.members;
     after_members.sort();
     if after_members != members
@@ -463,6 +234,48 @@ async fn export_members(_: &MemoryBinding, _: &Path) -> Result<Value> {
 // Only the Unix exporter writes files; elsewhere `export_members` refuses.
 #[cfg(unix)]
 const EXPORT_INDEX: &str = "axel-memory-index.json";
+/// The most one export file may hold: the service's one-transaction bound.
+#[cfg(unix)]
+const EXPORT_FILE_MAX_BYTES: usize = 24 * 1024 * 1024;
+
+/// The service's membership of the selected scope, as metadata only: never
+/// forward arbitrary service output to stdout.
+#[cfg(unix)]
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopeInfo {
+    canonical_project: String,
+    members: Vec<String>,
+    mode: String,
+    user_scope: bool,
+}
+#[cfg(unix)]
+async fn scope_info(binding: &MemoryBinding) -> Result<ScopeInfo> {
+    parse_scope_info(binding.rpc("scope_info", json!({})).await?, binding.scope()?.key())
+}
+#[cfg(unix)]
+fn parse_scope_info(value: Value, requested: &str) -> Result<ScopeInfo> {
+    let info: ScopeInfo = serde_json::from_value(value)
+        .map_err(|_| anyhow::anyhow!("invalid service scope metadata"))?;
+    if !matches!(info.mode.as_str(), "multi_project" | "pinned")
+        || info.user_scope
+        || info.members.len() > 4096
+        || !info.members.iter().all(|p| valid_project(p) && p != "p0000000000000000")
+        || info.members.iter().collect::<std::collections::BTreeSet<_>>().len()
+            != info.members.len()
+        || !info.members.iter().any(|p| p == requested)
+        || !info.members.contains(&info.canonical_project)
+    {
+        bail!("invalid service scope membership metadata");
+    }
+    Ok(info)
+}
+#[cfg(unix)]
+fn valid_project(s: &str) -> bool {
+    s.len() == 17
+        && s.starts_with('p')
+        && s[1..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 #[cfg(unix)]
 fn export_filename(project: &str, members: usize) -> String {
     if members == 1 {
@@ -505,7 +318,7 @@ fn write_export_file(
     use std::io::Write;
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
-    if bytes.len() > migration::MAX_APPLY_BYTES {
+    if bytes.len() > EXPORT_FILE_MAX_BYTES {
         bail!("Axel export file exceeds the 24 MiB bound; no final backup index written");
     }
     let mut file = root.create_file(name)?;
@@ -582,9 +395,6 @@ fn run_legacy(action: RetentionAction, roots: &RetentionRoots) -> Result<()> {
             retention::forget(roots, domain, &id)?;
             print_json(&json!({"domain":domain,"forgotten":true}))?;
         }
-        RetentionAction::MigrateMemory { .. }
-        | RetentionAction::MemoryScope { .. }
-        | RetentionAction::UpgradeMemory { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -598,25 +408,12 @@ mod tests {
         action: RetentionAction,
     }
     #[test]
-    fn migration_defaults_to_preview_and_apply_requires_digest_and_project() {
+    fn the_removed_migration_actions_are_unknown_subcommands() {
         use clap::Parser;
-        assert!(matches!(
-            Cli::try_parse_from(["retention", "migrate-memory"])
-                .unwrap()
-                .action,
-            RetentionAction::MigrateMemory { apply: false, .. }
-        ));
-        assert!(Cli::try_parse_from(["retention", "migrate-memory", "--apply"]).is_err());
-        assert!(
-            Cli::try_parse_from(["retention", "migrate-memory", "--dry-run", "--apply"]).is_err()
-        );
-        assert!(Cli::try_parse_from([
-            "retention",
-            "migrate-memory",
-            "--source-brain",
-            "/tmp/source.r8"
-        ])
-        .is_err());
+        for removed in ["memory-scope", "upgrade-memory", "migrate-memory"] {
+            let error = Cli::try_parse_from(["retention", removed]).err().expect(removed);
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand, "{removed}");
+        }
     }
     #[test]
     fn exact_scope_prefix_never_converted() {
