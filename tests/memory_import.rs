@@ -24,6 +24,8 @@ const MARKER: &str = "ZEBRA-CONTENT-7731";
 const SOURCE_KEY: &str = "p1111111111111111";
 /// A project a run files them under.
 const KEY: &str = "p0cc924a8dff92368";
+/// A third project.
+const THIRD_KEY: &str = "p2222222222222222";
 const TOTALS: [&str; 6] = [
     "read",
     "stored",
@@ -171,19 +173,30 @@ fn finish(mut command: Command, stdin: Option<&[u8]>) -> Out {
     }
 }
 
+/// Window `n` of `tag`, sealed in `store`: its id. The same `tag` and `n`
+/// are the same content, in whatever store.
+fn seal(store: &ArchiveStore, tag: &str, n: usize) -> String {
+    let messages = [
+        Arc::new(json!({"role": "user", "content": format!("{MARKER} {tag} question {n}")})),
+        Arc::new(json!({"role": "assistant", "content": format!("{MARKER} {tag} answer {n}")})),
+    ];
+    store.seal(&messages, &format!("{MARKER} note {n}")).unwrap().id
+}
+
 /// `count` archive records, as lines, sealed by the store itself in a base
 /// of their own, with their ids. `tag` keeps two calls apart.
 fn sealed(tag: &str, count: usize) -> Vec<(String, String)> {
+    sealed_in(SOURCE_KEY, tag, count)
+}
+
+/// The same, sealed in the project `key`.
+fn sealed_in(key: &str, tag: &str, count: usize) -> Vec<(String, String)> {
     let source = tempfile::tempdir().unwrap();
-    let store = ArchiveStore::new(source.path(), SOURCE_KEY, "made-up-chat").unwrap();
+    let store = ArchiveStore::new(source.path(), key, "made-up-chat").unwrap();
     (0..count)
         .map(|n| {
-            let messages = [
-                Arc::new(json!({"role": "user", "content": format!("{MARKER} {tag} question {n}")})),
-                Arc::new(json!({"role": "assistant", "content": format!("{MARKER} {tag} answer {n}")})),
-            ];
-            let id = store.seal(&messages, &format!("{MARKER} note {n}")).unwrap().id;
-            let path = archive_file(source.path(), SOURCE_KEY, &id).unwrap().unwrap();
+            let id = seal(&store, tag, n);
+            let path = archive_file(source.path(), key, &id).unwrap().unwrap();
             let line = std::fs::read_to_string(path).unwrap().trim().to_owned();
             assert!(!line.contains('\n'));
             (id, line)
@@ -471,6 +484,157 @@ fn t_a13_beside_a_running_store() {
     for id in &live {
         assert!(archive_file(&base, KEY, id).unwrap().is_some(), "seal {id} is not on disk");
     }
+}
+
+/// The ids of the archive files in the project of `key`, sorted.
+fn ids_on_disk(env: &Env, key: &str) -> Vec<String> {
+    let dir = env.base().join("context-archives").join(project_scope(key).unwrap());
+    let mut ids = Vec::new();
+    for shelf in std::fs::read_dir(dir).unwrap() {
+        let shelf = shelf.unwrap().path();
+        if !shelf.is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(shelf).unwrap() {
+            let name = file.unwrap().file_name().into_string().unwrap();
+            if let Some(id) = name.strip_suffix(".json") {
+                ids.push(id.to_owned());
+            }
+        }
+    }
+    ids.sort();
+    ids
+}
+
+/// core-a5-review answer 9: T-A13 seals other content than it imports. Here
+/// the chat the records came from goes on in the destination and seals the
+/// very windows the import brings: before it, after it, and while it runs.
+/// (The same messages sealed by another chat or project are other content
+/// to the store: `digest` covers `logical`.) Nothing asserted depends on
+/// how the two interleave.
+#[test]
+fn an_import_beside_a_seal_of_the_same_content() {
+    let records = sealed_in(KEY, "same", 4);
+    let mut wanted: Vec<String> = records.iter().map(|(id, _)| id.clone()).collect();
+    wanted.sort();
+    let env = Env::new();
+    let file = env.file("same.jsonl", &lines(&records));
+    let store = ArchiveStore::new(&env.base(), KEY, "made-up-chat").unwrap();
+
+    // Sealed here first: the import finds the content under its id.
+    for (n, (id, _)) in records.iter().enumerate().take(2) {
+        assert_eq!(&seal(&store, "same", n), id, "the same content has the same id");
+    }
+    let before = env.listing();
+    let dry = env.run(&["import-archives", &file, "--project-key", KEY, "--dry-run"]);
+    assert_eq!(env.listing(), before, "a dry run wrote something");
+    let real = env.run(&["import-archives", &file, "--project-key", KEY]);
+    assert_eq!((dry.code, real.code), (0, 0), "{}{}", real.stdout, real.stderr);
+    assert_eq!(real.totals(), [4, 2, 2, 0, 0, 0]);
+    assert_eq!(dry.totals(), real.totals());
+    assert_eq!(dry.doc["records"], real.doc["records"]);
+    assert_eq!(dry.doc["projects"], real.doc["projects"]);
+    for (n, outcome) in ["already_present", "already_present", "stored", "stored"]
+        .into_iter()
+        .enumerate()
+    {
+        let entry = &real.doc["records"][n];
+        assert_eq!(entry["outcome"], outcome, "line {}", n + 1);
+        assert_eq!(entry.get("note_differs"), None);
+        assert_eq!(entry.get("same_content_as"), None);
+    }
+    // Sealed here afterwards: the seal finds what the import stored.
+    for (n, (id, _)) in records.iter().enumerate() {
+        assert_eq!(&seal(&store, "same", n), id);
+    }
+    assert_eq!(ids_on_disk(&env, KEY), wanted, "one file for each window");
+
+    // While it runs. Each window ends up on disk once, under its one id,
+    // whoever came first; the import reports each line as one or the other.
+    let records = sealed_in(KEY, "racing", 50);
+    let mut wanted: Vec<String> = records.iter().map(|(id, _)| id.clone()).collect();
+    wanted.sort();
+    let env = Env::new();
+    let file = env.file("racing.jsonl", &lines(&records));
+    let base = env.base();
+    let sealer = std::thread::spawn(move || {
+        let store = ArchiveStore::new(&base, KEY, "made-up-chat").unwrap();
+        (0..50).map(|n| seal(&store, "racing", n)).collect::<Vec<String>>()
+    });
+    let run = env.run(&["import-archives", &file, "--project-key", KEY]);
+    let mut sealed_here = sealer.join().unwrap();
+    sealed_here.sort();
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+    let [read, stored, present, forgotten, kept, refused] = run.totals();
+    assert_eq!((read, stored + present), (50, 50), "{}", run.stdout);
+    assert_eq!((forgotten, kept, refused), (0, 0, 0));
+    assert_eq!(run.doc["balanced"], true);
+    assert_eq!(sealed_here, wanted);
+    assert_eq!(ids_on_disk(&env, KEY), wanted, "one file for each window");
+}
+
+/// core-a5-review answer 9: a dry run and the real run say the same under
+/// `--as-recorded` over several projects.
+#[test]
+fn archives_as_recorded_over_several_projects_dry_is_real() {
+    let a = sealed_in(SOURCE_KEY, "several-a", 2);
+    let b = sealed_in(KEY, "several-b", 1);
+    let c = sealed_in(THIRD_KEY, "several-c", 2);
+    let input = [
+        a[0].1.clone(),
+        b[0].1.clone(),
+        c[0].1.clone(),
+        a[1].1.clone(),
+        tombstone_of(&a[0].1),
+        b[0].1.clone(),
+        a[0].1.clone(),
+        c[1].1.replace("question", "QUESTION"),
+    ];
+    let env = Env::new();
+    let file = env.file("several.jsonl", &input);
+    let before = env.listing();
+    let dry = env.run(&["import-archives", &file, "--as-recorded", "--dry-run"]);
+    assert_eq!(env.listing(), before, "a dry run wrote something");
+    let real = env.run(&["import-archives", &file, "--as-recorded"]);
+    assert_eq!((dry.code, real.code), (1, 1), "{}{}", real.stdout, real.stderr);
+    assert_eq!(real.totals(), [8, 4, 1, 1, 1, 1]);
+    assert_eq!(dry.totals(), real.totals());
+    assert_eq!(dry.doc["records"], real.doc["records"]);
+    assert_eq!(dry.doc["projects"], real.doc["projects"]);
+    assert_eq!(dry.doc["forgets_not_complete"], real.doc["forgets_not_complete"]);
+    let outcomes: Vec<&str> = real.doc["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        outcomes,
+        ["stored", "stored", "stored", "stored", "forgotten", "already_present",
+         "kept_forgotten", "refused"]
+    );
+    // Each under the project it names, in the order first seen.
+    let dirs: Vec<&str> = real.doc["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|project| project["dir"].as_str().unwrap())
+        .collect();
+    let want = [SOURCE_KEY, KEY, THIRD_KEY].map(|key| project_scope(key).unwrap());
+    assert_eq!(dirs, want);
+    assert_eq!(real.doc["projects"][0]["read"], 4);
+    assert_eq!(ids_on_disk(&env, KEY), [b[0].0.clone()]);
+    assert_eq!(ids_on_disk(&env, THIRD_KEY), [c[0].0.clone()]);
+
+    // And the same input again.
+    let before = env.listing();
+    let dry = env.run(&["import-archives", &file, "--as-recorded", "--dry-run"]);
+    assert_eq!(env.listing(), before, "a dry run wrote something");
+    let real = env.run(&["import-archives", &file, "--as-recorded"]);
+    assert_eq!((dry.code, dry.totals()), (real.code, real.totals()));
+    assert_eq!(dry.doc["records"], real.doc["records"]);
+    // A tombstone that is there already is `already_present`.
+    assert_eq!(real.totals(), [8, 0, 5, 0, 2, 1], "{}", real.stdout);
 }
 
 /// cut-spec T-A15.
@@ -905,6 +1069,109 @@ fn notes_a_dry_run_then_the_real_run_then_the_same_again() {
     assert_eq!(again.code, 0, "{}{}", again.stdout, again.stderr);
     assert_eq!(again.totals(), [4, 0, 4, 0, 0, 0]);
     assert_eq!(env.listing(), stored, "a second run changed a byte");
+}
+
+/// core-a5-review answer 9: a dry run and the real run say the same for
+/// notes with a repeated id and with a tombstone before its note, as
+/// recorded over several projects and under one project key.
+#[test]
+fn notes_with_a_repeated_id_and_a_tombstone_before_its_note_dry_is_real() {
+    let reasons = |run: &Out| -> Vec<String> {
+        run.doc["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| match entry["reason"].as_str() {
+                Some(reason) => format!("refused: {reason}"),
+                None => entry["outcome"].as_str().unwrap().to_owned(),
+            })
+            .collect()
+    };
+    let both = |env: &Env, file: &str, flags: &[&str]| -> Out {
+        let mut args = vec!["import-notes", file];
+        args.extend_from_slice(flags);
+        let before = env.listing();
+        let mut dry_args = args.clone();
+        dry_args.push("--dry-run");
+        let dry = env.run(&dry_args);
+        assert_eq!(env.listing(), before, "a dry run wrote something");
+        let real = env.run(&args);
+        assert_eq!(dry.code, real.code, "{}{}", real.stdout, real.stderr);
+        assert_eq!(dry.totals(), real.totals());
+        for part in ["records", "projects", "tombstones_not_applied", "balanced", "stopped"] {
+            assert_eq!(dry.doc[part], real.doc[part], "{part}");
+        }
+        real
+    };
+
+    let env = Env::new();
+    let input = [
+        note("mem-1", KEY, "one"),
+        note("mem-2", SOURCE_KEY, "two"),
+        note("mem-1", KEY, "one"),
+        note("mem-1", KEY, "one, edited"),
+        note("mem-1", SOURCE_KEY, "one"),
+        note_tombstone("mem-1"),
+        note("mem-1", KEY, "one"),
+        note_tombstone("mem-7"),
+        note("mem-7", KEY, "seven"),
+        note("mem-3", THIRD_KEY, "three"),
+    ];
+    let file = env.file("notes.jsonl", &input);
+    let real = both(&env, &file, &["--as-recorded"]);
+    assert_eq!(real.code, 1, "{}{}", real.stdout, real.stderr);
+    assert_eq!(real.totals(), [10, 4, 1, 1, 1, 3]);
+    assert_eq!(
+        reasons(&real),
+        [
+            "stored",
+            "stored",
+            "already_present",
+            "refused: id already holds a different note",
+            "stored",
+            "forgotten",
+            "kept_forgotten",
+            "refused: a tombstone line names no project and no project's notes hold its id; \
+             pass --cwd or --project-key",
+            "refused: its tombstone in this run could not be filed",
+            "stored",
+        ]
+    );
+    assert_eq!(real.doc["tombstones_not_applied"], json!({"count": 1, "ids": ["mem-7"]}));
+    assert_eq!(real.doc["projects"].as_array().unwrap().len(), 3);
+    // The id was in two projects' files: it is forgotten in both.
+    for key in [KEY, SOURCE_KEY] {
+        let path = env.base().join("memory").join(format!("project-{key}.jsonl"));
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(text.lines().last(), Some(note_tombstone("mem-1").as_str()), "{key}");
+    }
+    // Again: nothing is stored. Every line of the forgotten id is kept
+    // out, the edited one too (the tombstone is looked at first).
+    let again = both(&env, &file, &["--as-recorded"]);
+    assert_eq!(again.totals(), [10, 0, 3, 0, 5, 2], "{}", again.stdout);
+
+    // Under one project key the tombstone that comes first is filed, and
+    // keeps its note out.
+    let env = Env::new();
+    let input = [
+        note_tombstone("mem-1"),
+        note("mem-1", SOURCE_KEY, "one"),
+        note("mem-2", SOURCE_KEY, "two"),
+        note("mem-2", THIRD_KEY, "two"),
+        note("mem-2", SOURCE_KEY, "two, edited"),
+    ];
+    let file = env.file("notes.jsonl", &input);
+    let real = both(&env, &file, &["--project-key", KEY]);
+    assert_eq!(real.code, 1, "{}{}", real.stdout, real.stderr);
+    assert_eq!(real.totals(), [5, 2, 1, 0, 1, 1]);
+    assert_eq!(
+        reasons(&real),
+        ["stored", "kept_forgotten", "stored", "already_present",
+         "refused: id already holds a different note"]
+    );
+    assert_eq!(real.doc["tombstones_not_applied"]["count"], 0);
+    let again = both(&env, &file, &["--project-key", KEY]);
+    assert_eq!(again.totals(), [5, 0, 3, 0, 1, 1], "{}", again.stdout);
 }
 
 #[test]
