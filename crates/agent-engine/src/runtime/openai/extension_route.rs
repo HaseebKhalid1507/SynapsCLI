@@ -605,7 +605,7 @@ mod caller_tests {
             &self,
             _params: ProviderCompleteParams,
         ) -> Result<ProviderCompleteResult, String> {
-            let asks = self.0.fetch_add(1, Ordering::SeqCst) % 2 == 0;
+            let asks = self.0.fetch_add(1, Ordering::SeqCst).is_multiple_of(2);
             Ok(ProviderCompleteResult {
                 content: vec![if asks {
                     json!({"type": "tool_use", "id": "t1", "name": "whoami", "input": {}})
