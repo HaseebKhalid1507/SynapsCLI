@@ -29,6 +29,11 @@ Examples:
 The `/settings` Subagent thinking row changes the default for later calls. It
 does not change foreground thinking or already-running workers.
 
+The worker model has the same kind of default: `subagent_model` (unset =
+inherit the foreground model). A call's `model` argument wins. Naming a model
+in `subagent_model` trusts it for workers the way a favorite does; an unknown
+id is denied rather than replaced by the foreground model.
+
 ## Astra wire behavior
 
 The Codex route uses its typed execution plan, not the generic

@@ -1456,6 +1456,12 @@ pub struct SynapsConfig {
     pub subagent_transform_hooks: bool,
     /// Worker default, independent of foreground `thinking`; per-call overrides win.
     pub subagent_thinking: crate::core::reasoning::ReasoningLevel,
+    /// Worker model when a delegation omits `model` (`subagent_model`).
+    /// `None` (unset, empty or `inherit`) = the foreground model. The raw
+    /// value is normalised at dispatch like the foreground `model` key.
+    /// Naming a model here trusts it for workers the way `favorite_models`
+    /// does; an unknown id is denied, never replaced by the foreground.
+    pub subagent_model: Option<String>,
     pub api_retries: u32,        // default 3
     pub refusal_retries: u32,    // default 2 — retries on stop_reason=refusal
     pub telemetry: String,       // off | basic | full (default off)
@@ -1616,6 +1622,7 @@ impl Default for SynapsConfig {
             subagent_rollover_tokens: DEFAULT_SUBAGENT_ROLLOVER_TOKENS,
             subagent_transform_hooks: true,
             subagent_thinking: crate::core::reasoning::ReasoningLevel::XHigh,
+            subagent_model: None,
             api_retries: 3,
             refusal_retries: 2,
             telemetry: "off".to_string(),
@@ -1740,6 +1747,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "subagent_rollover_tokens",
     "subagent_transform_hooks",
     "subagent_thinking",
+    "subagent_model",
     "subagent.max_concurrent",
     "subagent.max_total",
     "subagent.max_depth",
@@ -2252,6 +2260,10 @@ fn apply_config_content_with(
                         config.subagent_thinking
                     )),
                 }
+            }
+            "subagent_model" => {
+                config.subagent_model = (!val.is_empty() && !val.eq_ignore_ascii_case("inherit"))
+                    .then(|| val.to_string());
             }
             "subagent_timeout" => {
                 if let Ok(timeout) = val.parse::<u64>() {
@@ -4513,6 +4525,24 @@ mod tests {
             assert_eq!(cfg.subagent_thinking, ReasoningLevel::XHigh);
             assert!(!cfg.warnings.is_empty(), "{value:?}");
         }
+    }
+
+    #[test]
+    fn subagent_model_config_unset_set_inherit_and_blank() {
+        assert_eq!(load_config_from_str("model = claude-opus-4-6\n").subagent_model, None);
+        let cfg = load_config_from_str("subagent_model =  claude-sonnet-4-6 \n");
+        assert_eq!(cfg.subagent_model.as_deref(), Some("claude-sonnet-4-6"));
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        let cfg = load_config_from_str("subagent_model = openai-codex/gpt-5.6-sol\n");
+        assert_eq!(cfg.subagent_model.as_deref(), Some("openai-codex/gpt-5.6-sol"));
+        for value in ["inherit", "INHERIT", "", "   "] {
+            let cfg = load_config_from_str(&format!(
+                "subagent_model = claude-sonnet-4-6\nsubagent_model = {value}\n"
+            ));
+            assert_eq!(cfg.subagent_model, None, "{value:?}");
+            assert!(cfg.warnings.is_empty(), "{value:?}: {:?}", cfg.warnings);
+        }
+        assert!(config_content_problems("subagent_model = inherit\n").is_empty());
     }
 
     #[test]

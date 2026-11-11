@@ -247,6 +247,10 @@ define_settings! {
         "Default effort for new subagents; independent of foreground thinking. Resume keeps recorded effort unless overridden.",
         |_app, value| config_edit("subagent_thinking", value);
 
+    "subagent_model", "Subagent model", Agent, EditorKind::Text { numeric: false },
+        "Model for new subagents when a call omits model, e.g. claude-sonnet-4-6 or openai-codex/gpt-5.6-sol; inherit (default) = the foreground model. Naming a model trusts it for workers, as a favorite does; an unknown id refuses those dispatches instead of using the foreground model. Applies to workers started afterwards.",
+        |_app, value| config_edit("subagent_model", value);
+
     "subagent_timeout", "Subagent timeout", Agent, EditorKind::Text { numeric: true },
         "Seconds before a dispatched subagent is canceled.",
         |_app, value| match value.parse::<u64>() {
@@ -1081,6 +1085,26 @@ mod tests {
         }
         drop(temp);
         assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// `subagent_model` shows `inherit` when unset, blank or `inherit`, else
+    /// the configured value as written; edited as free text.
+    #[test]
+    fn subagent_model_row_shows_inherit_when_unset() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, shown) in [
+            ("", "inherit"),
+            ("subagent_model = inherit\n", "inherit"),
+            ("subagent_model =   \n", "inherit"),
+            ("subagent_model = claude-sonnet-4-6\n", "claude-sonnet-4-6"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(config_row_display("subagent_model").as_deref(), Some(shown), "{content:?}");
+            drop(temp);
+        }
+        let def = ALL_SETTINGS.iter().find(|d| d.key == "subagent_model").unwrap();
+        assert!(matches!(def.editor, EditorKind::Text { numeric: false }));
     }
 
     /// `cache_ttl` shows `auto` when unset (the config default) and when
