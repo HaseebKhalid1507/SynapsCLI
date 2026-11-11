@@ -7473,6 +7473,33 @@ mod rich_output_tests {
             json!({"type": "tool_use", "id": id, "name": tool, "input": input})
         }
 
+        /// Make `plug:prov:model-x` the model `provider` serves, and route
+        /// to it. As the host wires it: the manager shares `bus` and `tools`.
+        fn serve(provider: Arc<Scripted>, bus: Arc<HookBus>, tools: Arc<RwLock<ToolRegistry>>) {
+            let mut manager = ExtensionManager::new_with_tools(bus, tools);
+            manager
+                .register_provider_handler_for_tests(
+                    "plug",
+                    RegisteredProviderSpec {
+                        id: "prov".into(),
+                        display_name: "Scripted".into(),
+                        description: "scripted provider".into(),
+                        models: vec![RegisteredProviderModelSpec {
+                            id: "model-x".into(),
+                            display_name: None,
+                            capabilities: json!({"streaming": false, "tool_use": true}),
+                            context_window: None,
+                        }],
+                        config_schema: None,
+                    },
+                    provider,
+                )
+                .unwrap();
+            crate::runtime::openai::set_extension_manager_for_routing(Arc::new(RwLock::new(
+                manager,
+            )));
+        }
+
         /// One turn on the extension's model; `configure` makes the stream
         /// the chat's. Returns the tool results the model was handed.
         async fn turn(
@@ -7490,29 +7517,7 @@ mod rich_output_tests {
                 calls,
                 results: Default::default(),
             });
-            // As the host wires it: the manager shares the bus and the tools.
-            let mut manager = ExtensionManager::new_with_tools(bus.clone(), tools.clone());
-            manager
-                .register_provider_handler_for_tests(
-                    "plug",
-                    RegisteredProviderSpec {
-                        id: "prov".into(),
-                        display_name: "Scripted".into(),
-                        description: "scripted provider".into(),
-                        models: vec![RegisteredProviderModelSpec {
-                            id: "model-x".into(),
-                            display_name: None,
-                            capabilities: json!({"streaming": false, "tool_use": true}),
-                            context_window: None,
-                        }],
-                        config_schema: None,
-                    },
-                    provider.clone(),
-                )
-                .unwrap();
-            crate::runtime::openai::set_extension_manager_for_routing(Arc::new(RwLock::new(
-                manager,
-            )));
+            serve(provider.clone(), bus.clone(), tools.clone());
             let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
             let mut session = harness_session(
                 // Never dialled: the model is not Anthropic's.
@@ -7544,6 +7549,58 @@ mod rich_output_tests {
             run.expect("the stream loop finishes").expect("the turn completes");
             let results = provider.results.lock().unwrap().clone();
             results
+        }
+
+        /// A compaction request offers the model no tools, so nothing in its
+        /// answer is run. The same answer, a `write` call, is run when it
+        /// comes in a chat's turn; from compaction, which is no turn and has
+        /// no tool context, it used to be run all the same, for no chat: in
+        /// the process folder with the process environment, which under the
+        /// daemon are the daemon's.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn a_compaction_answer_with_a_tool_call_runs_no_tool() {
+            let _base = BaseDirGuard::new();
+            let dir = tempfile::tempdir().unwrap();
+            let write = |file: &std::path::Path| {
+                call("call-1", "write", json!({"path": file.to_str().unwrap(), "content": "x"}))
+            };
+
+            // In a chat's turn the call is the chat's, and runs.
+            let in_turn = dir.path().join("written-in-a-turn");
+            let results = turn(vec![write(&in_turn)], vec![], Arc::new(HookBus::new()), |session| {
+                session.session_id = Some("chat-A".into());
+            })
+            .await;
+            assert_eq!(results[0].get("is_error"), None, "{results:?}");
+            assert!(in_turn.exists());
+
+            // From compaction it is nobody's, and does not.
+            let in_compaction = dir.path().join("written-for-no-chat");
+            let provider = Arc::new(Scripted {
+                calls: vec![json!({"type": "text", "text": "SUMMARY"}), write(&in_compaction)],
+                results: Default::default(),
+            });
+            serve(
+                provider.clone(),
+                Arc::new(HookBus::new()),
+                Arc::new(RwLock::new(ToolRegistry::new())),
+            );
+            let mut rt = crate::Runtime::new_headless();
+            rt.set_compaction_model(Some("plug:prov:model-x".to_string()));
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                rt.compact_call(vec![Arc::new(json!({"role": "user", "content": "summarise"}))]),
+            )
+            .await;
+            crate::runtime::openai::clear_extension_manager_for_routing();
+
+            assert!(!in_compaction.exists(), "a tool ran for a compaction request");
+            assert!(
+                provider.results.lock().unwrap().is_empty(),
+                "the model was asked again, with a tool result"
+            );
+            assert_eq!(summary.expect("compaction finishes").unwrap(), "SUMMARY");
         }
 
         /// A note the model stores from that loop is filed under the chat's

@@ -54,7 +54,9 @@ fn local_gate_session() -> crate::tools::activation::SessionId {
 /// loop run in the chat's folder with the chat's environment, act on the
 /// chat's project, and the hook events and `tool.call`s they cause name the
 /// conversation and the folder. `None` (internal callers) = a call for no
-/// chat ([`TurnToolContext::no_chat`]).
+/// chat ([`TurnToolContext::no_chat`]). The internal callers offer no tools
+/// (compaction), and a request that offers none runs none: the loop is
+/// entered only when `tools_schema` is not empty.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn route_extension_provider(
     manager: Arc<tokio::sync::RwLock<ExtensionManager>>,
@@ -290,10 +292,10 @@ pub(crate) async fn route_extension_provider(
         }
     } else {
         // Non-streaming turn (direct complete, or the tool loop when a shared
-        // registry exists). One outer turn == one transport attempt: the
-        // tool-loop helper may perform several interior provider.complete
-        // calls, which are deliberately not counted as separate attempts
-        // (see `trace::extension` module docs).
+        // registry exists and tools were offered). One outer turn == one
+        // transport attempt: the tool-loop helper may perform several
+        // interior provider.complete calls, which are deliberately not
+        // counted as separate attempts (see `trace::extension` module docs).
         // Populated by the tool-loop helper; stays 0 on the direct-complete
         // branch, where no loop runs.
         let mut tools_requested: u32 = 0;
@@ -311,7 +313,12 @@ pub(crate) async fn route_extension_provider(
             )
             .await,
         );
-        let result = if let Some(tools) = tools_shared {
+        // The tool loop runs what the model was offered. A request that
+        // offers no tools (compaction's) gets one provider call and nothing
+        // in its answer is run: such a request is no turn and has no tool
+        // context, so a tool call would run for no chat, in the process
+        // folder with the process environment.
+        let result = if let Some(tools) = tools_shared.filter(|_| tools_exposed) {
             // A snapshot, not the lock: the loop's tools are the chat's and
             // may read this registry themselves (starting a worker does),
             // which under a read guard held for the whole provider round

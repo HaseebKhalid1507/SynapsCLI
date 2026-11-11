@@ -395,6 +395,18 @@ All notable changes to this project will be documented in this file.
   now runs under the turn's usage meter like every other non-Anthropic
   model, but its transport reports no usage event, so, as before, its
   rounds are not counted against the turn's token and cost budgets.
+- **Compaction on an extension-provided model runs no tools.** With
+  `compaction_model` set to a non-streaming model an extension provides, a
+  summary answer that contained a tool call had that call run, although a
+  compaction request offers the model no tools: for no chat, in the process
+  folder with the process environment (under the daemon, the daemon's).
+  Every built-in tool (`bash`, `write`, …) and every loaded extension and
+  MCP tool could be called that way, and the model was then asked again, up
+  to eight times. A request that offers no
+  tools now gets one provider call; the text of the answer is the summary
+  and a tool call in it is ignored. Compaction on such a model whose answer
+  is text only, and every chat turn, are unchanged. With or without the
+  daemon.
 - **Daemon: a plugin's shell slash command gets the chat's environment,
   and a tool-backed one the chat's memory binding.** A plugin slash command
   backed by a shell command (`"command": …` in the plugin manifest) was
