@@ -348,9 +348,10 @@ pub(crate) fn context_band_str(band: ContextBand) -> &'static str {
 }
 
 /// Tests only: the file store of the project the process folder is in.
-/// Production opens a chat's store through its [`MemoryBinding`]
-/// ([`archive_store_in`]): under the daemon the process folder is the
-/// daemon's, not the chat's.
+/// Production never asks the process folder, which under the daemon is the
+/// daemon's and not the chat's: a chat's window is sealed through its
+/// [`MemoryBinding`] (`history_seal_window`) and looked up on resume with
+/// [`existing_archive_store_in`].
 #[cfg(test)]
 pub(crate) fn archive_store() -> std::io::Result<ArchiveStore> {
     let cwd = std::env::current_dir()?;
@@ -359,10 +360,10 @@ pub(crate) fn archive_store() -> std::io::Result<ArchiveStore> {
     archive_store_in(&agent_core::config::base_dir(), &scope)
 }
 
-/// A project's file store opened for a read: unlike [`archive_store_in`]
-/// this creates no directory, changes no mode and syncs nothing. `None` when
-/// the project has no archive. The caller names the project, as for
-/// [`archive_store_in`]; nothing here reads the process folder.
+/// A project's file store opened for a read: unlike the open a seal makes
+/// (`ArchiveStore::new`) this creates no directory, changes no mode and
+/// syncs nothing. `None` when the project has no archive. The caller names
+/// the project; nothing here reads the process folder.
 fn existing_archive_store_in(
     base: &std::path::Path,
     scope: &agent_core::memory::store::ProjectScope,
@@ -370,8 +371,8 @@ fn existing_archive_store_in(
     ArchiveStore::open_existing(base, scope.key(), ARCHIVE_NAMESPACE)
 }
 
-/// Caller resolves scope before crossing a thread boundary. An ambient cwd or
-/// environment change during a blocking operation must not redirect its data.
+/// Tests only: a named project's file store, opened as a seal opens it.
+#[cfg(test)]
 pub(crate) fn archive_store_in(
     base: &std::path::Path,
     scope: &agent_core::memory::store::ProjectScope,
@@ -379,6 +380,8 @@ pub(crate) fn archive_store_in(
     archive_store_for_session(base, scope, ARCHIVE_NAMESPACE)
 }
 
+/// Tests only: the same, for one conversation's id.
+#[cfg(test)]
 fn archive_store_for_session(
     base: &std::path::Path,
     scope: &agent_core::memory::store::ProjectScope,
