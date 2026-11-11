@@ -326,6 +326,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Notes: "written, not confirmed" names the note.** When the sync after a
+  save or a forget failed, `memory_store` and `memory_forget` told the model
+  to search, with nothing exact to search for. The error
+  (`MemoryError::WrittenUnconfirmed`, now `{ id, cause }`) carries the
+  note's id, and the tools say "fetch mem-… with memory_fetch to check". A
+  record without an id (an extension's `memory.append`) and the end of an
+  import run have none and keep the old text.
 - **Notes: the end of an import syncs every file, and says which one
   failed.** `ImportRun::finish` stopped at the first file or directory
   whose sync failed, so the files after it were not synced, and the error

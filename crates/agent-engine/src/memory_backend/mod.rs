@@ -72,18 +72,31 @@ fn error(message: impl Into<String>) -> RuntimeError {
 /// `memory_store` makes a second note, and a second `memory_forget` answers
 /// "not found".
 fn legacy_write_error(e: store::MemoryError, what: &str) -> RuntimeError {
-    match (&e, what) {
-        (store::MemoryError::WrittenUnconfirmed(cause), "forget") => error(format!(
+    let store::MemoryError::WrittenUnconfirmed { id, cause } = &e else {
+        return error(e.to_string());
+    };
+    match (id, what) {
+        (Some(id), "forget") => error(format!(
+            "the forget of {id} was written but the disk did not confirm it ({cause}). The note \
+             is forgotten now and searches no longer return it. Do not call memory_forget for it \
+             again (it would answer not found); to check, fetch {id} with memory_fetch: not found \
+             means it is forgotten."
+        )),
+        (None, "forget") => error(format!(
             "the forget was written but the disk did not confirm it ({cause}). The note is \
              forgotten now and searches no longer return it. Do not call memory_forget for it \
              again (it would answer not found); use memory_search if you need to check."
         )),
-        (store::MemoryError::WrittenUnconfirmed(cause), _) => error(format!(
+        (Some(id), _) => error(format!(
+            "the note was written as {id} but the disk did not confirm it ({cause}). It is in \
+             memory now. Do NOT save it again: fetch {id} with memory_fetch to check, and call \
+             memory_store again only if the fetch does not return it."
+        )),
+        (None, _) => error(format!(
             "the note was written but the disk did not confirm it ({cause}). It is in memory \
              now. Do NOT save it again: use memory_search to find it first, and call \
              memory_store again only if the search does not return it."
         )),
-        _ => error(e.to_string()),
     }
 }
 
@@ -547,14 +560,27 @@ mod tests {
 
     #[test]
     fn a_write_that_was_not_confirmed_tells_the_model_to_search_before_saving_again() {
-        let unconfirmed = || store::MemoryError::WrittenUnconfirmed("EIO".into());
-        let stored = legacy_write_error(unconfirmed(), "note").to_string();
-        assert!(stored.contains("memory: the note was written"), "{stored}");
+        let unconfirmed = |id: Option<&str>| store::MemoryError::WrittenUnconfirmed {
+            id: id.map(str::to_string),
+            cause: "EIO".into(),
+        };
+        let stored = legacy_write_error(unconfirmed(Some("mem-abc")), "note").to_string();
+        assert!(stored.contains("memory: the note was written as mem-abc"), "{stored}");
         assert!(stored.contains("EIO"), "{stored}");
-        assert!(stored.contains("Do NOT save it again: use memory_search"), "{stored}");
-        let forgotten = legacy_write_error(unconfirmed(), "forget").to_string();
-        assert!(forgotten.contains("memory: the forget was written"), "{forgotten}");
+        assert!(
+            stored.contains("Do NOT save it again: fetch mem-abc with memory_fetch to check"),
+            "{stored}"
+        );
+        let forgotten = legacy_write_error(unconfirmed(Some("mem-abc")), "forget").to_string();
+        assert!(forgotten.contains("memory: the forget of mem-abc was written"), "{forgotten}");
         assert!(forgotten.contains("Do not call memory_forget for it again"), "{forgotten}");
+        assert!(forgotten.contains("fetch mem-abc with memory_fetch"), "{forgotten}");
+        // Without an id there is nothing exact to fetch: search.
+        let stored = legacy_write_error(unconfirmed(None), "note").to_string();
+        assert!(stored.contains("memory: the note was written but"), "{stored}");
+        assert!(stored.contains("Do NOT save it again: use memory_search"), "{stored}");
+        let forgotten = legacy_write_error(unconfirmed(None), "forget").to_string();
+        assert!(forgotten.contains("memory: the forget was written"), "{forgotten}");
         // Any other store error is passed on as it was.
         let other = legacy_write_error(store::MemoryError::NotFound("mem-1".into()), "forget");
         assert_eq!(

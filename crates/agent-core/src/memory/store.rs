@@ -113,8 +113,33 @@ pub enum MemoryError {
     /// and every reader sees it, but a sync after the write failed, so it is
     /// not confirmed to be on disk. Not a failed save: doing it again makes
     /// a second note under a new id, and a second forget answers
-    /// [`MemoryError::NotFound`]. Holds the sync's error.
-    WrittenUnconfirmed(String),
+    /// [`MemoryError::NotFound`]. Holds the id of the note saved or
+    /// forgotten, when there is one (a record without an id, or the end of
+    /// an import run, has none), and the sync's error.
+    WrittenUnconfirmed { id: Option<String>, cause: String },
+}
+
+impl MemoryError {
+    /// A sync failure after the write, before the caller knows the id.
+    fn unconfirmed(cause: impl std::fmt::Display) -> Self {
+        MemoryError::WrittenUnconfirmed {
+            id: None,
+            cause: cause.to_string(),
+        }
+    }
+
+    /// This error with `id` as the id of an unconfirmed write.
+    fn with_id(self, id: Option<&str>) -> Self {
+        match self {
+            MemoryError::WrittenUnconfirmed { id: None, cause } => {
+                MemoryError::WrittenUnconfirmed {
+                    id: id.map(str::to_string),
+                    cause,
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 impl std::fmt::Display for MemoryError {
@@ -130,10 +155,18 @@ impl std::fmt::Display for MemoryError {
                 write!(f, "memory record not found in this project scope: {id}")
             }
             MemoryError::InvalidProjectRoot(s) => write!(f, "invalid project root: {s}"),
-            MemoryError::WrittenUnconfirmed(s) => write!(
+            MemoryError::WrittenUnconfirmed { id: None, cause } => write!(
                 f,
-                "written, but not confirmed on disk (the sync failed: {s}); \
+                "written, but not confirmed on disk (the sync failed: {cause}); \
                  it is in the store now, so look before doing it again"
+            ),
+            MemoryError::WrittenUnconfirmed {
+                id: Some(id),
+                cause,
+            } => write!(
+                f,
+                "written, but not confirmed on disk (the sync failed: {cause}); \
+                 {id} is in the store now, so fetch {id} to check before doing it again"
             ),
         }
     }
@@ -222,7 +255,7 @@ fn append_record(base: &Path, record: &MemoryRecord, sync_now: bool) -> Result<(
     }
     let path = namespace_path(&dir, &record.namespace);
     let line = serde_json::to_string(record)?;
-    append_jsonl_line(&path, &line, sync_now)
+    append_jsonl_line(&path, &line, sync_now).map_err(|e| e.with_id(record.id.as_deref()))
 }
 
 /// Append one JSONL line and make it durable before returning: the line goes
@@ -276,7 +309,7 @@ fn append_jsonl_line(path: &Path, line: &str, sync_now: bool) -> Result<(), Memo
             Some(dir) => sync_dir(dir),
             None => Ok(()),
         });
-        synced.map_err(|e| MemoryError::WrittenUnconfirmed(e.to_string()))?;
+        synced.map_err(MemoryError::unconfirmed)?;
     }
     Ok(())
 }
@@ -1012,7 +1045,7 @@ fn append_tombstone(
     crate::core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::from)?;
     let path = namespace_path(&dir, namespace);
     let line = serde_json::to_string(tombstone)?;
-    append_jsonl_line(&path, &line, sync_now)
+    append_jsonl_line(&path, &line, sync_now).map_err(|e| e.with_id(Some(&tombstone.tombstone)))
 }
 
 /// Path of a project namespace's JSONL store file (index-module seam).
@@ -1207,9 +1240,8 @@ impl ImportRun {
     pub fn finish(mut self) -> Result<Vec<PathBuf>, MemoryError> {
         // Whatever the sync says, it was tried and the caller is told.
         self.finished = true;
-        self.sync().map_err(|(path, e)| {
-            MemoryError::WrittenUnconfirmed(format!("{}: {e}", path.display()))
-        })
+        self.sync()
+            .map_err(|(path, e)| MemoryError::unconfirmed(format!("{}: {e}", path.display())))
     }
 
     /// Sync every appended file, then every directory of one, trying all of
@@ -1880,10 +1912,18 @@ mod tests {
             let failing = Failing::step(step);
             let error = store_record_in(base, &scope, note(step)).unwrap_err();
             drop(failing);
-            assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+            // The error carries the id the note has in the file.
+            let live = load_live_project_records(base, &scope).unwrap();
+            let saved = live.iter().find(|r| r.content == step).unwrap();
+            let saved_id = saved.id.clone().unwrap();
+            assert!(
+                matches!(&error, MemoryError::WrittenUnconfirmed { id: Some(id), .. } if *id == saved_id),
+                "{error:?}"
+            );
             let message = error.to_string();
             assert!(message.starts_with("written, but not confirmed on disk"), "{message}");
             assert!(message.contains(&format!("{step} failed")), "{message}");
+            assert!(message.contains(&format!("fetch {saved_id} to check")), "{message}");
         }
         assert_eq!(contents(), ["kept", "sync file", "sync dir"], "both notes are there");
 
@@ -1893,7 +1933,10 @@ mod tests {
         let failing = Failing::step("sync file");
         let error = forget_in(base, &scope, id).unwrap_err();
         drop(failing);
-        assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+        assert!(
+            matches!(&error, MemoryError::WrittenUnconfirmed { id: Some(got), .. } if got == id),
+            "{error:?}"
+        );
         assert_eq!(contents(), ["sync file", "sync dir"]);
         assert!(matches!(forget_in(base, &scope, id), Err(MemoryError::NotFound(_))));
 
@@ -1901,7 +1944,11 @@ mod tests {
         let failing = Failing::step("sync dir");
         let error = append_to(base, &rec("ns", 1, "x", vec![])).unwrap_err();
         drop(failing);
-        assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+        // A record without an id: there is none to name.
+        assert!(
+            matches!(error, MemoryError::WrittenUnconfirmed { id: None, .. }),
+            "{error}"
+        );
         assert_eq!(query_in(base, "ns", &MemoryQuery::default()).unwrap().len(), 1);
 
         // An import: its lines are written, and `finish` is where the sync
@@ -1912,7 +1959,10 @@ mod tests {
         let failing = Failing::step("sync file");
         let error = run.finish().unwrap_err();
         drop(failing);
-        assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+        assert!(
+            matches!(error, MemoryError::WrittenUnconfirmed { id: None, .. }),
+            "{error}"
+        );
         assert_eq!(contents(), ["sync file", "sync dir", "imported"]);
 
         // Before the write: the sync of the folder a new `memory/` is in,
@@ -1958,7 +2008,10 @@ mod tests {
             .filter(|step| step.starts_with("sync"))
             .collect();
         assert_eq!(syncs, ["sync file", "sync file", "sync dir"], "all tried");
-        assert!(matches!(error, MemoryError::WrittenUnconfirmed(_)), "{error}");
+        assert!(
+            matches!(error, MemoryError::WrittenUnconfirmed { id: None, .. }),
+            "{error}"
+        );
         let message = error.to_string();
         assert!(message.contains(&paths[0].display().to_string()), "{message}");
         assert!(!message.contains(&paths[1].display().to_string()), "{message}");
