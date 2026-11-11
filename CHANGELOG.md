@@ -424,6 +424,79 @@ All notable changes to this project will be documented in this file.
   did not say which file it was. It now tries every file and every
   directory and returns the first failure as before
   (`WrittenUnconfirmed`), with the path that failed.
+
+- **Context rollover: "1 earlier archive not listed here".** The first
+  message of a window whose list of archives was shortened to leave one out
+  said "1 earlier archives"; it has its singular. A list that could not be
+  shortened because its text was not found in the message, which would
+  have gone unnoticed, now fails a debug build and is logged once in a
+  release build. New test: a window sealed as several archives whose full
+  list fails only the 1,024-token shrink check names fewer of them.
+- **Context rollover: resume uses only archive ids from a session file,
+  and a bounded number of them.** A resumed chat's first message lists the
+  archives of its last window. Every string in that list was fetched as an
+  archive, one whole file each, and written to the log when the fetch
+  failed; the archive the marker names was logged as it was even when it
+  was not an id. Only a string of 32 lowercase hex characters is now
+  fetched or logged. At most 64 listed archives are looked up and the rest
+  are logged as one count, and for a marker whose archive is not an id the
+  log gives its length.
+- **Context rollover: a resume whose archive lookup keeps failing is
+  settled by the next rollover, and is looked up once per turn.** A resumed
+  chat whose saved window names an archive that cannot be read (a damaged
+  file, not a missing one) goes on at window 1 and looks again at the next
+  turn. It looked twice at every turn start, and went on doing so after the
+  chat had rolled over, with a warning each time. A committed rollover now
+  settles the state, and the second lookup of a turn start, which repeated
+  the first for the same store, is gone. `docs/extensions/hooks.md` now
+  says that `(session_id, window)` is not unique across a resume (such a
+  chat announces window 2 again, for other archives): key on `archive_id`.
+- **Daemon: a restored chat's folder under a file is dropped as absent.**
+  A saved folder whose path runs through something that is not a directory
+  (a file where one of its parents was) cannot exist, but looking at it
+  fails with "not a directory" and not with "not found", so the restore
+  kept it. It is now dropped like an absent folder, with the warning. Only
+  failures that can pass (permission, I/O, a mount that is away) keep the
+  folder.
+- **Daemon: a restored chat keeps a folder that cannot be looked at, and
+  every dropped folder is logged.** A reload and the restore of a pinned
+  session drop a chat's folder when it is gone; the chat then runs its
+  tools and keeps its memory in the daemon's folder and project. "Gone" was
+  `is_dir()` being false, which it is for any failure, so a folder on a
+  mount that was away for a moment, or one the daemon had no permission to
+  look at, moved the chat as well, with no log line. Both restores now use
+  one rule: the folder is dropped only when its path does not exist or is
+  not a directory, and kept on any other error. Each drop, and each folder
+  kept although it could not be looked at, is a warning that names the
+  folder and the chat.
+- **Context rollover: a rollover that cannot be recorded writes no
+  archives.** The size of the new window is estimated before the seal, when
+  the archives it will name are not known. A window sealed as several
+  archives has a longer first message than the estimate, and a rollover
+  whose message was then not under the request budget failed after the
+  seal: the window's archives stayed on disk with nothing naming them, and
+  again at each later attempt. The budget is now held before the seal, on
+  an upper bound of that message for any way the window can be cut, so such
+  a rollover is refused with the history kept and nothing written. The
+  refusal comes up to about 200 tokens below the budget, for a window that
+  turns out to be one archive too. The check after the seal stays as a last
+  line; it can still refuse only when the store returns a longer working
+  note than it was given, and then says that the archives were written.
+  `docs/specs/context-continuation.md` also says again how a window is cut
+  (filled part by part from its start) and what a retry on a grown window
+  writes.
+- **Extensions: a handler that times out on an archive event is not sent
+  the rest of that rollover's events.** A window sealed as `n` archives
+  sends `n` `on_context_archived` events to each handler, one after the
+  other. A handler that did not answer one within 5 s was sent the next all
+  the same, so a slow extension had `n` requests in its input and was busy
+  for `n` times its own time; calls to one extension are made one at a
+  time, so every `before_tool_call` sent to it meanwhile timed out and the
+  tool ran. A handler's sequence now ends at its first timeout (logged
+  once, with the number of events not sent); other handlers still get every
+  event, undelayed. An extension that needs every archive must be able to
+  catch up by listing the store (`docs/extensions/hooks.md`). Not changed:
+  a `before_tool_call` that times out still lets the tool run.
 - **Notes: a save made while a notes file is rewritten is no longer lost.**
   `synaps retention sweep` and `synaps retention forget memory` rewrite
   `memory/<ns>.jsonl` and rename the new file over the old one. A note saved

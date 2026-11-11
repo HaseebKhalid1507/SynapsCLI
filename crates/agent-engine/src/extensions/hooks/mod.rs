@@ -770,18 +770,21 @@ impl HookBus {
     ///
     /// What it yields is `None`, `Some(event)` or a `Vec` of events. Several
     /// are one delivery, on the one task: every handler is sent them in that
-    /// order, the next once it has answered the one before or run out of
-    /// time for it ([`HANDLER_TIMEOUT`], per event). So a caller with many
-    /// events to send takes one in-flight slot, not one each, and cannot
-    /// have its later events dropped because its earlier ones are still in
-    /// flight; the task ends within the timeout for each event. An event of
-    /// another kind than `kind` is not sent.
+    /// order, the next once it has answered the one before. So a caller with
+    /// many events to send takes one in-flight slot, not one each, and
+    /// cannot have its later events dropped because its earlier ones are
+    /// still in flight. An event of another kind than `kind` is not sent.
     ///
-    /// Each handler gets the sequence on its own. One that is slow or never
-    /// answers holds up its own later events and nobody else's, and one that
-    /// panics on an event loses that event and nothing more: it is sent the
-    /// next, and the other handlers are not touched. (That is where a panic
-    /// unwinds. The release profile aborts on any panic, here as anywhere.)
+    /// Each handler gets the sequence on its own. One that does not answer
+    /// an event within [`HANDLER_TIMEOUT`] is sent no more of this delivery
+    /// (logged once, with the number not sent): the request that timed out
+    /// is still in its input, and each further one would keep it busy, and
+    /// its other hooks waiting, that much longer. Nobody else's events are
+    /// held up or dropped by it, and the task ends within one timeout of
+    /// the slowest answer. A handler that panics on an event loses that
+    /// event and nothing more: it is sent the next, and the other handlers
+    /// are not touched. (That is where a panic unwinds. The release profile
+    /// aborts on any panic, here as anywhere.)
     pub fn notify_with<F, I>(self: &Arc<Self>, kind: HookKind, events: F)
     where
         F: std::future::Future<Output = I> + Send + 'static,
@@ -824,13 +827,14 @@ impl HookBus {
             handlers.get(&kind).cloned().unwrap_or_default()
         }; // lock dropped here, as in `emit`
         let sequences = registrations.iter().map(|reg| async move {
-            for event in events {
-                let wanted = reg
-                    .tool_filter
+            let wanted = |event: &HookEvent| {
+                reg.tool_filter
                     .as_deref()
                     .is_none_or(|filter| tool_filter_matches(filter, event))
-                    && reg.matcher.as_ref().is_none_or(|m| m.matches(event));
-                if !wanted {
+                    && reg.matcher.as_ref().is_none_or(|m| m.matches(event))
+            };
+            for (sent, event) in events.iter().enumerate() {
+                if !wanted(event) {
                     continue;
                 }
                 // The answer is discarded. A panic is caught here, so it ends
@@ -838,12 +842,22 @@ impl HookBus {
                 let call = tokio::time::timeout(HANDLER_TIMEOUT, reg.handler.handle(event));
                 match std::panic::AssertUnwindSafe(call).catch_unwind().await {
                     Ok(Ok(_answer)) => {}
-                    Ok(Err(_timeout)) => tracing::warn!(
-                        hook = %kind.as_str(),
-                        extension = %reg.handler.id(),
-                        timeout_secs = HANDLER_TIMEOUT.as_secs(),
-                        "Notify-only hook handler timed out — event skipped for it"
-                    ),
+                    Ok(Err(_timeout)) => {
+                        // The host has given up on this call; the handler
+                        // has not. Sending it the rest would only add to
+                        // what it is behind by, and to the time its other
+                        // hooks time out in.
+                        let not_sent =
+                            events[sent + 1..].iter().filter(|event| wanted(event)).count();
+                        tracing::warn!(
+                            hook = %kind.as_str(),
+                            extension = %reg.handler.id(),
+                            timeout_secs = HANDLER_TIMEOUT.as_secs(),
+                            not_sent,
+                            "Notify-only hook handler timed out — the later events of this delivery are not sent to it"
+                        );
+                        break;
+                    }
                     Err(_panic) => tracing::error!(
                         hook = %kind.as_str(),
                         extension = %reg.handler.id(),
@@ -2912,8 +2926,7 @@ mod notify_tests {
     }
 
     /// Several events from one build are one delivery: one slot, sent to a
-    /// handler in order, each with its own handler timeout. More of them
-    /// than the in-flight limit lose none.
+    /// handler in order. More of them than the in-flight limit lose none.
     #[tokio::test(start_paused = true)]
     async fn notify_with_sends_several_events_in_order_as_one_delivery() {
         let numbered = |n: usize| part(n, NOTIFY_MAX_IN_FLIGHT + 6);
@@ -2931,21 +2944,18 @@ mod notify_tests {
         assert_eq!(parts_seen(&listener), (1..=count as u64).collect::<Vec<_>>());
         assert_eq!(bus.notifies_in_flight(), 0);
 
-        // A handler that never answers: the next event waits for the first
-        // one's timeout and is then sent all the same.
+        // A handler that never answers: the delivery ends at the first
+        // event's timeout, and the second is not sent.
         let hung = Listener::hanging("hung");
         let bus = bus_with(&[&hung]).await;
         bus.notify_with(KIND, async move { vec![numbered(1), numbered(2)] });
         settle().await;
         assert_eq!(parts_seen(&hung), [1]);
-        tokio::time::sleep(HANDLER_TIMEOUT).await;
-        settle().await;
-        assert_eq!(parts_seen(&hung), [1, 2]);
         assert_eq!(bus.notifies_in_flight(), 1);
         tokio::time::sleep(HANDLER_TIMEOUT).await;
         settle().await;
         assert_eq!(bus.notifies_in_flight(), 0);
-        assert_eq!(hung.calls(), (2, 0));
+        assert_eq!(hung.calls(), (1, 0));
     }
 
     fn part(n: usize, of: usize) -> HookEvent {
@@ -2960,8 +2970,14 @@ mod notify_tests {
     /// Two handlers, the first of which never answers. The healthy one used
     /// to get each later part only when the stuck one's 5 s for the part
     /// before had run out, so the last of `n` parts up to 5·(n-1) s late. It
-    /// now has them all at once, in order; the stuck one still gets every
-    /// part, one per timeout, and the delivery is one slot until it ends.
+    /// now has them all at once, in order.
+    ///
+    /// The stuck one is sent the first part and no other. It used to be sent
+    /// the next at each timeout, so an extension that was only slow had `n`
+    /// requests in its input after 5·n s and was busy for `n` times its own
+    /// time, with every other hook sent to it (a `before_tool_call`) timing
+    /// out meanwhile. Its backlog is now one event whatever `n` is, and the
+    /// delivery's slot is free after one timeout.
     #[tokio::test(start_paused = true)]
     async fn a_stuck_handler_does_not_delay_another_handlers_parts() {
         const PARTS: usize = 4;
@@ -2974,17 +2990,22 @@ mod notify_tests {
         assert_eq!(parts_seen(&stuck), [1]);
         assert_eq!(bus.notifies_in_flight(), 1);
 
-        // The stuck handler's own sequence: the next part at each timeout.
-        for sent in 2..=PARTS {
-            tokio::time::sleep(HANDLER_TIMEOUT).await;
-            settle().await;
-            assert_eq!(parts_seen(&stuck), (1..=sent as u64).collect::<Vec<_>>());
-            assert_eq!(bus.notifies_in_flight(), 1);
-        }
+        // The stuck handler's sequence ends at its first timeout, and the
+        // delivery with it: parts 2 to 4 are never sent to it.
         tokio::time::sleep(HANDLER_TIMEOUT).await;
         settle().await;
+        assert_eq!(bus.notifies_in_flight(), 0, "one timeout, not one per part");
+        assert_eq!(parts_seen(&stuck), [1]);
+        tokio::time::sleep(HANDLER_TIMEOUT * PARTS as u32).await;
+        assert_eq!((stuck.calls(), healthy.calls()), ((1, 0), (PARTS, PARTS)));
+
+        // A handler that is slow but answers in time is sent every part.
+        let slow = Listener::slow("slow", HANDLER_TIMEOUT - Duration::from_millis(1));
+        let bus = bus_with(&[&slow]).await;
+        bus.notify_with(KIND, async { (1..=PARTS).map(|n| part(n, PARTS)).collect::<Vec<_>>() });
+        tokio::time::sleep(HANDLER_TIMEOUT * PARTS as u32).await;
+        assert_eq!(slow.calls(), (PARTS, PARTS));
         assert_eq!(bus.notifies_in_flight(), 0);
-        assert_eq!((stuck.calls(), healthy.calls()), ((PARTS, 0), (PARTS, PARTS)));
     }
 
     /// A handler that panics on part 1 of several. It used to end the

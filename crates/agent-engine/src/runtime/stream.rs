@@ -812,9 +812,8 @@ impl StreamMethods {
             ));
         }
         if context_enabled {
-            if !memory_backend.exclusive() {
-                super::continuation::restore_window(&messages, &continuation, &memory_backend);
-            }
+            // The window of a resumed head was restored above
+            // (`validate_restored_history`), for either backend.
             let registry = prepare_or_cancel!(tools.read());
             for name in ["memory_search", "memory_fetch"] {
                 if registry.get(name).is_none_or(|tool| {
