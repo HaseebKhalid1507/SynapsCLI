@@ -371,9 +371,6 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         None => (
             SessionConfig {
                 cwd: meta.cwd.clone(),
-                // Like `/keepwarm`: the user's `/memory` choice survives a
-                // reload whose checkpoint did not confirm.
-                memory_mode: handle.memory_mode(),
                 env: None,
             env_stripped: Vec::new(),
                 ..SessionConfig::default()
@@ -1347,89 +1344,56 @@ mod tests {
         assert!(r.keep_warm && r.config.keep_warm);
     }
 
-    /// A `memory_mode` this image does not know (written by a newer one)
-    /// reads as `Off` — the consent-safe reading — instead of failing the
-    /// session's config and with it the whole reload state, so no session
-    /// would be rehydrated. A missing or null value stays no choice.
+    /// T-B4: a session config written before the session memory mode was
+    /// removed still carries `memory_mode`. It is read and ignored, in the
+    /// config alone and inside a reload state, whatever its value, and the
+    /// rest of the config is kept.
     #[test]
-    fn an_unknown_memory_mode_reads_as_off() {
-        use crate::session::SessionMemoryMode;
-        let cfg = |v: serde_json::Value| {
-            serde_json::from_value::<SessionConfig>(serde_json::json!({ "memory_mode": v }))
-        };
-        assert_eq!(cfg(serde_json::json!("off")).unwrap().memory_mode, Some(SessionMemoryMode::Off));
-        assert_eq!(
-            cfg(serde_json::json!("capture_and_recall")).unwrap().memory_mode,
-            Some(SessionMemoryMode::CaptureAndRecall)
-        );
-        assert_eq!(
-            cfg(serde_json::json!("recall_forever")).unwrap().memory_mode,
-            Some(SessionMemoryMode::Off)
-        );
-        assert_eq!(cfg(serde_json::json!(7)).unwrap().memory_mode, Some(SessionMemoryMode::Off));
-        assert_eq!(cfg(serde_json::Value::Null).unwrap().memory_mode, None);
-        let missing = serde_json::from_value::<SessionConfig>(serde_json::json!({})).unwrap();
-        assert_eq!(missing.memory_mode, None);
+    fn an_old_memory_mode_is_read_and_ignored() {
+        for v in [
+            serde_json::json!("capture_and_recall"),
+            serde_json::json!("off"),
+            serde_json::json!("recall_forever"),
+            serde_json::json!(7),
+            serde_json::Value::Null,
+        ] {
+            let cfg: SessionConfig = serde_json::from_value(serde_json::json!({
+                "memory_mode": v,
+                "model_override": "claude-sonnet-4-5",
+                "keep_warm": true
+            }))
+            .unwrap_or_else(|e| panic!("memory_mode = {v}: {e}"));
+            assert_eq!(cfg.model_override.as_deref(), Some("claude-sonnet-4-5"));
+            assert!(cfg.keep_warm);
+            let back = serde_json::to_value(&cfg).unwrap();
+            assert!(back.get("memory_mode").is_none(), "not written back: {back}");
+        }
         let rs: ReloadState = serde_json::from_value(serde_json::json!({
             "generation": 2,
             "written_at": "2026-10-14T18:17:03Z",
             "sessions": [{
                 "id": "s1", "journal_id": "s1", "keep_warm": false, "lifecycle": "live",
-                "config": { "memory_mode": "recall_forever" }
+                "config": { "memory_mode": "capture_and_recall", "cwd": "/srv/chat" }
             }],
             "expected_clients": 0
         }))
         .expect("the reload state still parses");
-        assert_eq!(rs.sessions[0].config.memory_mode, Some(SessionMemoryMode::Off));
+        assert_eq!(rs.sessions.len(), 1);
+        let restored = restore_config(&rs.sessions[0].config, SessionLifecycle::Live, "s1");
+        assert!(!restored.await_extensions);
     }
 
-    /// The restore without the hook wait keeps #255's `/memory` carry: the
-    /// session's recorded choice rides in the saved config, Parked or not.
+    /// The restore without the hook wait, Parked or not.
     #[test]
     fn a_restore_keeps_the_sessions_memory_choice() {
-        use crate::session::SessionMemoryMode;
-        for mode in [Some(SessionMemoryMode::Off), Some(SessionMemoryMode::CaptureOnly), None] {
-            let saved = SessionConfig {
-                memory_mode: mode,
-                await_extensions: true,
-                ..Default::default()
-            };
-            for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked, SessionLifecycle::Parking] {
-                let restored = restore_config(&saved, lifecycle, "chat");
-                assert_eq!(restored.memory_mode, mode, "{lifecycle:?}");
-                assert!(!restored.await_extensions, "{lifecycle:?}");
-            }
-        }
-    }
-
-    /// Likewise the session's `/memory` choice: a reload without a
-    /// checkpoint reply must not re-grant memory the user turned off.
-    #[test]
-    fn memory_choice_survives_an_unconfirmed_checkpoint() {
-        use crate::session::handle::echo::{meta_for, view_for};
-        use crate::session::SessionMemoryMode;
-        let id = crate::session::SessionId("mem-reload".into());
-        let (handle, ep) = SessionHandle::new(meta_for(&id), view_for());
-        assert_eq!(record(&handle, None).config.memory_mode, None);
-        *ep.memory_mode.lock().unwrap() = Some(SessionMemoryMode::Off);
-        assert_eq!(record(&handle, None).config.memory_mode, Some(SessionMemoryMode::Off));
-    }
-
-    /// A lock-held placeholder (F23) never answers a checkpoint, so the
-    /// next reload records it from its handle: its memory choice must ride
-    /// along, or a session reloaded twice comes back in the default.
-    #[tokio::test]
-    async fn a_locked_placeholder_keeps_its_memory_choice() {
-        use crate::session::SessionMemoryMode;
-        let sid = crate::session::SessionId("locked-mem".into());
-        let config = SessionConfig {
-            memory_mode: Some(SessionMemoryMode::Off),
-            ..SessionConfig::default()
+        let saved = SessionConfig {
+            await_extensions: true,
+            ..Default::default()
         };
-        let (handle, task) =
-            crate::session::handle::locked_placeholder::spawn(sid, config, "pid 1 (tui)".into());
-        assert_eq!(record(&handle, None).config.memory_mode, Some(SessionMemoryMode::Off));
-        task.abort();
+        for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked, SessionLifecycle::Parking] {
+            let restored = restore_config(&saved, lifecycle, "chat");
+            assert!(!restored.await_extensions, "{lifecycle:?}");
+        }
     }
 
     /// `ReloadAborted` reaches a session whose command queue is full (the

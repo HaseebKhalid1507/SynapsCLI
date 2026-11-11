@@ -738,6 +738,34 @@ async fn a_session_rehydrated_with_no_client_parks_after_the_grace() {
         .unwrap();
 }
 
+/// T-B4: a reload record written before the session memory mode was removed
+/// still carries `"memory_mode": "capture_and_recall"` in its config. It
+/// parses, and the session it names is rehydrated from its journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_reload_record_with_an_old_memory_mode_restores_the_session() {
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let run = tempfile::TempDir::new().unwrap();
+    let d = start_daemon(&host, &run).await;
+    let mut old = serde_json::to_value(reloaded_live_session(&host).await).unwrap();
+    old["sessions"][0]["config"]["memory_mode"] = serde_json::json!("capture_and_recall");
+    let rs: agent_engine::daemon::reload::ReloadState =
+        serde_json::from_value(old).expect("an old reload record still parses");
+
+    agent_engine::daemon::reload::rehydrate(&d.state, &rs).await;
+    let reborn = d.state.live_sessions().pop().expect("rehydrated");
+    assert!(reborn.meta().continued, "the same conversation, from its journal");
+    assert_eq!(reborn.journal_id(), rs.sessions[0].journal_id);
+    reborn
+        .send(SessionCommand::End { reason: EndReason::HostShutdown })
+        .await
+        .unwrap();
+}
+
 /// The grace the rehydrate arms is the reconnect grace, not a park: a client
 /// that reconnects within it keeps the session Live, and its later detach
 /// parks it as usual.

@@ -252,6 +252,12 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **The per-session memory mode.** A session no longer records a memory
+  choice (`SessionConfig::memory_mode`), a rebuilt runtime (unpark, daemon
+  reload) no longer restores one, and no session runtime applies
+  `memory.default_mode` any more: built-in automatic memory stays off. A
+  saved reload record or a create request that still carries `memory_mode`
+  loads as before; the value is read and ignored.
 - **The `memory_context` tool, `/memory` and the "Default memory mode"
   settings row.** Built-in automatic memory (capture and recall) is leaving
   core for an extension, and these were its outermost users; it was off
