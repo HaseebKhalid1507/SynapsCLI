@@ -108,10 +108,17 @@ pub async fn execute_plugin_command(
     }
 }
 
+/// [`execute_plugin_command`], plus the backend that needs the chat's tools:
+/// an extension tool. `session_id` and `cwd` are the chat the command was
+/// typed in and the folder that chat runs in; the tool's `tool.call` carries
+/// them. `None` = no conversation / the process folder, which under the
+/// daemon is the daemon's, so a command a chat runs must pass its own.
 pub async fn execute_plugin_command_with_tools(
     command: &RegisteredPluginCommand,
     slash_args: &str,
     tools: Arc<tokio::sync::RwLock<ToolRegistry>>,
+    session_id: Option<&str>,
+    cwd: Option<&Path>,
 ) -> crate::Result<PluginCommandOutput> {
     if let RegisteredPluginCommandBackend::ExtensionTool { tool, input } = &command.backend {
         let runtime_tool_name = format!("{}:{}", command.plugin, tool);
@@ -127,7 +134,9 @@ pub async fn execute_plugin_command_with_tools(
             })?
             .clone();
         drop(registry);
-        let stdout = tool.execute(params, empty_tool_context()).await?;
+        let stdout = tool
+            .execute(params, command_tool_context(session_id, cwd))
+            .await?;
         Ok(PluginCommandOutput {
             status: Some(0),
             stdout,
@@ -138,7 +147,9 @@ pub async fn execute_plugin_command_with_tools(
     }
 }
 
-fn empty_tool_context() -> ToolContext {
+/// The context a slash command's tool runs in: whose call it is, and
+/// nothing else of the chat's.
+fn command_tool_context(session_id: Option<&str>, cwd: Option<&Path>) -> ToolContext {
     ToolContext {
         channels: ToolChannels {
             tx_delta: None,
@@ -161,11 +172,11 @@ fn empty_tool_context() -> ToolContext {
             mcp_leases: None,
             extension_leases: None,
             memory_context: None,
-            cwd: None,
+            cwd: cwd.map(Path::to_path_buf),
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
-            session_id: None,
+            session_id: session_id.map(str::to_string),
             hook_bus: None,
         },
         limits: ToolLimits {
@@ -284,7 +295,7 @@ mod tests {
         let registry = Arc::new(tokio::sync::RwLock::new(ToolRegistry::without_subagent()));
         registry.write().await.register(Arc::new(EchoTool));
 
-        let output = execute_plugin_command_with_tools(&command, "hello", registry)
+        let output = execute_plugin_command_with_tools(&command, "hello", registry, None, None)
             .await
             .unwrap();
 

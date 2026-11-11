@@ -279,6 +279,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Daemon: an extension tool run by a plugin slash command is told the
+  chat.** A tool-backed `/plugin:command` typed in a daemon-hosted chat sent
+  its `tool.call` with `session_id: null` and the daemon's folder as `cwd`.
+  It now carries the chat's id and the chat's folder, like a tool call in a
+  turn.
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
   program names: a stock Windows has no `grep` or `ls` ("program not
   found"), and `find` resolved to `System32\find.exe`, an unrelated string

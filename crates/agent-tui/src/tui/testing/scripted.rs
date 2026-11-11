@@ -359,6 +359,8 @@ impl ScriptedTransport {
                             &command,
                             &arg,
                             self.runtime.tools_shared(),
+                            self.runtime.session_id(),
+                            self.runtime.cwd(),
                         )
                         .await
                         {

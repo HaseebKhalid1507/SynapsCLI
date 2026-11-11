@@ -471,6 +471,10 @@ impl SessionActor {
                 &cmd,
                 &arg,
                 self.runtime.tools_shared(),
+                // The command is this chat's: an extension tool it runs is
+                // told the chat and its folder, as in a turn.
+                self.runtime.session_id(),
+                self.runtime.cwd(),
             )
             .await
             {
