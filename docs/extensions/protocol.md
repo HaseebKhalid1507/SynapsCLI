@@ -920,9 +920,12 @@ Reserved future permissions are rejected if declared today: `tools.override`.
 
 `context_providers.register` and the manifest key `deferred.context_providers`
 are accepted and ignored. They declared a provider for built-in automatic
-memory, which was removed in 0.12.0; a manifest that still has them loads,
-its tools and hooks work, the declaration decides nothing about when the
-extension starts, and the host logs one line saying it is ignored. An
+memory, which was removed in 0.12.0. A manifest that still has them loads as
+its other parts say, its tools and hooks work, the declaration decides
+nothing about when the extension starts, and the host logs one line saying it
+is ignored. A manifest that declares only a context provider starts at load
+like one with an empty `deferred` block, and fails to load like one if its
+command does not start. An
 extension that provides capture and recall does it through hooks.
 
 Permissions are enforced before hook subscriptions are installed. Unknown permission strings are rejected, reserved permission strings are rejected, and a hook subscription without its required permission fails manifest loading.

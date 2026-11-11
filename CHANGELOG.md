@@ -321,12 +321,14 @@ All notable changes to this project will be documented in this file.
   to write one of these keys. `memory.backend`, `memory.user_scope` and
   `memory.axel.*` are unchanged.
   An extension manifest that declares `deferred.context_providers` or asks
-  for the permission `context_providers.register` still loads, and its
-  tools and hooks work; the declaration is not validated, grants nothing
-  and no longer decides when the extension starts (a manifest that
-  declared only a context provider used to wait for `/memory on`, which no
-  longer exists; it now starts like a manifest with an empty `deferred`
-  block). Loading it logs `extension <id> declares a context provider;
+  for the permission `context_providers.register` loads as its other parts
+  say, and its tools and hooks work; the declaration is not validated,
+  grants nothing and no longer decides when the extension starts. A
+  manifest that declared only a context provider used to wait for
+  `/memory on`, which no longer exists, so it never started; it now starts
+  at load like a manifest with an empty `deferred` block, and, like one,
+  fails to load if its command does not start (the other extensions still
+  load). Loading it logs `extension <id> declares a context provider;
   built-in automatic memory was removed in 0.12.0, the declaration is
   ignored`. The host's context-provider catalog
   (`extensions/context_provider.rs`) and the continuous-memory review

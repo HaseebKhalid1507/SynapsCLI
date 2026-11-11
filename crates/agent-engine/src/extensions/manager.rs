@@ -3055,6 +3055,154 @@ mod tests {
         assert_eq!(mgr.count(), 0, "discovery must spawn nothing");
     }
 
+    // ── a manifest that declares only a context provider (B-4) ──────────────
+
+    /// A `plugin.json` whose only `deferred` content is a context provider,
+    /// with the permission that used to go with it.
+    fn write_provider_only_plugin(
+        plugins_root: &std::path::Path,
+        dir_name: &str,
+        command: &str,
+        args: Vec<String>,
+    ) {
+        let plugin_dir = plugins_root.join(dir_name).join(".synaps-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let manifest = serde_json::json!({
+            "extension": {
+                "runtime": "process",
+                "command": command,
+                "args": args,
+                "permissions": ["context_providers.register"],
+                "deferred": {"context_providers": [{"id": "recall"}]}
+            }
+        });
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl LogCapture {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            let sink = self.0.clone();
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || LogWriter(sink.clone()))
+                .with_ansi(false)
+                .finish()
+        }
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// Through discovery (the real load path), with progressive disclosure
+    /// on: a provider-only manifest starts like one with an empty `deferred`
+    /// block (eager, its process runs `initialize`), and the load writes the
+    /// "declaration is ignored" notice to the log.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_provider_only_manifest_loads_eagerly_and_logs_the_ignored_declaration() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let _no_project_plugins =
+            crate::test_env::EnvVarGuard::set("SYNAPS_DISABLE_PROJECT_PLUGINS", "1");
+        let plugins_root = base.path().join("plugins");
+        let spy = base.path().join("spy.log");
+        let tools_json = base.path().join("tools.json");
+        std::fs::write(&tools_json, "[]").unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/extension_fixture.py");
+        write_provider_only_plugin(
+            &plugins_root,
+            "provider-only",
+            "python3",
+            vec![
+                fixture.display().to_string(),
+                spy.display().to_string(),
+                tools_json.display().to_string(),
+                "ok".to_string(),
+            ],
+        );
+
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::ToolRegistry::without_subagent(),
+        ));
+        let mut mgr = ExtensionManager::new_with_tools(Arc::new(HookBus::new()), registry);
+        mgr.set_progressive_deferral(true);
+        let log = LogCapture::default();
+        let (loaded, failed) = {
+            let _guard = tracing::subscriber::set_default(log.subscriber());
+            mgr.discover_and_load().await
+        };
+
+        assert!(failed.is_empty(), "no failures expected: {failed:?}");
+        assert_eq!(loaded, vec!["provider-only".to_string()]);
+        assert!(!mgr.is_deferred("provider-only"), "not dormant");
+        assert!(mgr.is_loaded("provider-only"));
+        assert_eq!(mgr.count(), 1, "its process is running");
+        let spy_log = std::fs::read_to_string(&spy).unwrap_or_default();
+        assert!(
+            spy_log.lines().any(|l| l == "request:initialize"),
+            "the process was started and initialized at load: {spy_log:?}"
+        );
+        let text = log.text();
+        assert_eq!(
+            text.matches(
+                "extension provider-only declares a context provider; built-in automatic \
+                 memory was removed in 0.12.0, the declaration is ignored"
+            )
+            .count(),
+            1,
+            "one notice in the log: {text}"
+        );
+        mgr.shutdown_all().await;
+    }
+
+    /// With progressive disclosure on, a provider-only manifest whose
+    /// command does not start fails to load like any eager manifest: the
+    /// failure is collected and the other extensions still load.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_provider_only_manifest_with_a_dead_command_fails_alone() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let _no_project_plugins =
+            crate::test_env::EnvVarGuard::set("SYNAPS_DISABLE_PROJECT_PLUGINS", "1");
+        let plugins_root = base.path().join("plugins");
+        write_provider_only_plugin(&plugins_root, "provider-only", "/bin/false", Vec::new());
+        write_installed_plugin(&plugins_root, "com.example.notes");
+
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::ToolRegistry::without_subagent(),
+        ));
+        let mut mgr = ExtensionManager::new_with_tools(Arc::new(HookBus::new()), registry.clone());
+        mgr.set_progressive_deferral(true);
+        let (loaded, failed) = mgr.discover_and_load().await;
+
+        assert_eq!(loaded, vec!["com.example.notes".to_string()]);
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].plugin, "provider-only");
+        assert!(!mgr.is_loaded("provider-only"));
+        assert!(!mgr.is_deferred("provider-only"));
+        assert!(registry
+            .read()
+            .await
+            .get("com.example.notes:memory_fetch")
+            .is_some());
+    }
+
     /// The exclusion helper is name-based and conservative: it must catch
     /// known backup/disabled/temp conventions without swallowing
     /// legitimate dotted or hyphenated plugin names.
