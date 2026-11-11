@@ -312,6 +312,13 @@ All notable changes to this project will be documented in this file.
   nothing. The lock also stops a line from landing on another writer's torn
   line. A version older than this one does not take the lock: do not run a
   sweep from one version while another version saves notes.
+- **Notes: a forgotten note stays forgotten across sweep, eviction and
+  forget.** A rewrite of `memory/<ns>.jsonl` used to write the kept notes
+  only, so after `synaps retention sweep` had dropped a forgotten note its
+  tombstone line was gone too, and an import of an export that still held
+  the note stored it again. Every rewrite now keeps every tombstone line
+  (about 70 bytes each), including when the disk budget evicts notes. A
+  sweep that finds only live notes and tombstones leaves the file alone.
 - **Notes: a saved note is on disk before `memory_store` says it is saved.**
   With the plain-file memory backend a note was written to
   `memory/project-<key>.jsonl` but not synced, so a crash or a power cut

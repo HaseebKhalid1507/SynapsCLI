@@ -492,7 +492,8 @@ pub fn sweep_at(
 
 /// Evict the globally oldest live memory records until at least
 /// `bytes_to_free` of line bytes are removed (atomic per-file rewrites).
-/// Returns the number of records dropped.
+/// Returns the number of records dropped. Tombstone lines are kept: they are
+/// about 70 bytes each and the budget cannot take them back.
 fn evict_oldest_memory_records(
     roots: &RetentionRoots,
     bytes_to_free: u64,
@@ -558,11 +559,8 @@ fn evict_oldest_memory_records(
                 if let Some(id) = value["id"].as_str() {
                     return !ids.contains(id);
                 }
-                // Tombstone lines for evicted ids are no longer needed;
-                // keep other tombstones.
-                if let Some(id) = value["tombstone"].as_str() {
-                    return !ids.contains(id);
-                }
+                // Every tombstone line stays, whatever id it names: it is
+                // what keeps a forgotten note from being imported again.
                 true
             })
             .collect();
@@ -701,7 +699,8 @@ fn delete_session_artifact(path: &Path, outcome: &mut SweepOutcome) -> io::Resul
 /// Rewrite one memory JSONL file, dropping tombstoned records, records past
 /// their own retention class (`ts + max_age_days < now`), and — when a
 /// global cutoff is set — records older than it. Atomic rewrite; returns
-/// the number of records physically removed.
+/// the number of records physically removed. Tombstone lines are kept, in
+/// place, on every rewrite.
 ///
 /// A line that does not parse is dropped and counted too. The file's lock is
 /// held here, so such a line is never a save caught half written: it is a
@@ -716,8 +715,14 @@ fn compact_memory_file(
     let _lock = lock_notes(path)?;
     let raw = fs::read_to_string(path)?;
     rewrite_read_done();
+    /// A line of the file: a tombstone, or a record with what decides
+    /// whether it stays.
+    enum Line {
+        Tombstone(String),
+        Record(Option<String>, u64, Option<u64>, String),
+    }
     let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut records: Vec<(Option<String>, u64, Option<u64>, String)> = Vec::new();
+    let mut lines: Vec<Line> = Vec::new();
     let mut dropped = 0usize;
 
     for line in raw.lines() {
@@ -731,13 +736,14 @@ fn compact_memory_file(
         };
         if let Some(id) = value["tombstone"].as_str() {
             tombstoned.insert(id.to_string());
+            lines.push(Line::Tombstone(trimmed.to_string()));
             continue;
         }
         let ts = value["timestamp_ms"].as_u64().unwrap_or(0);
         let per_record_span_ms = value["retention"]["max_age_days"]
             .as_u64()
             .map(|days| days * DAY_MS);
-        records.push((
+        lines.push(Line::Record(
             value["id"].as_str().map(String::from),
             ts,
             per_record_span_ms,
@@ -746,7 +752,18 @@ fn compact_memory_file(
     }
 
     let mut kept: Vec<String> = Vec::new();
-    for (id, ts, per_record_span_ms, line) in records {
+    for line in lines {
+        let (id, ts, per_record_span_ms, line) = match line {
+            // A tombstone line is never dropped and never counted: it stays
+            // where it was, so a forgotten note stays forgotten when its
+            // line is gone (an import checks for the tombstone), and a file
+            // with nothing else to drop is not rewritten.
+            Line::Tombstone(line) => {
+                kept.push(line);
+                continue;
+            }
+            Line::Record(id, ts, span, line) => (id, ts, span, line),
+        };
         if id.as_ref().is_some_and(|id| tombstoned.contains(id)) {
             dropped += 1;
             continue;
@@ -762,7 +779,6 @@ fn compact_memory_file(
         kept.push(line);
     }
 
-    // Tombstones fully applied: kept lines only.
     if dropped > 0 {
         let mut body = kept.join("\n");
         if !body.is_empty() {
@@ -1257,6 +1273,124 @@ mod tests {
         drop(held);
         assert_eq!(sweep_at(&roots, &AGE, now).unwrap().memory_records_dropped, 1);
         forget(&roots, RetentionDomain::Memory, "ns:mem-new").unwrap();
+    }
+
+    /// A forgotten note stays forgotten across sweep, eviction and forget:
+    /// each of the three rewrites the file, the tombstone line is still in
+    /// it, and an import of the note's own line is turned away by it.
+    #[test]
+    fn a_tombstone_outlives_every_rewrite() {
+        use crate::memory::store::{
+            import_line_in, ImportOutcome, ImportRun, ImportTarget, MemoryProvenance,
+            MemoryRetention, MemorySensitivity, NewMemoryRecord, ProjectScope,
+        };
+        let tmp = TempDir::new().unwrap();
+        let roots = roots(&tmp);
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let scope = ProjectScope::for_root(&project).unwrap();
+        let ns = scope.namespace();
+        let path = notes_file(&roots, &ns);
+        let stored = |content: &str| {
+            let new = NewMemoryRecord {
+                content: content.to_string(),
+                tags: vec![],
+                provenance: MemoryProvenance {
+                    source: "model".into(),
+                    session: None,
+                },
+                sensitivity: MemorySensitivity::Normal,
+                retention: MemoryRetention::Standard,
+            };
+            let record = store::store_record_in(&roots.base_dir, &scope, new).unwrap();
+            std::thread::sleep(Duration::from_millis(2)); // distinct times
+            record.id.unwrap()
+        };
+        let inode = || {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::MetadataExt::ino(&fs::metadata(&path).unwrap())
+            }
+            #[cfg(not(unix))]
+            {
+                0u64
+            }
+        };
+
+        let forgotten = stored("forgotten");
+        let exported = fs::read_to_string(&path).unwrap().trim().to_string();
+        let (second, third, fourth) = (stored("second"), stored("third"), stored("fourth"));
+        store::forget_in(&roots.base_dir, &scope, &forgotten).unwrap();
+        let tombstone = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        assert!(tombstone.contains(&format!(r#""tombstone":"{forgotten}""#)));
+
+        // What the import's check (`import_note`, "tombstoned" in the file)
+        // says about the forgotten note's own line, and what is in the file.
+        let check = |live: &[&String]| {
+            let text = fs::read_to_string(&path).unwrap();
+            assert_eq!(text.lines().filter(|line| *line == tombstone).count(), 1);
+            let live: Vec<String> = live.iter().map(|id| id.to_string()).collect();
+            assert_eq!(ids(&path), live);
+            let imported = import_line_in(
+                &roots.base_dir,
+                &exported,
+                ImportTarget::AsRecorded,
+                false,
+                &mut ImportRun::new(),
+            )
+            .unwrap();
+            assert_eq!(imported.outcome.name(), ImportOutcome::KeptForgotten.name());
+            assert_eq!(fs::read_to_string(&path).unwrap(), text, "nothing imported");
+        };
+
+        // The sweep: it drops the forgotten note's line, so it rewrites.
+        let before = inode();
+        let now = crate::epoch_millis();
+        let none = RetentionPolicy::default();
+        assert_eq!(sweep_at(&roots, &none, now).unwrap().memory_records_dropped, 1);
+        #[cfg(unix)]
+        assert_ne!(inode(), before, "the sweep rewrote the file");
+        check(&[&second, &third, &fourth]);
+
+        // A second sweep: tombstones and live notes only, nothing to drop,
+        // so the file is left as it is.
+        let before = inode();
+        assert_eq!(sweep_at(&roots, &none, now).unwrap().memory_records_dropped, 0);
+        assert_eq!(inode(), before, "a sweep with nothing to drop does not rewrite");
+        check(&[&second, &third, &fourth]);
+
+        // Eviction of the oldest live note.
+        assert_eq!(evict_oldest_memory_records(&roots, 1).unwrap(), 1);
+        #[cfg(unix)]
+        assert_ne!(inode(), before, "the eviction rewrote the file");
+        check(&[&third, &fourth]);
+
+        // The store's forget (an append), then `retention forget memory`
+        // (a rewrite): the file now has three tombstones.
+        store::forget_in(&roots.base_dir, &scope, &third).unwrap();
+        check(&[&third, &fourth]);
+        let before = inode();
+        forget(&roots, RetentionDomain::Memory, &format!("{ns}:{fourth}")).unwrap();
+        #[cfg(unix)]
+        assert_ne!(inode(), before, "the forget rewrote the file");
+        check(&[&third, &fourth]);
+        let text = fs::read_to_string(&path).unwrap();
+        for id in [&forgotten, &third, &fourth] {
+            assert!(text.contains(&format!(r#""tombstone":"{id}""#)), "{id}");
+        }
+
+        // And the sweep after that drops both forgotten notes and keeps all
+        // three tombstones.
+        assert_eq!(sweep_at(&roots, &none, now).unwrap().memory_records_dropped, 2);
+        check(&[]);
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        assert_eq!(text.matches(r#""tombstone":"#).count(), 3);
     }
 
     /// The lock file sits in `memory/` beside the notes file and is not one:

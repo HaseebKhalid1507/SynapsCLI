@@ -289,9 +289,15 @@ fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
     assert!(!rewritten.contains("expired by global age"));
     assert!(
         !rewritten.contains("tombstoned body"),
-        "tombstones purge physically"
+        "a forgotten note's line is purged physically"
     );
-    assert!(!rewritten.contains("mem-dead"));
+    // Its tombstone line stays (an id and a time, no content): it is what
+    // keeps the note forgotten if an export that still holds it is imported.
+    assert_eq!(
+        rewritten,
+        format!("{}\n", lines[4]),
+        "the tombstone is the one line left"
+    );
     // mem-new is 99d old at sweep time (now+40d) minus ts 99d → 41d → also
     // aged out under the 30-day budget.
     assert!(!rewritten.contains("fresh survivor"));
