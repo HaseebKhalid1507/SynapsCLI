@@ -2194,6 +2194,86 @@ mod worker_context_window_wire_tests {
             assert!(beta.contains("context-1m-2025-08-07"), "{path}: {beta:?}");
         }
     }
+
+    /// `subagent_status`, `subagent_collect` and the completion wake report
+    /// what a worker used: here one scripted response (10 input, 5 output).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn status_collect_and_the_wake_report_the_worker_usage() {
+        let base = crate::test_env::BaseDirGuard::new();
+        std::fs::write(
+            base.path().join("auth.json"),
+            r#"{"anthropic": {"type": "oauth", "refresh": "synthetic", "access": "synthetic-access", "expires": 9999999999999}}"#,
+        )
+        .unwrap();
+        let (url, _) = spawn_provider().await;
+        let _guards = [
+            crate::test_env::EnvVarGuard::remove("SYNAPS_AUTH_ENDPOINT"),
+            crate::test_env::EnvVarGuard::remove("SYNAPS_MACHINE_TOKEN"),
+            crate::test_env::EnvVarGuard::remove("SYNAPS_SUBAGENT_FRESH_RUNTIME"),
+            crate::test_env::EnvVarGuard::remove("ANTHROPIC_API_KEY"),
+            crate::test_env::EnvVarGuard::remove("SYNAPS_DISABLE_SUBAGENT_WAKE"),
+            crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url),
+        ];
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let queue = Arc::new(crate::events::EventQueue::new(16));
+        // One orchestration across the calls: status/collect poll the worker start authorized.
+        let orchestration = create_tool_context().capabilities.orchestration;
+        let ctx = || {
+            let mut ctx = create_tool_context();
+            ctx.capabilities.subagent_registry = Some(registry.clone());
+            ctx.capabilities.event_queue = Some(queue.clone());
+            ctx.capabilities.orchestration = orchestration.clone();
+            ctx
+        };
+        let task = json!({"system_prompt": "test worker", "task": "run it", "model": MODEL, "timeout": 60});
+        let out = super::SubagentStartTool.execute(task, ctx()).await.expect("subagent_start");
+        let handle = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &handle).await;
+
+        let want = json!({
+            "requests": 1, "input_tokens": 10, "output_tokens": 5,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+            "context_tokens": 10, "cost_usd": 0.0001
+        });
+        let status: Value = serde_json::from_str(
+            &super::SubagentStatusTool.execute(json!({"handle_id": handle}), ctx()).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["usage"], want, "{status}");
+        let collect: Value = serde_json::from_str(
+            &super::SubagentCollectTool
+                .execute(json!({"handle_id": handle, "reconciled": true}), ctx())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(collect["status"], "completed");
+        assert_eq!(collect["usage"], want, "{collect}");
+
+        let wake = queue.pop().expect("completion wake");
+        assert_eq!(wake.content.data.as_ref().unwrap()["usage"], want);
+        assert!(
+            wake.content.text.contains(
+                "Used 1 request, 10 input and 5 output tokens, under $0.01 at list prices. Call subagent_collect"
+            ),
+            "{}",
+            wake.content.text
+        );
+
+        // A resumed worker reports THIS run only, not the runs before it.
+        let out = super::SubagentResumeTool
+            .execute(json!({"handle_id": handle, "instructions": "again", "timeout": 60}), ctx())
+            .await
+            .expect("subagent_resume");
+        let resumed = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &resumed).await;
+        let status: Value = serde_json::from_str(
+            &super::SubagentStatusTool.execute(json!({"handle_id": resumed}), ctx()).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["usage"], want, "{status}");
+    }
 }
 
 /// The loopback provider and wire assertions the host-path twin

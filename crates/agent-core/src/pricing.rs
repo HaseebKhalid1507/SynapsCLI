@@ -105,7 +105,19 @@ fn is_sonnet_5(m: &str) -> bool {
 /// Falls back to Sonnet pricing for unknown models.
 #[inline]
 fn model_prices(model: &str, prompt_tokens: u64) -> (f64, f64) {
-    match model {
+    listed_prices(model, prompt_tokens).unwrap_or((3.0, 15.0)) // default: Sonnet pricing
+}
+
+/// Whether this table has a price for `model`, i.e. its cost is not the
+/// Sonnet fallback guess. Callers that must not guess (a worker's reported
+/// cost) omit the cost when this is false.
+pub fn has_list_price(model: &str) -> bool {
+    listed_prices(model, 0).is_some()
+}
+
+/// [`model_prices`] without the fallback: `None` for a model not in the table.
+fn listed_prices(model: &str, prompt_tokens: u64) -> Option<(f64, f64)> {
+    Some(match model {
         // InferX publishes DeepSeek V4 Flash at $0/M input and output.
         // Keep this exact ID before generic DeepSeek entries are ever added.
         "inferx/deepseek-v4-flash" | "deepseek-v4-flash" => (0.0, 0.0),
@@ -132,8 +144,8 @@ fn model_prices(model: &str, prompt_tokens: u64) -> (f64, f64) {
         }
         m if is_version(m, "3-haiku") || is_version(m, "haiku-3") => (0.25, 1.25),
         m if m.contains("haiku") => (1.0, 5.0),
-        _ => (3.0, 15.0), // default: Sonnet pricing
-    }
+        _ => return None,
+    })
 }
 
 /// Cache-read price as a multiple of the input price
@@ -470,6 +482,23 @@ mod tests {
         let cost_unknown = calculate_cost("gpt-99-turbo", 1_000_000, 0, 0, 0);
         let cost_sonnet = calculate_cost("claude-sonnet-4-5", 1_000_000, 0, 0, 0);
         assert!((cost_unknown - cost_sonnet).abs() < 1e-9);
+    }
+
+    /// The fallback above is a guess; `has_list_price` tells it apart.
+    #[test]
+    fn has_list_price_is_false_only_for_the_fallback() {
+        for m in [
+            "claude-sonnet-4-6",
+            "anthropic/claude-opus-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5",
+            "inferx/deepseek-v4-flash",
+        ] {
+            assert!(has_list_price(m), "{m}");
+        }
+        for m in ["gpt-99-turbo", "openai/gpt-5", "z-ai/glm-5.2", ""] {
+            assert!(!has_list_price(m), "{m}");
+        }
     }
 
     #[test]

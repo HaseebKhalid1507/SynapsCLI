@@ -1219,6 +1219,9 @@ impl TranscriptStore {
                             Style::default().fg(theme.error_color).bg(event_bg),
                         ));
                     }
+                    if let Some(u) = c.usage {
+                        body.push((u.to_string(), Style::default().fg(theme.muted).bg(event_bg)));
+                    }
                     for pl in super::markdown::strip_md_markers(c.preview).lines() {
                         body.push((pl.to_string(), text_style));
                     }

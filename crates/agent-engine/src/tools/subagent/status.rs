@@ -1,8 +1,9 @@
 //! SubagentStatusTool — poll the current state of a running or completed reactive subagent.
 //!
 //! Returns a lightweight snapshot: lifecycle status, last 500 chars of output,
-//! elapsed wall-clock seconds, and tool-use count. Non-blocking — always returns
-//! immediately regardless of the subagent's progress.
+//! elapsed wall-clock seconds, tool-use count and what the run used so far
+//! (`usage`). Non-blocking — always returns immediately regardless of the
+//! subagent's progress.
 
 use super::super::{Tool, ToolContext};
 use crate::{Result, RuntimeError};
@@ -78,11 +79,10 @@ impl Tool for SubagentStatusTool {
         let terminal = handle.terminal_diagnostic();
         let authorization = handle.authorization.clone();
         let archive_error = handle.archive_error();
-        let context = handle
-            .state
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .context_summary();
+        let (context, usage) = {
+            let s = handle.state.read().unwrap_or_else(|p| p.into_inner());
+            (s.context_summary(), s.usage.clone())
+        };
         let _ = handle;
         drop(reg);
 
@@ -111,7 +111,8 @@ impl Tool for SubagentStatusTool {
             "terminal_cause": terminal,
             "authorization":   authorization,
             "archiveError": archive_error,
-            "output_length":  output_length
+            "output_length":  output_length,
+            "usage":          usage
         });
         if let Some(reason) = status.failure_reason() {
             resp["error"] = json!(reason);

@@ -7,7 +7,7 @@
 
 use crate::events::types::{EventContent, EventSource, Severity};
 use crate::events::{Event, EventQueue};
-use crate::runtime::subagent::{SubagentState, SubagentStatus};
+use crate::runtime::subagent::{SubagentState, SubagentStatus, WorkerUsage};
 use std::sync::{Arc, RwLock};
 
 /// Kill-switch for rollback: set SYNAPS_DISABLE_SUBAGENT_WAKE=1|true|yes to suppress
@@ -22,7 +22,10 @@ fn wake_disabled() -> bool {
 
 /// Build the completion event. Pure — unit-testable without threads.
 /// `resumed_from`: set by resume.rs only (the prior handle_id this run continues from).
+/// `usage`: what this run used, when the worker's totals are at hand; adds
+/// `data.usage` and one sentence to `text`. `None` leaves both as before.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn build_completion_event(
     handle_id: &str,
     subagent_id: u64,
@@ -31,6 +34,7 @@ pub fn build_completion_event(
     result_preview: &str, // caller pre-truncates to ≤300 chars
     duration_secs: f64,
     resumed_from: Option<&str>,
+    usage: Option<&WorkerUsage>,
 ) -> Event {
     use chrono::Utc;
     use serde_json::json;
@@ -44,9 +48,13 @@ pub fn build_completion_event(
         }
         None => String::new(),
     };
+    let usage_sentence = usage
+        .and_then(WorkerUsage::sentence)
+        .map(|s| format!(" {s}"))
+        .unwrap_or_default();
     let text = format!(
         "Subagent '{agent_name}' ({handle_id}) finished with status '{status_str}' \
-         after {duration_secs:.1}s.{reason_suffix} \
+         after {duration_secs:.1}s.{reason_suffix}{usage_sentence} \
          Call subagent_collect with handle_id \"{handle_id}\" to retrieve the full result. \
          Preview: {result_preview}"
     );
@@ -63,6 +71,9 @@ pub fn build_completion_event(
     }
     if let Some(rf) = resumed_from {
         data_map["resumed_from"] = json!(rf);
+    }
+    if let Some(usage) = usage {
+        data_map["usage"] = json!(usage);
     }
 
     Event {
@@ -122,6 +133,7 @@ pub fn build_reload_carry_event(w: &crate::runtime::subagent::CarriedWorker) -> 
             &w.preview,
             w.elapsed_secs as f64,
             None,
+            None,
         );
         ev.content.text = text;
         if let Some(data) = ev.content.data.as_mut() {
@@ -142,6 +154,7 @@ pub fn build_reload_carry_event(w: &crate::runtime::subagent::CarriedWorker) -> 
             &status,
             &w.preview,
             w.elapsed_secs as f64,
+            None,
             None,
         )
     };
@@ -230,7 +243,7 @@ fn finalize_subagent_impl(
     resumed_from: Option<&str>,
     archive_dir: Option<&std::path::Path>,
 ) {
-    let (status, preview, cancelled) = {
+    let (status, preview, cancelled, usage) = {
         // R6: poison-safe — if the thread panicked while holding the write lock,
         // recover the inner value rather than re-panicking outside catch_unwind.
         let mut s = state.write().unwrap_or_else(|p| p.into_inner());
@@ -256,7 +269,7 @@ fn finalize_subagent_impl(
             latest
         };
         let preview: String = source.chars().take(300).collect();
-        (s.status.clone(), preview, s.cancel_requested)
+        (s.status.clone(), preview, s.cancel_requested, s.usage.clone())
     };
     // However this returns from here on: settled, so a reload's checkpoint
     // knows the wake (if any) is in the queue it is about to carry.
@@ -307,6 +320,7 @@ fn finalize_subagent_impl(
         &preview,
         started_at.elapsed().as_secs_f64(),
         resumed_from,
+        Some(&usage),
     );
 
     if let Err(e) = queue.push(ev.clone()) {
@@ -572,6 +586,7 @@ mod tests {
             "analysis done",
             3.5,
             None,
+            None,
         );
 
         assert_eq!(ev.source.source_type, "subagent");
@@ -730,6 +745,7 @@ mod tests {
             "clean preview text",
             1.0,
             None,
+            None,
         );
         assert!(ev.content.text.contains("clean preview text"));
     }
@@ -745,6 +761,7 @@ mod tests {
             "partial output",
             2.0,
             None,
+            None,
         );
 
         let data = ev.content.data.as_ref().unwrap();
@@ -758,5 +775,94 @@ mod tests {
             "event text must contain failure reason: {}",
             ev.content.text
         );
+    }
+    fn priced_usage(model: &str) -> WorkerUsage {
+        let mut u = WorkerUsage::default();
+        u.add(
+            &crate::SessionEvent::Usage {
+                input_tokens: 1_234,
+                output_tokens: 370_000,
+                cache_read_input_tokens: 61_200_000,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
+                model: None,
+            },
+            model,
+        );
+        u
+    }
+
+    /// The completion event says what the worker used, before the collect
+    /// instruction; the price clause only with a known price; no sentence
+    /// without requests; and no `usage` at all when none was passed.
+    #[test]
+    fn completion_event_reports_usage() {
+        let event = |usage: Option<&WorkerUsage>| {
+            build_completion_event(
+                "sa_u", 1, "spike", &SubagentStatus::Completed, "done", 2.0, None, usage,
+            )
+        };
+
+        let priced = priced_usage("claude-opus-5-5");
+        let ev = event(Some(&priced));
+        assert_eq!(
+            ev.content.text,
+            "Subagent 'spike' (sa_u) finished with status 'completed' after 2.0s. \
+             Used 1 request, 1.2k input, 61.2M cache-read and 370k output tokens, \
+             about $19.64 at list prices. \
+             Call subagent_collect with handle_id \"sa_u\" to retrieve the full result. \
+             Preview: done"
+        );
+        let data = ev.content.data.unwrap();
+        assert_eq!(data["usage"]["requests"], 1);
+        assert_eq!(data["usage"]["cache_read_tokens"], 61_200_000);
+        assert_eq!(data["usage"]["context_tokens"], 61_201_234);
+        assert_eq!(data["usage"]["cost_usd"], 19.6449);
+
+        let unpriced = priced_usage("openai/gpt-5");
+        let ev = event(Some(&unpriced));
+        assert!(
+            ev.content.text.contains(
+                "after 2.0s. Used 1 request, 1.2k input, 61.2M cache-read and 370k output tokens. Call subagent_collect"
+            ),
+            "{}",
+            ev.content.text
+        );
+        let data = ev.content.data.unwrap();
+        assert_eq!(data["usage"]["output_tokens"], 370_000);
+        assert!(data["usage"].get("cost_usd").is_none());
+
+        let none_used = WorkerUsage::default();
+        let ev = event(Some(&none_used));
+        assert!(!ev.content.text.contains("Used "), "{}", ev.content.text);
+        assert!(ev.content.text.contains("after 2.0s. Call subagent_collect"), "{}", ev.content.text);
+        assert_eq!(ev.content.data.unwrap()["usage"]["requests"], 0);
+
+        let ev = event(None);
+        assert!(ev.content.text.contains("after 2.0s. Call subagent_collect"), "{}", ev.content.text);
+        assert!(ev.content.data.unwrap().get("usage").is_none());
+    }
+
+    /// A failed worker's wake carries the usage its state accumulated.
+    #[test]
+    fn finalizer_publishes_the_usage_of_a_failed_worker() {
+        let state = make_state(SubagentStatus::Failed("provider request failed".into()), "partial");
+        state.write().unwrap().usage = priced_usage("claude-opus-5-5");
+        let queue = Arc::new(EventQueue::new(100));
+        let dir = tempfile::tempdir().unwrap();
+        finalize_subagent_in(
+            &state,
+            Some(&queue),
+            "sa_dead",
+            1,
+            "worker",
+            std::time::Instant::now(),
+            None,
+            dir.path(),
+        );
+        let ev = queue.pop().expect("completion wake");
+        assert!(ev.content.text.contains("Reason: provider request failed Used 1 request,"), "{}", ev.content.text);
+        assert_eq!(ev.content.data.unwrap()["usage"]["cost_usd"], 19.6449);
     }
 }
