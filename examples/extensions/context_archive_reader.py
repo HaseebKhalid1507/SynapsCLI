@@ -47,6 +47,12 @@ def read(path, scope, name):
         raise ValueError("the id is not 32 hex characters, or not the file's name")
     if record["body"]["state"] not in ("live", "tombstone"):
         raise ValueError("unknown state")
+    if "created_ms" in record:  # optional, and never in a tombstone
+        created = record["created_ms"]
+        if type(created) is not int or not 0 <= created < 2**64:
+            raise ValueError("created_ms is not a whole number of milliseconds")
+        if record["body"]["state"] == "tombstone":
+            raise ValueError("a tombstone with created_ms")
     return record
 
 
@@ -67,7 +73,8 @@ def describe(record, relative):
     messages = [entry["message"] for entry in body["messages"]]
     reduced = sum("_archive_reduced" in message for message in messages)
     as_text = sum(len(inputs_as_text(message)) for message in messages)
-    return "live", record["id"], relative, len(messages), body["source_message_count"], reduced, as_text
+    counts = len(messages), body["source_message_count"], reduced, as_text
+    return ("live", record["id"], relative, *counts, record.get("created_ms", "-"))
 
 
 def main(project):

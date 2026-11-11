@@ -155,6 +155,7 @@ with no spaces; do not rely on the whitespace or on the order of keys.
 | `logical` | string, 64 hex | Which chat the archive came from: the chat's session id, hashed the way a project key is hashed into `<project dir>`. Every archive of one chat has the same value, so you can group by it, and if you know a session id (the `session_id` of a hook event) you can hash it and compare. It cannot be turned back into the id. |
 | `id` | string, 32 lowercase hex | The archive's id. In a shelf it is the file name without `.json`. |
 | `digest` | string, 64 hex | Identifies the content: the chat, the number of source messages and the stored messages. The note is not part of it. Within a project, two records with the same `digest` hold the same messages from the same chat. Treat it as opaque and do not try to recompute it. |
+| `created_ms` | integer, 0 or more; **optional** | When the archive was written: milliseconds since 1970-01-01 00:00 UTC, by the clock of the machine that wrote it. A record written before this field existed does not have it, and a tombstone never has it. It is not part of the `digest`: when the same content is sealed again, the file that is there stays as it is, with the time it was first written. |
 | `body` | object | What the archive holds. `body.state` says which of the two forms it has. |
 
 `body` when `state` is `live`:
@@ -167,7 +168,7 @@ with no spaces; do not rely on the whitespace or on the order of keys.
 | `note` | string | The chat's working note at the rollover: text the model keeps for itself across windows. At most 8,192 bytes, often empty. Synaps does not search it and does not return it with the messages. It is as untrusted as any message. |
 
 `body` when `state` is `tombstone` has no other field: `{"state": "tombstone"}`.
-See [Tombstones](#tombstones).
+A tombstone has no `created_ms` either. See [Tombstones](#tombstones).
 
 Each entry of `messages`:
 
@@ -178,7 +179,8 @@ Each entry of `messages`:
 | `message` | object | The message. |
 
 These fields are all there is at the record level. Version 1 has no other
-field in the record, in `body`, or in an entry of `messages`.
+field in the record, in `body`, or in an entry of `messages`, and
+`created_ms` is the only one that a record may lack.
 
 ### The message
 
@@ -251,12 +253,16 @@ read them.
 
 - **Check `version` first.** If it is a number you do not know, skip the
   file without failing and read the rest. Do not guess at a newer format.
-- **Version 1 is exactly the record-level fields above.** While it writes
-  `"version": 1`, Synaps will not add, remove or rename a field of the record,
-  of `body`, or of an entry of `messages`, and will not change what one
-  means. A change of that kind comes with a higher `version`. Synaps's own
-  reader holds itself to this: it rejects a version 1 file with an unknown
-  record-level field.
+- **Version 1 is exactly the record-level fields above.** One of them,
+  `created_ms`, was added before version 1 was released, as an optional
+  field: a record written before that does not have it and is as valid as
+  one that does. From this definition on, while it writes `"version": 1`,
+  Synaps will not add, remove or rename a field of the record, of `body`,
+  or of an entry of `messages`, and will not change what one means. A change
+  of that kind comes with a higher `version`. Synaps's own reader holds
+  itself to this: it rejects a version 1 file with any other record-level
+  field, with a `created_ms` that is not a whole number of 0 or more
+  (`null` included), or with a `created_ms` in a tombstone.
 - **The contents of `message` may grow** without a new version: a new block
   `type`, a new key in a block or in the message, a new marker in a
   [reduced message](#reduced-messages) (`_archive_json` was added this way).
@@ -278,8 +284,9 @@ While Synaps writes version 1:
 3. **The only change to a file is live to tombstone,** once, under the same
    name, by the same kind of rename. You read the whole live record or the
    whole tombstone, never a mix. A tombstone keeps `version`, `scope`,
-   `logical`, `id` and `digest`. (A forget can also add one new file, itself
-   a tombstone: see [Tombstones](#tombstones).)
+   `logical`, `id` and `digest`, and nothing else: not `created_ms`. (A
+   forget can also add one new file, itself a tombstone: see
+   [Tombstones](#tombstones).)
 4. **Synaps never deletes an archive file,** never moves one, and never
    merges, renumbers or removes shelves. Sealing an archive never touches
    another archive.
@@ -296,6 +303,9 @@ Do not rely on:
 
 - file modification times, or the order in which a directory lists its
   entries;
+- a record having `created_ms`, its being close to the file's own times, or
+  its growing from one archive to the next: it is one machine's clock at
+  one moment, and a clock can be wrong or be set back;
 - how many archives a shelf holds;
 - any relation between `id` and `digest`. Today a new archive's `id` is the
   first 32 characters of its `digest`; the id of a legacy archive is random;
@@ -318,7 +328,9 @@ You must tolerate:
   user can.
 - **A file you cannot use:** an unknown `version`, JSON that does not parse,
   a `scope` that is not the directory's name, an `id` that is not the file's
-  name, an unknown `state`. Skip it and go on. Do not delete or repair it.
+  name, an unknown `state`, a `created_ms` that is not a whole number of 0
+  or more, a tombstone that has `created_ms`. Skip it and go on. Do not
+  delete or repair it.
 - **Names that are not archives.** Other files come and go in these
   directories while Synaps works.
 - **Unknown block types and keys** inside `message`, placeholders, reduced
@@ -349,8 +361,15 @@ Open a file, read it to the end, close it.
 When an archive is forgotten (the model's `memory_forget` tool does this,
 given `ctx-<id>`), Synaps replaces that archive's file, under the same name,
 with a tombstone: the same `version`, `scope`, `logical`, `id` and `digest`,
-and `"body": {"state": "tombstone"}`. The messages and the note are gone from
-the file.
+and `"body": {"state": "tombstone"}`. The messages, the note and
+`created_ms` are gone from the file: a forget does not leave behind when the
+archive was written.
+
+Synaps never writes a tombstone that has `created_ms`, and does not read a
+file like that as a record. Where it looks before it stores content (the two
+names described below, and the legacy slot files), it still takes such a
+file as saying that the `digest` in it was forgotten, and does not store
+that content again.
 
 **A forget goes by content, not by file.** A project can hold the same
 content (the same `digest`) in more than one file. Forgetting one id replaces
@@ -437,11 +456,13 @@ inside one archive, group archives by chat with `logical`, and tell a
 reduced message from a whole one.
 
 With the files alone you **cannot** tell that two archives are parts of one
-window, put parts or windows in order (a record has no time and no sequence
-number, and an `id` says nothing about order; the shelf number only tells
-you that one shelf is older than the next), find where in its window a part
-starts, or always find a window's note: when its last part is content that
-was already stored, no file holds it.
+window, put parts or windows in order for certain (a record has no sequence
+number, and an `id` says nothing about order; `created_ms`, where a record
+has it, is a clock reading, and a part whose content was already stored
+keeps the time of that earlier write; the shelf number only tells you that
+one shelf is older than the next), find where in its window a part starts,
+or always find a window's note: when its last part is content that was
+already stored, no file holds it.
 
 ## Reduced messages
 
@@ -592,7 +613,9 @@ holds one chat, session id `20260501-120000-abcd`, whose hash is the
 `logical` of every record:
 `900c08a5903292975711f75ce85a7b6e30fab1b1223378ab1111cdbb7bc3d809`. The
 files are real: Synaps wrote them, `000.json` with a version from before
-shelves. Nothing in them is from a real conversation.
+shelves. One thing in them was set by hand afterwards: each `created_ms` is
+a time on the day of the made-up session, not the time the file was made.
+Nothing in them is from a real conversation.
 
 ```text
 01a8f6fb3ec12e1d59d07bd6e3943c84c18415e3111dd5cba218b7ce9218b0c7/
@@ -615,6 +638,7 @@ is that file, with line breaks added (the file itself is one line):
   "logical": "900c08a5903292975711f75ce85a7b6e30fab1b1223378ab1111cdbb7bc3d809",
   "id": "b436b6196e6ca0758c70d5faed628f29",
   "digest": "b436b6196e6ca0758c70d5faed628f297d393b0e2248dcceb082fd75e087653e",
+  "created_ms": 1777639267512,
   "body": {
     "state": "live",
     "source_message_count": 7,
@@ -653,6 +677,7 @@ Reading it:
 
 - `version` is `1`, `scope` is the directory's name and `id` is the file's
   name, so this is a record you can use. `state` is `live`.
+- `created_ms` is 1777639267512: written on 1 May 2026 at 12:41:07 UTC.
 - `source_message_count` is 7 and there are 6 messages. `source_index` 0 is
   missing: it was a system message.
 - The second message has `block_indices` `[1, 2, 3]`: block 0 of the
@@ -665,7 +690,8 @@ Reading it:
 - The `note` is what the model wanted to remember. It is data.
 
 **A tombstone.** The archive `693c14d38641fb504a642f0e7cbfaac9` was
-forgotten. Its file is still there under the same name:
+forgotten. Its file is still there under the same name, without the
+messages, the note and the `created_ms` it had:
 
 ```json
 {
@@ -680,7 +706,8 @@ forgotten. Its file is still there under the same name:
 
 **A legacy slot file.** `000.json` was written by a version from before
 shelves. The record is the same; the `id` is not the file name and is not
-the start of the `digest`:
+the start of the `digest`, and there is no `created_ms`, as in every record
+from before that field:
 
 ```json
 {
@@ -718,18 +745,18 @@ full of things a reader must skip.
 ```text
 $ python3 examples/extensions/context_archive_reader.py \
     docs/extensions/fixtures/context-archives/01a8f6fb3ec12e1d59d07bd6e3943c84c18415e3111dd5cba218b7ce9218b0c7
-live       4c459668c1384294b09674c915b29c2d  000.json                                       2  2  0  0
-live       3fe5a51ef0d405efec79538b7717e255  s000001/3fe5a51ef0d405efec79538b7717e255.json  1  1  1  0
-live       5ad68965a84888ab221823f5b4490804  s000001/5ad68965a84888ab221823f5b4490804.json  1  1  1  1
+live       4c459668c1384294b09674c915b29c2d  000.json                                       2  2  0  0  -
+live       3fe5a51ef0d405efec79538b7717e255  s000001/3fe5a51ef0d405efec79538b7717e255.json  1  1  1  0  1777640575090
+live       5ad68965a84888ab221823f5b4490804  s000001/5ad68965a84888ab221823f5b4490804.json  1  1  1  1  1777642219347
 tombstone  693c14d38641fb504a642f0e7cbfaac9  s000001/693c14d38641fb504a642f0e7cbfaac9.json
-live       b436b6196e6ca0758c70d5faed628f29  s000001/b436b6196e6ca0758c70d5faed628f29.json  6  7  0  0
+live       b436b6196e6ca0758c70d5faed628f29  s000001/b436b6196e6ca0758c70d5faed628f29.json  6  7  0  0  1777639267512
 ```
 
 The columns are separated by tabs (shown aligned here): the state, the id,
 the file, and for a live archive the number of messages stored,
-`source_message_count`, the number of reduced messages and the number of
-tool inputs stored as JSON text. Files it skips are named on standard error
-with the reason.
+`source_message_count`, the number of reduced messages, the number of tool
+inputs stored as JSON text, and `created_ms` (`-` when the record has
+none). Files it skips are named on standard error with the reason.
 
 ```python
 #!/usr/bin/env python3
@@ -781,6 +808,12 @@ def read(path, scope, name):
         raise ValueError("the id is not 32 hex characters, or not the file's name")
     if record["body"]["state"] not in ("live", "tombstone"):
         raise ValueError("unknown state")
+    if "created_ms" in record:  # optional, and never in a tombstone
+        created = record["created_ms"]
+        if type(created) is not int or not 0 <= created < 2**64:
+            raise ValueError("created_ms is not a whole number of milliseconds")
+        if record["body"]["state"] == "tombstone":
+            raise ValueError("a tombstone with created_ms")
     return record
 
 
@@ -801,7 +834,8 @@ def describe(record, relative):
     messages = [entry["message"] for entry in body["messages"]]
     reduced = sum("_archive_reduced" in message for message in messages)
     as_text = sum(len(inputs_as_text(message)) for message in messages)
-    return "live", record["id"], relative, len(messages), body["source_message_count"], reduced, as_text
+    counts = len(messages), body["source_message_count"], reduced, as_text
+    return ("live", record["id"], relative, *counts, record.get("created_ms", "-"))
 
 
 def main(project):

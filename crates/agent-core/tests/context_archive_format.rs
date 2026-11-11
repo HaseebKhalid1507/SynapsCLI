@@ -20,6 +20,13 @@
 //!   `message`), print them again with
 //!   `cargo test -p synaps-core --test context_archive_format -- --ignored --nocapture print_fixtures`
 //!   and describe the change in the document.
+//! - one value in them is not what a store writes again: `created_ms`, the
+//!   time of the write. The tests check that the store writes one and that
+//!   it is the time of the write, and compare everything else. The values in
+//!   the fixtures were put in when the field was added to version 1 (before
+//!   its release): times on the day of the made-up session, in the place
+//!   the store writes the field. Printed again, they are the time of the
+//!   printing; the document's example and the reader's listing quote them.
 //!
 //! Only the store's public API is used. Where a platform has no store
 //! (`ErrorKind::Unsupported`) the tests that need one skip themselves, and
@@ -368,6 +375,11 @@ fn one_part(store: &ArchiveStore, messages: &[SharedMessage], note: &str) -> Str
     window.parts[0].archive.id.clone()
 }
 
+fn now_ms() -> u64 {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    since.unwrap().as_millis() as u64
+}
+
 /// Seal the four fixed windows and forget the second: what `s000001/` in the
 /// fixtures was made by. Returns their ids.
 fn seal_fixture_windows(store: &ArchiveStore) -> [String; 4] {
@@ -425,7 +437,9 @@ fn the_store_writes_the_published_fixtures() {
     let Some(store) = open(&base) else {
         return;
     };
+    let before = now_ms();
     let ids = seal_fixture_windows(&store);
+    let after = now_ms();
     let written = archive_files(&project_dir(&base));
     assert_eq!(written.len(), 4, "four archives, each in a file named by its id: {RECORD_DRIFT}");
 
@@ -440,7 +454,17 @@ fn the_store_writes_the_published_fixtures() {
         let bytes = written
             .get(&shelf_path(id))
             .unwrap_or_else(|| panic!("no file named by the id {id}: {RECORD_DRIFT}"));
-        let (written, published) = (parse(bytes), fixture(&shelf_path(published_id)));
+        let (mut written, mut published) = (parse(bytes), fixture(&shelf_path(published_id)));
+        // A live record says when it was written, which is now for the one
+        // and was then for the other; a tombstone does not say.
+        if published_id == TOMBSTONE {
+            assert!(written.get("created_ms").is_none(), "{RECORD_DRIFT}");
+        } else {
+            let created = written["created_ms"].take().as_u64();
+            let created = created.unwrap_or_else(|| panic!("no created_ms: {RECORD_DRIFT}"));
+            assert!((before..=after).contains(&created), "created_ms is the time of the write");
+            assert!(published["created_ms"].take().is_u64(), "{RECORD_DRIFT}");
+        }
         assert_eq!(shape(&written), shape(&published), "{RECORD_DRIFT}");
         assert_eq!(
             written["body"]["messages"], published["body"]["messages"],
@@ -595,6 +619,9 @@ fn forgetting_leaves_a_tombstone_under_the_same_name() {
     let mut expected = parse(&before[&shelf_path(&gone)]);
     assert_eq!(expected["body"]["state"], "live");
     expected["body"] = json!({"state":"tombstone"});
+    // When it was written goes with the content.
+    let live = expected.as_object_mut().unwrap();
+    assert!(live.remove("created_ms").is_some_and(|created| created.is_u64()), "{RECORD_DRIFT}");
     let tombstone = parse(&after[&shelf_path(&gone)]);
     assert_eq!(tombstone, expected, "{RECORD_DRIFT}");
     let record_keys = ["body", "digest", "id", "logical", "scope", "version"];
@@ -635,7 +662,7 @@ fn the_parts_of_a_window_do_not_name_each_other() {
 
     let files = archive_files(&project_dir(&base));
     assert_eq!(files.len(), sealed.parts.len());
-    let record_keys = ["body", "digest", "id", "logical", "scope", "version"];
+    let record_keys = ["body", "created_ms", "digest", "id", "logical", "scope", "version"];
     let body_keys = ["messages", "note", "source_message_count", "state"];
     let notes: Vec<_> = sealed
         .parts
@@ -881,7 +908,14 @@ fn the_fixtures_have_exactly_the_documented_fields() {
     for (path, bytes) in &files {
         assert!(bytes.len() <= MAX_SEGMENT_BYTES);
         let record = parse(bytes);
-        assert_eq!(keys(&record), ["body", "digest", "id", "logical", "scope", "version"], "{path}");
+        // `created_ms` is the one optional field: in the live records of the
+        // shelf, not in the tombstone, not in the record from before it.
+        let mut record_keys = vec!["body", "digest", "id", "logical", "scope", "version"];
+        if path != LEGACY_SLOT && record["id"] != TOMBSTONE {
+            record_keys.insert(1, "created_ms");
+            assert!(record["created_ms"].is_u64(), "{path}");
+        }
+        assert_eq!(keys(&record), record_keys, "{path}");
         assert_eq!(record["version"], json!(1), "{path}");
         assert_eq!(record["scope"], PROJECT_DIR, "{path}");
         assert_eq!(record["logical"], LOGICAL, "{path}");
@@ -983,6 +1017,7 @@ fn the_document_names_everything_the_fixtures_contain() {
         "block_indices",
         "body",
         "content",
+        "created_ms",
         "digest",
         "id",
         "input",
@@ -1188,16 +1223,17 @@ fn the_reference_reader_reads_the_fixtures_and_skips_everything_else() {
         return;
     };
     let mut rows: Vec<_> = [
-        format!("live\t{LIVE}\t{SHELF}/{LIVE}.json\t6\t7\t0\t0"),
+        format!("live\t{LIVE}\t{SHELF}/{LIVE}.json\t6\t7\t0\t0\t1777639267512"),
         format!("tombstone\t{TOMBSTONE}\t{SHELF}/{TOMBSTONE}.json"),
-        format!("live\t{REDUCED}\t{SHELF}/{REDUCED}.json\t1\t1\t1\t0"),
-        format!("live\t{JSON_TEXT}\t{SHELF}/{JSON_TEXT}.json\t1\t1\t1\t1"),
+        format!("live\t{REDUCED}\t{SHELF}/{REDUCED}.json\t1\t1\t1\t0\t1777640575090"),
+        format!("live\t{JSON_TEXT}\t{SHELF}/{JSON_TEXT}.json\t1\t1\t1\t1\t1777642219347"),
     ]
     .into_iter()
     .map(|line| (line.split('\t').nth(1).unwrap().to_owned(), line))
     .collect();
     rows.sort();
-    let mut expected = vec![format!("live\t{LEGACY}\t{LEGACY_SLOT}\t2\t2\t0\t0")];
+    // The last column is `created_ms`, which the legacy record does not have.
+    let mut expected = vec![format!("live\t{LEGACY}\t{LEGACY_SLOT}\t2\t2\t0\t0\t-")];
     expected.extend(rows.into_iter().map(|(_, line)| line));
 
     // The published directory, where it is.
@@ -1260,6 +1296,26 @@ fn the_reference_reader_reads_the_fixtures_and_skips_everything_else() {
     write(shelf.join(named('4')), &record(&|record| {
         record["body"] = json!({"state":"compacted"});
         record["id"] = json!("4".repeat(32));
+    }));
+    // A `created_ms` that is not a whole number of milliseconds, and one in
+    // a tombstone.
+    let not_a_time = [
+        ('a', json!(null)),
+        ('b', json!("1777639267512")),
+        ('c', json!(1.5)),
+        ('d', json!(-1)),
+        ('e', json!(true)),
+    ];
+    for (digit, created) in not_a_time {
+        write(shelf.join(named(digit)), &record(&|record| {
+            record["created_ms"] = created.clone();
+            record["id"] = json!(digit.to_string().repeat(32));
+        }));
+    }
+    write(shelf.join(named('0')), &record(&|record| {
+        assert!(record["created_ms"].is_u64());
+        record["body"] = json!({"state":"tombstone"});
+        record["id"] = json!("0".repeat(32));
     }));
     write(shelf.join(named('5')), &live[..live.len() / 2]);
     write(shelf.join(named('6')), b"[1, 2, 3]");

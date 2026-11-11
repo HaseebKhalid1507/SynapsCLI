@@ -101,6 +101,9 @@
 //! record with a content-free id/digest/scope tombstone, and is the only
 //! operation that replaces a file. The digest covers ONLY
 //! the eligible projection and source indices, not the note or forbidden data.
+//! Nor does it cover `created_ms`, the time a live record was first written:
+//! a seal writes the time of the write, a record from before the field has
+//! none, and a tombstone never has one.
 //! Identical projections in one logical conversation deduplicate permanently;
 //! a changed note does not create a new segment. Retrying a tombstoned projection
 //! returns PermissionDenied. A successful seal fsyncs data and directory before
@@ -660,7 +663,47 @@ struct Record {
     logical: String,
     id: String,
     digest: String,
+    /// When the record was first written, in milliseconds since the Unix
+    /// epoch. Optional: a record from before the field existed has none and
+    /// is as valid as one that has it, and a tombstone never has one (a
+    /// forget leaves no time behind). Not part of the digest, so it says
+    /// nothing about which content a record holds. No other field may be
+    /// added to a version 1 record: any other unknown key is still refused.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    created_ms: Option<u64>,
     body: Body,
+}
+
+/// A `created_ms` that is in a record is a whole number of milliseconds:
+/// `null` is not a way to leave it out.
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
+}
+
+/// When a record is to say it was written, and what time its file is to
+/// carry: what an import supplies for a record that was first written
+/// somewhere else. A seal has neither to give and uses [`Written::now`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Written {
+    /// The record's `created_ms`, stored as given. `None` stores a record
+    /// without the field.
+    pub(crate) created_ms: Option<u64>,
+    /// The time of last access and modification of the record's file.
+    /// `None` leaves it the time of the write.
+    pub(crate) modified: Option<std::time::SystemTime>,
+}
+
+impl Written {
+    /// What a seal writes: the time of the write. A clock set before 1970
+    /// has no such number, and the record then goes without the field
+    /// rather than the save be refused.
+    fn now() -> Self {
+        let since_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        Written {
+            created_ms: since_epoch.ok().and_then(|since| u64::try_from(since.as_millis()).ok()),
+            modified: None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -975,9 +1018,25 @@ impl ArchiveStore {
             .iter()
             .filter(|archived| archived.message.get(REDUCED_KEY).is_some())
             .count();
-        let _lock = self.exclusive()?;
-        let (reference, note) = self.store(projection)?;
+        let (reference, note) = self.seal_projection(projection, None)?;
         Ok((reference, note, reduced))
+    }
+
+    /// Store `projection` under the lock, as every seal does. `written` is
+    /// `None` for a seal: the record gets the time of the write as its
+    /// `created_ms`. An import, which stores records that were first written
+    /// somewhere else, gives [`Written`] instead, and then that is what is
+    /// stored: nothing on the way to the file puts the time of this write in
+    /// its place, and a `created_ms` of `None` stores a record without the
+    /// field. Content that is already stored is the answer either way and is
+    /// left as it is, its `created_ms` and the time of its file included.
+    pub(crate) fn seal_projection(
+        &self,
+        projection: ArchiveProjection,
+        written: Option<Written>,
+    ) -> io::Result<(ArchiveRef, String)> {
+        let _lock = self.exclusive()?;
+        self.store(projection, written.unwrap_or_else(Written::now))
     }
 
     /// What a seal does once it holds the lock: find `projection` stored, or
@@ -992,7 +1051,11 @@ impl ArchiveStore {
     /// the other name holds. Only then is it written, under the first half
     /// if that name is free and under the second if something else has the
     /// first. Nothing else in the directory refuses it.
-    fn store(&self, projection: ArchiveProjection) -> io::Result<(ArchiveRef, String)> {
+    fn store(
+        &self,
+        projection: ArchiveProjection,
+        written: Written,
+    ) -> io::Result<(ArchiveRef, String)> {
         let ArchiveProjection {
             digest,
             source_message_count,
@@ -1006,6 +1069,7 @@ impl ArchiveStore {
             logical: self.logical.clone(),
             id: String::new(),
             digest,
+            created_ms: written.created_ms,
             body: Body::Live {
                 source_message_count,
                 messages,
@@ -1053,7 +1117,8 @@ impl ArchiveStore {
             let bytes = bounded_json(&record, MAX_SEGMENT_BYTES)?;
             // Created new: a file that is already there is never renamed over.
             let shelf = self.writable_shelf(&shelves)?;
-            match shelf.publish(&archive_name(&record.id), &bytes, true) {
+            let name = archive_name(&record.id);
+            match shelf.publish_dated(&name, &bytes, true, written.modified) {
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 result => return result.and_then(|()| Ok((record.reference()?, note))),
             }
@@ -1404,6 +1469,7 @@ impl ArchiveStore {
                     logical: asked.logical.clone(),
                     id: id.to_owned(),
                     digest: digest.to_owned(),
+                    created_ms: None,
                     body: Body::Tombstone,
                 };
                 let bytes = bounded_json(&guard, MAX_SEGMENT_BYTES)?;
@@ -1432,7 +1498,10 @@ impl ArchiveStore {
                 dir.sync()?;
                 continue;
             }
+            // A tombstone keeps what names the record and nothing else: not
+            // the content, and not when it was written.
             record.body = Body::Tombstone;
+            record.created_ms = None;
             dir.publish(&name, &bounded_json(&record, MAX_SEGMENT_BYTES)?, false)?;
             ids.push(record.id);
         }
@@ -1682,6 +1751,8 @@ impl ArchiveStore {
             || !record.digest.bytes().all(|b| b.is_ascii_hexdigit())
             // A shelf file is named by its id; only a legacy slot is not.
             || (name != archive_name(&record.id) && slot_number(name).is_none())
+            // A tombstone is what names the record and nothing else.
+            || (matches!(record.body, Body::Tombstone) && record.created_ms.is_some())
         {
             return Err(corrupt());
         }
@@ -2999,6 +3070,21 @@ impl PrivateDir {
     /// `AlreadyExists` and is left as it is, whatever it is. Without it
     /// (forget) the file at `name` is replaced.
     fn publish(&self, name: &str, bytes: &[u8], create_new: bool) -> io::Result<()> {
+        self.publish_dated(name, bytes, create_new, None)
+    }
+    /// [`publish`](Self::publish) that can also give the file a time of last
+    /// access and modification, for a record that was first written
+    /// somewhere else. The time is set on the temporary file, through its
+    /// own descriptor, before it is synced and renamed: the file appears
+    /// under its name with that time, and the time is on disk with the
+    /// content. No directory's time is ever set.
+    fn publish_dated(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        create_new: bool,
+        modified: Option<std::time::SystemTime>,
+    ) -> io::Result<()> {
         let target = c_name(name)?;
         // Created new under a name no other write has: nothing else writes
         // to this file, removes it while it is fresh or renames it.
@@ -3006,6 +3092,10 @@ impl PrivateDir {
         let mut file = self.open(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
         let result = (|| {
             file.write_all(bytes)?;
+            if let Some(time) = modified {
+                let times = std::fs::FileTimes::new().set_accessed(time).set_modified(time);
+                file.set_times(times)?;
+            }
             file.sync_all()?;
             if create_new {
                 self.rename_new(&tmp, &target)?;
@@ -3199,6 +3289,15 @@ impl PrivateDir {
         Self::unsupported()
     }
     fn publish(&self, _: &str, _: &[u8], _: bool) -> io::Result<()> {
+        Self::unsupported()
+    }
+    fn publish_dated(
+        &self,
+        _: &str,
+        _: &[u8],
+        _: bool,
+        _: Option<std::time::SystemTime>,
+    ) -> io::Result<()> {
         Self::unsupported()
     }
     fn discard(&self, _: &str) -> io::Result<()> {
@@ -3604,6 +3703,8 @@ mod tests {
             logical: store.logical.clone(),
             id: uuid::Uuid::new_v4().simple().to_string(),
             digest: projection.digest,
+            // As every record was then: without the field.
+            created_ms: None,
             body: Body::Live {
                 source_message_count: projection.source_message_count,
                 messages: projection.messages,
@@ -3797,9 +3898,10 @@ mod tests {
         assert_eq!(row["note"], "the note");
         // A tombstone in any copy, whichever file it is, makes it forgotten.
         let tombstone = |file: &Path| {
-            let live = std::fs::read_to_string(file).unwrap();
-            let body = &live[live.find("\"body\":").unwrap()..];
-            std::fs::write(file, live.replace(body, "\"body\":{\"state\":\"tombstone\"}}")).unwrap();
+            let mut record = json_of(file);
+            record["body"] = json!({"state":"tombstone"});
+            record.as_object_mut().unwrap().remove("created_ms");
+            std::fs::write(file, serde_json::to_vec(&record).unwrap()).unwrap();
         };
         tombstone(&newer.join(&name));
         tombstone(&newer.join(archive_name(&digest[32..])));
@@ -4631,6 +4733,7 @@ mod tests {
             logical: store.logical.clone(),
             id: id.to_owned(),
             digest: projection.digest,
+            created_ms: None,
             body: Body::Live {
                 source_message_count: projection.source_message_count,
                 messages: projection.messages,
@@ -6207,9 +6310,15 @@ mod tests {
             note,
         };
         assert_eq!(window, expected);
+        // The same record, but for when each was written.
+        let undated = |dir: PathBuf| {
+            let mut record: Value = serde_json::from_slice(&std::fs::read(dir).unwrap()).unwrap();
+            assert!(record["created_ms"].take().is_u64());
+            record
+        };
         assert_eq!(
-            std::fs::read(only_archive_file(&directory(&tmp, &store))).unwrap(),
-            std::fs::read(only_archive_file(&directory(&strict_tmp, &strict))).unwrap()
+            undated(only_archive_file(&directory(&tmp, &store))),
+            undated(only_archive_file(&directory(&strict_tmp, &strict)))
         );
         // In one store the two calls find each other's segment.
         assert_eq!(strict.seal_window(&messages, "another note").unwrap(), window);
@@ -6779,6 +6888,215 @@ mod tests {
         assert_eq!(cut(4000, &[1000, 2000, 3000]), seven);
         // First, last and next to each other: no part is empty.
         assert_eq!(cut(4, &[0, 1, 3]), [(0, 1), (1, 1), (2, 0), (3, 1)]);
+    }
+
+    fn now_ms() -> u64 {
+        let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        since.unwrap().as_millis() as u64
+    }
+    fn json_of(path: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+    fn top_level(record: &Value) -> Vec<&str> {
+        record.as_object().unwrap().keys().map(String::as_str).collect()
+    }
+
+    /// A seal writes when it wrote. The time is not part of the digest, so
+    /// the same content sealed later is found, and what is stored keeps the
+    /// time it was first written with.
+    #[test]
+    fn a_seal_records_the_time_of_the_write_and_a_later_seal_leaves_it() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let messages = text("sealed once");
+        let before = now_ms();
+        let sealed = store.seal(&messages, "note").unwrap();
+        let after = now_ms();
+        let file = only_archive_file(&dir);
+        let record = json_of(&file);
+        // serde_json keeps the keys of a map sorted.
+        let fields = ["body", "created_ms", "digest", "id", "logical", "scope", "version"];
+        assert_eq!(top_level(&record), fields);
+        let created = record["created_ms"].as_u64().unwrap();
+        assert!((before..=after).contains(&created), "{before} <= {created} <= {after}");
+        // In the file it follows the digest and comes before the body.
+        let raw = std::fs::read_to_string(&file).unwrap();
+        let digest = record["digest"].as_str().unwrap();
+        let expected = format!("\"digest\":\"{digest}\",\"created_ms\":{created},\"body\":{{");
+        assert!(raw.contains(&expected));
+
+        // The digest is what it was before the field existed: the content's.
+        let projection = project_archive("synthetic-logical", &messages, "note", None).unwrap();
+        assert_eq!(record["digest"], projection.digest.as_str());
+        assert_eq!(sealed.id, projection.digest[..32]);
+
+        // Sealed again, later: the same segment, and not a byte of it changed.
+        let snapshot_before = snapshot(&dir);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(store.seal(&messages, "another note").unwrap(), sealed);
+        assert_eq!(store.seal_window(&messages, "").unwrap().parts[0].archive, sealed);
+        assert_eq!(snapshot(&dir), snapshot_before);
+        assert_eq!(json_of(&file)["created_ms"], created);
+    }
+
+    /// What an import gives is what is stored: the record's `created_ms` and
+    /// the time of its file, set before the file has its name. No directory
+    /// gets that time, and content that is already stored is not touched.
+    #[test]
+    fn a_supplied_created_ms_and_file_time_are_stored_as_given() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let project = |words: &str| {
+            project_hashed(&store.logical, &text(words), "", None, Reduce::None).unwrap()
+        };
+        // 9 September 2001, and a file time that is not the same instant.
+        let created_ms = 1_000_000_000_123;
+        let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_500);
+        let given = Written {
+            created_ms: Some(created_ms),
+            modified: Some(modified),
+        };
+        let started = std::time::SystemTime::now() - Duration::from_secs(5);
+        let (sealed, _) = store.seal_projection(project("from another store"), Some(given)).unwrap();
+        let file = dir.join("s000001").join(archive_name(&sealed.id));
+        // Before the file is read here, which may move its time of access.
+        let metadata = std::fs::metadata(&file).unwrap();
+        assert_eq!(metadata.modified().unwrap(), modified);
+        assert_eq!(metadata.accessed().unwrap(), modified);
+        assert_eq!(json_of(&file)["created_ms"], created_ms);
+        for directory in [dir.clone(), dir.join("s000001")] {
+            let changed = std::fs::metadata(&directory).unwrap().modified().unwrap();
+            assert!(changed >= started, "{directory:?} was given the time of a file");
+        }
+        assert_eq!(store.fetch(&sealed.id, 0, 1).unwrap(), text("from another store"));
+
+        // The same content with another time: found, and left as it is.
+        let other = Written {
+            created_ms: Some(5),
+            modified: None,
+        };
+        let before = snapshot(&dir);
+        let again = store.seal_projection(project("from another store"), Some(other)).unwrap();
+        assert_eq!(again.0, sealed);
+        assert_eq!(store.seal(&text("from another store"), "").unwrap(), sealed);
+        assert_eq!(snapshot(&dir), before);
+        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), modified);
+
+        // A record that never had a time is stored without one, not with
+        // the time of the import; its file has the time of the write.
+        let undated = Written {
+            created_ms: None,
+            modified: None,
+        };
+        let (plain, _) = store.seal_projection(project("never had a time"), Some(undated)).unwrap();
+        let file = dir.join("s000001").join(archive_name(&plain.id));
+        let fields = ["body", "digest", "id", "logical", "scope", "version"];
+        assert_eq!(top_level(&json_of(&file)), fields);
+        assert!(std::fs::metadata(&file).unwrap().modified().unwrap() >= started);
+        assert_eq!(store.fetch(&plain.id, 0, 1).unwrap(), text("never had a time"));
+    }
+
+    /// `created_ms` is the one field a version 1 record may have or not
+    /// have. With it or without it the record is read; with anything else
+    /// at the top level, or with a `created_ms` that is not a whole number
+    /// of milliseconds, it is not a record.
+    #[test]
+    fn created_ms_is_optional_and_no_other_field_is_accepted() {
+        let (tmp, store) = setup();
+        let shelf = directory(&tmp, &store).join("s000001");
+        std::fs::create_dir(&shelf).unwrap();
+        let id = "a".repeat(32);
+        let file = shelf.join(archive_name(&id));
+        let words = text("with or without");
+        let without = record_bytes(&store, &id, &words, |_| {});
+        assert!(!String::from_utf8_lossy(&without).contains("created_ms"));
+        let with = |value: Value| {
+            let mut record: Value = serde_json::from_slice(&without).unwrap();
+            record["created_ms"] = value;
+            serde_json::to_vec(&record).unwrap()
+        };
+        for valid in [without.clone(), with(json!(0)), with(json!(1_757_000_000_000u64)), with(json!(u64::MAX))] {
+            std::fs::write(&file, valid).unwrap();
+            assert_eq!(store.fetch(&id, 0, 1).unwrap(), words);
+            assert_eq!(store.search("without", 4).unwrap().len(), 1);
+        }
+        let mut extra: Value = serde_json::from_slice(&without).unwrap();
+        extra["created_at"] = json!(5);
+        let mut nested: Value = serde_json::from_slice(&without).unwrap();
+        nested["body"]["created_ms"] = json!(5);
+        let invalid = [
+            with(Value::Null),
+            with(json!(-1)),
+            with(json!(1.5)),
+            with(json!("1757000000000")),
+            with(json!(true)),
+            serde_json::to_vec(&extra).unwrap(),
+            serde_json::to_vec(&nested).unwrap(),
+        ];
+        for (index, bytes) in invalid.into_iter().enumerate() {
+            std::fs::write(&file, bytes).unwrap();
+            let error = store.fetch(&id, 0, 1).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "case {index}: {error}");
+        }
+    }
+
+    /// A forget leaves no time behind: the tombstone keeps what names the
+    /// record and nothing else, whatever the live record had.
+    #[test]
+    fn a_tombstone_carries_no_created_ms() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let sealed = store.seal(&text("to be forgotten"), "").unwrap();
+        let file = only_archive_file(&dir);
+        assert!(json_of(&file)["created_ms"].is_u64());
+        store.forget(&sealed.id).unwrap();
+        let tombstone = json_of(&file);
+        let fields = ["body", "digest", "id", "logical", "scope", "version"];
+        assert_eq!(top_level(&tombstone), fields);
+        assert_eq!(tombstone["body"], json!({"state":"tombstone"}));
+
+        // Nor does the tombstone a forget adds for a copy that was stored
+        // under no name of its digest: here, a legacy slot.
+        let slot = seal_legacy_slot(&store, 0, &text("forgotten in a slot"), "");
+        store.forget(&slot.id).unwrap();
+        for path in shelf_files(&dir).into_iter().chain([dir.join(slot_name(0))]) {
+            let record = json_of(&path);
+            assert_eq!(top_level(&record), fields, "{path:?}");
+            assert_eq!(record["body"]["state"], "tombstone");
+        }
+        assert_eq!(shelf_files(&dir).len(), 2);
+    }
+
+    /// A tombstone that has `created_ms` is not a record: nothing is read
+    /// from it. It still says that its content was forgotten, as any file
+    /// that names the digest with the state `tombstone` does.
+    #[test]
+    fn a_tombstone_with_created_ms_is_not_a_record_and_still_blocks_a_seal() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let words = text("forgotten somewhere else");
+        let digest = project_hashed(&store.logical, &words, "", None, Reduce::None).unwrap().digest;
+        let id = &digest[..32];
+        let shelf = dir.join("s000001");
+        std::fs::create_dir(&shelf).unwrap();
+        let file = shelf.join(archive_name(id));
+        let dated = |created_ms| {
+            record_bytes(&store, id, &words, |record| {
+                record.body = Body::Tombstone;
+                record.created_ms = created_ms;
+            })
+        };
+        // Without the field it is the tombstone a forget writes.
+        std::fs::write(&file, dated(None)).unwrap();
+        assert_eq!(store.fetch(id, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
+        // With it, it is not a record.
+        let invalid = dated(Some(1_757_000_000_000));
+        std::fs::write(&file, &invalid).unwrap();
+        assert_eq!(store.fetch(id, 0, 1).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let error = store.seal(&words, "").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert_eq!(shelf_files(&dir), std::slice::from_ref(&file));
+        assert_eq!(std::fs::read(&file).unwrap(), invalid);
     }
 
     /// A project directory from before shelves: a live segment in slot 0, a
@@ -7837,7 +8155,10 @@ mod lock_tests {
                             start.wait();
                             let note = format!("note of writer {writer}");
                             let name = if same { "any".to_owned() } else { format!("writer {writer}") };
-                            let seal = |round| store.store(project(&window(format!("{name} window {round};")), &note));
+                            let seal = |round| {
+                                let window = window(format!("{name} window {round};"));
+                                store.store(project(&window, &note), Written::now())
+                            };
                             (0..rounds).map(|round| seal(round).unwrap()).collect()
                         })
                     })
