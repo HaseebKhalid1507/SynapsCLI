@@ -46,8 +46,12 @@ hook event and `tool.call` also carries `cwd`, the chat's working folder
 Two kinds of call used to send `null` and now carry the chat's id, on their
 hook events and in `tool.call`: the tool calls of a model an extension
 provides (the host runs them in a loop of their own), and an extension tool
-run by a plugin slash command. For a worker on such a model the id is still
-`null`, as for every worker.
+run by a plugin slash command. No worker runs on a model an extension
+provides: a worker's model is an exact `provider/model` id that the chat's
+worker policy authorizes (`subagent`, `subagent_start` and `subagent_resume`
+all go through `OrchestrationRuntime::resolve_and_authorize`), and a
+`plugin:provider:model` id has no `/`, so it is refused there;
+`subagent_model_authorize` accepts only ids of the built-in catalogs.
 
 ## Why: one sidecar, many sessions
 

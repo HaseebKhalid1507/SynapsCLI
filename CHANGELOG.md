@@ -313,6 +313,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Docs: `docs/extensions/session-id.md` no longer describes a worker on
+  a model an extension provides.** No such worker can exist; the page now
+  says why (a worker's model is an authorized `provider/model` id). The
+  folder tests of hook events and extension tool calls
+  (`session_actor_hook_cwd`) now check in every case that the extension
+  heard from no session but the test's own.
 - **Extension models: stop ends a tool call in their tool loop.** On a
   `plugin:provider:model` model the loop that runs the model's tool calls
   did not watch the turn's cancel, so after stop the turn waited for the
