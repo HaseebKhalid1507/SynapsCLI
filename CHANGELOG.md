@@ -17,6 +17,14 @@ All notable changes to this project will be documented in this file.
   `unified_reset`. With that the log shows how fast a run is using up the
   weekly allowance, before the provider starts refusing requests. Nothing
   is recorded when the headers are absent.
+- **The api-log records the thinking level of each request**
+  (`telemetry = basic` and up): `thinking` is the level the request was
+  made at by its config name (`medium`, `xhigh`, ...; a worker's own level
+  on a worker record), and `effort` is the `output_config.effort` value the
+  request carried, read from the body that was sent. `effort` is absent
+  when the request carried none (thinking off or adaptive, or a model that
+  takes a token budget). Until now the level was in no log, so what a
+  level costs could only be worked out from worker archives.
 - **Owned daemon sessions.** A client can create a session bound to its
   connection (`Attach::Create{owned}`; `SocketTransport::create_owned`;
   `synaps attach --owned`). When the owner disconnects for any reason

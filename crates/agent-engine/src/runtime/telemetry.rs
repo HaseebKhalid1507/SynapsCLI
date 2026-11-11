@@ -5,8 +5,9 @@
 //! (mode 0600, O_NOFOLLOW — same hardening as the legacy usage log).
 //!
 //! `basic` records timing, usage, an estimated `cost_usd` (from
-//! [`agent_core::pricing`]), the persisted conversation id (`session_id`,
-//! the `~/.synaps-cli/sessions/<id>.json` id) and the request-trace
+//! [`agent_core::pricing`]), the thinking level of the request (`thinking`,
+//! and `effort` when the request carried one), the persisted conversation
+//! id (`session_id`, the `~/.synaps-cli/sessions/<id>.json` id) and the request-trace
 //! correlation ids (`runtime_session_id` / `turn_id` / `trace_request_id`),
 //! so a record joins both its session and its `request-trace.jsonl` line.
 //! Worker records also carry the worker's identity (`worker_agent`,
@@ -288,6 +289,16 @@ pub struct TelemetryRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msg_id: Option<String>,
     pub model: String,
+    /// The thinking level the request was made at, by its config name
+    /// (`off`, `adaptive`, `low`, `medium`, `high`, `xhigh`, `max`, ...): the
+    /// session's level, or on a worker record the worker's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// The `output_config.effort` value the request carried. Absent when it
+    /// carried none: thinking off or adaptive, or a model that takes a token
+    /// budget instead of an effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// 1-based attempt number that succeeded (1 = no retries).
     pub attempt: u32,
     /// Number of refusal retries consumed (0 = no refusals). Present only when > 0.
@@ -610,6 +621,8 @@ mod tests {
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("request_id"));
+        assert!(!json.contains("thinking"), "unknown level is not written");
+        assert!(!json.contains("effort"));
         assert!(!json.contains("ratelimit"));
         assert!(!json.contains("cache_diag"));
         assert!(!json.contains("keepwarm"), "turn records carry no keepwarm field");

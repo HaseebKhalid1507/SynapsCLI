@@ -1509,6 +1509,9 @@ impl ApiMethods {
             true,
         );
         let mut body = parts.body;
+        // api-log: the effort this body carries, read from the body itself so
+        // the record says what was sent, not what the level implies.
+        let telem_effort = body.effort().map(str::to_owned);
         // Before the keep-warm fingerprint below: a ping's prefix is the
         // turn's, `thinking` included.
         body.set_thinking_display(options.thinking_display);
@@ -2516,6 +2519,8 @@ impl ApiMethods {
                     request_id: telem_request_id,
                     msg_id: state.telem_msg_id,
                     model: model.to_string(),
+                    thinking: Some(reasoning_level.as_str().to_string()),
+                    effort: telem_effort.clone(),
                     attempt: attempt + 1, // 1-based: 0 = first try, N = (N+1)th send
                     refusal_retries_used: if refusal_attempts > 0 {
                         Some(refusal_attempts)
