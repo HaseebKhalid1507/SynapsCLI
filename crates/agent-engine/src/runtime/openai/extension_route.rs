@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::extensions::manager::ExtensionManager;
 use crate::runtime::trace::extension as trace_ext;
-use crate::tools::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits};
+use crate::tools::{ToolChannels, TurnToolContext};
 
 type RouteResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -49,12 +49,12 @@ fn local_gate_session() -> crate::tools::activation::SessionId {
 /// loop; `None` (internal/sync callers) fails closed to a locally minted
 /// identity with the same default-core policy.
 ///
-/// `memory_backend`, `conversation_id`, `cwd` and `tool_hook_bus` are the
-/// chat that loop's tool calls belong to, as the stream loop hands them to
-/// its own tools: the tools run in `cwd` and act on that binding's project,
-/// and the hook events and `tool.call`s they cause name the conversation and
-/// the folder. `None` (internal callers) = no conversation, the process
-/// folder, no notify-only events.
+/// `tool_context` is what the turn's tool calls are given: the one the
+/// caller's own tool loop makes its contexts from, so the tools of this
+/// loop run in the chat's folder with the chat's environment, act on the
+/// chat's project, and the hook events and `tool.call`s they cause name the
+/// conversation and the folder. `None` (internal callers) = a call for no
+/// chat ([`TurnToolContext::no_chat`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn route_extension_provider(
     manager: Arc<tokio::sync::RwLock<ExtensionManager>>,
@@ -72,10 +72,7 @@ pub(crate) async fn route_extension_provider(
     cancel: &tokio_util::sync::CancellationToken,
     tool_session_id: Option<&crate::tools::activation::SessionId>,
     session_tool_set: Option<&crate::tools::activation::SharedSessionToolSet>,
-    memory_backend: Option<&crate::memory_backend::MemoryBinding>,
-    conversation_id: Option<&str>,
-    cwd: Option<&std::path::Path>,
-    tool_hook_bus: Option<&Arc<crate::extensions::hooks::HookBus>>,
+    tool_context: Option<&TurnToolContext>,
     trace: &crate::runtime::trace::TraceContext,
 ) -> RouteResult {
     let provider_runtime_id = format!("{}:{}", plugin_id, provider_id);
@@ -170,12 +167,13 @@ pub(crate) async fn route_extension_provider(
         // Generation-pinned for the WHOLE interior tool loop (Task 18): the
         // caller's schema (full set, or the flag-on session projection) is
         // snapshotted here and never re-projected between interior rounds.
-        // Sound because the interior loop's ToolContext carries
-        // `tool_activation: None` (below), so `activate_tools` cannot mutate
-        // the retained session set mid-loop — activations only surface on
-        // the next OUTER stream round, which re-projects. If activation
-        // capability is ever wired into this route, `tools` must be
-        // recomputed per interior round from the session set instead.
+        // Sound because the interior loop's ToolContext carries no
+        // `tool_activation` (a `TurnToolContext` never does; only a stream
+        // dispatch adds it), so `activate_tools` cannot mutate the retained
+        // session set mid-loop — activations only surface on the next OUTER
+        // stream round, which re-projects. If activation capability is ever
+        // wired into this route, `tools` must be recomputed per interior
+        // round from the session set instead.
         tools: tools_schema.as_ref().clone(),
         temperature,
         max_tokens,
@@ -314,10 +312,14 @@ pub(crate) async fn route_extension_provider(
             .await,
         );
         let result = if let Some(tools) = tools_shared {
-            let registry = tools.read().await;
+            // A snapshot, not the lock: the loop's tools are the chat's and
+            // may read this registry themselves (starting a worker does),
+            // which under a read guard held for the whole provider round
+            // would wait for ever behind any writer that queued meanwhile.
+            let registry = tools.read().await.clone();
             // ═══ EXECUTION GATE (Task 16/17, spec §7.1) ═══ ONE session
             // tool set for the whole interior tool loop, resolved here
-            // under the SAME registry read guard the loop holds for the
+            // against the SAME registry snapshot the loop uses for the
             // entire outer call: the catalog cannot drift between interior
             // rounds, so one snapshot at one generation governs every tool
             // call the extension provider requests. When the runtime
@@ -337,55 +339,25 @@ pub(crate) async fn route_extension_provider(
                 registry.catalog(),
                 || tool_session_id.cloned().unwrap_or_else(local_gate_session),
             );
+            let turn_tools = tool_context.cloned().unwrap_or_else(TurnToolContext::no_chat);
             crate::extensions::runtime::process::complete_provider_with_tools(
                 handler.clone(),
                 params,
                 &registry,
                 &session_tools,
                 &hook_bus,
-                || ToolContext {
-                    channels: ToolChannels {
+                // A call's context is made from the turn's, like a call of
+                // the caller's own loop, with the turn's event channel (a
+                // worker started here is shown like any other). No delta
+                // lane: these calls are not announced to the frontend, so
+                // partial output would have no tool call to belong to.
+                || {
+                    turn_tools.for_call(ToolChannels {
                         tx_delta: None,
-                        tx_events: None,
-                    },
-                    capabilities: ToolCapabilities {
-                        session_allow_all: None,
-                        launch_cancel: None,
-                        memory_backend: memory_backend.cloned(),
-                        telemetry: None,
-                        tool_register_tx: None,
-                        session_manager: None,
-                        subagent_registry: None,
-                        event_queue: None,
-                        delegation_parent: None,
-                        codex_parent_plan: None,
-                        secret_prompt: None,
-                        orchestration: None,
-                        tool_activation: None,
-                        mcp_leases: None,
-                        extension_leases: None,
-                        memory_context: None,
-                        // The chat's folder: where these tools resolve paths
-                        // and start commands.
-                        cwd: cwd.map(std::path::Path::to_path_buf),
-                        env: None,
-                        env_stripped: Vec::new(),
-                        env_warned: Default::default(),
-                        session_id: conversation_id.map(str::to_string),
-                        // The chat's bus, not the manager's: a worker's view
-                        // sends no notify-only event, here as in its stream.
-                        hook_bus: tool_hook_bus.cloned(),
-                        continuation: None,
-                    },
-                    limits: ToolLimits {
-                        max_tool_output: 30000,
-                        max_tool_buffer: 256 * 1024,
-                        bash_timeout: 30,
-                        bash_max_timeout: 300,
-                        subagent_timeout: 300,
-                    },
+                        tx_events: Some(tx.clone()),
+                    })
                 },
-                30000,
+                turn_tools.limits().max_tool_output,
                 8,
                 &mut tools_requested,
             )

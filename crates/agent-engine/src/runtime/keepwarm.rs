@@ -679,10 +679,7 @@ impl Runtime {
 
         let options = ApiOptions {
             // A ping runs no tool: nothing of the chat's goes with it.
-            memory_backend: None,
-            conversation_id: None,
-            cwd: None,
-            hook_bus: None,
+            tool_context: None,
             use_1m_context: self.context_window_override == Some(1_000_000),
             cache_ttl: self.cache_ttl,
             // The SESSION's latch: a ping that sees the silent 1h→5m

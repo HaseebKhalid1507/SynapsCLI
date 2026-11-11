@@ -374,6 +374,32 @@ All notable changes to this project will be documented in this file.
   is new; so does the line `memory_forget` appends, and an extension's
   `memory.append`. A save costs one file sync more than before. The file
   format is unchanged, and older versions read the files as before.
+- **Daemon: commands run by an extension-provided model get the chat's
+  environment, and its tools everything else a chat's tools get.** A model
+  served by an extension (`plugin:provider:model`) runs its tool calls in a
+  loop of its own, and that loop built its tool context by hand, with the
+  chat's folder and project but nothing else of the chat. In a daemon-hosted
+  chat `bash` there ran in the chat's folder with the daemon's whole
+  environment: the daemon's `PATH`, `HOME` and virtualenv, and any variable
+  the client had stripped as a secret, if the daemon's own environment had
+  it. That loop now makes each call's context from the one the turn's other
+  tool calls are made from, so the two cannot differ again. For a chat on
+  such a model this means: commands get the session's environment and the
+  stripped-secret notice; the `shell_*` tools have the chat's shell
+  sessions (they answered "Shell sessions not available"); an extension's
+  Confirm prompts the user and "Allow all" is remembered (it was refused:
+  "no interactive prompt is available"); `memory_context` and
+  `context_checkpoint` act on the chat; and output and time limits are the
+  configured `max_tool_output`, `bash_timeout`, `bash_max_timeout` and
+  `subagent_timeout`, not 30,000 bytes and 30 / 300 / 300 seconds. The
+  `subagent*` tools are handed the chat's delegation policy, worker
+  registry and event queue, and deferred MCP and extension tools the
+  session's leases; without them they answered "delegation policy
+  unavailable" and started nothing. Still not there: `activate_tools` and
+  `search_tools`, because the tool list of one provider round is fixed.
+  Without the daemon the environment was already the same; the rest
+  changes there too. Engine API: `tools::TurnToolContext`;
+  `ToolCapabilities` is `Clone + Default`.
 - **Daemon: a chat's `context_checkpoint` reaches that chat, and no chat
   takes a tool away from another.** Every chat on a daemon shares one tool
   registry, and three things that belong to one chat were kept in it. A chat

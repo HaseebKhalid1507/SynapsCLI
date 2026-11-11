@@ -131,10 +131,7 @@ impl ApiMethods {
             options.codex_request_role,
             options.tool_session_id.as_ref(),
             options.session_tool_set.as_ref(),
-            options.memory_backend.as_ref(),
-            options.conversation_id.as_deref(),
-            options.cwd.as_deref(),
-            options.hook_bus.as_ref(),
+            options.tool_context.as_ref(),
             &options.trace,
             options.suppress_stream_deltas,
         )
@@ -634,10 +631,7 @@ impl ApiMethods {
             // default-core gate identity — never to ungated execution.
             None,
             None,
-            options.memory_backend.as_ref(),
-            options.conversation_id.as_deref(),
-            options.cwd.as_deref(),
-            options.hook_bus.as_ref(),
+            options.tool_context.as_ref(),
             &options.trace,
             options.suppress_stream_deltas,
         )

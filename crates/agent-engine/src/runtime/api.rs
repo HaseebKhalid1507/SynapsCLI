@@ -832,21 +832,15 @@ fn classify_stream_outcome(
 /// Extensible — new flags go here instead of adding parameters to 4 signatures.
 #[derive(Debug, Clone, Default)]
 pub struct ApiOptions {
-    /// Immutable host binding for extension-provider interior tool execution:
-    /// the chat's, so a memory tool in that loop acts on the chat's project.
-    /// The stream loop installs the binding its own tools get; `run_single`
-    /// sets the runtime's. `None` (keep-warm pings, compaction, tests): the
-    /// memory tools in that loop refuse rather than guess a project.
-    pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
-    /// The chat that loop's tool calls belong to: its conversation id
-    /// (`ToolCapabilities.session_id`; `None` for a worker), the folder its
-    /// tools run in (`None` = the process folder, which under the daemon is
-    /// the daemon's) and its hook bus. Installed with `memory_backend`, from
-    /// the same sources, and `None` wherever it is: that loop's tools then
-    /// run in the process folder, for no conversation.
-    pub conversation_id: Option<String>,
-    pub cwd: Option<std::path::PathBuf>,
-    pub hook_bus: Option<Arc<crate::extensions::hooks::HookBus>>,
+    /// What the tool calls of this turn are given, for the tool loop of an
+    /// extension-provided model (`openai::extension_route`): the very
+    /// [`TurnToolContext`](crate::tools::TurnToolContext) the stream loop
+    /// (or `run_single`) makes its own tools' contexts from, so that loop's
+    /// tools run in the chat's folder with the chat's environment, for the
+    /// chat. `None` (keep-warm pings, compaction, tests): a request that
+    /// runs no tool for a chat; a tool that loop runs then gets
+    /// `TurnToolContext::no_chat`.
+    pub tool_context: Option<crate::tools::TurnToolContext>,
     /// Opt into the 1M context window beta header.
     pub use_1m_context: bool,
     /// Configured prompt-cache TTL (spec: cache-ttl). Resolved to a wire
@@ -1294,10 +1288,7 @@ impl ApiMethods {
                     options.codex_request_role,
                     options.tool_session_id.as_ref(),
                     options.session_tool_set.as_ref(),
-                    options.memory_backend.as_ref(),
-                    options.conversation_id.as_deref(),
-                    options.cwd.as_deref(),
-                    options.hook_bus.as_ref(),
+                    options.tool_context.as_ref(),
                     &options.trace,
                     options.suppress_stream_deltas,
                 )

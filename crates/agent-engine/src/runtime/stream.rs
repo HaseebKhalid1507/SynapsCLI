@@ -898,15 +898,6 @@ impl StreamMethods {
         // minting a fresh set.
         let mut options = options;
         options.session_tool_set = Some(std::sync::Arc::clone(&session_tool_set));
-        // That loop's tools are this chat's: they get the binding, folder,
-        // conversation id and hook bus this stream's own tools get, so they
-        // run in the chat's folder and act on the chat's project, and their
-        // hook events and `tool.call`s name the chat.
-        options.memory_backend = Some(memory_backend.clone());
-        options.conversation_id = session_id.clone();
-        options.cwd = cwd.clone();
-        options.hook_bus = Some(hook_bus.clone());
-        let options = options;
         // Host activation policy for MODEL-INITIATED `activate_tools`:
         // confirmation authority comes exclusively from host configuration
         // (explicit server auto-approve), never from model-authored JSON.
@@ -928,6 +919,49 @@ impl StreamMethods {
             )
         });
         let _extension_session_scope = extension_session_scope;
+
+        // What every tool call of this turn is given. Both dispatch lanes
+        // below make their contexts from it, and so does the tool loop of
+        // an extension-provided model, which gets it through `options`:
+        // those are this chat's tool calls too, in the chat's folder, with
+        // its environment, for its conversation.
+        let turn_tools = crate::tools::TurnToolContext::new(
+            crate::tools::ToolCapabilities {
+                session_allow_all: Some(session_allow_all.clone()),
+                launch_cancel: Some(cancel.clone()),
+                memory_backend: Some(memory_backend.clone()),
+                telemetry: Some(worker_telemetry),
+                // Per dispatch: `TurnToolContext::for_dispatch`.
+                tool_register_tx: None,
+                tool_activation: None,
+                session_manager: Some(session_manager),
+                subagent_registry: Some(subagent_registry.clone()),
+                event_queue: Some(event_queue),
+                delegation_parent,
+                codex_parent_plan,
+                secret_prompt: secret_prompt.clone(),
+                orchestration: orchestration.clone(),
+                mcp_leases: mcp_lease_capability,
+                extension_leases: extension_lease_capability,
+                memory_context,
+                cwd: cwd.clone(),
+                env,
+                env_stripped,
+                env_warned,
+                session_id: session_id.clone(),
+                hook_bus: Some(hook_bus.clone()),
+                continuation: Some(continuation.clone()),
+            },
+            crate::tools::ToolLimits {
+                max_tool_output,
+                max_tool_buffer: 256 * 1024,
+                bash_timeout,
+                bash_max_timeout,
+                subagent_timeout,
+            },
+        );
+        options.tool_context = Some(turn_tools.clone());
+        let options = options;
 
         let (activation_authority, activation_prompt_allowed) =
             activation_policy(activation_confirm, auto_approve_confirms);
@@ -2045,6 +2079,17 @@ impl StreamMethods {
                 // Channel for dynamic tool registration (MCP connect uses this)
                 let (tool_reg_tx, mut tool_reg_rx) =
                     tokio::sync::mpsc::unbounded_channel::<Vec<Arc<dyn crate::Tool>>>();
+                // The turn's tool context for this dispatch: with the
+                // channel above and this round's catalog snapshot.
+                let dispatch_tools = turn_tools.for_dispatch(
+                    tool_reg_tx.clone(),
+                    crate::tools::discovery::ActivationCapability::new(
+                        catalog_snapshot.clone(),
+                        std::sync::Arc::clone(&session_tool_set),
+                        activation_authority,
+                    )
+                    .with_host_prompt(activation_prompt_allowed),
+                );
                 // blocks". On cancellation we synthesize a "Canceled by user" result for any
                 // remaining tools so message history stays valid.
                 let mut tool_results = Vec::new();
@@ -2232,11 +2277,9 @@ impl StreamMethods {
                                         &input,
                                         cwd.as_deref(),
                                     );
-                                    match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
-                                            channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), telemetry: Some(worker_telemetry.clone()), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone(), hook_bus: Some(hook_bus.clone()), continuation: Some(continuation.clone()) },
-                                            limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
-                                        })).await {
+                                    match await_tool_call(&cancel, tool.execute_rich(input, dispatch_tools.for_call(
+                                            crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
+                                        ))).await {
                                         (Some(res), _) => {
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks) = match res {
@@ -2577,38 +2620,17 @@ impl StreamMethods {
                         let dedupe_history_inner = Arc::clone(&dedupe_history);
                         let request_correlation_inner = request_correlation.clone();
                         let trace_inner = round_options.trace.clone();
-                        let delegation_parent_inner = delegation_parent.clone();
-                        let codex_parent_plan_inner = codex_parent_plan.clone();
                         let cancel_token = cancel.clone();
                         let turn_completion_inner = turn_completion.clone();
-                        let tool_reg_tx_inner = tool_reg_tx.clone();
-                        let session_mgr = session_manager.clone();
-                        let registry_inner = subagent_registry.clone();
-                        let eq_inner = event_queue.clone();
+                        let dispatch_tools_inner = dispatch_tools.clone();
                         let hook_bus_inner = hook_bus.clone();
-                        let continuation_inner = continuation.clone();
                         let prompt_inner = secret_prompt.clone();
                         let model_inner = model.clone();
                         let cwd_inner = cwd.clone();
-                        let env_inner = env.clone();
-                        let env_stripped_inner = env_stripped.clone();
-                        let env_warned_inner = env_warned.clone();
-                        let memory_backend_inner = memory_backend.clone();
-                        let worker_telemetry_inner = worker_telemetry.clone();
-                        let memory_context_inner = memory_context.clone();
                         let session_id_inner = session_id.clone();
                         let tool_spill_inner = tool_spill.clone();
                         let auto_approve_inner = auto_approve_confirms;
                         let session_allow_all_inner = session_allow_all.clone();
-                        let orchestration_inner = orchestration.clone();
-                        let mcp_leases_inner = mcp_lease_capability.clone();
-                        let extension_leases_inner = extension_lease_capability.clone();
-                        let activation_inner = crate::tools::discovery::ActivationCapability::new(
-                            catalog_snapshot.clone(),
-                            std::sync::Arc::clone(&session_tool_set),
-                            activation_authority,
-                        )
-                        .with_host_prompt(activation_prompt_allowed);
 
                         join_set.spawn(async move {
                             let mut lane_results: Vec<(String, bool, Option<String>, Value)> = Vec::new();
@@ -2701,11 +2723,9 @@ impl StreamMethods {
                                     );
                                     let tx_d = delta_channel.sender;
 
-                                    match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
-                                            channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), telemetry: Some(worker_telemetry_inner.clone()), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), session_id: session_id_inner.clone(), hook_bus: Some(hook_bus_inner.clone()), continuation: Some(continuation_inner.clone()) },
-                                            limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
-                                        })).await {
+                                    match await_tool_call(&cancel_token, t.execute_rich(input, dispatch_tools_inner.for_call(
+                                            crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
+                                        ))).await {
                                         (Some(res), _) => {
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks, errored) = match res {
@@ -7661,6 +7681,268 @@ mod rich_output_tests {
                 assert_eq!(session_id.as_deref(), Some("chat-A"), "{kind:?}");
                 assert_eq!(cwd, folder, "{kind:?}: the process folder is {process:?}");
             }
+        }
+
+        /// A variable the host process has too, with its own value.
+        const WHOSE: &str = "SYNAPS_TEST_LEAKS2_WHOSE";
+        /// A variable the session had stripped as a secret.
+        const STRIPPED: &str = "SYNAPS_TEST_LEAKS2_STRIPPED";
+
+        /// Which handle a context holds: its address, 0 for none.
+        fn at<T: ?Sized>(handle: Option<&Arc<T>>) -> usize {
+            handle.map_or(0, |handle| Arc::as_ptr(handle) as *const () as usize)
+        }
+
+        /// What a tool's context gives it, in a form two contexts can be
+        /// compared in: values, and for the handles a session shares, which
+        /// one it is.
+        #[derive(Debug, Clone, PartialEq)]
+        struct Given {
+            session_id: Option<String>,
+            cwd: Option<PathBuf>,
+            /// Whether its commands get a session environment at all, and
+            /// [`WHOSE`] as they would see it.
+            session_env: bool,
+            whose: Option<String>,
+            stripped: Vec<String>,
+            /// Output, buffer, bash, bash max, subagent.
+            limits: (usize, usize, u64, u64, u64),
+            project: Option<String>,
+            shells: usize,
+            allow_all: usize,
+            warned: usize,
+            rollover: usize,
+            hook_bus: usize,
+            workers: usize,
+            wakes: usize,
+            secret_prompt: bool,
+            launch_cancel: bool,
+            telemetry: bool,
+            events: bool,
+            /// These three belong to one dispatch of the stream loop.
+            activation: bool,
+            registration: bool,
+            delta: bool,
+        }
+
+        struct GivenProbe(Arc<std::sync::Mutex<Vec<Given>>>);
+        #[async_trait::async_trait]
+        impl Tool for GivenProbe {
+            fn name(&self) -> &str {
+                "given_probe"
+            }
+            fn description(&self) -> &str {
+                "records what its context gives it"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object","properties":{}})
+            }
+            fn origin(&self) -> crate::tools::ToolOrigin {
+                crate::tools::ToolOrigin::Builtin
+            }
+            fn effect(&self) -> crate::tools::catalog::ToolEffect {
+                crate::tools::catalog::ToolEffect::ReadOnly
+            }
+            async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+                let caps = &ctx.capabilities;
+                let limits = &ctx.limits;
+                self.0.lock().unwrap().push(Given {
+                    session_id: caps.session_id.clone(),
+                    cwd: caps.cwd.clone(),
+                    session_env: caps.env.is_some(),
+                    whose: caps
+                        .env
+                        .as_ref()
+                        .and_then(|env| env.get(WHOSE))
+                        .map(str::to_string),
+                    stripped: caps.env_stripped.clone(),
+                    limits: (
+                        limits.max_tool_output,
+                        limits.max_tool_buffer,
+                        limits.bash_timeout,
+                        limits.bash_max_timeout,
+                        limits.subagent_timeout,
+                    ),
+                    project: caps
+                        .memory_backend
+                        .as_ref()
+                        .and_then(|binding| binding.scope().ok())
+                        .map(|scope| scope.key().to_string()),
+                    shells: at(caps.session_manager.as_ref()),
+                    allow_all: at(caps.session_allow_all.as_ref()),
+                    warned: at(Some(&caps.env_warned)),
+                    rollover: at(caps.continuation.as_ref()),
+                    hook_bus: at(caps.hook_bus.as_ref()),
+                    workers: at(caps.subagent_registry.as_ref()),
+                    wakes: at(caps.event_queue.as_ref()),
+                    secret_prompt: caps.secret_prompt.is_some(),
+                    launch_cancel: caps.launch_cancel.is_some(),
+                    telemetry: caps.telemetry.is_some(),
+                    events: ctx.channels.tx_events.is_some(),
+                    activation: caps.tool_activation.is_some(),
+                    registration: caps.tool_register_tx.is_some(),
+                    delta: ctx.channels.tx_delta.is_some(),
+                });
+                Ok("probed".to_string())
+            }
+        }
+
+        /// The loop's tools are given what the stream loop's own tools are
+        /// given for the same chat: the session's environment and stripped
+        /// list (not the process's), its shell sessions, secret prompt,
+        /// allow-all latch, rollover state and limits, the very same
+        /// handles. The one difference is what belongs to a single dispatch
+        /// of the stream loop.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn its_tools_are_given_what_the_stream_loops_tools_are_given() {
+            let _base = BaseDirGuard::new();
+            // The host process's value: under the daemon, the daemon's.
+            let _whose = EnvVarGuard::set(WHOSE, "the-process");
+            let chat = tempfile::tempdir().unwrap();
+            let bus = Arc::new(HookBus::new());
+            let shells = crate::tools::shell::SessionManager::new(
+                crate::tools::shell::ShellConfig::default(),
+            );
+            let latch = Arc::new(crate::tools::SessionConfirmLatch::new());
+            let warned: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+                Default::default();
+            let rollover = crate::runtime::continuation::SharedContinuation::default();
+            let workers = Arc::new(Mutex::new(
+                crate::runtime::subagent::SubagentRegistry::new(),
+            ));
+            let wakes = Arc::new(crate::events::EventQueue::new(100));
+            let (prompt_tx, _prompt_rx) = mpsc::unbounded_channel();
+            let prompt = crate::tools::SecretPromptHandle::new(prompt_tx);
+            // A daemon-hosted chat: everything of its own, none of it the
+            // harness defaults (which are also what a context for no chat
+            // carries).
+            let daemon_chat = |session: &mut StreamSession| {
+                session.session_id = Some("chat-A".into());
+                session.cwd = Some(chat.path().to_path_buf());
+                session.env = Some(vec![(WHOSE.to_string(), "the-chat".to_string())].into());
+                session.env_stripped = vec![STRIPPED.to_string()];
+                session.env_warned = warned.clone();
+                session.session_manager = shells.clone();
+                session.session_allow_all = latch.clone();
+                session.continuation = rollover.clone();
+                session.subagent_registry = workers.clone();
+                session.event_queue = wakes.clone();
+                session.secret_prompt = Some(prompt.clone());
+                session.max_tool_output = 12_345;
+                session.bash_timeout = 7;
+                session.bash_max_timeout = 77;
+                session.subagent_timeout = 777;
+            };
+
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            // The same chat's tool call, run by the extension model's loop …
+            turn(
+                vec![call("call-1", "given_probe", json!({}))],
+                vec![Arc::new(GivenProbe(seen.clone()))],
+                bus.clone(),
+                &daemon_chat,
+            )
+            .await;
+            // … and by the stream loop itself, on a model that is not an
+            // extension's.
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let _ = drive_configured(
+                "claude-sonnet-4-6",
+                initial,
+                vec![Arc::new(GivenProbe(seen.clone()))],
+                &[("toolu_1", "given_probe")],
+                bus.clone(),
+                std::time::Duration::from_secs(20),
+                &daemon_chat,
+            )
+            .await;
+
+            let seen = seen.lock().unwrap().clone();
+            let [extension, stream] = &seen[..] else {
+                panic!("one call in each loop: {seen:?}");
+            };
+            assert_eq!(extension.session_id.as_deref(), Some("chat-A"));
+            assert_eq!(extension.cwd.as_deref(), Some(chat.path()));
+            assert!(extension.session_env, "the process environment is inherited");
+            assert_eq!(
+                extension.whose.as_deref(),
+                Some("the-chat"),
+                "the process has {:?}",
+                std::env::var(WHOSE)
+            );
+            assert_eq!(extension.stripped, [STRIPPED]);
+            assert_eq!(extension.limits, (12_345, 256 * 1024, 7, 77, 777));
+            assert_eq!(extension.shells, at(Some(&shells)));
+            assert_eq!(extension.allow_all, at(Some(&latch)));
+            assert_eq!(extension.warned, at(Some(&warned)));
+            assert_eq!(extension.rollover, at(Some(&rollover)));
+            assert_eq!(extension.hook_bus, at(Some(&bus)));
+            assert_eq!(extension.workers, at(Some(&workers)));
+            assert_eq!(extension.wakes, at(Some(&wakes)));
+            assert!(extension.secret_prompt && extension.launch_cancel && extension.telemetry);
+            assert!(extension.project.is_some() && extension.events);
+            assert!(!extension.activation && !extension.registration && !extension.delta);
+            // Field for field the stream loop's, but for its dispatch's three.
+            assert_eq!(
+                *stream,
+                Given {
+                    activation: true,
+                    registration: true,
+                    delta: true,
+                    ..extension.clone()
+                }
+            );
+        }
+
+        /// A command the loop runs gets the session's environment: the
+        /// chat's value of a variable the host process also has, and no
+        /// value for one the session had stripped as a secret, which the
+        /// failed command is told about. It runs in the chat's folder.
+        #[cfg(all(unix, feature = "command-exec"))]
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn a_command_it_runs_gets_the_sessions_environment_not_the_processs() {
+            let _base = BaseDirGuard::new();
+            let _whose = EnvVarGuard::set(WHOSE, "the-process");
+            let _secret = EnvVarGuard::set(STRIPPED, "the-process-secret");
+            let chat = tempfile::tempdir().unwrap();
+            std::fs::write(chat.path().join("only-in-the-chats-folder"), "").unwrap();
+            let command = format!(
+                "printf '%s|%s|' \"${}\" \"${{{}-absent}}\"; ls; exit 3",
+                WHOSE, STRIPPED
+            );
+            let results = turn(
+                vec![call("call-1", "bash", json!({"command": command}))],
+                vec![],
+                Arc::new(HookBus::new()),
+                |session| {
+                    session.session_id = Some("chat-A".into());
+                    session.cwd = Some(chat.path().to_path_buf());
+                    session.env = Some(
+                        vec![
+                            ("PATH".to_string(), std::env::var("PATH").unwrap_or_default()),
+                            (WHOSE.to_string(), "the-chat".to_string()),
+                        ]
+                        .into(),
+                    );
+                    session.env_stripped = vec![STRIPPED.to_string()];
+                },
+            )
+            .await;
+
+            let output = results[0]["content"].as_str().unwrap_or_default();
+            assert!(output.contains("(exit 3)"), "the command ran: {results:?}");
+            assert!(
+                output.contains("the-chat|absent|"),
+                "the session's value, and nothing of the stripped variable: {output}"
+            );
+            assert!(!output.contains("the-process"), "{output}");
+            assert!(output.contains("only-in-the-chats-folder"), "{output}");
+            assert!(
+                output.contains(&format!("${STRIPPED} was stripped from the session env")),
+                "the stripped list reached the tool: {output}"
+            );
         }
     }
 

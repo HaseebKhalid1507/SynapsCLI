@@ -207,9 +207,6 @@ async fn route(
         None,
         None,
         None,
-        None,
-        None,
-        None,
         trace,
     )
     .await

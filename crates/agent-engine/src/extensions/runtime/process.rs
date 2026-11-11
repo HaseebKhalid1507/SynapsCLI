@@ -231,8 +231,8 @@ pub async fn execute_provider_tool_use(
     // live ToolId, verify the session set snapshot generation + pinned
     // schema digest, require core/exact-grant status, re-check source
     // trust, and only then acquire the implementation — all against the
-    // one consistent registry borrow the caller holds (read-locked for the
-    // whole outer provider call, so the catalog cannot drift inside the
+    // one consistent registry snapshot the caller holds (for the whole
+    // outer provider call, so the catalog cannot drift inside the
     // loop). Denial happens BEFORE input translation, BEFORE hook
     // emission, BEFORE execution, and returns a valid tool_result with
     // typed bounded static content and `is_error: true`.
@@ -321,9 +321,9 @@ pub async fn execute_provider_tool_use(
 }
 
 /// Interior extension-provider tool loop. `session_tools` is built ONCE by
-/// the caller (under the same registry read guard passed as `registry`) and
-/// reused for every tool call in every interior round — the registry stays
-/// read-locked for the whole outer provider call, so no catalog drift is
+/// the caller (against the same registry snapshot passed as `registry`) and
+/// reused for every tool call in every interior round — the snapshot does
+/// not change for the whole outer provider call, so no catalog drift is
 /// possible inside this loop and one set snapshot governs all rounds.
 #[allow(clippy::too_many_arguments)] // explicit loop policy inputs; grouping would hide registry/session coupling
 pub async fn complete_provider_with_tools<F>(

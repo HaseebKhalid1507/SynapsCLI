@@ -4438,6 +4438,50 @@ impl Runtime {
         .await
     }
 
+    /// What `run_single`'s tool calls are given: this runtime's own. Its
+    /// loop, and the tool loop of an extension-provided model it calls, make
+    /// every call's context from this one value.
+    fn single_turn_tools(&self) -> crate::tools::TurnToolContext {
+        crate::tools::TurnToolContext::new(
+            crate::tools::ToolCapabilities {
+                session_allow_all: Some(self.session_allow_all.clone()),
+                launch_cancel: None,
+                memory_backend: Some(self.memory_backend.clone()),
+                telemetry: Some(self.worker_telemetry()),
+                tool_register_tx: None,
+                session_manager: Some(self.session_manager.clone()),
+                subagent_registry: Some(self.subagent_registry.clone()),
+                delegation_parent: None,
+                codex_parent_plan: Self::codex_delegation_plan(
+                    &self.model,
+                    self.reasoning_level(),
+                    self.codex_request_role(),
+                ),
+                event_queue: Some(self.event_queue.clone()),
+                secret_prompt: None,
+                orchestration: self.orchestration.clone(),
+                tool_activation: None,
+                mcp_leases: None,
+                extension_leases: None,
+                memory_context: self.memory_tool_capability(),
+                cwd: self.cwd.clone(),
+                env: self.env.clone(),
+                env_stripped: self.env_stripped.clone(),
+                env_warned: self.env_warned.clone(),
+                session_id: self.session_id.clone(),
+                hook_bus: Some(self.hook_bus.clone()),
+                continuation: Some(self.continuation.clone()),
+            },
+            crate::tools::ToolLimits {
+                max_tool_output: self.max_tool_output,
+                max_tool_buffer: 256 * 1024,
+                bash_timeout: self.bash_timeout,
+                bash_max_timeout: self.bash_max_timeout,
+                subagent_timeout: self.subagent_timeout,
+            },
+        )
+    }
+
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
     /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
@@ -4461,6 +4505,7 @@ impl Runtime {
             json!({"role": "user", "content": prompt}),
         )];
         let system_prompt = self.effective_system_prompt().await;
+        let turn_tools = self.single_turn_tools();
 
         loop {
             let response = ApiMethods::call_api(
@@ -4474,13 +4519,11 @@ impl Runtime {
                 &messages,
                 self.api_retries,
                 &api::ApiOptions {
-                    // An extension-provided model's own tool loop acts on
-                    // this runtime's project and runs for its conversation
-                    // and folder, like the tool calls below.
-                    memory_backend: Some(self.memory_backend.clone()),
-                    conversation_id: self.session_id.clone(),
-                    cwd: self.cwd.clone(),
-                    hook_bus: Some(self.hook_bus.clone()),
+                    // An extension-provided model's own tool loop makes its
+                    // contexts from the one the tool calls below are made
+                    // from: this runtime's project, folder, environment and
+                    // conversation.
+                    tool_context: Some(turn_tools.clone()),
                     use_1m_context: self.context_window_override == Some(1_000_000),
                     cache_ttl: self.cache_ttl,
                     ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
@@ -4592,48 +4635,10 @@ impl Runtime {
                                     .await
                                     .runtime_name_for_api(tool_name)
                                     .to_string();
-                                let ctx = crate::ToolContext {
-                                    channels: crate::tools::ToolChannels {
-                                        tx_delta: None,
-                                        tx_events: None,
-                                    },
-                                    capabilities: crate::tools::ToolCapabilities {
-                                        session_allow_all: Some(self.session_allow_all.clone()),
-                                        launch_cancel: None,
-                                        memory_backend: Some(self.memory_backend.clone()),
-                                        telemetry: Some(self.worker_telemetry()),
-                                        tool_register_tx: None,
-                                        session_manager: Some(self.session_manager.clone()),
-                                        subagent_registry: Some(self.subagent_registry.clone()),
-                                        delegation_parent: None,
-                                        codex_parent_plan: Self::codex_delegation_plan(
-                                            &self.model,
-                                            self.reasoning_level(),
-                                            self.codex_request_role(),
-                                        ),
-                                        event_queue: Some(self.event_queue.clone()),
-                                        secret_prompt: None,
-                                        orchestration: self.orchestration.clone(),
-                                        tool_activation: None,
-                                        mcp_leases: None,
-                                        extension_leases: None,
-                                        memory_context: self.memory_tool_capability(),
-                                        cwd: self.cwd.clone(),
-                                        env: self.env.clone(),
-                                        env_stripped: self.env_stripped.clone(),
-                                        env_warned: self.env_warned.clone(),
-                                        session_id: self.session_id.clone(),
-                                        hook_bus: Some(self.hook_bus.clone()),
-                                        continuation: Some(self.continuation.clone()),
-                                    },
-                                    limits: crate::tools::ToolLimits {
-                                        max_tool_output: self.max_tool_output,
-                                        max_tool_buffer: 256 * 1024,
-                                        bash_timeout: self.bash_timeout,
-                                        bash_max_timeout: self.bash_max_timeout,
-                                        subagent_timeout: self.subagent_timeout,
-                                    },
-                                };
+                                let ctx = turn_tools.for_call(crate::tools::ToolChannels {
+                                    tx_delta: None,
+                                    tx_events: None,
+                                });
                                 let decision = resolve_before_tool_call_decision(
                                     input.clone(),
                                     emit_before_tool_call(
@@ -4691,21 +4696,8 @@ impl Runtime {
 
                     // Capture config values before spawning (can't borrow &self in 'static spawn)
                     let cfg_max_tool_output = self.max_tool_output;
-                    let cfg_bash_timeout = self.bash_timeout;
-                    let cfg_bash_max_timeout = self.bash_max_timeout;
-                    let cfg_subagent_timeout = self.subagent_timeout;
-                    let session_mgr = self.session_manager.clone();
-                    let cfg_subagent_registry = self.subagent_registry.clone();
-                    let cfg_event_queue = self.event_queue.clone();
                     let cfg_hook_bus = self.hook_bus.clone();
-                    let cfg_orchestration = self.orchestration.clone();
-                    let codex_parent_plan = Self::codex_delegation_plan(
-                        &self.model,
-                        self.reasoning_level(),
-                        self.codex_request_role(),
-                    );
                     let cfg_cwd = self.cwd.clone();
-                    let cfg_env = self.env.clone();
                     let cfg_session_id = self.session_id.clone();
 
                     for tool_use in &tool_uses {
@@ -4721,21 +4713,10 @@ impl Runtime {
                                 tools_snapshot.runtime_name_for_api(&tool_name).to_string();
                             let tool = tools_snapshot.get(&tool_name).cloned();
                             drop(tools_snapshot);
-                            let session_mgr_inner = session_mgr.clone();
-                            let registry_inner = cfg_subagent_registry.clone();
-                            let event_queue_inner = cfg_event_queue.clone();
+                            let turn_tools_inner = turn_tools.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
-                            let continuation_inner = self.continuation.clone();
                             let session_allow_all_inner = self.session_allow_all.clone();
-                            let orchestration_inner = cfg_orchestration.clone();
-                            let memory_backend_inner = self.memory_backend.clone();
-                            let worker_telemetry_inner = self.worker_telemetry();
-                            let memory_context_inner = self.memory_tool_capability();
-                            let codex_parent_plan_inner = codex_parent_plan.clone();
                             let cwd_inner = cfg_cwd.clone();
-                            let env_inner = cfg_env.clone();
-                            let env_stripped_inner = self.env_stripped.clone();
-                            let env_warned_inner = self.env_warned.clone();
                             let session_id_inner = cfg_session_id.clone();
                             let attachment_model = self.model.clone();
                             let tool_name_for_hook = tool_name.clone();
@@ -4773,44 +4754,12 @@ impl Runtime {
                                             else {
                                                 unreachable!()
                                             };
-                                            let ctx = crate::ToolContext {
-                                                channels: crate::tools::ToolChannels {
+                                            let ctx = turn_tools_inner.for_call(
+                                                crate::tools::ToolChannels {
                                                     tx_delta: None,
                                                     tx_events: None,
                                                 },
-                                                capabilities: crate::tools::ToolCapabilities {
-                                                    session_allow_all: Some(session_allow_all_inner.clone()),
-                                                    launch_cancel: None,
-                                                    memory_backend: Some(memory_backend_inner),
-                                                    telemetry: Some(worker_telemetry_inner),
-                                                    tool_register_tx: None,
-                                                    session_manager: Some(session_mgr_inner),
-                                                    subagent_registry: Some(registry_inner),
-                                                    delegation_parent: None,
-                                                    codex_parent_plan: codex_parent_plan_inner,
-                                                    event_queue: Some(event_queue_inner),
-                                                    secret_prompt: None,
-                                                    orchestration: orchestration_inner,
-                                                    tool_activation: None,
-                                                    mcp_leases: None,
-                                                    extension_leases: None,
-                                                    memory_context: memory_context_inner,
-                                                    cwd: cwd_inner.clone(),
-                                                    env: env_inner,
-                                                    env_stripped: env_stripped_inner,
-                                                    env_warned: env_warned_inner,
-                                                    session_id: session_id_inner.clone(),
-                                                    hook_bus: Some(hook_bus_inner.clone()),
-                                                    continuation: Some(continuation_inner.clone()),
-                                                },
-                                                limits: crate::tools::ToolLimits {
-                                                    max_tool_output: cfg_max_tool_output,
-                                                    max_tool_buffer: 256 * 1024,
-                                                    bash_timeout: cfg_bash_timeout,
-                                                    bash_max_timeout: cfg_bash_max_timeout,
-                                                    subagent_timeout: cfg_subagent_timeout,
-                                                },
-                                            };
+                                            );
                                             let input_for_hook = input.clone();
                                             let (output, rich_blocks) =
                                                 match t.execute_rich(input, ctx).await {
@@ -5068,13 +5017,9 @@ impl Runtime {
         let capture_state = self.memory_context_state.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
-            // Placeholders: the stream loop installs the binding, conversation
-            // id, folder and hook bus its own tools get before the first
-            // provider round.
-            memory_backend: None,
-            conversation_id: None,
-            cwd: None,
-            hook_bus: None,
+            // Placeholder: the stream loop installs the tool context its
+            // own tools are made from before the first provider round.
+            tool_context: None,
             use_1m_context: self.context_window_override == Some(1_000_000),
             cache_ttl: self.cache_ttl,
             ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),

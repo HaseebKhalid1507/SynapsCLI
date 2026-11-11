@@ -1162,13 +1162,22 @@ mod codex_ultra_worker_tests {
         assert!(later.session_allow_all().is_empty());
     }
 
+    /// The stream loop's serial and parallel lane each making a call's
+    /// context from the turn's one tool context.
+    const BOTH_LANES: [&str; 2] = [
+        "tool.execute_rich(input, dispatch_tools.for_call(",
+        "t.execute_rich(input, dispatch_tools_inner.for_call(",
+    ];
+
     #[test]
     fn session_allow_all_all_real_worker_paths_pass_parent_before_streaming() {
         // Both serial and parallel streaming dispatch must supply the parent
         // capability; worker-policy tests alone would miss a disconnected wire.
+        // The turn's one tool context carries it and both lanes make their
+        // calls' contexts from that.
         let dispatch = include_str!("../../runtime/stream.rs");
         assert!(dispatch.contains("session_allow_all: Some(session_allow_all.clone())"));
-        assert!(dispatch.contains("session_allow_all: Some(session_allow_all_inner.clone())"));
+        assert!(dispatch.contains(BOTH_LANES[0]) && dispatch.contains(BOTH_LANES[1]));
         for (name, source) in [
             ("oneshot", include_str!("oneshot.rs")),
             ("start", include_str!("start.rs")),
@@ -1392,10 +1401,11 @@ mod codex_ultra_worker_tests {
     #[test]
     fn every_worker_path_passes_parent_telemetry_before_streaming() {
         // Both streaming dispatch sites must hand the parent's telemetry to
-        // tools, and every spawn path must pass it into the worker policy.
+        // tools (through the turn's one tool context), and every spawn path
+        // must pass it into the worker policy.
         let dispatch = include_str!("../../runtime/stream.rs");
-        assert!(dispatch.contains("telemetry: Some(worker_telemetry.clone())"));
-        assert!(dispatch.contains("telemetry: Some(worker_telemetry_inner.clone())"));
+        assert!(dispatch.contains("telemetry: Some(worker_telemetry),"));
+        assert!(dispatch.contains(BOTH_LANES[0]) && dispatch.contains(BOTH_LANES[1]));
         for (name, source) in [
             ("oneshot", include_str!("oneshot.rs")),
             ("start", include_str!("start.rs")),
