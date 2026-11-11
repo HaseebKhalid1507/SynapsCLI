@@ -638,9 +638,35 @@ impl Tool for MemoryForgetTool {
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("memory_forget requires an id".into()))?;
         if let Some(id) = id.strip_prefix("ctx-") {
-            binding.history_forget(id).await?;
+            let done = binding.history_forget(id).await?;
+            // The id that was asked for, and each other id the same window
+            // was stored under: an extension that indexed one of those drops
+            // it too.
             forgotten.send(id, "archive", &scope, selected);
-            return Ok("Forgot this archived context window. Tombstone retained; other sessions/notes are not erased.".into());
+            let mut others: Vec<&str> = done.ids.iter().map(String::as_str).collect();
+            others.sort_unstable();
+            others.dedup();
+            for other in others.into_iter().filter(|other| *other != id) {
+                forgotten.send(other, "archive", &scope, selected);
+            }
+            let mut out = String::from(
+                "Forgot this archived context window. Tombstone retained; other sessions/notes are not erased.",
+            );
+            if done.ids.len() > 1 {
+                out.push_str(&format!(
+                    " The window was stored in {} files; all of them are tombstones now.",
+                    done.ids.len()
+                ));
+            }
+            // A copy that could not be reached is still readable: never a
+            // plain "forgot".
+            if let Some(unread) = done.unread {
+                out.push_str(&format!(
+                    " NOT COMPLETE: {unread}. A copy of this window there was not reached and can \
+                     still be read. Call memory_forget with this id again once it can be read."
+                ));
+            }
+            return Ok(out);
         }
         binding.forget(id).await?;
         forgotten.send(id, "note", &scope, selected);
@@ -1595,6 +1621,61 @@ mod tests {
         forget().await.unwrap();
         let events = listener.wait_for(2).await;
         assert_eq!(events[0].data, events[1].data);
+    }
+
+    /// The file store can hold one window in more than one file. Forgetting
+    /// one id forgets every copy, says how many there were and announces
+    /// each id; and a place that could not be read is never a plain "forgot".
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn forget_archive_reaches_every_copy_and_says_what_it_could_not_read() {
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let listener = Listener::prompt("indexer");
+        let bus = forget_bus(&listener).await;
+        let window = [std::sync::Arc::new(json!({"role":"assistant","content":"a window stored twice"}))];
+        let (archive, _) = binding.history_seal("synthetic-chat", &window, "").await.unwrap();
+        // A second copy under the other half of the digest, in the same shelf.
+        let key = binding.scope().unwrap().key().to_owned();
+        let file = agent_core::context_archive::archive_file(binding.base(), &key, &archive.id);
+        let file = file.unwrap().unwrap();
+        let mut record: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let other = record["digest"].as_str().unwrap()[32..].to_owned();
+        assert_ne!(other, archive.id);
+        record["id"] = json!(other);
+        let copy = file.with_file_name(format!("{other}.json"));
+        std::fs::write(&copy, serde_json::to_vec(&record).unwrap()).unwrap();
+        let rows = binding.history_search("stored twice", 8).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // A shelf name that is not a shelf: a copy could be behind it.
+        let project = file.parent().unwrap().parent().unwrap();
+        std::fs::write(project.join("s000002"), b"not a directory").unwrap();
+
+        let forget = || {
+            MemoryForgetTool.execute(
+                json!({"id": format!("ctx-{}", archive.id)}),
+                chat_context(&binding, Some(&bus), env.path()),
+            )
+        };
+        let out = forget().await.unwrap();
+        assert!(out.starts_with("Forgot this archived context window."), "{out}");
+        assert!(out.contains("stored in 2 files; all of them are tombstones now"), "{out}");
+        assert!(out.contains("NOT COMPLETE: 1 place(s) could not be read, first s000002: "), "{out}");
+        let events = listener.wait_for(2).await;
+        let mut ids: Vec<_> = events.iter().map(|event| event.data["id"].as_str().unwrap()).collect();
+        ids.sort_unstable();
+        let mut expected = [archive.id.as_str(), other.as_str()];
+        expected.sort_unstable();
+        assert_eq!(ids, expected, "one event for each id the window was stored under");
+        for id in [&archive.id, &other] {
+            assert!(binding.history_fetch(id, 0, 1).await.is_err(), "{id}");
+        }
+        // With everything readable and nothing left to forget, it is plain.
+        std::fs::remove_file(project.join("s000002")).unwrap();
+        assert_eq!(
+            forget().await.unwrap(),
+            "Forgot this archived context window. Tombstone retained; other sessions/notes are not erased."
+        );
     }
 
     /// Nothing is announced unless the forget happened: an id that does not

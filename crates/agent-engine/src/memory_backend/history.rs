@@ -4,7 +4,7 @@ use super::{error, MemoryBinding, Result};
 use crate::SharedMessage;
 use agent_core::context_archive::{
     self, ArchiveDescriptor, ArchivePart, ArchiveRedactor, ArchiveRef, ArchiveStore,
-    ArchivedMessage,
+    ArchivedMessage, Forgotten,
 };
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -280,7 +280,13 @@ impl MemoryBinding {
         }
         Ok(note)
     }
-    pub async fn history_forget(&self, id: &str) -> Result<()> {
+    /// Forget the archived window `id`. The file store forgets by content:
+    /// every file that holds the same window becomes a tombstone, and what
+    /// comes back names each one ([`Forgotten::ids`]) and says whether a
+    /// place that may hold another copy could not be read
+    /// ([`Forgotten::unread`]); such a copy is still live. The Axel backend
+    /// keeps one record for an id and reports that one.
+    pub async fn history_forget(&self, id: &str) -> Result<Forgotten> {
         if !valid_id(id) {
             return Err(error("invalid history id"));
         }
@@ -298,7 +304,10 @@ impl MemoryBinding {
         if self.rpc("history_forget", json!({"id":id})).await? != true {
             return Err(error("history not found in project"));
         }
-        Ok(())
+        Ok(Forgotten {
+            ids: vec![id.to_owned()],
+            unread: None,
+        })
     }
 }
 

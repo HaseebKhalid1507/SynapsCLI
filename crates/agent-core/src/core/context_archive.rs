@@ -226,6 +226,22 @@ pub struct SealedWindow {
     pub note: String,
 }
 
+/// What [`ArchiveStore::forget`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forgotten {
+    /// The id of every file that held the content live and is a tombstone
+    /// now: the id asked for first if it is one of them, then every other
+    /// file the same content was stored in. An id is here twice when two
+    /// shelves held a file under it. Empty when every copy that could be
+    /// read had been forgotten before.
+    pub ids: Vec<String>,
+    /// `Some` when a shelf, a legacy slot or a file that may hold another
+    /// copy could not be read: how many such places, and the first with its
+    /// error. A copy there was not reached and is still live. Forgetting
+    /// the id again once the place can be read reaches it.
+    pub unread: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveDescriptor {
     pub id: String,
@@ -535,6 +551,15 @@ impl Unread {
         tracing::warn!(%place, %error, "archive lookup passed over what it could not read");
         self.places += 1;
         self.first.get_or_insert_with(|| (place.to_owned(), error));
+    }
+
+    /// What an operation that went on without these places tells its caller:
+    /// how many there were and the first, by name, with its error. `None`
+    /// when everything could be read.
+    fn notice(&self) -> Option<String> {
+        let (place, error) = self.first.as_ref()?;
+        let places = self.places;
+        Some(format!("{places} place(s) could not be read, first {place}: {error}"))
     }
 
     /// The error of a lookup that did not find its segment: "not found" when
@@ -1106,29 +1131,165 @@ impl ArchiveStore {
         Ok((rows, None))
     }
 
-    /// Durable, idempotent deletion. Replaces content in the SAME file with a
-    /// marker; it never frees the id/digest for reuse. Unknown ids are NotFound.
-    /// This is logical deletion, not secure erasure of filesystem snapshots.
-    /// The only operation that replaces a file, and only the one for `id`.
-    pub fn forget(&self, id: &str) -> io::Result<()> {
+    /// Durable, idempotent deletion of the content of segment `id`, in every
+    /// file that holds it. Each is replaced, under the same name, by a
+    /// marker; the id and digest are never freed for reuse. Unknown ids are
+    /// NotFound. This is logical deletion, not secure erasure of filesystem
+    /// snapshots. The only operation that replaces a file.
+    ///
+    /// The store can hold one projection more than once: under each half of
+    /// its digest, under one id on two shelves (stored again while a shelf
+    /// could not be read), in a legacy slot, under an id an import kept. So
+    /// forget goes by content. The record found under `id` names the
+    /// projection, and every live record of it becomes a tombstone: under
+    /// `id` and under both halves of the digest on every shelf that can be
+    /// opened, and in every legacy slot that can be read.
+    ///
+    /// When it returns, a tombstone of the projection is on a shelf under
+    /// one of the two ids its digest gives it, which is where a later seal
+    /// of the same window looks. If the projection was only stored under
+    /// another id (a legacy slot's, an import's), that tombstone is written
+    /// new, on the newest shelf. It is written before any other file is
+    /// replaced, and a copy under one of those two ids is replaced before
+    /// the others: an error or a crash part-way leaves the content refused
+    /// to a seal, and forgetting again finishes. An id that is already a
+    /// tombstone is not an early return for the same reason.
+    ///
+    /// A shelf that cannot be opened, a legacy slot that cannot be read or
+    /// validated and an unreadable file under one of the names may hold a
+    /// copy that was not reached. That is never silent: [`Forgotten::unread`]
+    /// says so, and forgetting again when the place can be read reaches it.
+    pub fn forget(&self, id: &str) -> io::Result<Forgotten> {
         validate_id(id)?;
         let _lock = self.exclusive()?;
-        let mut unread = Unread::default();
         let (shelves, slots) = self.layout()?;
-        let located = self.locate(&shelves, id, false, &mut unread)?;
-        let (shelf, name, mut record) = match located {
-            Some((_, shelf, record)) => (Some(shelf), archive_name(id), record),
+        // The record asked for says which content to forget.
+        let mut unread = Unread::default();
+        let asked = match self.locate(&shelves, id, false, &mut unread)? {
+            Some((.., record)) => record,
             None => match self.legacy_segment(&slots, id, false, &mut unread) {
-                Some((slot, record)) => (None, slot, record),
+                Some((_, record)) => record,
                 None => return Err(unread.not_found()),
             },
         };
-        let dir = shelf.as_ref().unwrap_or(&self.fs);
-        if matches!(record.body, Body::Tombstone) {
-            return dir.sync();
+        let digest = asked.digest.as_str();
+        let derived = [&digest[..32], &digest[32..]];
+        let mut names: Vec<_> = derived.iter().map(|id| archive_name(id)).collect();
+        if !derived.contains(&id) {
+            names.push(archive_name(id));
         }
-        record.body = Body::Tombstone;
-        dir.publish(&name, &bounded_json(&record, MAX_SEGMENT_BYTES)?, false)
+        // Every copy that can be read, as (shelf or, for a slot, none; file
+        // name; record), and the places that could not be: counted afresh,
+        // each once.
+        let mut unread = Unread::default();
+        let mut copies = Vec::new();
+        // Whether a seal already finds a tombstone under one of its two
+        // names, and which of the two names something has.
+        let (mut guarded, mut taken) = (false, [false; 2]);
+        for shelf in &shelves {
+            let dir = match self.fs.open_child(shelf, false) {
+                Ok(Some(dir)) => dir,
+                Ok(None) => continue,
+                Err(error) => {
+                    unread.pass(shelf, error);
+                    continue;
+                }
+            };
+            for (index, name) in names.iter().enumerate() {
+                let raw = match dir.read_with(name, MAX_SEGMENT_BYTES, false) {
+                    Ok(Some(raw)) => Some(raw),
+                    Ok(None) => continue,
+                    Err(error) => {
+                        unread.pass(&format!("{shelf}/{name}"), error);
+                        None
+                    }
+                };
+                if let Some(held) = taken.get_mut(index) {
+                    *held = true;
+                }
+                let Some(raw) = raw else {
+                    continue;
+                };
+                match self.record(name, &raw) {
+                    Ok(record) if record.digest == digest => {
+                        copies.push((Some(shelf), name.clone(), record));
+                    }
+                    // What a seal of this projection takes for a tombstone.
+                    Err(_) if says_forgotten(&raw, digest) => guarded |= index < 2,
+                    // Another projection, or not a record: not a copy.
+                    _ => {}
+                }
+            }
+        }
+        for slot in &slots {
+            let raw = self.fs.read_with(slot, MAX_SEGMENT_BYTES, false);
+            match raw.and_then(|raw| raw.map(|raw| self.record(slot, &raw)).transpose()) {
+                Ok(Some(record)) if record.digest == digest => {
+                    copies.push((None, slot.clone(), record));
+                }
+                Ok(_) => {}
+                // A legacy id is not in the file name: this may be a copy.
+                Err(error) => unread.pass(slot, error),
+            }
+        }
+        // The copies a seal looks under come first.
+        let seen_by_a_seal = |(shelf, name, _): &(Option<&String>, String, Record)| {
+            shelf.is_some() && archive_id(name).is_some_and(|id| derived.contains(&id))
+        };
+        copies.sort_by_key(|copy| !seen_by_a_seal(copy));
+        guarded |= copies.first().is_some_and(seen_by_a_seal);
+        if !guarded {
+            // Stored under no name a seal looks under: the tombstone it will
+            // find, on the newest shelf, before anything is replaced. With
+            // both names taken by other files there is none to write and
+            // none is needed, because a seal has no name to store under.
+            for (index, id) in derived.into_iter().enumerate() {
+                if taken[index] {
+                    continue;
+                }
+                let guard = Record {
+                    version: 1,
+                    scope: self.scope.clone(),
+                    logical: asked.logical.clone(),
+                    id: id.to_owned(),
+                    digest: digest.to_owned(),
+                    body: Body::Tombstone,
+                };
+                let bytes = bounded_json(&guard, MAX_SEGMENT_BYTES)?;
+                let shelf = self.writable_shelf(&shelves)?;
+                match shelf.publish(&archive_name(id), &bytes, true) {
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    result => {
+                        result?;
+                        break;
+                    }
+                }
+            }
+        }
+        let mut ids = Vec::new();
+        for (shelf, name, mut record) in copies {
+            let opened;
+            let dir = match shelf {
+                Some(shelf) => {
+                    opened = self.fs.open_child(shelf, false)?.ok_or_else(not_found)?;
+                    &opened
+                }
+                None => &self.fs,
+            };
+            if matches!(record.body, Body::Tombstone) {
+                // A previous call may have failed after rename, before fsync.
+                dir.sync()?;
+                continue;
+            }
+            record.body = Body::Tombstone;
+            dir.publish(&name, &bounded_json(&record, MAX_SEGMENT_BYTES)?, false)?;
+            ids.push(record.id);
+        }
+        ids.sort_by_key(|forgotten| forgotten != id);
+        Ok(Forgotten {
+            ids,
+            unread: unread.notice(),
+        })
     }
 
     /// Migration-only export of validated eligible evidence and permanent
@@ -2708,6 +2869,10 @@ impl PrivateDir {
     }
     /// The plain rename, which replaces.
     fn rename(&self, from: &std::ffi::CStr, to: &std::ffi::CStr) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(error) = fault("rename", to) {
+            return Err(error);
+        }
         match unsafe { libc::renameat(self.fd(), from.as_ptr(), self.fd(), to.as_ptr()) } {
             0 => Ok(()),
             _ => Err(io::Error::last_os_error()),
@@ -3793,7 +3958,7 @@ mod tests {
         for result in [
             store.fetch(&reference.id, 0, 1).map(drop),
             store.fetch_note(&reference.id).map(drop),
-            store.forget(&reference.id),
+            store.forget(&reference.id).map(drop),
         ] {
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         }
@@ -3988,7 +4153,7 @@ mod tests {
             // Whatever is changed from here on gets a later change time.
             std::thread::sleep(Duration::from_millis(50));
             let before = stamps(tmp.path());
-            assert_eq!(before.len(), if lock { 9 } else { 8 }, "4 directories, 4 files, lock");
+            assert_eq!(before.len(), if lock { 10 } else { 9 }, "4 directories, 5 files, lock");
             read_everything(tmp.path(), &live, &gone, 2);
             // The export wants the lock file a seal leaves, and does not
             // make one.
@@ -4078,7 +4243,7 @@ mod tests {
         let refused = |id: &str| {
             unread(store.fetch(id, 0, 1).map(drop));
             unread(store.fetch_note(id).map(drop));
-            unread(store.forget(id));
+            unread(store.forget(id).map(drop));
             unread(archive_file(tmp.path(), "synthetic-project", id).map(drop));
             assert!(store.search("", MAX_SEARCH_RESULTS).is_err());
             assert!(store.export_records().is_err());
@@ -4160,7 +4325,7 @@ mod tests {
         assert_eq!(store.fetch(&next.id, 0, 1).unwrap(), text("archive 1000"));
         assert_eq!(store.fetch(&ids[0], 0, 1).unwrap(), text("archive 0"));
         for id in [ids[5].clone(), "a".repeat(32)] {
-            for result in [store.fetch(&id, 0, 1).map(drop), store.forget(&id)] {
+            for result in [store.fetch(&id, 0, 1).map(drop), store.forget(&id).map(drop)] {
                 let error = result.unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
                 assert!(error.to_string().contains("s000001"), "{error}");
@@ -4346,13 +4511,15 @@ mod tests {
         };
         // In a legacy slot, and on a shelf under either id of the projection.
         let shelf = dir.join("s000001");
-        std::fs::create_dir(&shelf).unwrap();
         let places = [
             dir.join("000.json"),
             shelf.join(archive_name(&digest[..32])),
             shelf.join(archive_name(&digest[32..])),
         ];
+        // Each place is tried by itself: neither the slot's tombstone nor
+        // the one the forget left under the first id stays.
         std::fs::remove_file(&places[0]).unwrap();
+        std::fs::remove_file(&places[1]).unwrap();
         // The second id is looked under whether the first is free or taken.
         for (index, place) in places.iter().enumerate() {
             for bytes in &altered {
@@ -4493,6 +4660,188 @@ mod tests {
         assert_eq!(mode(&file), 0o000);
     }
 
+    /// Whether the file is a tombstone of `digest` under the id its name gives.
+    fn is_tombstone_of(store: &ArchiveStore, file: &Path, digest: &str) -> bool {
+        let name = file.file_name().unwrap().to_str().unwrap();
+        let record = store.record(name, &std::fs::read(file).unwrap()).unwrap();
+        record.digest == digest && matches!(record.body, Body::Tombstone)
+    }
+    fn forgotten(ids: &[&str]) -> Forgotten {
+        Forgotten {
+            ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            unread: None,
+        }
+    }
+
+    /// One window in several files: under both halves of its digest, under
+    /// one id on two shelves, in a legacy slot. Forgetting any one id
+    /// forgets the window.
+    #[test]
+    fn forget_reaches_every_copy_of_the_window() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let (older, newer) = (dir.join("s000001"), dir.join("s000002"));
+        let gone = |words: &str| {
+            assert!(store.search(words, 8).unwrap().is_empty(), "{words}");
+            let refused = store.seal(&text(words), "").unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{words}");
+        };
+        // Under both halves of the digest, as a build before both names were
+        // looked under could leave it. Forgotten by the second.
+        let words = "under both halves";
+        let digest = digest_of(words);
+        let (first, second) = (&digest[..32], &digest[32..]);
+        assert_eq!(store.seal(&text(words), "").unwrap().id, first);
+        let copy = record_bytes(&store, second, &text(words), |_| {});
+        std::fs::write(older.join(archive_name(second)), copy).unwrap();
+        assert_eq!(store.search(words, 8).unwrap().len(), 2);
+        assert_eq!(store.forget(second).unwrap(), forgotten(&[second, first]));
+        for id in [first, second] {
+            assert_eq!(store.fetch(id, 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
+            assert!(is_tombstone_of(&store, &older.join(archive_name(id)), &digest));
+        }
+        gone(words);
+        // Forgotten again: nothing is left to do, and nothing is written.
+        let before = snapshot(&dir);
+        assert_eq!(store.forget(first).unwrap(), forgotten(&[]));
+        assert_eq!(snapshot(&dir), before);
+
+        // Under one id on two shelves, as a seal that could not open the
+        // older shelf leaves it.
+        let words = "one id on two shelves";
+        let twice = store.seal(&text(words), "").unwrap();
+        let name = archive_name(&twice.id);
+        std::fs::create_dir(&newer).unwrap();
+        std::fs::copy(older.join(&name), newer.join(&name)).unwrap();
+        assert_eq!(store.search(words, 8).unwrap().len(), 2);
+        assert_eq!(store.forget(&twice.id).unwrap(), forgotten(&[&twice.id, &twice.id]));
+        for shelf in [&older, &newer] {
+            assert!(is_tombstone_of(&store, &shelf.join(&name), &digest_of(words)));
+        }
+        gone(words);
+
+        // In a legacy slot and on a shelf. Forgotten by the slot's id.
+        let words = "in a slot and on a shelf";
+        let slot = seal_legacy_slot(&store, 0, &text(words), "");
+        let digest = digest_of(words);
+        let copy = record_bytes(&store, &digest[32..], &text(words), |_| {});
+        std::fs::write(older.join(archive_name(&digest[32..])), copy).unwrap();
+        // The copy a seal looks under is replaced first.
+        let done = store.forget(&slot.id).unwrap();
+        assert_eq!(done, forgotten(&[&slot.id, &digest[32..]]));
+        assert!(is_tombstone_of(&store, &dir.join("000.json"), &digest));
+        gone(words);
+        assert!(temporary_files(&dir).is_empty());
+    }
+
+    /// A later seal of a forgotten window looks under the two ids its digest
+    /// gives it. A window that was only stored under another id (a legacy
+    /// slot's, an import's) leaves a tombstone there too, written first.
+    #[test]
+    fn a_forget_leaves_a_tombstone_where_a_seal_looks() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let shelf = dir.join("s000001");
+        let imported = "0123456789abcdef0123456789abcdef";
+        // In a legacy slot, in a project that has no shelf yet.
+        let words = "only in a slot";
+        let digest = digest_of(words);
+        let slot = seal_legacy_slot(&store, 0, &text(words), "");
+        assert_eq!(store.forget(&slot.id).unwrap(), forgotten(&[&slot.id]));
+        let guard = shelf.join(archive_name(&digest[..32]));
+        assert!(is_tombstone_of(&store, &guard, &digest));
+        assert!(is_tombstone_of(&store, &dir.join("000.json"), &digest));
+        // The slot can go bad; the window stays forgotten.
+        std::fs::write(dir.join("000.json"), b"{\"version\":1,").unwrap();
+        let refused = store.seal(&text(words), "").unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        std::fs::remove_file(dir.join("000.json")).unwrap();
+
+        // On a shelf under an id its digest does not give it, with the first
+        // of the two names taken by something else: the second is used.
+        let words = "under an imported id";
+        let digest = digest_of(words);
+        let file = shelf.join(archive_name(imported));
+        std::fs::write(&file, record_bytes(&store, imported, &text(words), |_| {})).unwrap();
+        std::fs::write(shelf.join(archive_name(&digest[..32])), b"not a record").unwrap();
+        assert_eq!(store.fetch(imported, 0, 1).unwrap(), text(words));
+        // The tombstone a seal will find is written before the archive is
+        // replaced: when that fails, the window is still there and can
+        // already not be sealed again.
+        let failing = Fault::on("rename", imported, libc::EIO);
+        assert_eq!(store.forget(imported).unwrap_err().raw_os_error(), Some(libc::EIO));
+        drop(failing);
+        let guard = shelf.join(archive_name(&digest[32..]));
+        assert!(is_tombstone_of(&store, &guard, &digest));
+        assert_eq!(store.fetch(imported, 0, 1).unwrap(), text(words));
+        let refused = store.seal(&text(words), "").unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        // Forgetting again finishes, and writes no second tombstone.
+        let files = shelf_files(&dir).len();
+        assert_eq!(store.forget(imported).unwrap(), forgotten(&[imported]));
+        assert!(is_tombstone_of(&store, &file, &digest));
+        assert_eq!(shelf_files(&dir).len(), files);
+        assert_eq!(std::fs::read(shelf.join(archive_name(&digest[..32]))).unwrap(), b"not a record");
+        // An archive that was forgotten before this rule gets its tombstone
+        // the next time it is forgotten.
+        std::fs::remove_file(&guard).unwrap();
+        assert_eq!(store.forget(imported).unwrap(), forgotten(&[]));
+        assert!(is_tombstone_of(&store, &guard, &digest));
+
+        // Stored under one of its two ids, the archive's own tombstone is
+        // the one a seal finds: nothing is added.
+        let native = store.seal(&text("under its own id"), "").unwrap();
+        let files = shelf_files(&dir).len();
+        assert_eq!(store.forget(&native.id).unwrap(), forgotten(&[&native.id]));
+        assert_eq!(shelf_files(&dir).len(), files);
+        assert!(temporary_files(&dir).is_empty());
+    }
+
+    /// A copy in a place that cannot be read is not reached. The forget
+    /// says so, and forgetting again reaches it.
+    #[test]
+    fn a_forget_says_which_places_it_could_not_read() {
+        let (tmp, store) = setup();
+        let dir = directory(&tmp, &store);
+        let (older, newer) = (dir.join("s000001"), dir.join("s000002"));
+        let words = "one id on two shelves";
+        let twice = store.seal(&text(words), "").unwrap();
+        let name = archive_name(&twice.id);
+        std::fs::create_dir(&newer).unwrap();
+        std::fs::copy(older.join(&name), newer.join(&name)).unwrap();
+        // The older shelf cannot be opened: its copy stays live.
+        let failing = Fault::on("open", "s000001", libc::EIO);
+        let done = store.forget(&twice.id).unwrap();
+        drop(failing);
+        assert_eq!(done.ids, std::slice::from_ref(&twice.id));
+        let unread = done.unread.unwrap();
+        assert!(unread.starts_with("1 place(s) could not be read, first s000001: "), "{unread}");
+        assert!(is_tombstone_of(&store, &newer.join(&name), &digest_of(words)));
+        let rows = store.search(words, 8).unwrap();
+        assert_eq!(rows.len(), 1, "the copy that was not reached is still found");
+        // Forgotten again, with the shelf readable: reached.
+        assert_eq!(store.forget(&twice.id).unwrap(), forgotten(&[&twice.id]));
+        assert!(store.search(words, 8).unwrap().is_empty());
+
+        // A file under one of the window's names that the store does not
+        // read may be a copy too.
+        let words = "beside a file with two names";
+        let digest = digest_of(words);
+        let sealed = store.seal(&text(words), "").unwrap();
+        let linked = newer.join(archive_name(&digest[32..]));
+        std::fs::hard_link(newer.join(archive_name(&sealed.id)), tmp.path().join("a-second-name")).unwrap();
+        std::fs::write(&linked, b"x").unwrap();
+        std::fs::hard_link(&linked, tmp.path().join("another-second-name")).unwrap();
+        let error = store.forget(&sealed.id).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "its own file has two names");
+        std::fs::remove_file(tmp.path().join("a-second-name")).unwrap();
+        let done = store.forget(&sealed.id).unwrap();
+        assert_eq!(done.ids, std::slice::from_ref(&sealed.id));
+        let place = format!("first s000002/{}: ", archive_name(&digest[32..]));
+        assert!(done.unread.unwrap().contains(&place));
+        assert_eq!(std::fs::read(&linked).unwrap(), b"x");
+    }
+
     const PASSING: [i32; 5] = [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EINTR, libc::EAGAIN];
 
     /// An error that is not about the shelf (the process is out of
@@ -4505,6 +4854,9 @@ mod tests {
         let dir = directory(&tmp, &store);
         let slot = seal_legacy_slot(&store, 0, &text("in a slot"), "");
         store.forget(&slot.id).unwrap();
+        // As a build from before a forget left a tombstone on a shelf
+        // forgot it: only the slot says so.
+        std::fs::remove_file(only_archive_file(&dir)).unwrap();
         let kept = store.seal(&text("kept"), "").unwrap();
         let gone = store.seal(&text("forgotten"), "").unwrap();
         store.forget(&gone.id).unwrap();
@@ -4715,7 +5067,7 @@ mod tests {
         let forgotten = seal_legacy_slot(&store, 1, &text("legacy forgotten"), "");
         store.forget(&forgotten.id).unwrap();
         let mut before = snapshot(&dir);
-        assert_eq!(before.len(), 3, "lock and two legacy slots");
+        assert_eq!(before.len(), 4, "lock, two legacy slots and the forget's tombstone on a shelf");
         for index in 0..300 {
             store.seal(&text(&format!("archive {index}")), "").unwrap();
             let after = snapshot(&dir);
@@ -4793,17 +5145,27 @@ mod tests {
         store.forget(&a.id).unwrap();
         assert!(std::fs::read_to_string(&slots[0]).unwrap().contains("tombstone"));
         assert_eq!(found(""), [b.id.as_str()]);
-        assert!(shelf_files(&dir).is_empty());
+        // On the shelf so far: the tombstone each forget left where a seal
+        // of that window looks, and no archive.
+        let shelf = dir.join("s000001");
+        let guards = ["legacy alpha", "legacy gamma"].map(|words| {
+            let digest = digest_of(words);
+            let guard = shelf.join(archive_name(&digest[..32]));
+            assert!(is_tombstone_of(&store, &guard, &digest), "{words}");
+            guard
+        });
+        let mut guards = guards.to_vec();
+        guards.sort();
+        assert_eq!(shelf_files(&dir), guards);
         // Only what is sealed from now on goes to a shelf, under its digest id.
         let new = store.seal(&text("after shelves"), "").unwrap();
-        assert_eq!(
-            only_archive_file(&dir),
-            dir.join("s000001").join(archive_name(&new.id))
-        );
+        assert!(shelf.join(archive_name(&new.id)).is_file());
+        assert_eq!(shelf_files(&dir).len(), 3);
         assert_eq!(found(""), [new.id.as_str(), b.id.as_str()]);
         assert_eq!(std::fs::read(&slots[1]).unwrap(), kept);
         assert!(slots.iter().all(|slot| slot.is_file()));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 5);
+        // A forgotten window is carried once, though it has two tombstones.
         assert_eq!(store.export_records().unwrap().len(), 4);
     }
 
@@ -4850,8 +5212,11 @@ mod tests {
             store.seal(&text("forgotten long ago"), "").unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
-        assert!(shelf_files(&dir).is_empty());
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "lock and two slots");
+        // Neither seal wrote anything. The one file on a shelf is the
+        // tombstone the forget left where a seal looks.
+        let guard = only_archive_file(&dir);
+        assert!(is_tombstone_of(&store, &guard, &digest_of("forgotten long ago")));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 4, "lock, two slots, one shelf");
     }
 
     /// Legacy slots are still read under the lock, and only they are.
@@ -5125,7 +5490,7 @@ mod tests {
         for result in [
             store.fetch(&b, 0, 1).map(drop),
             store.fetch_note(&b).map(drop),
-            store.forget(&b),
+            store.forget(&b).map(drop),
             archive_file(tmp.path(), "synthetic-project", &b).map(drop),
         ] {
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
@@ -5945,7 +6310,7 @@ mod tests {
         for result in [
             store.fetch(&missing, 0, 1).map(drop),
             store.fetch_note(&missing).map(drop),
-            store.forget(&missing),
+            store.forget(&missing).map(drop),
             archive_file(tmp.path(), "synthetic-project", &missing).map(drop),
         ] {
             let error = result.unwrap_err();
@@ -5956,25 +6321,34 @@ mod tests {
         assert!(store.export_records().is_err(), "{words}");
         assert!(export_in(tmp.path(), "synthetic-project").is_err(), "{words}");
     }
-    /// A forget of the healthy segment in slot 0 works beside slot 1 too,
-    /// and replaces slot 0 and nothing else. (Slot 1 itself, which may be a
-    /// directory or a FIFO, is for the caller to look at.)
+    /// A forget of the healthy segment in slot 0 works beside slot 1 too.
+    /// It replaces slot 0, adds the tombstone a seal looks for on the shelf
+    /// and changes nothing else. Slot 1 may hold a copy of the same window
+    /// and could not be read, which the forget says. (Slot 1 itself, which
+    /// may be a directory or a FIFO, is for the caller to look at.)
     fn assert_forgets_beside_slot_1(tmp: &tempfile::TempDir, store: &ArchiveStore, live: &ArchiveRef) {
         let dir = directory(tmp, store);
         let slot = dir.join("000.json");
+        let guard = dir.join("s000001").join(archive_name(&digest_of("legacy live")[..32]));
         let others = || -> Vec<_> {
             let mut files = shelf_files(&dir);
+            files.retain(|file| *file != guard);
             files.push(dir.join("002.json"));
             files.into_iter().map(|path| (identity(&path), path)).collect()
         };
         let (before, entries) = (others(), std::fs::read_dir(&dir).unwrap().count());
         let live_file = identity(&slot);
-        store.forget(&live.id).unwrap();
+        assert!(!guard.exists());
+        let done = store.forget(&live.id).unwrap();
+        assert_eq!(done.ids, std::slice::from_ref(&live.id));
+        let unread = done.unread.unwrap();
+        assert!(unread.starts_with("1 place(s) could not be read, first 001.json: "), "{unread}");
         assert_ne!(identity(&slot), live_file);
-        let tombstone = identity(&slot);
-        store.forget(&live.id).unwrap();
-        assert_eq!(identity(&slot), tombstone, "forgotten twice, written once");
+        let tombstone = (identity(&slot), identity(&guard));
+        assert!(store.forget(&live.id).unwrap().ids.is_empty());
+        assert_eq!((identity(&slot), identity(&guard)), tombstone, "forgotten twice, written once");
         assert!(std::fs::read_to_string(&slot).unwrap().contains("tombstone"));
+        assert!(is_tombstone_of(store, &guard, &digest_of("legacy live")));
         // Found, and forgotten: plainly "not found", with nothing to add.
         let error = store.fetch(&live.id, 0, 1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
@@ -6016,8 +6390,9 @@ mod tests {
         std::fs::File::create(&slot).unwrap().set_len(large).unwrap();
         assert_slot_1_is_passed_over(&tmp, &store, &live, "over the size bound", invalid);
         assert_eq!(std::fs::metadata(&slot).unwrap().len(), large);
-        // Five seals, five new files, and no other change to the directory.
-        assert_eq!(shelf_files(&dir).len(), 5);
+        // Five seals, five new files beside the tombstone that the forget
+        // of slot 2 left on the shelf, and no other change to the directory.
+        assert_eq!(shelf_files(&dir).len(), 6);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 5, "lock, 3 slots, 1 shelf");
         assert_forgets_beside_slot_1(&tmp, &store, &live);
         assert_eq!(std::fs::metadata(&slot).unwrap().len(), large);
@@ -6062,6 +6437,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not change");
     }
 
+    /// A slot that was forgotten by a build from before a forget left a
+    /// tombstone on a shelf has only itself to say so.
     #[test]
     fn a_legacy_tombstone_that_cannot_be_read_no_longer_forbids_its_projection() {
         let (tmp, store) = setup();
@@ -6071,11 +6448,16 @@ mod tests {
         store.forget(&gone.id).unwrap();
         let refused = store.seal(&text("forgotten words"), "").unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
-        // The price of passing over what cannot be read: with the tombstone
-        // torn, nothing says that this projection was forgotten.
+        // With the tombstone torn, the one on the shelf still says that
+        // this projection was forgotten.
         let tombstone = std::fs::read(&slot).unwrap();
         let torn = &tombstone[..tombstone.len() / 2];
         std::fs::write(&slot, torn).unwrap();
+        let refused = store.seal(&text("forgotten words"), "").unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        // Without that one, the price of passing over what cannot be read:
+        // nothing says so any more.
+        std::fs::remove_file(only_archive_file(&dir)).unwrap();
         let again = store.seal(&text("forgotten words"), "").unwrap();
         assert_eq!(store.fetch(&again.id, 0, 1).unwrap(), text("forgotten words"));
         assert_eq!(only_archive_file(&dir), dir.join("s000001").join(archive_name(&again.id)));
@@ -6407,7 +6789,7 @@ mod lock_tests {
             store
                 .seal(&[msg("user", json!("other evidence"))], "")
                 .map(drop),
-            store.forget(&reference.id),
+            store.forget(&reference.id).map(drop),
         ];
         for result in results {
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
@@ -6589,7 +6971,7 @@ mod lock_tests {
         // The same for a forget: busy after the wait, the segment untouched.
         let foreign = store.fs.lock().unwrap();
         let started = Instant::now();
-        assert_busy(store.forget(&reference.id));
+        assert_busy(store.forget(&reference.id).map(drop));
         assert!(started.elapsed() >= store.process_wait);
         drop(foreign);
         assert_reads(&store, &reference);
@@ -6628,7 +7010,7 @@ mod lock_tests {
         store.process_wait = Duration::ZERO;
         let _foreign = store.fs.lock().unwrap();
         assert_reads(&store, &reference);
-        assert_busy(store.forget(&reference.id));
+        assert_busy(store.forget(&reference.id).map(drop));
     }
 
     #[test]
@@ -6640,7 +7022,7 @@ mod lock_tests {
         // A read that queued behind the gate would now fail at once.
         reader.wait = Duration::ZERO;
         assert_reads(&reader, &reference);
-        assert_busy(reader.forget(&reference.id));
+        assert_busy(reader.forget(&reference.id).map(drop));
     }
 
     #[test]

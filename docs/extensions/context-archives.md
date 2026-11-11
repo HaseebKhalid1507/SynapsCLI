@@ -274,10 +274,11 @@ While Synaps writes version 1:
    disk. You never see half a record under a name you are told to read.
 2. **A live archive never changes.** Once written, its bytes stay as they
    are.
-3. **The only change is live to tombstone,** once, under the same name, by
-   the same kind of rename. You read the whole live record or the whole
-   tombstone, never a mix. A tombstone keeps `version`, `scope`, `logical`,
-   `id` and `digest`.
+3. **The only change to a file is live to tombstone,** once, under the same
+   name, by the same kind of rename. You read the whole live record or the
+   whole tombstone, never a mix. A tombstone keeps `version`, `scope`,
+   `logical`, `id` and `digest`. (A forget can also add one new file, itself
+   a tombstone: see [Tombstones](#tombstones).)
 4. **Synaps never deletes an archive file,** never moves one, and never
    merges, renumbers or removes shelves. Sealing an archive never touches
    another archive.
@@ -348,17 +349,40 @@ with a tombstone: the same `version`, `scope`, `logical`, `id` and `digest`,
 and `"body": {"state": "tombstone"}`. The messages and the note are gone from
 the file.
 
+**A forget goes by content, not by file.** A project can hold the same
+content (the same `digest`) in more than one file. Forgetting one id replaces
+every file with that `digest` that Synaps can read at that moment, each
+under its own name and with its own `id`. A copy in a shelf or a file that
+Synaps cannot read then is not replaced; the tool says that the forget is
+not complete, and forgetting the same id again reaches it once it can be
+read.
+
+**A forget can add one file.** When it is done, a tombstone with that
+`digest` is in a shelf under one of two names: the first 32 characters of
+the `digest`, or the last 32. That is where Synaps looks before it stores
+the same content again. If no file with that `digest` was under one of
+those names (the forgotten archive was a legacy slot file, whose id is
+random), Synaps writes that tombstone as a new file in the newest shelf,
+before it replaces anything. Its `id` is the file's name, and no archive was
+ever announced with it.
+
+- **If any file with a `digest` is a tombstone, that content is forgotten,**
+  whatever another file with the same `digest` says. Drop what you indexed
+  from every one of them.
 - **Drop what you indexed from it.** A file can already be a tombstone the
   first time you see it.
 - **A tombstone stays.** Synaps does not delete it or bring the archive
   back, and it refuses to store the same messages from the same chat again.
-  (One exception: if the tombstone is a legacy slot file that Synaps can no
-  longer read, it no longer blocks that.)
+  (One exception: a legacy slot file that was forgotten before a forget
+  added the second tombstone has only itself to say so. If Synaps can no
+  longer read that file, it no longer blocks that.)
 - **It forgets one archive, not a text.** The same words can be in another
   archive that holds different messages around them. And replacing a file
   does not erase backups or filesystem snapshots, or what you copied.
 - [`on_memory_forgotten`](hooks.md#on_memory_forgotten) tells you when it
-  happens, if you are running. The tombstone is the record.
+  happens, if you are running: once for the id that was asked for, and once
+  for each other id whose file the forget replaced. The tombstone is the
+  record.
 
 ## Parts
 
