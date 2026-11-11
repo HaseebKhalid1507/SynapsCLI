@@ -335,13 +335,20 @@ without an archive link.
   archive (missing, forgotten, or sealed in another project).
 - **A lookup that failed** for any other reason (the store is busy, something
   in it cannot be read) settles nothing. It is logged, the chat goes on, and
-  the lookup is made again at the next request, until it finds the archive or
-  finds that it is not there.
+  the lookup is made again at the next request, once, until it finds the
+  archive, finds that it is not there, or the chat rolls over: a committed
+  rollover settles the state with the window it made, numbered from window 1.
 - **The other parts.** For a head that lists several parts, each listed id is
   looked up as well, in the background, and the log names every one the store
   cannot give back. This is a warning only: the continuation message still
   lists the part, and the resume neither waits for the check nor depends on
-  it.
+  it. At most 64 ids are looked up, the first of the list, each once; the
+  rest are logged as one count.
+- **Only an id is used.** The marker comes from a session file. A value in
+  `archive` or in an `archives[].id` that is not 32 lowercase hex characters
+  is not fetched and not written to the log: a marker whose `archive` is not
+  an id counts as "not found" and the log gives its length, and such
+  entries of `archives` are counted.
 
 The lookup reads a file and can wait for a busy store; the continuation state
 is not locked while it does.

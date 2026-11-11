@@ -1511,7 +1511,7 @@ pub fn restore_window(
     state: &SharedContinuation,
     binding: &MemoryBinding,
 ) {
-    let (id, window, mut listed, epoch, chat) = {
+    let (named, window, listed, passed_over, epoch, chat) = {
         let mut s = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1521,37 +1521,38 @@ pub fn restore_window(
         let marker = messages
             .iter()
             .find_map(|m| (m["_synaps_context"]["schema"] == MARKER).then_some(&m["_synaps_context"]));
-        let Some((marker, id)) = marker.and_then(|marker| Some((marker, marker["archive"].as_str()?)))
+        let Some((marker, named)) = marker.and_then(|marker| Some((marker, marker["archive"].as_str()?)))
         else {
             s.initialized = true;
             return;
         };
-        let listed: Vec<String> = marker["archives"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|part| part["id"].as_str().map(str::to_owned))
-            .collect();
+        // What the marker holds is what a session file held: nothing of it
+        // is fetched, kept or logged unless it has the form of an id.
+        let named = if is_archive_id(named) { Ok(named.to_owned()) } else { Err(named.len()) };
+        let (listed, passed_over) = listed_parts(marker, named.as_deref().ok());
         let window = marker["window"].as_u64().unwrap_or(1);
-        (id.to_owned(), window, listed, s.epoch, s.logical_id.clone())
+        (named, window, listed, passed_over, s.epoch, s.logical_id.clone())
     };
 
     // Off the lock from here: a file is read.
-    let is_id = id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    let lookup = if is_id {
-        look_up(binding, &id)
-    } else {
-        Lookup::Absent("the head's marker does not hold an archive id".into())
+    let lookup = match &named {
+        Ok(id) => look_up(binding, id),
+        Err(_) => Lookup::Absent(String::new()),
     };
-    match &lookup {
-        Lookup::Found => {}
-        Lookup::Absent(why) => tracing::warn!(
+    match (&lookup, &named) {
+        (Lookup::Found, _) => {}
+        (_, Err(bytes)) => tracing::warn!(
+            session = %chat,
+            "resumed chat: its context head's marker names no archive ({bytes} bytes that are \
+             not an archive id); the chat goes on at window 1 without its archive link"
+        ),
+        (Lookup::Absent(why), Ok(id)) => tracing::warn!(
             session = %chat,
             archive = %format_args!("ctx-{id}"),
             "resumed chat: the archive its context head names was not found: {why}; \
              the chat goes on at window 1 without its archive link"
         ),
-        Lookup::Failed(why) => tracing::warn!(
+        (Lookup::Failed(why), Ok(id)) => tracing::warn!(
             session = %chat,
             archive = %format_args!("ctx-{id}"),
             "resumed chat: the archive its context head names could not be looked up: {why}; \
@@ -1569,7 +1570,7 @@ pub fn restore_window(
         }
         match lookup {
             Lookup::Found => {
-                s.latest_archive = Some(id.clone());
+                s.latest_archive = named.ok();
                 s.window = window;
             }
             Lookup::Absent(_) => {}
@@ -1577,12 +1578,61 @@ pub fn restore_window(
         }
         s.initialized = true;
     }
-    // Each other part once: parts with the same content are one archive.
-    let mut seen = std::collections::HashSet::from([id]);
-    listed.retain(|part| seen.insert(part.clone()));
+    if passed_over.unchecked > 0 || passed_over.not_ids > 0 {
+        tracing::warn!(
+            session = %chat,
+            checked = listed.len(),
+            unchecked = passed_over.unchecked,
+            not_ids = passed_over.not_ids,
+            "resumed chat: not every earlier archive its context head lists is looked up: at most \
+             {CHECKED_PARTS} are, and an entry that does not hold an archive id is not"
+        );
+    }
     if !listed.is_empty() {
         warn_unavailable_parts(binding.clone(), chat, listed);
     }
+}
+
+/// Whether `id` has the form of an archive id: 32 lowercase hex characters.
+fn is_archive_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Most parts of a resumed head's list that are looked up
+/// ([`warn_unavailable_parts`]). Each lookup reads a whole archive file, and
+/// the list comes from a session file, which bounds nothing.
+const CHECKED_PARTS: usize = 64;
+
+/// Entries of a resumed head's part list that are not looked up.
+#[derive(Default)]
+struct PassedOver {
+    /// Ids beyond the first [`CHECKED_PARTS`] (a repeated one may be
+    /// counted more than once).
+    unchecked: usize,
+    /// Entries whose `id` is not an archive id.
+    not_ids: usize,
+}
+
+/// The parts a resumed head lists (`archives` of `marker`) that are to be
+/// looked up: the first [`CHECKED_PARTS`] ids, each once, without `named`,
+/// which [`restore_window`] looks up itself (parts with the same content are
+/// one archive). Only a string with the form of an id is copied out of the
+/// list; everything else in it is counted.
+fn listed_parts(marker: &Value, named: Option<&str>) -> (Vec<String>, PassedOver) {
+    let mut seen: std::collections::HashSet<&str> = named.into_iter().collect();
+    let (mut listed, mut passed_over) = (Vec::new(), PassedOver::default());
+    for part in marker["archives"].as_array().into_iter().flatten() {
+        match part["id"].as_str().filter(|id| is_archive_id(id)) {
+            None => passed_over.not_ids += 1,
+            Some(id) if seen.contains(id) => {}
+            Some(_) if listed.len() == CHECKED_PARTS => passed_over.unchecked += 1,
+            Some(id) => {
+                seen.insert(id);
+                listed.push(id.to_owned());
+            }
+        }
+    }
+    (listed, passed_over)
 }
 
 /// A resumed head that lists the parts of a split window: warn for each of
@@ -6764,6 +6814,92 @@ mod resume_tests {
             assert_eq!(restored(&state), settled);
         }
         assert_eq!(log.lines().len(), 1, "no lookup, so nothing more is said: {:?}", log.lines());
+    }
+
+    /// `head` with its marker's `archives` replaced by entries of `ids`.
+    fn listing(head: &[SharedMessage], ids: impl IntoIterator<Item = String>) -> Vec<SharedMessage> {
+        let mut first = (*head[0]).clone();
+        let entries: Vec<Value> = ids.into_iter().map(|id| json!({"id": id, "first": 0, "count": 1, "messages": 1})).collect();
+        first["_synaps_context"]["archives"] = json!(entries);
+        let mut head = head.to_vec();
+        head[0] = Arc::new(first);
+        head
+    }
+
+    /// The marker is read from a session file, and resume used whatever
+    /// strings it held: every `archives[].id` was fetched, one whole archive
+    /// file each, with a warning carrying the string for each that failed,
+    /// and the marker's `archive` was logged as it was when it was not an
+    /// id. A long list is now looked up to a bound and the rest counted.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn resume_looks_up_a_bounded_number_of_the_parts_a_head_lists() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let found = (Some(parts[0].archive.id.clone()), 2, true);
+        // 200 ids no archive has, the first of them listed twice, and the
+        // archive the marker names, which is looked up as that.
+        let absent = |n: usize| format!("{n:032x}");
+        let mut ids: Vec<String> = (0..200).map(absent).collect();
+        ids.insert(1, absent(0));
+        ids.insert(2, parts[0].archive.id.clone());
+        let head = listing(&head, ids);
+
+        let log = Log::default();
+        let _capture = log.capture();
+        assert_eq!(resume(&head, &binding), found);
+        let lines = log.wait_for(CHECKED_PARTS + 1).await;
+        let looked_up: Vec<&String> =
+            lines.iter().filter(|line| line.contains("lists an earlier archive")).collect();
+        assert_eq!(looked_up.len(), CHECKED_PARTS, "{} lines", lines.len());
+        for (n, line) in looked_up.iter().enumerate() {
+            assert_says(line, &[&format!("ctx-{}", absent(n))]);
+        }
+        // One line for all the others.
+        assert_eq!(lines.len(), CHECKED_PARTS + 1, "{lines:?}");
+        let rest = lines.iter().find(|line| line.contains("not every earlier archive")).unwrap();
+        assert_says(rest, &[CHAT, "checked=64", "unchecked=136", "not_ids=0"]);
+    }
+
+    /// A string in the marker that is not an id is not an archive to fetch
+    /// and not something to write to the log, whatever it is: here 10 MB in
+    /// the marker's `archive` and in an `archives[].id`.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn resume_neither_fetches_nor_logs_a_marker_string_that_is_not_an_id() {
+        const BYTES: usize = 10 * 1024 * 1024;
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::legacy_current();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let id = parts[0].archive.id.clone();
+        let huge = "7".repeat(BYTES);
+        let log = Log::default();
+        let _capture = log.capture();
+        let logged = |log: &Log| log.0.lock().unwrap().len();
+
+        // In the list: counted, and the resume is what it would have been.
+        // Uppercase hex, and an id with something after it, are not ids.
+        let not_ids = [huge.clone(), id.to_uppercase(), format!("{id}/../x"), String::new()];
+        let listed = listing(&head, not_ids);
+        assert_eq!(resume(&listed, &binding), (Some(id.clone()), 2, true));
+        let lines = log.wait_for(1).await;
+        assert_eq!(lines.len(), 1, "nothing was looked up: {} lines", lines.len());
+        assert_says(&lines[0], &["not every earlier archive", "checked=0", "unchecked=0", "not_ids=4"]);
+        assert!(logged(&log) < 2_048, "{} bytes logged", logged(&log));
+
+        // As the archive the marker names: not found, settled, and the log
+        // has its length.
+        log.clear();
+        let mut first = (*head[0]).clone();
+        first["_synaps_context"]["archive"] = json!(huge);
+        let named = vec![Arc::new(first)];
+        assert_eq!(resume(&named, &binding), (None, 1, true));
+        let lines = log.wait_for(1).await;
+        assert_eq!(lines.len(), 1, "{} lines", lines.len());
+        assert_says(&lines[0], &[CHAT, "names no archive", &format!("{BYTES} bytes"), "goes on at window 1"]);
+        assert!(!lines[0].contains("ctx-"), "no archive is named");
+        assert!(logged(&log) < 2_048, "{} bytes logged", logged(&log));
     }
 
     /// A head that lists the parts of a split window tells the model each of

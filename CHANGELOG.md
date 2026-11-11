@@ -313,6 +313,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context rollover: resume uses only archive ids from a session file,
+  and a bounded number of them.** A resumed chat's first message lists the
+  archives of its last window. Every string in that list was fetched as an
+  archive, one whole file each, and written to the log when the fetch
+  failed; the archive the marker names was logged as it was even when it
+  was not an id. Only a string of 32 lowercase hex characters is now
+  fetched or logged. At most 64 listed archives are looked up and the rest
+  are logged as one count, and for a marker whose archive is not an id the
+  log gives its length.
 - **Context rollover: a resume whose archive lookup keeps failing is
   settled by the next rollover, and is looked up once per turn.** A resumed
   chat whose saved window names an archive that cannot be read (a damaged
