@@ -75,8 +75,8 @@ Before a real Axel adapter can be enabled:
 Relevant existing tests: `memory_context_e2e`, `continuous_memory_adversarial`,
 `memory_history_import`, `extension_lease_lifecycle`, `deferred_host_context`,
 `memory_project_scope`, `memory_index`, `disclosure_retention`, and
-`extensions_memory`. Historical review gates in
-`docs/reviews/continuous-memory-cp-f.md` concern recorded local revisions, not
-proof of today's installed pairing. The earlier no-SQLite decision in
+`extensions_memory`. The historical review gates of continuous memory (the
+`docs/reviews/continuous-memory-*.md` files, removed with the feature) concerned
+recorded local revisions, not proof of today's installed pairing. The earlier no-SQLite decision in
 `docs/decisions/T33-memory-index-no-sqlite.md` also rules out casually adding a
 new host database as a shortcut.

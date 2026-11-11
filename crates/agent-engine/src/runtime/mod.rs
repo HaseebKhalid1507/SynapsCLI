@@ -2306,14 +2306,6 @@ impl Runtime {
         .anchored(anchor.as_ref(), messages)
     }
 
-    /// C5 lease-release assertion seam (metadata only).
-    #[cfg(any(test, feature = "testing"))]
-    pub fn extension_lease_count_for_harness(&self) -> usize {
-        self.extension_runtime
-            .as_ref()
-            .map_or(0, |manager| manager.lease_count())
-    }
-
     /// Inherit storage authority only, with a fresh worker execution author.
     /// Oneshot, start, and resume share this path; even resume must not reuse
     /// a prior actor. Off/no-lease context state and tool grants stay untouched.
@@ -6385,65 +6377,19 @@ mod http_client_timeout_tests {
     }
 }
 
-/// Memory-backend configuration on a runtime with context-provider
-/// extensions loaded. (The module keeps its old name; the automatic-memory
-/// tests that shared it are gone with their subject.)
+/// Memory-backend configuration on a runtime. (The module keeps its old
+/// name; the automatic-memory and context-provider tests that shared it are
+/// gone with their subjects.)
 #[cfg(test)]
 mod memory_context_provider_tests {
     use super::Runtime;
-    use std::sync::Arc;
-
-    // ── task A6: memory-context provider validation + revocation wiring ──
-
-    /// Build a headless Runtime with the extension runtime installed (the
-    /// exact `install_extension_runtime` wiring point the engine uses at
-    /// boot) and one deferred context-provider-only extension loaded per
-    /// `(plugin, provider-id)` pair. Nothing spawns: context-provider
-    /// manifests classify as deferred and stay dormant.
-    async fn memory_runtime_with_providers(
-        plugins: &[(&str, &str)],
-    ) -> (
-        Runtime,
-        std::sync::Arc<crate::extensions::lease::ExtensionRuntimeManager>,
-    ) {
-        let mut manager = crate::extensions::manager::ExtensionManager::new(Arc::new(
-            crate::extensions::hooks::HookBus::new(),
-        ));
-        manager.set_progressive_deferral(true);
-        for (plugin, provider) in plugins {
-            let manifest: crate::extensions::manifest::ExtensionManifest =
-                serde_json::from_value(serde_json::json!({
-                    "runtime": "process",
-                    "command": "/bin/false",
-                    "permissions": ["context_providers.register"],
-                    "deferred": {
-                        "context_providers": [{
-                            "id": provider,
-                            "capability": "project-memory",
-                            "description": "test context provider",
-                            "schema_version": 1
-                        }]
-                    }
-                }))
-                .expect("manifest parses");
-            manager
-                .load(plugin, &manifest)
-                .await
-                .expect("deferred context-provider load succeeds without spawning");
-        }
-        let extension_runtime = manager.extension_runtime();
-        let mut runtime = Runtime::new_headless();
-        runtime.install_extension_runtime(std::sync::Arc::clone(&extension_runtime));
-        (runtime, extension_runtime)
-    }
 
     // ── memory-backend configuration tests (ported from upstream) ────────
 
     #[tokio::test]
-    async fn memory_backend_exclusive_rejects_extension_recall_capture_and_history() {
+    async fn an_axel_or_unknown_backend_is_exclusive_and_a_clone_keeps_it() {
         for selector in ["axel", "invalid-selector"] {
-            let (mut runtime, _manager) =
-                memory_runtime_with_providers(&[("memory-test", "notes")]).await;
+            let mut runtime = Runtime::new_headless();
             runtime.apply_config(&agent_core::config::load_config_from_str(&format!(
                 "memory.backend = {selector}\n"
             )));
@@ -6520,7 +6466,7 @@ mod memory_context_provider_tests {
     /// no id is invented for it. (The lease half of this test went with
     /// automatic memory.)
     #[test]
-    fn memory_binding_without_project_grants_no_lease() {
+    fn a_binding_without_a_folder_has_no_project() {
         let gone = tempfile::tempdir().unwrap();
         let gone_path = gone.path().join("deleted");
         std::fs::create_dir(&gone_path).unwrap();
@@ -6535,34 +6481,45 @@ mod memory_context_provider_tests {
         }
     }
 
+    /// An old config with the removed automatic-memory keys reaches nothing
+    /// in a runtime: it is bound exactly like one given an empty config,
+    /// and a second apply is not a "changed backend".
     #[test]
-    fn axel_invalid_config_cannot_grant_consent_or_fallback() {
+    fn an_old_automatic_memory_config_changes_nothing_on_a_runtime() {
+        let old = agent_core::config::load_config_from_str(
+            "memory.default_mode = capture_and_recall\n\
+             memory.default_mode_confirmed = true\n\
+             memory.recall_max_records = 12\n\
+             memory.recall_max_tokens = 2048\n\
+             memory.recall_timeout_ms = 250\n\
+             memory.capture_tools = off\n\
+             memory.capture_assistant = false\n\
+             memory.capture_user = false\n\
+             memory.auto_consolidate = on\n\
+             memory.local_embeddings = on\n\
+             memory.gliner = on\n",
+        );
+        assert_eq!(old.warnings.len(), 1, "{:?}", old.warnings);
+        let plain = agent_core::config::load_config_from_str("");
+        let mut with_old = Runtime::new_headless();
+        with_old.apply_config(&old);
+        with_old.apply_config(&old);
+        let mut with_plain = Runtime::new_headless();
+        with_plain.apply_config(&plain);
+        assert!(!with_old.memory_backend.exclusive());
+        assert_eq!(with_old.memory_backend_config, with_plain.memory_backend_config);
+        assert_eq!(with_old.memory_backend.base(), with_plain.memory_backend.base());
+        assert!(!with_old
+            .memory_backend_reconfigure_denied
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn an_unknown_backend_selector_binds_exclusive_not_legacy() {
         let mut runtime = Runtime::new_headless();
         runtime.apply_config(&agent_core::config::load_config_from_str(
             "memory.backend = invalid-not-axel-not-legacy\n",
         ));
         assert!(runtime.memory_backend.exclusive());
-    }
-
-    /// Session-end plumbing: dropping the LAST runtime owner runs the
-    /// shared `ExtensionSessionEndGuard` (terminate_session — the SAME
-    /// reap mechanism deferred tools/handlers use), and a fresh
-    /// construction against the same extension runtime has no lease.
-    #[tokio::test]
-    async fn memory_session_end_guard_drop_fresh_construction_is_off_no_lease() {
-        let (runtime, ext) =
-            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
-        // True session end: the last owner drop fires the guard.
-        drop(runtime);
-        assert_eq!(
-            ext.lease_count(),
-            0,
-            "session end must leave no runtime lease (never-spawned reap is a no-op)"
-        );
-
-        // A fresh construction (what any new session does) holds no lease.
-        let mut fresh = Runtime::new_headless();
-        fresh.install_extension_runtime(std::sync::Arc::clone(&ext));
-        assert_eq!(ext.lease_count(), 0);
     }
 }

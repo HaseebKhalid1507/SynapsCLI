@@ -512,6 +512,47 @@ pub(super) fn rebuild_stale_tool_set(
     }
 }
 
+/// Fire `on_message_complete` for one finished assistant message and apply
+/// an advisory work phase the extension reports back. The one place the
+/// event is built: every path that ends an assistant message calls this.
+///
+/// An extension may report an advisory work phase; it is applied exactly
+/// like the model's own `context_checkpoint` (no note) and is never
+/// capacity or permission authority.
+async fn emit_message_complete(
+    hook_bus: &crate::extensions::hooks::HookBus,
+    continuation: &super::continuation::SharedContinuation,
+    context_enabled: bool,
+    session_id: Option<&str>,
+    cwd: Option<&std::path::Path>,
+    content: &[Value],
+    has_tool_use: bool,
+) {
+    let assistant_text = assistant_text_from_content(content);
+    let context_management = continuation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .hook_context_management();
+    let hook_event = HookEvent::on_message_complete(
+        &assistant_text,
+        json!({
+            "content_block_count": content.len(),
+            "has_tool_use": has_tool_use,
+            "context_management": context_management,
+        }),
+    )
+    .with_session(session_id)
+    .with_cwd(cwd);
+    if let HookResult::ContextPhase { phase } = hook_bus.emit(&hook_event).await {
+        if context_enabled {
+            continuation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .report_hook_phase(&phase);
+        }
+    }
+}
+
 fn assistant_text_from_content(content: &[Value]) -> String {
     content
         .iter()
@@ -1885,6 +1926,20 @@ impl StreamMethods {
                     let after_tool_result = budget_meter.rounds_used() > 1;
                     if after_tool_result && !cancel.is_cancelled() {
                         // Legitimate empty end_turn after tool results — clean finish.
+                        // It is still the turn's last assistant message: an
+                        // extension that acts "when the turn is done" waits
+                        // for the event with `has_tool_use: false`, and the
+                        // tool rounds before this one all said `true`.
+                        emit_message_complete(
+                            &hook_bus,
+                            &continuation,
+                            context_enabled,
+                            session_id.as_deref(),
+                            cwd.as_deref(),
+                            content,
+                            false,
+                        )
+                        .await;
                         turn_completion.mark_completed();
                         send_history!();
                         return Ok(());
@@ -1959,32 +2014,16 @@ impl StreamMethods {
                     continue;
                 }
 
-                let assistant_text = assistant_text_from_content(content);
-                let context_management = continuation
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .hook_context_management();
-                let hook_event = HookEvent::on_message_complete(
-                    &assistant_text,
-                    json!({
-                        "content_block_count": content.len(),
-                        "has_tool_use": !tool_uses.is_empty(),
-                        "context_management": context_management,
-                    }),
+                emit_message_complete(
+                    &hook_bus,
+                    &continuation,
+                    context_enabled,
+                    session_id.as_deref(),
+                    cwd.as_deref(),
+                    content,
+                    !tool_uses.is_empty(),
                 )
-                .with_session(session_id.as_deref())
-                .with_cwd(cwd.as_deref());
-                // An extension may report an advisory work phase; it is
-                // applied exactly like the model's own `context_checkpoint`
-                // (no note) and is never capacity or permission authority.
-                if let HookResult::ContextPhase { phase } = hook_bus.emit(&hook_event).await {
-                    if context_enabled {
-                        continuation
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .report_hook_phase(&phase);
-                    }
-                }
+                .await;
 
                 // If no tool uses, check for steering messages before finishing.
                 // Steering can redirect the model even when it has no more tool calls.
@@ -5134,6 +5173,7 @@ mod rich_output_tests {
     /// an advisory `new_task` phase.
     struct PhaseHook {
         seen: Mutex<Vec<Value>>,
+        messages: Mutex<Vec<Option<String>>>,
     }
     #[async_trait::async_trait]
     impl crate::extensions::runtime::ExtensionHandler for PhaseHook {
@@ -5142,6 +5182,7 @@ mod rich_output_tests {
         }
         async fn handle(&self, event: &HookEvent) -> HookResult {
             self.seen.lock().unwrap().push(event.data.clone());
+            self.messages.lock().unwrap().push(event.message.clone());
             HookResult::ContextPhase {
                 phase: "new_task".into(),
             }
@@ -5155,6 +5196,7 @@ mod rich_output_tests {
         let bus = Arc::new(crate::extensions::hooks::HookBus::new());
         let hook = Arc::new(PhaseHook {
             seen: Mutex::new(Vec::new()),
+            messages: Mutex::new(Vec::new()),
         });
         let mut perms = PermissionSet::new();
         perms.grant(crate::extensions::permissions::Permission::LlmContent);
@@ -5196,6 +5238,8 @@ mod rich_output_tests {
         assert_eq!(seen.len(), 2, "one hook per assistant message: {seen:?}");
         assert_eq!(seen[0]["content_block_count"], 1);
         assert_eq!(seen[0]["has_tool_use"], true);
+        // A normal turn says "this was the last message" exactly once.
+        assert_eq!(seen[1]["has_tool_use"], false);
         assert_eq!(
             seen[0]["context_management"],
             json!({"enabled": true, "band": "normal", "phase": "unknown"})
@@ -6448,7 +6492,7 @@ mod rich_output_tests {
             uuid::Uuid::new_v4()
         ))
         .unwrap();
-        let hook_bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let (hook_bus, hook) = phase_hook_bus(false).await;
 
         let session = StreamSession {
             memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
@@ -6567,6 +6611,18 @@ mod rich_output_tests {
             history[2]["content"][0]["type"] == "tool_result",
             "F19: third message must be tool_result"
         );
+
+        // The extension is told the turn's last message is done: one event
+        // for the tool round, and exactly one, with empty text, for the
+        // empty reply that ended the turn.
+        let seen = hook.seen.lock().unwrap().clone();
+        let messages = hook.messages.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one event per assistant message: {seen:?}");
+        assert_eq!(seen[0]["has_tool_use"], true);
+        assert_eq!(seen[1]["has_tool_use"], false);
+        assert_eq!(seen[1]["content_block_count"], 0);
+        assert_eq!(messages[0].as_deref(), Some("pre-tool text"));
+        assert_eq!(messages[1].as_deref(), Some(""));
     }
 
     // ── Tool output virtualisation, through the real tool-result → history

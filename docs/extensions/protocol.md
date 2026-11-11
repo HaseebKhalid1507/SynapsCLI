@@ -493,6 +493,11 @@ never block, modify, or inject. `message` contains concatenated assistant text
 blocks when present; tool-use blocks are summarized in `data` instead of being
 serialized into `message`.
 
+A turn fires one event per assistant message, and the turn's last one is the
+one with `has_tool_use: false`. Its `message` may be empty: a model that has
+nothing to add after its tool calls ends the turn on an empty reply, and that
+reply is still reported (`message: ""`, `content_block_count: 0`).
+
 ```json
 {
   "kind": "on_message_complete",
@@ -897,6 +902,13 @@ Relative command paths and local argument paths are resolved from the plugin dir
 | `providers.register`| Register extension-provided provider metadata during initialization. Chat routing is not wired yet. |
 
 Reserved future permissions are rejected if declared today: `tools.override`.
+
+`context_providers.register` and the manifest key `deferred.context_providers`
+are accepted and ignored. They declared a provider for built-in automatic
+memory, which was removed in 0.12.0; a manifest that still has them loads,
+its tools and hooks work, the declaration decides nothing about when the
+extension starts, and the host logs one line saying it is ignored. An
+extension that provides capture and recall does it through hooks.
 
 Permissions are enforced before hook subscriptions are installed. Unknown permission strings are rejected, reserved permission strings are rejected, and a hook subscription without its required permission fails manifest loading.
 

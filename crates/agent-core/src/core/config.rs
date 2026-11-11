@@ -1224,143 +1224,33 @@ fn parse_turn_budget_config_key(
     Ok(deprecation)
 }
 
-/// Continuous-memory settings surface (Task A2, spec §12). Every field is
-/// fail-closed: unknown or invalid values warn and keep the compiled default.
-///
-/// This struct contains continuous-memory policy; backend selection lives in
-/// the separate `MemoryBackendConfig`.
-/// Secret handling, retention, and project-scope rules are deliberately NOT
-/// fields here — they are not configurable at all (spec §12: "Secret,
-/// retention, and project rules are not configurable to fail open").
-#[derive(Debug, Clone, PartialEq)]
-pub struct MemoryConfig {
-    /// Durable default memory mode. "off" unless the operator explicitly
-    /// consents via `memory.default_mode_confirmed = true` in the same
-    /// config parse pass (spec §12 operator-consent rule). Known values:
-    /// off | recall_once | recall_each_prompt | capture_only |
-    /// capture_and_recall (spec §6.1).
-    pub default_mode: String,
-    /// Operator-consent latch for `default_mode` (spec §12). Must be set to
-    /// `true` in the same parse pass for a non-"off" `default_mode` to take
-    /// effect; otherwise `default_mode` reverts to "off" with a warning.
-    pub default_mode_confirmed: bool,
-    /// Max records surfaced per recall (spec §10.3 budget).
-    pub recall_max_records: u32,
-    /// Max tokens surfaced per recall (spec §10.3 budget).
-    pub recall_max_tokens: u32,
-    /// Recall time budget in milliseconds (spec §16).
-    pub recall_timeout_ms: u64,
-    /// Tool-result capture policy: off | summary_only (spec §11).
-    pub capture_tools: String,
-    /// Capture assistant turns (spec §8.2).
-    pub capture_assistant: bool,
-    /// Capture user turns (spec §8.2).
-    pub capture_user: bool,
-    /// Background consolidation: off | on (spec §11.3, explicit opt-in).
-    pub auto_consolidate: String,
-    /// Local embedding models: off | on (spec §11.2, never implicit).
-    pub local_embeddings: String,
-    /// GLiNER entity extraction: off | on (spec §11.2, never implicit).
-    pub gliner: String,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            default_mode: "off".to_string(),
-            default_mode_confirmed: false,
-            recall_max_records: 8,
-            recall_max_tokens: 4096,
-            recall_timeout_ms: 150,
-            capture_tools: "summary_only".to_string(),
-            capture_assistant: true,
-            capture_user: true,
-            auto_consolidate: "off".to_string(),
-            local_embeddings: "off".to_string(),
-            gliner: "off".to_string(),
-        }
-    }
-}
-
-/// Memory mode strings accepted by `memory.default_mode` (spec §6.1,
-/// snake_case of `MemoryContextMode`). Anything else fails closed to the
-/// current value — `default_mode` can never silently become a non-off mode
-/// through an unrecognised string.
-const KNOWN_MEMORY_MODES: &[&str] = &[
-    "off",
-    "recall_once",
-    "recall_each_prompt",
-    "capture_only",
-    "capture_and_recall",
+/// The eleven keys of built-in automatic memory (capture and recall), which
+/// left core for an extension. Read, never validated, never able to fail
+/// anything: whatever their values, the family is reported with one warning
+/// so an old config still loads.
+const REMOVED_AUTOMATIC_MEMORY_KEYS: [&str; 11] = [
+    "memory.default_mode",
+    "memory.default_mode_confirmed",
+    "memory.recall_max_records",
+    "memory.recall_max_tokens",
+    "memory.recall_timeout_ms",
+    "memory.capture_tools",
+    "memory.capture_assistant",
+    "memory.capture_user",
+    "memory.auto_consolidate",
+    "memory.local_embeddings",
+    "memory.gliner",
 ];
-
-/// Parse `memory.<field>` keys (Task A2, spec §12). Invalid values warn and
-/// keep the default (parity with turn_budget.* parsing) — never fail open.
-/// `Err` carries the diagnostic the caller prints.
-fn parse_memory_config_key(memory: &mut MemoryConfig, key: &str, val: &str) -> Result<(), String> {
-    let Some(field) = key.strip_prefix("memory.") else {
-        return Ok(());
-    };
-    /// Strict boolean: recognised forms parse; anything else warns and
-    /// keeps the current (default) value.
-    fn parse_bool(slot: &mut bool, key: &str, val: &str) -> Result<(), String> {
-        match val {
-            "true" | "1" | "yes" | "on" => *slot = true,
-            "false" | "0" | "no" | "off" => *slot = false,
-            other => {
-                return Err(format!(
-                    "Warning: invalid value for {key}: '{other}', expected true/false — using default"
-                ))
-            }
-        }
-        Ok(())
-    }
-    /// Closed string-enum: value must be in `allowed`, else warn and keep
-    /// the current (default) value.
-    fn parse_enum(slot: &mut String, key: &str, val: &str, allowed: &[&str]) -> Result<(), String> {
-        if allowed.contains(&val) {
-            *slot = val.to_string();
-            Ok(())
-        } else {
-            Err(format!(
-                "Warning: invalid value for {key}: '{val}', expected one of {} — using default",
-                allowed.join("|")
-            ))
-        }
-    }
-    macro_rules! set_num {
-        ($slot:expr, $ty:ty) => {
-            match val.parse::<$ty>() {
-                Ok(parsed) => {
-                    $slot = parsed;
-                    Ok(())
-                }
-                Err(_) => Err(format!("Warning: invalid value for {key}: '{val}', using default")),
-            }
-        };
-    }
-    match field {
-        "default_mode" => parse_enum(&mut memory.default_mode, key, val, KNOWN_MEMORY_MODES),
-        "default_mode_confirmed" => parse_bool(&mut memory.default_mode_confirmed, key, val),
-        "recall_max_records" => set_num!(memory.recall_max_records, u32),
-        "recall_max_tokens" => set_num!(memory.recall_max_tokens, u32),
-        "recall_timeout_ms" => set_num!(memory.recall_timeout_ms, u64),
-        "capture_tools" => parse_enum(
-            &mut memory.capture_tools,
-            key,
-            val,
-            &["off", "summary_only"],
-        ),
-        "capture_assistant" => parse_bool(&mut memory.capture_assistant, key, val),
-        "capture_user" => parse_bool(&mut memory.capture_user, key, val),
-        "auto_consolidate" => parse_enum(&mut memory.auto_consolidate, key, val, &["off", "on"]),
-        "local_embeddings" => parse_enum(&mut memory.local_embeddings, key, val, &["off", "on"]),
-        "gliner" => parse_enum(&mut memory.gliner, key, val, &["off", "on"]),
-        other => Err(format!("Warning: unknown memory field '{other}'")),
-    }
+fn removed_automatic_memory_warning() -> String {
+    format!(
+        "memory.default_mode, memory.recall_* and memory.capture_* (and memory.auto_consolidate, \
+         memory.local_embeddings, memory.gliner) are ignored: built-in automatic memory was \
+         removed in {}; an extension provides capture and recall through hooks. Remove these lines",
+        crate::AXEL_BACKEND_REMOVED_IN
+    )
 }
 
-/// Host-owned note storage selection, independent of continuous-memory consent.
+/// Host-owned note storage selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemoryBackendKind {
     #[default]
@@ -1580,8 +1470,6 @@ pub struct SynapsConfig {
     pub keybinds: std::collections::HashMap<String, String>,
     /// Typed per-role turn budgets (Task 23, spec §8.1).
     pub turn_budgets: TurnBudgetsConfig,
-    /// Continuous-memory settings surface (Task A2, spec §12).
-    pub memory: MemoryConfig,
     /// Host-owned backend; selecting it does not enable recall or capture.
     pub memory_backend: MemoryBackendConfig,
     /// Non-fatal problems found while parsing the config file (unknown keys,
@@ -1657,7 +1545,6 @@ impl Default for SynapsConfig {
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
             turn_budgets: TurnBudgetsConfig::default(),
-            memory: MemoryConfig::default(),
             memory_backend: MemoryBackendConfig::default(),
             warnings: Vec::new(),
         }
@@ -1785,7 +1672,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
 
 /// Every key accepted by the namespaced family parsers that is NOT in
 /// [`KNOWN_CONFIG_KEYS`] (`shell.*`, `events.*`, `turn_budget.*`,
-/// `memory.*`, `server.*`, `auth.*`). Open-ended families whose
+/// the memory backend keys, `server.*`, `auth.*`). Open-ended families whose
 /// suffix is user-chosen are listed as `prefix.*`. Keep this in sync when a
 /// parser learns a key: the /settings coverage test requires each entry to
 /// have a settings row or an explicit exclusion.
@@ -1829,18 +1716,6 @@ pub const FAMILY_CONFIG_KEYS: &[&str] = &[
     "memory.user_scope",
     "memory.axel.executable",
     "memory.axel.brain",
-    // parse_memory_config_key
-    "memory.default_mode",
-    "memory.default_mode_confirmed",
-    "memory.recall_max_records",
-    "memory.recall_max_tokens",
-    "memory.recall_timeout_ms",
-    "memory.capture_tools",
-    "memory.capture_assistant",
-    "memory.capture_user",
-    "memory.auto_consolidate",
-    "memory.local_embeddings",
-    "memory.gliner",
     // parse_server_config_key
     "server.auto_approve_confirms",
     // parse_auth_config_key
@@ -2058,8 +1933,8 @@ pub fn config_content_problems(content: &str) -> Vec<String> {
 /// Runs the real parser over the config file as it would look after
 /// [`write_config_value`] and returns `Err` with the parser's own messages
 /// for any problem the edit introduces — invalid values, and cross-key
-/// rules such as `context_management` threshold ordering, `subagent`
-/// concurrency vs total, or `memory.default_mode` without operator consent.
+/// rules such as `context_management` threshold ordering or `subagent`
+/// concurrency vs total. A removed key is refused with its removal warning.
 /// Problems already present before the edit are not blamed on it.
 pub fn validate_config_edit(key: &str, value: &str) -> Result<(), String> {
     if key.contains(['=', '\n', '\r'])
@@ -2110,8 +1985,8 @@ pub fn load_config() -> SynapsConfig {
 /// Apply key=value config lines from `content` into `config`.
 /// Shared by `load_config` (file path) and `load_config_from_str` (test helper).
 fn apply_config_content(config: &mut SynapsConfig, content: &str) {
-    // The shell/events/turn_budget/memory families report to stderr (not
-    // `config.warnings`) — unchanged behaviour.
+    // The shell/events/turn_budget families and an unknown `memory.*` key
+    // report to stderr (not `config.warnings`) — unchanged behaviour.
     apply_config_content_with(config, content, &mut |diagnostic: String| eprintln!("{diagnostic}"));
 }
 
@@ -2595,11 +2470,14 @@ fn apply_config_content_with(
                         }
                         Err(diagnostic) => family_diagnostic(diagnostic),
                     }
-                } else if key.starts_with("memory.") {
-                    if let Err(diagnostic) = parse_memory_config_key(&mut config.memory, key, val)
-                    {
-                        family_diagnostic(diagnostic);
+                } else if REMOVED_AUTOMATIC_MEMORY_KEYS.contains(&key) {
+                    // One warning for the family, whatever the values.
+                    let warning = removed_automatic_memory_warning();
+                    if !config.warnings.contains(&warning) {
+                        config.warnings.push(warning);
                     }
+                } else if let Some(field) = key.strip_prefix("memory.") {
+                    family_diagnostic(format!("Warning: unknown memory field '{field}'"));
                 } else if key.starts_with("startup.") {
                     if let Err(reason) =
                         parse_startup_config_key(&mut config.startup, key, val)
@@ -2685,19 +2563,6 @@ fn apply_config_content_with(
     // order or later duplicate selectors. Never silently route to legacy.
     if invalid_memory_backend {
         config.memory_backend.kind = MemoryBackendKind::Unavailable;
-    }
-
-    // Fail-closed operator-consent rule (Task A2, spec §12): a non-"off"
-    // `memory.default_mode` takes effect only when the operator also set
-    // `memory.default_mode_confirmed = true` in this same parse pass.
-    // Checked after the loop so key order never matters.
-    if config.memory.default_mode != "off" && !config.memory.default_mode_confirmed {
-        config.warnings.push(format!(
-            "memory.default_mode = {} requires memory.default_mode_confirmed = true \
-             in the same config; reverting to off",
-            config.memory.default_mode
-        ));
-        config.memory.default_mode = "off".to_string();
     }
 }
 
@@ -3809,10 +3674,21 @@ mod tests {
         }
     }
 
+    /// An old config with every automatic-memory key still loads: one
+    /// warning for the family, with the exact text, and no key changes
+    /// anything. Garbage values are not validated, so they cannot add a
+    /// second warning or a diagnostic.
     #[test]
-    fn memory_keys_all_parse_with_consent() {
-        let config = super::load_config_from_str(
-            "memory.default_mode = capture_and_recall\n\
+    fn removed_automatic_memory_keys_still_load_with_one_warning() {
+        let expected = format!(
+            "memory.default_mode, memory.recall_* and memory.capture_* (and \
+             memory.auto_consolidate, memory.local_embeddings, memory.gliner) are ignored: \
+             built-in automatic memory was removed in {}; an extension provides capture and \
+             recall through hooks. Remove these lines",
+            crate::AXEL_BACKEND_REMOVED_IN
+        );
+        assert_eq!(super::removed_automatic_memory_warning(), expected);
+        let valid = "memory.default_mode = capture_and_recall\n\
              memory.default_mode_confirmed = true\n\
              memory.recall_max_records = 12\n\
              memory.recall_max_tokens = 2048\n\
@@ -3822,43 +3698,10 @@ mod tests {
              memory.capture_user = false\n\
              memory.auto_consolidate = on\n\
              memory.local_embeddings = on\n\
-             memory.gliner = on\n",
-        );
-        assert_eq!(config.memory.default_mode, "capture_and_recall");
-        assert!(config.memory.default_mode_confirmed);
-        assert_eq!(config.memory.recall_max_records, 12);
-        assert_eq!(config.memory.recall_max_tokens, 2048);
-        assert_eq!(config.memory.recall_timeout_ms, 250);
-        assert_eq!(config.memory.capture_tools, "off");
-        assert!(!config.memory.capture_assistant);
-        assert!(!config.memory.capture_user);
-        assert_eq!(config.memory.auto_consolidate, "on");
-        assert_eq!(config.memory.local_embeddings, "on");
-        assert_eq!(config.memory.gliner, "on");
-    }
-
-    #[test]
-    fn memory_defaults_match_spec_12() {
-        let config = super::load_config_from_str("");
-        assert_eq!(config.memory, super::MemoryConfig::default());
-        assert_eq!(config.memory.default_mode, "off");
-        assert!(!config.memory.default_mode_confirmed);
-        assert_eq!(config.memory.recall_max_records, 8);
-        assert_eq!(config.memory.recall_max_tokens, 4096);
-        assert_eq!(config.memory.recall_timeout_ms, 150);
-        assert_eq!(config.memory.capture_tools, "summary_only");
-        assert!(config.memory.capture_assistant);
-        assert!(config.memory.capture_user);
-        assert_eq!(config.memory.auto_consolidate, "off");
-        assert_eq!(config.memory.local_embeddings, "off");
-        assert_eq!(config.memory.gliner, "off");
-    }
-
-    #[test]
-    fn memory_unknown_values_fail_closed_to_defaults() {
-        let config = super::load_config_from_str(
-            "memory.default_mode = recall_everything_forever\n\
-             memory.default_mode_confirmed = true\n\
+             memory.gliner = on\n\
+             model = claude-sonnet-4-6\n";
+        let garbage = "memory.default_mode = recall_everything_forever\n\
+             memory.default_mode_confirmed = definitely\n\
              memory.recall_max_records = lots\n\
              memory.recall_max_tokens = -5\n\
              memory.recall_timeout_ms = fast\n\
@@ -3868,63 +3711,35 @@ mod tests {
              memory.auto_consolidate = aggressive\n\
              memory.local_embeddings = auto\n\
              memory.gliner = download\n\
-             memory.nosuchfield = 1\n",
+             model = claude-sonnet-4-6\n";
+        assert_eq!(valid.lines().filter(|l| l.contains("memory.")).count(), 11);
+        let plain = super::load_config_from_str("model = claude-sonnet-4-6\n");
+        for content in [valid, garbage] {
+            let config = super::load_config_from_str(content);
+            assert_eq!(config.warnings, std::slice::from_ref(&expected), "{:?}", config.warnings);
+            // The family reaches nothing else: the next key still parses and
+            // the storage backend is the one a config without these has.
+            assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-6"));
+            assert_eq!(config.memory_backend, plain.memory_backend);
+            assert_eq!(config.memory_backend.kind, super::MemoryBackendKind::Legacy);
+            // No stderr diagnostic either: the warning is all there is.
+            assert_eq!(super::config_content_problems(content), std::slice::from_ref(&expected));
+        }
+        // Each key alone gives the same one warning.
+        for key in super::REMOVED_AUTOMATIC_MEMORY_KEYS {
+            let config = super::load_config_from_str(&format!("{key} = on\n"));
+            assert_eq!(config.warnings, std::slice::from_ref(&expected), "{key}");
+        }
+        // The old consent warning is gone: an unconfirmed mode says only that
+        // the key is ignored.
+        let unconfirmed = super::load_config_from_str("memory.default_mode = recall_each_prompt\n");
+        assert_eq!(unconfirmed.warnings, std::slice::from_ref(&expected));
+        // A `memory.*` key that never existed is still reported as unknown,
+        // not as removed.
+        assert_eq!(
+            super::config_content_problems("memory.nosuchfield = 1\n"),
+            ["Warning: unknown memory field 'nosuchfield'".to_string()]
         );
-        // Unrecognised mode string must stay "off" — never a non-off mode.
-        assert_eq!(config.memory.default_mode, "off");
-        assert_eq!(config.memory.recall_max_records, 8);
-        assert_eq!(config.memory.recall_max_tokens, 4096);
-        assert_eq!(config.memory.recall_timeout_ms, 150);
-        assert_eq!(config.memory.capture_tools, "summary_only");
-        assert!(config.memory.capture_assistant);
-        assert!(config.memory.capture_user);
-        assert_eq!(config.memory.auto_consolidate, "off");
-        assert_eq!(config.memory.local_embeddings, "off");
-        assert_eq!(config.memory.gliner, "off");
-    }
-
-    #[test]
-    fn memory_default_mode_without_consent_reverts_to_off() {
-        let config = super::load_config_from_str("memory.default_mode = recall_each_prompt\n");
-        assert_eq!(config.memory.default_mode, "off");
-        assert!(
-            config
-                .warnings
-                .iter()
-                .any(|w| w.contains("memory.default_mode_confirmed")),
-            "reversion must surface a warning; got: {:?}",
-            config.warnings
-        );
-
-        // Explicit false consent is not consent.
-        let denied = super::load_config_from_str(
-            "memory.default_mode = capture_only\n\
-             memory.default_mode_confirmed = false\n",
-        );
-        assert_eq!(denied.memory.default_mode, "off");
-
-        // Garbage consent value fails closed — not consent.
-        let garbage = super::load_config_from_str(
-            "memory.default_mode = capture_only\n\
-             memory.default_mode_confirmed = definitely\n",
-        );
-        assert_eq!(garbage.memory.default_mode, "off");
-    }
-
-    #[test]
-    fn memory_consent_is_order_independent() {
-        // Consent key before the mode key.
-        let before = super::load_config_from_str(
-            "memory.default_mode_confirmed = true\n\
-             memory.default_mode = recall_once\n",
-        );
-        assert_eq!(before.memory.default_mode, "recall_once");
-        // Consent key after the mode key.
-        let after = super::load_config_from_str(
-            "memory.default_mode = recall_once\n\
-             memory.default_mode_confirmed = true\n",
-        );
-        assert_eq!(after.memory.default_mode, "recall_once");
     }
 
     #[test]
@@ -3934,7 +3749,6 @@ mod tests {
         assert_eq!(config.memory_backend.kind, super::MemoryBackendKind::Legacy);
         let axel = super::load_config_from_str("memory.backend = axel\n");
         assert_eq!(axel.memory_backend.kind, super::MemoryBackendKind::Axel);
-        assert_eq!(axel.memory, config.memory);
         assert!(axel.warnings.is_empty());
     }
 
@@ -3945,7 +3759,6 @@ mod tests {
         let enabled =
             super::load_config_from_str("memory.backend = axel\nmemory.user_scope = true\n");
         assert!(enabled.memory_backend.user_scope);
-        assert_eq!(enabled.memory, default.memory);
         for bad in ["yes", "", "1", "TRUE"] {
             let config = super::load_config_from_str(&format!(
                 "memory.user_scope = {bad}\nmemory.backend = axel\n"
@@ -4011,30 +3824,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn memory_config_surface_is_closed_by_construction() {
-        // Exhaustive struct literal — no `..Default::default()` spread. This
-        // fails to COMPILE if any field is added to or removed from
-        // MemoryConfig, pinning the exact memory.* config surface. Secret,
-        // retention, and project-scope semantics have no field here, so no
-        // `memory.secret*` / `memory.retention*` / `memory.project*` config
-        // key can exist (spec §12: those rules are not configurable to fail
-        // open). Asserted by construction, not by test disproof.
-        let _closed_surface = super::MemoryConfig {
-            default_mode: "off".to_string(),
-            default_mode_confirmed: false,
-            recall_max_records: 8,
-            recall_max_tokens: 4096,
-            recall_timeout_ms: 150,
-            capture_tools: "summary_only".to_string(),
-            capture_assistant: true,
-            capture_user: true,
-            auto_consolidate: "off".to_string(),
-            local_embeddings: "off".to_string(),
-            gliner: "off".to_string(),
-        };
     }
 
     use super::*;
@@ -5505,8 +5294,7 @@ api_retries = 5
             "events.auto_turn_cap = many",
             "turn_budget.worker.max_cost_usd = cheap",
             "turn_budget.nobody.max_tool_calls = 3",
-            "memory.capture_tools = everything",
-            "memory.recall_max_records = -1",
+            "memory.nosuchfield = 1",
             "memory.user_scope = yes",
             "cache_ttl = forever",
         ] {
@@ -5519,8 +5307,6 @@ api_retries = 5
             "events.auto_turn = off",
             "events.auto_turn_cap = unlimited",
             "turn_budget.worker.max_cost_usd = 2.5",
-            "memory.capture_tools = off",
-            "memory.recall_max_records = 4",
             "memory.user_scope = true",
             "cache_ttl = hybrid",
             "cache_ttl = auto",
@@ -5590,11 +5376,7 @@ api_retries = 5
             match key {
                 "shell.readiness_strategy" => "hybrid",
                 "memory.backend" => "legacy",
-                "memory.user_scope" | "memory.default_mode_confirmed" => "true",
-                "memory.default_mode" => "off",
-                "memory.capture_tools" => "summary_only",
-                "memory.capture_assistant" | "memory.capture_user" => "on",
-                "memory.auto_consolidate" | "memory.local_embeddings" | "memory.gliner" => "off",
+                "memory.user_scope" => "true",
                 "memory.axel.executable" | "memory.axel.brain" => ABSOLUTE_SAMPLE_PATH,
                 "events.auto_turn" => "on",
                 "server.auto_approve_confirms" => "false",
@@ -5632,11 +5414,15 @@ api_retries = 5
             std::fs::write(&cfg, "subagent.max_total = 8\n").unwrap();
             assert!(validate_config_edit("subagent.max_concurrent", "8").is_ok());
             assert!(validate_config_edit("subagent.max_concurrent", "9").is_err());
+            // A removed key is refused with its removal warning, whatever
+            // the value (the consent rule it once had went with the key).
             std::fs::write(&cfg, "").unwrap();
-            assert!(validate_config_edit("memory.default_mode", "recall_once").is_err());
-            assert!(validate_config_edit("memory.default_mode", "off").is_ok());
-            std::fs::write(&cfg, "memory.default_mode_confirmed = true\n").unwrap();
-            assert!(validate_config_edit("memory.default_mode", "recall_once").is_ok());
+            for value in ["recall_once", "off"] {
+                assert_eq!(
+                    validate_config_edit("memory.default_mode", value),
+                    Err(removed_automatic_memory_warning())
+                );
+            }
 
             // A problem already in the file is not blamed on an unrelated edit.
             std::fs::write(&cfg, "cache_ttl = forever\n").unwrap();

@@ -148,7 +148,7 @@ impl TryFrom<RawExtensionManifest> for ExtensionManifest {
                 tools: raw.tools,
                 providers: Vec::new(),
                 lifecycle: None,
-                context_providers: Vec::new(),
+                context_providers: Value::Null,
             })
         } else {
             raw.deferred
