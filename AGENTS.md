@@ -236,7 +236,7 @@ Axel uses one shared brain with per-repository scopes: Git worktrees share a
 random durable identity in their common Git directory. Default service is an
 installed sibling; default brain is `~/.synaps-cli/memory/axel/brain.r8`.
 Absolute `memory.axel.executable`/`memory.axel.brain` overrides remain supported.
-Linux/procfs is required. Old path scopes require explicit migration/linking;
+Linux/procfs is required. Old path scopes require explicit migration;
 there is no legacy fallback or automatic private-history import. User-wide notes
 require separate `memory.user_scope = true` and explicit tool `scope=user`.
 Selection is restart-bound; `/memory` consent and `/context auto` remain separate

@@ -191,9 +191,7 @@ supported multi-project marker or exact original pin and scoped schema, checked
 read-only **before** `Brain::open`. Unmarked/legacy brains and foreign access to
 a pinned brain are refused, never silently adopted or migrated.
 An interrupted first initialization can leave an unusable file; fail closed,
-do not automatically adopt it. Explicit operator migration is available through
-`synaps retention migrate-memory`; it never adopts a legacy brain in place or
-changes backend configuration. See [the migration guide](../../docs/specs/memory-migration.md).
+do not automatically adopt it.
 
 The parent must already exist, be owned by the current UID, and have no
 other-user permission bits. Parent traversal uses `openat(O_NOFOLLOW)`;
