@@ -91,7 +91,7 @@ fn is_tool_result(e: &SessionEventWire) -> bool {
 async fn a_pending_prompt_survives_reattach_and_is_answered_over_the_endpoint() {
     let guard = HomeGuard::new();
     let script: &'static [&'static str] =
-        Box::leak(vec![sse_tool_call("prompt_fixture", "toolu_w1u"), ANTHROPIC_SSE].into_boxed_slice());
+        Box::leak(vec![sse_tool_call("prompt_fixture", "toolu_fixture"), ANTHROPIC_SSE].into_boxed_slice());
     let (url, _hits, _) = spawn_stub(Script::SeqSse(script)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
