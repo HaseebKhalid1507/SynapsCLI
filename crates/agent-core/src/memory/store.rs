@@ -193,16 +193,27 @@ fn append_record(base: &Path, record: &MemoryRecord, sync_now: bool) -> Result<(
         });
     }
     let dir = memory_dir_in(base);
+    let new_dir = !dir.exists();
     crate::core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::from)?;
+    if new_dir {
+        // The name of a `memory/` folder made just now is in its parent, and
+        // no sync below reaches that. Before the line is written, so that a
+        // failure here leaves no note behind an error.
+        if let Some(parent) = dir.parent() {
+            sync_dir(parent)?;
+        }
+    }
     let path = namespace_path(&dir, &record.namespace);
     let line = serde_json::to_string(record)?;
     append_jsonl_line(&path, &line, sync_now)
 }
 
 /// Append one JSONL line and make it durable before returning: the line goes
-/// to the file whole ([`write_whole_line`]), the file is synced, and when
-/// this append found no file or an empty one, its directory is synced too,
-/// because nothing else puts the new file's name on disk.
+/// to the file whole ([`write_whole_line`]), the file is synced, and then
+/// its directory, on every save. "The file had bytes" does not say that its
+/// name is on disk: another saver may have created it and not synced the
+/// directory yet, a rewrite may have renamed a new file over it, or an
+/// import that did not finish may have made it.
 ///
 /// With `sync_now` false nothing is synced here: the caller is an import
 /// run, which syncs each file and its directory once, at its end
@@ -227,25 +238,23 @@ fn append_record(base: &Path, record: &MemoryRecord, sync_now: bool) -> Result<(
 /// not had within [`NOTES_LOCK_WAIT`] the save fails and nothing is written.
 fn append_jsonl_line(path: &Path, line: &str, sync_now: bool) -> Result<(), MemoryError> {
     let _lock = lock_notes_file(path)?;
-    let (had_bytes, needs_heal) = match fs::metadata(path) {
+    let needs_heal = match fs::metadata(path) {
         Ok(meta) if meta.len() > 0 => {
             use std::io::{Read, Seek, SeekFrom};
             let mut f = fs::File::open(path)?;
             f.seek(SeekFrom::End(-1))?;
             let mut last = [0u8; 1];
             f.read_exact(&mut last)?;
-            (true, last[0] != b'\n')
+            last[0] != b'\n'
         }
-        _ => (false, false),
+        _ => false,
     };
     let mut f = crate::core::private_fs::open_private_append(path).map_err(std::io::Error::from)?;
     write_whole_line(&mut f, line, needs_heal)?;
     if sync_now {
         sync_file(&f)?;
-        if !had_bytes {
-            if let Some(dir) = path.parent() {
-                sync_dir(dir)?;
-            }
+        if let Some(dir) = path.parent() {
+            sync_dir(dir)?;
         }
     }
     Ok(())
@@ -391,13 +400,21 @@ fn sync_file(file: &fs::File) -> std::io::Result<()> {
     file.sync_all()
 }
 
-/// Sync a directory, so that the name of a file just created in it is on
-/// disk.
+/// Sync a directory, so that the name of a file created in it, or renamed
+/// into it, is on disk.
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     step("sync dir");
+    // A file system that cannot sync a directory at all says so with EINVAL
+    // or ENOTSUP. That is not a failed save: now that every save syncs the
+    // directory, it would fail every save there, each with its line already
+    // in the file.
     #[cfg(unix)]
     {
-        fs::File::open(dir)?.sync_all()
+        use std::io::ErrorKind::{InvalidInput, Unsupported};
+        match fs::File::open(dir)?.sync_all() {
+            Err(e) if matches!(e.kind(), InvalidInput | Unsupported) => Ok(()),
+            result => result,
+        }
     }
     // Windows cannot open a directory to flush it, and NTFS journals the new
     // name itself: the choice `session_journal::sync_sessions_dir` makes.
@@ -444,9 +461,14 @@ pub fn query_in(
     let needle = q.content_contains.as_ref().map(|s| s.to_lowercase());
     let mut out: Vec<MemoryRecord> = Vec::new();
     for line in reader.lines() {
+        // The rule of `scan_project_file`: a line that is not UTF-8 is
+        // skipped like one that does not parse; any other read error is
+        // returned. `lines` gives a lasting error again on every call, so
+        // skipping it would never end.
         let line = match line {
             Ok(l) => l,
-            Err(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(e) => return Err(e.into()),
         };
         if line.trim().is_empty() {
             continue;
@@ -1493,6 +1515,33 @@ mod tests {
         assert_eq!(got.len(), 2);
     }
 
+    /// A line that is not UTF-8 is skipped like one that does not parse. A
+    /// read error that will not go away ends the query with that error:
+    /// `lines` returns it again on every call, so a loop that skipped it
+    /// never ended.
+    #[test]
+    fn query_skips_a_line_that_is_not_utf8_and_stops_on_a_lasting_read_error() {
+        let tmp = TempDir::new().unwrap();
+        append_to(tmp.path(), &rec("ns", 1, "one", vec![])).unwrap();
+        let path = memory_dir_in(tmp.path()).join("ns.jsonl");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"content\":\"caf\xc3\n");
+        fs::write(&path, bytes).unwrap();
+        append_to(tmp.path(), &rec("ns", 2, "two", vec![])).unwrap();
+        let found = query_in(tmp.path(), "ns", &MemoryQuery::default()).unwrap();
+        let contents: Vec<&str> = found.iter().map(|r| r.content.as_str()).collect();
+        assert_eq!(contents, ["two", "one"]);
+
+        // A directory where the file should be opens, and every read of it
+        // fails the same way.
+        #[cfg(unix)]
+        {
+            fs::create_dir(memory_dir_in(tmp.path()).join("dir.jsonl")).unwrap();
+            let error = query_in(tmp.path(), "dir", &MemoryQuery::default()).unwrap_err();
+            assert!(matches!(error, MemoryError::Io(_)), "{error}");
+        }
+    }
+
     #[test]
     fn append_rejects_oversized_content() {
         let tmp = TempDir::new().unwrap();
@@ -1577,8 +1626,9 @@ mod tests {
     }
 
     /// What this shows: the ORDER of the calls a save makes. One write of the
-    /// line, then a sync of the file, then (only when the file was new) a
-    /// sync of its directory, all before the call returns, and the same for
+    /// line, then a sync of the file, then a sync of its directory (before
+    /// all of them, once, a sync of the folder `memory/` was just made in),
+    /// all before the call returns, and the same for
     /// the line a forget appends. What it cannot show: that the bytes are on
     /// the platter. A test cannot cut the power, and whether a sync reaches
     /// the medium is up to the system and the disk.
@@ -1591,21 +1641,23 @@ mod tests {
         let first = store_record_in(tmp.path(), &scope, note("first")).unwrap();
         assert_eq!(
             take_steps(),
-            ["write", "sync file", "sync dir"],
-            "the save that creates the file syncs the file, then its directory"
+            ["sync dir", "write", "sync file", "sync dir"],
+            "the first save makes `memory/` and syncs the folder it is in; \
+             then the line, the file, and the file's directory"
         );
 
         store_record_in(tmp.path(), &scope, note("second")).unwrap();
         assert_eq!(
             take_steps(),
-            ["write", "sync file"],
-            "a later save syncs the file; its name is already on disk"
+            ["write", "sync file", "sync dir"],
+            "every save syncs the directory: that the file has bytes does not \
+             say its name is on disk"
         );
 
         forget_in(tmp.path(), &scope, first.id.as_deref().unwrap()).unwrap();
         assert_eq!(
             take_steps(),
-            ["write", "sync file"],
+            ["write", "sync file", "sync dir"],
             "a tombstone line is synced like a note"
         );
 
@@ -1613,8 +1665,7 @@ mod tests {
         append_to(tmp.path(), &rec("ns", 1, "x", vec![])).unwrap();
         assert_eq!(take_steps(), ["write", "sync file", "sync dir"]);
 
-        // A file that is there but empty has no line whose save synced the
-        // directory, so the first line does.
+        // A file that is there but empty.
         fs::write(memory_dir_in(tmp.path()).join("empty.jsonl"), "").unwrap();
         append_to(tmp.path(), &rec("empty", 1, "x", vec![])).unwrap();
         assert_eq!(take_steps(), ["write", "sync file", "sync dir"]);
@@ -2232,7 +2283,11 @@ mod tests {
             import(base, tombstone, ImportTarget::Project(a), &mut run).outcome,
             ImportOutcome::Forgotten
         );
-        assert_eq!(take_steps(), ["write"; 5], "five lines, no sync yet");
+        assert_eq!(
+            take_steps(),
+            ["sync dir", "write", "write", "write", "write", "write"],
+            "the folder the new `memory/` is in, then five lines and no sync yet"
+        );
 
         let files = [a, b].map(|key| namespace_file(base, &project_namespace(key)));
         assert_eq!(run.sync().unwrap(), files);

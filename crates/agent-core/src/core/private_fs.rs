@@ -120,10 +120,39 @@ pub fn open_private_append(path: &Path) -> Result<File, PrivateFsError> {
     }
 }
 
+/// Sync the directory `path` is in, so that a rename into it is on disk.
+/// A directory that cannot be synced at all (the file system refuses, or it
+/// may be written but not opened for reading) is left as it is: that is not
+/// a reason to call a finished replace failed. Any other error is returned.
+/// Nothing to do on Windows, which cannot open a directory to flush it.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        match File::open(dir).and_then(|dir| dir.sync_all()) {
+            Err(e) if matches!(e.kind(), InvalidInput | PermissionDenied | Unsupported) => Ok(()),
+            result => result,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// Atomically replace `path` with `data`: the temp file is created in the
 /// same directory with `create_new` + mode `0600` (never create-then-chmod,
-/// so no interval is broader than policy), written, then renamed over the
-/// target. A symlink at the target or temp path yields a typed refusal.
+/// so no interval is broader than policy), written, synced, then renamed
+/// over the target, and the directory is synced after the rename. A symlink
+/// at the target or temp path yields a typed refusal.
+///
+/// An error after the rename (the directory sync) means the replace is NOT
+/// acknowledged, not that it did not happen: the new file is in place.
 pub fn write_atomic_private(path: &Path, data: &[u8]) -> Result<(), PrivateFsError> {
     refuse_symlink(path)?;
     let mut tmp_name = path
@@ -163,6 +192,9 @@ pub fn write_atomic_private(path: &Path, data: &[u8]) -> Result<(), PrivateFsErr
         // following it, so this is policy enforcement, not a traversal fix).
         refuse_symlink(path)?;
         std::fs::rename(&tmp, path)?;
+        // The rename is in the directory, not in the file: without this a
+        // crash can bring the old file back.
+        sync_parent_dir(path)?;
         Ok(())
     })();
     if result.is_err() {

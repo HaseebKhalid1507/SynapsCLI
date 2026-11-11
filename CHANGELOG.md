@@ -328,6 +328,20 @@ All notable changes to this project will be documented in this file.
   the sweep and the eviction drop it when they rewrite (the sweep counts
   it in `memory_records_dropped`), and `retention forget memory` writes it
   back unchanged.
+- **Notes: every save syncs the `memory/` directory, and a rewritten file's
+  rename is synced.** A save synced the directory only when it found no
+  file or an empty one, which does not say the file's name is on disk
+  (another save may have just created it, or a sweep just renamed a new
+  file over it). Every save now syncs the directory, and the folder a new
+  `memory/` was made in. Files replaced by write-then-rename (notes after
+  a sweep, the quota keeper's state, the session list cache, the MCP
+  descriptor cache, captured trace bundles) sync their directory after the
+  rename; a file system that refuses to sync a directory is tolerated
+  there. A save costs one directory sync more than before.
+- **Extensions: `memory.query` ends on a read error that will not go
+  away.** It skipped every read error, and a lasting one comes back on
+  every read, so the query never returned. It now skips only a line that
+  is not UTF-8 and returns any other read error.
 - **Notes: a saved note is on disk before `memory_store` says it is saved.**
   With the plain-file memory backend a note was written to
   `memory/project-<key>.jsonl` but not synced, so a crash or a power cut
