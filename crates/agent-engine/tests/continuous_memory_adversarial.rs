@@ -22,7 +22,6 @@ use agent_engine::extensions::lease::{ExtensionLeaseCapability, ExtensionSession
 use agent_engine::extensions::manager::ExtensionManager;
 use agent_engine::extensions::manifest::ExtensionManifest;
 use agent_engine::tools::catalog::SchemaDigest;
-use agent_engine::tools::ToolLimits;
 use serde_json::json;
 
 const PLUGIN: &str = "f2-memory-fixture";
@@ -213,56 +212,4 @@ async fn host_or_plugin_crash_does_not_leak_lease_or_child_process() {
         wait_until(|| liveness.upgrade().is_none()).await,
         "crash cleanup retained child ownership"
     );
-}
-
-/// §20.5 bullet 3 cross-reference: Axel `recall_quality` owns the sentinel
-/// matrix (search/fetch/context/logs/traces/index/export/errors). Host defense
-/// in depth is named by `tools::memory::tests::secret_bodies_never_reach_model_context`.
-#[test]
-fn secret_body_sentinel_absence_is_covered_by_axel_and_host_oracles() {
-    hermetic_base_dir::pin();
-    let references = [
-        "Axel recall_quality secret sentinel matrix",
-        "tools::memory::tests::secret_bodies_never_reach_model_context",
-    ];
-    assert_eq!(references.len(), 2);
-}
-
-/// §20.5 bullet 4 cross-reference: private-fs symlink and `umask 000`
-/// fail-closed oracles are owned by the existing core/plugin/Axel suites.
-#[test]
-fn symlink_and_permissive_umask_attacks_are_covered_by_private_fs_oracles() {
-    hermetic_base_dir::pin();
-    assert!(matches!(
-        agent_core::core::private_fs::PrivateFsError::SymlinkRefused(std::path::PathBuf::new()),
-        agent_core::core::private_fs::PrivateFsError::SymlinkRefused(_)
-    ));
-}
-
-/// §20.5 bullet 5 cross-reference: C5 owns the capped slow-consumer and 1 GiB
-/// synthetic capture oracle; rerunning that allocation here would violate the
-/// capped F2 verification contract.
-#[test]
-fn slow_consumer_and_one_gib_capture_bounds_are_covered_by_c5_oracles() {
-    hermetic_base_dir::pin();
-    assert_eq!(
-        ToolLimits {
-            max_tool_output: 30_000,
-            max_tool_buffer: 256 * 1024,
-            bash_timeout: 30,
-            bash_max_timeout: 300,
-            subagent_timeout: 300,
-        }
-        .max_tool_buffer,
-        256 * 1024
-    );
-}
-
-/// §20.5 bullet 6 cross-reference: C5's cancel-after-possible-commit oracle
-/// verifies query-by-idempotency-key and no blind duplicate capture.
-#[test]
-fn cancellation_after_possible_commit_is_covered_by_c5_idempotency_oracle() {
-    hermetic_base_dir::pin();
-    let existing_oracle = "C5 cancel-after-possible-commit queries capture_id before retry";
-    assert!(existing_oracle.contains("capture_id"));
 }

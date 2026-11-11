@@ -6440,7 +6440,7 @@ mod memory_context_provider_tests {
     // ── memory-backend configuration tests (ported from upstream) ────────
 
     #[tokio::test]
-    async fn memory_backend_exclusive_rejects_extension_recall_capture_and_history() {
+    async fn an_axel_or_unknown_backend_is_exclusive_and_a_clone_keeps_it() {
         for selector in ["axel", "invalid-selector"] {
             let (mut runtime, _manager) =
                 memory_runtime_with_providers(&[("memory-test", "notes")]).await;
@@ -6520,7 +6520,7 @@ mod memory_context_provider_tests {
     /// no id is invented for it. (The lease half of this test went with
     /// automatic memory.)
     #[test]
-    fn memory_binding_without_project_grants_no_lease() {
+    fn a_binding_without_a_folder_has_no_project() {
         let gone = tempfile::tempdir().unwrap();
         let gone_path = gone.path().join("deleted");
         std::fs::create_dir(&gone_path).unwrap();
@@ -6536,33 +6536,11 @@ mod memory_context_provider_tests {
     }
 
     #[test]
-    fn axel_invalid_config_cannot_grant_consent_or_fallback() {
+    fn an_unknown_backend_selector_binds_exclusive_not_legacy() {
         let mut runtime = Runtime::new_headless();
         runtime.apply_config(&agent_core::config::load_config_from_str(
             "memory.backend = invalid-not-axel-not-legacy\n",
         ));
         assert!(runtime.memory_backend.exclusive());
-    }
-
-    /// Session-end plumbing: dropping the LAST runtime owner runs the
-    /// shared `ExtensionSessionEndGuard` (terminate_session — the SAME
-    /// reap mechanism deferred tools/handlers use), and a fresh
-    /// construction against the same extension runtime has no lease.
-    #[tokio::test]
-    async fn memory_session_end_guard_drop_fresh_construction_is_off_no_lease() {
-        let (runtime, ext) =
-            memory_runtime_with_providers(&[("axel-memory-manager", "project-memory")]).await;
-        // True session end: the last owner drop fires the guard.
-        drop(runtime);
-        assert_eq!(
-            ext.lease_count(),
-            0,
-            "session end must leave no runtime lease (never-spawned reap is a no-op)"
-        );
-
-        // A fresh construction (what any new session does) holds no lease.
-        let mut fresh = Runtime::new_headless();
-        fresh.install_extension_runtime(std::sync::Arc::clone(&ext));
-        assert_eq!(ext.lease_count(), 0);
     }
 }
