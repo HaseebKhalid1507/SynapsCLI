@@ -313,6 +313,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context rollover: "1 earlier archive not listed here".** The first
+  message of a window whose list of archives was shortened to leave one out
+  said "1 earlier archives"; it has its singular. A list that could not be
+  shortened because its text was not found in the message, which would
+  have gone unnoticed, now fails a debug build and is logged once in a
+  release build. New test: a window sealed as several archives whose full
+  list fails only the 1,024-token shrink check names fewer of them.
 - **Context rollover: resume uses only archive ids from a session file,
   and a bounded number of them.** A resumed chat's first message lists the
   archives of its last window. Every string in that list was fetched as an

@@ -660,7 +660,8 @@ fn assumed_parts(len: usize) -> Vec<ArchivePart> {
 /// - its reduced messages and the window's, which nothing bounds: the
 ///   largest number there is, on the named part;
 /// - the number of parts not named: `len - 1`. That one cannot be made up
-///   without as many parts, so it is "1" here and its other digits are
+///   without as many parts, so it is "1" here, and its other digits and
+///   the plural's "s" ("1 earlier archive", "2 earlier archives") are
 ///   added, a token each (more than the estimate charges for a character).
 ///
 /// It is not a bound on a head whose note is longer than `note`: see
@@ -689,8 +690,8 @@ fn largest_split_head(
     let widest = [part(0, len - 1, len - 1, 0), part(len - 1, 1, len, usize::MAX)];
     let mut head = successor_from_parts(messages, &widest, note, window, target, turn_start, workers);
     head[0] = relisted(&head[0], &widest, widest.len(), 1);
-    let more_digits = u64::from((len - 1).ilog10());
-    Some(super::context::estimate_history(&head).saturating_add(more_digits))
+    let more_characters = u64::from((len - 1).ilog10()) + 1;
+    Some(super::context::estimate_history(&head).saturating_add(more_characters))
 }
 
 /// Where the window that was just archived is: the sentence the continuation
@@ -722,8 +723,9 @@ fn archived_evidence(parts: &[ArchivePart], listed: usize) -> (String, Option<Va
             // The first range says what the numbers are.
             let mut label = "source messages ";
             if unlisted > 0 {
+                let archives = if unlisted == 1 { "archive" } else { "archives" };
                 listed.push(format!(
-                    "{unlisted} earlier archives not listed here ({label}#{}-#{})",
+                    "{unlisted} earlier {archives} not listed here ({label}#{}-#{})",
                     parts[0].first_source_index,
                     last_index(&parts[unlisted - 1]),
                 ));
@@ -1350,13 +1352,30 @@ fn check_cover(parts: &[ArchivePart], len: usize) -> std::result::Result<(), Str
 /// `head`, the continuation message of a window sealed as `parts`, naming
 /// `to` of them by id where it names `from`. Nothing else in it changes:
 /// the sentence that lists the parts is the first thing in the message.
+///
+/// The sentence is found by its text. A head that does not hold it as
+/// [`archived_evidence`] writes it for `from` parts would come back
+/// unchanged, and the caller's loop would count its list down without
+/// making the message any shorter: that is a bug in this file, so it fails
+/// a debug build and is logged, once, in a release build.
 fn relisted(head: &SharedMessage, parts: &[ArchivePart], from: usize, to: usize) -> SharedMessage {
     let mut message = (**head).clone();
-    let text = message["content"].as_str().unwrap_or_default().replacen(
-        &archived_evidence(parts, from).0,
-        &archived_evidence(parts, to).0,
-        1,
-    );
+    let before = message["content"].as_str().unwrap_or_default();
+    let (old, new) = (archived_evidence(parts, from).0, archived_evidence(parts, to).0);
+    let text = before.replacen(&old, &new, 1);
+    let relisted = old == new || text != before;
+    debug_assert!(relisted, "the head does not hold the list of {from} parts it was written with");
+    if !relisted {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                from,
+                to,
+                "context rollover: the continuation message does not hold the list of archives it \
+                 was written with, so the list could not be shortened; the message is kept as it is"
+            )
+        });
+    }
     message["content"] = Value::String(text);
     Arc::new(message)
 }
@@ -2623,6 +2642,12 @@ mod tests {
             "6".repeat(32),
         );
         assert!(text.starts_with(&listed), "{text}");
+        // One part that is not listed is "1 earlier archive".
+        let (one, _) = archived_evidence(&parts[..3], 2);
+        let singular = "in source order: 1 earlier archive not listed here (source messages #0-#9), ctx-1111";
+        assert!(one.contains(singular), "{one}");
+        let (two, _) = archived_evidence(&parts[..3], 1);
+        assert!(two.contains("in source order: 2 earlier archives not listed here (source messages #0-#19), ctx-2222"), "{two}");
         // The newest part is the last one listed.
         assert!(text.contains(&format!("ctx-{} (#360-#369, 10 archived), available via memory_search(source=history)", "4".repeat(32))), "{text}");
         // A reduced message in a part that is not listed is still counted.
@@ -4954,8 +4979,9 @@ mod rollover_path_tests {
         assert!((1..all).contains(&listed), "{listed} of {all}: {text}");
         let (unlisted, named) = parts.split_at(parts.len() - listed);
         let summary = format!(
-            "in source order: {} earlier archives not listed here (source messages #0-#{}), ctx-{} (#{}-#",
+            "in source order: {} earlier archive{} not listed here (source messages #0-#{}), ctx-{} (#{}-#",
             unlisted.len(),
+            if unlisted.len() == 1 { "" } else { "s" },
             named[0].first_source_index - 1,
             named[0].archive.id,
             named[0].first_source_index,
@@ -5086,6 +5112,89 @@ mod rollover_path_tests {
         );
         assert!(text.contains(&named), "{named}\n{text}");
         assert_eq!(estimate_history(&prepared.messages), floor);
+    }
+
+    /// The shrink check alone fails after the seal: the budget is far above
+    /// any head of this window. Before the seal the rollover is taken to
+    /// save more than 1,024 tokens, on a head with the one-archive sentence.
+    /// Sealed as several parts, the head that names them all saves less
+    /// than that. Parts are taken off its list, earliest first, until it
+    /// saves more than 1,024 tokens again, and no further.
+    ///
+    /// The window keeps its wide tool calls (their results follow the last
+    /// answer, so they are the tail every rollover keeps) and drops one
+    /// event, whose size is what the rollover saves.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_split_whose_full_list_would_fail_only_the_shrink_check_names_fewer_parts() {
+        const BUDGET: u64 = 10_000_000;
+        let _env = BaseDirGuard::new();
+        let none = SuccessorBudget { history_tokens: 0 };
+        let wide = json!(vec![0; 40_000]);
+        let build = |bytes: usize| {
+            let mut m = vec![user("charter"), event(0, bytes), user("TURN-START: continue")];
+            let id = |n: usize| format!("wide-{n}");
+            m.extend((0..6).map(|n| {
+                msg(json!({"role":"assistant","content":[{"type":"tool_use","id":id(n),"name":"plot","input":wide}]}))
+            }));
+            let results: Vec<Value> = (0..6)
+                .map(|n| json!({"type":"tool_result","tool_use_id":id(n),"content":"plotted"}))
+                .collect();
+            m.push(msg(json!({"role":"user","content":results})));
+            m
+        };
+        // What a head of `m` saves: the one checked before the seal, and
+        // any other.
+        let saves = |m: &[SharedMessage], head: &[SharedMessage]| {
+            estimate_history(m) as i64 - estimate_history(head) as i64
+        };
+        let checked = |m: &[SharedMessage]| {
+            let assumed = assumed_parts(m.len());
+            assert_eq!(assumed.len(), 1);
+            saves(m, &successor_from_parts(m, &assumed, "", 2, none, None, ""))
+        };
+        let roll = |m: Vec<SharedMessage>| async move {
+            let (binding, state, cancel) = (MemoryBinding::legacy_current(), auto_state(), Default::default());
+            let rolled = rollover_for_boundary(&m, &state, &binding, BUDGET, none, &cancel, false, "").await;
+            (ready(rolled), m)
+        };
+
+        // With a large event dropped every part is named. That shows what
+        // the list costs: the shortest head and the full one, against the
+        // one that was checked.
+        let (roomy, m) = roll(build(20_000)).await;
+        let parts = roomy.parts.clone();
+        let all = LISTED_PARTS.min(parts.len());
+        assert!(all >= 6, "six inputs that cannot share an archive: {parts:?}");
+        assert_eq!(named_in(&roomy.messages), all);
+        let mut shortest = roomy.messages.clone();
+        shortest[0] = relisted(&shortest[0], &parts, all, 1);
+        let (least, most) = (checked(&m) - saves(&m, &shortest), checked(&m) - saves(&m, &roomy.messages));
+        assert!(0 < least && least + 40 < most, "the list costs {least} to {most} tokens");
+
+        // An event sized so that the checked head saves 1,024 tokens and
+        // about half of that list.
+        let wanted = 1024 + (least + most) / 2;
+        let sizes: Vec<usize> = (1_000..20_000).collect();
+        let bytes = sizes[sizes.partition_point(|&b| checked(&build(b)) < wanted)];
+        assert!(checked(&build(bytes)) >= wanted && checked(&build(bytes - 1)) < wanted);
+        let (prepared, m) = roll(build(bytes)).await;
+        assert_eq!(prepared.parts.len(), parts.len());
+        let parts = prepared.parts.clone();
+        let named = named_in(&prepared.messages);
+        assert!((1..all).contains(&named), "{named} of {all} parts named");
+        // The head saves more than 1,024 tokens, and with one more part
+        // named, as with all of them, it would not.
+        assert!(saves(&m, &prepared.messages) > 1024);
+        let mut longer = prepared.messages.clone();
+        longer[0] = relisted(&longer[0], &parts, named, named + 1);
+        assert!(saves(&m, &longer) <= 1024);
+        longer[0] = relisted(&longer[0], &parts, named + 1, all);
+        assert_eq!(named_in(&longer), all);
+        assert!(saves(&m, &longer) <= 1024);
+        // The budget had nothing to do with it.
+        assert!(estimate_history(&longer) < BUDGET / 2);
+        assert_eq!(prepared.messages[0]["_synaps_context"]["archives"].as_array().unwrap().len(), parts.len());
     }
 
     /// The old window is dropped on the word of the list of parts the store
