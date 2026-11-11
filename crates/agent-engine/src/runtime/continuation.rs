@@ -640,6 +640,59 @@ fn assumed_parts(len: usize) -> Vec<ArchivePart> {
         .collect()
 }
 
+/// An upper bound on the size of the new window when the store seals this
+/// one as several parts, whatever the parts are: the head with one part
+/// named, which is as short as [`rollover_for_boundary`] can make it, with
+/// every number in its sentence as wide as that number can be. `None` for a
+/// window of fewer than two messages, which cannot be sealed as several.
+///
+/// The parts decide nothing in the head but that sentence and the id in the
+/// stub of a first request too large to keep, which is 32 characters
+/// whichever part it is: which messages are retained, the list of dropped
+/// requests, the note and the manifest are the same for any part list. The
+/// sentence is ASCII, which the estimate charges by the character, so a
+/// sentence with no more characters is not estimated higher. Given parts
+/// that cover a window of `len` messages ([`check_cover`]), the widest are:
+///
+/// - the last index of the parts not named: `len - 2`, and the first of the
+///   one named: `len - 1`, as here;
+/// - the messages the named part stores: no more than it covers, so `len`;
+/// - its reduced messages and the window's, which nothing bounds: the
+///   largest number there is, on the named part;
+/// - the number of parts not named: `len - 1`. That one cannot be made up
+///   without as many parts, so it is "1" here and its other digits are
+///   added, a token each (more than the estimate charges for a character).
+///
+/// It is not a bound on a head whose note is longer than `note`: see
+/// [`rollover_for_boundary`].
+fn largest_split_head(
+    messages: &[SharedMessage],
+    note: &str,
+    window: u64,
+    target: SuccessorBudget,
+    turn_start: Option<&str>,
+    workers: &str,
+) -> Option<u64> {
+    let len = messages.len();
+    if len < 2 {
+        return None;
+    }
+    let part = |first: usize, covers: usize, stored: usize, reduced: usize| ArchivePart {
+        archive: ArchiveRef {
+            id: "0".repeat(32),
+            message_count: stored,
+            source_message_count: covers,
+        },
+        first_source_index: first,
+        reduced_messages: reduced,
+    };
+    let widest = [part(0, len - 1, len - 1, 0), part(len - 1, 1, len, usize::MAX)];
+    let mut head = successor_from_parts(messages, &widest, note, window, target, turn_start, workers);
+    head[0] = relisted(&head[0], &widest, widest.len(), 1);
+    let more_digits = u64::from((len - 1).ilog10());
+    Some(super::context::estimate_history(&head).saturating_add(more_digits))
+}
+
 /// Where the window that was just archived is: the sentence the continuation
 /// message says it in, and the host's record of the parts (`archives` in the
 /// message's metadata).
@@ -1125,7 +1178,8 @@ pub(crate) async fn rollover_for_boundary(
     // The parts are not known before the seal: assume the fewest the message
     // limit allows (`assumed_parts`). A split made by another limit gives
     // more parts, about 30 tokens for each one listed, that this estimate
-    // does not see; the head is measured again after the seal, below.
+    // does not see; the head is measured again after the seal, below, and
+    // names fewer parts if it has to.
     let candidate = successor_from_parts(
         messages,
         &assumed_parts(messages.len()),
@@ -1143,9 +1197,19 @@ pub(crate) async fn rollover_for_boundary(
         // hard admission decides whether this no-op can continue.
         return Ok(RolloverPreparation::Unproductive);
     }
-    if estimate >= budget {
+    // The budget is a limit, and a rollover that is refused on it after the
+    // seal leaves a window of archives nothing names: so it is refused here
+    // unless the head fits however the window is cut. What the head will be
+    // cannot be known here, because the seal decides the parts. With one
+    // part named it is as short as it gets, and `largest_split_head` is at
+    // least that for any parts. This refuses up to about 200 tokens below
+    // the budget, the wording of a split window that this window may not
+    // need, and a window sealed as one archive pays that too.
+    let largest = largest_split_head(messages, &note, window, target, turn_start.as_deref(), workers)
+        .map_or(estimate, |split| split.max(estimate));
+    if largest >= budget {
         return Err(RuntimeError::Config(format!(
-            "context rollover retained history exceeds the safe request budget (estimated {estimate} tokens, budget {budget}); history retained"
+            "context rollover retained history exceeds the safe request budget (estimated {largest} tokens, budget {budget}); history retained"
         )));
     }
     // Every part is on disk or this fails: a window that was only partly
@@ -1205,9 +1269,19 @@ pub(crate) async fn rollover_for_boundary(
         // together). The shrink check's 1,024 tokens are a margin, and a
         // rollover that saves that little less is still made. The budget is
         // a limit, so the head is held to it.
+        //
+        // The check before the seal has already refused every window whose
+        // head could be over the budget for its parts, so this is the last
+        // line and not a path. One thing can still bring a rollover here:
+        // the head carries the note the store returns, not the one it was
+        // given. That is the note as the store's redactor left it, or, when
+        // the last part's content was sealed before, the note it was sealed
+        // with then (up to the store's note limit). Only the seal knows
+        // either, so a longer one cannot be refused before it. The archives
+        // are written by now; the error says so.
         if real >= budget {
             return Err(RuntimeError::Config(format!(
-                "context rollover retained history exceeds the safe request budget (estimated {real} tokens, budget {budget}); history retained"
+                "context rollover retained history exceeds the safe request budget (estimated {real} tokens, budget {budget}); history retained; the window's archives were already written"
             )));
         }
     }
@@ -4802,9 +4876,13 @@ mod rollover_path_tests {
         let all = LISTED_PARTS.min(parts.len());
         assert_eq!(named_in(&roomy.messages), all);
 
-        // A budget the checked head is 40 tokens under, and that head is
-        // not: it is what was checked plus the parts nobody had counted.
-        let budget = checked + 40;
+        // The lowest budget the rollover is not refused on before the seal
+        // (one over the bound it holds there). The checked head is under
+        // it, and the head with every part named is not: it is what was
+        // checked plus the parts nobody had counted.
+        let bound = largest_split_head(&messages, "", 2, SMALL_TARGET, None, "").unwrap();
+        let budget = bound + 1;
+        assert!(checked < budget, "{checked} checked, {bound} held to");
         let unchecked = estimate_history(&roomy.messages);
         assert!(unchecked >= budget, "{unchecked} tokens with every part named; {checked} checked");
         let prepared = ready(roll_within(&messages, &state, budget).await);
@@ -4845,17 +4923,33 @@ mod rollover_path_tests {
         assert_eq!(state.lock().unwrap().window, 2);
     }
 
+    /// Every file under `dir`, at any depth.
+    fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let paths = entries.map(|entry| entry.unwrap().path());
+        paths
+            .flat_map(|path| if path.is_dir() { files_under(&path) } else { vec![path] })
+            .collect()
+    }
+
     /// A window within the message limit is estimated as one archive, with
     /// the one-archive sentence, and can be sealed as several. Naming one
     /// part and counting the rest is as short as its list gets, and that
     /// head is still longer than the estimate, by the wording of the
     /// split-window sentence: the same however many parts there are. The
     /// request budget is a limit, so a rollover whose shortest head is not
-    /// under it fails with the history kept, as it does before the seal.
+    /// under it fails with the history kept.
+    ///
+    /// It used to fail after the seal: in that band of budgets the window's
+    /// archives were written and then named by nothing, once more at every
+    /// attempt on the window as it grew. It is now refused before the seal,
+    /// on an upper bound of that head, and writes no file.
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn a_split_that_was_estimated_as_one_archive_is_held_to_the_budget_with_one_part_named() {
-        let _env = BaseDirGuard::new();
+        let env = BaseDirGuard::new();
         let mut messages = vec![user("charter")];
         messages.extend(wide_calls(6));
         messages.extend((0..40).map(|i| event(i, 1_100)));
@@ -4863,6 +4957,35 @@ mod rollover_path_tests {
         assert_eq!(assumed_parts(messages.len()).len(), 1);
         let checked = checked_size(&messages);
         let state = auto_state();
+        // What the rollover holds to the budget before it seals.
+        let bound = largest_split_head(&messages, "", 2, SMALL_TARGET, None, "").unwrap();
+        let band = bound - checked;
+        assert!((1..260).contains(&band), "the wording of a split window: {band} tokens");
+        let refused_in = |result: Result<RolloverPreparation>, budget: u64| {
+            let refused = match result {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("budget {budget}: the head could be at or over it"),
+            };
+            assert!(refused.contains("exceeds the safe request budget"), "{refused}");
+            assert!(refused.ends_with("history retained"), "refused before the seal: {refused}");
+            let s = state.lock().unwrap();
+            assert_eq!((s.window, s.latest_archive.as_ref()), (1, None));
+        };
+
+        // The band, in a store that holds nothing: the head that was
+        // checked is under each of these budgets, and nothing is written.
+        for budget in [checked + 1, checked + band / 2, bound] {
+            refused_in(roll_within(&messages, &state, budget).await, budget);
+            let written = files_under(env.path());
+            assert!(written.is_empty(), "budget {budget}: {written:?}");
+        }
+        // Just below the band it rolls over.
+        let prepared = ready(roll_within(&messages, &state, bound + 1).await);
+        assert!(prepared.parts.len() >= 6, "{:?}", prepared.parts);
+        assert!(estimate_history(&prepared.messages) < bound + 1);
+        assert!(named_in(&prepared.messages) >= 1);
+        let sealed = files_under(env.path()).len();
+        assert!(sealed >= 6, "{sealed} files");
 
         // With room in the budget every part is named.
         let roomy = ready(roll_within(&messages, &state, 1_000_000).await);
@@ -4877,23 +5000,21 @@ mod rollover_path_tests {
         let floor = estimate_history(&shortest);
         let over = floor.saturating_sub(checked);
         assert!((1..200).contains(&over), "the longer sentence, and no list: {over} tokens");
+        // The bound is a bound: the real shortest head is not over it. It
+        // is above it only by numbers this window's parts do not reach.
+        assert!(floor <= bound, "{floor} > {bound}");
+        assert!(bound - floor < 100, "{bound} against {floor}");
 
-        // A budget the checked head is under and the shortest real one is
-        // not: the rollover fails and nothing is recorded.
-        for budget in [checked + 1, floor] {
-            let refused = match roll_within(&messages, &state, budget).await {
-                Err(error) => error.to_string(),
-                Ok(_) => panic!("budget {budget}: the real head is not under it"),
-            };
-            assert!(refused.contains("exceeds the safe request budget"), "{refused}");
-            assert!(refused.contains("history retained"), "{refused}");
-            let s = state.lock().unwrap();
-            assert_eq!((s.window, s.latest_archive.as_ref()), (1, None));
-        }
+        // A budget the shortest real head is not under is refused as the
+        // others were, before the seal.
+        refused_in(roll_within(&messages, &state, floor).await, floor);
+        assert_eq!(files_under(env.path()).len(), sealed);
 
-        // One token more and it rolls over, one part named.
-        let prepared = ready(roll_within(&messages, &state, floor + 1).await);
+        // The shortest head, as the rollover makes it: one part named.
+        let mut prepared = ready(roll_within(&messages, &state, bound + 1).await);
         assert_eq!(prepared.parts, parts);
+        let named = named_in(&prepared.messages);
+        prepared.messages[0] = relisted(&prepared.messages[0], &parts, named, 1);
         assert_eq!(named_in(&prepared.messages), 1);
         let text = prepared.messages[0]["content"].as_str().unwrap();
         let last = parts.last().unwrap();

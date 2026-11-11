@@ -222,9 +222,14 @@ history retained", so the rollover failed, the turn ended, and the same window
 failed again on every later attempt.
 
 With the file store (`memory.backend = legacy`) such a window is now sealed as
-several consecutive archives, "parts". The store cuts the window so that each
-part is within the limits, which are unchanged; every part is an ordinary
-archive, fetched by its own id. Together the parts hold each archivable message of the
+several consecutive archives, "parts". The store fills the window part by
+part from its start: a part runs from where the one before ended until the
+next message would take it over a limit (moved back so that the next part does
+not begin with tool results, where it can), and a part that is only found too
+large once written is tried again at the largest power of two messages below
+its length. Where a part ends therefore depends on the messages before its
+end and not on how many follow. The limits are unchanged; every part is an
+ordinary archive, fetched by its own id. Together the parts hold each archivable message of the
 window once, in order. The working note is stored with the last part. A window
 within the limits is one archive, and everything about it is as before: the
 same archive, the same continuation message, the same marker, the same hook
@@ -283,8 +288,9 @@ Earlier eligible source evidence, in source order: ctx-<id A> (source messages #
   estimate, by the wording of the longer sentence: under 200 tokens whatever
   the number of parts. The 1,024 tokens of the first check are a margin, and
   a rollover that saves that little less is still made. The request budget
-  is a limit: a rollover whose message is not under it with one part listed
-  fails with the history kept, as it does before the seal.
+  is a limit, and it is held before the seal: a rollover whose message
+  could be at or over it with one part listed is refused there, with the
+  history kept and nothing written ("Refused before the seal", below).
 - A stub for a first request too large to keep names the part that holds it.
 
 **The marker.** `_synaps_context.archive` is the id of the last part, the one
@@ -350,10 +356,27 @@ refers to; they are searchable and are not cleaned up. The next attempt seals
 the window as it then is. A part whose content is already on disk is found
 there and not written again, so an attempt on the same window writes only what
 is missing and returns the list the first one would have returned. After a
-failed turn the window has usually grown, by the user's message at least: the
-new attempt's parts need not be the earlier ones, and whichever of those it
-does not come to again stay on disk unreferenced. Only the list of the attempt
-that completes is recorded and announced.
+failed turn the window has usually grown, by the user's message at least.
+Because a window is filled from its start, the new attempt's parts are the
+earlier ones up to the last: every part that was full is found on disk and
+not written again. Only the earlier attempt's last part, which ended where
+the window then ended, is not come to again: its messages are stored once
+more in the new last part or parts, and it stays on disk unreferenced. Only
+the list of the attempt that completes is recorded and announced.
+
+**Refused before the seal.** A rollover whose new window would not be under
+the request budget is refused before anything is written. The seal decides
+the parts, so the check is made on an upper bound: the message with one part
+named (the shortest it can be made after the seal) and every number in its
+sentence as wide as it can be for a window of that length. That is up to
+about 200 tokens more than the message of a window sealed as one archive, so
+a rollover is refused that much below the budget whether or not the window
+turns out to be split. The same check after the seal stays as a last line.
+It can still refuse in one case: the message carries the note the store
+returns, which is the note after the store's redaction, or, when the last
+part's content was already sealed, the note stored with it then; a returned
+note longer than the one given is not known before the seal. The error then
+says that the window's archives were already written.
 
 Extensions are told of a window's archives (`on_context_archived`, one event
 per part) only when the rollover is committed: every part is on disk, the new

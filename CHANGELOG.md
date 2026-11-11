@@ -313,6 +313,22 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Context rollover: a rollover that cannot be recorded writes no
+  archives.** The size of the new window is estimated before the seal, when
+  the archives it will name are not known. A window sealed as several
+  archives has a longer first message than the estimate, and a rollover
+  whose message was then not under the request budget failed after the
+  seal: the window's archives stayed on disk with nothing naming them, and
+  again at each later attempt. The budget is now held before the seal, on
+  an upper bound of that message for any way the window can be cut, so such
+  a rollover is refused with the history kept and nothing written. The
+  refusal comes up to about 200 tokens below the budget, for a window that
+  turns out to be one archive too. The check after the seal stays as a last
+  line; it can still refuse only when the store returns a longer working
+  note than it was given, and then says that the archives were written.
+  `docs/specs/context-continuation.md` also says again how a window is cut
+  (filled part by part from its start) and what a retry on a grown window
+  writes.
 - **Extensions: a handler that times out on an archive event is not sent
   the rest of that rollover's events.** A window sealed as `n` archives
   sends `n` `on_context_archived` events to each handler, one after the
