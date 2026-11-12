@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`tools.always_loaded`.** Under `progressive_tool_disclosure`, a
+  comma-separated list of tool ids (as `activate_tools` takes them, e.g.
+  `ext.axel:search, builtin:subagent`) that join the session core, so they
+  are loaded from the first request instead of waiting for an activation the
+  model may never make. Only cataloged tools with a verified source join
+  (the activation trust rule); absent ids are skipped, an extension that
+  registers later gets its listed tools loaded at the next request, and a
+  listed tool that disappears is dropped fail-closed. Malformed ids are a
+  config warning. No effect without disclosure. Also in `/settings` (Tool
+  limits).
+
 - **`synaps memory import-archives | import-notes | project`**, the command
   for moving saved archives and notes into the plain-file stores from
   somewhere else. The input is JSON Lines (`-` is standard input, anything

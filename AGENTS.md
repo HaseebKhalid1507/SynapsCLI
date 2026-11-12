@@ -488,6 +488,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `disabled_plugins` | comma list | — | Plugins to skip on boot |
 | `disabled_skills` | comma list | — | Skills to skip on boot |
 | `disabled_tools` | comma list | — | Built-in tools to remove from the registry at boot (by runtime name, e.g. `bash, ls`); subagent workers don't get them either |
+| `tools.always_loaded` | comma list | — | With `progressive_tool_disclosure = true`: tool ids (as `activate_tools` takes them, e.g. `ext.axel:search, builtin:subagent`) kept loaded from the first request instead of deferred. Ids not in the catalog are skipped (an extension that registers later joins at the next request); untrusted tools never; malformed ids are a config warning. No effect without disclosure ([docs/request-lifecycle-progressive-disclosure.md](docs/request-lifecycle-progressive-disclosure.md#always-loaded-tools)) |
 | `cache_ttl` | string | auto | Prompt-cache TTL: `auto` (1h on an Anthropic subscription/OAuth login, 5m on an API key), `5m`, `1h` or `hybrid`. Other providers ignore it; workers always use 5m |
 | `cache_keepwarm_tools` | bool | on | Keep the prompt cache warm while a long tool round runs (foreground and workers) |
 | `cache_keepwarm_headless` | bool | off | Let idle keep-warm (`cache_keepwarm`) run for daemon sessions driven only by non-interactive clients |
