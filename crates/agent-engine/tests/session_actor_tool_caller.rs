@@ -1,5 +1,5 @@
 //! `caller` on an extension tool call made from a chat's turn is the
-//! author of that chat's own memory binding (`binding.forum_author()`).
+//! author of that chat's own memory binding (`binding.author()`).
 //! One host, one
 //! recording extension, sessions run through the production actor →
 //! runtime → stream loop against a loopback stub, like
@@ -105,7 +105,7 @@ impl agent_engine::Tool for Admitted {
             .capabilities
             .memory_backend
             .as_ref()
-            .map(|binding| binding.forum_author().clone());
+            .map(|binding| binding.author().clone());
         self.0.execute(params, ctx).await
     }
 }

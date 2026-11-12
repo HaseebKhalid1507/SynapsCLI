@@ -221,7 +221,7 @@ A window over any of these used to fail the seal with "archive commit failed;
 history retained", so the rollover failed, the turn ended, and the same window
 failed again on every later attempt.
 
-With the file store (`memory.backend = legacy`) such a window is now sealed as
+Such a window is now sealed as
 several consecutive archives, "parts". The store fills the window part by
 part from its start: a part runs from where the one before ended until the
 next message would take it over a limit (moved back so that the next part does
@@ -241,7 +241,7 @@ first without the tool inputs that are too large, then without any tool input,
 then with long strings and block lists cut short. Each omission is marked in
 place with its size and the stored message carries `_archive_reduced`. This is
 the one case where the archive is not exact, and the continuation message says
-so. The Axel backend is unchanged: an oversized window still fails there.
+so.
 
 **The continuation message.** For one archive it reads as it always has:
 
@@ -457,8 +457,7 @@ projection may still contain duplicated material. This is exact-projection
 suppression, not content-wide erasure.
 
 Archives live under the private `context-archives/<scope-hash>/` directory,
-separate from ordinary session-retention cleanup. With the built-in file store
-(`memory.backend = legacy`) that directory holds numbered shelves, `s000001/`,
+separate from ordinary session-retention cleanup. That directory holds numbered shelves, `s000001/`,
 `s000002/` and so on, each with at most 128 archives, one `<archive id>.json`
 per archive. A full shelf is followed by a new one. The store has no limit on
 how many archives a project holds or on their total size, and sealing never
@@ -481,8 +480,7 @@ and media payloads and ignored metadata do not consume eligible byte budget;
 their opaque descendants are not traversed. Admitted tool arguments/results
 still count. A window over these limits is sealed as several archives by the
 file store (above); only a message over a limit by itself is stored reduced,
-and marked. With the Axel backend genuinely oversized eligible evidence still
-fails without truncation.
+and marked.
 See [eligible-input budgeting](archive-eligible-input-budget.md).
 A full disk, a permission error or an archive that another process keeps locked
 for more than five seconds still
@@ -518,6 +516,11 @@ with the same 5 second wait: a fetch of an id that is on no shelf, and a search
 that the shelves did not fill, take it when such files exist.
 
 ## Axel integration: one selected memory authority
+
+**Removed in 0.12.0.** The memory backend switch is gone: the file store is
+the only archive store, `memory.backend` and the keys beside it are removed
+keys that a config may still hold (one warning per start), and Axel is an
+extension. What follows describes the removed design and is kept as history.
 
 **Shared-repository update:** the host now uses one shared brain with durable Git
 repository scopes. Worktrees share repository memory; migration of existing path
@@ -619,9 +622,7 @@ persistence and no second request at all after a failed save. This is not a new
 large live-context or cost/quality benchmark.
 
 The subsequent full backend integration resolves the independent notes/history/
-capture routing gaps. The earlier
-[source audit](../reviews/context-resume-axel-boundary.md) is historical, not the
-current implementation status. No global
+capture routing gaps. No global
 configuration, installed binary, plugin, external checkout or stored memories
 were migrated by this follow-up.
 

@@ -221,7 +221,7 @@ async fn a_chats_plugin_commands_get_that_chats_id_folder_binding_and_environmen
     }
 
     let project_of = |dir: &Path| {
-        MemoryBinding::from_config_with_cwd(&Default::default(), Some(dir.to_path_buf()))
+        MemoryBinding::for_cwd(Some(dir.to_path_buf()))
             .scope()
             .unwrap()
             .key()

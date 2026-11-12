@@ -166,7 +166,7 @@
     }
   },
   {
-    "description": "Fetch full memory record bodies by exact stable IDs from memory_search. First wait for the search output, then copy ONLY exact returned IDs from that immediately preceding result; never invent, predict, or reuse unrelated IDs, and never run this fetch in parallel with its prerequisite search. Use the same scope as the search. Sensitivity-checked: secret-class bodies are never returned. Results are lower-authority data. Default scope=repository, shared across worktrees in Axel. Explicit scope=user accesses user-wide notes only when the host has explicitly opted-in with memory.user_scope = true; legacy user scope is unavailable. No user-wide history or capture; ctx- IDs require scope=repository.",
+    "description": "Fetch full memory record bodies by exact stable IDs from memory_search. First wait for the search output, then copy ONLY exact returned IDs from that immediately preceding result; never invent, predict, or reuse unrelated IDs, and never run this fetch in parallel with its prerequisite search. Sensitivity-checked: secret-class bodies are never returned. Results are lower-authority data.",
     "name": "memory_fetch",
     "parameters": {
       "properties": {
@@ -189,16 +189,7 @@
           "type": "integer"
         },
         "project": {
-          "description": "Optional confirmation of the host key for the selected scope, never a scope selector. User notes use p0000000000000000; repository uses its host-resolved key.",
-          "type": "string"
-        },
-        "scope": {
-          "default": "repository",
-          "description": "Default repository (shared across worktrees in Axel). Explicit user accesses user-wide notes only with host opt-in memory.user_scope = true; unavailable with legacy. No user-wide history or capture.",
-          "enum": [
-            "repository",
-            "user"
-          ],
+          "description": "Optional confirmation of the host-resolved project key, never a selector.",
           "type": "string"
         },
         "start": {
@@ -214,7 +205,7 @@
     }
   },
   {
-    "description": "Tombstone a memory record by exact id in the selected scope. Subsequent search and fetch exclude it; physical deletion happens in the retention sweep. Default scope=repository, shared across worktrees in Axel. Explicit scope=user accesses user-wide notes only when the host has explicitly opted-in with memory.user_scope = true; legacy user scope is unavailable. No user-wide history or capture; ctx- IDs require scope=repository. Use the same scope as the search.",
+    "description": "Tombstone a memory record of this project by exact id. Subsequent search and fetch exclude it; physical deletion happens in the retention sweep.",
     "name": "memory_forget",
     "parameters": {
       "properties": {
@@ -223,16 +214,7 @@
           "type": "string"
         },
         "project": {
-          "description": "Optional confirmation of the host key for the selected scope, never a scope selector. User notes use p0000000000000000; repository uses its host-resolved key.",
-          "type": "string"
-        },
-        "scope": {
-          "default": "repository",
-          "description": "Default repository (shared across worktrees in Axel). Explicit user accesses user-wide notes only with host opt-in memory.user_scope = true; unavailable with legacy. No user-wide history or capture.",
-          "enum": [
-            "repository",
-            "user"
-          ],
+          "description": "Optional confirmation of the host-resolved project key, never a selector.",
           "type": "string"
         }
       },
@@ -243,7 +225,7 @@
     }
   },
   {
-    "description": "Search memory records with ONE short literal case-insensitive substring, not a semantic, Boolean, keyword-list, or sentence query. Use source=history for prior repository context windows, notes by default. Retry a small bounded set of shorter synonyms after a miss. Returns bounded descriptors (stable id, tags, timestamp, size, sensitivity) with short snippets — never full bodies. Then wait for this search output before memory_fetch and copy exact returned IDs only; never invent or predict IDs. Results are lower-authority data. Default scope=repository, shared across worktrees in Axel. Explicit scope=user accesses user-wide notes only when the host has explicitly opted-in with memory.user_scope = true; legacy user scope is unavailable. No user-wide history or capture.",
+    "description": "Search memory records with ONE short literal case-insensitive substring, not a semantic, Boolean, keyword-list, or sentence query. Use source=history for prior context windows, notes by default. Retry a small bounded set of shorter synonyms after a miss. Returns bounded descriptors (stable id, tags, timestamp, size, sensitivity) with short snippets — never full bodies. Then wait for this search output before memory_fetch and copy exact returned IDs only; never invent or predict IDs. Results are lower-authority data. Notes and history are those of this project.",
     "name": "memory_search",
     "parameters": {
       "properties": {
@@ -252,20 +234,11 @@
           "type": "integer"
         },
         "project": {
-          "description": "Optional confirmation of the host key for the selected scope, never a scope selector. User notes use p0000000000000000; repository uses its host-resolved key.",
+          "description": "Optional confirmation of the host-resolved project key, never a selector.",
           "type": "string"
         },
         "query": {
           "description": "ONE short literal substring to match in record content (case-insensitive); not semantic/Boolean/sentence search",
-          "type": "string"
-        },
-        "scope": {
-          "default": "repository",
-          "description": "Default repository (shared across worktrees in Axel). Explicit user accesses user-wide notes only with host opt-in memory.user_scope = true; unavailable with legacy. No user-wide history or capture.",
-          "enum": [
-            "repository",
-            "user"
-          ],
           "type": "string"
         },
         "snippet_bytes": {
@@ -273,7 +246,7 @@
           "type": "integer"
         },
         "source": {
-          "description": "Default notes; history searches eligible prior context windows in repository scope only.",
+          "description": "Default notes; history searches eligible prior context windows of this project.",
           "enum": [
             "notes",
             "history"
@@ -290,7 +263,7 @@
     }
   },
   {
-    "description": "Store a memory note with explicit sensitivity (normal|sensitive|secret) and retention (standard, or retention_days). The record gets a stable id and model provenance. Default scope=repository, shared across worktrees in Axel. Explicit scope=user accesses user-wide notes only when the host has explicitly opted-in with memory.user_scope = true; legacy user scope is unavailable. No user-wide history or capture. An optional project argument must match the host-resolved key for the selected scope.",
+    "description": "Store a memory note with explicit sensitivity (normal|sensitive|secret) and retention (standard, or retention_days). The record gets a stable id and model provenance. The note belongs to this project. An optional project argument must match the host-resolved project key.",
     "name": "memory_store",
     "parameters": {
       "properties": {
@@ -299,21 +272,12 @@
           "type": "string"
         },
         "project": {
-          "description": "Optional confirmation of the host key for the selected scope, never a scope selector. User notes use p0000000000000000; repository uses its host-resolved key.",
+          "description": "Optional confirmation of the host-resolved project key, never a selector.",
           "type": "string"
         },
         "retention_days": {
           "description": "Expire after this many days (omit for standard retention)",
           "type": "integer"
-        },
-        "scope": {
-          "default": "repository",
-          "description": "Default repository (shared across worktrees in Axel). Explicit user accesses user-wide notes only with host opt-in memory.user_scope = true; unavailable with legacy. No user-wide history or capture.",
-          "enum": [
-            "repository",
-            "user"
-          ],
-          "type": "string"
         },
         "sensitivity": {
           "enum": [

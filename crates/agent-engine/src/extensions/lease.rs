@@ -799,12 +799,11 @@ impl ExtensionRuntimeManager {
         fingerprint: SchemaDigest,
     ) -> Result<Arc<LeaseInner>, ExtensionLeaseError> {
         let manifest = &record.manifest;
-        let process = ProcessExtension::spawn_with_memory_policy(
+        let process = ProcessExtension::spawn_with_cwd(
             plugin,
             &manifest.command,
             &manifest.args,
             record.cwd.clone(),
-            record.exclusive_memory,
         )
         .await
         .map_err(|e| ExtensionLeaseError::Transport(plugin.to_string(), bound_detail(&e)))?;

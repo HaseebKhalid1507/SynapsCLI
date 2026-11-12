@@ -329,7 +329,7 @@ async fn a_deferred_tools_call_names_the_calling_runs_own_author() {
     let chat = |name: &str| {
         let dir = fx.dir.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let binding = MemoryBinding::from_config_with_cwd(&Default::default(), Some(dir));
+        let binding = MemoryBinding::for_cwd(Some(dir));
         let session = SessionId::parse(&format!("task20-{name}")).unwrap();
         (binding, ExtensionLeaseCapability::new(session, Arc::clone(&runtime)), name.to_string())
     };
@@ -367,7 +367,7 @@ async fn a_deferred_tools_call_names_the_calling_runs_own_author() {
     };
     for (call, (binding, _, name)) in calls.iter().zip([&a, &b, &a]) {
         assert_eq!(call["session_id"], json!(name), "{call}");
-        assert_eq!(&author(call), binding.forum_author(), "{name}: its own binding's author");
+        assert_eq!(&author(call), binding.author(), "{name}: its own binding's author");
         assert!(author(call).parent.is_none(), "a chat has no parent");
     }
     let (of_a, of_b) = (author(&calls[0]), author(&calls[1]));

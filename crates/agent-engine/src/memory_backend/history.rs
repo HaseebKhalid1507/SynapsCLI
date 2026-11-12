@@ -1,12 +1,12 @@
-//! One history authority behind the selected backend. Projection is pure and
-//! host-screened; selecting Axel never creates a legacy context archive.
+//! The context archives of a binding's project: the file store, reached on
+//! a blocking worker. Projection is host-screened.
 use super::{error, MemoryBinding, Result};
 use crate::SharedMessage;
 use agent_core::context_archive::{
     self, ArchiveDescriptor, ArchivePart, ArchiveRedactor, ArchiveRef, ArchiveStore,
     ArchivedMessage, Forgotten, Unscanned,
 };
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -82,50 +82,24 @@ impl MemoryBinding {
         note: &str,
     ) -> Result<(ArchiveRef, String)> {
         let scope = self.scope()?.clone();
-        if !self.exclusive() {
-            let base = self.base().to_owned();
-            let logical = logical_id.to_owned();
-            let source = messages.to_vec();
-            let note = note.to_owned();
-            // One locked operation: the stored note comes from the same scan.
-            return archive_worker(move |abort| {
-                ArchiveStore::new(&base, scope.key(), &logical)?
-                    .with_redactor(redactor())
-                    .with_abort(abort)
-                    .seal_with_note(&source, &note)
-            })
-            .await;
-        }
-        let projection =
-            context_archive::project_archive(logical_id, messages, note, Some(redactor()))
-                .map_err(|e| error(e.to_string()))?;
-        let count = projection.messages.len();
-        let source_count = projection.source_message_count;
-        let value = self
-            .rpc(
-                "history_seal",
-                serde_json::to_value(projection).map_err(|_| error("history encoding failed"))?,
-            )
-            .await?;
-        let r:ArchiveRef=serde_json::from_value(json!({"id":value["id"],"message_count":value["message_count"],"source_message_count":value["source_message_count"]})).map_err(|_|error("invalid history commit acknowledgement"))?;
-        let stored = value["note"]
-            .as_str()
-            .ok_or_else(|| error("history commit missing note"))?
-            .to_owned();
-        if !valid_id(&r.id)
-            || r.message_count != count
-            || r.source_message_count != source_count
-            || stored.len() > 8192
-        {
-            return Err(error("history commit acknowledgement mismatch"));
-        }
-        Ok((r, stored))
+        let base = self.base().to_owned();
+        let logical = logical_id.to_owned();
+        let source = messages.to_vec();
+        let note = note.to_owned();
+        // One locked operation: the stored note comes from the same scan.
+        archive_worker(move |abort| {
+            ArchiveStore::new(&base, scope.key(), &logical)?
+                .with_redactor(redactor())
+                .with_abort(abort)
+                .seal_with_note(&source, &note)
+        })
+        .await
     }
     /// [`history_seal`](Self::history_seal) for a whole window, as rollover
     /// needs it: the archives the window was sealed as ("parts", in source
     /// order, never empty) and the note stored with the last one.
     ///
-    /// The file store never fails this for a window over a per-archive limit
+    /// The store never fails this for a window over a per-archive limit
     /// ([`ArchiveStore::seal_window`]): it cuts the window into several
     /// archives, and a window that fits is the one archive `history_seal`
     /// makes. The archives record nothing about each other, so the returned
@@ -133,24 +107,12 @@ impl MemoryBinding {
     /// failure, or a caller dropped between two of them, leaves the earlier
     /// ones on disk and returns no list; sealing the same window again finds
     /// them and returns the same list.
-    ///
-    /// The Axel backend seals one archive exactly as `history_seal` does, so
-    /// an oversized window still fails there.
     pub async fn history_seal_window(
         &self,
         logical_id: &str,
         messages: &[SharedMessage],
         note: &str,
     ) -> Result<(Vec<ArchivePart>, String)> {
-        if self.exclusive() {
-            let (archive, stored) = self.history_seal(logical_id, messages, note).await?;
-            let whole = ArchivePart {
-                archive,
-                first_source_index: 0,
-                reduced_messages: 0,
-            };
-            return Ok((vec![whole], stored));
-        }
         let scope = self.scope()?.clone();
         let base = self.base().to_owned();
         let logical = logical_id.to_owned();
@@ -174,46 +136,24 @@ impl MemoryBinding {
             return Err(error("history search exceeds bounds"));
         }
         let scope = self.scope()?.clone();
-        if !self.exclusive() {
-            let base = self.base().to_owned();
-            let query = query.to_owned();
-            return archive_worker(move |abort| match reader(&base, scope.key(), abort)? {
-                Some(store) => store.search(&query, limit),
-                None => Ok(Vec::new()),
-            })
-            .await;
-        }
-        let rows: Vec<ArchiveDescriptor> = serde_json::from_value(
-            self.rpc("history_search", json!({"query":query,"limit":limit}))
-                .await?,
-        )
-        .map_err(|_| error("invalid history descriptors"))?;
-        if rows.len() > limit
-            || rows.iter().any(|r| {
-                !valid_id(&r.id)
-                    || r.snippet.len() > 256
-                    || r.message_count > 4096
-                    || r.source_message_count > 4096
-            })
-        {
-            return Err(error("history descriptors exceed bounds"));
-        }
-        Ok(rows)
+        let base = self.base().to_owned();
+        let query = query.to_owned();
+        archive_worker(move |abort| match reader(&base, scope.key(), abort)? {
+            Some(store) => store.search(&query, limit),
+            None => Ok(Vec::new()),
+        })
+        .await
     }
     /// [`history_search`](Self::history_search) that also reports what the
-    /// file store did not read: `None` when nothing is missing, otherwise an
+    /// store did not read: `None` when nothing is missing, otherwise an
     /// [`Unscanned`] that says whether the scan budget stopped it
     /// (`stopped_after`) and whether a shelf, a legacy slot or a file was
-    /// passed over because it could not be read (`unread`). With the Axel
-    /// backend the service does the search and reports neither: always `None`.
+    /// passed over because it could not be read (`unread`).
     pub async fn history_search_scan(
         &self,
         query: &str,
         limit: usize,
     ) -> Result<(Vec<ArchiveDescriptor>, Option<Unscanned>)> {
-        if self.exclusive() {
-            return Ok((self.history_search(query, limit).await?, None));
-        }
         if query.len() > 512 || limit > 32 {
             return Err(error("history search exceeds bounds"));
         }
@@ -236,105 +176,59 @@ impl MemoryBinding {
             return Err(error("invalid history range"));
         }
         let scope = self.scope()?.clone();
-        if !self.exclusive() {
-            let base = self.base().to_owned();
-            let id = id.to_owned();
-            return archive_worker(move |abort| {
-                reader(&base, scope.key(), abort)?
-                    .ok_or_else(no_archive)?
-                    .fetch_with_provenance(&id, start, limit)
-            })
-            .await;
-        }
-        let rows: Vec<ArchivedMessage> = serde_json::from_value(
-            self.rpc(
-                "history_fetch",
-                json!({"id":id,"start":start,"limit":limit}),
-            )
-            .await?,
-        )
-        .map_err(|_| error("invalid history fetch"))?;
-        if rows.len() > limit || rows.iter().any(|r| r.source_index >= 4096) {
-            return Err(error("history range exceeds bounds"));
-        }
-        Ok(rows)
+        let base = self.base().to_owned();
+        let id = id.to_owned();
+        archive_worker(move |abort| {
+            reader(&base, scope.key(), abort)?
+                .ok_or_else(no_archive)?
+                .fetch_with_provenance(&id, start, limit)
+        })
+        .await
     }
     pub async fn history_note(&self, id: &str) -> Result<String> {
         if !valid_id(id) {
             return Err(error("invalid history id"));
         }
         let scope = self.scope()?.clone();
-        if !self.exclusive() {
-            let base = self.base().to_owned();
-            let id = id.to_owned();
-            return archive_worker(move |abort| {
-                reader(&base, scope.key(), abort)?
-                    .ok_or_else(no_archive)?
-                    .fetch_note(&id)
-            })
-            .await;
-        }
-        let note: String =
-            serde_json::from_value(self.rpc("history_note", json!({"id":id})).await?)
-                .map_err(|_| error("invalid history note"))?;
-        if note.len() > 8192 {
-            return Err(error("history note exceeds bounds"));
-        }
-        Ok(note)
+        let base = self.base().to_owned();
+        let id = id.to_owned();
+        archive_worker(move |abort| {
+            reader(&base, scope.key(), abort)?
+                .ok_or_else(no_archive)?
+                .fetch_note(&id)
+        })
+        .await
     }
-    /// Forget the archived window `id`. The file store forgets by content:
+    /// Forget the archived window `id`. The store forgets by content:
     /// every file that holds the same window becomes a tombstone, and what
     /// comes back names each one ([`Forgotten::ids`]) and says whether a
     /// place that may hold another copy could not be read
-    /// ([`Forgotten::unread`]); such a copy is still live. The Axel backend
-    /// keeps one record for an id and reports that one.
+    /// ([`Forgotten::unread`]); such a copy is still live.
     pub async fn history_forget(&self, id: &str) -> Result<Forgotten> {
         if !valid_id(id) {
             return Err(error("invalid history id"));
         }
         let scope = self.scope()?.clone();
-        if !self.exclusive() {
-            let base = self.base().to_owned();
-            let id = id.to_owned();
-            return archive_worker(move |abort| {
-                ArchiveStore::new(&base, scope.key(), "context-windows-v1")?
-                    .with_abort(abort)
-                    .forget(&id)
-            })
-            .await;
-        }
-        if self.rpc("history_forget", json!({"id":id})).await? != true {
-            return Err(error("history not found in project"));
-        }
-        Ok(Forgotten {
-            ids: vec![id.to_owned()],
-            unread: None,
+        let base = self.base().to_owned();
+        let id = id.to_owned();
+        archive_worker(move |abort| {
+            ArchiveStore::new(&base, scope.key(), "context-windows-v1")?
+                .with_abort(abort)
+                .forget(&id)
         })
+        .await
     }
 }
 
 #[cfg(test)]
 mod budget_tests {
     use super::*;
-    use agent_core::config::{MemoryBackendConfig, MemoryBackendKind};
     use agent_core::memory::store::ProjectScope;
+    use serde_json::json;
     use std::path::Path;
 
-    fn binding(
-        root: &Path,
-        kind: MemoryBackendKind,
-        exe: Option<std::path::PathBuf>,
-    ) -> MemoryBinding {
-        MemoryBinding::new(
-            root.into(),
-            Ok(ProjectScope::for_root(root).unwrap()),
-            &MemoryBackendConfig {
-                kind,
-                executable: exe,
-                brain: Some(root.join("brain.r8")),
-                user_scope: false,
-            },
-        )
+    fn binding(root: &Path) -> MemoryBinding {
+        MemoryBinding::new(root.into(), Ok(ProjectScope::for_root(root).unwrap()))
     }
 
     async fn roundtrip(binding: &MemoryBinding) {
@@ -394,7 +288,7 @@ mod budget_tests {
     #[tokio::test]
     async fn legacy_history_eligible_budget_roundtrip_and_atomic_refusal() {
         let temp = tempfile::tempdir().unwrap();
-        roundtrip(&binding(temp.path(), MemoryBackendKind::Legacy, None)).await;
+        roundtrip(&binding(temp.path())).await;
     }
 
     /// The file store keeps every archive: the 129th seal in a project used to
@@ -402,7 +296,7 @@ mod budget_tests {
     #[tokio::test]
     async fn legacy_history_seals_past_128_archives_and_reports_a_complete_search() {
         let temp = tempfile::tempdir().unwrap();
-        let binding = binding(temp.path(), MemoryBackendKind::Legacy, None);
+        let binding = binding(temp.path());
         let mut ids = Vec::new();
         for index in 0..129 {
             let messages = vec![Arc::new(
@@ -446,7 +340,7 @@ mod budget_tests {
         use std::os::unix::fs::MetadataExt;
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
-        let binding = binding(&root, MemoryBackendKind::Legacy, None);
+        let binding = binding(&root);
         let missing = "a".repeat(32);
         let not_there = context_archive::NOT_FOUND;
         // No archive yet: nothing is made to find that out.
@@ -495,25 +389,6 @@ mod budget_tests {
         assert_eq!(stamps(), before);
     }
 
-    #[tokio::test]
-    async fn axel_eligible_overflow_refuses_before_service_or_storage() {
-        let temp = tempfile::tempdir().unwrap();
-        let b = binding(
-            temp.path(),
-            MemoryBackendKind::Axel,
-            Some(temp.path().join("never-started")),
-        );
-        let too_big = vec![Arc::new(
-            json!({"role":"user", "content":"x".repeat(context_archive::MAX_INPUT_BYTES + 1)}),
-        )];
-        let err = b
-            .history_seal("budget-session", &too_big, "")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("input byte budget exceeded"));
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
-    }
-
     fn lines(count: usize) -> Vec<SharedMessage> {
         (0..count)
             .map(|index| Arc::new(json!({"role":"user","content":format!("line {index}.")})))
@@ -526,7 +401,7 @@ mod budget_tests {
     #[tokio::test]
     async fn legacy_history_seal_window_splits_what_history_seal_refuses() {
         let temp = tempfile::tempdir().unwrap();
-        let binding = binding(temp.path(), MemoryBackendKind::Legacy, None);
+        let binding = binding(temp.path());
         let small = lines(3);
         let (parts, note) = binding
             .history_seal_window("window-session", &small, "the note")
@@ -581,58 +456,12 @@ mod budget_tests {
         assert_eq!(binding.history_search("", 8).await.unwrap().len(), 3);
     }
 
-    /// Decision 6.2: the Axel backend is unchanged. A window over a
-    /// per-archive limit is still refused there, before the service is
-    /// started or anything is stored, through the rollover's entry point too.
-    #[tokio::test]
-    async fn axel_oversized_window_still_refuses() {
-        let temp = tempfile::tempdir().unwrap();
-        let b = binding(
-            temp.path(),
-            MemoryBackendKind::Axel,
-            Some(temp.path().join("never-started")),
-        );
-        let too_big = vec![Arc::new(
-            json!({"role":"user", "content":"x".repeat(context_archive::MAX_INPUT_BYTES + 1)}),
-        )];
-        let err = b
-            .history_seal_window("budget-session", &too_big, "")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("input byte budget exceeded"), "{err}");
-        let too_many = lines(context_archive::MAX_MESSAGES + 1);
-        let err = b
-            .history_seal_window("budget-session", &too_many, "")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("message/note budget exceeded"), "{err}");
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[ignore = "requires SYNAPS_AXEL_TEST_BIN; isolated synthetic archive only"]
-    async fn real_axel_history_eligible_budget_roundtrip_and_atomic_refusal() {
-        let temp = tempfile::tempdir().unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let exe =
-            std::env::var_os("SYNAPS_AXEL_TEST_BIN").expect("explicit synthetic service binary");
-        roundtrip(&binding(
-            temp.path(),
-            MemoryBackendKind::Axel,
-            Some(exe.into()),
-        ))
-        .await;
-        assert!(!temp.path().join("context-archives").exists());
-    }
-
     /// Parallel history tools and rollovers share one archive directory per
     /// project; in-process overlap must queue, never surface "archive busy".
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_legacy_history_operations_queue_instead_of_reporting_busy() {
         let temp = tempfile::tempdir().unwrap();
-        let binding = binding(temp.path(), MemoryBackendKind::Legacy, None);
+        let binding = binding(temp.path());
         let tasks: Vec<_> = (0..8)
             .map(|worker| {
                 let binding = binding.clone();

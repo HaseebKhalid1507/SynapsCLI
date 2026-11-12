@@ -277,9 +277,6 @@ What it means, and what it does not:
   store when you start.
 - **Not sent when the seal fails.** The chat keeps its history and no event
   goes out.
-- **Plain-file memory backend only.** With `memory.backend = axel` there is
-  no archive file and no event (and an oversized window still fails to roll
-  over there).
 - **Not for subagent workers**, whose windows are saved beside their own
   transcripts, and not for `/compact`, which is `on_compaction`.
 - **Treat the file as read-only.** It is written once and never changed,
@@ -318,17 +315,16 @@ the thing from your own index.
 | `cwd` | The folder that tool call ran in: the chat's working folder (see below). |
 | `data.kind` | `"archive"` or `"note"`. |
 | `data.id` | For an archive, the bare 32 hex characters: the same string as `archive_id` in `on_context_archived`, without the `ctx-` the model writes. For a note, its id exactly as stored. |
-| `data.project_key` | The project the archive or note belonged to. A user-wide note has the reserved key `p0000000000000000`. |
-| `data.scope` | `"repository"` or `"user"`. Archives are always `repository`. |
+| `data.project_key` | The project the archive or note belonged to. |
+| `data.scope` | Always `"repository"`. (It could be `"user"` for a user-wide note while Synaps had an Axel memory backend.) |
 
 What it means, and what it does not:
 
-- **Sent only when the forget happened.** The tombstone is written (or the
-  memory service has acknowledged it) before the event goes out. A forget
+- **Sent only when the forget happened.** The tombstone is written before
+  the event goes out. A forget
   that fails sends nothing: an id that does not exist, one that belongs to
   another project, a note already forgotten, a store error.
-- **Both memory backends.** It describes what the tool did and carries no
-  path. With `memory.backend = axel` the id is the one the tool was given.
+- **No path.** It describes what the tool did and carries no path.
 - **An archive can be announced twice.** Forgetting an archive that is
   already forgotten succeeds again, and is announced again. Key your work on
   `id`.

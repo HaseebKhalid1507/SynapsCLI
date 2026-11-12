@@ -145,9 +145,11 @@ pub struct ContinuationState {
     /// A head save was requested but not durably acknowledged. Only an explicit
     /// session reload/reset resolves that uncertainty; mode toggles do not.
     pub durability_blocked: bool,
-    /// Restored Axel metadata is only syntactic until the host service verifies
-    /// the durable source. Never infer from a restored head while this is set.
-    restore_pending: bool,
+    /// The archive a resumed head names that its project's store does not
+    /// hold ([`restore_window`]): the chat goes on at window 1 and the
+    /// earlier windows cannot be fetched. `/context status` says so.
+    /// Cleared on reset and by a committed rollover.
+    missing_archive: Option<String>,
     /// Latest provider-reported vs estimated footprint of one request. Kept
     /// across rollovers (same tokenizer); cleared with the session binding.
     pub token_calibration: Option<TokenCalibration>,
@@ -176,7 +178,7 @@ impl Default for ContinuationState {
             latest_archive: None,
             last_band: None,
             durability_blocked: false,
-            restore_pending: false,
+            missing_archive: None,
             token_calibration: None,
             calibration_model: None,
             usage_anchor: None,
@@ -1042,6 +1044,7 @@ impl PreparedRollover {
         // resumed head is left to restore: a lookup for one that kept
         // failing ([`restore_window`]) is not made again.
         s.initialized = true;
+        s.missing_archive = None;
         s.policy.reset();
         s.note.clear();
         s.last_advisory = None;
@@ -1398,8 +1401,7 @@ fn relisted(head: &SharedMessage, parts: &[ArchivePart], from: usize, to: usize)
 /// ([`HookBus::notify_with`]); with no subscriber not even the lookups
 /// happen.
 ///
-/// Sent for the file store only: the Axel backend has no archive file. A
-/// worker's bus sends nothing.
+/// A worker's bus sends nothing.
 ///
 /// [`HookBus::notify_with`]: crate::extensions::hooks::HookBus::notify_with
 fn announce_archived(
@@ -1411,9 +1413,6 @@ fn announce_archived(
     cwd: Option<&std::path::Path>,
 ) {
     use crate::extensions::hooks::events::{HookEvent, HookKind};
-    if binding.exclusive() {
-        return;
-    }
     let Ok(scope) = binding.scope() else {
         return;
     };
@@ -1548,8 +1547,7 @@ pub fn restore_window(
         // What the marker holds is what a session file held: nothing of it
         // is fetched, kept or logged unless it has the form of an id.
         // A rollover numbers its windows from 2; no marker it writes holds
-        // 0. Such a marker is refused whole, as the Axel path refuses it
-        // (`validate_restored_history`), before anything is looked up.
+        // 0. Such a marker is refused whole, before anything is looked up.
         if marker["window"].as_u64() == Some(0) {
             tracing::warn!(
                 session = %s.logical_id,
@@ -1604,7 +1602,8 @@ pub fn restore_window(
                 s.latest_archive = named.ok();
                 s.window = window;
             }
-            Lookup::Absent(_) => {}
+            // Kept for `/context status`: the log is not where a user looks.
+            Lookup::Absent(_) => s.missing_archive = named.ok(),
             Lookup::Failed(_) => return,
         }
         s.initialized = true;
@@ -1626,11 +1625,11 @@ pub fn restore_window(
 
 /// Whether `id` has the form of an archive id: 32 lowercase hex characters.
 /// The one rule for every reader of a resumed head's marker
-/// ([`restore_window`], [`restore_window_syntactic`],
-/// [`validate_restored_history`]), so that they cannot disagree about a
-/// marker. Lowercase only: both stores write their ids so (the first or
-/// last 32 characters of a digest printed in lowercase), and the file store
-/// looks an id up as a file name, which an uppercase spelling is not.
+/// ([`restore_window`], [`listed_parts`]), so that they cannot disagree
+/// about a marker. Lowercase only: the store writes its ids so (the first
+/// or last 32 characters of a digest printed in lowercase, or an imported
+/// id of the same form) and looks an id up as a file name, which an
+/// uppercase spelling is not.
 fn is_archive_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -1718,91 +1717,16 @@ fn warn_unavailable_parts(binding: MemoryBinding, chat: String, ids: Vec<String>
     }
 }
 
-/// Capture only host marker syntax, without authorizing mode or touching a
-/// filesystem. Missing/malformed references remain pending and fail validation.
-fn restore_window_syntactic(messages: &[SharedMessage], state: &SharedContinuation) {
-    let mut s = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if s.initialized {
-        return;
-    }
-    s.initialized = true;
-    if let Some(marker) = messages.iter().find_map(|m| m.get("_synaps_context")) {
-        s.restore_pending = true;
-        if marker["schema"] == MARKER {
-            s.latest_archive = marker["archive"]
-                .as_str()
-                .filter(|id| is_archive_id(id))
-                .map(str::to_owned);
-            s.window = marker["window"].as_u64().filter(|w| *w > 0).unwrap_or(1);
-        }
-    }
-}
-
-/// Host-only async pre-inference barrier for resumed Axel context heads. Call
-/// even when automatic management is off: mode is not evidence of durability.
-/// No hidden note is fetched or injected during validation. A failed lookup
-/// leaves the barrier pending, and resetting the binding invalidates late work.
+/// What a turn does with a resumed head before its first request:
+/// [`restore_window`], whose lookup never refuses the turn. A head whose
+/// archive is not in the chat's store goes on at window 1. Call even when
+/// automatic management is off.
 pub async fn validate_restored_history(
     messages: &[SharedMessage],
     state: &SharedContinuation,
     binding: &MemoryBinding,
 ) -> Result<()> {
-    if !binding.exclusive() {
-        restore_window(messages, state, binding);
-        return Ok(());
-    }
-    // Inspect this actual request even if reset/another request initialized the
-    // state already. A loaded marker must never bypass verification because an
-    // earlier empty head (or legacy binding) set `initialized` first.
-    let mut markers = messages.iter().filter_map(|m| m.get("_synaps_context"));
-    let Some(marker) = markers.next() else {
-        let mut s = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if s.restore_pending {
-            return Err(RuntimeError::Session(
-                "restored context archive marker is missing; stopped before inference".into(),
-            ));
-        }
-        s.initialized = true;
-        return Ok(());
-    };
-    let epoch = {
-        let mut s = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        s.restore_pending = true;
-        s.epoch
-    };
-    let valid = marker["schema"] == MARKER && markers.next().is_none();
-    let id = marker["archive"]
-        .as_str()
-        .filter(|id| valid && is_archive_id(id));
-    let window = marker["window"].as_u64().filter(|w| *w > 0);
-    let (Some(id), Some(window)) = (id, window) else {
-        return Err(RuntimeError::Session(
-            "restored context archive marker is invalid; stopped before inference".into(),
-        ));
-    };
-    binding.history_fetch(id, 0, 1).await.map_err(|e| {
-        RuntimeError::Session(format!(
-            "restored context archive could not be verified; stopped before inference: {e}"
-        ))
-    })?;
-    let mut s = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if s.epoch != epoch {
-        return Err(RuntimeError::Session(
-            "restored context belongs to a superseded session binding".into(),
-        ));
-    }
-    s.latest_archive = Some(id.to_owned());
-    s.window = window;
-    s.initialized = true;
-    s.restore_pending = false;
+    restore_window(messages, state, binding);
     Ok(())
 }
 
@@ -1823,11 +1747,7 @@ impl crate::Runtime {
                 ..Default::default()
             };
         }
-        if self.memory_backend_exclusive() {
-            restore_window_syntactic(messages, &self.continuation);
-        } else {
-            restore_window(messages, &self.continuation, &self.memory_backend);
-        }
+        restore_window(messages, &self.continuation, &self.memory_backend);
     }
     pub fn context_management_enabled(&self) -> bool {
         self.continuation
@@ -1845,7 +1765,15 @@ impl crate::Runtime {
             self.context_window(),
         )
         .ok();
-        format!("context management: {} | window {} | capacity {} | pressure {} | rollover {} | archive {}\nAutomatic rollover preserves eligible source evidence in the selected memory backend and starts a fresh wall-clock allowance; permissions, running environment and other resource/cost budgets are unchanged.",s.config.mode.as_str(),s.window,self.context_window(),thresholds.map_or(0,|t|t.pressure_tokens),thresholds.map_or(0,|t|t.rollover_tokens),s.latest_archive.as_deref().unwrap_or("none"))
+        let mut status = format!("context management: {} | window {} | capacity {} | pressure {} | rollover {} | archive {}\nAutomatic rollover preserves eligible source evidence in this folder's archive store and starts a fresh wall-clock allowance; permissions, running environment and other resource/cost budgets are unchanged.",s.config.mode.as_str(),s.window,self.context_window(),thresholds.map_or(0,|t|t.pressure_tokens),thresholds.map_or(0,|t|t.rollover_tokens),s.latest_archive.as_deref().unwrap_or("none"));
+        if let Some(id) = &s.missing_archive {
+            status.push_str(&format!(
+                "\narchive ctx-{id}, which this chat continues from, is not in this folder's \
+                 archive store, so earlier windows cannot be fetched. If you opened the chat \
+                 from another folder than before, open it from that one."
+            ));
+        }
+        status
     }
     pub fn context_management_command(&self, arg: &str) -> std::result::Result<String, String> {
         if arg.is_empty() || arg == "status" {
@@ -1869,15 +1797,6 @@ impl crate::Runtime {
             _ => return Err("try /context auto | off | status (session-only); config context_management.mode persists the preference".into()),
         }
         if cfg.mode == ContextManagementMode::Auto {
-            if self.memory_backend_exclusive() && !self.memory_backend.is_axel() {
-                return Err("selected memory backend is unavailable; automatic rollover refused; mode unchanged".into());
-            }
-            if self
-                .memory_backend_reconfigure_denied
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return Err("memory backend selection changed; restart before enabling automatic rollover; mode unchanged".into());
-            }
             self.memory_backend.scope().map_err(|e| e.to_string())?;
         }
         if cfg.mode == ContextManagementMode::Auto && !cfg!(unix) {
@@ -2330,7 +2249,7 @@ mod tests {
         assert!(rollover(
             &messages,
             &state,
-            &MemoryBinding::legacy_current(),
+            &MemoryBinding::for_process_cwd(),
             100_000,
             SuccessorBudget::UNBOUNDED,
             &cancel
@@ -2361,7 +2280,7 @@ mod tests {
         let prepared = rollover(
             &messages,
             &state,
-            &MemoryBinding::legacy_current(),
+            &MemoryBinding::for_process_cwd(),
             100_000,
             SuccessorBudget::UNBOUNDED,
             &Default::default(),
@@ -2381,7 +2300,7 @@ mod tests {
         assert_eq!(source.len(), messages.len());
         assert_eq!(source[1], messages[1]);
         let restored = Arc::new(Mutex::new(ContinuationState::default()));
-        restore_window(&next, &restored, &MemoryBinding::legacy_current());
+        restore_window(&next, &restored, &MemoryBinding::for_process_cwd());
         let s = restored.lock().unwrap();
         assert_eq!(s.window, 2);
         assert!(!s.enabled());
@@ -2400,7 +2319,7 @@ mod tests {
         )];
         let state = Arc::new(Mutex::new(ContinuationState::default()));
         let window = state.lock().unwrap().window;
-        restore_window(&head, &state, &MemoryBinding::legacy_current());
+        restore_window(&head, &state, &MemoryBinding::for_process_cwd());
         let s = state.lock().unwrap();
         assert!(s.initialized);
         assert_eq!((s.latest_archive.as_deref(), s.window), (None, window));
@@ -2414,7 +2333,7 @@ mod tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn rollover_is_ready_when_the_project_already_holds_128_archives() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         for index in 0..128 {
             let window = vec![Arc::new(
                 json!({"role":"assistant","content":format!("earlier window {index}")}),
@@ -2463,7 +2382,7 @@ mod tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn eligible_archive_budget_preserves_rollover_head_barrier_and_failure_state() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         for eligible_overflow in [false, true] {
             let state = Arc::new(Mutex::new(ContinuationState::default()));
             {
@@ -2694,7 +2613,7 @@ mod tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn no_shrink_is_typed_and_does_not_write_or_change_checkpoint_state() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let messages = vec![Arc::new(
             json!({"role":"user", "content":"Retain every requirement. ".repeat(4000)}),
         )];
@@ -2747,7 +2666,7 @@ mod tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn shrinking_but_oversized_candidate_and_time_boundary_still_fail_closed() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let messages = vec![
             Arc::new(json!({"role":"user", "content":"Pinned instruction ".repeat(4000)})),
             Arc::new(
@@ -2790,7 +2709,7 @@ mod tests {
         assert!(rollover(
             &messages,
             &state,
-            &MemoryBinding::legacy_current(),
+            &MemoryBinding::for_process_cwd(),
             1000,
             SuccessorBudget::UNBOUNDED,
             &Default::default()
@@ -2832,42 +2751,111 @@ mod command_tests {
         assert!(!rt.continuation.lock().unwrap().durability_blocked);
     }
 
+    /// T-B6. A saved head whose marker names an archive that its project's
+    /// store does not hold: the turn is not refused, the chat goes on at
+    /// window 1, and `/context status` says which archive is missing and
+    /// what to do. Once the archive is imported into the chat's project,
+    /// loading the chat again restores its window and the line is gone. The
+    /// same head loaded from a folder of another project: window 1 and the
+    /// line; from the folder that holds the archive: the window.
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
-    async fn axel_restore_is_syntactic_until_host_validation_even_when_mode_off() {
+    async fn a_missing_archive_opens_the_chat_at_window_1_and_status_says_so() {
+        use agent_core::context_archive::{
+            archive_file, project_scope, ArchiveStore, ImportOutcome, ImportSeen, NOT_FOUND,
+        };
         let env = crate::test_env::BaseDirGuard::new();
-        let mut rt = crate::Runtime::new_headless();
-        rt.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig {
-            kind: agent_core::config::MemoryBackendKind::Axel,
-            executable: Some(env.path().join("missing-service")),
-            brain: Some(env.path().join("brain.r8")),
-            user_scope: false,
-        });
-        let messages = vec![Arc::new(json!({"role":"user","content":"historical data",
-            "_synaps_context":{"schema":MARKER,"archive":"a".repeat(32),"window":4}}))];
-        rt.reset_context_continuation("synthetic-resumed", &messages);
-        assert!(!rt.context_management_enabled());
-        assert_eq!(rt.continuation.lock().unwrap().window, 4);
-        for _ in 0..2 {
-            assert!(
-                validate_restored_history(&messages, &rt.continuation, &rt.memory_backend)
-                    .await
-                    .is_err()
-            );
-            assert!(rt.continuation.lock().unwrap().restore_pending);
-        }
-        assert!(!env.path().join("context-archives").exists());
-        assert!(!env.path().join("brain.r8").exists());
-        // An earlier empty request must not make a later loaded marker trusted.
-        rt.reset_context_continuation("synthetic-empty", &[]);
-        assert!(rt.continuation.lock().unwrap().initialized);
-        assert!(
-            validate_restored_history(&messages, &rt.continuation, &rt.memory_backend)
-                .await
-                .is_err()
+        let _root = crate::test_env::EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        let project = || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".synaps-project"), "").unwrap();
+            dir
+        };
+        // A session runtime as the host builds it: folder first, then bound.
+        let runtime_in = |folder: &std::path::Path| {
+            let mut rt = crate::Runtime::new_headless();
+            rt.set_cwd(Some(folder.to_path_buf()));
+            rt.bind_memory();
+            rt
+        };
+        let key = |rt: &crate::Runtime| rt.memory_backend.scope().unwrap().key().to_owned();
+        let opened = |rt: &crate::Runtime| {
+            let s = rt.continuation.lock().unwrap();
+            (s.latest_archive.clone(), s.window)
+        };
+        const MISSING: &str = "is not in this folder's archive store";
+
+        // The window was sealed in another folder's project.
+        let (own, other) = (project(), project());
+        let elsewhere = runtime_in(other.path());
+        let window = vec![Arc::new(json!({"role":"assistant","content":"the earlier window"}))];
+        let (sealed, _) = elsewhere
+            .memory_backend
+            .history_seal("chat", &window, "note")
+            .await
+            .unwrap();
+        let head = vec![Arc::new(json!({"role":"user","content":"carry on",
+            "_synaps_context":{"schema":MARKER,"archive":sealed.id,"window":4}}))];
+        let line = format!(
+            "archive ctx-{}, which this chat continues from, is not in this folder's archive \
+             store, so earlier windows cannot be fetched. If you opened the chat from another \
+             folder than before, open it from that one.",
+            sealed.id
         );
-        assert_eq!(rt.continuation.lock().unwrap().window, 1);
-        assert!(rt.continuation.lock().unwrap().latest_archive.is_none());
+
+        // Opened in a folder whose store does not hold the archive.
+        let rt = runtime_in(own.path());
+        assert_ne!(key(&rt), key(&elsewhere));
+        rt.reset_context_continuation("chat", &head);
+        assert_eq!(opened(&rt), (None, 1));
+        // The barrier before the first request passes, every time.
+        for _ in 0..2 {
+            validate_restored_history(&head, &rt.continuation, &rt.memory_backend)
+                .await
+                .expect("a missing archive does not refuse the turn");
+            assert_eq!(opened(&rt), (None, 1));
+        }
+        let status = rt.context_management_status();
+        assert!(status.contains(" | window 1 | ") && status.contains(" | archive none\n"), "{status}");
+        assert_eq!(status.lines().last(), Some(line.as_str()), "{status}");
+        assert_eq!(status.matches(MISSING).count(), 1, "{status}");
+        assert_eq!(rt.context_management_command("status").unwrap(), status);
+        let fetch = rt.memory_backend.history_fetch(&sealed.id, 0, 1).await.unwrap_err();
+        assert!(fetch.to_string().contains(NOT_FOUND), "{fetch}");
+
+        // The archive is imported into the chat's project, as
+        // `synaps memory import-archives --cwd` does it.
+        let file = archive_file(env.path(), &key(&elsewhere), &sealed.id).unwrap().expect("the sealed file");
+        let record = std::fs::read(file).unwrap();
+        let store = ArchiveStore::for_scope(env.path(), &project_scope(&key(&rt)).unwrap()).unwrap();
+        let done = store
+            .import(record.trim_ascii(), true, false, &mut ImportSeen::default())
+            .unwrap()
+            .expect("the record is accepted");
+        assert_eq!(done.outcome, ImportOutcome::Stored);
+        // The open chat is as it was; loaded again, it has its window.
+        assert_eq!(opened(&rt), (None, 1));
+        let again = runtime_in(own.path());
+        again.reset_context_continuation("chat", &head);
+        assert_eq!(opened(&again), (Some(sealed.id.clone()), 4));
+        let status = again.context_management_status();
+        assert!(status.contains(" | window 4 | ") && !status.contains(MISSING), "{status}");
+
+        // The same head from a third folder, and from the folder it was
+        // sealed in.
+        let third = project();
+        let stray = runtime_in(third.path());
+        stray.reset_context_continuation("chat", &head);
+        assert_eq!(opened(&stray), (None, 1));
+        assert_eq!(stray.context_management_status().lines().last(), Some(line.as_str()));
+        let home = runtime_in(other.path());
+        home.reset_context_continuation("chat", &head);
+        assert_eq!(opened(&home), (Some(sealed.id.clone()), 4));
+        assert!(!home.context_management_status().contains(MISSING));
+
+        // A head with no marker, or after a reset to another chat: no line.
+        stray.reset_context_continuation("another-chat", &[]);
+        assert!(!stray.context_management_status().contains(MISSING));
     }
 
     /// A chat the daemon hosts runs in its own folder, and its windows are
@@ -2882,12 +2870,11 @@ mod command_tests {
         // The chat's folder is a project of its own, apart from the host's.
         let chat = tempfile::tempdir().unwrap();
         std::fs::write(chat.path().join(".synaps-project"), "").unwrap();
-        let files = agent_core::config::MemoryBackendConfig::default();
-        // A session runtime as the host builds it: folder first, then config.
+        // A session runtime as the host builds it: folder first, then bound.
         let runtime_in = |folder: Option<&std::path::Path>| {
             let mut rt = crate::Runtime::new_headless();
             rt.set_cwd(folder.map(std::path::Path::to_path_buf));
-            rt.apply_memory_backend_config(&files);
+            rt.bind_memory();
             rt
         };
         let window = |text: &str| vec![Arc::new(json!({"role":"assistant","content":text}))];
@@ -2936,17 +2923,14 @@ mod command_tests {
 
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
-    async fn unavailable_backend_never_rolls_over_into_local_archive() {
+    async fn a_chat_without_a_project_never_rolls_over_into_an_archive() {
         let env = crate::test_env::BaseDirGuard::new();
         let mut rt = crate::Runtime::new_headless();
-        rt.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig {
-            kind: agent_core::config::MemoryBackendKind::Unavailable,
-            ..Default::default()
-        });
+        rt.inherit_memory_binding(&MemoryBinding::for_cwd(None));
         assert!(rt
             .context_management_command("auto")
             .unwrap_err()
-            .contains("unavailable"));
+            .contains("host project scope unavailable"));
         let messages = vec![Arc::new(
             json!({"role":"assistant","content":"prior evidence ".repeat(5000)}),
         )];
@@ -2968,25 +2952,6 @@ mod command_tests {
         assert_eq!(serde_json::to_vec(&messages).unwrap(), before);
         assert_eq!(rt.continuation.lock().unwrap().window, 1);
         assert!(!env.path().join("context-archives").exists());
-    }
-
-    #[test]
-    #[serial_test::serial(synaps_base_dir)]
-    fn configured_axel_allows_host_auto_without_opening_any_store() {
-        let env = crate::test_env::BaseDirGuard::new();
-        let mut rt = crate::Runtime::new_headless();
-        rt.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig {
-            kind: agent_core::config::MemoryBackendKind::Axel,
-            executable: Some(env.path().join("host-service")),
-            brain: Some(env.path().join("brain.r8")),
-            user_scope: false,
-        });
-        if cfg!(unix) {
-            rt.context_management_command("auto").unwrap();
-            assert!(rt.context_management_enabled());
-        }
-        assert!(!env.path().join("context-archives").exists());
-        assert!(!env.path().join("brain.r8").exists());
     }
 
     /// Incident 2026-10-13: rollover waited on near-continuous workers for
@@ -4418,40 +4383,35 @@ mod budget_tests {
         assert_eq!(wire[3]["content"], m[3]["content"], "the note's text is sent");
 
         let restored = Arc::new(Mutex::new(ContinuationState::default()));
-        restore_window_syntactic(&m, &restored);
-        assert!(!restored.lock().unwrap().restore_pending, "no archive marker here");
+        restore_window(&m, &restored, &MemoryBinding::for_cwd(None));
+        let s = restored.lock().unwrap();
+        assert!(s.latest_archive.is_none() && s.missing_archive.is_none(), "no archive marker here");
     }
 
     /// A resumed history holding the note passes restore validation
-    /// unchanged under Axel memory: the archive-marker readers never see
-    /// it. (A `_synaps_context`-tagged note made 0.10.2's readers stop
-    /// every turn: "restored context archive marker is invalid".)
+    /// unchanged: the archive-marker readers never see it. (A
+    /// `_synaps_context`-tagged note made 0.10.2's readers stop every turn:
+    /// "restored context archive marker is invalid".)
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
-    async fn resumed_history_with_the_tool_note_passes_axel_restore_validation() {
+    async fn resumed_history_with_the_tool_note_passes_restore_validation() {
         use crate::engine::interrupt::{
             append_marker, tool_in_flight_note_message, InterruptReason,
         };
         let env = crate::test_env::BaseDirGuard::new();
-        let mut rt = crate::Runtime::new_headless();
-        rt.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig {
-            kind: agent_core::config::MemoryBackendKind::Axel,
-            executable: Some(env.path().join("missing-service")),
-            brain: Some(env.path().join("brain.r8")),
-            user_scope: false,
-        });
+        let rt = crate::Runtime::new_headless();
         let mut messages = vec![user("REAL TASK"), assistant("Let me look")];
         messages.push(tool_in_flight_note_message(InterruptReason::User, &["bash".into()]));
         append_marker(&mut messages, InterruptReason::User);
         rt.reset_context_continuation("synthetic-resumed", &messages);
-        assert!(!rt.continuation.lock().unwrap().restore_pending);
+        assert!(rt.continuation.lock().unwrap().missing_archive.is_none());
         for _ in 0..2 {
             validate_restored_history(&messages, &rt.continuation, &rt.memory_backend)
                 .await
-                .expect("no archive marker: nothing to verify, the turn may run");
-            assert!(!rt.continuation.lock().unwrap().restore_pending);
+                .expect("no archive marker: nothing to look up, the turn may run");
+            assert!(rt.continuation.lock().unwrap().missing_archive.is_none());
         }
-        assert!(!env.path().join("brain.r8").exists(), "nothing fetched");
+        assert!(!env.path().join("context-archives").exists(), "nothing looked up or made");
     }
 
     #[test]
@@ -4674,7 +4634,7 @@ mod rollover_path_tests {
         rollover_for_boundary(
             messages,
             state,
-            &MemoryBinding::legacy_current(),
+            &MemoryBinding::for_process_cwd(),
             1_000_000,
             target,
             &Default::default(),
@@ -4821,7 +4781,7 @@ mod rollover_path_tests {
         let refused = rollover_for_boundary(
             &messages,
             &auto_state(),
-            &MemoryBinding::legacy_current(),
+            &MemoryBinding::for_process_cwd(),
             200_000,
             target,
             &Default::default(),
@@ -4943,7 +4903,7 @@ mod rollover_path_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn oversized_window_rolls_over_in_parts() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let messages = long_window(5_000);
         assert!(messages.len() > agent_core::context_archive::MAX_MESSAGES);
         let state = auto_state();
@@ -5093,7 +5053,7 @@ mod rollover_path_tests {
         state: &SharedContinuation,
         budget: u64,
     ) -> Result<RolloverPreparation> {
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let none = Default::default();
         rollover_for_boundary(messages, state, &binding, budget, SMALL_TARGET, &none, false, "").await
     }
@@ -5325,7 +5285,7 @@ mod rollover_path_tests {
             saves(m, &successor_from_parts(m, &assumed, "", 2, none, None, ""))
         };
         let roll = |m: Vec<SharedMessage>| async move {
-            let (binding, state, cancel) = (MemoryBinding::legacy_current(), auto_state(), Default::default());
+            let (binding, state, cancel) = (MemoryBinding::for_process_cwd(), auto_state(), Default::default());
             let rolled = rollover_for_boundary(&m, &state, &binding, BUDGET, none, &cancel, false, "").await;
             (ready(rolled), m)
         };
@@ -5473,7 +5433,7 @@ mod rollover_path_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn a_chat_rolled_over_in_parts_reopens_like_a_single_archive_chat() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         // Two chats at the same point: one whose window fitted one archive,
         // one whose window was sealed as several. Both are then closed.
         let (single_chat, single_parts) = rolled_and_saved(&long_window(3_000)).await;
@@ -5491,7 +5451,7 @@ mod rollover_path_tests {
             (
                 s.window,
                 s.latest_archive.clone(),
-                (s.initialized, s.restore_pending, s.durability_blocked),
+                (s.initialized, s.missing_archive.is_some(), s.durability_blocked),
                 s.note.clone(),
             )
         };
@@ -5578,7 +5538,7 @@ mod rollover_path_tests {
     async fn interrupted_then_retried(grown_by: Vec<SharedMessage>) {
         use crate::extensions::hooks::{events::HookKind, test_support::Listener, HookBus};
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let scope = binding.scope().unwrap().clone();
         // Three inputs no two of which fit one archive.
         let mut messages = vec![user("charter")];
@@ -6402,7 +6362,6 @@ mod archived_hook_tests {
     use crate::extensions::hooks::test_support::Listener;
     use crate::extensions::hooks::HookBus;
     use crate::test_env::BaseDirGuard;
-    use agent_core::config::MemoryBackendKind;
 
     pub(super) const CHAT: &str = "chat-under-test";
 
@@ -6504,7 +6463,7 @@ mod archived_hook_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn a_part_stored_under_its_second_id_is_named_by_it_in_the_head_the_marker_and_the_event() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let scope = binding.scope().unwrap().clone();
         let (bus, listener) = listening().await;
         let (messages, state) = (split_window(), chat_state());
@@ -6615,7 +6574,7 @@ mod archived_hook_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn a_sealed_window_is_announced_with_its_archive_file() {
         let env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let (bus, listener) = listening().await;
         let (messages, state) = (window(), chat_state());
         let prepared = seal(&binding, &state, &messages).await;
@@ -6676,7 +6635,7 @@ mod archived_hook_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn each_part_of_a_split_window_is_announced_with_its_own_file() {
         let env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let (bus, listener) = listening().await;
         let (messages, state) = (split_window(), chat_state());
         let prepared = seal(&binding, &state, &messages).await;
@@ -6741,7 +6700,7 @@ mod archived_hook_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn a_window_sealed_twice_is_announced_once_by_the_rollover_that_commits() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let (bus, listener) = listening().await;
         let (messages, state) = (window(), chat_state());
         // Sealed, and abandoned before its head was saved.
@@ -6772,7 +6731,7 @@ mod archived_hook_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn a_rollover_whose_commit_is_refused_announces_nothing() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let (bus, listener) = listening().await;
         let (messages, state) = (window(), chat_state());
         let prepared = seal(&binding, &state, &messages).await;
@@ -6785,26 +6744,24 @@ mod archived_hook_tests {
         assert_eq!(state.lock().unwrap().window, 1);
     }
 
-    /// The Axel backend has no archive file, so nothing is announced and
-    /// nothing is touched. The control is the same rollover on the file
-    /// store, which is delivered (without a path: nothing holds that id).
+    /// A rollover whose archive no file holds is still announced, without a
+    /// path, and the lookup creates nothing. A binding with no project
+    /// announces nothing.
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
-    async fn nothing_is_announced_for_the_axel_backend() {
+    async fn an_archive_with_no_file_is_announced_without_a_path() {
         let env = BaseDirGuard::new();
-        let axel = crate::tools::test_helpers::memory_binding(MemoryBackendKind::Axel, env.path());
-        assert!(axel.exclusive());
         let (bus, listener) = listening().await;
         let state = chat_state();
-        unsealed(&state).commit_and_announce(&state, &bus, &axel, None).unwrap();
+        let nowhere = MemoryBinding::for_cwd(None);
+        unsealed(&state).commit_and_announce(&state, &bus, &nowhere, None).unwrap();
         assert_eq!(bus.notifies_in_flight(), 0, "no delivery was started");
         assert!(!env.path().join("context-archives").exists());
-        assert!(!env.path().join("brain.r8").exists());
 
-        let files = crate::tools::test_helpers::memory_binding(MemoryBackendKind::Legacy, env.path());
+        let files = crate::tools::test_helpers::memory_binding(env.path());
         unsealed(&state).commit_and_announce(&state, &bus, &files, None).unwrap();
         let events = listener.wait_for(1).await;
-        assert_eq!(events.len(), 1, "only the file store's: {events:?}");
+        assert_eq!(events.len(), 1, "only the one with a project: {events:?}");
         assert_eq!(events[0].data["path"], Value::Null);
         assert_eq!(events[0].data["message_count"], json!(3));
         assert!(!env.path().join("context-archives").exists(), "a lookup creates nothing");
@@ -6816,7 +6773,7 @@ mod archived_hook_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn nothing_is_announced_from_a_worker_or_without_a_subscriber() {
         let env = BaseDirGuard::new();
-        let files = crate::tools::test_helpers::memory_binding(MemoryBackendKind::Legacy, env.path());
+        let files = crate::tools::test_helpers::memory_binding(env.path());
         let (host, listener) = listening().await;
         let state = chat_state();
         let worker = HookBus::worker_transforms(&host);
@@ -6948,12 +6905,12 @@ mod resume_tests {
     }
 
     /// A session runtime as the host builds it for a chat in `folder`: the
-    /// folder first, then the configuration, which binds the chat's memory
-    /// to that folder's project.
+    /// folder first, then the binding of the chat's memory to that folder's
+    /// project.
     fn runtime_in(folder: &Path) -> crate::Runtime {
         let mut rt = crate::Runtime::new_headless();
         rt.set_cwd(Some(folder.to_path_buf()));
-        rt.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig::default());
+        rt.bind_memory();
         rt
     }
 
@@ -7027,7 +6984,7 @@ mod resume_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn a_lookup_that_fails_settles_nothing_and_the_next_call_looks_again() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let (head, parts) = rolled_over(&binding, &window()).await;
         let id = parts[0].archive.id.clone();
         let heal = make_unreadable(&binding, &id);
@@ -7064,7 +7021,7 @@ mod resume_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn a_committed_rollover_settles_a_resume_whose_lookup_kept_failing() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let (head, parts) = rolled_over(&binding, &window()).await;
         let _unreadable = make_unreadable(&binding, &parts[0].archive.id);
 
@@ -7105,30 +7062,15 @@ mod resume_tests {
         head
     }
 
-    /// A head whose marker names archive `id` at window 4, and nothing else.
-    fn head_naming(id: &str) -> Vec<SharedMessage> {
-        vec![Arc::new(json!({"role":"user","content":"historical data",
-            "_synaps_context":{"schema":MARKER,"archive":id,"window":4}}))]
-    }
-
-    /// An Axel binding whose service is not there: a lookup through it fails.
-    fn axel_without_service(dir: &Path) -> MemoryBinding {
-        let binding = crate::tools::test_helpers::memory_binding(
-            agent_core::config::MemoryBackendKind::Axel,
-            dir,
-        );
-        assert!(binding.exclusive());
-        binding
-    }
-
-    /// No rollover writes window 0. The Axel path refused such a marker;
-    /// the file-store path took it, archive link and all, and the chat went
-    /// on at window 0. Both refuse it now.
+    /// No rollover writes window 0. The resume once took such a marker,
+    /// archive link and all, and the chat went on at window 0. It is
+    /// refused whole now, and the barrier before the first request lets the
+    /// turn run.
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn a_marker_with_window_0_is_refused_by_the_file_store_resume_too() {
-        let env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
         let (head, parts) = rolled_over(&binding, &window()).await;
         let id = parts[0].archive.id.clone();
         assert_eq!(resume(&head, &binding), (Some(id), 2, true), "as it was sealed");
@@ -7141,11 +7083,10 @@ mod resume_tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert_says(&lines[0], &["window 0", "goes on at window 1 without its archive link"]);
 
-        let refused = validate_restored_history(&zero, &chat_state(), &axel_without_service(env.path()))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(refused.contains("marker is invalid"), "{refused}");
+        let state = chat_state();
+        validate_restored_history(&zero, &state, &binding).await.unwrap();
+        let s = state.lock().unwrap();
+        assert_eq!((s.latest_archive.clone(), s.window, s.initialized), (None, 1, true));
     }
 
     /// An archive id is 32 lowercase hex characters on every path that
@@ -7156,7 +7097,7 @@ mod resume_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn an_id_in_uppercase_is_no_archive_id_for_the_file_store_resume() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let (head, parts) = rolled_over(&binding, &window()).await;
         let id = parts[0].archive.id.clone();
         // An id of digits alone has no capitals to test with.
@@ -7174,49 +7115,6 @@ mod resume_tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert_says(&lines[0], &["names no archive", "32 bytes that are not an archive id"]);
         assert!(!lines[0].contains(&upper), "what is not an id is not logged: {lines:?}");
-    }
-
-    const UPPER: &str = "ABCDEF0123456789ABCDEF0123456789";
-
-    /// The same rule on the syntactic path (Axel memory, before the host
-    /// has validated the head): it kept an id in capitals as the archive
-    /// link.
-    #[test]
-    fn an_id_in_uppercase_is_no_archive_id_for_the_syntactic_restore() {
-        let restore = |id: &str| {
-            let state = chat_state();
-            restore_window_syntactic(&head_naming(id), &state);
-            let s = state.lock().unwrap();
-            (s.latest_archive.clone(), s.window, s.restore_pending)
-        };
-        let lower = UPPER.to_lowercase();
-        assert_eq!(restore(&lower), (Some(lower.clone()), 4, true));
-        assert_eq!(restore(UPPER), (None, 4, true), "pending, with no archive to go by");
-    }
-
-    /// The same rule on the Axel validation path: it asked the service for
-    /// an id in capitals. Such a marker is now invalid before anything is
-    /// asked; an id of the right form is still looked up (and here not
-    /// verified, the service being away).
-    #[tokio::test]
-    #[serial_test::serial(synaps_base_dir)]
-    async fn an_id_in_uppercase_is_refused_by_the_axel_validation() {
-        let env = BaseDirGuard::new();
-        let axel = axel_without_service(env.path());
-        let refusal = |id: String| {
-            let axel = &axel;
-            async move {
-                validate_restored_history(&head_naming(&id), &chat_state(), axel)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-            }
-        };
-        let lower = refusal(UPPER.to_lowercase()).await;
-        assert!(lower.contains("could not be verified"), "{lower}");
-        let upper = refusal(UPPER.to_string()).await;
-        assert!(upper.contains("marker is invalid"), "{upper}");
-        assert!(!env.path().join("brain.r8").exists());
     }
 
     /// `head` with its marker's `archives` replaced by entries of `ids`.
@@ -7238,7 +7136,7 @@ mod resume_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn resume_looks_up_a_bounded_number_of_the_parts_a_head_lists() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let (head, parts) = rolled_over(&binding, &window()).await;
         let found = (Some(parts[0].archive.id.clone()), 2, true);
         // 200 ids no archive has, the first of them listed twice, and the
@@ -7273,7 +7171,7 @@ mod resume_tests {
     async fn resume_neither_fetches_nor_logs_a_marker_string_that_is_not_an_id() {
         const BYTES: usize = 10 * 1024 * 1024;
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let (head, parts) = rolled_over(&binding, &window()).await;
         let id = parts[0].archive.id.clone();
         let huge = "7".repeat(BYTES);
@@ -7315,7 +7213,7 @@ mod resume_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn resume_warns_for_each_listed_part_the_store_cannot_give_back() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let (head, parts) = rolled_over(&binding, &split_window()).await;
         let (last, earlier) = parts.split_last().unwrap();
         assert!(earlier.len() >= 2, "three inputs that cannot share an archive: {parts:?}");
@@ -7355,7 +7253,7 @@ mod resume_tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn resume_with_the_last_part_forgotten_goes_on_at_window_1_and_says_so() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let (head, parts) = rolled_over(&binding, &split_window()).await;
         let (last, earlier) = parts.split_last().unwrap();
         assert!(!earlier.is_empty(), "{parts:?}");

@@ -1250,25 +1250,31 @@ fn removed_automatic_memory_warning() -> String {
     )
 }
 
-/// Host-owned note storage selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MemoryBackendKind {
-    #[default]
-    Legacy,
-    Axel,
-    /// Invalid configuration must never select legacy storage implicitly.
-    Unavailable,
+/// The warning for a config that selected or configured the removed Axel
+/// memory backend: `memory.backend = axel`, or any of `memory.user_scope`,
+/// `memory.axel.executable`, `memory.axel.brain` with any value. There is
+/// one store now, plain files, so these keys are read, never validated and
+/// never able to fail anything: the config loads, on plain files.
+fn removed_axel_backend_warning() -> String {
+    format!(
+        "memory.backend = axel is no longer supported: since {v} Synaps keeps context archives \
+         and notes in plain files under its base directory, always, and Axel is an extension. \
+         This session uses plain files. Archives and notes saved to the Axel brain are not read \
+         any more: move them once with \"axel synaps-export\" and \"synaps memory \
+         import-archives\" / \"import-notes\", install the Axel extension for recall and the \
+         forum, then remove the memory.backend, memory.user_scope and memory.axel.* lines. See \
+         docs/upgrading/{v}.md",
+        v = crate::AXEL_BACKEND_REMOVED_IN
+    )
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct MemoryBackendConfig {
-    pub kind: MemoryBackendKind,
-    /// Explicit absolute executable path; never resolved through PATH.
-    pub executable: Option<PathBuf>,
-    /// Optional absolute shared Axel brain path; absent uses the private user default.
-    pub brain: Option<PathBuf>,
-    /// Explicit host opt-in to user-wide notes. Never grants capture/history consent.
-    pub user_scope: bool,
+/// The warning for a config whose only such line is `memory.backend` with
+/// another value (`legacy`, or anything else).
+fn removed_memory_backend_warning() -> String {
+    format!(
+        "memory.backend is ignored: plain files are the only memory storage since {}. Remove \
+         this line",
+        crate::AXEL_BACKEND_REMOVED_IN
+    )
 }
 
 /// Parsed configuration from the config file.
@@ -1477,8 +1483,6 @@ pub struct SynapsConfig {
     pub keybinds: std::collections::HashMap<String, String>,
     /// Typed per-role turn budgets (Task 23, spec §8.1).
     pub turn_budgets: TurnBudgetsConfig,
-    /// Host-owned backend; selecting it does not enable recall or capture.
-    pub memory_backend: MemoryBackendConfig,
     /// Non-fatal problems found while parsing the config file (unknown keys,
     /// unparseable values). Surfaced once at startup — never block boot.
     pub warnings: Vec<String>,
@@ -1553,7 +1557,6 @@ impl Default for SynapsConfig {
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
             turn_budgets: TurnBudgetsConfig::default(),
-            memory_backend: MemoryBackendConfig::default(),
             warnings: Vec::new(),
         }
     }
@@ -1681,7 +1684,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
 
 /// Every key accepted by the namespaced family parsers that is NOT in
 /// [`KNOWN_CONFIG_KEYS`] (`shell.*`, `events.*`, `turn_budget.*`,
-/// the memory backend keys, `server.*`, `auth.*`). Open-ended families whose
+/// `server.*`, `auth.*`). Open-ended families whose
 /// suffix is user-chosen are listed as `prefix.*`. Keep this in sync when a
 /// parser learns a key: the /settings coverage test requires each entry to
 /// have a settings row or an explicit exclusion.
@@ -1720,11 +1723,6 @@ pub const FAMILY_CONFIG_KEYS: &[&str] = &[
     "turn_budget.worker.max_context_tokens",
     "turn_budget.worker.max_cost_usd",
     "turn_budget.worker.max_round_renewals",
-    // memory backend (top-level arms of apply_config_content)
-    "memory.backend",
-    "memory.user_scope",
-    "memory.axel.executable",
-    "memory.axel.brain",
     // parse_server_config_key
     "server.auto_approve_confirms",
     // parse_auth_config_key
@@ -2024,7 +2022,8 @@ fn apply_config_content_with(
     family_diagnostic: &mut dyn FnMut(String),
 ) {
     let mut invalid_context_management = false;
-    let mut invalid_memory_backend = false;
+    // The removed memory backend keys: which of their two warnings is due.
+    let (mut removed_axel_backend, mut removed_other_backend) = (false, false);
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2418,43 +2417,12 @@ fn apply_config_content_with(
             "disabled_tools" => {
                 config.disabled_tools = parse_comma_list(val);
             }
-            "memory.backend" => {
-                config.memory_backend.kind = match val {
-                    "legacy" => MemoryBackendKind::Legacy,
-                    "axel" => MemoryBackendKind::Axel,
-                    _ => {
-                        invalid_memory_backend = true;
-                        config.warnings.push(format!(
-                            "memory.backend = {val} — expected legacy or axel; memory backend unavailable"
-                        ));
-                        MemoryBackendKind::Unavailable
-                    }
-                };
-            }
-            "memory.user_scope" => match val {
-                "true" => config.memory_backend.user_scope = true,
-                "false" => config.memory_backend.user_scope = false,
-                _ => {
-                    invalid_memory_backend = true;
-                    config.warnings.push("memory.user_scope — expected true or false; memory backend unavailable".into());
-                }
-            },
-            "memory.axel.executable" | "memory.axel.brain" => {
-                let path = PathBuf::from(val);
-                if !path.is_absolute() {
-                    invalid_memory_backend = true;
-                    config.warnings.push(format!(
-                        "{key} — expected an absolute path; memory backend unavailable"
-                    ));
-                }
-                // Retain invalid paths too: direct config consumers must not
-                // mistake an invalid explicit path for an absent default.
-                if key == "memory.axel.executable" {
-                    config.memory_backend.executable = Some(path);
-                } else {
-                    config.memory_backend.brain = Some(path);
-                }
-            }
+            // The removed memory backend keys. Read, never validated:
+            // whatever the values, the family is reported once, after the
+            // loop, and nothing else changes.
+            "memory.backend" if val != "axel" => removed_other_backend = true,
+            "memory.backend" | "memory.user_scope" | "memory.axel.executable"
+            | "memory.axel.brain" => removed_axel_backend = true,
             _ => {
                 // Handle namespaced keys
                 if key.starts_with("shell.") {
@@ -2595,10 +2563,13 @@ fn apply_config_content_with(
         );
     }
 
-    // Any invalid backend setting poisons this parse pass, regardless of key
-    // order or later duplicate selectors. Never silently route to legacy.
-    if invalid_memory_backend {
-        config.memory_backend.kind = MemoryBackendKind::Unavailable;
+    // One line for the removed memory backend keys, however many there are
+    // and in whatever order: the Axel one when the config selected or
+    // configured Axel, else the one for a bare `memory.backend`.
+    if removed_axel_backend {
+        config.warnings.push(removed_axel_backend_warning());
+    } else if removed_other_backend {
+        config.warnings.push(removed_memory_backend_warning());
     }
 }
 
@@ -3785,11 +3756,9 @@ mod tests {
         for content in [valid, garbage] {
             let config = super::load_config_from_str(content);
             assert_eq!(config.warnings, std::slice::from_ref(&expected), "{:?}", config.warnings);
-            // The family reaches nothing else: the next key still parses and
-            // the storage backend is the one a config without these has.
+            // The family reaches nothing else: the next key still parses.
             assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-6"));
-            assert_eq!(config.memory_backend, plain.memory_backend);
-            assert_eq!(config.memory_backend.kind, super::MemoryBackendKind::Legacy);
+            assert_eq!(config.context_management, plain.context_management);
             // No stderr diagnostic either: the warning is all there is.
             assert_eq!(super::config_content_problems(content), std::slice::from_ref(&expected));
         }
@@ -3810,88 +3779,122 @@ mod tests {
         );
     }
 
-    #[test]
-    fn memory_backend_defaults_are_independent_of_consent() {
-        let config = super::load_config_from_str("");
-        assert_eq!(config.memory_backend, super::MemoryBackendConfig::default());
-        assert_eq!(config.memory_backend.kind, super::MemoryBackendKind::Legacy);
-        let axel = super::load_config_from_str("memory.backend = axel\n");
-        assert_eq!(axel.memory_backend.kind, super::MemoryBackendKind::Axel);
-        assert!(axel.warnings.is_empty());
+    /// The first warning of the removed memory backend keys, as written.
+    fn axel_backend_warning() -> String {
+        let v = crate::AXEL_BACKEND_REMOVED_IN;
+        let expected = format!(
+            "memory.backend = axel is no longer supported: since {v} Synaps keeps context \
+             archives and notes in plain files under its base directory, always, and Axel is an \
+             extension. This session uses plain files. Archives and notes saved to the Axel \
+             brain are not read any more: move them once with \"axel synaps-export\" and \
+             \"synaps memory import-archives\" / \"import-notes\", install the Axel extension \
+             for recall and the forum, then remove the memory.backend, memory.user_scope and \
+             memory.axel.* lines. See docs/upgrading/{v}.md"
+        );
+        assert_eq!(super::removed_axel_backend_warning(), expected);
+        expected
     }
 
+    /// The second: a `memory.backend` line that is not `axel`, alone.
+    fn other_backend_warning() -> String {
+        let expected = format!(
+            "memory.backend is ignored: plain files are the only memory storage since {}. \
+             Remove this line",
+            crate::AXEL_BACKEND_REMOVED_IN
+        );
+        assert_eq!(super::removed_memory_backend_warning(), expected);
+        expected
+    }
+
+    /// T-B1. A config that selected or configured the Axel backend still
+    /// loads: one warning with the exact text, whatever the values, their
+    /// order or how often a key appears, and nothing else is reported or
+    /// changed. What used to make the backend "unavailable" (a relative
+    /// brain, a helper that is not there, a bad `user_scope`) is among them.
     #[test]
-    fn user_wide_notes_require_explicit_valid_opt_in() {
-        let default = super::load_config_from_str("memory.backend = axel\n");
-        assert!(!default.memory_backend.user_scope);
-        let enabled =
-            super::load_config_from_str("memory.backend = axel\nmemory.user_scope = true\n");
-        assert!(enabled.memory_backend.user_scope);
-        for bad in ["yes", "", "1", "TRUE"] {
-            let config = super::load_config_from_str(&format!(
-                "memory.user_scope = {bad}\nmemory.backend = axel\n"
-            ));
-            assert_eq!(
-                config.memory_backend.kind,
-                super::MemoryBackendKind::Unavailable
-            );
+    fn a_config_with_the_axel_backend_keys_loads_with_one_warning() {
+        let expected = axel_backend_warning();
+        for content in [
+            "memory.backend = axel\n",
+            "memory.backend = axel\nmemory.backend = axel\nmemory.backend = axel\n",
+            "memory.backend = axel\nmemory.axel.brain = relative/brain.r8\n",
+            "memory.backend = axel\nmemory.axel.brain = ~/brain\n",
+            "memory.backend = axel\nmemory.axel.executable = /nonexistent/synaps-axel-memory-service\n",
+            "memory.backend = axel\nmemory.axel.executable = \nmemory.axel.brain = \n",
+            "memory.backend = axel\nmemory.user_scope = true\n",
+            "memory.user_scope = yes\nmemory.backend = axel\n",
+            "memory.backend = axel\nmemory.user_scope = true\n\
+             memory.axel.executable = /opt/axel/service\nmemory.axel.brain = /opt/axel/brain.r8\n",
+            // Any of the other three alone, with any value.
+            "memory.user_scope = false\n",
+            "memory.user_scope = \n",
+            "memory.axel.executable = /opt/axel/service\n",
+            "memory.axel.brain = relative\n",
+            "memory.axel.brain = /a\nmemory.axel.brain = /b\nmemory.axel.brain = /c\n",
+            // With another selector beside them, in either order.
+            "memory.backend = legacy\nmemory.axel.brain = /opt/axel/brain.r8\n",
+            "memory.backend = axel\nmemory.backend = legacy\n",
+            "memory.backend = sqlite\nmemory.backend = axel\n",
+        ] {
+            let content = format!("{content}model = claude-sonnet-4-6\n");
+            let config = super::load_config_from_str(&content);
+            assert_eq!(config.warnings, std::slice::from_ref(&expected), "{content}");
+            // No stderr diagnostic either, and the next key still parses.
+            assert_eq!(super::config_content_problems(&content), std::slice::from_ref(&expected));
+            assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-6"), "{content}");
         }
     }
 
+    /// T-B1. `memory.backend` with any other value, and no other backend
+    /// key: the short warning, once. `sqlite`, a typo and an empty value
+    /// are no different from `legacy`.
     #[test]
-    fn memory_backend_invalid_selector_fails_closed() {
+    fn a_config_with_another_memory_backend_loads_with_the_short_warning() {
+        let expected = other_backend_warning();
         for content in [
+            "memory.backend = legacy\n",
+            "memory.backend = sqlite\n",
             "memory.backend = typo\n",
-            "memory.backend = \n",
             "memory.backend = unavailable\n",
-            "memory.backend = axel\nmemory.backend = typo\n",
-            "memory.backend = typo\nmemory.backend = legacy\n",
+            "memory.backend = \n",
+            "memory.backend = AXEL\n",
+            "memory.backend = legacy\nmemory.backend = sqlite\nmemory.backend = legacy\n",
         ] {
             let config = super::load_config_from_str(content);
-            assert_eq!(
-                config.memory_backend.kind,
-                super::MemoryBackendKind::Unavailable
-            );
-            assert!(config
-                .warnings
-                .iter()
-                .any(|w| w.contains("memory backend unavailable")));
+            assert_eq!(config.warnings, std::slice::from_ref(&expected), "{content}");
+            assert_eq!(super::config_content_problems(content), std::slice::from_ref(&expected));
         }
+        // No such line, no warning.
+        assert!(super::load_config_from_str("model = claude-sonnet-4-6\n").warnings.is_empty());
     }
 
+    /// T-B1. The removed families are independent and say nothing about each
+    /// other; `context_management.mode = auto` beside them is on and has no
+    /// warning of its own (it seals to plain files).
     #[test]
-    fn memory_backend_absolute_paths_are_preserved() {
-        let root = std::env::current_dir().unwrap();
-        let executable = root.join("fixture bin/axel");
-        let brain = root.join("fixture brain");
-        let config = super::load_config_from_str(&format!(
-            "memory.axel.brain = {}\nmemory.backend = axel\nmemory.axel.executable = {}\n",
-            brain.display(),
-            executable.display()
-        ));
-        assert_eq!(config.memory_backend.kind, super::MemoryBackendKind::Axel);
-        assert_eq!(config.memory_backend.executable, Some(executable));
-        assert_eq!(config.memory_backend.brain, Some(brain));
-        assert!(config.warnings.is_empty());
-    }
+    fn removed_memory_keys_do_not_touch_context_management_or_each_other() {
+        let content = "memory.backend = axel\n\
+             memory.user_scope = true\n\
+             memory.axel.executable = /nonexistent/service\n\
+             memory.axel.brain = relative/brain.r8\n\
+             memory.default_mode = capture_and_recall\n\
+             memory.gliner = on\n\
+             context_management.mode = auto\n";
+        let config = super::load_config_from_str(content);
+        assert_eq!(
+            config.warnings,
+            [super::removed_automatic_memory_warning(), axel_backend_warning()],
+        );
+        assert_eq!(config.context_management.mode, ContextManagementMode::Auto);
+        let plain = super::load_config_from_str("context_management.mode = auto\n");
+        assert!(plain.warnings.is_empty(), "{:?}", plain.warnings);
+        assert_eq!(config.context_management, plain.context_management);
 
-    #[test]
-    fn memory_backend_relative_or_empty_paths_fail_closed_in_any_order() {
-        for key in ["memory.axel.executable", "memory.axel.brain"] {
-            for path in ["relative/path", "~/brain", ""] {
-                for content in [
-                    format!("memory.backend = axel\n{key} = {path}\n"),
-                    format!("{key} = {path}\nmemory.backend = legacy\n"),
-                ] {
-                    let config = super::load_config_from_str(&content);
-                    assert_eq!(
-                        config.memory_backend.kind,
-                        super::MemoryBackendKind::Unavailable
-                    );
-                    assert!(config.warnings.iter().any(|w| w.contains("absolute path")));
-                }
-            }
-        }
+        let legacy = super::load_config_from_str(
+            "context_management.mode = auto\nmemory.backend = legacy\n",
+        );
+        assert_eq!(legacy.warnings, [other_backend_warning()]);
+        assert_eq!(legacy.context_management, plain.context_management);
     }
 
     use super::*;
@@ -5363,7 +5366,6 @@ api_retries = 5
             "turn_budget.worker.max_cost_usd = cheap",
             "turn_budget.nobody.max_tool_calls = 3",
             "memory.nosuchfield = 1",
-            "memory.user_scope = yes",
             "cache_ttl = forever",
         ] {
             let problems = config_content_problems(bad);
@@ -5375,7 +5377,6 @@ api_retries = 5
             "events.auto_turn = off",
             "events.auto_turn_cap = unlimited",
             "turn_budget.worker.max_cost_usd = 2.5",
-            "memory.user_scope = true",
             "cache_ttl = hybrid",
             "cache_ttl = auto",
         ] {
@@ -5443,9 +5444,6 @@ api_retries = 5
         let sample = |key: &str| -> &'static str {
             match key {
                 "shell.readiness_strategy" => "hybrid",
-                "memory.backend" => "legacy",
-                "memory.user_scope" => "true",
-                "memory.axel.executable" | "memory.axel.brain" => ABSOLUTE_SAMPLE_PATH,
                 "events.auto_turn" => "on",
                 "server.auto_approve_confirms" => "false",
                 "auth.remote_endpoint" | "auth.machine_token" => "x",
@@ -5471,8 +5469,6 @@ api_retries = 5
             assert!(validate_config_edit("cache_ttl", "auto").is_ok());
             assert!(validate_config_edit("cache_ttl", "2h").is_err());
             assert!(validate_config_edit("shell.max_output", "big").is_err());
-            assert!(validate_config_edit("memory.axel.brain", "relative/brain").is_err());
-            assert!(validate_config_edit("memory.axel.brain", ABSOLUTE_SAMPLE_PATH).is_ok());
             assert!(validate_config_edit("model", "a\nb").is_err());
 
             // Cross-key rules see the rest of the file.
@@ -5491,6 +5487,18 @@ api_retries = 5
                     Err(removed_automatic_memory_warning())
                 );
             }
+            for (key, value) in [
+                ("memory.backend", "axel"),
+                ("memory.user_scope", "true"),
+                ("memory.axel.executable", ABSOLUTE_SAMPLE_PATH),
+                ("memory.axel.brain", "relative/brain"),
+            ] {
+                assert_eq!(validate_config_edit(key, value), Err(removed_axel_backend_warning()));
+            }
+            assert_eq!(
+                validate_config_edit("memory.backend", "legacy"),
+                Err(removed_memory_backend_warning())
+            );
 
             // A problem already in the file is not blamed on an unrelated edit.
             std::fs::write(&cfg, "cache_ttl = forever\n").unwrap();

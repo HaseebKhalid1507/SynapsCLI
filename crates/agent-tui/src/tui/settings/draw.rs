@@ -676,7 +676,7 @@ fn u64_config_display(key: &str, default: u64) -> String {
 /// opened on it starts empty, never with this placeholder.
 pub(crate) const NONE_DISPLAY: &str = "(none)";
 /// Shown for an unset key whose default lives elsewhere (role budgets,
-/// identity, Axel paths). A text editor opened on it starts empty.
+/// identity). A text editor opened on it starts empty.
 pub(crate) const DEFAULT_DISPLAY: &str = "(default)";
 
 /// Trimmed, non-empty raw config value.
@@ -881,12 +881,6 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
         // Appearance
         "max_fps" => ranged_config_display(key, 1..=1000, 60),
         "scroll_lines" => ranged_config_display(key, 1..=20, 3),
-        // Memory
-        "memory.backend" => checked_config_display(key, |v| v == "axel", "legacy"),
-        "memory.user_scope" => checked_config_display(key, |v| v == "true", "false"),
-        "memory.axel.executable" | "memory.axel.brain" => {
-            raw_config(key).unwrap_or_else(|| DEFAULT_DISPLAY.to_string())
-        }
         _ => return None,
     };
     Some(v)

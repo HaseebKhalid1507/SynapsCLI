@@ -577,21 +577,12 @@ impl Tool for DeferredExtensionTool {
     async fn execute(&self, params: Value, ctx: ToolContext) -> crate::Result<String> {
         // Runs strictly AFTER the ExecutionGate authorized this exact call.
         // Who calls: the author of the binding the context came with.
-        // No binding, no caller: the
-        // stand-in made below is the process's, not a run's.
+        // No binding, no caller.
         let caller = ctx
             .capabilities
             .memory_backend
             .as_ref()
-            .map(|binding| binding.forum_author().clone());
-        let binding = ctx
-            .capabilities
-            .memory_backend
-            .clone()
-            .unwrap_or_else(crate::memory_backend::MemoryBinding::configured_current);
-        if binding.exclusive() && crate::memory_backend::competing_memory_tool(self) {
-            return Err(crate::RuntimeError::Tool("independent extension memory is disabled by the selected host backend; use short memory tools".into()));
-        }
+            .map(|binding| binding.author().clone());
         // Without the typed session lease capability, a deferred extension
         // tool NEVER starts a process.
         let Some(leases) = ctx.capabilities.extension_leases.clone() else {
@@ -969,17 +960,11 @@ mod tests {
         );
     }
 
-    // ── an exclusive memory binding refuses aliased memory tools ────────
+    // ── a deferred tool named like a memory tool is not refused for it ──
 
-    const MEMORY_REFUSAL: &str = "independent extension memory is disabled by the selected host backend; use short memory tools";
-
-    async fn call_deferred(
-        plugin: &str,
-        operation: &str,
-        kind: agent_core::config::MemoryBackendKind,
-    ) -> String {
+    async fn call_deferred(plugin: &str, operation: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
-        let binding = crate::tools::test_helpers::memory_binding(kind, dir.path());
+        let binding = crate::tools::test_helpers::memory_binding(dir.path());
         let tool = DeferredExtensionTool::new(plugin, &declared_tool(operation));
         match tool
             .execute(json!({}), crate::tools::test_helpers::context_with_memory(binding))
@@ -990,32 +975,10 @@ mod tests {
         }
     }
 
-    /// Regression: `memory:search` is offered as `memory_search`, yet only
-    /// its operation `search` was checked.
-    #[tokio::test]
-    async fn an_exclusive_binding_refuses_deferred_extension_memory_aliases() {
-        use agent_core::config::MemoryBackendKind::Axel;
-        for (plugin, operation) in [
-            ("memory", "search"),
-            ("memory", "fetch"),
-            ("Memory", "Search"),
-            ("plug", "memory.store"),
-            ("plug", "MEMORY_STORE"),
-            ("axel-memory-manager", "memory_search"),
-            ("axel-memory-manager", "memory_forget"),
-        ] {
-            assert_eq!(
-                call_deferred(plugin, operation, Axel).await,
-                MEMORY_REFUSAL,
-                "{plugin}:{operation}"
-            );
-        }
-    }
-
     /// The suffixed wire name the model sees beside the host's own tool
-    /// reaches the deferred alias, which refuses.
+    /// reaches the deferred alias, which goes on to the lease check.
     #[tokio::test]
-    async fn the_suffixed_wire_name_of_a_deferred_alias_is_refused() {
+    async fn the_suffixed_wire_name_of_a_deferred_alias_reaches_the_lease_check() {
         let dir = tempfile::tempdir().unwrap();
         let registry = crate::tools::ToolRegistry::from_tools_for_tests(vec![
             Arc::new(crate::tools::memory::MemorySearchTool),
@@ -1026,23 +989,21 @@ mod tests {
         let alias = registry
             .get(registry.runtime_name_for_api("memory_search_2"))
             .expect("alias registered");
-        let binding = crate::tools::test_helpers::memory_binding(
-            agent_core::config::MemoryBackendKind::Axel,
-            dir.path(),
-        );
+        let binding = crate::tools::test_helpers::memory_binding(dir.path());
         match alias
             .execute(json!({}), crate::tools::test_helpers::context_with_memory(binding))
             .await
         {
-            Err(crate::RuntimeError::Tool(message)) => assert_eq!(message, MEMORY_REFUSAL),
-            other => panic!("expected the memory refusal, got {other:?}"),
+            Err(crate::RuntimeError::Tool(message)) => {
+                assert!(message.contains("is activation-deferred"), "{message}")
+            }
+            other => panic!("expected the lease refusal, got {other:?}"),
         }
     }
 
     /// A nested `:` (`plug:memory:fetch`) cannot reach a deferred tool: the
     /// manifest refuses `:` in declared tool names, and a plugin id with `:`
-    /// gets no deferred tools. The classifier still covers it for other
-    /// routes (`memory_backend::competing`).
+    /// gets no deferred tools.
     #[test]
     fn a_nested_colon_name_never_becomes_a_deferred_tool() {
         assert_eq!(
@@ -1061,18 +1022,23 @@ mod tests {
         assert!(dormant_extension_tools("plug:memory", &manifest).is_empty());
     }
 
-    /// Other tools, and every tool without an exclusive binding, go on to
-    /// the lease check exactly as before (no lease here, so nothing starts).
+    /// T-B7. Every deferred tool, a memory tool's name or alias included,
+    /// goes on to the lease check (no lease here, so nothing starts): the
+    /// guard that refused such names beside an exclusive backend is gone.
     #[tokio::test]
-    async fn other_deferred_tools_and_legacy_bindings_reach_the_lease_check() {
-        use agent_core::config::MemoryBackendKind::{Axel, Legacy};
-        for (plugin, operation, kind) in [
-            ("weather", "search", Axel),
-            ("memory", "summarize", Axel),
-            ("memory", "search", Legacy),
-            ("axel-memory-manager", "memory_search", Legacy),
+    async fn deferred_tools_named_like_memory_tools_reach_the_lease_check() {
+        for (plugin, operation) in [
+            ("weather", "search"),
+            ("memory", "summarize"),
+            ("memory", "search"),
+            ("memory", "fetch"),
+            ("Memory", "Search"),
+            ("plug", "memory.store"),
+            ("plug", "MEMORY_STORE"),
+            ("axel-memory-manager", "memory_search"),
+            ("axel-memory-manager", "memory_forget"),
         ] {
-            let message = call_deferred(plugin, operation, kind).await;
+            let message = call_deferred(plugin, operation).await;
             assert!(
                 message.contains("is activation-deferred"),
                 "{plugin}:{operation}: {message}"

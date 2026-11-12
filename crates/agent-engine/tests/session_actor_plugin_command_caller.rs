@@ -91,7 +91,7 @@ impl Tool for Noting {
             .capabilities
             .memory_backend
             .as_ref()
-            .map(|binding| binding.forum_author().clone());
+            .map(|binding| binding.author().clone());
         self.0.execute(params, ctx).await
     }
 }

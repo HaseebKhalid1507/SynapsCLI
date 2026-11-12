@@ -482,7 +482,7 @@ impl HookEvent {
 
     /// Construct an `on_memory_forgotten` event: `memory_forget` forgot the
     /// archive or note `id` in project `project_key`. `kind` is `"archive"`
-    /// or `"note"`, `scope` is `"repository"` or `"user"`. `session_id` is
+    /// or `"note"`, `scope` is `"repository"` (the tool has no other). `session_id` is
     /// the chat whose tool call it was (`None`: no chat behind the call). An
     /// archive's `id` is the bare id, as in `on_context_archived`, without
     /// the model-facing `ctx-` prefix.

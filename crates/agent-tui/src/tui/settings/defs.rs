@@ -693,23 +693,6 @@ define_settings! {
         "Lines scrolled per mouse-wheel event (1–20, default 3). Takes effect next launch.",
         |_app, value| whole_number("scroll_lines", value);
 
-    // ── Memory ───────────────────────────────────────────────────────────
-
-    "memory.backend", "Memory backend", Memory, EditorKind::Cycler(&["legacy", "axel"]),
-        "Note storage: legacy (default) or axel (needs the Axel executable below). Selecting a backend never enables capture or recall. Restart required.",
-        |_app, value| config_edit("memory.backend", value);
-
-    "memory.user_scope", "User-wide notes", Memory, EditorKind::Cycler(&["true", "false"]),
-        "Allow user-wide notes in addition to project notes (default false). Never grants capture or history consent. Restart required.",
-        |_app, value| config_edit("memory.user_scope", value);
-
-    "memory.axel.executable", "Axel executable", Memory, EditorKind::Text { numeric: false },
-        "Absolute path to the Axel memory service executable (never looked up on PATH). Restart required.",
-        |_app, value| config_edit("memory.axel.executable", value);
-
-    "memory.axel.brain", "Axel brain", Memory, EditorKind::Text { numeric: false },
-        "Absolute path to a shared Axel brain file (unset = the private per-user default). Restart required.",
-        |_app, value| config_edit("memory.axel.brain", value);
 }
 
 #[cfg(test)]
@@ -1286,11 +1269,6 @@ mod tests {
             assert!(is_ok(d("max_fps", "144")));
             assert!(is_err(d("max_fps", "0")));
             assert!(is_err(d("scroll_lines", "21")));
-            let absolute = if cfg!(windows) { r"C:\srv\axel\brain.r8" } else { "/srv/axel/brain.r8" };
-            assert!(is_ok(d("memory.axel.brain", absolute)));
-            assert!(is_err(d("memory.axel.brain", "brain.r8")));
-            assert!(is_err(d("memory.user_scope", "yes")));
-            assert!(is_err(d("memory.backend", "sqlite")));
         }
 
         // Cross-key rules see the rest of the file.

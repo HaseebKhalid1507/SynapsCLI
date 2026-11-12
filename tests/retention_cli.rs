@@ -112,146 +112,153 @@ fn the_removed_migration_actions_are_unknown_to_retention() {
     }
 }
 
-/// `synaps retention export` with `memory.backend = axel`, against a real
-/// helper named by `SYNAPS_AXEL_TEST_BIN` (synthetic temp state only).
-mod axel_export {
-    use serde_json::Value;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+/// A config that still selects the removed Axel backend, all four keys
+/// active. The helper and the brain it names do not exist.
+fn old_axel_config(tmp: &Path) -> String {
+    format!(
+        "memory.backend = axel\nmemory.user_scope = true\nmemory.axel.executable = {}\n\
+         memory.axel.brain = {}\ncontext_management.mode = auto\n",
+        tmp.join("no-such-helper").display(),
+        tmp.join("brain.r8").display(),
+    )
+}
 
-    struct Fixture {
-        tmp: tempfile::TempDir,
-        main: PathBuf,
-        base: PathBuf,
-    }
-    impl Fixture {
-        fn new() -> Self {
-            let tmp = tempfile::tempdir().unwrap();
-            let main = tmp.path().join("repository");
-            let worktree = tmp.path().join("registered-worktree");
-            let base = tmp.path().join("synthetic-base");
-            fs::create_dir(&main).unwrap();
-            fs::create_dir(&base).unwrap();
-            fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
-            let fixture = Self { tmp, main, base };
-            fixture.git(&["init", "-q"]);
-            fixture.git(&[
-                "-c",
-                "user.name=Synthetic",
-                "-c",
-                "user.email=synthetic@example.invalid",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "synthetic",
-            ]);
-            fixture.git(&[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "synthetic-worktree",
-                worktree.to_str().unwrap(),
-            ]);
-            fixture
+/// Ruling 4, T-B8. With that config `synaps retention inspect | sweep |
+/// export | forget` do what they do with no config: they act on the plain
+/// files, print the same reports and never fail for the config. Before B-7
+/// each of them asked the helper, and failed without it.
+#[test]
+fn retention_acts_on_plain_files_under_a_config_that_still_selects_axel() {
+    let seeded = || {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, project) = (tmp.path().join("base"), tmp.path().join("project"));
+        for dir in [base.join("sessions"), tmp.path().join("home"), project.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
         }
-        fn git(&self, args: &[&str]) {
-            let output = Command::new("/usr/bin/git")
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("HOME", self.tmp.path())
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .arg("-c")
-                .arg("core.hooksPath=/dev/null")
-                .arg("-C")
-                .arg(&self.main)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        }
-        fn brain(&self) -> PathBuf {
-            self.base.join("shared.r8")
-        }
-        fn run(&self, cwd: &Path, args: &[&str]) -> Output {
-            Command::new(env!("CARGO_BIN_EXE_synaps"))
-                .current_dir(cwd)
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("HOME", self.tmp.path())
-                .env("SYNAPS_BASE_DIR", &self.base)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("XDG_CONFIG_HOME", self.tmp.path().join("xdg"))
-                .env("XDG_CACHE_HOME", self.tmp.path().join("cache"))
-                .arg("retention")
-                .args(args)
-                .output()
-                .unwrap()
-        }
-    }
+        session(&base.join("sessions"), "old-session", "2020-01-01T00:00:00Z");
+        session(&base.join("sessions"), "kept-session", &chrono::Utc::now().to_rfc3339());
+        tmp
+    };
+    let report = |tmp: &Path, args: &[&str]| -> Value {
+        let run = synaps(tmp, args);
+        assert!(run.status.success(), "{args:?}: {}", String::from_utf8_lossy(&run.stderr));
+        serde_json::from_slice(&run.stdout).unwrap()
+    };
 
-    fn real_executable() -> PathBuf {
-        PathBuf::from(
-            std::env::var_os("SYNAPS_AXEL_TEST_BIN").expect("explicit synthetic service binary"),
-        )
-    }
+    let old = seeded();
+    let config = old_axel_config(old.path());
+    std::fs::write(old.path().join("base/config"), &config).unwrap();
+    let plain = seeded();
 
-    fn select(f: &Fixture, exe: &Path, brain: &Path) {
-        fs::write(
-            f.base.join("config"),
-            format!(
-                "memory.backend = axel\nmemory.axel.executable = {}\nmemory.axel.brain = {}\n",
-                exe.display(),
-                brain.display()
-            ),
+    // A note in each base, forgotten below by its plain-file id.
+    let note_in = |tmp: &Path| {
+        let scope = ProjectScope::for_root(&tmp.join("project")).unwrap();
+        let note = store_record_in(
+            &tmp.join("base"),
+            &scope,
+            NewMemoryRecord {
+                content: "a saved note".into(),
+                tags: vec![],
+                provenance: MemoryProvenance { source: "user".into(), session: None },
+                sensitivity: MemorySensitivity::Normal,
+                retention: MemoryRetention::Standard,
+            },
         )
         .unwrap();
-        fs::set_permissions(f.base.join("config"), fs::Permissions::from_mode(0o600)).unwrap();
-    }
+        (project_notes_file(&tmp.join("base"), scope.key()), format!("{}:{}", scope.namespace(), note.id.unwrap()))
+    };
 
-    fn checked_backup(f: &Fixture, dest: &Path, expected: usize) -> Value {
-        use sha2::{Digest, Sha256};
-        let out = f.run(&f.main, &["export", dest.to_str().unwrap()]);
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert!(!String::from_utf8_lossy(&out.stdout).contains("synthetic-private"));
-        let index: Value =
-            serde_json::from_slice(&fs::read(dest.join("axel-memory-index.json")).unwrap())
-                .unwrap();
-        assert_eq!(index["complete"], true);
-        assert_eq!(index["files"].as_array().unwrap().len(), expected);
-        for file in index["files"].as_array().unwrap() {
-            let path = dest.join(file["file"].as_str().unwrap());
-            let bytes = fs::read(&path).unwrap();
-            assert_eq!(file["sha256"], format!("{:x}", Sha256::digest(&bytes)));
-            assert_eq!(file["bytes"], bytes.len());
-            let inventory: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(inventory["source_project"], file["project"]);
-            assert_eq!(inventory["target_project"], file["project"]);
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    let mut reports = Vec::new();
+    for tmp in [old.path(), plain.path()] {
+        let (notes, note_id) = note_in(tmp);
+        let inspect = report(tmp, &["retention", "inspect"]);
+        assert!(inspect["domains"].is_array(), "{inspect}");
+        let dest = tmp.join("export");
+        let export = report(tmp, &["retention", "export", dest.to_str().unwrap()]);
+        assert!(export["files"].as_u64().unwrap() >= 3, "two sessions and the notes: {export}");
+        // The plain-file export, not the helper's: no Axel index.
+        assert!(!dest.join("axel-memory-index.json").exists());
+        let sweep = report(tmp, &["retention", "sweep", "--max-age-days", "30"]);
+        assert_eq!(sweep["deleted_files"], 1, "{sweep}");
+        assert!(!tmp.join("base/sessions/old-session.json").exists());
+        assert!(tmp.join("base/sessions/kept-session.json").exists());
+        let before = std::fs::read(&notes).unwrap();
+        let forget = report(tmp, &["retention", "forget", "memory", &note_id]);
+        assert_eq!(forget, json!({"domain": "memory", "forgotten": true}));
+        assert_ne!(std::fs::read(&notes).unwrap(), before, "the notes file was rewritten");
+        // `history` was the Axel backend's domain; it is unknown now.
+        let history = synaps(tmp, &["retention", "forget", "history", "ctx-0"]);
+        assert!(!history.status.success());
+        assert!(String::from_utf8_lossy(&history.stderr).contains("unknown domain"));
+        // No report names a backend.
+        for value in [&inspect, &export, &sweep] {
+            assert!(value.get("backend").is_none() && value.get("omitted_domains").is_none(), "{value}");
         }
-        assert_eq!(fs::metadata(dest).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(
-            fs::metadata(dest.join("axel-memory-index.json")).unwrap().permissions().mode()
-                & 0o777,
-            0o600
-        );
-        assert!(!f.run(&f.main, &["export", dest.to_str().unwrap()]).status.success());
-        index
+        let domains: Vec<Value> = inspect["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|domain| json!([domain["domain"], domain["files"]]))
+            .collect();
+        reports.push((domains, export["files"].clone(), sweep["deleted_files"].clone()));
     }
+    // The same with the old config as with none.
+    assert_eq!(reports[0], reports[1]);
+    // The config is as it was, and nothing of Axel's was made.
+    assert_eq!(std::fs::read_to_string(old.path().join("base/config")).unwrap(), config);
+    assert!(!old.path().join("brain.r8").exists());
+    assert!(!old.path().join("no-such-helper").exists());
+}
 
-    #[test]
-    #[ignore = "requires explicitly selected service binary; synthetic temp state only"]
-    fn real_cli_single_member_backup_keeps_compatible_filename() {
-        let f = Fixture::new();
-        let exe = real_executable();
-        select(&f, &exe, &f.brain());
-        let dest = f.tmp.path().join("single-backup");
-        let index = checked_backup(&f, &dest, 1);
-        assert_eq!(index["files"][0]["file"], "axel-memory.json");
+/// Ruling 4. A headless host (`synaps rpc`) under that config starts,
+/// says the one warning once on stderr, and stops cleanly.
+#[test]
+fn a_headless_host_starts_under_a_config_that_still_selects_axel() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    for dir in [base.clone(), tmp.path().join("home")] {
+        std::fs::create_dir_all(dir).unwrap();
     }
+    std::fs::write(base.join("config"), old_axel_config(tmp.path())).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_synaps"))
+        .arg("rpc")
+        .current_dir(tmp.path())
+        .env("SYNAPS_BASE_DIR", &base)
+        .env("HOME", tmp.path().join("home"))
+        .env("SYNAPS_DAEMON_AUTOSPAWN", "0")
+        .env_remove("SYNAPS_PROFILE")
+        .env_remove("SYNAPS_PROJECT_ROOT")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{\"type\":\"shutdown\"}\n").unwrap();
+    let run = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    let warnings: Vec<&str> =
+        stderr.lines().filter(|line| line.starts_with("synaps: config warning: ")).collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    let version = agent_core::AXEL_BACKEND_REMOVED_IN;
+    assert_eq!(
+        warnings[0],
+        format!(
+            "synaps: config warning: memory.backend = axel is no longer supported: since \
+             {version} Synaps keeps context archives and notes in plain files under its base \
+             directory, always, and Axel is an extension. This session uses plain files. \
+             Archives and notes saved to the Axel brain are not read any more: move them once \
+             with \"axel synaps-export\" and \"synaps memory import-archives\" / \"import-notes\", \
+             install the Axel extension for recall and the forum, then remove the \
+             memory.backend, memory.user_scope and memory.axel.* lines. See \
+             docs/upgrading/{version}.md"
+        )
+    );
+    assert!(!stderr.contains("unavailable"), "{stderr}");
+    assert!(!tmp.path().join("brain.r8").exists());
 }

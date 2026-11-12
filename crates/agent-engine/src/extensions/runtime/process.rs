@@ -597,7 +597,6 @@ struct Inbox {
     inbound_stdin: Mutex<Option<Arc<Mutex<ChildStdin>>>>,
     /// Extension id, used for namespace policy and diagnostics.
     extension_id: String,
-    exclusive_memory: bool,
 }
 
 impl Inbox {
@@ -611,8 +610,6 @@ impl Inbox {
             next_generation: AtomicU64::new(2),
             permissions: RwLock::new(None),
             inbound_stdin: Mutex::new(None),
-            exclusive_memory: crate::memory_backend::MemoryBinding::configured_current()
-                .exclusive(),
             extension_id,
         }
     }
@@ -776,25 +773,7 @@ impl ProcessExtension {
         args: &[String],
         cwd: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let exclusive = crate::memory_backend::MemoryBinding::configured_current().exclusive();
-        Self::spawn_with_memory_policy(id, command, args, cwd, exclusive).await
-    }
-
-    pub(crate) async fn spawn_with_memory_policy(
-        id: &str,
-        command: &str,
-        args: &[String],
-        cwd: Option<PathBuf>,
-        exclusive: bool,
-    ) -> Result<Self, String> {
-        if exclusive && id == "axel-memory-manager" {
-            return Err(
-                "independent Axel plugin is disabled by the host-selected memory backend".into(),
-            );
-        }
-        let mut inbox = Inbox::new(id.to_string());
-        inbox.exclusive_memory = exclusive;
-        let inbox = Arc::new(inbox);
+        let inbox = Arc::new(Inbox::new(id.to_string()));
         let state = Self::spawn_state(id, command, args, cwd.as_ref(), inbox.clone()).await?;
         Ok(Self {
             id: id.to_string(),
@@ -1271,13 +1250,6 @@ impl ProcessExtension {
     ) -> Result<Value, (i32, String)> {
         use crate::extensions::permissions::Permission;
         use crate::memory::store::{self, MemoryQuery};
-
-        if inbox.exclusive_memory && matches!(method, "memory.append" | "memory.query") {
-            return Err((
-                -32000,
-                "legacy extension memory is disabled by the host-selected backend".into(),
-            ));
-        }
 
         match method {
             "memory.append" => {
@@ -2624,26 +2596,6 @@ impl ExtensionHandler for ProcessExtension {
             }
         } else {
             ExtensionHealth::Running
-        }
-    }
-}
-
-#[cfg(test)]
-mod exclusive_memory_tests {
-    use super::*;
-    #[tokio::test]
-    async fn exclusive_inbox_refuses_legacy_memory_without_writes() {
-        let mut inbox = Inbox::new("fixture".into());
-        inbox.exclusive_memory = true;
-        let inbox = Arc::new(inbox);
-        for method in ["memory.append", "memory.query"] {
-            let result = ProcessExtension::handle_inbound_request(
-                &inbox,
-                method,
-                serde_json::json!({"namespace":"fixture","content":"must not persist"}),
-            )
-            .await;
-            assert!(result.unwrap_err().1.contains("disabled"));
         }
     }
 }

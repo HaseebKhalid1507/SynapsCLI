@@ -304,9 +304,6 @@ pub fn compute_extension_load_hint(
     plugin_dir: &std::path::Path,
     declared_setup: Option<&str>,
 ) -> String {
-    if error == "independent Axel plugin is disabled by the host-selected memory backend" {
-        return "Expected: integrated Axel owns memory. Disable axel-memory-manager in this configuration to skip its load; do not reinstall it or delete its data.".into();
-    }
     let missing_binary =
         error.contains("No such file or directory") || error.contains("os error 2");
     match (missing_binary, declared_setup) {
@@ -340,7 +337,6 @@ pub enum DiscoveryState {
 pub struct ExtensionManager {
     /// Once-per-process discovery record; see [`DiscoveryState`].
     discovery: DiscoveryState,
-    exclusive_memory: bool,
     /// The shared hook bus.
     hook_bus: Arc<HookBus>,
     /// Optional shared tool registry for extension-provided tools.
@@ -410,8 +406,6 @@ pub(crate) type SharedDeferredRecords =
 /// acquisition stays inside the manager/lease lifecycle API.
 #[derive(Clone)]
 pub(crate) struct DeferredExtensionRecord {
-    #[allow(dead_code)] // merge(112): read by lease lifecycle (phase 6+)
-    pub(crate) exclusive_memory: bool,
     pub(crate) manifest: ExtensionManifest,
     pub(crate) cwd: Option<std::path::PathBuf>,
     pub(crate) config: Value,
@@ -422,9 +416,6 @@ impl ExtensionManager {
     pub fn new(hook_bus: Arc<HookBus>) -> Self {
         Self {
             discovery: DiscoveryState::NotStarted,
-            // TODO(session-identity T1/§4): per-PROCESS binding is acceptable for now
-            exclusive_memory: crate::memory_backend::MemoryBinding::configured_current()
-                .exclusive(),
             hook_bus,
             tools: None,
             providers: ProviderRegistry::new(),
@@ -449,9 +440,6 @@ impl ExtensionManager {
     ) -> Self {
         Self {
             discovery: DiscoveryState::NotStarted,
-            // TODO(session-identity T1/§4): per-PROCESS binding is acceptable for now
-            exclusive_memory: crate::memory_backend::MemoryBinding::configured_current()
-                .exclusive(),
             hook_bus,
             tools: Some(tools),
             providers: ProviderRegistry::new(),
@@ -467,11 +455,6 @@ impl ExtensionManager {
             extension_runtime: std::sync::OnceLock::new(),
             host_project_root: std::sync::OnceLock::new(),
         }
-    }
-
-    /// Set once at host boot, before any extension can spawn.
-    pub fn bind_memory_backend(&mut self, exclusive: bool) {
-        self.exclusive_memory = exclusive;
     }
 
     /// Load and start an extension from its manifest.
@@ -715,7 +698,6 @@ impl ExtensionManager {
                 .insert(
                     id.to_string(),
                     DeferredExtensionRecord {
-                        exclusive_memory: self.exclusive_memory,
                         manifest: manifest.clone(),
                         cwd,
                         config: config.clone(),
@@ -825,14 +807,9 @@ impl ExtensionManager {
         }
 
         // Spawn the extension process only after the manifest is known-good.
-        let process = ProcessExtension::spawn_with_memory_policy(
-            id,
-            &manifest.command,
-            &manifest.args,
-            cwd.clone(),
-            self.exclusive_memory,
-        )
-        .await?;
+        let process =
+            ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd.clone())
+                .await?;
         // Publish permissions to the inbound-request dispatcher so memory.*
         // calls during initialize can be authorized correctly.
         process.set_permissions(permissions.clone()).await;
@@ -2937,17 +2914,6 @@ mod tests {
             Some("setup.sh"),
         );
         assert!(hint.contains("Extension binary missing"), "got {hint}");
-    }
-
-    #[test]
-    fn hint_exclusive_axel_is_expected_not_missing_binary() {
-        let hint = compute_extension_load_hint(
-            "independent Axel plugin is disabled by the host-selected memory backend",
-            std::path::Path::new("/synthetic/plugin"),
-            None,
-        );
-        assert!(hint.contains("Expected: integrated Axel"));
-        assert!(!hint.contains("contract.json"));
     }
 
     // ── bugfix: installed-plugin backup discovery ───────────────────────────

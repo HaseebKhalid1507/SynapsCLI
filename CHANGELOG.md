@@ -327,6 +327,58 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **The memory backend switch.** Notes and context archives are plain files
+  under the base directory, always; there is no backend to select and no
+  helper process. `memory.backend`, `memory.user_scope`,
+  `memory.axel.executable` and `memory.axel.brain` are removed keys: a
+  config that still has them loads and starts as before (daemon, TUI and
+  every `synaps` subcommand), nothing about them is validated, and nothing
+  can fail because of them. `memory.backend = axel`, or any of the other
+  three with any value, gets one warning per start: `memory.backend = axel
+  is no longer supported: since 0.12.0 Synaps keeps context archives and
+  notes in plain files under its base directory, always, and Axel is an
+  extension. This session uses plain files. Archives and notes saved to the
+  Axel brain are not read any more: move them once with "axel
+  synaps-export" and "synaps memory import-archives" / "import-notes",
+  install the Axel extension for recall and the forum, then remove the
+  memory.backend, memory.user_scope and memory.axel.* lines. See
+  docs/upgrading/0.12.0.md`. A `memory.backend` line with any other value,
+  alone, gets `memory.backend is ignored: plain files are the only memory
+  storage since 0.12.0. Remove this line`. `/settings` loses the four rows
+  and its Memory page, and refuses to write one of these keys.
+  What can no longer happen: a turn refused with "selected memory backend
+  unavailable", `/context auto` refused for the backend, a chat that will
+  not continue because the Axel service could not verify its archive.
+  A resumed chat whose archive is not in its folder's store goes on at
+  window 1, and `/context status` says so: `archive ctx-<id>, which this
+  chat continues from, is not in this folder's archive store, so earlier
+  windows cannot be fetched. If you opened the chat from another folder
+  than before, open it from that one.`
+  `memory_search`, `memory_fetch`, `memory_store` and `memory_forget` have
+  no `scope` parameter any more (`docs/tools.json`). `scope: "repository"`
+  is still accepted and ignored; any other value is refused with `memory:
+  user-wide notes are not available; omit scope`. `project` is unchanged.
+  **User-wide notes (`scope=user`) have no home in Synaps now**; the ones
+  in an Axel brain stay there. `on_memory_forgotten` always has `scope:
+  "repository"`.
+  The guard that refused extension and MCP tools named like the memory
+  tools (`memory_search`, `memory:search`, ...) under the Axel backend is
+  gone: such a tool runs like any other. The extension protocol's
+  `memory.append` and `memory.query` are never refused for the backend, and
+  a plugin named `axel-memory-manager` loads like any other.
+  `synaps retention inspect | sweep | export | forget` act on the plain
+  files only: the `history` domain of `forget` and the Axel reports
+  (`"backend": "axel"`, `axel-memory-index.json`) are gone.
+  Code: `memory_backend::{process, provisioning, competing}`, the `Backend`
+  enum and the RPC half of `MemoryBinding` (now the base directory, the
+  project and the run's author; `forum_author()` is `author()`,
+  `fork_for_worker()` is `for_worker()`), `MemoryBackendKind`,
+  `MemoryBackendConfig`, `context_archive::project_archive`,
+  `Runtime::apply_memory_backend_config` (now `bind_memory()`),
+  `ExtensionManager::bind_memory_backend`. The helper under
+  `sidecars/axel-memory-service` is not built or started by anything and is
+  removed separately. `docs/reviews/context-resume-axel-boundary.md` is
+  removed.
 - **The built-in project forum.** The tools `forum_post`, `forum_read` and
   `forum_forget` are gone from the registry, from workers and from
   `docs/tools.json` (26 built-in tools now), with the code behind them

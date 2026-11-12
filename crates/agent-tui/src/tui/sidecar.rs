@@ -875,10 +875,9 @@ for line in sys.stdin:
         }
 
         fn manager() -> ExtensionManager {
-            let mut manager = synaps_cli::extensions::manager::ExtensionManager::new(Arc::new(
+            let manager = synaps_cli::extensions::manager::ExtensionManager::new(Arc::new(
                 synaps_cli::extensions::hooks::HookBus::new(),
             ));
-            manager.bind_memory_backend(false);
             Arc::new(tokio::sync::RwLock::new(manager))
         }
 

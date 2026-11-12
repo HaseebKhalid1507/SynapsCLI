@@ -183,15 +183,21 @@ pub(crate) fn apply_subagent_runtime_policy(
     // process-wide broker (`spawn_runtime`); only the legacy fresh-runtime
     // path re-applies auth config there. (#158 A3 → engine-host B2)
 
-    // Parent runtime capability wins over reloaded global config. The common
-    // inherit path forks execution authorship, not authority: never copy
-    // session recall/capture leases or expand the worker tool registry.
-    runtime.inherit_memory_backend(memory_backend.cloned().unwrap_or_else(|| {
-        crate::memory_backend::MemoryBinding::from_config_with_cwd(
-            &config.memory_backend,
-            workspace.cwd.clone().or_else(|| std::env::current_dir().ok()),
-        )
-    }));
+    // The parent's binding, else one for the worker's folder: a worker acts
+    // on its parent's project, wherever its own folder is. The common
+    // inherit path forks execution authorship, not authority: it never
+    // expands the worker tool registry.
+    let fallback;
+    let binding = match memory_backend {
+        Some(binding) => binding,
+        None => {
+            fallback = crate::memory_backend::MemoryBinding::for_cwd(
+                workspace.cwd.clone().or_else(|| std::env::current_dir().ok()),
+            );
+            &fallback
+        }
+    };
+    runtime.inherit_memory_binding(binding);
 
     runtime.set_codex_request_role(crate::runtime::openai::catalog::CodexRequestRole::Worker);
 
@@ -1348,13 +1354,13 @@ mod codex_ultra_worker_tests {
 }
 
 #[cfg(test)]
-mod forum_worker_tests {
+mod worker_author_tests {
     use super::{apply_subagent_runtime_policy, subagent_tools};
     #[test]
     fn common_worker_policy_forks_author_without_mutating_parent() {
         let parent = crate::Runtime::new_headless();
         let binding = parent.memory_backend_for_test();
-        let author = binding.forum_author().clone();
+        let author = binding.author().clone();
         let mut actors = std::collections::HashSet::new();
         for _ in 0..3 {
             let mut worker = crate::Runtime::new_headless();
@@ -1367,19 +1373,19 @@ mod forum_worker_tests {
                 &Default::default(),
             );
             let inherited = worker.memory_backend_for_test();
-            assert_eq!(inherited.forum_author().group, author.group);
+            assert_eq!(inherited.author().group, author.group);
             assert_eq!(
-                inherited.forum_author().parent.as_deref(),
+                inherited.author().parent.as_deref(),
                 Some(author.actor.as_str())
             );
-            assert_ne!(inherited.forum_author().actor, author.actor);
-            assert!(actors.insert(inherited.forum_author().actor.clone()));
+            assert_ne!(inherited.author().actor, author.actor);
+            assert!(actors.insert(inherited.author().actor.clone()));
             assert_eq!(
-                worker.clone().memory_backend_for_test().forum_author(),
-                inherited.forum_author()
+                worker.clone().memory_backend_for_test().author(),
+                inherited.author()
             );
         }
-        assert_eq!(parent.memory_backend_for_test().forum_author(), &author);
+        assert_eq!(parent.memory_backend_for_test().author(), &author);
     }
 
     // FINDING: all_launch_paths_use_common_author_registry_and_prompt_wiring
@@ -1427,10 +1433,31 @@ mod forum_worker_tests {
         assert!(names.contains(&"read"));
     }
 
+    /// A worker acts on its parent's project, wherever its own folder is,
+    /// and a later `apply_config` on it does not rebind it to that folder.
+    /// With no parent binding it is bound to its own folder's project.
     #[tokio::test]
-    async fn memory_backend_worker_inheritance_has_no_legacy_extension_fallback() {
-        let parent = crate::Runtime::new_headless();
-        let parent_binding = parent.memory_backend_for_test();
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_worker_inherits_its_parents_project_not_its_own_folders() {
+        use crate::memory_backend::MemoryBinding;
+        use crate::tools::Tool;
+        let base = crate::test_env::BaseDirGuard::new();
+        let _root = crate::test_env::EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        let project = || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".synaps-project"), "").unwrap();
+            dir
+        };
+        let (parents, workers) = (project(), project());
+        let parent_binding = MemoryBinding::for_cwd(Some(parents.path().to_path_buf()));
+        let key = |binding: &MemoryBinding| binding.scope().unwrap().key().to_owned();
+        let workspace = super::WorkerWorkspace {
+            cwd: Some(workers.path().to_path_buf()),
+            ..Default::default()
+        };
+        let own = key(&MemoryBinding::for_cwd(workspace.cwd.clone()));
+        assert_ne!(key(&parent_binding), own);
+
         let mut worker = crate::Runtime::new_headless();
         apply_subagent_runtime_policy(
             &mut worker,
@@ -1438,12 +1465,46 @@ mod forum_worker_tests {
             Some(&parent_binding),
             None,
             None,
-            &Default::default(),
+            &workspace,
         );
-        assert!(!worker.memory_backend_for_test().exclusive());
+        let inherited = worker.memory_backend_for_test();
+        assert_eq!(key(&inherited), key(&parent_binding));
+        assert_eq!(inherited.base(), parent_binding.base());
+        // T-B9: the worker's `memory_store` writes under its parent's key,
+        // before and after `apply_config` runs on the worker.
+        let notes_of = |key: &str| {
+            let file = agent_core::memory::store::project_notes_file(base.path(), key);
+            std::fs::read_to_string(file).unwrap_or_default().lines().count()
+        };
+        let store = |binding: MemoryBinding| async move {
+            crate::tools::memory::MemoryStoreTool
+                .execute(
+                    serde_json::json!({"content": "a worker's note"}),
+                    crate::tools::test_helpers::context_with_memory(binding),
+                )
+                .await
+                .unwrap()
+        };
+        store(worker.memory_backend_for_test()).await;
+        assert_eq!((notes_of(&key(&parent_binding)), notes_of(&own)), (1, 0));
+        worker.apply_config(&Default::default());
+        assert_eq!(key(&worker.memory_backend_for_test()), key(&parent_binding));
+        assert_eq!(worker.memory_backend_for_test().author(), inherited.author());
+        store(worker.memory_backend_for_test()).await;
+        assert_eq!((notes_of(&key(&parent_binding)), notes_of(&own)), (2, 0));
+
         let mut worker_none = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None, None, None, &Default::default());
-        assert!(!worker_none.memory_backend_for_test().exclusive());
+        apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None, None, None, &workspace);
+        assert_eq!(key(&worker_none.memory_backend_for_test()), own);
+
+        // A parent with no project: the worker has none either, and none
+        // is found for it from its own folder.
+        let nowhere = MemoryBinding::for_cwd(None);
+        let mut orphan = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut orphan, &Default::default(), Some(&nowhere), None, None, &workspace);
+        let refused = orphan.memory_backend_for_test().scope().unwrap_err().to_string();
+        assert_eq!(refused, nowhere.scope().unwrap_err().to_string());
+        assert_eq!(orphan.memory_backend_for_test().author().group, nowhere.author().group);
     }
 }
 

@@ -2357,13 +2357,10 @@ async fn on_context_archived_reaches_its_subscriber_and_nobody_else() {
     manager.shutdown_all().await;
 }
 
-/// A legacy (plain-file) memory binding for the project at `project`, with
-/// its store under the test's base dir.
+/// The memory binding of a chat that runs in the project at `project`,
+/// with its store under the test's base dir.
 fn file_memory(project: &std::path::Path) -> agent_engine::memory_backend::MemoryBinding {
-    agent_engine::memory_backend::MemoryBinding::from_config_with_cwd(
-        &Default::default(),
-        Some(project.to_path_buf()),
-    )
+    agent_engine::memory_backend::MemoryBinding::for_cwd(Some(project.to_path_buf()))
 }
 
 /// A `memory_*` tool call by chat `session_id`, which runs in `chat`.

@@ -871,18 +871,13 @@ mod tests {
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Off);
     }
 
-    /// merge(112) DARK test: default config boots with legacy memory and is
-    /// offered no context_checkpoint, and no built-in forum tool exists.
+    /// DARK test: default config is offered no context_checkpoint, and no
+    /// built-in forum tool exists.
     /// `context_checkpoint` is in the registry, which every chat on a host
     /// shares; what a chat is offered is its own.
     #[tokio::test]
-    async fn default_config_is_dark_no_checkpoint_tool_legacy_binding() {
+    async fn default_config_is_dark_no_checkpoint_tool() {
         let runtime = Runtime::new_headless();
-        // Default memory backend must be legacy (no Axel sidecar spawn).
-        assert!(
-            !runtime.memory_backend_exclusive(),
-            "default config must NOT be exclusive (Axel); it must be legacy"
-        );
         let offered = runtime.offered_tools_schema().await;
         let names: Vec<&str> = offered.iter().filter_map(|t| t["name"].as_str()).collect();
         for dark in ["context_checkpoint", "forum_post", "forum_read", "forum_forget"] {

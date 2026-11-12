@@ -646,13 +646,13 @@ pub struct Runtime {
     /// exactly the next outgoing provider request, even when telemetry is
     /// Off, then auto-disarms. Shared across clones.
     trace_controls: std::sync::Arc<trace::TraceControls>,
-    /// Immutable host-owned note backend and captured project scope (#112).
-    /// DARK by default: `MemoryBinding::legacy_current()`.
+    /// The chat's memory binding: the captured project of its folder (#112).
+    /// Until it is bound, the project of the process folder, as before.
     memory_backend: crate::memory_backend::MemoryBinding,
-    /// First explicit host selection; never replace the captured binding.
-    memory_backend_config: Option<crate::config::MemoryBackendConfig>,
-    /// Sticky across same-session clones: live extension policy needs restart.
-    memory_backend_reconfigure_denied: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the binding has been made ([`Self::bind_memory`]) or given
+    /// ([`Self::inherit_memory_binding`]). It is made once and never
+    /// replaced.
+    memory_bound: bool,
     /// Writer handle backing the most recent armed one-shot ephemeral
     /// trace context (telemetry Off + `/trace next`). Retained here — not
     /// only inside the request's cloned context — so the session exit
@@ -1036,9 +1036,10 @@ impl Runtime {
             trace_ctx: trace::TraceContext::disabled(),
             trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
             // DARK defaults: legacy memory backend, continuation off (#112).
-            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
-            memory_backend_config: None,
-            memory_backend_reconfigure_denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            memory_backend: crate::memory_backend::MemoryBinding::for_cwd(
+                std::env::current_dir().ok(),
+            ),
+            memory_bound: false,
             continuation: Arc::new(Mutex::new(continuation::ContinuationState::default())),
             worker_context: Default::default(),
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -2061,17 +2062,6 @@ impl Runtime {
         model: &str,
         role: crate::runtime::openai::catalog::CodexRequestRole,
     ) -> Result<()> {
-        // A denied memory-backend reconfiguration poisons the runtime: the
-        // live binding no longer matches config, so no request may be sent
-        // until restart. (#112; upstream `validate_request_preflight_for`.)
-        if self
-            .memory_backend_reconfigure_denied
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(RuntimeError::Config(
-                "memory backend cannot be reconfigured at runtime (including live legacy extension processes); restart required; request denied".into(),
-            ));
-        }
         let level = self.reasoning_level();
         if model.starts_with("anthropic/")
             && level == agent_core::reasoning::ReasoningLevel::UltraCode
@@ -2309,43 +2299,39 @@ impl Runtime {
         .anchored(anchor.as_ref(), messages)
     }
 
-    /// Inherit storage authority only, with a fresh worker execution author.
-    /// Oneshot, start, and resume share this path; even resume must not reuse
-    /// a prior actor. Off/no-lease context state and tool grants stay untouched.
-    pub(crate) fn inherit_memory_backend(&mut self, binding: crate::memory_backend::MemoryBinding) {
-        self.memory_backend = binding.fork_for_worker();
+    /// Give a worker its parent's binding: the parent's base and project,
+    /// wherever the worker's own folder is, with a fresh worker execution
+    /// author. Oneshot, start, and resume share this path; even resume must
+    /// not reuse a prior actor. The runtime is then bound: a later
+    /// `apply_config` on it does not replace the binding with one for the
+    /// worker's folder. Tool grants stay untouched.
+    pub(crate) fn inherit_memory_binding(&mut self, binding: &crate::memory_backend::MemoryBinding) {
+        self.memory_backend = binding.for_worker();
+        self.memory_bound = true;
     }
 
-    /// Bind standalone host entry points without applying unrelated settings.
-    pub fn apply_memory_backend_config(&mut self, config: &crate::config::MemoryBackendConfig) {
-        if let Some(selected) = &self.memory_backend_config {
-            if selected != config {
-                self.memory_backend_reconfigure_denied
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                tracing::warn!("memory backend change denied: live extension processes cannot be reconfigured at runtime; original binding retained; restart required");
-            }
+    /// Bind this runtime's memory to the project of its folder, once: a
+    /// runtime that is already bound keeps its binding. Standalone host
+    /// entry points call it without applying unrelated settings;
+    /// `apply_config` calls it too, so a runtime is given its folder
+    /// (`set_cwd`) before its first `apply_config`.
+    pub fn bind_memory(&mut self) {
+        if self.memory_bound {
             return;
         }
         // merge(112) §4: under the daemon the session cwd differs from
         // process cwd; use it when available so project-scope resolution
         // lands in the right repo.
-        self.memory_backend = crate::memory_backend::MemoryBinding::from_config_with_cwd(
-            config,
+        self.memory_backend = crate::memory_backend::MemoryBinding::for_cwd(
             self.cwd.clone().or_else(|| std::env::current_dir().ok()),
         );
-        self.memory_backend_config = Some(config.clone());
+        self.memory_bound = true;
     }
 
     #[cfg(test)]
     #[allow(dead_code)] // merge(112): consumed in phase 5
     pub(crate) fn memory_backend_for_test(&self) -> crate::memory_backend::MemoryBinding {
         self.memory_backend.clone()
-    }
-
-    /// True when legacy note/history/provider access is forbidden by the host
-    /// selection, including invalid or unavailable backend configuration.
-    pub fn memory_backend_exclusive(&self) -> bool {
-        self.memory_backend.exclusive()
     }
 
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
@@ -2366,8 +2352,8 @@ impl Runtime {
     }
 
     fn apply_config_inner(&mut self, config: &crate::config::SynapsConfig, disable_tools: bool) {
-        // #112: apply memory backend config early (binding is immutable once set).
-        self.apply_memory_backend_config(&config.memory_backend);
+        // #112: bind memory early (the binding is immutable once made).
+        self.bind_memory();
         if let Some(ref model) = config.model {
             self.set_model(model.clone());
         }
@@ -3902,8 +3888,7 @@ impl Clone for Runtime {
             trace_ctx: self.trace_ctx.clone(),
             trace_controls: Arc::clone(&self.trace_controls),
             memory_backend: self.memory_backend.clone(),
-            memory_backend_config: self.memory_backend_config.clone(),
-            memory_backend_reconfigure_denied: Arc::clone(&self.memory_backend_reconfigure_denied),
+            memory_bound: self.memory_bound,
             one_shot_trace_writer: Arc::clone(&self.one_shot_trace_writer),
             capture_dir: self.capture_dir.clone(),
             cache_diagnostics: self.cache_diagnostics,
@@ -6396,89 +6381,153 @@ mod http_client_timeout_tests {
     }
 }
 
-/// Memory-backend configuration on a runtime. (The module keeps its old
-/// name; the automatic-memory and context-provider tests that shared it are
-/// gone with their subjects.)
+/// The memory binding of a runtime: made once, for the runtime's folder,
+/// whatever an old config still says about a backend.
 #[cfg(test)]
-mod memory_context_provider_tests {
+mod memory_binding_tests {
     use super::Runtime;
+    use crate::test_env::{BaseDirGuard, EnvVarGuard};
+    use crate::tools::test_helpers::context_with_memory;
+    use crate::tools::Tool;
+    use serde_json::json;
+    use std::path::Path;
 
-    // ── memory-backend configuration tests (ported from upstream) ────────
-
-    #[tokio::test]
-    async fn an_axel_or_unknown_backend_is_exclusive_and_a_clone_keeps_it() {
-        for selector in ["axel", "invalid-selector"] {
-            let mut runtime = Runtime::new_headless();
-            runtime.apply_config(&agent_core::config::load_config_from_str(&format!(
-                "memory.backend = {selector}\n"
-            )));
-            assert!(runtime.memory_backend.exclusive());
-            let clone = runtime.clone();
-            assert!(clone.memory_backend.exclusive());
-            assert_eq!(clone.memory_backend.base(), runtime.memory_backend.base());
-        }
+    /// A folder that is a project of its own.
+    fn project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".synaps-project"), "").unwrap();
+        dir
     }
 
-    #[tokio::test]
-    async fn memory_backend_first_config_is_immutable_and_changes_require_restart() {
-        for (first, different) in [("legacy", "axel"), ("axel", "legacy")] {
-            let mut runtime = Runtime::new_headless();
-            let config =
-                agent_core::config::load_config_from_str(&format!("memory.backend = {first}\n"));
-            runtime.apply_config(&config);
-            let binding = runtime.memory_backend.clone();
-            runtime.apply_config(&config);
-            assert!(!runtime
-                .memory_backend_reconfigure_denied
-                .load(std::sync::atomic::Ordering::SeqCst));
-            if let (Ok(a), Ok(b)) = (binding.scope(), runtime.memory_backend.scope()) {
-                assert!(std::ptr::eq(a, b));
-            }
-            let clone = runtime.clone();
-            runtime.apply_config(&agent_core::config::load_config_from_str(&format!(
-                "memory.backend = {different}\n"
-            )));
-            assert_eq!(runtime.memory_backend.exclusive(), binding.exclusive());
-            assert_eq!(
-                runtime.memory_backend_config.as_ref(),
-                Some(&config.memory_backend)
-            );
-            for denied in [&runtime, &clone] {
-                let error = denied
-                    .validate_request_preflight()
-                    .await
-                    .unwrap_err()
-                    .to_string();
-                assert!(error.contains("restart required"), "{error}");
-            }
-            runtime.apply_config(&config);
-            assert!(runtime.validate_request_preflight().await.is_err());
-        }
+    fn key_of(dir: &Path) -> String {
+        let scope = agent_core::memory::store::ProjectScope::discover(dir).unwrap();
+        scope.key().to_owned()
     }
 
+    fn bound_key(runtime: &Runtime) -> String {
+        runtime.memory_backend.scope().unwrap().key().to_owned()
+    }
+
+    /// A config from before the cut, with all four backend keys active. The
+    /// helper and the brain it names do not exist, and the brain path is
+    /// relative: each of these used to leave the backend unavailable.
+    const OLD_AXEL_CONFIG: &str = "memory.backend = axel\n\
+         memory.user_scope = true\n\
+         memory.axel.executable = /nonexistent/synaps-axel-memory-service\n\
+         memory.axel.brain = relative/brain.r8\n\
+         context_management.mode = auto\n";
+
+    /// The binding is made by the first `apply_config`, for the folder the
+    /// runtime was given before it, and never again: not by a second
+    /// `apply_config`, not after the folder changes, not when the config
+    /// changes. A clone keeps it, with the same author.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn a_runtime_binds_its_folders_project_once() {
+        let _root = EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        let (first, second) = (project(), project());
+        assert_ne!(key_of(first.path()), key_of(second.path()));
+        let plain = agent_core::config::load_config_from_str("");
+        let old = agent_core::config::load_config_from_str(OLD_AXEL_CONFIG);
+
+        let mut runtime = Runtime::new_headless();
+        runtime.set_cwd(Some(first.path().to_path_buf()));
+        runtime.apply_config(&plain);
+        assert_eq!(bound_key(&runtime), key_of(first.path()));
+        let author = runtime.memory_backend.author().clone();
+
+        runtime.set_cwd(Some(second.path().to_path_buf()));
+        runtime.apply_config(&plain);
+        runtime.apply_config(&old);
+        runtime.bind_memory();
+        assert_eq!(bound_key(&runtime), key_of(first.path()));
+        assert_eq!(runtime.memory_backend.author(), &author);
+
+        let clone = runtime.clone();
+        assert_eq!(bound_key(&clone), key_of(first.path()));
+        assert_eq!(clone.memory_backend.author(), &author);
+        assert_eq!(clone.memory_backend.base(), runtime.memory_backend.base());
+    }
+
+    /// T-B2, ruling 4: a config that still has `memory.backend = axel` and
+    /// the three keys beside it starts a runtime. It reports the one
+    /// warning, passes the request preflight's memory check, lets automatic
+    /// context management be switched on, and its memory tools and its
+    /// rollover seal act on the plain files of the chat's project. No
+    /// helper is started and no brain is made.
     #[tokio::test]
-    async fn memory_backend_path_changes_also_require_restart() {
-        for field in ["executable", "brain"] {
-            let mut runtime = Runtime::new_headless();
-            let config = crate::config::MemoryBackendConfig::default();
-            runtime.apply_memory_backend_config(&config);
-            let mut different = config.clone();
-            let path = std::env::temp_dir().join("synaps-memory-config-test");
-            if field == "executable" {
-                different.executable = Some(path);
-            } else {
-                different.brain = Some(path);
-            }
-            runtime.apply_memory_backend_config(&different);
-            assert_eq!(runtime.memory_backend_config.as_ref(), Some(&config));
-            assert!(!runtime.memory_backend.exclusive());
-            let error = runtime
-                .validate_request_preflight()
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("restart required"), "{error}");
-        }
+    #[serial_test::serial(synaps_base_dir)]
+    async fn an_old_axel_config_starts_a_runtime_on_plain_files() {
+        let base = BaseDirGuard::new();
+        let _root = EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        let chat = project();
+        let config = agent_core::config::load_config_from_str(OLD_AXEL_CONFIG);
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(config.warnings[0].starts_with("memory.backend = axel is no longer supported"));
+        assert_eq!(
+            config.context_management.mode,
+            agent_core::config::ContextManagementMode::Auto
+        );
+
+        let mut runtime = Runtime::new_headless();
+        runtime.set_cwd(Some(chat.path().to_path_buf()));
+        runtime.apply_config(&config);
+        let key = key_of(chat.path());
+        assert_eq!(bound_key(&runtime), key);
+        assert_eq!(runtime.memory_backend.base(), base.path());
+        // Automatic rollover is on from the config and can be set again:
+        // the "selected backend unavailable" refusals are gone.
+        assert!(runtime.context_management_enabled());
+        runtime.context_management_command("auto").expect("/context auto is not refused");
+
+        let ctx = || context_with_memory(runtime.memory_backend.clone());
+        let stored = crate::tools::memory::MemoryStoreTool
+            .execute(json!({"content": "NOTE_UNDER_AN_OLD_CONFIG"}), ctx())
+            .await
+            .unwrap();
+        assert!(stored.contains(&format!("project {key}")), "{stored}");
+        let id = stored.split_whitespace().nth(2).unwrap().to_owned();
+        // The note is a line of the project's plain file.
+        let file = base.path().join("memory").join(format!("project-{key}.jsonl"));
+        let lines = std::fs::read_to_string(&file).expect("the project's notes file");
+        assert!(lines.contains("NOTE_UNDER_AN_OLD_CONFIG") && lines.contains(&id), "{lines}");
+        let found = crate::tools::memory::MemorySearchTool
+            .execute(json!({"query": "NOTE_UNDER_AN_OLD_CONFIG"}), ctx())
+            .await
+            .unwrap();
+        assert!(found.contains(&id), "{found}");
+        let fetched = crate::tools::memory::MemoryFetchTool
+            .execute(json!({"ids": [id]}), ctx())
+            .await
+            .unwrap();
+        assert!(fetched.contains("NOTE_UNDER_AN_OLD_CONFIG"), "{fetched}");
+
+        // A rollover's seal writes an archive file under the same project.
+        let window = vec![std::sync::Arc::new(json!({"role": "user", "content": "sealed words"}))];
+        let (parts, _) = runtime
+            .memory_backend
+            .history_seal_window("old-config-chat", &window, "")
+            .await
+            .unwrap();
+        let archive = &parts[0].archive.id;
+        let sealed = agent_core::context_archive::archive_file(base.path(), &key, archive);
+        assert!(sealed.unwrap().expect("an archive file").starts_with(base.path()));
+        let history = crate::tools::memory::MemoryFetchTool
+            .execute(json!({"ids": [format!("ctx-{archive}")]}), ctx())
+            .await
+            .unwrap();
+        assert!(history.contains("sealed words"), "{history}");
+
+        crate::tools::memory::MemoryForgetTool
+            .execute(json!({"id": id}), ctx())
+            .await
+            .unwrap();
+        // Nothing of the old backend was made: the two plain stores are
+        // there, a brain is not.
+        assert!(base.path().join("memory").is_dir());
+        assert!(base.path().join("context-archives").is_dir());
+        assert!(!base.path().join("memory/axel").exists());
+        assert!(!chat.path().join("relative").exists());
     }
 
     /// A binding made with no folder, or with a deleted one, has no project:
@@ -6492,17 +6541,13 @@ mod memory_context_provider_tests {
         std::fs::remove_dir(&gone_path).unwrap();
         for cwd in [None, Some(gone_path)] {
             let mut runtime = Runtime::new_headless();
-            runtime.memory_backend = crate::memory_backend::MemoryBinding::from_config_with_cwd(
-                &Default::default(),
-                cwd.clone(),
-            );
+            runtime.memory_backend = crate::memory_backend::MemoryBinding::for_cwd(cwd.clone());
             assert!(runtime.memory_backend.scope().is_err(), "{cwd:?} must have no project");
         }
     }
 
     /// An old config with the removed automatic-memory keys reaches nothing
-    /// in a runtime: it is bound exactly like one given an empty config,
-    /// and a second apply is not a "changed backend".
+    /// in a runtime: it is bound exactly like one given an empty config.
     #[test]
     fn an_old_automatic_memory_config_changes_nothing_on_a_runtime() {
         let old = agent_core::config::load_config_from_str(
@@ -6525,20 +6570,28 @@ mod memory_context_provider_tests {
         with_old.apply_config(&old);
         let mut with_plain = Runtime::new_headless();
         with_plain.apply_config(&plain);
-        assert!(!with_old.memory_backend.exclusive());
-        assert_eq!(with_old.memory_backend_config, with_plain.memory_backend_config);
         assert_eq!(with_old.memory_backend.base(), with_plain.memory_backend.base());
-        assert!(!with_old
-            .memory_backend_reconfigure_denied
-            .load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            with_old.memory_backend.scope().ok().map(|scope| scope.key().to_owned()),
+            with_plain.memory_backend.scope().ok().map(|scope| scope.key().to_owned()),
+        );
     }
 
+    /// Any `memory.backend` value binds the same plain-file project as no
+    /// such line: there is no unavailable backend to fall into.
     #[test]
-    fn an_unknown_backend_selector_binds_exclusive_not_legacy() {
-        let mut runtime = Runtime::new_headless();
-        runtime.apply_config(&agent_core::config::load_config_from_str(
-            "memory.backend = invalid-not-axel-not-legacy\n",
-        ));
-        assert!(runtime.memory_backend.exclusive());
+    #[serial_test::serial(synaps_base_dir)]
+    fn any_backend_selector_binds_the_same_plain_files() {
+        let _root = EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        let chat = project();
+        for selector in ["axel", "legacy", "sqlite", "invalid-not-axel-not-legacy", ""] {
+            let mut runtime = Runtime::new_headless();
+            runtime.set_cwd(Some(chat.path().to_path_buf()));
+            runtime.apply_config(&agent_core::config::load_config_from_str(&format!(
+                "memory.backend = {selector}\n"
+            )));
+            assert_eq!(bound_key(&runtime), key_of(chat.path()), "{selector}");
+            assert_eq!(runtime.memory_backend.base(), agent_core::config::base_dir());
+        }
     }
 }

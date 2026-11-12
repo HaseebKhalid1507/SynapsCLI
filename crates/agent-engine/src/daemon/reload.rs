@@ -1244,13 +1244,10 @@ mod tests {
         };
 
         // What the dead path does to a chat that keeps it.
-        let files = crate::config::MemoryBackendConfig::default();
-        let binding =
-            crate::memory_backend::MemoryBinding::from_config_with_cwd(&files, Some(gone.clone()));
+        let binding = crate::memory_backend::MemoryBinding::for_cwd(Some(gone.clone()));
         let error = binding.scope().unwrap_err().to_string();
         assert!(error.contains("host project scope unavailable"), "{error}");
-        let binding =
-            crate::memory_backend::MemoryBinding::from_config_with_cwd(&files, Some(kept.clone()));
+        let binding = crate::memory_backend::MemoryBinding::for_cwd(Some(kept.clone()));
         assert!(binding.scope().is_ok());
 
         for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked] {

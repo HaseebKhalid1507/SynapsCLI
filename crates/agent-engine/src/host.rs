@@ -196,10 +196,6 @@ impl EngineHost {
             Arc::clone(&hook_bus),
             Arc::clone(&tools),
         );
-        // Per-process: tell the extension manager whether memory is exclusive
-        // (Axel) so extensions spawned later inherit the right policy.
-        let mem_binding = crate::memory_backend::MemoryBinding::from_config(&config.memory_backend);
-        ext_mgr.bind_memory_backend(mem_binding.exclusive());
         ext_mgr.set_progressive_deferral(config.progressive_tool_disclosure);
         let extension_runtime = if config.progressive_tool_disclosure {
             Some(ext_mgr.extension_runtime())
@@ -381,7 +377,7 @@ impl EngineHost {
 
     /// `foreground_runtime()` for a session whose cwd is not the process cwd
     /// (daemon-hosted sessions). The cwd is set BEFORE `apply_config` so the
-    /// memory binding (`apply_memory_backend_config`, one-shot) scopes to the
+    /// memory binding (`bind_memory`, one-shot) scopes to the
     /// session's project, not the daemon's — A-engine-merge §4. `None` =
     /// process cwd, byte-identical to `foreground_runtime()`.
     pub async fn foreground_runtime_for(&self, cwd: Option<std::path::PathBuf>) -> Result<Runtime> {

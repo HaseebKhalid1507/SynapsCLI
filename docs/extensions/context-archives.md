@@ -19,8 +19,7 @@ against real files, which you can use too:
 
 What this page covers:
 
-- **The built-in file store only.** That is `memory.backend = legacy`, the
-  default. With `memory.backend = axel` no archive files are written.
+- **The built-in file store,** which is the only archive store Synaps has.
 - **Unix only, today.** The file store exists on Linux and macOS. On other
   platforms Synaps writes no archives, and nothing here describes them.
 - **Synaps writes, you read.** Reading is the only thing an extension may do
@@ -791,8 +790,7 @@ What to know before you rely on it:
   `on_context_archived` and `on_memory_forgotten` do not fire for what it
   stores or forgets. An index finds imported archives and their tombstones
   the way [When to look](#when-to-look) says: by scanning.
-- **It writes the built-in file store whatever `memory.backend` says,** and
-  never talks to another backend.
+- **It writes the built-in file store** and talks to nothing else.
 - **It may run while chats are running.** It takes the same lock a seal
   takes, one record at a time.
 - **A record that names another project is moved, not shared.** Chats find

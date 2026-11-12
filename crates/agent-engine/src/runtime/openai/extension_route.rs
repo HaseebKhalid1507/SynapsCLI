@@ -581,7 +581,6 @@ mod caller_tests {
     use crate::extensions::runtime::ExtensionHandler;
     use crate::memory_backend::MemoryBinding;
     use crate::tools::test_helpers::{create_tool_context, memory_binding};
-    use agent_core::config::MemoryBackendKind;
     use agent_core::memory::author::Author;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -761,7 +760,7 @@ mod caller_tests {
         let dirs = [base.path().join("a"), base.path().join("b")];
         let bindings = dirs
             .each_ref()
-            .map(|dir| memory_binding(MemoryBackendKind::Legacy, dir));
+            .map(|dir| memory_binding(dir));
         turn("chat-a", bindings[0].clone()).await;
         turn("chat-b", bindings[1].clone()).await;
         turn("chat-a", bindings[0].clone()).await;
@@ -774,7 +773,7 @@ mod caller_tests {
             assert_eq!(session_id.as_deref(), Some(chat));
             let caller = caller.as_ref().unwrap_or_else(|| panic!("{chat}: no caller"));
             caller.validate().unwrap();
-            assert_eq!(caller, binding.forum_author(), "{chat}: its own binding's author");
+            assert_eq!(caller, binding.author(), "{chat}: its own binding's author");
         }
         let (of_a, of_b) = (calls[0].1.clone().unwrap(), calls[1].1.clone().unwrap());
         assert_ne!(of_a.actor, of_b.actor);

@@ -41,7 +41,7 @@ fn caller_of(ctx: &ToolContext) -> Option<agent_core::memory::author::Author> {
     ctx.capabilities
         .memory_backend
         .as_ref()
-        .map(|binding| binding.forum_author().clone())
+        .map(|binding| binding.author().clone())
 }
 
 #[async_trait::async_trait]
@@ -60,13 +60,6 @@ impl crate::tools::Tool for ExtensionTool {
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
         let caller = caller_of(&ctx);
-        let binding = ctx
-            .capabilities
-            .memory_backend
-            .unwrap_or_else(crate::memory_backend::MemoryBinding::configured_current);
-        if binding.exclusive() && crate::memory_backend::competing_memory_tool(self) {
-            return Err(RuntimeError::Tool("independent extension memory is disabled by the selected host backend; use short memory tools".into()));
-        }
         let value = self
             .handler
             .call_tool_as(
@@ -100,15 +93,12 @@ impl crate::tools::Tool for ExtensionTool {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use agent_core::config::MemoryBackendKind;
     use serde_json::json;
 
     use super::*;
     use crate::extensions::hooks::events::{HookEvent, HookResult};
-    use crate::tools::test_helpers::{context_with_memory, memory_binding};
+    use crate::tools::test_helpers::{context_with_memory, create_tool_context, memory_binding};
     use crate::tools::{Tool, ToolRegistry};
-
-    const REFUSAL: &str = "independent extension memory is disabled by the selected host backend; use short memory tools";
 
     /// An extension process stand-in that counts the tool calls it receives.
     #[derive(Default)]
@@ -147,70 +137,50 @@ mod tests {
         )
     }
 
-    async fn call(tool: &dyn Tool, kind: MemoryBackendKind) -> Result<String> {
+    /// One call with a chat's binding and one with no binding at all.
+    async fn call(tool: &dyn Tool) -> [Result<String>; 2] {
         let dir = tempfile::tempdir().unwrap();
-        let binding = memory_binding(kind, dir.path());
-        tool.execute(json!({}), context_with_memory(binding)).await
+        let binding = memory_binding(dir.path());
+        [
+            tool.execute(json!({}), context_with_memory(binding)).await,
+            tool.execute(json!({}), create_tool_context()).await,
+        ]
     }
 
-    fn refusal(result: Result<String>) -> String {
-        match result {
-            Err(RuntimeError::Tool(message)) => message,
-            other => panic!("expected a tool refusal, got {other:?}"),
-        }
-    }
-
-    /// Regression: an extension `memory` registering `search` is offered as
-    /// `memory_search` (`memory_search_2` beside the host's own tool), yet
-    /// only its operation `search` was checked.
+    /// T-B7. The guard that refused an extension's memory tools beside an
+    /// exclusive backend went with the backend: an extension tool runs
+    /// whatever it is named, `memory_search` and its aliases included.
     #[tokio::test]
-    async fn an_exclusive_binding_refuses_extension_memory_aliases() {
+    async fn extension_tools_named_like_memory_tools_run() {
         let handler = Arc::new(Counting::default());
-        for (plugin, operation) in [
+        let named = [
             ("memory", "search"),
             ("memory", "fetch"),
             ("memory", "store"),
             ("memory", "forget"),
             ("plug", "memory.search"),
             ("Memory", "Search"),
-        ] {
+            ("axel", "memory_search"),
+            ("axel-memory-manager", "memory_search"),
+            ("axel-memory-manager", "memory_fetch"),
+            ("axel-memory-manager", "memory_store"),
+            ("axel-memory-manager", "memory_forget"),
+            ("weather", "search"),
+            ("memory", "summarize"),
+        ];
+        for (plugin, operation) in named {
             let tool = tool(plugin, operation, &handler);
-            assert_eq!(
-                refusal(call(&tool, MemoryBackendKind::Axel).await),
-                REFUSAL,
-                "{plugin}:{operation}"
-            );
+            for result in call(&tool).await {
+                assert_eq!(result.unwrap(), "extension result", "{plugin}:{operation}");
+            }
         }
-        assert_eq!(handler.0.load(Ordering::SeqCst), 0, "no call reached the extension");
-    }
-
-    #[tokio::test]
-    async fn an_exclusive_binding_still_refuses_exact_memory_tool_names() {
-        let handler = Arc::new(Counting::default());
-        for operation in ["memory_search", "memory_fetch", "memory_store", "memory_forget"] {
-            let tool = tool("axel-memory-manager", operation, &handler);
-            assert_eq!(refusal(call(&tool, MemoryBackendKind::Axel).await), REFUSAL);
-        }
-        assert_eq!(handler.0.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn an_exclusive_binding_runs_other_extension_tools() {
-        let handler = Arc::new(Counting::default());
-        for (plugin, operation) in [("weather", "search"), ("memory", "summarize")] {
-            let tool = tool(plugin, operation, &handler);
-            assert_eq!(
-                call(&tool, MemoryBackendKind::Axel).await.unwrap(),
-                "extension result"
-            );
-        }
-        assert_eq!(handler.0.load(Ordering::SeqCst), 2);
+        assert_eq!(handler.0.load(Ordering::SeqCst), named.len() * 2, "every call reached the extension");
     }
 
     /// The suffixed wire name the model sees beside the host's own tool
-    /// reaches the extension tool, which refuses.
+    /// reaches the extension tool, which runs.
     #[tokio::test]
-    async fn the_suffixed_wire_name_of_an_alias_is_refused() {
+    async fn the_suffixed_wire_name_of_an_alias_runs() {
         let handler = Arc::new(Counting::default());
         let registry = ToolRegistry::from_tools_for_tests(vec![
             Arc::new(crate::tools::memory::MemorySearchTool),
@@ -219,23 +189,8 @@ mod tests {
         assert_eq!(registry.runtime_name_for_api("memory_search"), "memory_search");
         assert_eq!(registry.runtime_name_for_api("memory_search_2"), "memory:search");
         let alias = registry.get("memory:search").expect("alias registered");
-        assert_eq!(
-            refusal(call(alias.as_ref(), MemoryBackendKind::Axel).await),
-            REFUSAL
-        );
-        assert_eq!(handler.0.load(Ordering::SeqCst), 0);
-    }
-
-    /// No behaviour change without an exclusive binding.
-    #[tokio::test]
-    async fn a_legacy_binding_runs_extension_memory_tools_unchanged() {
-        let handler = Arc::new(Counting::default());
-        for (plugin, operation) in [("memory", "search"), ("axel-memory-manager", "memory_search")] {
-            let tool = tool(plugin, operation, &handler);
-            assert_eq!(
-                call(&tool, MemoryBackendKind::Legacy).await.unwrap(),
-                "extension result"
-            );
+        for result in call(alias.as_ref()).await {
+            assert_eq!(result.unwrap(), "extension result");
         }
         assert_eq!(handler.0.load(Ordering::SeqCst), 2);
     }
@@ -249,16 +204,14 @@ mod caller_tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use agent_core::config::{MemoryBackendConfig, MemoryBackendKind};
     use agent_core::memory::author::Author;
-    use agent_core::memory::store::ProjectScope;
     use serde_json::json;
 
     use super::*;
     use crate::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION;
     use crate::extensions::runtime::process::ProcessExtension;
     use crate::memory_backend::MemoryBinding;
-    use crate::tools::test_helpers::{context_with_memory, create_tool_context, fake_axel_service};
+    use crate::tools::test_helpers::{context_with_memory, create_tool_context};
     use crate::tools::Tool;
 
     /// An extension process that appends the body of each `tool.call` to
@@ -328,26 +281,14 @@ done"#,
             .collect()
     }
 
-    /// A chat's binding: Axel, a project of its own in `dir`, served by the
-    /// stand-in service, which keeps what it is asked in `requests.jsonl`.
+    /// A chat's binding, for a chat that runs in `dir`.
     fn chat_binding(dir: &Path) -> MemoryBinding {
-        let binding = MemoryBinding::from_config_with_cwd(
-            &MemoryBackendConfig {
-                kind: MemoryBackendKind::Axel,
-                executable: Some(fake_axel_service(dir, "{}")),
-                brain: Some(dir.join("brain.r8")),
-                user_scope: false,
-            },
-            Some(dir.to_path_buf()),
-        )
-        .with_scope(ProjectScope::for_root(dir).unwrap());
-        assert!(binding.is_axel());
-        binding
+        MemoryBinding::for_cwd(Some(dir.to_path_buf()))
     }
 
     /// The author `binding` holds, as it serialises.
     fn author_of(binding: &MemoryBinding) -> Value {
-        serde_json::to_value(binding.forum_author()).unwrap()
+        serde_json::to_value(binding.author()).unwrap()
     }
 
     /// What `tools/subagent` gives a worker runtime of a chat with `chat`:
@@ -385,7 +326,7 @@ done"#,
         // As the type serialises: a chat has no `parent` key; it reads back
         // as an `Author` and validates.
         let caller = as_author(&params["caller"]);
-        assert_eq!(&caller, chat.forum_author());
+        assert_eq!(&caller, chat.author());
         assert!(caller.parent.is_none());
         let mut keys: Vec<&str> =
             params["caller"].as_object().unwrap().keys().map(String::as_str).collect();

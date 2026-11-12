@@ -229,18 +229,12 @@ Project-scoped persistent memory in `crates/agent-core/src/memory/`:
 
 Records have stable IDs, model provenance, tags, timestamps, and optional TTL. The system is designed for agents to accumulate project knowledge across sessions.
 
-Opt-in `memory.backend = axel` routes short notes, eligible context history,
-consented capture/recall, explicit history import, migration and memory retention
-to `sidecars/axel-memory-service`, independently built at an exact Axel revision.
-Axel uses one shared brain with per-repository scopes: Git worktrees share a
-random durable identity in their common Git directory. Default service is an
-installed sibling; default brain is `~/.synaps-cli/memory/axel/brain.r8`.
-Absolute `memory.axel.executable`/`memory.axel.brain` overrides remain supported.
-Linux/procfs is required. Old path scopes require explicit migration;
-there is no legacy fallback or automatic private-history import. User-wide notes
-require separate `memory.user_scope = true` and explicit tool `scope=user`.
-Selection is restart-bound; `/memory` consent and `/context auto` remain separate
-host decisions.
+Notes and context archives are plain files under the base directory, always:
+there is no memory backend to select. `memory.backend`, `memory.user_scope`,
+`memory.axel.executable` and `memory.axel.brain` are removed keys: a config
+that still has them starts normally with one warning. The `memory_*` tools act
+on the project of the chat's folder and take no `scope` (`scope: "repository"`
+is accepted and ignored, any other value refused). Axel is an extension.
 
 ### Reactive Subagent Lifecycle
 

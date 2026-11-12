@@ -855,14 +855,9 @@ impl StreamMethods {
         if context_enabled {
             super::continuation::record_turn_start(&continuation, &mut messages);
         }
-        if context_enabled && memory_backend.exclusive() && !memory_backend.is_axel() {
-            return Err(crate::RuntimeError::Config(
-                "automatic context management requires a configured memory backend; selected backend unavailable and no fallback; history unchanged".into(),
-            ));
-        }
         if context_enabled {
             // The window of a resumed head was restored above
-            // (`validate_restored_history`), for either backend.
+            // (`validate_restored_history`).
             let registry = prepare_or_cancel!(tools.read());
             for name in ["memory_search", "memory_fetch"] {
                 if registry.get(name).is_none_or(|tool| {
@@ -4434,7 +4429,7 @@ mod rich_output_tests {
         model: &str,
     ) -> StreamSession {
         StreamSession {
-            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
+            memory_backend: crate::memory_backend::MemoryBinding::for_cwd(std::env::current_dir().ok()),
             turn_completion: Default::default(),
             context_window: 200_000,
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
@@ -6503,7 +6498,7 @@ mod rich_output_tests {
         let (hook_bus, hook) = phase_hook_bus(false).await;
 
         let session = StreamSession {
-            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
+            memory_backend: crate::memory_backend::MemoryBinding::for_cwd(std::env::current_dir().ok()),
             turn_completion: Default::default(),
             context_window: 200_000,
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
@@ -7916,11 +7911,8 @@ mod rich_output_tests {
             // The chat's folder is a project of its own, apart from the host's.
             let chat = tempfile::tempdir().unwrap();
             std::fs::write(chat.path().join(".synaps-project"), "").unwrap();
-            let chats = crate::tools::test_helpers::memory_binding(
-                agent_core::config::MemoryBackendKind::Legacy,
-                chat.path(),
-            );
-            let hosts = MemoryBinding::legacy_current();
+            let chats = crate::tools::test_helpers::memory_binding(chat.path());
+            let hosts = MemoryBinding::for_cwd(std::env::current_dir().ok());
             assert_ne!(chats.scope().unwrap().key(), hosts.scope().unwrap().key());
 
             let results = turn(
