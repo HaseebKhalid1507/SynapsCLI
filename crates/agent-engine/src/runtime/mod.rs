@@ -1035,7 +1035,9 @@ impl Runtime {
             telemetry_writer: None,
             trace_ctx: trace::TraceContext::disabled(),
             trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
-            // DARK defaults: legacy memory backend, continuation off (#112).
+            // Unbound until `bind_memory`, which replaces this binding with the
+            // project of the folder given by `set_cwd`; until then, the process
+            // folder's (as `legacy_current()` did). Continuation off (#112).
             memory_backend: crate::memory_backend::MemoryBinding::for_cwd(
                 std::env::current_dir().ok(),
             ),
@@ -6451,7 +6453,7 @@ mod memory_binding_tests {
 
     /// T-B2, ruling 4: a config that still has `memory.backend = axel` and
     /// the three keys beside it starts a runtime. It reports the one
-    /// warning, passes the request preflight's memory check, lets automatic
+    /// warning, passes the request preflight, lets automatic
     /// context management be switched on, and its memory tools and its
     /// rollover seal act on the plain files of the chat's project. No
     /// helper is started and no brain is made.
@@ -6472,6 +6474,13 @@ mod memory_binding_tests {
         let mut runtime = Runtime::new_headless();
         runtime.set_cwd(Some(chat.path().to_path_buf()));
         runtime.apply_config(&config);
+        runtime.apply_config(&config);
+        // No "selected memory backend unavailable" or reconfigure-denied
+        // refusal is left in the preflight every request passes.
+        runtime
+            .validate_request_preflight()
+            .await
+            .expect("an old Axel config passes the request preflight");
         let key = key_of(chat.path());
         assert_eq!(bound_key(&runtime), key);
         assert_eq!(runtime.memory_backend.base(), base.path());
@@ -6534,6 +6543,7 @@ mod memory_binding_tests {
     /// no id is invented for it. (The lease half of this test went with
     /// automatic memory.)
     #[test]
+    #[serial_test::serial(synaps_base_dir)]
     fn a_binding_without_a_folder_has_no_project() {
         let gone = tempfile::tempdir().unwrap();
         let gone_path = gone.path().join("deleted");
@@ -6549,6 +6559,7 @@ mod memory_binding_tests {
     /// An old config with the removed automatic-memory keys reaches nothing
     /// in a runtime: it is bound exactly like one given an empty config.
     #[test]
+    #[serial_test::serial(synaps_base_dir)]
     fn an_old_automatic_memory_config_changes_nothing_on_a_runtime() {
         let old = agent_core::config::load_config_from_str(
             "memory.default_mode = capture_and_recall\n\

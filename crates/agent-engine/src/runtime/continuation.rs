@@ -149,7 +149,7 @@ pub struct ContinuationState {
     /// hold ([`restore_window`]): the chat goes on at window 1 and the
     /// earlier windows cannot be fetched. `/context status` says so.
     /// Cleared on reset and by a committed rollover.
-    missing_archive: Option<String>,
+    missing_archive: Option<MissingArchive>,
     /// Latest provider-reported vs estimated footprint of one request. Kept
     /// across rollovers (same tokenizer); cleared with the session binding.
     pub token_calibration: Option<TokenCalibration>,
@@ -1447,9 +1447,19 @@ fn announce_archived(
     });
 }
 
+/// The archive a resumed head names that could not be restored, and whether
+/// that is because the chat's folder has no project to look in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MissingArchive {
+    id: String,
+    no_project: bool,
+}
+
 /// What looking up the archive a resumed head names found.
 enum Lookup {
     Found,
+    /// The chat's folder has no project, so there is no store to look in.
+    NoProject(String),
     /// It is not there, and looking again would not find it: why.
     Absent(String),
     /// The lookup itself failed, so nothing is known: why.
@@ -1460,16 +1470,18 @@ enum Lookup {
 /// resume needs to know it. A read: the store is opened as it is and nothing
 /// is created for a project that has no archive.
 ///
-/// `Absent` is the three ways of not being there, told apart in its text:
-/// the chat has no project, the project has no archive store, the store
-/// does not hold the id (the store's own "not found", which it gives only
+/// `NoProject` is a chat whose folder has no project: there is nowhere to
+/// look. `Absent` is the two ways of not being there, told apart in its
+/// text: the project has no archive store, the store does not hold the id (the store's own "not found", which it gives only
 /// when it could read everything the archive might be in). Anything else,
 /// such as a busy store, a shelf that cannot be read or an I/O error, is
 /// `Failed`.
 fn look_up(binding: &MemoryBinding, id: &str) -> Lookup {
     let scope = match binding.scope() {
         Ok(scope) => scope,
-        Err(error) => return Lookup::Absent(format!("the chat has no project to look in ({error})")),
+        Err(error) => {
+            return Lookup::NoProject(format!("the chat has no project to look in ({error})"))
+        }
     };
     let project = format!("project {} ({})", scope.key(), scope.root().display());
     let store = match existing_archive_store_in(binding.base(), scope) {
@@ -1575,7 +1587,7 @@ pub fn restore_window(
             "resumed chat: its context head's marker names no archive ({bytes} bytes that are \
              not an archive id); the chat goes on at window 1 without its archive link"
         ),
-        (Lookup::Absent(why), Ok(id)) => tracing::warn!(
+        (Lookup::Absent(why) | Lookup::NoProject(why), Ok(id)) => tracing::warn!(
             session = %chat,
             archive = %format_args!("ctx-{id}"),
             "resumed chat: the archive its context head names was not found: {why}; \
@@ -1603,7 +1615,12 @@ pub fn restore_window(
                 s.window = window;
             }
             // Kept for `/context status`: the log is not where a user looks.
-            Lookup::Absent(_) => s.missing_archive = named.ok(),
+            Lookup::Absent(_) => {
+                s.missing_archive = named.ok().map(|id| MissingArchive { id, no_project: false })
+            }
+            Lookup::NoProject(_) => {
+                s.missing_archive = named.ok().map(|id| MissingArchive { id, no_project: true })
+            }
             Lookup::Failed(_) => return,
         }
         s.initialized = true;
@@ -1766,12 +1783,17 @@ impl crate::Runtime {
         )
         .ok();
         let mut status = format!("context management: {} | window {} | capacity {} | pressure {} | rollover {} | archive {}\nAutomatic rollover preserves eligible source evidence in this folder's archive store and starts a fresh wall-clock allowance; permissions, running environment and other resource/cost budgets are unchanged.",s.config.mode.as_str(),s.window,self.context_window(),thresholds.map_or(0,|t|t.pressure_tokens),thresholds.map_or(0,|t|t.rollover_tokens),s.latest_archive.as_deref().unwrap_or("none"));
-        if let Some(id) = &s.missing_archive {
-            status.push_str(&format!(
+        match &s.missing_archive {
+            Some(MissingArchive { id, no_project: true }) => status.push_str(&format!(
+                "\narchive ctx-{id}, which this chat continues from, cannot be looked up: this \
+                 chat's folder has no project, so earlier windows cannot be fetched."
+            )),
+            Some(MissingArchive { id, no_project: false }) => status.push_str(&format!(
                 "\narchive ctx-{id}, which this chat continues from, is not in this folder's \
                  archive store, so earlier windows cannot be fetched. If you opened the chat \
                  from another folder than before, open it from that one."
-            ));
+            )),
+            None => {}
         }
         status
     }
@@ -2856,6 +2878,50 @@ mod command_tests {
         // A head with no marker, or after a reset to another chat: no line.
         stray.reset_context_continuation("another-chat", &[]);
         assert!(!stray.context_management_status().contains(MISSING));
+    }
+
+    /// A saved head resumed by a chat whose folder has no project: the turn
+    /// is not refused, the chat goes on at window 1, and `/context status`
+    /// says the folder has no project, not to open the chat from another
+    /// folder.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_resumed_chat_with_no_project_says_so_in_status() {
+        let _env = crate::test_env::BaseDirGuard::new();
+        let _root = crate::test_env::EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        let sealed_in = tempfile::tempdir().unwrap();
+        std::fs::write(sealed_in.path().join(".synaps-project"), "").unwrap();
+        let mut elsewhere = crate::Runtime::new_headless();
+        elsewhere.set_cwd(Some(sealed_in.path().to_path_buf()));
+        elsewhere.bind_memory();
+        let window = vec![Arc::new(json!({"role":"assistant","content":"the earlier window"}))];
+        let (sealed, _) = elsewhere
+            .memory_backend
+            .history_seal("chat", &window, "note")
+            .await
+            .unwrap();
+        let head = vec![Arc::new(json!({"role":"user","content":"carry on",
+            "_synaps_context":{"schema":MARKER,"archive":sealed.id,"window":4}}))];
+
+        let mut rt = crate::Runtime::new_headless();
+        rt.memory_backend = crate::memory_backend::MemoryBinding::for_cwd(None);
+        assert!(rt.memory_backend.scope().is_err(), "no folder, no project");
+        rt.reset_context_continuation("chat", &head);
+        validate_restored_history(&head, &rt.continuation, &rt.memory_backend)
+            .await
+            .expect("a chat with no project is not refused");
+        {
+            let s = rt.continuation.lock().unwrap();
+            assert_eq!((s.latest_archive.clone(), s.window), (None, 1));
+        }
+        let status = rt.context_management_status();
+        let line = format!(
+            "archive ctx-{}, which this chat continues from, cannot be looked up: this chat's \
+             folder has no project, so earlier windows cannot be fetched.",
+            sealed.id
+        );
+        assert_eq!(status.lines().last(), Some(line.as_str()), "{status}");
+        assert!(!status.contains("another folder"), "{status}");
     }
 
     /// A chat the daemon hosts runs in its own folder, and its windows are

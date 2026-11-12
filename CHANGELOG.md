@@ -362,7 +362,10 @@ All notable changes to this project will be documented in this file.
   window 1, and `/context status` says so: `archive ctx-<id>, which this
   chat continues from, is not in this folder's archive store, so earlier
   windows cannot be fetched. If you opened the chat from another folder
-  than before, open it from that one.`
+  than before, open it from that one.` A chat whose folder has no project
+  gets `archive ctx-<id>, which this chat continues from, cannot be looked
+  up: this chat's folder has no project, so earlier windows cannot be
+  fetched.` instead.
   `memory_search`, `memory_fetch`, `memory_store` and `memory_forget` have
   no `scope` parameter any more (`docs/tools.json`). `scope: "repository"`
   is still accepted and ignored; any other value is refused with `memory:
