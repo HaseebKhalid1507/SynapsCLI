@@ -40,7 +40,11 @@ removed in 0.12.0; see `docs/upgrading/0.12.0.md`.
 ## The wire contract
 
 JSON-RPC over the extension's stdio. Hooks, permissions and manifest
-rules are in `docs/extensions/contract.json`.
+rules, and which permission each call needs, are in
+`docs/extensions/contract.json`. The requests an extension may send are
+routed in `handle_inbound_request` in
+`crates/agent-engine/src/extensions/runtime/process.rs`; any other method
+gets JSON-RPC error -32601.
 
 ### App → Plugin (requests)
 
@@ -57,6 +61,19 @@ rules are in `docs/extensions/contract.json`.
 | `provider.complete`       | LLM completion                                      |
 | `provider.stream`         | streamed `provider.stream.event` notifs             |
 | `shutdown`                | -                                                   |
+
+### Plugin → App (requests)
+
+| Method             | Needs permission    | Returns                          |
+|--------------------|---------------------|----------------------------------|
+| `memory.append`    | `memory.write`      | `{ ok, timestamp_ms }`           |
+| `memory.query`     | `memory.read`       | `{ records }`                    |
+| `config.get`       | -                   | `{ value }` (the plugin's own key) |
+| `config.set`       | `config.write`      | `{ ok }`                         |
+| `config.subscribe` | `config.subscribe`  | `{ ok }`                         |
+
+`memory.*` only reach the extension's own namespace; `config.*` only the
+extension's own config keys.
 
 ### Plugin → App (notifications)
 
