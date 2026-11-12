@@ -327,6 +327,15 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **Repository identity.** The opt-in Git repository identity (a random key
+  kept in `synaps-memory-identity.json` in Git's common directory, shared by
+  every worktree of a repository) is gone with the backend it served:
+  `RepositoryIdentity`, `ProjectScope::discover_repository` and the public
+  `ProjectScope::user_scope` and `from_key` constructors. Nothing in Synaps
+  read it any more. Notes and archives keep their `project-<key>` files and
+  folders, keyed by the chat's folder exactly as before; a marker file left
+  in a repository is ignored.
+
 - **The memory backend switch.** Notes and context archives are plain files
   under the base directory, always; there is no backend to select and no
   helper process. `memory.backend`, `memory.user_scope`,

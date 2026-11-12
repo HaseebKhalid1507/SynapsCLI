@@ -8,7 +8,4 @@
 
 pub mod author;
 pub mod index;
-pub mod repository;
 pub mod store;
-
-pub use repository::RepositoryIdentity;
