@@ -612,6 +612,18 @@ All notable changes to this project will be documented in this file.
   spawn with, `runtime::continuation::restore_window` takes the memory
   binding, and `runtime::continuation::archive_store` is gone.
 
+### Tests
+
+- **The frozen reference reactor and its differentials are gone.**
+  `tests/support/reference_reactor{,_ext}.rs`, `tests/session_actor_differential.rs`
+  and `tests/tui_transport_differential.rs` (with `scripts/tui-e2e/differential.sh`)
+  compared the actor and the TUI with copies of the pre-actor code. Their
+  scenarios are asserted directly: four new actor tests in
+  `tests/session_actor_scenarios.rs` (provider error, idle auto-turn cap,
+  steer mid-stream, event mid-stream), the rest by existing actor and TUI
+  harness tests. `tests/session_identity_differential.rs` stays: it compares
+  two real paths (in-process and daemon), not an oracle.
+
 ### Fixed
 
 - **Extensions: the `on_message_complete` pages say what `has_tool_use: false`
