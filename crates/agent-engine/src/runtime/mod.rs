@@ -765,6 +765,9 @@ pub struct Runtime {
     /// than the legacy full tool schema. Opt-in and false by default so the
     /// flag-off request bytes stay unchanged (Task 18).
     progressive_tool_disclosure: bool,
+    /// `tools.always_loaded`: tool ids joined to the progressive session core
+    /// (`SessionToolSet::progressive_core_with`). Inert without disclosure.
+    tools_always_loaded: Arc<[crate::tools::catalog::ToolId]>,
     /// `tools.deferred_loading`: Anthropic `defer_loading` + `tool_reference`
     /// for progressive disclosure, so activations keep the cached prefix.
     deferred_tool_loading: bool,
@@ -1228,6 +1231,7 @@ fn fresh_host_parts() -> Result<crate::host::HostParts> {
         capture_dir,
         spill_root,
         progressive_tool_disclosure: false,
+        tools_always_loaded: Arc::from([]),
     })
 }
 
@@ -1381,6 +1385,7 @@ impl Runtime {
             trusted_worker_models: Vec::new(),
             subagent_limits: crate::config::SubagentLimits::default(),
             progressive_tool_disclosure: host.progressive_tool_disclosure,
+            tools_always_loaded: host.tools_always_loaded,
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
@@ -1442,6 +1447,7 @@ impl Runtime {
             capture_dir: trace::default_capture_dir(),
             spill_root: agent_core::core::tool_spill::default_spill_root(),
             progressive_tool_disclosure: false,
+            tools_always_loaded: Arc::from([]),
         };
         let mut runtime = Self::from_parts(RuntimeParts::without_reaper(host));
         runtime.auth = Arc::new(RwLock::new(AuthState {
@@ -1518,6 +1524,7 @@ impl Runtime {
                     registry.catalog(),
                     true,
                     self.context_management_enabled(),
+                    &self.tools_always_loaded,
                 );
                 let core: std::collections::HashSet<String> = core_set
                     .core_ids()
@@ -3047,6 +3054,7 @@ impl Runtime {
             config.request_compression_level,
         );
         self.progressive_tool_disclosure = config.progressive_tool_disclosure;
+        self.tools_always_loaded = Arc::from(config.tools_always_loaded.as_slice());
         self.deferred_tool_loading = config.tools_deferred_loading;
         self.activation_confirm = config.tools_activation_confirm;
         tracing::info!(
@@ -5094,6 +5102,7 @@ impl Runtime {
             delegation_parent: self.delegation_parent.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            tools_always_loaded: Arc::clone(&self.tools_always_loaded),
             deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
             tool_session_id: self.host_tool_session.clone(),
@@ -5234,6 +5243,7 @@ impl Clone for Runtime {
             trusted_worker_models: self.trusted_worker_models.clone(),
             subagent_limits: self.subagent_limits,
             progressive_tool_disclosure: self.progressive_tool_disclosure,
+            tools_always_loaded: Arc::clone(&self.tools_always_loaded),
             deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),

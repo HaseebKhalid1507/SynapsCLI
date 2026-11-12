@@ -624,6 +624,7 @@ impl Runtime {
                 tools_snapshot.catalog(),
                 true,
                 context_enabled,
+                &self.tools_always_loaded,
             );
             // The SAME selection a turn start makes (`retain_session_tool_set`),
             // through its pure half: nothing is written back.

@@ -1564,6 +1564,13 @@ pub struct SynapsConfig {
     /// with `tool_reference` blocks, so an activation never changes the cached
     /// prompt prefix. `off` restores the per-activation tools-array change.
     pub tools_deferred_loading: bool,
+    /// `tools.always_loaded`: canonical tool ids (`ext.axel:search`,
+    /// `builtin:subagent`, as `activate_tools` takes them) that join the
+    /// session core under progressive disclosure, so they are loaded from the
+    /// first request instead of waiting for `activate_tools`. Only ids in the
+    /// catalog with a verified source are admitted (the activation trust
+    /// rule); absent ones are skipped. No effect without disclosure.
+    pub tools_always_loaded: Vec<crate::orchestration::capability::ToolId>,
     /// Opt-in session persistence strategy (Task 35, spec §9.8). `Json`
     /// (default) is the unchanged legacy full-rewrite path; `Journal` adds
     /// an append-only delta journal with periodic atomic snapshots. See
@@ -1648,6 +1655,7 @@ impl Default for SynapsConfig {
             progressive_tool_disclosure: false,
             tools_activation_confirm: ActivationConfirm::default(),
             tools_deferred_loading: true,
+            tools_always_loaded: Vec::new(),
             session_persistence: crate::core::session_journal::SessionPersistence::default(),
             disabled_tools: Vec::new(),
             shell: ShellConfig::default(),
@@ -1779,6 +1787,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "progressive_tool_disclosure",
     "tools.activation_confirm",
     "tools.deferred_loading",
+    "tools.always_loaded",
     "session_persistence",
     "sidecar_toggle_key",
 ];
@@ -1885,6 +1894,22 @@ fn parse_comma_list(val: &str) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// `tools.always_loaded`: comma-separated canonical tool ids. Returns the
+/// parsed ids (deduplicated, in order) and the raw spellings that failed
+/// [`ToolId::parse`](crate::orchestration::capability::ToolId::parse).
+fn parse_tool_id_list(val: &str) -> (Vec<crate::orchestration::capability::ToolId>, Vec<String>) {
+    let mut ids = Vec::new();
+    let mut bad = Vec::new();
+    for raw in parse_comma_list(val) {
+        match crate::orchestration::capability::ToolId::parse(&raw) {
+            Ok(id) if !ids.contains(&id) => ids.push(id),
+            Ok(_) => {}
+            Err(_) => bad.push(raw),
+        }
+    }
+    (ids, bad)
 }
 
 fn write_comma_list_locked(key: &str, values: &[String]) -> std::io::Result<()> {
@@ -2495,6 +2520,17 @@ fn apply_config_content_with(
                      keeping the default (auto)"
                 )),
             },
+            "tools.always_loaded" => {
+                let (ids, bad) = parse_tool_id_list(val);
+                config.tools_always_loaded = ids;
+                if !bad.is_empty() {
+                    config.warnings.push(format!(
+                        "tools.always_loaded: ignoring malformed tool id(s) {} — expected \
+                         namespace:name, e.g. ext.axel:search or builtin:subagent",
+                        bad.join(", ")
+                    ));
+                }
+            }
             "session_persistence" => {
                 match crate::core::session_journal::SessionPersistence::parse(val) {
                     Some(mode) => config.session_persistence = mode,

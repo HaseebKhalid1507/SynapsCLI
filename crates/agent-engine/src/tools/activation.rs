@@ -320,6 +320,21 @@ impl SessionToolSet {
     /// Specialized subagent lifecycle, extension, MCP, shell-session, and
     /// dynamically registered tools remain deferred until exact activation.
     pub fn progressive_core_for_catalog(session: SessionId, catalog: &ToolCatalog) -> Self {
+        Self::progressive_core_with(session, catalog, &[])
+    }
+
+    /// [`Self::progressive_core_for_catalog`] plus the operator's
+    /// `tools.always_loaded` ids. A listed id joins the core only when it is
+    /// in `catalog` AND activation could grant it ([`is_activatable_record`]:
+    /// verified provenance matching its source; never `Unverified`). An id
+    /// not (yet) cataloged is skipped, so a tool registered after the
+    /// session started joins at the next round-top rebuild, and one that
+    /// disappears leaves the core with the catalog (fail-closed).
+    pub fn progressive_core_with(
+        session: SessionId,
+        catalog: &ToolCatalog,
+        always_loaded: &[ToolId],
+    ) -> Self {
         const ESSENTIAL_BUILTINS: &[&str] = &[
             "bash",
             "read",
@@ -338,6 +353,12 @@ impl SessionToolSet {
             .iter()
             .map(|name| ToolId::builtin(name))
             .filter(|id| catalog.get(id).is_some())
+            .chain(
+                always_loaded
+                    .iter()
+                    .filter(|id| catalog.get(id).is_some_and(is_activatable_record))
+                    .cloned(),
+            )
             .collect::<Vec<_>>();
         Self::new(session, core, catalog)
             .expect("progressive core ids are filtered through the catalog")

@@ -33,6 +33,8 @@ pub struct HostParts {
     /// `<base>/spill` (tool output virtualisation), bound once at boot.
     pub spill_root: std::path::PathBuf,
     pub progressive_tool_disclosure: bool,
+    /// `tools.always_loaded` (joined to the progressive session core).
+    pub tools_always_loaded: Arc<[crate::tools::catalog::ToolId]>,
 }
 
 pub struct HostOpts {
@@ -217,6 +219,7 @@ impl EngineHost {
             capture_dir,
             spill_root,
             progressive_tool_disclosure: config.progressive_tool_disclosure,
+            tools_always_loaded: Arc::from(config.tools_always_loaded.as_slice()),
         };
 
         Ok(Arc::new(Self {
