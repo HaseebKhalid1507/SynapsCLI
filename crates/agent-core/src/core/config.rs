@@ -542,7 +542,7 @@ pub const MAX_CACHE_KEEPWARM_HOURS: u32 = 48;
 /// Default for `cache_keepwarm_auto_max_hours`: the longest an `auto` idle
 /// period may run. Without it the ski-rental bound alone lets a 0.05×
 /// cache-read model (Opus 5.5, Sonnet 5.5) ping ~39 times over ~36h and a
-/// 0.025× model (Fable 5.1, Mythos 5.1) ~79 times over ~72h under a 1h TTL,
+/// 0.025× model (Fable 5.1 / 5.2, Mythos 5.1 / 5.2) ~79 times over ~72h under a 1h TTL,
 /// keeping an abandoned session unparked for days. 24h: a user who steps
 /// away for a working day or overnight still comes back to a warm cache; a
 /// session left over a weekend parks. (Owner decision, task #444.)

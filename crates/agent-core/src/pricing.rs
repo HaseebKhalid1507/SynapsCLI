@@ -11,6 +11,7 @@
 //!
 //! | Model                         | Input  | Output | Cache read |
 //! |-------------------------------|--------|--------|------------|
+//! | Fable 5.2 / Mythos 5.2        | $8.00  | $40.00 | 0.025×     |
 //! | Fable 5.1 / Mythos 5.1        | $10.00 | $50.00 | 0.025×     |
 //! | Fable 5 / Mythos 5            | $10.00 | $50.00 | 0.10×      |
 //! | Opus 5.5                      | $4.00  | $20.00 | 0.05×      |
@@ -109,6 +110,9 @@ fn model_prices(model: &str, prompt_tokens: u64) -> (f64, f64) {
         // InferX publishes DeepSeek V4 Flash at $0/M input and output.
         // Keep this exact ID before generic DeepSeek entries are ever added.
         "inferx/deepseek-v4-flash" | "deepseek-v4-flash" => (0.0, 0.0),
+        // Fable 5.2 / Mythos 5.2: $8 / $40 in the model overview (verified
+        // 2026-11-12: <https://platform.claude.com/docs/en/models/fable-5-2/overview>).
+        m if is_version(m, "fable-5-2") || is_version(m, "mythos-5-2") => (8.0, 40.0),
         m if m.contains("fable") || m.contains("mythos") => (10.0, 50.0),
         m if is_version(m, "opus-5-5") => (4.0, 20.0),
         m if is_legacy_opus(m) => (15.0, 75.0),
@@ -139,12 +143,18 @@ fn model_prices(model: &str, prompt_tokens: u64) -> (f64, f64) {
 /// Cache-read price as a multiple of the input price
 /// (<https://platform.claude.com/docs/en/about-claude/pricing>, "Prompt
 /// caching"). The docs list 0.025×
-/// for Fable 5.1 / Mythos 5.1 and 0.05× for Opus 5.5 / Sonnet 5.5; every
+/// for Fable 5.1 / 5.2 and Mythos 5.1 / 5.2 and 0.05× for Opus 5.5 / Sonnet 5.5; every
 /// other model uses the standard 0.1× (also the conservative default for
 /// models this table does not know).
 pub fn cache_read_multiplier(model: &str) -> f64 {
     match model {
-        m if is_version(m, "fable-5-1") || is_version(m, "mythos-5-1") => 0.025,
+        m if is_version(m, "fable-5-1")
+            || is_version(m, "mythos-5-1")
+            || is_version(m, "fable-5-2")
+            || is_version(m, "mythos-5-2") =>
+        {
+            0.025
+        }
         m if is_version(m, "opus-5-5") || is_version(m, "sonnet-5-5") => 0.05,
         _ => 0.1,
     }
@@ -362,6 +372,8 @@ mod tests {
             ("sonnet-5.5", "sonnet-5-5"),
             ("haiku-5.5", "haiku-5-5"),
             ("fable-5.1", "fable-5-1"),
+            ("fable-5.2", "fable-5-2"),
+            ("mythos-5.2", "mythos-5-2"),
             ("mythos-5.1", "mythos-5-1"),
             ("haiku-3.5", "haiku-3-5"),
         ] {
@@ -513,11 +525,15 @@ mod tests {
 
     #[test]
     fn documented_cache_read_multipliers() {
-        // Fable 5.1: $10 × 0.025 = $0.25/MTok; Opus 5.5: $4 × 0.05 = $0.20;
+        // Fable 5.1: $10 × 0.025 = $0.25/MTok; Fable 5.2: $8 × 0.025 = $0.20
+        // (the documented cache-read price); Opus 5.5: $4 × 0.05 = $0.20;
         // Sonnet 5.5: $2 × 0.05 = $0.10; Opus 4.7: $5 × 0.1 = $0.50.
         for (m, want) in [
             ("claude-fable-5-1", 0.25),
             ("claude-mythos-5-1", 0.25),
+            ("claude-fable-5-2", 0.20),
+            ("claude-mythos-5-2", 0.20),
+            ("claude-fable-5-2-20261109", 0.20),
             ("claude-opus-5-5", 0.20),
             ("claude-sonnet-5-5", 0.10),
             ("claude-opus-4-7", 0.50),
