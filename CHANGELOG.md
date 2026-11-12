@@ -334,6 +334,16 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **The eight `shell.*` config keys.** `shell.max_sessions`,
+  `shell.idle_timeout`, `shell.readiness_timeout_ms`,
+  `shell.max_readiness_timeout_ms`, `shell.default_rows`,
+  `shell.default_cols`, `shell.readiness_strategy` and `shell.max_output`
+  were parsed but never read: interactive shells always ran with the
+  built-in limits, and still do. They are no longer parsed or validated,
+  and `SynapsConfig::shell` is gone (`ShellConfig` moved to
+  `tools::shell::config`). A config that still sets them loads silently,
+  with no warning, for this release.
+
 - **The lexical memory index and the `memory-index` retention domain.**
   `memory::index` (the staged segment index under `<base>/memory/index/`,
   T33) is deleted with its tests and benchmark: nothing outside its tests
