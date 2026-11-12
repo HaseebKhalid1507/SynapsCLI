@@ -2461,21 +2461,6 @@ impl ExtensionHandler for ProcessExtension {
         })
     }
 
-    async fn sidecar_spawn_args(&self) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
-        let value = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.call("sidecar.spawn_args", Value::Null),
-        )
-        .await
-        .map_err(|_| format!("Extension '{}' sidecar.spawn_args timed out", self.id))??;
-        serde_json::from_value(value).map_err(|e| {
-            format!(
-                "Invalid sidecar.spawn_args response from extension '{}': {}",
-                self.id, e
-            )
-        })
-    }
-
     async fn settings_editor_open(&self, category: &str, field: &str) -> Result<Value, String> {
         let params = crate::extensions::settings_editor::SettingsEditorOpenParams {
             category: category.to_string(),
@@ -3240,7 +3225,7 @@ done"#
     async fn application_error_reply_never_restarts_the_process() {
         let ext = unknown_method_fixture().await;
         let before = ext.lifecycle_snapshot().unwrap();
-        for method in ["info.get", "sidecar.spawn_args", "no.such.method"] {
+        for method in ["info.get", "no.such.method"] {
             let error = tokio::time::timeout(Duration::from_secs(3), ext.call(method, Value::Null))
                 .await
                 .expect("bounded call")

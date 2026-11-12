@@ -65,7 +65,7 @@ pub(crate) fn handle_event(
         }
         return handle_editor_key(state, key);
     }
-    let visible = visible_categories(&snap.lifecycle_claims);
+    let visible = visible_categories();
     if state.focus == Focus::Right && state.category_idx < visible.len() {
         let cat = visible[state.category_idx];
         if cat == super::schema::Category::Providers {
@@ -280,7 +280,7 @@ pub(crate) fn handle_event(
         (KeyCode::Down, _) => {
             match state.focus {
                 Focus::Left => {
-                    let total_categories = visible_categories(&snap.lifecycle_claims).len()
+                    let total_categories = visible_categories().len()
                         + snap.plugin_categories.len();
                     if state.category_idx + 1 < total_categories {
                         state.category_idx += 1;
@@ -609,10 +609,6 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
                 "invisible".to_string()
             }
         }
-        "sidecar_toggle_key" => synaps_cli::config::read_config_value("sidecar_toggle_key")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "F8".to_string()),
         "tui_streaming_glow" => {
             if super::super::neon_prompt::streaming_glow_enabled() {
                 "on".to_string()
@@ -685,7 +681,7 @@ fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
             .map(|c| c.fields.len())
             .unwrap_or(0);
     }
-    let visible = visible_categories(&snap.lifecycle_claims);
+    let visible = visible_categories();
     // Guard against a stale `category_idx` parked past the list (e.g. a plugin
     // category hot-reloaded away while the modal is open): no category => no rows.
     let Some(&cat) = visible.get(state.category_idx) else {
@@ -733,7 +729,6 @@ mod tests {
             local_url_explicit: None,
             model_health: std::collections::HashMap::new(),
             plugin_categories: Vec::new(),
-            lifecycle_claims: Vec::new(),
             thinking_options: vec![
                 "low".into(),
                 "medium".into(),

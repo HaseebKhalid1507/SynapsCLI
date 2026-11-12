@@ -7,7 +7,7 @@ assumptions, no sockets, no network. The extension host clears the child
 environment, so ALL behavior is driven by argv:
 
   argv[1]  spy log path (append-only event log: spawn / request:<method>
-           / call:<tool> / hook:<kind> / provider:<model> / sidecar /
+           / call:<tool> / hook:<kind> / provider:<model> /
            shutdown / eof)
   argv[2]  path to a JSON array of tools to register at initialize
            (objects with name/description/input_schema)
@@ -295,9 +295,6 @@ while True:
             "content": [{"type": "text", "text": "provider-reply"}],
             "stop_reason": "end_turn",
         })
-    elif method == "sidecar.spawn_args":
-        log("sidecar")
-        respond(request, {"args": ["--fixture-sidecar"]})
     elif method == "context_provider.recall":
         respond(request, recall_response(request.get("params", {})))
     elif method == "tool.call":

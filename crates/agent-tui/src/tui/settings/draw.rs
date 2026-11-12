@@ -66,7 +66,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap:
 
     render_categories(frame, sidebar, state, snap, &p);
     render_settings(frame, main, state, snap, &p);
-    render_footer(frame, footer, state, snap, &p);
+    render_footer(frame, footer, state, &p);
 
     if let Some(ActiveEditor::PluginCustom { render, .. }) = &state.edit_mode {
         render_plugin_custom_editor(frame, main, render, &p);
@@ -82,7 +82,7 @@ fn render_categories(
 ) {
     let focused = state.focus == Focus::Left;
     let mut lines = Vec::new();
-    let cats = visible_categories(&snap.lifecycle_claims);
+    let cats = visible_categories();
     let n_builtin = cats.len();
     for (i, cat) in cats.iter().enumerate() {
         lines.push(row_line(
@@ -148,7 +148,7 @@ fn render_settings(
         render_plugin_category(frame, area, state, snap, p);
         return;
     }
-    let current_cat = visible_categories(&snap.lifecycle_claims)
+    let current_cat = visible_categories()
         .get(state.category_idx)
         .copied()
         .unwrap_or(super::schema::Category::Plugins);
@@ -620,14 +620,8 @@ fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usiz
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_footer(
-    frame: &mut Frame,
-    area: Rect,
-    state: &SettingsState,
-    snap: &RuntimeSnapshot,
-    p: &Palette,
-) {
-    let cats = visible_categories(&snap.lifecycle_claims);
+fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState, p: &Palette) {
+    let cats = visible_categories();
     let cat = cats
         .get(state.category_idx)
         .copied()
@@ -906,10 +900,6 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
                 "invisible".into()
             }
         }
-        "sidecar_toggle_key" => synaps_cli::config::read_config_value("sidecar_toggle_key")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "F8".to_string()),
         "theme_transition" => synaps_cli::config::read_config_value("theme_transition")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())

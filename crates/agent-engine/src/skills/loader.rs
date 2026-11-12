@@ -548,6 +548,18 @@ fn walk_root(
     }
 }
 
+/// The sidecar system is gone. A manifest that still has a
+/// `provides.sidecar` block loads; the block is ignored. Returns the one
+/// warning line for such a manifest.
+fn removed_sidecar_warning(plugin: &str, manifest_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(manifest_json).ok()?;
+    value.pointer("/provides/sidecar")?;
+    Some(format!(
+        "plugin '{plugin}': `provides.sidecar` is ignored; sidecars are no longer supported (removed in {})",
+        agent_core::SIDECAR_REMOVED_IN
+    ))
+}
+
 fn load_plugin(
     plugin_root: &Path,
     marketplace: Option<&str>,
@@ -568,6 +580,9 @@ fn load_plugin(
         tracing::warn!("failed to parse {}", manifest_path.display());
         return;
     };
+    if let Some(warning) = removed_sidecar_warning(&m.name, &content) {
+        tracing::warn!("{warning}");
+    }
 
     let Ok(root_abs) = plugin_root.canonicalize() else {
         return;
@@ -1131,6 +1146,111 @@ mod tests {
         assert_eq!(skills[0].plugin.as_deref(), Some("good"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The `local-voice` manifest shape (a `provides.sidecar` block next to
+    /// an extension, commands, settings and keybinds), copied from the
+    /// installed plugin. The sidecar system is gone; the rest must load.
+    const LEGACY_SIDECAR_PLUGIN_JSON: &str = r#"{
+      "name": "local-voice",
+      "version": "0.1.0",
+      "extension": {
+        "protocol_version": 1,
+        "runtime": "process",
+        "command": "bin/synaps-voice-plugin",
+        "args": ["--extension-rpc"],
+        "permissions": ["audio.input", "config.subscribe"],
+        "hooks": [],
+        "config": []
+      },
+      "commands": [
+        {
+          "name": "voice",
+          "description": "Manage local voice dictation models and sidecar builds.",
+          "interactive": true,
+          "subcommands": ["help", "models", "download", "rebuild"]
+        }
+      ],
+      "settings": {
+        "categories": [
+          {
+            "id": "voice",
+            "label": "Voice",
+            "fields": [
+              {"key": "backend", "label": "STT backend", "editor": "cycler",
+               "options": ["auto", "cpu"], "default": "auto"}
+            ]
+          }
+        ]
+      },
+      "provides": {
+        "sidecar": {
+          "command": "bin/synaps-voice-plugin",
+          "setup": "scripts/setup.sh",
+          "protocol_version": 2,
+          "model": {"default_path": "~/.synaps-cli/models/whisper/ggml-base.en.bin", "required": true},
+          "lifecycle": {"command": "voice", "settings_category": "voice", "display_name": "Voice", "importance": 50}
+        }
+      },
+      "keybinds": [
+        {"key": "C-Space", "action": "slash_command", "command": "voice toggle",
+         "description": "Toggle local voice dictation on/off"}
+      ]
+    }"#;
+
+    #[test]
+    fn legacy_provides_sidecar_manifest_still_loads_extension_and_commands() {
+        let root = tempdir();
+        let dir = root.join("local-voice");
+        fs::create_dir_all(dir.join(".synaps-plugin")).unwrap();
+        fs::write(
+            dir.join(".synaps-plugin").join("plugin.json"),
+            LEGACY_SIDECAR_PLUGIN_JSON,
+        )
+        .unwrap();
+
+        let (plugins, _skills) = load_all(std::slice::from_ref(&root));
+        assert_eq!(plugins.len(), 1, "a provides.sidecar manifest must still load");
+        let p = &plugins[0];
+        assert_eq!(p.name, "local-voice");
+        let ext = p.extension.as_ref().expect("extension block kept");
+        assert_eq!(ext.command, "bin/synaps-voice-plugin");
+        let m = p.manifest.as_ref().unwrap();
+        assert_eq!(m.keybinds.len(), 1);
+        assert_eq!(m.keybinds[0].command.as_deref(), Some("voice toggle"));
+        assert_eq!(m.settings.as_ref().unwrap().categories[0].id, "voice");
+
+        let reg = crate::skills::registry::CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            plugins.clone(),
+        );
+        match reg.resolve("voice") {
+            crate::skills::registry::Resolution::PluginCommand(c) => {
+                assert_eq!(c.plugin, "local-voice");
+                assert!(matches!(
+                    c.backend,
+                    crate::skills::registry::RegisteredPluginCommandBackend::Interactive { .. }
+                ));
+            }
+            _ => panic!("`voice` must resolve to the plugin's own command"),
+        }
+        let cats = reg.plugin_settings_categories();
+        assert_eq!(cats.len(), 1);
+        assert!(
+            cats[0].fields.iter().all(|f| f.key == "backend"),
+            "no field is injected into the plugin's settings any more"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_provides_sidecar_gets_one_warning_line() {
+        let w = removed_sidecar_warning("local-voice", LEGACY_SIDECAR_PLUGIN_JSON)
+            .expect("provides.sidecar warns");
+        assert!(w.contains("local-voice") && w.contains("no longer supported"), "{w}");
+        assert!(removed_sidecar_warning("plain", r#"{"name":"plain"}"#).is_none());
     }
 
     /// Create a unique tempdir under /tmp for tests.

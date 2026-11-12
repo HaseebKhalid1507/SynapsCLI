@@ -54,12 +54,9 @@ impl PluginPermissionSummary {
 
 pub fn summarize_plugin_permissions(plugin: &Plugin) -> PluginPermissionSummary {
     let has_setup_script = plugin
-        .manifest
+        .extension
         .as_ref()
-        .and_then(|m| m.provides.as_ref())
-        .and_then(|p| p.sidecar.as_ref())
-        .and_then(|s| s.setup.as_ref())
-        .is_some();
+        .is_some_and(|e| e.setup.is_some());
 
     let Some(extension) = &plugin.extension else {
         return PluginPermissionSummary {

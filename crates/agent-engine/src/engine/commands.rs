@@ -131,14 +131,6 @@ pub enum CommandResult {
         command: std::sync::Arc<crate::skills::registry::RegisteredPluginCommand>,
         arg: String,
     },
-
-    /// Sidecar toggle/status.
-    SidecarToggle {
-        plugin_id: Option<String>,
-    },
-    SidecarStatus {
-        plugin_id: Option<String>,
-    },
 }
 
 /// TUI-specific modals the engine can request.

@@ -146,10 +146,6 @@ pub(crate) struct RuntimeSnapshot {
     /// at modal-open time. Each entry contributes a category row in the
     /// left pane and a list of fields in the right pane. Path B Phase 4.
     pub plugin_categories: Vec<synaps_cli::skills::registry::PluginSettingsCategory>,
-    /// Phase 8 8A.4: lifecycle claims used by `schema::visible_categories`
-    /// to hide the legacy global `Sidecar` page when a plugin has staked a
-    /// claim with a `settings_category`.
-    pub lifecycle_claims: Vec<synaps_cli::skills::registry::LifecycleClaim>,
     /// Dynamic thinking level options for the active model.
     /// For Codex models: the exact ordered supported levels from the catalog.
     /// For all other models: the conservative legacy set.
@@ -232,7 +228,6 @@ impl RuntimeSnapshot {
             local_url_explicit: synaps_cli::auth::broker::local_endpoint_config(),
             model_health,
             plugin_categories: registry.plugin_settings_categories(),
-            lifecycle_claims: registry.lifecycle_claims(),
             thinking_options: thinking_options_for_model(runtime.model()),
             catalog_overrides: std::collections::BTreeMap::new(),
             reasoning_type: reasoning_type_for_model(runtime.model()).to_string(),
@@ -363,15 +358,12 @@ impl SettingsState {
     }
 
     /// Settings in the currently selected category.
-    pub fn current_settings(&self, snap: &RuntimeSnapshot) -> Vec<&'static SettingDef> {
-        // `category_idx` indexes the *visible* category list (built-ins with any
-        // hidden `Sidecar` removed) followed by plugin categories — NOT the
-        // static `CATEGORIES` array. Map through the visible list: a plugin
-        // position, or a stale index past the list (plugin hot-reloaded while
-        // the modal is open), yields no built-in settings instead of
-        // mis-mapping onto a static-array neighbour (e.g. returning Sidecar's
-        // keybind for a plugin category) or panicking on an out-of-bounds index.
-        let visible = schema::visible_categories(&snap.lifecycle_claims);
+    pub fn current_settings(&self, _snap: &RuntimeSnapshot) -> Vec<&'static SettingDef> {
+        // `category_idx` indexes the visible built-in categories followed by
+        // plugin categories. A plugin position, or a stale index past the
+        // list (plugin hot-reloaded while the modal is open), yields no
+        // built-in settings instead of panicking on an out-of-bounds index.
+        let visible = schema::visible_categories();
         let Some(&cat) = visible.get(self.category_idx) else {
             return Vec::new();
         };
@@ -391,7 +383,7 @@ impl SettingsState {
     /// True iff `category_idx` points past the built-in categories at a
     /// plugin-declared category from `snap.plugin_categories`.
     pub fn is_plugin_category(&self, snap: &RuntimeSnapshot) -> bool {
-        let n_builtin = schema::visible_categories(&snap.lifecycle_claims).len();
+        let n_builtin = schema::visible_categories().len();
         self.category_idx >= n_builtin
             && self.category_idx - n_builtin < snap.plugin_categories.len()
     }
@@ -406,7 +398,7 @@ impl SettingsState {
             return None;
         }
         snap.plugin_categories
-            .get(self.category_idx - schema::visible_categories(&snap.lifecycle_claims).len())
+            .get(self.category_idx - schema::visible_categories().len())
     }
 
     /// Plugin field at `setting_idx` within the current plugin category.
@@ -422,9 +414,8 @@ impl SettingsState {
 #[cfg(test)]
 mod wireup_tests {
     use super::*;
-    use synaps_cli::skills::registry::LifecycleClaim;
 
-    fn snap_with_claims(claims: Vec<LifecycleClaim>) -> RuntimeSnapshot {
+    fn snap() -> RuntimeSnapshot {
         RuntimeSnapshot {
             model: "m".into(),
             thinking: "medium".into(),
@@ -443,7 +434,6 @@ mod wireup_tests {
             local_url_explicit: None,
             model_health: std::collections::HashMap::new(),
             plugin_categories: Vec::new(),
-            lifecycle_claims: claims,
             thinking_options: vec![
                 "low".into(),
                 "medium".into(),
@@ -457,76 +447,24 @@ mod wireup_tests {
         }
     }
 
-    fn claim(settings_category: Option<&str>) -> LifecycleClaim {
-        LifecycleClaim {
-            plugin: "p".into(),
-            command: "capture".into(),
-            settings_category: settings_category.map(|s| s.into()),
-            display_name: "Sample".into(),
-            importance: 0,
-        }
-    }
-
-    #[test]
-    fn visible_categories_excludes_sidecar_when_claim_present() {
-        let snap = snap_with_claims(vec![claim(Some("capture"))]);
-        let v = schema::visible_categories(&snap.lifecycle_claims);
-        assert!(!v.contains(&schema::Category::Sidecar));
-    }
-
-    #[test]
-    fn visible_categories_includes_sidecar_when_no_claim_settings_category() {
-        let snap_empty = snap_with_claims(Vec::new());
-        assert!(schema::visible_categories(&snap_empty.lifecycle_claims)
-            .contains(&schema::Category::Sidecar));
-
-        let snap_no_cat = snap_with_claims(vec![claim(None)]);
-        assert!(schema::visible_categories(&snap_no_cat.lifecycle_claims)
-            .contains(&schema::Category::Sidecar));
-    }
-
     #[test]
     fn current_settings_maps_plugin_category_to_empty_not_static_neighbour() {
-        // Regression (PR#60 review). `category_idx` indexes the VISIBLE category
-        // list (built-ins minus a hidden Sidecar) followed by plugin categories —
-        // NOT the static `CATEGORIES` array. Two failure modes pinned here:
-        //  (1) silverhand: an index past the list must not panic.
-        //  (2) shady: with Sidecar hidden, the first plugin category sits at
-        //      idx == visible_len (6). The OLD `CATEGORIES[6]` returned Sidecar's
-        //      keybind def for that plugin category (silent mis-map that let a
-        //      keypress rewire the sidecar toggle). It must resolve to empty.
+        // Regression (PR#60 review). `category_idx` indexes the visible
+        // built-in categories followed by plugin categories. An index past
+        // the list must not panic, and the first plugin position must
+        // resolve to no built-in settings.
         let mut state = SettingsState::new();
+        let snap = snap();
+        let visible = schema::visible_categories();
 
-        // --- No plugin claim: all 7 built-ins visible, Sidecar present. ---
-        let snap_plain = snap_with_claims(Vec::new());
-        // One past the array must not panic and must be empty (silverhand).
-        state.category_idx = schema::CATEGORIES.len();
-        assert!(state.current_settings(&snap_plain).is_empty());
-        assert!(state.current_setting(&snap_plain).is_none());
-        state.category_idx = schema::CATEGORIES.len() + 5;
-        assert!(state.current_settings(&snap_plain).is_empty());
-        assert!(state.current_setting(&snap_plain).is_none());
-
-        // --- Plugin claim present: Sidecar hidden, visible list len 6. ---
-        let snap_claimed = snap_with_claims(vec![claim(Some("capture"))]);
-        let visible = schema::visible_categories(&snap_claimed.lifecycle_claims);
-        assert_eq!(
-            visible.len(),
-            schema::CATEGORIES.len() - 1,
-            "Sidecar should be hidden when a plugin claims a settings_category"
-        );
-
-        // idx == visible_len is the first PLUGIN position — must be empty, NOT
-        // Sidecar's settings (shady's silent-mis-map blocker).
         state.category_idx = visible.len();
-        assert!(
-            state.current_settings(&snap_claimed).is_empty(),
-            "first plugin category must return NO built-in settings (not Sidecar's)"
-        );
-        assert!(state.current_setting(&snap_claimed).is_none());
+        assert!(state.current_settings(&snap).is_empty());
+        assert!(state.current_setting(&snap).is_none());
+        state.category_idx = visible.len() + 5;
+        assert!(state.current_settings(&snap).is_empty());
+        assert!(state.current_setting(&snap).is_none());
 
-        // Every built-in position still maps to exactly its own settings —
-        // proves the visible-list mapping didn't regress in-range lookups.
+        // Every built-in position maps to exactly its own settings.
         for (idx, &cat) in visible.iter().enumerate() {
             state.category_idx = idx;
             let expected = if cat == schema::Category::Plugins || cat == schema::Category::Providers
@@ -539,7 +477,7 @@ mod wireup_tests {
                     .count()
             };
             assert_eq!(
-                state.current_settings(&snap_claimed).len(),
+                state.current_settings(&snap).len(),
                 expected,
                 "built-in category at idx {idx} mapped to the wrong settings"
             );

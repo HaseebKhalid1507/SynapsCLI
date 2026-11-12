@@ -244,7 +244,6 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "auth",
     "ping",
     "keybinds",
-    "sidecar",
     "watch",
 ];
 
@@ -278,38 +277,7 @@ pub async fn register(
         "loaded plugins and skills"
     );
 
-    // Build keybind registry from plugin manifests
-    let mut kb_registry = keybinds::KeybindRegistry::new();
-    for plugin in &plugins {
-        if let Some(ref manifest) = plugin.manifest {
-            if !manifest.keybinds.is_empty() {
-                kb_registry.register_plugin(&manifest.name, &manifest.keybinds, &plugin.root);
-                tracing::info!(
-                    plugin = manifest.name.as_str(),
-                    count = manifest.keybinds.len(),
-                    "registered plugin keybinds"
-                );
-            }
-        }
-    }
-
-    // Apply user keybind overrides from config
-    if !config.keybinds.is_empty() {
-        kb_registry.register_user(&config.keybinds);
-    }
-
-    // Synthesize the sidecar toggle keybind. The selected key in
-    // `sidecar_toggle_key` is the *only* active sidecar toggle binding —
-    // there's no plugin-level F8 anymore, so picking a value in
-    // /settings → Sidecar fully replaces the previous chord. Defaults to
-    // F8 when no value has been chosen.
-    let sidecar_key = crate::config::read_config_value("sidecar_toggle_key")
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "F8".to_string());
-    let mut overrides = std::collections::HashMap::new();
-    overrides.insert(sidecar_key, "/sidecar toggle".to_string());
-    kb_registry.register_user(&overrides);
+    let kb_registry = build_keybind_registry(&plugins, &config.keybinds);
 
     let registry = Arc::new(CommandRegistry::new_with_plugins(
         BUILTIN_COMMANDS,
@@ -327,6 +295,31 @@ pub async fn register(
     (registry, Arc::new(std::sync::RwLock::new(kb_registry)))
 }
 
+/// Keybinds from plugin manifests, then the user's `keybinds` config on top.
+/// Core binds no key of its own here.
+fn build_keybind_registry(
+    plugins: &[Plugin],
+    user_keybinds: &std::collections::HashMap<String, String>,
+) -> keybinds::KeybindRegistry {
+    let mut kb_registry = keybinds::KeybindRegistry::new();
+    for plugin in plugins {
+        if let Some(ref manifest) = plugin.manifest {
+            if !manifest.keybinds.is_empty() {
+                kb_registry.register_plugin(&manifest.name, &manifest.keybinds, &plugin.root);
+                tracing::info!(
+                    plugin = manifest.name.as_str(),
+                    count = manifest.keybinds.len(),
+                    "registered plugin keybinds"
+                );
+            }
+        }
+    }
+    if !user_keybinds.is_empty() {
+        kb_registry.register_user(user_keybinds);
+    }
+    kb_registry
+}
+
 /// Re-walks discovery roots and swaps in the new skill set atomically.
 /// Built-ins and the existing `load_skill` tool registration are unchanged.
 pub fn reload_registry(registry: &CommandRegistry, config: &crate::SynapsConfig) {
@@ -337,4 +330,20 @@ pub fn reload_registry(registry: &CommandRegistry, config: &crate::SynapsConfig)
     }
     tracing::info!(skills = skills.len(), "reloaded skills");
     registry.rebuild_with_plugins(skills, plugins);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    /// The sidecar system is gone: core binds no toggle key (F8 was the
+    /// old default), and an empty install binds nothing at all.
+    #[test]
+    fn core_binds_no_sidecar_toggle_key() {
+        let reg = build_keybind_registry(&[], &std::collections::HashMap::new());
+        assert!(reg.match_key(KeyCode::F(8), KeyModifiers::NONE).is_none());
+        assert!(reg.custom_binds().is_empty(), "core added a bind of its own");
+        assert!(!BUILTIN_COMMANDS.contains(&"sidecar"));
+    }
 }
