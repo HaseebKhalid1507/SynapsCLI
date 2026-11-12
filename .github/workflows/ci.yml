@@ -42,8 +42,8 @@ jobs:
   # sharded or the `#[serial]` guarantees stop holding.
   #
   # It runs under a seeded, realistic HOME (Claude Code identity line,
-  # memory.backend = axel, context_management.mode = auto, a dummy
-  # auth.json) instead of the runner's empty one, which could never see a
+  # an old memory.backend = axel line that must only warn,
+  # context_management.mode = auto, a dummy auth.json) instead of the runner's empty one, which could never see a
   # test reading the developer's real ~/.synaps-cli. Any test that writes
   # into that HOME fails the job. The whole workspace, so a new test binary
   # needs no list entry. Same suite as before: the cost is seconds (seeding
@@ -146,40 +146,6 @@ jobs:
       - run: cargo test --locked --no-fail-fast --test "daemon_*"
       - run: cargo test --locked --no-fail-fast -p synaps-tui --lib
       - run: 'cargo test --locked --no-fail-fast -p synaps-engine --lib -- events::socket ipc:: tools::unix_programs tools::search tools::grep tools::find tools::ls'
-
-  # The Axel memory sidecar is its own workspace (its own Cargo.lock and
-  # dependency graph), so nothing above builds it. Its `axel` dependency is
-  # a public git repo pinned by rev; no credentials needed.
-  sidecar:
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: sidecars/axel-memory-service
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: sidecars/axel-memory-service
-          save-if: ${{ github.event_name == 'push' }}
-      - run: cargo build --locked
-      - run: cargo test --locked
-
-  # The sidecar's macOS-only code (`private_path` volfs, unsafe libc calls)
-  # is compiled by nothing else. Check it, tests included.
-  sidecar-macos-check:
-    runs-on: macos-latest
-    defaults:
-      run:
-        working-directory: sidecars/axel-memory-service
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: sidecars/axel-memory-service
-          save-if: ${{ github.event_name == 'push' }}
-      - run: cargo check --all-targets --locked
 
   ignore-ratchet:
     runs-on: ubuntu-24.04

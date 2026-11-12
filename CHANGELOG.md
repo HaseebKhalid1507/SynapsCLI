@@ -327,6 +327,14 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **The Axel memory helper's source and its CI jobs.** `sidecars/axel-memory-service`
+  (the `synaps-axel-memory-service` process the memory backend started, with
+  its copy of the forum contract) is deleted, with the CI jobs `sidecar` and
+  `sidecar-macos-check` that built and checked it. Nothing in Synaps started
+  it since the backend switch was removed. An installed copy keeps working for
+  whatever still calls it, but nothing here builds a new one. Upgrading from a
+  `memory.backend = axel` setup is described in `docs/upgrading/0.12.0.md`
+  (new).
 - **Repository identity.** The opt-in Git repository identity (a random key
   kept in `synaps-memory-identity.json` in Git's common directory, shared by
   every worktree of a repository) is gone with the backend it served:

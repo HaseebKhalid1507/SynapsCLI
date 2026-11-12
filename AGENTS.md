@@ -28,8 +28,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings  # linting (CI ga
 **Build/test worker ceiling (preference):** always use at most **8 workers**
 for Synaps builds/tests (`CARGO_BUILD_JOBS=8` or `cargo -j 8`, test harness
 `--test-threads=8` maximum; use `1` for PTY/environment-sensitive suites).
-Repository `.cargo/config.toml` supplies these defaults. Apply the same ceiling
-to the independently built Axel sidecar; do not multiply parallel build jobs.
+Repository `.cargo/config.toml` supplies these defaults; do not multiply
+parallel build jobs.
 
 **Minimum Rust:** 1.88 (edition 2021).
 **Platforms:** Linux, macOS and Windows 10/11. CI runs the full suite on Linux; macOS gets `cargo check` and the `git_program` tests; Windows gets clippy in both feature sets (default and `--no-default-features`), the `daemon_*` integration tests and `cargo test -p synaps-tui --lib` — the rest of the suite isn't run there yet. Gate Unix-only code and tests with `#[cfg(unix)]` (or `target_os = "linux"` for procfs/systemd); the Windows CI job is the only build that compiles the `cfg(windows)` code.
@@ -123,7 +123,7 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── multi_edit.rs     — anchored edits across files, all or nothing (docs/multi-edit.md)
 │   ├── powershell.rs     — PowerShell tool (Windows only; shares the bash tool's runner)
 │   ├── subagent/         — reactive lifecycle: start, status, steer, collect, resume, authorize_model, finalize + oneshot
-│   ├── memory/           — memory_store, memory_search, memory_fetch, memory_forget, memory_context tools
+│   ├── memory.rs         — memory_store, memory_search, memory_fetch, memory_forget tools
 │   ├── agent.rs          — (legacy — prefer the subagent tools)
 │   ├── extension.rs      — extension-provided tool wrapper
 │   ├── respond.rs        — event-bus response tool
@@ -225,7 +225,7 @@ Project-scoped persistent memory in `crates/agent-core/src/memory/`:
 - **Store**: JSONL files at `~/.synaps-cli/memory/<project>/`, one record per line.
 - **Index**: Lexical substring index for fast search without external dependencies.
 - **Sensitivity**: Three classes — `normal` (full access), `sensitive` (redacted in exports/logs), `secret` (never returned via tool calls).
-- **Tools**: `memory_store`, `memory_search` (returns descriptors with snippets), `memory_fetch` (full bodies by ID), `memory_forget` (tombstone), `memory_context` (session lifecycle control).
+- **Tools**: `memory_store`, `memory_search` (returns descriptors with snippets), `memory_fetch` (full bodies by ID), `memory_forget` (tombstone).
 
 Records have stable IDs, model provenance, tags, timestamps, and optional TTL. The system is designed for agents to accumulate project knowledge across sessions.
 
