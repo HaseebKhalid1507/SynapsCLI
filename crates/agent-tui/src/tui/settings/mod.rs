@@ -358,7 +358,7 @@ impl SettingsState {
     }
 
     /// Settings in the currently selected category.
-    pub fn current_settings(&self, _snap: &RuntimeSnapshot) -> Vec<&'static SettingDef> {
+    pub fn current_settings(&self) -> Vec<&'static SettingDef> {
         // `category_idx` indexes the visible built-in categories followed by
         // plugin categories. A plugin position, or a stale index past the
         // list (plugin hot-reloaded while the modal is open), yields no
@@ -376,8 +376,8 @@ impl SettingsState {
             .collect()
     }
 
-    pub fn current_setting(&self, snap: &RuntimeSnapshot) -> Option<&'static SettingDef> {
-        self.current_settings(snap).get(self.setting_idx).copied()
+    pub fn current_setting(&self) -> Option<&'static SettingDef> {
+        self.current_settings().get(self.setting_idx).copied()
     }
 
     /// True iff `category_idx` points past the built-in categories at a
@@ -415,38 +415,6 @@ impl SettingsState {
 mod wireup_tests {
     use super::*;
 
-    fn snap() -> RuntimeSnapshot {
-        RuntimeSnapshot {
-            model: "m".into(),
-            thinking: "medium".into(),
-            context_window: "auto".into(),
-            compaction_model: "m".into(),
-            max_tool_output: 0,
-            bash_timeout: 0,
-            bash_max_timeout: 0,
-            subagent_timeout: 0,
-            api_retries: 0,
-            theme_name: "t".into(),
-            background_opaque: true,
-            plugins: Vec::new(),
-            disabled_plugins: Vec::new(),
-            provider_key_status: std::collections::BTreeMap::new(),
-            local_url_explicit: None,
-            model_health: std::collections::HashMap::new(),
-            plugin_categories: Vec::new(),
-            thinking_options: vec![
-                "low".into(),
-                "medium".into(),
-                "high".into(),
-                "xhigh".into(),
-                "adaptive".into(),
-            ],
-            catalog_overrides: std::collections::BTreeMap::new(),
-            reasoning_type: "budget (legacy)".into(),
-            anthropic_subscription: false,
-        }
-    }
-
     #[test]
     fn current_settings_maps_plugin_category_to_empty_not_static_neighbour() {
         // Regression (PR#60 review). `category_idx` indexes the visible
@@ -454,15 +422,14 @@ mod wireup_tests {
         // the list must not panic, and the first plugin position must
         // resolve to no built-in settings.
         let mut state = SettingsState::new();
-        let snap = snap();
         let visible = schema::visible_categories();
 
         state.category_idx = visible.len();
-        assert!(state.current_settings(&snap).is_empty());
-        assert!(state.current_setting(&snap).is_none());
+        assert!(state.current_settings().is_empty());
+        assert!(state.current_setting().is_none());
         state.category_idx = visible.len() + 5;
-        assert!(state.current_settings(&snap).is_empty());
-        assert!(state.current_setting(&snap).is_none());
+        assert!(state.current_settings().is_empty());
+        assert!(state.current_setting().is_none());
 
         // Every built-in position maps to exactly its own settings.
         for (idx, &cat) in visible.iter().enumerate() {
@@ -477,7 +444,7 @@ mod wireup_tests {
                     .count()
             };
             assert_eq!(
-                state.current_settings(&snap).len(),
+                state.current_settings().len(),
                 expected,
                 "built-in category at idx {idx} mapped to the wrong settings"
             );

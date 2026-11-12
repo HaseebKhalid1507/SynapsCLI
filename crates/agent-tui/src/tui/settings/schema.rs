@@ -50,8 +50,8 @@ pub(crate) const CATEGORIES: [Category; 10] = [
 
 /// The built-in categories shown in the modal, in order. Plugin
 /// categories follow them.
-pub(crate) fn visible_categories() -> Vec<Category> {
-    CATEGORIES.to_vec()
+pub(crate) fn visible_categories() -> &'static [Category] {
+    &CATEGORIES
 }
 
 pub(crate) enum EditorKind {

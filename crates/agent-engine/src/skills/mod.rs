@@ -250,6 +250,10 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
 /// Load all skills, apply disable filters, build the command registry,
 /// build the keybind registry, and register the `load_skill` tool.
 /// Returns (command_registry, keybind_registry).
+///
+/// Core binds no key here: every bind comes from plugin manifests or the
+/// user's `keybinds` config, through [`build_keybind_registry`] (F8 used
+/// to be bound for the removed sidecar toggle).
 pub async fn register(
     tools: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
     config: &crate::SynapsConfig,
@@ -344,6 +348,5 @@ mod tests {
         let reg = build_keybind_registry(&[], &std::collections::HashMap::new());
         assert!(reg.match_key(KeyCode::F(8), KeyModifiers::NONE).is_none());
         assert!(reg.custom_binds().is_empty(), "core added a bind of its own");
-        assert!(!BUILTIN_COMMANDS.contains(&"sidecar"));
     }
 }

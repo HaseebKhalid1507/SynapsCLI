@@ -161,7 +161,7 @@ fn render_settings(
         return;
     }
     let focused = state.focus == Focus::Right;
-    let settings = state.current_settings(snap);
+    let settings = state.current_settings();
     let selected_key = settings.get(state.setting_idx).map(|d| d.key);
     let mut lines = section_title(p, current_cat.label());
     let mut focus = (0, 0);

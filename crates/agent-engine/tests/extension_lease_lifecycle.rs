@@ -1080,7 +1080,7 @@ async fn hook_class_first_authorized_matching_event_starts_once() {
 async fn user_lifecycle_class_stays_user_triggered() {
     hermetic_base_dir::pin();
     let fx = fixture_with(
-        "sidecar-class",
+        "user-class",
         "ok",
         json!([]),
         None,

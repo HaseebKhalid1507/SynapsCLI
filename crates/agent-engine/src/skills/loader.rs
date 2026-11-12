@@ -1215,6 +1215,16 @@ mod tests {
         assert_eq!(p.name, "local-voice");
         let ext = p.extension.as_ref().expect("extension block kept");
         assert_eq!(ext.command, "bin/synaps-voice-plugin");
+        // The extension manager's pre-spawn step accepts it: permissions and
+        // hooks validate, and with no `deferred` block it is an eager extension.
+        let validated = ext.validate("local-voice").expect("extension manifest validates");
+        assert!(validated
+            .permissions
+            .has(crate::extensions::permissions::Permission::AudioInput));
+        assert_eq!(
+            crate::extensions::lifecycle::classify(ext),
+            crate::extensions::lifecycle::ExtensionClass::LegacyEager
+        );
         let m = p.manifest.as_ref().unwrap();
         assert_eq!(m.keybinds.len(), 1);
         assert_eq!(m.keybinds[0].command.as_deref(), Some("voice toggle"));

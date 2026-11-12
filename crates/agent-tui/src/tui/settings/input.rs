@@ -298,7 +298,7 @@ pub(crate) fn handle_event(
             InputOutcome::None
         }
         (KeyCode::Left, _) | (KeyCode::Right, _) if state.focus == Focus::Right => {
-            if let Some(def) = state.current_setting(snap) {
+            if let Some(def) = state.current_setting() {
                 let dyn_opts: Vec<String>;
                 let opts_ref: &[&str];
                 let dyn_strs: Vec<&str>;
@@ -342,7 +342,7 @@ pub(crate) fn handle_event(
             InputOutcome::None
         }
         (KeyCode::Enter, _) if state.focus == Focus::Right => {
-            if let Some(def) = state.current_setting(snap) {
+            if let Some(def) = state.current_setting() {
                 match def.editor {
                     EditorKind::Text { numeric } => {
                         state.row_error = None;
@@ -692,7 +692,7 @@ fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
     } else if cat == super::schema::Category::Providers {
         synaps_cli::runtime::openai::registry::providers().len() + 1 // +1 for Local row
     } else {
-        state.current_settings(snap).len()
+        state.current_settings().len()
     }
 }
 
@@ -991,12 +991,12 @@ mod tests {
         let mut state = SettingsState::new();
         state.set_focus(Focus::Right);
         let idx = state
-            .current_settings(&s)
+            .current_settings()
             .iter()
             .position(|d| d.key == "reasoning_type")
             .expect("reasoning_type row must exist in the Model category");
         state.setting_idx = idx;
-        let def = state.current_setting(&s).unwrap();
+        let def = state.current_setting().unwrap();
         assert!(matches!(def.editor, EditorKind::Display));
         assert_eq!(current_value_for(def, &s), "effort");
 

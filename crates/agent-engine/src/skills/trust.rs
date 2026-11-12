@@ -53,15 +53,10 @@ impl PluginPermissionSummary {
 }
 
 pub fn summarize_plugin_permissions(plugin: &Plugin) -> PluginPermissionSummary {
-    let has_setup_script = plugin
-        .extension
-        .as_ref()
-        .is_some_and(|e| e.setup.is_some());
-
     let Some(extension) = &plugin.extension else {
         return PluginPermissionSummary {
             has_executable_extension: false,
-            has_setup_script,
+            has_setup_script: false,
             permissions: Vec::new(),
             hooks: Vec::new(),
             config_keys: Vec::new(),
@@ -96,7 +91,7 @@ pub fn summarize_plugin_permissions(plugin: &Plugin) -> PluginPermissionSummary 
 
     PluginPermissionSummary {
         has_executable_extension: true,
-        has_setup_script,
+        has_setup_script: extension.setup.is_some(),
         permissions,
         hooks,
         config_keys,
@@ -126,6 +121,47 @@ mod tests {
             extension,
             manifest: None,
         }
+    }
+
+    /// Load one plugin from a `plugin.json` body, the way the install
+    /// trust prompt does (`load_all` over the parent folder).
+    fn loaded(name: &str, manifest_json: &str) -> Plugin {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(name).join(".synaps-plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.json"), manifest_json).unwrap();
+        let (mut plugins, _) = crate::skills::loader::load_all(&[root.path().to_path_buf()]);
+        assert_eq!(plugins.len(), 1, "{name} must load");
+        plugins.remove(0)
+    }
+
+    const SETUP_LINE: &str = "⚠ runs setup script on install";
+
+    #[test]
+    fn extension_setup_shows_the_setup_script_warning() {
+        let p = loaded(
+            "with-setup",
+            r#"{"name":"with-setup","extension":{"protocol_version":1,"runtime":"process",
+               "command":"bin/x","setup":"scripts/setup.sh","permissions":["config.subscribe"]}}"#,
+        );
+        let summary = summarize_plugin_permissions(&p);
+        assert!(summary.has_setup_script);
+        assert!(summary.lines().iter().any(|l| l == SETUP_LINE), "{:?}", summary.lines());
+    }
+
+    /// `provides.sidecar.setup` was the old slot; the block is ignored now,
+    /// so a plugin with only that and no extension has no setup script.
+    #[test]
+    fn legacy_sidecar_setup_alone_shows_no_setup_script_warning() {
+        let p = loaded(
+            "legacy-setup",
+            r#"{"name":"legacy-setup","provides":{"sidecar":{"command":"bin/x",
+               "setup":"scripts/setup.sh","protocol_version":1}}}"#,
+        );
+        let summary = summarize_plugin_permissions(&p);
+        assert!(!summary.has_setup_script);
+        assert!(summary.lines().iter().all(|l| l != SETUP_LINE), "{:?}", summary.lines());
+        assert!(summary.is_empty());
     }
 
     #[test]
