@@ -192,6 +192,7 @@ mod tests {
                 registry.catalog(),
                 progressive,
                 false,
+                &[],
             );
             assert!(!rebuilt.is_stale(registry.catalog()));
             for name in FORUM.into_iter().chain(["context_checkpoint"]) {
