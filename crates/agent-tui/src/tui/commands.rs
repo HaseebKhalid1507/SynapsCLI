@@ -1720,7 +1720,6 @@ mod tests {
                     compatibility: None,
                     extension: None,
                     help_entries: vec![],
-                    provides: None,
                     settings: None,
                     commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
                         ManifestSkillPromptCommand {
