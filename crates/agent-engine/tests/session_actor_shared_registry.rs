@@ -6,6 +6,10 @@
 //!
 //! Drives the production actor → runtime → Anthropic transport against a
 //! loopback stub, like the other `session_actor_*` tests.
+//!
+//! Unix only: context management archives on Unix only (`/context auto` is
+//! refused elsewhere), so there is no second chat with it on to test against.
+#![cfg(unix)]
 
 mod session_actor_common;
 use session_actor_common::*;
@@ -229,12 +233,9 @@ fn untouched() -> (&'static str, String) {
     holds("unknown", "")
 }
 
-// Context management archives on Unix only (`/context auto` is refused
-// elsewhere), so there is no second chat with it on to test against.
 /// Two chats with context management, both mid-turn at once. Each reports
 /// its own phase and note: each chat's rollover state holds what its own
 /// model reported, and nothing of the other's.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn each_chats_checkpoint_goes_into_its_own_rollover_state() {
@@ -286,7 +287,6 @@ async fn each_chats_checkpoint_goes_into_its_own_rollover_state() {
 /// still offered `context_checkpoint` and its report still lands in its own
 /// state; the second is never offered the tool, and if its model calls it
 /// anyway it is refused and nothing is written anywhere.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn a_chat_without_context_management_takes_nothing_from_one_that_has_it() {
