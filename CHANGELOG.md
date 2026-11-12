@@ -341,8 +341,10 @@ All notable changes to this project will be documented in this file.
   were parsed but never read: interactive shells always ran with the
   built-in limits, and still do. They are no longer parsed or validated,
   and `SynapsConfig::shell` is gone (`ShellConfig` moved to
-  `tools::shell::config`). A config that still sets them loads; the keys
-  are ignored silently, with no warning.
+  `tools::shell::config`). A config that still sets them loads, ignores
+  them and shows one warning per start naming the keys it sets:
+  `shell.max_sessions, … no longer do anything (removed in 0.12.0; they
+  were never read): delete these lines`.
 
 - **The lexical memory index and the `memory-index` retention domain.**
   `memory::index` (the staged segment index under `<base>/memory/index/`,
@@ -370,6 +372,14 @@ All notable changes to this project will be documented in this file.
   stays) and `engine::reactor::AUTO_TURN_CAP_CONFIG_KEY`. `synaps chat` runs
   on the session actor exactly as before. A build that passes
   `--features legacy_inline` now fails: drop the flag.
+
+- **The frozen reference reactor and its differential tests.**
+  `tests/support/reference_reactor{,_ext}.rs`,
+  `tests/session_actor_differential.rs`, `tests/tui_transport_differential.rs`
+  and `scripts/tui-e2e/differential.sh` compared the actor and the TUI with
+  copies of the pre-actor code; their scenarios are now asserted directly
+  (six new actor tests in `tests/session_actor_scenarios.rs`, the rest by
+  existing actor and TUI harness tests).
 
 - **The Axel memory helper's source and its CI jobs.** `sidecars/axel-memory-service`
   (the `synaps-axel-memory-service` process the memory backend started, with
@@ -611,20 +621,6 @@ All notable changes to this project will be documented in this file.
   `skills::commands::execute_plugin_command` takes the environment to
   spawn with, `runtime::continuation::restore_window` takes the memory
   binding, and `runtime::continuation::archive_store` is gone.
-
-### Tests
-
-- **The frozen reference reactor and its differentials are gone.**
-  `tests/support/reference_reactor{,_ext}.rs`, `tests/session_actor_differential.rs`
-  and `tests/tui_transport_differential.rs` (with `scripts/tui-e2e/differential.sh`)
-  compared the actor and the TUI with copies of the pre-actor code. Their
-  scenarios are asserted directly: six new actor tests in
-  `tests/session_actor_scenarios.rs` (provider error, idle auto-turn cap,
-  steer mid-stream, event mid-stream, and the old journal save-count bounds:
-  at most one save per `MessageHistory` in a tool loop, at most two per
-  cancelled turn, plus the journal fields after a tool loop), the rest by
-  existing actor and TUI harness tests. `tests/session_identity_differential.rs` stays: it compares
-  two real paths (in-process and daemon), not an oracle.
 
 ### Fixed
 

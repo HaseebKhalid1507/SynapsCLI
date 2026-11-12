@@ -1,5 +1,5 @@
 //! Operator-only retention over the plain files under the base directory:
-//! sessions, notes, the derived note index, traces and logs.
+//! sessions, notes, traces and logs.
 //! No operator export (which can contain secret bodies) is exposed as a model tool.
 
 use anyhow::{bail, Result};

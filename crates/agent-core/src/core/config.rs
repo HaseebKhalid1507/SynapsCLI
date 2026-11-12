@@ -1138,7 +1138,7 @@ fn removed_bridge_warning() -> String {
 }
 
 /// Parse `turn_budget.<role>.<field>` keys. Invalid values warn and keep
-/// the default (parity with shell.* parsing). `Err` carries the stderr
+/// the default. `Err` carries the stderr
 /// diagnostic. `Ok(Some(warning))`: applied, with a deprecation warning for
 /// `config.warnings` (shown at TUI startup and on stderr for headless
 /// hosts).
@@ -1779,7 +1779,7 @@ fn write_comma_list_locked(key: &str, values: &[String]) -> std::io::Result<()> 
 
 /// The `shell.*` keys removed in 0.12.0. They were parsed but read by
 /// nothing (the shell tool always used its defaults). A config that still
-/// sets them loads; the keys are ignored silently, without a warning.
+/// sets them loads, ignores them and gets one warning naming the keys set.
 pub const REMOVED_SHELL_KEYS: &[&str] = &[
     "shell.max_sessions",
     "shell.idle_timeout",
@@ -1790,6 +1790,19 @@ pub const REMOVED_SHELL_KEYS: &[&str] = &[
     "shell.readiness_strategy",
     "shell.max_output",
 ];
+
+/// The one warning for the removed `shell.*` keys a config sets, named in
+/// [`REMOVED_SHELL_KEYS`] order, each once.
+fn removed_shell_keys_warning(set: &[&str]) -> String {
+    format!(
+        "{} no longer {} anything (removed in {}; {} never read): delete {}",
+        set.join(", "),
+        if set.len() == 1 { "does" } else { "do" },
+        crate::REMOVED_IN,
+        if set.len() == 1 { "it was" } else { "they were" },
+        if set.len() == 1 { "this line" } else { "these lines" },
+    )
+}
 
 /// Parse server.* configuration keys and update the ServerConfig.
 /// `Some(warning)`: a key of the removed `synaps server`, ignored; the
@@ -1983,6 +1996,7 @@ fn apply_config_content_with(
     let mut invalid_context_management = false;
     // The removed memory backend keys: which of their two warnings is due.
     let (mut removed_axel_backend, mut removed_other_backend) = (false, false);
+    let mut removed_shell_keys = [false; REMOVED_SHELL_KEYS.len()];
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2382,8 +2396,12 @@ fn apply_config_content_with(
             "memory.backend" if val != "axel" => removed_other_backend = true,
             "memory.backend" | "memory.user_scope" | "memory.axel.executable"
             | "memory.axel.brain" => removed_axel_backend = true,
-            // Removed in 0.12.0, ignored silently.
-            key if REMOVED_SHELL_KEYS.contains(&key) => {}
+            // Removed in 0.12.0: ignored, reported once after the loop.
+            key if REMOVED_SHELL_KEYS.contains(&key) => {
+                if let Some(i) = REMOVED_SHELL_KEYS.iter().position(|k| *k == key) {
+                    removed_shell_keys[i] = true;
+                }
+            }
             _ => {
                 // Handle namespaced keys
                 if key.starts_with("server.") {
@@ -2527,6 +2545,14 @@ fn apply_config_content_with(
         config.warnings.push(removed_axel_backend_warning());
     } else if removed_other_backend {
         config.warnings.push(removed_memory_backend_warning());
+    }
+    let set_shell_keys: Vec<&str> = REMOVED_SHELL_KEYS
+        .iter()
+        .zip(removed_shell_keys)
+        .filter_map(|(k, set)| set.then_some(*k))
+        .collect();
+    if !set_shell_keys.is_empty() {
+        config.warnings.push(removed_shell_keys_warning(&set_shell_keys));
     }
 }
 
@@ -5335,23 +5361,35 @@ api_retries = 5
         assert!(!cfg.events.auto_turn, "unrecognised auto_turn still fails safe to false");
     }
 
-    /// The `shell.*` keys removed in 0.12.0 are ignored silently:
-    /// whatever their values, no warning and no diagnostic.
+    /// The `shell.*` keys removed in 0.12.0 load, are ignored and get one
+    /// warning naming each key set, once, in `REMOVED_SHELL_KEYS` order.
     #[test]
-    fn removed_shell_keys_load_silently() {
-        let content = "shell.max_sessions = 10\nshell.idle_timeout = 1200\n\
-             shell.readiness_timeout_ms = 500\nshell.max_readiness_timeout_ms = lots\n\
-             shell.default_rows = 30\nshell.default_cols = 120\n\
-             shell.readiness_strategy = eventually\nshell.max_output = big\nmodel = m\n";
+    fn removed_shell_keys_warn_once() {
         assert_eq!(REMOVED_SHELL_KEYS.len(), 8);
         for key in REMOVED_SHELL_KEYS {
-            assert!(content.contains(&format!("{key} = ")), "{key} not in the sample");
             assert!(!KNOWN_CONFIG_KEYS.contains(key) && !FAMILY_CONFIG_KEYS.contains(key));
         }
-        assert_eq!(config_content_problems(content), Vec::<String>::new());
+        let expected = format!(
+            "shell.max_sessions, shell.max_output no longer do anything (removed in {}; they \
+             were never read): delete these lines",
+            crate::REMOVED_IN
+        );
+        // Two keys, one of them twice, out of order: one warning naming both.
+        let content = "shell.max_output = big\nshell.max_sessions = 10\nmodel = m\n\
+             shell.max_output = huge\n";
         let cfg = load_config_from_str(content);
-        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        assert_eq!(cfg.warnings, std::slice::from_ref(&expected), "{:?}", cfg.warnings);
         assert_eq!(cfg.model.as_deref(), Some("m"), "the rest of the file still loads");
+        assert_eq!(config_content_problems(content), [expected]);
+        let one = load_config_from_str("shell.default_rows = 30\n");
+        assert_eq!(
+            one.warnings,
+            [format!(
+                "shell.default_rows no longer does anything (removed in {}; it was never read): \
+                 delete this line",
+                crate::REMOVED_IN
+            )]
+        );
     }
 
     #[test]
