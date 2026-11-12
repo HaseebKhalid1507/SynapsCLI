@@ -28,41 +28,40 @@ All notable changes to this project will be documented in this file.
   for moving saved archives and notes into the plain-file stores from
   somewhere else. The input is JSON Lines (`-` is standard input, anything
   else must be a regular file and all inputs are opened before a line is
-  imported; blank
-  lines are skipped; a line over 16 MiB and 4 KiB is refused without being
-  read into memory): for archives one archive record per line, the object
-  an archive file holds; for notes a note line or a tombstone line. There
-  is no default destination: exactly one of `--as-recorded` (each line
-  under the project it names), `--cwd DIR` (the project of that folder, as
-  for a chat started there) or `--project-key KEY` is required; `--cwd` is refused
-  while `SYNAPS_PROJECT_ROOT` is set. Every
-  decision about a line is the store's own (`ArchiveStore::import`,
-  `import_line_in`), so a second run of the same input stores nothing and a
-  forget is never undone. Each run prints one JSON document: the inputs
-  with their line counts and SHA-256, the totals `read`, `stored`,
-  `already_present`, `forgotten`, `kept_forgotten`, `refused`, `balanced`,
-  `stopped`, a block for each project and an entry for each line with its
-  id, outcome and, when refused, the name of the check. No field holds
-  content. Exit code 0 when nothing was refused, 1 when something was or
-  when an archive forget may not have reached every copy (those ids are in
-  `forgets_not_complete`), 2 when the run stopped or the command line could
-  not be used; a store that stops at a record is named in `stopped` with
-  the record's id and the project directory. `--dry-run`
-  writes nothing (no directory, no lock file, no mode) and prints what the
-  real run prints. The base (`SYNAPS_BASE_DIR`, or `~/.synaps-cli`) must be
-  an absolute path, and a real run does not create it: an empty
-  `SYNAPS_BASE_DIR` or a base that is not there is exit code 2. A real `import-notes` holds `memory/.import.lock` for the
-  whole run and a second one stops with "another import is running"; a
+  imported; blank lines are skipped; a line over 16 MiB and 4 KiB is refused
+  without being read into memory): for archives one archive record per line,
+  the object an archive file holds; for notes a note line or a tombstone line.
+  There is no default destination: exactly one of `--as-recorded` (each line
+  under the project it names), `--cwd DIR` (the project of that folder, as for
+  a chat started there) or `--project-key KEY` is required; `--cwd` is refused
+  while `SYNAPS_PROJECT_ROOT` is set. Every decision about a line is the
+  store's own (`ArchiveStore::import`, `import_line_in`), so a second run of
+  the same input stores nothing and a forget is never undone. Each run prints
+  one JSON document: the inputs with their line counts and SHA-256, the totals
+  `read`, `stored`, `already_present`, `forgotten`, `kept_forgotten`,
+  `refused`, `balanced`, `stopped`, a block for each project and an entry for
+  each line with its id, outcome and, when refused, the name of the check. No
+  field holds content. Exit code 0 when nothing was refused, 1 when something
+  was or when an archive forget may not have reached every copy (those ids are
+  in `forgets_not_complete`), 2 when the run stopped or the command line could
+  not be used; a store that stops at a record is named in `stopped` with the
+  record's id and the project directory. `--dry-run` writes nothing (no
+  directory, no lock file, no mode) and prints what the real run prints. The
+  base (`SYNAPS_BASE_DIR`, or `~/.synaps-cli`) must be an absolute path, and a
+  real run does not create it: an empty `SYNAPS_BASE_DIR` or a base that is
+  not there is exit code 2. A real `import-notes` holds `memory/.import.lock`
+  for the whole run and a second one stops with "another import is running"; a
   note tombstone that could not be applied is counted and named
   (`tombstones_not_applied`); under `--as-recorded` its id is looked for in
   every project's notes file under the base before it is refused, so a note
-  that an earlier command stored is forgotten. `synaps memory project [--cwd DIR]` prints a
-  folder's project key, archive directory and notes file, and whether
-  `SYNAPS_PROJECT_ROOT` is overriding the folder; it creates nothing. The
-  command never reads `memory.backend` and sends no hook. New in the store:
-  `memory::store::project_notes_file`, and `open_lock_file` is public (the
-  import lock is opened with it, never through a link). See "Moving archives between
-  machines or projects" in `docs/extensions/context-archives.md`.
+  that an earlier command stored is forgotten. `synaps memory project [--cwd
+  DIR]` prints a folder's project key, archive directory and notes file, and
+  whether `SYNAPS_PROJECT_ROOT` is overriding the folder; it creates nothing.
+  The command never reads `memory.backend` and sends no hook. New in the
+  store: `memory::store::project_notes_file`, and `open_lock_file` is public
+  (the import lock is opened with it, never through a link). See "Moving
+  archives between machines or projects" in
+  `docs/extensions/context-archives.md`.
 - **Context archives: `ArchiveStore::import`**, the store side of moving
   archives into the plain-file store from somewhere else. It takes one
   archive record (the JSON object an archive file holds) and stores it as
@@ -79,10 +78,10 @@ All notable changes to this project will be documented in this file.
   A dry run writes nothing at all (no file, shelf, lock file or mode) and
   answers what the real run would. With `ArchiveStore::for_scope` and
   `existing_scope` (a project directory by its name), `record_scope` and
-  `project_scope`. Nothing calls it yet; no command, no format change.
+  `project_scope`. No format change.
 - **Extensions: `tool.call` carries `caller`**, the run that makes the call:
-  `{"actor", "group", "parent"}`, the author the host records when the same
-  run posts to the project forum. A chat and each of its workers is a run
+  `{"actor", "group", "parent"}`, the run's author (what an extension's
+  forum can record as the poster). A chat and each of its workers is a run
   of its own (workers share the chat's `group` and name the run that
   started them as `parent`; a chat has no `parent` key), so an extension
   can tell them apart. The key is absent when the call has no memory
@@ -92,8 +91,7 @@ All notable changes to this project will be documented in this file.
   of a run (`session_id` is what stays the same for a chat). Additive: an
   extension that ignores it is unaffected. See `docs/extensions/protocol.md`.
 - **Extensions: the context archive file format is a documented contract.**
-  With the built-in file store (`memory.backend = legacy`), an extension may
-  read the files under `context-archives/` directly.
+  An extension may read the files under `context-archives/` directly.
   `docs/extensions/context-archives.md` describes where they are, every field
   of the version 1 record, what `version` means, what Synaps will not change
   without a new version, what a reader must tolerate and must not do,
@@ -142,7 +140,7 @@ All notable changes to this project will be documented in this file.
   rollover is committed: every archive of the window is on disk and the new
   window is saved. A rollover that is given up before that announces
   nothing. Best effort and unordered; one
-  archive can be announced more than once. Plain-file memory backend only.
+  archive can be announced more than once.
   Additive: existing extensions are unaffected, and an extension that names
   the hook does not load on an older Synaps. A window sealed as several
   archives (see "An oversized context window no longer fails rollover"
@@ -156,7 +154,7 @@ All notable changes to this project will be documented in this file.
   or a note, the project and scope, and the calling chat's `session_id` and
   `cwd`. Ids only, no content. Notify-only like `on_context_archived`: the
   tool's result and timing never depend on an extension, and a forget that
-  failed is not announced. Sent with both memory backends. Not sent for a
+  failed is not announced. Not sent for a
   forget made by a subagent worker or by `synaps retention`; the tombstone
   on disk is the record.
 
@@ -169,7 +167,7 @@ All notable changes to this project will be documented in this file.
   read still answers `invalid archive record` for every one of them, and
   what is read and refused is unchanged.
 - **`synaps retention sweep --max-disk-bytes N` no longer deletes saved notes
-  unless `--include-notes` is given (plain-file memory).** When the budget
+  unless `--include-notes` is given.** When the budget
   was still exceeded after the derived indexes and the oldest sessions,
   traces and logs were gone, the sweep evicted notes of every class, oldest
   first, until none was left, and could then still fail because protected
@@ -181,62 +179,59 @@ All notable changes to this project will be documented in this file.
   `--max-age-days`; it can be given with `--max-disk-bytes` alone. The
   `sweep` help says what can delete notes and what cannot.
   `RetentionError::BudgetUnmet` has a new field, `notes_kept`.
-- **`synaps retention sweep --max-age-days N` no longer deletes saved notes
-  (plain-file memory).** An age sweep, run to prune sessions, traces and
-  logs, also deleted every note older than N days, whatever its retention
-  class, although a `standard` note is documented as "kept until explicitly
-  forgotten or swept by disk budget". The age now applies to sessions,
-  traces, logs and tool-output spill only. A note saved with an expiry of
-  its own (`max_age_days`) still expires by that on every sweep, a
-  forgotten note is still removed, and `--max-disk-bytes` evicts notes
-  only with `--include-notes` (entry above). `--include-notes` restores
-  the old behaviour. The Axel backend's sweep is unchanged.
+- **`synaps retention sweep --max-age-days N` no longer deletes saved notes.**
+  An age sweep, run to prune sessions, traces and logs, also deleted every
+  note older than N days, whatever its retention class, although a `standard`
+  note is documented as "kept until explicitly forgotten or swept by disk
+  budget". The age now applies to sessions, traces, logs and tool-output spill
+  only. A note saved with an expiry of its own (`max_age_days`) still expires
+  by that on every sweep, a forgotten note is still removed, and
+  `--max-disk-bytes` evicts notes only with `--include-notes` (entry above).
+  `--include-notes` restores the old behaviour.
 - **The file archive store never refuses a rollover for being full, and never
-  deletes or replaces an archive.** With `memory.backend = legacy`, a project
-  could hold 128 context archives (forgotten ones included) and 256 MiB, for
-  good; after that every rollover failed with "archive segment budget
-  exhausted" and the turn ended. New archives now go to numbered shelf
-  directories under `context-archives/<project hash>/` (`s000001/`,
-  `s000002/`, ..., 128 archives each, one `<archive id>.json` per archive)
-  with no cap on count or total size. Fetching an archive opens one file
-  instead of reading the whole store. History search returns the newest
-  matches first (it was oldest first) and stops after reading 1,024 archives
-  or 256 MiB; when that leaves older archives unread, `memory_search` with
-  `source=history` says so in one line with the number it did read. Existing `000.json` to `127.json` files keep working where they
-  are, with no migration. The limits on a single archive (16 MiB, 4,096
-  messages) are unchanged, and the files-to-Axel migration still carries at
-  most 128 archives / 256 MiB: it refuses a larger store.
-  **Downgrading:** an older Synaps pointed at the same directory sees only
-  the old slot files. Archives sealed by this version stay on disk but it
-  cannot fetch them, and a chat resumed there restarts its window count.
-- **An oversized context window no longer fails rollover.** With
-  `memory.backend = legacy`, a window over what one archive may hold (4,096
-  messages, 16 MiB, 65,536 visited nodes, or a tool input nested more than
-  about 29 levels deep) failed the seal with "archive commit failed; history
-  retained"; the turn ended, and the same window failed again on every
-  later attempt, so the chat could never roll over. Such a window is now
-  sealed as several consecutive archives. The first message of the new
-  window lists every part in order with the range of the old window it
-  covers and the number of messages stored, for example `ctx-<id> (source
-  messages #0-#2499, 2431 archived), ctx-<id> (#2500-#4999, 2402 archived)`,
-  and `memory_fetch` works on each part by its id; inside a part
-  `source_index` starts again at 0, and the message says how to find source
-  message `#i` there. A single message that is too large for
-  one archive by itself is stored with its oversized payloads left out,
-  each marked in place, and the new window says so: the one case where an
-  archive is not exact. Up to 32 parts are listed by id (the newest), and
-  fewer when naming them all would put the new window over the request
-  budget; the other
-  ones are counted with their range and found with `memory_search`. A list
-  of parts that is not the whole window, in order, fails the rollover with
-  the history kept. If sealing stops between two parts the
-  rollover fails with the history kept, as before, and the next attempt
-  does not write again a part whose content is already on disk. A window that fits one archive is
-  unchanged: the same archive, the same message, the same saved session.
-  The limits on one archive are unchanged, and `memory.backend = axel` still
-  fails on an oversized window. See `docs/specs/context-continuation.md`.
+  deletes or replaces an archive.** A project could hold 128 context archives
+  (forgotten ones included) and 256 MiB, for good; after that every rollover
+  failed with "archive segment budget exhausted" and the turn ended. New
+  archives now go to numbered shelf directories under
+  `context-archives/<project hash>/` (`s000001/`, `s000002/`, ..., 128
+  archives each, one `<archive id>.json` per archive) with no cap on count or
+  total size. Fetching an archive opens one file instead of reading the whole
+  store. History search returns the newest matches first (it was oldest first)
+  and stops after reading 1,024 archives or 256 MiB; when that leaves older
+  archives unread, `memory_search` with `source=history` says so in one line
+  with the number it did read. Existing `000.json` to `127.json` files keep
+  working where they are, with no migration. The limits on a single archive
+  (16 MiB, 4,096 messages) are unchanged. **Downgrading:** an older Synaps
+  pointed at the same directory sees only the old slot files. Archives sealed
+  by this version stay on disk but it cannot fetch them, and a chat resumed
+  there restarts its window count ("Going back to 0.11.1" in
+  `docs/upgrading/0.12.0.md`).
+- **An oversized context window no longer fails rollover.** A window over what
+  one archive may hold (4,096 messages, 16 MiB, 65,536 visited nodes, or a
+  tool input nested more than about 29 levels deep) failed the seal with
+  "archive commit failed; history retained"; the turn ended, and the same
+  window failed again on every later attempt, so the chat could never roll
+  over. Such a window is now sealed as several consecutive archives. The first
+  message of the new window lists every part in order with the range of the
+  old window it covers and the number of messages stored, for example
+  `ctx-<id> (source messages #0-#2499, 2431 archived), ctx-<id> (#2500-#4999,
+  2402 archived)`, and `memory_fetch` works on each part by its id; inside a
+  part `source_index` starts again at 0, and the message says how to find
+  source message `#i` there. A single message that is too large for one
+  archive by itself is stored with its oversized payloads left out, each
+  marked in place, and the new window says so: the one case where an archive
+  is not exact. Up to 32 parts are listed by id (the newest), and fewer when
+  naming them all would put the new window over the request budget; the other
+  ones are counted with their range and found with `memory_search`. A list of
+  parts that is not the whole window, in order, fails the rollover with the
+  history kept. If sealing stops between two parts the rollover fails with the
+  history kept, as before, and the next attempt does not write again a part
+  whose content is already on disk. A window that fits one archive is
+  unchanged: the same archive, the same message, the same saved session. The
+  limits on one archive are unchanged. See
+  `docs/specs/context-continuation.md`.
 - **A rollover waits for a busy archive store instead of failing, and reading
-  history takes no lock.** With `memory.backend = legacy`, a rollover whose
+  history takes no lock.** A rollover whose
   project archive was locked by another Synaps process failed at once with
   "archive busy". Saving an archive and `memory_forget` now wait up to 5
   seconds for the other process and only then report "archive busy" (history
@@ -351,14 +346,14 @@ All notable changes to this project will be documented in this file.
   summary's "runs setup script on install" now reflects `extension.setup`.
   See `docs/upgrading/0.12.0.md`.
 
-- **The Axel memory helper's source and its CI jobs.** `sidecars/axel-memory-service`
-  (the `synaps-axel-memory-service` process the memory backend started, with
-  its copy of the forum contract) is deleted, with the CI jobs `sidecar` and
-  `sidecar-macos-check` that built and checked it. Nothing in Synaps started
-  it since the backend switch was removed. An installed copy keeps working for
-  whatever still calls it, but nothing here builds a new one. Upgrading from a
-  `memory.backend = axel` setup is described in `docs/upgrading/0.12.0.md`
-  (new).
+- **The Axel memory helper's source and its CI jobs.**
+  `sidecars/axel-memory-service` (the `synaps-axel-memory-service` process the
+  memory backend started, with its copy of the forum contract) is deleted,
+  with the CI jobs `sidecar` and `sidecar-macos-check` that built and checked
+  it. Nothing in Synaps starts it any more (the backend switch is removed,
+  below). An installed copy keeps working for whatever still calls it, but
+  nothing here builds a new one. Upgrading from a `memory.backend = axel` setup is
+  described in `docs/upgrading/0.12.0.md` (new).
 - **Repository identity.** The opt-in Git repository identity (a random key
   kept in `synaps-memory-identity.json` in Git's common directory, shared by
   every worktree of a repository) is gone with the backend it served:
@@ -371,85 +366,77 @@ All notable changes to this project will be documented in this file.
 - **The memory backend switch.** Notes and context archives are plain files
   under the base directory, always; there is no backend to select and no
   helper process. `memory.backend`, `memory.user_scope`,
-  `memory.axel.executable` and `memory.axel.brain` are removed keys: a
-  config that still has them loads and starts as before (daemon, TUI and
-  every `synaps` subcommand), nothing about them is validated, and nothing
-  can fail because of them. `memory.backend = axel`, or any of the other
-  three with any value, gets one warning per start: `memory.backend = axel
-  is no longer supported: since 0.12.0 Synaps keeps context archives and
-  notes in plain files under its base directory, always, and Axel is an
-  extension. This session uses plain files. Archives and notes saved to the
-  Axel brain are not read any more: move them once with "axel
-  synaps-export" and "synaps memory import-archives" / "import-notes",
-  install the Axel extension for recall and the forum, then remove the
-  memory.backend, memory.user_scope and memory.axel.* lines. See
-  docs/upgrading/0.12.0.md`. A `memory.backend` line with any other value,
-  alone, gets `memory.backend is ignored: plain files are the only memory
-  storage since 0.12.0. Remove this line`. `/settings` loses the four rows
-  and its Memory page, and refuses to write one of these keys.
-  What can no longer happen: a turn refused with "selected memory backend
-  unavailable", `/context auto` refused for the backend, a chat that will
-  not continue because the Axel service could not verify its archive.
-  A resumed chat whose archive is not in its folder's store goes on at
-  window 1, and `/context status` says so: `archive ctx-<id>, which this
-  chat continues from, is not in this folder's archive store, so earlier
-  windows cannot be fetched. If you opened the chat from another folder
-  than before, open it from that one.` A chat whose folder has no project
-  gets `archive ctx-<id>, which this chat continues from, cannot be looked
-  up: this chat's folder has no project, so earlier windows cannot be
-  fetched.` instead.
-  `memory_search`, `memory_fetch`, `memory_store` and `memory_forget` have
-  no `scope` parameter any more (`docs/tools.json`). `scope: "repository"`
-  is still accepted and ignored; any other value is refused with `memory:
-  user-wide notes are not available; omit scope`. `project` is unchanged.
-  **User-wide notes (`scope=user`) have no home in Synaps now**; the ones
-  in an Axel brain stay there. `on_memory_forgotten` always has `scope:
-  "repository"`.
-  The guard that refused extension and MCP tools named like the memory
-  tools (`memory_search`, `memory:search`, ...) under the Axel backend is
-  gone: such a tool runs like any other. The extension protocol's
-  `memory.append` and `memory.query` are never refused for the backend, and
-  a plugin named `axel-memory-manager` loads like any other.
-  `synaps retention inspect | sweep | export | forget` act on the plain
+  `memory.axel.executable` and `memory.axel.brain` are removed keys: a config
+  that still has them loads and starts as before (daemon, TUI and every
+  `synaps` subcommand), nothing about them is validated, and nothing can fail
+  because of them. `memory.backend = axel`, or any of the other three with any
+  value, gets one warning per start: `The Axel memory backend (memory.backend
+  = axel, memory.user_scope, memory.axel.*) is no longer supported: since
+  0.12.0 Synaps keeps context archives and notes in plain files under its base
+  directory, always, and Axel is an extension. This session uses plain files.
+  Archives and notes saved to the Axel brain are not read any more: move them
+  once with "axel synaps-export" (Axel v2) and "synaps memory import-archives"
+  / "import-notes", install the Axel extension for recall and the forum, then
+  remove the memory.backend, memory.user_scope and memory.axel.* lines. See
+  https://github.com/HaseebKhalid1507/SynapsCLI/blob/dev/docs/upgrading/0.12.0.md`.
+  A `memory.backend` line with any other value, alone, gets `memory.backend is
+  ignored: plain files are the only memory storage since 0.12.0. Remove this
+  line`. `/settings` loses the four rows and its Memory page, and refuses to
+  write one of these keys. What can no longer happen: a turn refused with
+  "selected memory backend unavailable", `/context auto` refused for the
+  backend, a chat that will not continue because the Axel service could not
+  verify its archive. A resumed chat whose archive is not in its folder's
+  store goes on at window 1, and `/context status` says so: `archive ctx-<id>,
+  which this chat continues from, is not in this folder's archive store, so
+  earlier windows cannot be fetched. If you opened the chat from another
+  folder than before, open it from that one.` A chat whose folder has no
+  project gets `archive ctx-<id>, which this chat continues from, cannot be
+  looked up: this chat's folder has no project, so earlier windows cannot be
+  fetched.` instead. `memory_search`, `memory_fetch`, `memory_store` and
+  `memory_forget` have no `scope` parameter any more (`docs/tools.json`).
+  `scope: "repository"` is still accepted and ignored; any other value is
+  refused with `memory: user-wide notes are not available; omit scope`.
+  `project` is unchanged. **User-wide notes (`scope=user`) have no home in
+  Synaps now**; the ones in an Axel brain stay there. `on_memory_forgotten`
+  always has `scope: "repository"`. The guard that refused extension and MCP
+  tools named like the memory tools (`memory_search`, `memory:search`, ...)
+  under the Axel backend is gone: such a tool runs like any other. The
+  extension protocol's `memory.append` and `memory.query` are never refused
+  for the backend, and a plugin named `axel-memory-manager` loads like any
+  other. `synaps retention inspect | sweep | export | forget` act on the plain
   files only: the `history` domain of `forget` and the Axel reports
-  (`"backend": "axel"`, `axel-memory-index.json`) are gone.
-  Code: `memory_backend::{process, provisioning, competing}`, the `Backend`
-  enum and the RPC half of `MemoryBinding` (now the base directory, the
-  project and the run's author; `forum_author()` is `author()`,
-  `fork_for_worker()` is `for_worker()`), `MemoryBackendKind`,
-  `MemoryBackendConfig`, `context_archive::project_archive`,
-  `Runtime::apply_memory_backend_config` (now `bind_memory()`),
-  `ExtensionManager::bind_memory_backend`. The helper under
-  `sidecars/axel-memory-service` is not built or started by anything and is
-  removed separately. `docs/reviews/context-resume-axel-boundary.md` is
-  removed.
+  (`"backend": "axel"`, `axel-memory-index.json`) are gone. Code:
+  `memory_backend::{process, provisioning, competing}`, the `Backend` enum and
+  the RPC half of `MemoryBinding` (now the base directory, the project and the
+  run's author; `forum_author()` is `author()`, `fork_for_worker()` is
+  `for_worker()`), `MemoryBackendKind`, `MemoryBackendConfig`,
+  `context_archive::project_archive`, `Runtime::apply_memory_backend_config`
+  (now `bind_memory()`), `ExtensionManager::bind_memory_backend`.
+  `docs/reviews/context-resume-axel-boundary.md` is removed.
 - **The built-in project forum.** The tools `forum_post`, `forum_read` and
   `forum_forget` are gone from the registry, from workers and from
   `docs/tools.json` (26 built-in tools now), with the code behind them
   (`tools::forum`, `memory_backend::forum`, `agent_core::memory::forum`) and
   the forum paragraph core appended to every worker's system prompt under
   `memory.backend = axel`. The Axel extension serves the forum as
-  `axel:forum_post`, `axel:forum_read` and `axel:forum_forget`; tell workers
+  `axel_forum_post`, `axel_forum_read` and `axel_forum_forget` (tool ids
+  `ext.axel:forum_post`, …); forum posts in an Axel brain are not exported
+  and stay in the brain. Tell workers
   about it in `<base>/subagent-preamble.md`, which is still prepended to
   every worker prompt. A run's author stays: it is
   `agent_core::memory::author::Author`, and `tool.call` still sends it to
-  extensions as `caller`. The Axel helper keeps its copy of the forum
-  contract (`sidecars/axel-memory-service/src/forum_contract.rs`) until it
-  is removed. `docs/agent-forum.md`, `docs/specs/agent-forum.md` and
+  extensions as `caller`. `docs/agent-forum.md`, `docs/specs/agent-forum.md` and
   `docs/reviews/forum-*.md` are removed.
-- **The files-to-Axel migration.** `synaps retention memory-scope`,
-  `synaps retention upgrade-memory` and `synaps retention migrate-memory`
-  are gone, with the code behind them (`memory_backend::migration`,
-  `memory_backend::repository_migration`) and the archive store's
-  migration export (`ArchiveStore::export_records`,
-  `context_archive::export_in`, `MAX_STORE_BYTES`). Typing one of them is
-  now clap's `error: unrecognized subcommand '<name>'`, exit code 2. The
-  way to move archives and notes into the plain-file stores is `synaps
-  memory import-archives | import-notes`. `synaps retention inspect |
-  sweep | export | forget` are unchanged, on plain files and with
-  `memory.backend = axel`, except that an Axel `retention export` can no
-  longer be restored with this binary (its index says so under
-  `"restore"`). The specs `docs/specs/memory-migration.md`,
+- **The files-to-Axel migration.** `synaps retention memory-scope`, `synaps
+  retention upgrade-memory` and `synaps retention migrate-memory` are gone,
+  with the code behind them (`memory_backend::migration`,
+  `memory_backend::repository_migration`) and the archive store's migration
+  export (`ArchiveStore::export_records`, `context_archive::export_in`,
+  `MAX_STORE_BYTES`). Typing one of them is now clap's `error: unrecognized
+  subcommand '<name>'`, exit code 2. The way to move archives and notes into
+  the plain-file stores is `synaps memory import-archives | import-notes`.
+  `synaps retention inspect | sweep | export | forget` are unchanged on plain
+  files. The specs `docs/specs/memory-migration.md`,
   `shared-axel-repositories.md` and `axel-host-backend.md` are removed.
 - **The automatic-memory config keys and extension context providers.**
   The eleven keys `memory.default_mode`, `memory.default_mode_confirmed`,
@@ -464,8 +451,7 @@ All notable changes to this project will be documented in this file.
   memory was removed in 0.12.0; an extension provides capture and recall
   through hooks. Remove these lines`. The old warning that asked for
   `memory.default_mode_confirmed = true` is gone, and `/settings` refuses
-  to write one of these keys. `memory.backend`, `memory.user_scope` and
-  `memory.axel.*` are unchanged.
+  to write one of these keys.
   An extension manifest that declares `deferred.context_providers` or asks
   for the permission `context_providers.register` loads as its other parts
   say, and its tools and hooks work; the declaration is not validated,
@@ -482,18 +468,17 @@ All notable changes to this project will be documented in this file.
   `/memory` now answers `/memory was removed in 0.12.0: automatic memory is
   not built into Synaps any more; an extension provides it (Axel). Synaps
   itself captures nothing automatically.`
-- **Built-in automatic memory (capture and recall) is out of the engine.**
-  The runtime no longer holds a memory lease, asks a context provider for
-  recalled text before a turn, or sends a finished turn or a compaction
-  summary to a capture provider; the history-import preview went with them
+- **Built-in automatic memory (capture and recall) is out of the engine.** The
+  runtime no longer holds a memory lease, asks a context provider for recalled
+  text before a turn, or sends a finished turn or a compaction summary to a
+  capture provider; the history-import preview went with them
   (`runtime/memory_context.rs`, `memory_history.rs`, `chat_capture.rs`,
-  `capture_worker.rs`, `axel_context.rs`). Nothing could switch this on
-  since `/memory` and the `memory_context` tool were removed, so a turn
-  behaves as before. An extension does this work now, on the hook bus: no
-  hook kind, hook event field or protocol method changed. Unchanged too:
-  context rollover and the archive store, the four memory tools and the
-  memory backend setting. The context budget's memory lane is always
-  empty.
+  `capture_worker.rs`, `axel_context.rs`). Nothing could switch this on since
+  `/memory` and the `memory_context` tool were removed, so a turn behaves as
+  before. An extension does this work now, on the hook bus: no hook kind, hook
+  event field or protocol method changed. Unchanged too: context rollover, the
+  archive store and the four memory tools. The context budget's memory lane is
+  always empty.
 - **The per-session memory mode.** A session no longer records a memory
   choice (`SessionConfig::memory_mode`), a rebuilt runtime (unpark, daemon
   reload) no longer restores one, and no session runtime applies
@@ -501,10 +486,10 @@ All notable changes to this project will be documented in this file.
   saved reload record or a create request that still carries `memory_mode`
   loads as before; the value is read and ignored.
 - **The `memory_context` tool, `/memory` and the "Default memory mode"
-  settings row.** Built-in automatic memory (capture and recall) is leaving
+  settings row.** Built-in automatic memory (capture and recall) has left
   core for an extension, and these were its outermost users; it was off
   unless switched on by hand. The model no longer has a `memory_context`
-  tool (29 builtins; `docs/tools.json` regenerated). `/memory`, with any
+  tool. `/memory`, with any
   argument, now answers one line: `/memory was removed in 0.12.0: automatic
   memory is not built into Synaps any more; an extension provides it (Axel).
   Synaps itself captures nothing automatically.` `/settings` has no
@@ -700,13 +685,13 @@ All notable changes to this project will be documented in this file.
   of a chat's messages never produced such a record and is unchanged.
 - **A resumed head's marker is read by one rule; a log line no longer names
   the wrong host.** Two small things:
-  - A resumed chat's context head with `window` 0 in its marker was refused
-    with Axel memory and taken, archive link and all, with plain-file
-    memory. Both refuse it now: the chat goes on at window 1 without the
-    link, and a warning says so. And "has the form of an archive id" is one
-    function on the three paths that read such a marker: 32 lowercase hex
-    characters, which is what both stores write. Two of the paths took
-    capitals too; a marker naming an id in capitals is now invalid there.
+  - A resumed chat's context head with `window` 0 in its marker was taken,
+    archive link and all. It is refused now: the chat goes on at window 1
+    without the link, and a warning says so. And "has the form of an
+    archive id" is one function on the three paths that read such a marker:
+    32 lowercase hex characters, which is what the store writes. Two of the
+    paths took capitals too; a marker naming an id in capitals is now
+    invalid there.
   - The two warnings about a chat's folder that is gone or cannot be looked
     at began "daemon:", and an unpark in a host that is not the daemon
     writes them too. They no longer name a host.
@@ -742,17 +727,8 @@ All notable changes to this project will be documented in this file.
   warning with the directory and the error: after a power cut the name of a
   file newly created there may be missing. Nothing else changes: the save
   still answers as it did.
-- **`synaps retention sweep` with Axel memory: an age or a budget is refused
-  without `--include-notes`.** The Axel service's sweep deletes saved notes
-  and nothing else: every note older than `--max-age-days`, then notes
-  oldest first until `--max-disk-bytes` is met. The command passed both to
-  it whether or not `--include-notes` was given (the help said the flag had
-  "no effect with Axel"), so a sweep meant for old sessions and logs
-  deleted notes. Without the flag the command now stops before the service
-  is asked, says that notes are all that sweep can delete, and deletes
-  nothing. With the flag it does what it did.
 - **`synaps retention sweep --max-disk-bytes`: a budget that cannot be met
-  deletes nothing (plain-file memory).** A budget smaller than what the
+  deletes nothing.** A budget smaller than what the
   sweep may not delete (the sessions named chains point at, and saved notes
   when `--include-notes` is not given) can never be met. The sweep still
   deleted every other session, trace and log, oldest first, and only then
@@ -1015,7 +991,7 @@ All notable changes to this project will be documented in this file.
 - **Notes: a line with `"tags": null` is read as a note with no tags.** The
   plain-file store skipped such a line.
 - **Notes: a saved note is on disk before `memory_store` says it is saved.**
-  With the plain-file memory backend a note was written to
+  A note was written to
   `memory/project-<key>.jsonl` but not synced, so a crash or a power cut
   straight after the tool reported success could lose it. A save now syncs
   the file before it returns, and the `memory/` directory too when the file
@@ -1051,28 +1027,6 @@ All notable changes to this project will be documented in this file.
   `concurrency_key_in(input, cwd)`, which the scheduler calls; its default
   is the existing `concurrency_key(input)`, so a tool that does not
   implement it behaves as before.
-- **Daemon: automatic memory tells a memory extension the chat's project,
-  not the daemon's.** With the plain-file backend (`memory.backend` not
-  `axel`), the `project_id` in the capture and recall requests sent to a
-  memory extension was worked out from the folder the process runs in. Under
-  the daemon that is the daemon's folder: every chat's turns were captured
-  under one project id and a chat could be handed another project's
-  memories, while the same request named the chat's own folder as `cwd`.
-  The id is now the one of the chat's memory binding, made from the chat's
-  folder, as it already was with `memory.backend = axel`. What changes for
-  stored data: captures a memory extension took from daemon chats before
-  this are filed under the id of the folder the daemon was started in (a
-  `p` and 16 hex digits). Chats in other folders now ask under their own
-  project's id and no longer get them back; a chat in the daemon's own
-  folder still does. Synaps does not move them: they are in the extension's
-  store, and whether to re-file them by the folder each came from is the
-  extension's to offer. One more thing follows on the plain-file backend:
-  `/memory index-history` still previews the project of the daemon's
-  folder, and its `confirm` step, which used to import that project's
-  history from whichever chat asked, now refuses a chat in any other folder
-  ("history import identity is invalid"), because the chat's memory lease
-  is for the chat's project. Without the daemon nothing changes: the id was
-  already the one of the folder the chat runs in.
 - **Compaction on an extension-provided model runs no tools.** With
   `compaction_model` set to a non-streaming model an extension provides, a
   summary answer that contained a tool call had that call run, although a
@@ -1093,13 +1047,10 @@ All notable changes to this project will be documented in this file.
   client had stripped as a secret, if the daemon's own environment had it.
   It is now spawned with the session's environment, the one the chat's
   `bash` gets. It still runs from the plugin's own folder. A slash command
-  backed by an extension tool ran that tool with no memory binding, so the
-  tool worked one out for itself from the daemon's folder (a config read,
-  and with `memory.backend = axel` a repository lookup there, on every
-  command); it is handed the chat's. Nothing a user sees changes in the
-  second case: only whether the host's memory backend is exclusive was read
-  from it, and that does not depend on the folder. Without the daemon the
-  environment and the folder were already the chat's.
+  backed by an extension tool is handed the chat's memory binding instead of
+  working one out from the daemon's folder; nothing a user sees changes
+  there. Without the daemon the environment and the folder were already the
+  chat's.
 - **Daemon: commands run by an extension-provided model get the chat's
   environment, and its tools everything else a chat's tools get.** A model
   served by an extension (`plugin:provider:model`) runs its tool calls in a
@@ -1114,8 +1065,8 @@ All notable changes to this project will be documented in this file.
   stripped-secret notice; the `shell_*` tools have the chat's shell
   sessions (they answered "Shell sessions not available"); an extension's
   Confirm prompts the user and "Allow all" is remembered (it was refused:
-  "no interactive prompt is available"); `memory_context` and
-  `context_checkpoint` act on the chat; and output and time limits are the
+  "no interactive prompt is available"); `context_checkpoint` acts on the
+  chat; and output and time limits are the
   configured `max_tool_output`, `bash_timeout`, `bash_max_timeout` and
   `subagent_timeout`, not 30,000 bytes and 30 / 300 / 300 seconds. The
   `subagent*` tools are handed the chat's delegation policy, worker
@@ -1126,31 +1077,25 @@ All notable changes to this project will be documented in this file.
   Without the daemon the environment was already the same; the rest
   changes there too. Engine API: `tools::TurnToolContext`;
   `ToolCapabilities` is `Clone + Default`.
-- **Daemon: a chat's `context_checkpoint` reaches that chat, and no chat
-  takes a tool away from another.** Every chat on a daemon shares one tool
-  registry, and three things that belong to one chat were kept in it. A chat
-  with context management on registered `context_checkpoint`, bound to its
-  own rollover state, at the start of every turn, replacing the last chat's:
-  with two such chats mid-turn, the phase and note one reported (the note is
-  its unfinished work, up to 8,192 bytes) were written into the other's
-  state, the reporter was answered "recorded", and its own state got
-  nothing. A chat with context management off removed the tool from the
-  registry, so a chat that had it got "Unknown tool" mid-turn. And a chat
-  whose folder's project cannot be resolved (a `.git` Git cannot verify, a
-  folder that is gone) removed `forum_post`, `forum_read` and `forum_forget`
-  for every chat until the daemon restarted. Now the registry holds one
-  `context_checkpoint`, which writes to the state of the chat that called
-  it, and a chat with no use for a tool is not offered it; the registry is
-  never changed for one chat. Also gone with this: every such turn start
-  advanced the shared catalog generation, which made every other chat
-  rebuild its tool set mid-turn. A chat still sees exactly the tools it saw
-  when it was alone on a host, with three differences. `synaps tools export`
-  and `docs/tools.json` list `context_checkpoint` (30 built-ins). `disabled_tools
-  = context_checkpoint` is now obeyed; it was undone at every turn start.
-  With `progressive_tool_disclosure`, a chat with no forum no longer has the
-  three forum tools in its list of tools to activate, where they could show
-  up and then fail to activate. Engine API: `ToolCapabilities` has a
-  `continuation` field (the calling chat's rollover state),
+- **Daemon: a chat's `context_checkpoint` reaches that chat, and no chat takes
+  a tool away from another.** Every chat on a daemon shares one tool registry,
+  and three things that belong to one chat were kept in it. A chat with
+  context management on registered `context_checkpoint`, bound to its own
+  rollover state, at the start of every turn, replacing the last chat's: with
+  two such chats mid-turn, the phase and note one reported (the note is its
+  unfinished work, up to 8,192 bytes) were written into the other's state, the
+  reporter was answered "recorded", and its own state got nothing. A chat with
+  context management off removed the tool from the registry, so a chat that
+  had it got "Unknown tool" mid-turn. Now the registry holds one
+  `context_checkpoint`, which writes to the state of the chat that called it,
+  and a chat with no use for a tool is not offered it; the registry is never
+  changed for one chat. Also gone with this: every such turn start advanced
+  the shared catalog generation, which made every other chat rebuild its tool
+  set mid-turn. A chat still sees exactly the tools it saw when it was alone
+  on a host, with two differences. `synaps tools export` and `docs/tools.json`
+  list `context_checkpoint`. `disabled_tools = context_checkpoint` is now
+  obeyed; it was undone at every turn start. Engine API: `ToolCapabilities`
+  has a `continuation` field (the calling chat's rollover state),
   `ContextCheckpointTool` holds no state, `SessionToolSet::withholding`
   records what a session is not offered, and `Runtime::offered_tools_schema`
   is the registry's schema as one chat is offered it.
@@ -1160,7 +1105,7 @@ All notable changes to this project will be documented in this file.
   It now carries the chat's id and the chat's folder, like a tool call in a
   turn.
 - **Daemon: a chat resumed in the same project keeps its context-window
-  count.** With the plain-file memory backend and context management on, a
+  count.** With context management on, a
   daemon-hosted chat that was resumed (`--continue`, a daemon reload or
   restart, waking a parked chat) checked for its last archived window in the
   project of the daemon's folder instead of its own. The archive is not
@@ -1197,9 +1142,7 @@ All notable changes to this project will be documented in this file.
   tools no project. They fell back to the project of the process folder, so
   in a daemon-hosted chat `memory_store`, `memory_search`, `memory_fetch` and
   `memory_forget` read, wrote and forgot notes in the daemon's project. They
-  now use the chat's project, as tool calls in any other turn do, with either
-  memory backend. With `memory.backend = axel` the `forum_*` tools, which
-  refused there for want of a project, work for the same reason. A memory
+  now use the chat's project, as tool calls in any other turn do. A memory
   tool run with no project at all now refuses instead of guessing one.
 - **Daemon: tools called by an extension-provided model run in the chat's
   folder.** A model served by an extension (`plugin:provider:model`) runs its

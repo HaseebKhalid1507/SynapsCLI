@@ -628,7 +628,7 @@ pub fn trace_command(arg: &str, runtime: &crate::Runtime) -> CommandResult {
 /// What `/memory` answers, whatever its argument, since built-in automatic
 /// memory left core. Kept so a user who types it (or an older TUI that
 /// sends it) gets this line instead of "unknown command".
-fn memory_removed_line() -> String {
+pub fn memory_removed_line() -> String {
     format!(
         "/memory was removed in {}: automatic memory is not built into Synaps any more; an extension provides it (Axel). Synaps itself captures nothing automatically.",
         agent_core::AXEL_BACKEND_REMOVED_IN
@@ -1497,13 +1497,7 @@ mod tests {
         let mut runtime = crate::Runtime::new_headless();
         for arg in ["", "on", "status", "off", "index-history confirm", "bogus"] {
             match handle_engine_command("memory", arg, &mut runtime) {
-                Some(CommandResult::Output(text)) => assert_eq!(
-                    text,
-                    format!(
-                        "/memory was removed in {}: automatic memory is not built into Synaps any more; an extension provides it (Axel). Synaps itself captures nothing automatically.",
-                        agent_core::AXEL_BACKEND_REMOVED_IN
-                    )
-                ),
+                Some(CommandResult::Output(text)) => assert_eq!(text, memory_removed_line()),
                 other => panic!("/memory {arg}: expected the removal line, got {other:?}"),
             }
         }

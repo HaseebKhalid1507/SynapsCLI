@@ -333,9 +333,9 @@ What it means, and what it does not:
   without extensions. And like every notify-only event it can be dropped.
 - **The tombstone is the record.** Whether or not you were told, the forget
   is on disk: the archive's file now holds `"body": {"state": "tombstone"}`
-  instead of its messages, and with the plain-file backend a forgotten note
-  is a `{"tombstone": "<id>", ...}` line in the project's notes file. An
-  index that must be exact checks those when it starts.
+  instead of its messages, and a forgotten note is a
+  `{"tombstone": "<id>", ...}` line in the project's notes file. An index
+  that must be exact checks those when it starts.
 - **Removal is not announced.** When the retention sweep later deletes a
   tombstoned note for good, no event is sent.
 

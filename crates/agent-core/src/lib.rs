@@ -32,8 +32,9 @@ pub use core::session_catalog;
 pub use core::session_journal;
 pub use core::session_lock;
 
-/// The release that removed `synaps agent` and `synaps watcher`. The
-/// one-release CLI stubs and the warnings for their config keys name it.
+/// The release that removed `synaps agent`, `synaps watcher` and `synaps
+/// server`. The one-release CLI stubs and the warnings for their config keys
+/// name it.
 pub const REMOVED_IN: &str = "0.12.0";
 
 /// The release that removed the built-in Axel memory backend and built-in

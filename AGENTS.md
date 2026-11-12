@@ -792,7 +792,7 @@ The model reports task phases through `context_checkpoint`; short `memory_search
 Unix only for now. Rollover waits for a durable frontend head acknowledgement;
 journal generations prevent stale replay after head replacement. Failed saves
 block inference until recovery; this is not an exactly-once tool-effect guarantee.
-No Axel note migration is implied. See
+See
 [context-continuation spec](docs/specs/context-continuation.md) for bounds and
 the 140k/200k versus 250k–400k/1m policy.
 
