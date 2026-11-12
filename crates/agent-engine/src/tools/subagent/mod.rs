@@ -810,13 +810,29 @@ mod cache_ttl_policy_tests {
 mod preamble_tests {
     use super::{compose_system_prompt, compose_system_prompt_with_preamble};
 
+    /// The production IO seam, against a base directory of the test's own:
+    /// the prompt is the agent's text, then the preamble file and the
+    /// agent's text, and core adds nothing of its own about a forum (the
+    /// guidance it used to append is gone; a preamble may name any tool).
     #[test]
+    #[serial_test::serial(synaps_base_dir)]
     fn prompt_keeps_the_agent_text_and_adds_no_forum_guidance() {
-        // Production IO seam: whatever the local preamble state, the agent
-        // text is there and core adds nothing about a forum.
+        const REMOVED: [&str; 3] = [
+            "Project forum (when enabled)",
+            "using forum_post/forum_read",
+            "The foreman remains responsible",
+        ];
+        let base = crate::test_env::BaseDirGuard::new();
         let result = compose_system_prompt("hello world".to_string());
-        assert!(result.ends_with("hello world"));
-        assert!(!result.contains("forum_post"));
+        assert_eq!(result, "hello world");
+
+        let preamble = "Share findings with axel_forum_post.";
+        std::fs::write(base.path().join("subagent-preamble.md"), preamble).unwrap();
+        let result = compose_system_prompt("hello world".to_string());
+        assert_eq!(result, format!("{preamble}\n\nhello world"));
+        for removed in REMOVED {
+            assert!(!result.contains(removed), "{removed}");
+        }
     }
 
     #[test]

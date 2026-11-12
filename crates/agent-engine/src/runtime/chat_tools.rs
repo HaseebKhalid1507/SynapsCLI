@@ -124,7 +124,8 @@ mod tests {
     /// Progressive disclosure: a withheld tool cannot be activated. The
     /// chat with context management has `context_checkpoint`; the chat
     /// without is told there is no such tool, and neither the deferred list
-    /// nor a search shows it one.
+    /// nor a search shows it one. A chat that is offered it and has it
+    /// deferred finds it and activates it.
     #[tokio::test]
     async fn a_chat_cannot_activate_or_find_what_it_is_not_offered() {
         let registry = ToolRegistry::new();
@@ -144,6 +145,20 @@ mod tests {
         assert!(deferred(&lacks).contains(&"subagent_start".to_string()));
 
         assert!(!search(&registry, lacks.clone()).await.contains("context_checkpoint"));
+
+        // The other half: a chat that is offered the tool and has it
+        // deferred finds it and can activate it. `chat_tool_set` loads
+        // `context_checkpoint` for a chat with context management, so the
+        // deferred case is the bare progressive core with the same (empty)
+        // withheld list.
+        let mut offered = SessionToolSet::progressive_core_with(session("offered"), catalog, &[])
+            .withholding(withheld_tools(true));
+        assert!(!allowed(&registry, &offered, "context_checkpoint"));
+        assert!(deferred(&offered).contains(&"context_checkpoint".to_string()));
+        let found = search(&registry, offered.clone()).await;
+        assert!(found.contains("builtin:context_checkpoint"), "{found}");
+        activate_exact_for_user(&mut offered, catalog, &checkpoint).unwrap();
+        assert!(allowed(&registry, &offered, "context_checkpoint"));
 
         let refused = activate_exact_for_user(&mut lacks, catalog, &checkpoint).unwrap_err();
         assert!(refused.to_string().contains("does not know"), "{refused}");
