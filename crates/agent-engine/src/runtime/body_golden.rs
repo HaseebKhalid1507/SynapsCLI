@@ -327,7 +327,7 @@ pub(super) fn old_body_bytes(s: &Scenario) -> Vec<u8> {
         })
     };
 
-    // Sync transport (api_sync::call_api) never had a "stream" key — removing
+    // The removed sync transport (`call_api`) never had a "stream" key — removing
     // from a BTreeMap-backed Value is byte-identical to never inserting it.
     if !s.stream {
         body.as_object_mut().unwrap().remove("stream");

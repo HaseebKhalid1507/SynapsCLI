@@ -679,8 +679,9 @@ mod tests {
     }
 
     #[test]
-    fn both_transports_replay_and_validate_before_merging_and_cache_marker() {
-        for source in [include_str!("api.rs"), include_str!("api_sync.rs")] {
+    fn turn_transport_replays_and_validates_before_merging_and_cache_marker() {
+        {
+            let source = include_str!("api.rs");
             let first = source
                 .find("attachments::validate_history_for_request(model, messages)")
                 .unwrap();

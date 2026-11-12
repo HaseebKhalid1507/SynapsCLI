@@ -835,7 +835,7 @@ pub struct ApiOptions {
     /// What the tool calls of this turn are given, for the tool loop of an
     /// extension-provided model (`openai::extension_route`): the very
     /// [`TurnToolContext`](crate::tools::TurnToolContext) the stream loop
-    /// (or `run_single`) makes its own tools' contexts from, so that loop's
+    /// makes its own tools' contexts from, so that loop's
     /// tools run in the chat's folder with the chat's environment, for the
     /// chat. `None` (keep-warm pings, compaction, tests): a request that
     /// runs no tool for a chat; a tool that loop runs then gets
@@ -911,7 +911,7 @@ pub struct ApiOptions {
     pub telemetry: Option<crate::runtime::telemetry::TelemetryWriter>,
     /// Runtime-scoped tool-session identity (Task 16). Scopes the execution
     /// gate for extension-provider interior tool loops reached through
-    /// `try_route`. Stream turns (and `run_single`) thread the Runtime's
+    /// `try_route`. Stream turns thread the Runtime's
     /// host session; `None` (internal helpers, tests) makes the extension
     /// route fail closed to a locally minted identity with the identical
     /// default-core policy — never to ungated execution.

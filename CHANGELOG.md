@@ -334,6 +334,13 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **`Runtime::run_single` and the non-streaming turn call.** The
+  non-streaming single-prompt loop (`Runtime::run_single`) and the
+  `ApiMethods::call_api` request it made are deleted, with the tool-result
+  helpers only that loop used. Nothing in Synaps called them: every turn
+  streams. An embedder that called `run_single` should use `run_stream`.
+  Compaction's non-streaming call (`call_api_simple`) is unchanged.
+
 - **The inline `synaps chat` loop.** The pre-actor chat loop behind the
   `legacy_inline` Cargo feature and `SYNAPS_CHAT_INLINE=1` is deleted, with
   the feature itself and the engine stream adapter only it used

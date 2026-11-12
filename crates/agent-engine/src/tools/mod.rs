@@ -267,9 +267,8 @@ pub struct ToolContext {
 /// What the tool calls of one turn are given, whichever loop runs them.
 ///
 /// A turn's tool calls are run by the loop that received the model's
-/// answer: the stream loop (its serial and its parallel lane), the legacy
-/// non-stream loop (`Runtime::run_single`), or, for a model an extension
-/// provides, the loop inside the provider round
+/// answer: the stream loop (its serial and its parallel lane) or, for a
+/// model an extension provides, the loop inside the provider round
 /// (`runtime::openai::extension_route`). The host builds one of these per
 /// turn and each loop makes every call's [`ToolContext`] from it
 /// ([`Self::for_call`]). So what one loop's tools are given, the others'
