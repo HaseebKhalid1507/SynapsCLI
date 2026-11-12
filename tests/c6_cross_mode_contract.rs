@@ -327,10 +327,13 @@ fn claim_auto_turn_uniform_boundary_semantics() {
 
 // ─── T3 (request-lifecycle hardening): typed TurnOutcome cross-mode contract ──
 //
-// Spec §5.2: every frontend (chat, TUI, RPC, subagents)
-// receives the SAME typed terminal outcome — variant + correlation ID — for
-// the same failure. The engine derives it exactly once
-// (`runtime::helpers::turn_error_for`); adapters forward it verbatim.
+// Spec §5.2: every frontend (TUI, RPC, subagents) receives the SAME typed
+// terminal outcome — variant + correlation ID — for the same failure. The
+// engine derives it exactly once (`runtime::helpers::turn_error_for`);
+// adapters forward it verbatim. `synaps chat` runs on the SessionActor; its
+// provider-failure path is covered by
+// `session_actor_scenarios::provider_error_keeps_only_the_prompt_in_history`
+// and `phase1_privacy::headless_provider_failure_exits_nonzero_and_preserves_history`.
 
 #[test]
 fn turn_failure_outcome_identical_across_frontend_seams() {
