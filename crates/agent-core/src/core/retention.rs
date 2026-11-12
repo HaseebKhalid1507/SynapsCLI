@@ -1442,6 +1442,8 @@ mod tests {
         };
 
         // The sweep: it drops the forgotten note's line, so it rewrites.
+        // (Inode checks are unix-only: elsewhere `inode()` is always 0.)
+        #[cfg(unix)]
         let before = inode();
         let now = crate::epoch_millis();
         let none = RetentionPolicy::default();
@@ -1467,6 +1469,7 @@ mod tests {
         // (a rewrite): the file now has three tombstones.
         store::forget_in(&roots.base_dir, &scope, &third).unwrap();
         check(&[&third, &fourth]);
+        #[cfg(unix)]
         let before = inode();
         forget(&roots, RetentionDomain::Memory, &format!("{ns}:{fourth}")).unwrap();
         #[cfg(unix)]
