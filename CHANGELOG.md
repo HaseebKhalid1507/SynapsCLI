@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Claude Fable 5.2.** `anthropic/claude-fable-5-2` is in the known-model
+  list, so the model picker shows it and `subagent_model_authorize` can grant
+  it to workers (before, a worker could only get it by inheriting a chat that
+  was already on it). It uses adaptive thinking and the 1M context window like
+  Fable 5.1. Costs are shown at its documented $8 / $40 per million tokens
+  (cache reads 0.025×, $0.20), not Fable 5.1's $10 / $50; Mythos 5.2 the same.
+
 - **Owned daemon sessions.** A client can create a session bound to its
   connection (`Attach::Create{owned}`; `SocketTransport::create_owned`;
   `synaps attach --owned`). When the owner disconnects for any reason
