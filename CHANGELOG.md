@@ -334,6 +334,17 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **The lexical memory index and the `memory-index` retention domain.**
+  `memory::index` (the staged segment index under `<base>/memory/index/`,
+  T33) is deleted with its tests and benchmark: nothing outside its tests
+  ever built or searched it. Retention loses the domain that held it:
+  `synaps retention inspect` has no `memory_index` entry in `domains` (and
+  `total_bytes` no longer counts `<base>/memory/index/`), `synaps retention
+  forget memory-index <id>` is refused as an unknown domain, and a sweep no
+  longer deletes index directories (rewriting a note file, or as the first
+  stage of a disk budget). The session metadata index
+  (`<base>/sessions/index.jsonl`) is a different thing and is unchanged.
+
 - **`Runtime::run_single` and the non-streaming turn call.** The
   non-streaming single-prompt loop (`Runtime::run_single`) and the
   `ApiMethods::call_api` request it made are deleted, with the tool-result

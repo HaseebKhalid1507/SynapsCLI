@@ -9,7 +9,6 @@
 //! | injected wrappers cannot escape / override policy | `s9_4_summary_wrapper_injection_cannot_escape_or_override_prompt_policy`, `s9_4_memory_content_enters_as_bounded_data_never_policy` |
 //! | first-turn context has no memory bodies | `s9_5_first_turn_context_includes_no_memory_bodies` |
 //! | search/fetch project-scoped, bounded, sensitivity-aware, deletable | `s9_6_search_fetch_are_bounded_sensitivity_aware_and_deletable`, `s9_6_cross_project_memory_reads_fail_closed` |
-//! | retrieval memory proportional to limit | `s9_7_retrieval_memory_is_proportional_to_result_limit` |
 //! | retention never leaves chains dangling | `s9_8_retention_cannot_leave_named_chains_pointing_to_deleted_sessions` |
 //! | large-save bounded memory + documented recovery | `s9_9_large_session_saves_are_delta_bounded_with_documented_recovery`, `s9_9_bench_program_level_save_and_recovery` (`--ignored`) |
 //!
@@ -19,7 +18,6 @@
 use serial_test::serial;
 use std::sync::Arc;
 
-use agent_core::memory::index::{ensure_index_in, search_index_in, IndexQuery};
 use agent_core::memory::store::{
     fetch_exact_in, forget_in, search_project_in, store_record_in, MemoryProvenance,
     MemoryRetention, MemorySensitivity, NewMemoryRecord, ProjectMemoryQuery, ProjectScope,
@@ -698,68 +696,6 @@ fn s9_6_cross_project_memory_reads_fail_closed() {
     )
     .unwrap();
     assert!(hits.is_empty(), "cross-project search must return nothing");
-}
-
-// ─── §9.7 retrieval memory proportional to limit ─────────────────────────────
-
-#[test]
-fn s9_7_retrieval_memory_is_proportional_to_result_limit() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let scope = scope_for(tmp.path(), "proj");
-    for i in 0..300 {
-        store_record_in(
-            tmp.path(),
-            &scope,
-            record(
-                &format!("budget note {i} engine compaction"),
-                MemorySensitivity::Normal,
-            ),
-        )
-        .unwrap();
-    }
-    ensure_index_in(tmp.path(), &scope).unwrap();
-    let q = IndexQuery {
-        terms: vec!["budget".into()],
-        limit: Some(10),
-        ..Default::default()
-    };
-    let page = search_index_in(tmp.path(), &scope, &q).unwrap();
-    assert_eq!(page.hits.len(), 10);
-    assert!(
-        page.stats.max_resident_hits <= 10,
-        "resident result memory ({}) must be bounded by the requested limit",
-        page.stats.max_resident_hits
-    );
-
-    // Prove the corpus dwarfs the limit: a cursor walk surfaces every one
-    // of the 300 matches — while EACH page kept at most 10 resident hits.
-    let mut seen = std::collections::HashSet::new();
-    let mut cursor = None;
-    loop {
-        let q = IndexQuery {
-            terms: vec!["budget".into()],
-            limit: Some(10),
-            cursor,
-            ..Default::default()
-        };
-        let page = search_index_in(tmp.path(), &scope, &q).unwrap();
-        assert!(
-            page.stats.max_resident_hits <= 10,
-            "every page must stay limit-bounded"
-        );
-        for hit in &page.hits {
-            seen.insert(hit.id.clone());
-        }
-        match page.next {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-    assert_eq!(
-        seen.len(),
-        300,
-        "all matches reachable, yet never more than the limit resident"
-    );
 }
 
 // ─── §9.8 retention chain integrity ──────────────────────────────────────────

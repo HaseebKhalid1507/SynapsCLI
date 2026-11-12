@@ -18,8 +18,8 @@ pub enum RetentionAction {
         /// note saved with its own expiry still expires by that.
         #[arg(long)]
         max_age_days: Option<u32>,
-        /// Requested disk budget: deletes derived indexes, then the oldest
-        /// sessions, traces and logs (never protected chain heads). It does
+        /// Requested disk budget: deletes the oldest sessions, traces and
+        /// logs (never protected chain heads). It does
         /// NOT delete notes unless --include-notes is given; without it an
         /// unmet budget is an error and every note is kept.
         #[arg(long)]
@@ -39,7 +39,7 @@ pub enum RetentionAction {
     },
     /// Delete one artifact by domain and exact id.
     Forget {
-        /// sessions | memory | memory-index | traces | logs
+        /// sessions | memory | traces | logs
         domain: String,
         /// Memory: namespace:record-id (the id as it is in the file).
         id: String,
@@ -68,10 +68,9 @@ fn parse_domain(domain: &str) -> Result<RetentionDomain> {
     Ok(match domain {
         "sessions" => RetentionDomain::Sessions,
         "memory" => RetentionDomain::Memory,
-        "memory-index" => RetentionDomain::MemoryIndex,
         "traces" => RetentionDomain::Traces,
         "logs" => RetentionDomain::Logs,
-        _ => bail!("unknown domain — expected sessions|memory|memory-index|traces|logs"),
+        _ => bail!("unknown domain — expected sessions|memory|traces|logs"),
     })
 }
 fn run_legacy(action: RetentionAction, roots: &RetentionRoots) -> Result<()> {
@@ -126,11 +125,12 @@ mod tests {
         let refused = parse_domain("history").unwrap_err().to_string();
         assert_eq!(
             refused,
-            "unknown domain — expected sessions|memory|memory-index|traces|logs"
+            "unknown domain — expected sessions|memory|traces|logs"
         );
-        for domain in ["sessions", "memory", "memory-index", "traces", "logs"] {
+        for domain in ["sessions", "memory", "traces", "logs"] {
             parse_domain(domain).unwrap();
         }
+        assert!(parse_domain("memory-index").is_err());
     }
     #[test]
     fn include_notes_parses_with_the_disk_budget_alone() {

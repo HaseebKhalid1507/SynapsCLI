@@ -3,7 +3,7 @@
 //! - Every disclosure class is enforced at the ONE model-visibility gate
 //!   (sentinel test per class; consent and redaction fail CLOSED).
 //! - Unified retention spans sessions (incl. compaction parents), memory,
-//!   memory indexes, traces, and logs: max age + disk budget, headless
+//!   traces, and logs: max age + disk budget, headless
 //!   inspect/export/forget, and chain integrity — a sweep never leaves a
 //!   named chain pointing at a deleted session.
 
@@ -254,10 +254,6 @@ fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
         ),
     ];
     std::fs::write(&memory, lines.join("\n") + "\n").unwrap();
-    // A stale derived index dir for that namespace must be dropped too.
-    let index_dir = h.roots.base_dir.join("memory/index/project-p11");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    std::fs::write(index_dir.join("manifest.json"), "{}").unwrap();
 
     // Traces and logs (mtime-aged: everything is "now"-written, so use a
     // future now to age them past the budget).
@@ -331,10 +327,6 @@ fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
     // aged out under the 30-day budget.
     assert!(!rewritten.contains("fresh survivor"));
 
-    assert!(
-        !index_dir.exists(),
-        "derived index dropped with its namespace"
-    );
     assert!(!h.roots.cache_dir.join("request-trace.jsonl").exists());
     assert!(!h.roots.config_dir.join("synaps.log.2020-01-01").exists());
 }
@@ -533,7 +525,6 @@ fn forget_rejects_path_traversal_ids_for_every_domain() {
             RetentionDomain::Sessions,
             RetentionDomain::Traces,
             RetentionDomain::Logs,
-            RetentionDomain::MemoryIndex,
         ] {
             let err = forget(&h.roots, domain, id).unwrap_err();
             assert!(
@@ -545,11 +536,7 @@ fn forget_rejects_path_traversal_ids_for_every_domain() {
     // Single-component domains additionally reject nested ids; Traces
     // accepts VALIDATED nested relative ids (CP-13 fix2) — a nonexistent
     // one errors without touching anything outside the cache root.
-    for domain in [
-        RetentionDomain::Sessions,
-        RetentionDomain::Logs,
-        RetentionDomain::MemoryIndex,
-    ] {
+    for domain in [RetentionDomain::Sessions, RetentionDomain::Logs] {
         let err = forget(&h.roots, domain, "a/b").unwrap_err();
         assert!(
             err.to_string().contains("invalid"),
@@ -601,7 +588,7 @@ fn memory_forget_requires_exact_live_record_ids() {
 // ─── CP-13 fix1: budget enforcement + fail-closed chains ─────────────────────
 
 #[test]
-fn disk_budget_evicts_derived_indexes_and_oldest_memory_records() {
+fn disk_budget_evicts_oldest_memory_records() {
     let h = harness();
     let now = 100 * DAY_MS;
 
@@ -628,11 +615,6 @@ fn disk_budget_evicts_derived_indexes_and_oldest_memory_records() {
     ));
     std::fs::write(&memory, lines.join("\n") + "\n").unwrap();
 
-    // A fat derived index dir — free win, evicted before any data.
-    let index_dir = h.roots.base_dir.join("memory/index/project-p44");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    std::fs::write(index_dir.join("seg-000000.jsonl"), "z".repeat(4_000)).unwrap();
-
     // Budget: room for roughly the two fresh records only.
     let outcome = sweep_at(
         &h.roots,
@@ -645,10 +627,6 @@ fn disk_budget_evicts_derived_indexes_and_oldest_memory_records() {
     )
     .unwrap();
 
-    assert!(
-        !index_dir.exists(),
-        "derived index evicted first (no data loss)"
-    );
     let rewritten = std::fs::read_to_string(&memory).unwrap();
     assert!(rewritten.contains("fresh keep one") && rewritten.contains("fresh keep two"));
     assert!(
@@ -803,16 +781,13 @@ fn a_budget_below_what_is_protected_deletes_nothing() {
     write_chain(&h.roots, "keep", "pinned");
     std::fs::write(sessions.join("pinned.journal"), "journal of the head\n").unwrap();
     // What a sweep deletes when it runs: old sessions (by age and by
-    // budget), a journal with no session, a trace, a log, a derived index,
-    // and a forgotten note's line.
+    // budget), a journal with no session, a trace, a log, and a forgotten
+    // note's line.
     write_session(&h.roots, "old-a", 10 * DAY_MS, None);
     write_session(&h.roots, "old-b", 20 * DAY_MS, None);
     std::fs::write(sessions.join("ghost.journal"), "no session\n").unwrap();
     std::fs::write(h.roots.cache_dir.join("trace.jsonl"), "t".repeat(300)).unwrap();
     std::fs::write(h.roots.config_dir.join("synaps.log"), "l".repeat(300)).unwrap();
-    let index = h.roots.base_dir.join("memory/index/project-a");
-    std::fs::create_dir_all(&index).unwrap();
-    std::fs::write(index.join("seg-000000.jsonl"), "z".repeat(300)).unwrap();
     let (gone, live) = (note_line("mem-gone", DAY_MS), note_line("mem-live", 2 * DAY_MS));
     let tombstone = r#"{"tombstone":"mem-gone"}"#;
     std::fs::write(
@@ -1033,24 +1008,13 @@ fn cache_retention_is_recursive_and_confined() {
     let outside = h.roots.base_dir.join("outside-data.jsonl");
     std::fs::write(&outside, "keep me\n").unwrap();
     std::os::unix::fs::symlink(&outside, h.roots.cache_dir.join("sub/escape.jsonl")).unwrap();
-    // Index files for the honest MemoryIndex count (M5).
-    let index_dir = h.roots.base_dir.join("memory/index/project-x");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    std::fs::write(index_dir.join("manifest.json"), "{}").unwrap();
-    std::fs::write(index_dir.join("seg-000000.jsonl"), "d\n").unwrap();
-
-    // Inspect sees nested cache files and real index file counts.
+    // Inspect sees nested cache files.
     let report = inspect(&h.roots).unwrap();
     let domain = |d: RetentionDomain| report.domains.iter().find(|x| x.domain == d).unwrap();
     assert_eq!(
         domain(RetentionDomain::Traces).files,
         2,
         "recursive cache count (symlinks excluded)"
-    );
-    assert_eq!(
-        domain(RetentionDomain::MemoryIndex).files,
-        2,
-        "actual index file count, not zero"
     );
 
     // Sweep ages out nested files but never the symlink target.

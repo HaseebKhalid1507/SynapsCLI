@@ -7,5 +7,4 @@
 //! and `memory.query` protocol methods (added in a follow-up step).
 
 pub mod author;
-pub mod index;
 pub mod store;
