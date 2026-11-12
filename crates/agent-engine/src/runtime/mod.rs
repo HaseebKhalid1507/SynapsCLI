@@ -6987,6 +6987,25 @@ mod effective_prompt_tests {
         assert!(prompt.ends_with(&catalog), "catalog appended last");
     }
 
+    /// `tools.always_loaded` flows config → runtime → clones (the stream
+    /// session and subagent forks copy it), and a listed tool is core, so the
+    /// activatable-tools catalog stops offering it.
+    #[tokio::test]
+    async fn tools_always_loaded_flows_from_config_into_the_session_core() {
+        let mut runtime = headless("anthropic/claude-sonnet-5-5", "BASE.");
+        let config = agent_core::config::load_config_from_str(
+            "progressive_tool_disclosure = true\ntools.always_loaded = builtin:subagent_start\n",
+        );
+        runtime.apply_config_keep_tools(&config);
+        assert!(runtime.progressive_tool_disclosure);
+        let listed = crate::tools::catalog::ToolId::builtin("subagent_start");
+        assert_eq!(&*runtime.tools_always_loaded, std::slice::from_ref(&listed));
+        assert_eq!(&*runtime.clone().tools_always_loaded, std::slice::from_ref(&listed));
+        let catalog = runtime.frozen_tool_catalog().await.expect("catalog");
+        assert!(!catalog.contains("- builtin:subagent_start"), "{catalog}");
+        assert!(catalog.contains("- builtin:subagent_"), "other tools still listed");
+    }
+
     #[tokio::test]
     async fn tool_catalog_is_frozen_per_session() {
         let mut runtime = headless("anthropic/claude-sonnet-5-5", "BASE.");

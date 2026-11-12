@@ -2417,6 +2417,154 @@ mod lifecycle_tests {
         assert!(!off.is_core(&ToolId::builtin("memory_search")));
     }
 
+    /// A fake tool with a chosen runtime name and origin.
+    struct OriginTool(&'static str, crate::tools::ToolOrigin);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for OriginTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "always-loaded fixture"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            self.1.clone()
+        }
+        fn extension_id(&self) -> Option<&str> {
+            match &self.1 {
+                crate::tools::ToolOrigin::Extension { .. } => self.0.split(':').next(),
+                _ => None,
+            }
+        }
+        async fn execute(
+            &self,
+            _: Value,
+            _: crate::tools::ToolContext,
+        ) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn axel_search() -> Arc<OriginTool> {
+        Arc::new(OriginTool(
+            "axel:search",
+            crate::tools::ToolOrigin::Extension {
+                extension_id: "axel".into(),
+            },
+        ))
+    }
+
+    fn ids(raw: &[&str]) -> Vec<ToolId> {
+        raw.iter().map(|r| ToolId::parse(r).unwrap()).collect()
+    }
+
+    /// `tools.always_loaded`: listed ids join the progressive core only when
+    /// cataloged and activatable; absent, unverified and disabled (withheld)
+    /// ones are skipped; without disclosure the list changes nothing.
+    #[test]
+    fn always_loaded_joins_progressive_core_only_when_cataloged_and_trusted() {
+        let session = crate::tools::activation::SessionId::parse("always-loaded").unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(axel_search());
+        registry.register(Arc::new(OriginTool("rogue", crate::tools::ToolOrigin::Unknown)));
+        let rogue = ToolId::unclassified("rogue");
+        assert!(registry.catalog().get(&rogue).is_some(), "fixture: unverified tool cataloged");
+        let mut list = ids(&["ext.axel:search", "ext.axel:recall", "builtin:memory_store"]);
+        list.push(rogue.clone());
+
+        let bare = context_tool_set(session.clone(), registry.catalog(), true, false, &[]);
+        let set = context_tool_set(session.clone(), registry.catalog(), true, false, &list);
+        let search = ToolId::extension("axel", "search");
+        assert!(!bare.is_core(&search), "deferred without the list");
+        assert!(set.is_core(&search), "listed extension tool is core");
+        assert!(set.is_core(&ToolId::builtin("memory_store")));
+        assert!(!set.is_core(&ToolId::extension("axel", "recall")), "absent id skipped");
+        assert!(!set.is_core(&rogue), "unverified tool never core");
+        assert!(ExecutionGate::authorize_wire_call(&registry, &set, "rogue").is_err());
+        assert_eq!(
+            set.core_ids().count(),
+            bare.core_ids().count() + 2,
+            "exactly the two admissible ids join"
+        );
+        assert!(registry
+            .session_tools_schema(&set)
+            .schema
+            .iter()
+            .any(|t| t["name"].as_str().is_some_and(|n| n.contains("axel"))));
+        assert!(ExecutionGate::authorize_wire_call(&registry, &set, "axel:search").is_ok());
+        assert!(ExecutionGate::authorize_wire_call(&registry, &bare, "axel:search").is_err());
+
+        // Context management on: the context reads AND the list.
+        let ctx = context_tool_set(session.clone(), registry.catalog(), true, true, &list);
+        assert!(ctx.is_core(&search) && ctx.is_core(&ToolId::builtin("memory_fetch")));
+
+        // Withheld (disabled_tools): gone from the catalog, so skipped.
+        registry.disable(&["memory_store".into()]);
+        let withheld = context_tool_set(session.clone(), registry.catalog(), true, false, &list);
+        assert!(!withheld.is_core(&ToolId::builtin("memory_store")));
+        assert!(withheld.is_core(&search));
+
+        // No disclosure: the full trusted core, identical with or without the list.
+        let full = context_tool_set(session.clone(), registry.catalog(), false, false, &[]);
+        let full_listed = context_tool_set(session, registry.catalog(), false, false, &list);
+        assert_eq!(
+            full.core_ids().collect::<Vec<_>>(),
+            full_listed.core_ids().collect::<Vec<_>>()
+        );
+        assert!(!full_listed.is_core(&rogue));
+    }
+
+    /// An extension that registers AFTER the session started: its listed tool
+    /// joins at the next round-top rebuild; when it disappears the rebuild
+    /// drops it fail-closed.
+    #[test]
+    fn always_loaded_late_registration_joins_at_round_top_and_drops_when_gone() {
+        let session = crate::tools::activation::SessionId::parse("always-loaded-late").unwrap();
+        let list = ids(&["ext.axel:search"]);
+        let search = ToolId::extension("axel", "search");
+        let mut registry = ToolRegistry::new();
+        let initial = context_tool_set(session.clone(), registry.catalog(), true, true, &list);
+        assert!(!initial.is_core(&search), "not registered yet");
+
+        registry.register(axel_search());
+        assert!(initial.is_stale(registry.catalog()));
+        let (rebuilt, dropped) = crate::runtime::stream::rebuild_stale_tool_set(
+            &initial,
+            session.clone(),
+            registry.catalog(),
+            true,
+            true,
+            &list,
+        );
+        assert!(dropped.is_empty());
+        assert!(rebuilt.is_core(&search), "late-registered listed tool joins the core");
+        assert!(rebuilt.is_core(&ToolId::builtin("memory_fetch")), "context reads kept");
+        assert!(registry
+            .session_tools_schema(&rebuilt)
+            .schema
+            .iter()
+            .any(|t| t["name"].as_str().is_some_and(|n| n.contains("axel"))));
+        let wire = "axel:search";
+        assert!(ExecutionGate::authorize_wire_call(&registry, &rebuilt, wire).is_ok());
+
+        registry.disable(&["axel:search".into()]);
+        assert!(rebuilt.is_stale(registry.catalog()));
+        let (gone, _) = crate::runtime::stream::rebuild_stale_tool_set(
+            &rebuilt,
+            session,
+            registry.catalog(),
+            true,
+            true,
+            &list,
+        );
+        assert!(!gone.is_core(&search), "vanished tool leaves the core");
+        assert!(ExecutionGate::authorize_wire_call(&registry, &gone, wire).is_err());
+    }
+
     /// Regression (2026-10-12, `rollover requires admitted builtin history
     /// retrieval tools`): a sibling daemon session's turn re-registers
     /// `context_checkpoint` on the shared registry, advancing the catalog
