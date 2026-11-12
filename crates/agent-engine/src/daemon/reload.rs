@@ -1281,6 +1281,7 @@ mod tests {
     /// is known to be gone. `is_dir()` said "gone" for every failure, so a
     /// folder that could not be looked at for a moment (a mount that was
     /// away, a permission) moved the chat as well, without a log line.
+    #[cfg(unix)]
     #[test]
     fn a_folder_is_dropped_only_when_it_is_absent_or_not_a_directory() {
         use std::os::unix::fs::PermissionsExt;
