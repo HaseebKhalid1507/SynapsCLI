@@ -1610,6 +1610,20 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A folder's project key is the first 8 bytes of SHA-256 of its canonical path, as
+    /// hex after `p`. Notes files and archive folders on disk are named by it, so it
+    /// must never change: these are fixed values, not recomputed here.
+    #[test]
+    fn a_folder_maps_to_the_same_project_key_forever() {
+        for (path, key) in [
+            ("/fixed/project/root", "p6e2cb4c61e23315c"),
+            ("/home/haseeb", "pa465e6cee4a607a1"),
+        ] {
+            let scope = ProjectScope::for_canonical_root(PathBuf::from(path));
+            assert_eq!(scope.key(), key, "{path}");
+        }
+    }
+
     fn rec(ns: &str, ts: u64, content: &str, tags: Vec<&str>) -> MemoryRecord {
         MemoryRecord {
             namespace: ns.to_string(),
