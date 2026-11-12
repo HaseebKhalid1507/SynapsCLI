@@ -249,14 +249,15 @@ fn a_headless_host_starts_under_a_config_that_still_selects_axel() {
     assert_eq!(
         warnings[0],
         format!(
-            "synaps: config warning: memory.backend = axel is no longer supported: since \
-             {version} Synaps keeps context archives and notes in plain files under its base \
-             directory, always, and Axel is an extension. This session uses plain files. \
-             Archives and notes saved to the Axel brain are not read any more: move them once \
-             with \"axel synaps-export\" and \"synaps memory import-archives\" / \"import-notes\", \
-             install the Axel extension for recall and the forum, then remove the \
-             memory.backend, memory.user_scope and memory.axel.* lines. See \
-             docs/upgrading/{version}.md"
+            "synaps: config warning: The Axel memory backend (memory.backend = axel, \
+             memory.user_scope, memory.axel.*) is no longer supported: since {version} Synaps \
+             keeps context archives and notes in plain files under its base directory, always, \
+             and Axel is an extension. This session uses plain files. Archives and notes saved \
+             to the Axel brain are not read any more: move them once with \"axel synaps-export\" \
+             (Axel v2) and \"synaps memory import-archives\" / \"import-notes\", install the \
+             Axel extension for recall and the forum, then remove the memory.backend, \
+             memory.user_scope and memory.axel.* lines. See \
+             https://github.com/HaseebKhalid1507/SynapsCLI/blob/dev/docs/upgrading/{version}.md"
         )
     );
     assert!(!stderr.contains("unavailable"), "{stderr}");

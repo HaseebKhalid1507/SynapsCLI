@@ -549,8 +549,8 @@ nothing until the first real turn. The restore holds the daemon's idle exit.
 - `SYNAPS_DAEMON_RESTORE_PINS=0` starts a daemon without restoring (the pin book
   is kept for the next start).
 - Not restored: `/system` overrides, `/settings` knobs changed in the session
-  (thinking, model override beyond the journal's, auto-approve), `/memory`
-  choice, running workers. The conversation, model, name and env come from the
+  (thinking, model override beyond the journal's, auto-approve), running
+  workers. The conversation, model, name and env come from the
   journal.
 - At boot: `deploy/synaps-daemon.service` (systemd user unit, with
   `loginctl enable-linger`) starts the daemon, and with it every pin.
