@@ -10,7 +10,6 @@ Durable references live here at the top level. Working history is filed by kind 
 | [architecture-host-plugin-split.md](architecture-host-plugin-split.md) | How the host and plugin halves divide responsibility. |
 | [rpc-protocol.md](rpc-protocol.md) | `synaps rpc` wire protocol. |
 | [daemon-mode.md](daemon-mode.md) | `synaps daemon` and `synaps --attach`: lifecycle, pins, rename, reload, files and the wire protocol (Unix socket or Windows named pipe). |
-| [sidecar-protocol.md](sidecar-protocol.md) | Sidecar protocol v2. |
 | [events-reactor.md](events-reactor.md) | Runtime event reactor semantics and mode policy. |
 | [petri-net-model.md](petri-net-model.md) | Petri-net model of a daemon session, a turn, a tool batch, a tool call and the prompt cache, with the invariants each net encodes. |
 | [trace-schema.md](trace-schema.md) | `synaps-request-trace/1` schema. |

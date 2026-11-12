@@ -42,6 +42,10 @@ pub const REMOVED_IN: &str = "0.12.0";
 /// command stubs go, this removal must not move with it.
 pub const AXEL_BACKEND_REMOVED_IN: &str = "0.12.0";
 
+/// The release that removed the plugin sidecar system (`provides.sidecar`,
+/// `/sidecar`, `sidecar_toggle_key`).
+pub const SIDECAR_REMOVED_IN: &str = "0.12.0";
+
 /// Current time as Unix epoch milliseconds. Panics only if system clock is before 1970.
 #[inline]
 pub fn epoch_millis() -> u64 {

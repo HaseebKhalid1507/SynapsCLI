@@ -5,7 +5,7 @@ This is the onboarding doc for any agent (Cursor, Aider, or SynapsCLI itself) to
 SynapsCLI is a terminal-native AI agent runtime written in Rust. ~210K LOC across the workspace (counts drift — verify with `find src crates -name '*.rs' -not -path '*/target/*' | xargs wc -l`). **Cargo workspace** with three library crates + a root binary crate:
 
 - `synaps-core` (`crates/agent-core/`) — config, session, auth, credential broker, models, memory, orchestration policy, prompt manifests, pricing, protocol primitives
-- `synaps-engine` (`crates/agent-engine/`) — runtime, provider catalogs, credential routing, tools, memory tools, reactive subagent lifecycle, MCP, skills, events, extensions, sidecar, daemon
+- `synaps-engine` (`crates/agent-engine/`) — runtime, provider catalogs, credential routing, tools, memory tools, reactive subagent lifecycle, MCP, skills, events, extensions, daemon
 - `synaps-tui` (`crates/agent-tui/`) — the ratatui TUI
 - `synaps` (`src/main.rs`) — the binary; CLI dispatch
 
@@ -144,7 +144,6 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── manifest.rs       — ExtensionManifest from plugin.json
 │   ├── manager.rs        — ExtensionManager lifecycle
 │   └── runtime/process.rs — JSON-RPC over stdio ProcessExtension
-├── sidecar/              — sidecar process support
 ├── skills/               — skill discovery + command registry
 │   ├── loader.rs         — walks .synaps-cli/{plugins,skills} roots
 │   ├── manifest.rs       — plugin.json / marketplace.json parsers

@@ -19,6 +19,8 @@ Extensions can:
 - **Replace** — rewrite `after_tool_call` output before it enters history (compression, redaction, summarization; requires `tools.transform_output`)
 - **Inject** — attach context to the outgoing request before it reaches the LLM (`on_session_start` → system prompt, session-stable; `before_message` → newest user message, per-turn ephemeral)
 
+> **"Sidecar" in these docs** (and in `ExtensionClass::UiSidecar` / `ui_sidecar` in `contract.json`) means an extension process that starts on user action. It is not the plugin sidecar system removed in 0.12.0.
+
 Future protocol phases reserve names for tool/provider registration, but phase 1 does not grant those capabilities yet.
 
 SynapsCLI spawns each extension as a subprocess on session start and tears it down on session end. Extensions run with the plugin root as their current working directory. If an extension crashes or times out, the runtime fails open — the event proceeds as if the extension wasn't there. Transport failures trigger up to three restart attempts before the extension is marked failed.

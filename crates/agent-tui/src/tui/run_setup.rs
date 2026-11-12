@@ -235,9 +235,6 @@ pub(crate) async fn run_setup(
     )
     .await?;
 
-    // Legacy sidecar key migration
-    loop_arms::migrate_sidecar_toggle_key_to_claimed_plugins(&ctx.registry.lifecycle_claims());
-
     if !no_extensions {
         let session_id_for_hook = ctx.app.session.id.clone();
         ctx.app.extension_loader_running = true;

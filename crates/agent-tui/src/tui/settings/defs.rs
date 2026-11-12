@@ -335,23 +335,6 @@ define_settings! {
             }
         };
 
-    "sidecar_toggle_key", "Sidecar toggle key", Sidecar,
-        EditorKind::Cycler(&["F8", "F2", "F12", "C-V", "C-G"]),
-        "Keybind that toggles the active sidecar plugin. Takes effect immediately.",
-        |app, value| {
-            if let Some(kb) = app.keybinds.as_ref() {
-                match kb.write() {
-                    Ok(mut g) => {
-                        if let Err(e) = g.set_slash_command_key("sidecar toggle", value) {
-                            tracing::warn!("sidecar_toggle_key apply failed: {}", e);
-                        }
-                    }
-                    Err(_) => tracing::warn!("sidecar_toggle_key apply: registry poisoned"),
-                }
-            }
-            SettingApply::Local(Ok(()))
-        };
-
     "startup.quick_start", "Quick start", Startup, EditorKind::Cycler(&["on", "off"]),
         "Start without waiting for extensions to load (faster startup). The first message still waits for extensions to start before it is sent (up to the extensions-ready wait, 30 s by default, plus the extensions' session-start hooks). Takes effect next launch.",
         |_app, value| match value {
@@ -710,15 +693,6 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_toggle_key_setting_is_in_sidecar_category() {
-        let def = ALL_SETTINGS
-            .iter()
-            .find(|d| d.key == "sidecar_toggle_key")
-            .expect("sidecar_toggle_key setting should be defined");
-        assert_eq!(def.category, Category::Sidecar);
-    }
-
-    #[test]
     fn quick_start_setting_is_in_startup_category() {
         let def = ALL_SETTINGS
             .iter()
@@ -761,24 +735,8 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_toggle_key_static_setting_still_defined_for_backward_compat() {
-        // Phase 8 slice 8A.4: even after `visible_categories(claims)`
-        // hides the global Sidecar page when a plugin claims its own
-        // settings_category, the static def stays in ALL_SETTINGS so
-        // legacy users without claimed plugins keep a working toggle
-        // and config round-trips remain stable.
-        let def = ALL_SETTINGS
-            .iter()
-            .find(|d| d.key == "sidecar_toggle_key")
-            .expect("sidecar_toggle_key setting must remain in ALL_SETTINGS for back-compat");
-        assert_eq!(def.category, Category::Sidecar);
-        match def.editor {
-            EditorKind::Cycler(opts) => {
-                assert!(opts.contains(&"F8"));
-                assert!(opts.contains(&"C-V"));
-            }
-            _ => panic!("expected Cycler editor for sidecar_toggle_key"),
-        }
+    fn sidecar_toggle_key_has_no_settings_row() {
+        assert!(ALL_SETTINGS.iter().all(|d| d.key != "sidecar_toggle_key"));
     }
 
     fn app_with_model(model: &str) -> crate::tui::app::App {
@@ -995,7 +953,6 @@ mod tests {
             "tui_background_opaque",
             "tui_streaming_glow",
             "theme_transition",
-            "sidecar_toggle_key",
             "startup.quick_start",
             "startup.extensions_ready_timeout_secs",
             "daemon.idle_exit_secs",
