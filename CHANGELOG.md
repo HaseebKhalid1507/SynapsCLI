@@ -334,6 +334,15 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **The inline `synaps chat` loop.** The pre-actor chat loop behind the
+  `legacy_inline` Cargo feature and `SYNAPS_CHAT_INLINE=1` is deleted, with
+  the feature itself and the engine stream adapter only it used
+  (`engine::stream::process_stream_event`, `EngineStreamEvent`,
+  `StreamCompletion`, `SubagentTracker`; `repair_history_after_failure`
+  stays) and `engine::reactor::AUTO_TURN_CAP_CONFIG_KEY`. `synaps chat` runs
+  on the session actor exactly as before. A build that passes
+  `--features legacy_inline` now fails: drop the flag.
+
 - **The Axel memory helper's source and its CI jobs.** `sidecars/axel-memory-service`
   (the `synaps-axel-memory-service` process the memory backend started, with
   its copy of the forum contract) is deleted, with the CI jobs `sidecar` and

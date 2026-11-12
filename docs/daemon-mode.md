@@ -1207,7 +1207,7 @@ Honest list of behaviour changes on this branch on the plain in-process path (`s
    plain turn, provider error repairing history, idle auto-turn to cap. **Tool loop, steer-mid-stream,
    queue-while-busy, cancel (history + marker), secret-prompt round-trip are asserted by actor unit
    tests, not by the differential.** `tests/chat_stdin.rs` is unchanged and green but never runs a turn through a
-   stub. The kill-switch `SYNAPS_CHAT_INLINE=1` only exists in a `--features legacy_inline` build.
+   stub. The inline loop and its kill-switch (`SYNAPS_CHAT_INLINE=1`, `--features legacy_inline`) were removed in 0.12.0.
    Cancel diverges from the frozen oracle by design: the oracle folds an `ABORT CONTEXT` recap into the
    next user message; the actor keeps the interrupted turn as history plus an interruption marker
    (`cancel_keeps_real_history_where_the_oracle_folded_a_recap` pins both sides).

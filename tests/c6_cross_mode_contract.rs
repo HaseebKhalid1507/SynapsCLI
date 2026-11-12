@@ -327,60 +327,24 @@ fn claim_auto_turn_uniform_boundary_semantics() {
 
 // ─── T3 (request-lifecycle hardening): typed TurnOutcome cross-mode contract ──
 //
-// Spec §5.2: every frontend (chat, server, TUI, RPC, subagents)
+// Spec §5.2: every frontend (chat, TUI, RPC, subagents)
 // receives the SAME typed terminal outcome — variant + correlation ID — for
 // the same failure. The engine derives it exactly once
 // (`runtime::helpers::turn_error_for`); adapters forward it verbatim.
 
 #[test]
 fn turn_failure_outcome_identical_across_frontend_seams() {
-    use agent_engine::engine::stream::{process_stream_event, StreamCompletion};
-    use synaps_cli::{SessionEvent, StreamEvent, TurnError, TurnOutcome};
+    use synaps_cli::{TurnError, TurnOutcome};
 
     // One failure fixture, as emitted by the engine stream task.
     let fixture = TurnError::provider("stub provider failure", "api_status", "turn-fixture-7");
-
-    // ── chat / server seam (StreamCompletion from process_stream_event) ──
-    let mut messages: Vec<synaps_cli::SharedMessage> = vec![std::sync::Arc::new(
-        serde_json::json!({"role": "user", "content": "hi"}),
-    )];
-    let turn_baseline = messages.len();
-    let mut subagents = Vec::new();
-    let mut queued = None;
-    let mut pending = Vec::new();
-    let (_, completion) = process_stream_event(
-        StreamEvent::Session(SessionEvent::Error(fixture.clone())),
-        &mut messages,
-        &mut subagents,
-        &mut queued,
-        &mut pending,
-        turn_baseline,
-    );
-    let StreamCompletion::Error(received) = completion else {
-        panic!("failure event must complete as StreamCompletion::Error");
-    };
-    assert_eq!(
-        received, fixture,
-        "chat/server must receive the engine's typed outcome verbatim"
-    );
-    assert_eq!(
-        received.outcome.correlation_id(),
-        Some("turn-fixture-7"),
-        "correlation ID must survive the chat/server seam"
-    );
-    assert!(received.outcome.is_failure());
-    assert_eq!(
-        messages.len(),
-        1,
-        "pre-existing trailing user message must survive in every frontend"
-    );
 
     // ── RPC seam — outcome serialized verbatim into the Response body
     //    (mirrors src/cmd/rpc.rs SessionEvent::Error handling) ──
     let body = serde_json::json!({
         "ok": false,
-        "error": received.message,
-        "outcome": received.outcome,
+        "error": fixture.message,
+        "outcome": fixture.outcome,
     });
     assert_eq!(body["outcome"]["kind"], "provider_failed");
     assert_eq!(body["outcome"]["code"], "api_status");
