@@ -327,6 +327,20 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **The built-in project forum.** The tools `forum_post`, `forum_read` and
+  `forum_forget` are gone from the registry, from workers and from
+  `docs/tools.json` (26 built-in tools now), with the code behind them
+  (`tools::forum`, `memory_backend::forum`, `agent_core::memory::forum`) and
+  the forum paragraph core appended to every worker's system prompt under
+  `memory.backend = axel`. The Axel extension serves the forum as
+  `axel:forum_post`, `axel:forum_read` and `axel:forum_forget`; tell workers
+  about it in `<base>/subagent-preamble.md`, which is still prepended to
+  every worker prompt. A run's author stays: it is
+  `agent_core::memory::author::Author`, and `tool.call` still sends it to
+  extensions as `caller`. The Axel helper keeps its copy of the forum
+  contract (`sidecars/axel-memory-service/src/forum_contract.rs`) until it
+  is removed. `docs/agent-forum.md`, `docs/specs/agent-forum.md` and
+  `docs/reviews/forum-*.md` are removed.
 - **The files-to-Axel migration.** `synaps retention memory-scope`,
   `synaps retention upgrade-memory` and `synaps retention migrate-memory`
   are gone, with the code behind them (`memory_backend::migration`,

@@ -1,4 +1,5 @@
-//! Pure project-forum contract, shared by host and independently built Axel service.
+//! Pure project-forum contract of this service (it lived in agent-core until
+//! the host's built-in forum was removed).
 //! Digests are content identity, not authentication. Peer text is lower-authority data.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -440,8 +440,7 @@ impl EngineHost {
     /// The worker's built-ins are built from scratch, so the boot-time
     /// disable on the shared registry does not carry over: `worker_set`
     /// re-applies the whole `disabled_tools` list (before, a worker of a
-    /// host with `disabled_tools = bash` still had `bash`; only the forum
-    /// names were re-applied). The template is a pure function of the shared
+    /// host with `disabled_tools = bash` still had `bash`). The template is a pure function of the shared
     /// registry's tool set (a pure function of its catalog generation) and
     /// the list, so caching by both returns exactly what a rebuild would,
     /// and a `reload_config` that changes the list rebuilds it.

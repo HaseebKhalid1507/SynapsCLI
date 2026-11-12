@@ -13,7 +13,7 @@ use session_actor_common::*;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use agent_core::memory::forum::Author;
+use agent_core::memory::author::Author;
 use agent_engine::extensions::hooks::events::{HookEvent, HookResult};
 use agent_engine::extensions::runtime::process::RegisteredExtensionToolSpec;
 use agent_engine::extensions::runtime::ExtensionHandler;
@@ -70,7 +70,7 @@ impl ExtensionHandler for Recorder {
 }
 
 /// The real `ExtensionTool` behind `/who:ami`, under its own name. It notes
-/// the author of the context's binding, as `forum_post` would read it, and
+/// the author of the context's binding, and
 /// the call itself is `ExtensionTool::execute`. Commands here run one at a
 /// time.
 struct Noting(agent_engine::tools::ExtensionTool, Arc<Recorder>);

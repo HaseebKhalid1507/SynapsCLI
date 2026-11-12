@@ -1199,7 +1199,6 @@ impl Runtime {
                     registry.catalog(),
                     true,
                     self.context_management_enabled(),
-                    self.memory_backend.is_axel(),
                     &self.tools_always_loaded,
                 );
                 let core: std::collections::HashSet<String> = core_set
@@ -1724,10 +1723,7 @@ impl Runtime {
     /// the host's and holds every chat's tools, so its own
     /// [`ToolRegistry::tools_schema`] is not what any one chat sends.
     pub async fn offered_tools_schema(&self) -> Arc<Vec<Value>> {
-        let withheld = chat_tools::withheld_tools(
-            self.context_management_enabled(),
-            self.memory_backend.is_axel(),
-        );
+        let withheld = chat_tools::withheld_tools(self.context_management_enabled());
         let registry = self.tools.read().await;
         registry
             .tools_schema_without(&withheld)
@@ -2348,12 +2344,6 @@ impl Runtime {
 
     /// True when legacy note/history/provider access is forbidden by the host
     /// selection, including invalid or unavailable backend configuration.
-    /// Whether the project forum is live for this runtime (Axel backend).
-    /// Workers use it to decide whether forum guidance belongs in the prompt.
-    pub fn memory_backend_is_axel(&self) -> bool {
-        self.memory_backend.is_axel()
-    }
-
     pub fn memory_backend_exclusive(&self) -> bool {
         self.memory_backend.exclusive()
     }

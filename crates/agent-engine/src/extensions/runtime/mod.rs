@@ -149,7 +149,7 @@ pub trait ExtensionHandler: Send + Sync {
     }
 
     /// [`Self::call_tool_for`], naming the run that calls: `caller` is the
-    /// forum author of the calling run's memory binding (`None` = the call's
+    /// author of the calling run's memory binding (`None` = the call's
     /// context has no binding), sent as `tool.call` `params.caller` so an
     /// extension can tell a chat from each of its workers. What a registered
     /// extension tool calls. Default: [`Self::call_tool_for`], for a handler
@@ -160,7 +160,7 @@ pub trait ExtensionHandler: Send + Sync {
         input: Value,
         session_id: Option<&str>,
         cwd: Option<&std::path::Path>,
-        caller: Option<&agent_core::memory::forum::Author>,
+        caller: Option<&agent_core::memory::author::Author>,
     ) -> Result<Value, String> {
         let _ = caller;
         self.call_tool_for(name, input, session_id, cwd).await

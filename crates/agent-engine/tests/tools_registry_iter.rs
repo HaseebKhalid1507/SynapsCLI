@@ -105,11 +105,11 @@ fn iter_tools_sorted_is_deterministic_across_calls() {
     assert_eq!(first_call, expected, "order must be ascending alphabetical");
 }
 
-// ─── 3. Builtin registry (ToolRegistry::new) — 29 tools in sorted order ─────
+// ─── 3. Builtin registry (ToolRegistry::new) — 26 tools in sorted order ─────
 
-/// 29 builtins; the hardened build (`--no-default-features`) has no `bash`
+/// 26 builtins; the hardened build (`--no-default-features`) has no `bash`
 /// and no `shell_start`/`shell_send`/`shell_end`.
-const BUILTIN_COUNT: usize = if cfg!(feature = "command-exec") { 29 } else { 25 };
+const BUILTIN_COUNT: usize = if cfg!(feature = "command-exec") { 26 } else { 22 };
 
 fn is_command_exec_tool(name: &str) -> bool {
     name == "bash" || name.starts_with("shell_")
@@ -135,9 +135,6 @@ fn iter_tools_sorted_on_default_registry_has_18_tools_in_order() {
         "context_checkpoint",
         "edit",
         "find",
-        "forum_forget",
-        "forum_post",
-        "forum_read",
         "grep",
         "ls",
         "memory_fetch",

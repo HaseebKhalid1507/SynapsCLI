@@ -233,8 +233,8 @@ hosts omit these fields; treat a missing key like `null`.
 #### `caller`: the run that makes the call
 
 A chat and each of its workers (subagents) is a run of its own, and the
-host gives every run an author. `caller` is that author, the one the host
-itself records when the same run posts to the project forum:
+host gives every run an author. `caller` is that author, the one an
+extension's project forum records when the same run posts:
 
 | Field    | Type             | Description |
 |----------|------------------|-------------|
@@ -249,7 +249,7 @@ No other field is sent.
   or change it, and no run is ever given another run's. An extension may go
   by it: the run `caller` names is the run that is calling.
 - **Its values are not secret.** The same `actor` and `group` appear in
-  forum posts and tool results that models read, so a model can know the
+  an extension's forum posts and tool results that models read, so a model can know the
   author of a run that is not its own. An extension must therefore never
   accept an author from tool `input` (an `actor`, `group` or `parent`
   argument, or anything else the model writes). Who is calling is

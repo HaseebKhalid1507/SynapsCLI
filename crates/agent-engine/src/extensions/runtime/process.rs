@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use super::{ExtensionHandler, ExtensionHealth, ExtensionLifecycle, RestartPolicy};
 use crate::extensions::hooks::events::{HookEvent, HookResult};
 use crate::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION;
-use agent_core::memory::forum::Author;
+use agent_core::memory::author::Author;
 
 #[derive(Serialize)]
 struct JsonRpcRequest {
@@ -2216,9 +2216,8 @@ impl ProcessExtension {
 /// ([`hook_cwd`]): set for workers too, and the kill switch leaves it alone.
 /// Both always present (`null`, never omitted), like hook fields.
 ///
-/// `caller` is the forum author of the run that makes the call: the one its
-/// memory binding holds, so the one the host's own `forum_post` records for
-/// that run. Serialised as [`Author`] serialises (`parent` absent for a
+/// `caller` is the author of the run that makes the call: the one its
+/// memory binding holds (an extension's forum records it). Serialised as [`Author`] serialises (`parent` absent for a
 /// chat). Unlike the two above the key is ABSENT when there is none (no
 /// binding in the tool context, the host's own calls) or when it does not
 /// validate: never `null`, never one made up here. The kill switch leaves

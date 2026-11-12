@@ -619,14 +619,12 @@ impl Runtime {
         // progressive disclosure is on — read-only: the retained session
         // tool set is never written.
         let tools_snapshot = self.tools.read().await.clone();
-        let forum_ready = self.memory_backend.is_axel();
         let (request_tools_schema, anthropic_tool_split) = if self.progressive_tool_disclosure {
             let fresh = super::chat_tools::chat_tool_set(
                 self.host_tool_session.clone(),
                 tools_snapshot.catalog(),
                 true,
                 context_enabled,
-                forum_ready,
                 &self.tools_always_loaded,
             );
             // The SAME selection a turn start makes (`retain_session_tool_set`),
@@ -674,7 +672,7 @@ impl Runtime {
             });
             (Some(Arc::new(schema)), split)
         } else {
-            let withheld = super::chat_tools::withheld_tools(context_enabled, forum_ready);
+            let withheld = super::chat_tools::withheld_tools(context_enabled);
             (tools_snapshot.tools_schema_without(&withheld), None)
         };
 
@@ -1453,8 +1451,7 @@ mod tests {
         let (ping, real) = (&bodies[0], &bodies[1]);
         // The non-deferred tools are the cached prefix. (The deferred list
         // can still differ here: this runtime's first turn applies its
-        // idempotent setup, e.g. hiding the forum tools under the legacy
-        // memory backend; deferred definitions are outside the prefix.)
+        // idempotent setup; deferred definitions are outside the prefix.)
         let loaded = |b: &Value| -> Vec<Value> {
             b["tools"]
                 .as_array()

@@ -33,12 +33,11 @@ impl ExtensionTool {
 }
 
 /// Who an extension tool call is made by, for `tool.call` `params.caller`:
-/// the forum author of the memory binding the call's context came with,
-/// which is the author the host's own `forum_post` records for the same run
-/// (`tools/forum.rs` reads the same field of the same binding). `None` when
+/// the author of the memory binding the call's context came with (an
+/// extension's forum records it as the run's author). `None` when
 /// the context has no binding: a binding made on the spot would carry an
 /// author no run has, so none is sent.
-fn caller_of(ctx: &ToolContext) -> Option<agent_core::memory::forum::Author> {
+fn caller_of(ctx: &ToolContext) -> Option<agent_core::memory::author::Author> {
     ctx.capabilities
         .memory_backend
         .as_ref()
@@ -251,7 +250,7 @@ mod caller_tests {
     use std::time::Duration;
 
     use agent_core::config::{MemoryBackendConfig, MemoryBackendKind};
-    use agent_core::memory::forum::Author;
+    use agent_core::memory::author::Author;
     use agent_core::memory::store::ProjectScope;
     use serde_json::json;
 
@@ -346,27 +345,9 @@ done"#,
         binding
     }
 
-    /// The author the host's own `forum_post` gives the store for a run
-    /// with `binding`: the tool is run, and the request it made is read.
-    async fn author_forum_post_records(dir: &Path, binding: &MemoryBinding) -> Value {
-        let requests = dir.join("requests.jsonl");
-        let _ = std::fs::remove_file(&requests);
-        // The stand-in's `{}` is no receipt, so the tool reports a failure;
-        // the request it sent first is what is read here.
-        let _ = crate::tools::forum::ForumPostTool
-            .execute(
-                json!({"request_key": "k-1", "title": "Finding", "body": "Synthetic peer note"}),
-                context_with_memory(binding.clone()),
-            )
-            .await;
-        let posts: Vec<Value> = std::fs::read_to_string(&requests)
-            .expect("forum_post reached the service")
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .filter(|request| request["operation"] == "forum_post")
-            .collect();
-        assert_eq!(posts.len(), 1, "{posts:?}");
-        posts[0]["payload"]["author"].clone()
+    /// The author `binding` holds, as it serialises.
+    fn author_of(binding: &MemoryBinding) -> Value {
+        serde_json::to_value(binding.forum_author()).unwrap()
     }
 
     /// What `tools/subagent` gives a worker runtime of a chat with `chat`:
@@ -391,7 +372,7 @@ done"#,
     }
 
     #[tokio::test]
-    async fn a_chats_tool_call_names_the_author_its_forum_post_records() {
+    async fn a_chats_tool_call_names_the_author_its_binding_holds() {
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
         let log = dir.join("calls.jsonl");
@@ -399,9 +380,7 @@ done"#,
         let chat = chat_binding(&dir);
 
         let params = params_sent(&tool, &log, context_with_memory(chat.clone())).await;
-        let posted = author_forum_post_records(&dir, &chat).await;
-        assert!(posted.is_object(), "{posted}");
-        assert_eq!(params["caller"], posted, "the same run, the same author, either route");
+        assert_eq!(params["caller"], author_of(&chat), "the run's own author");
 
         // As the type serialises: a chat has no `parent` key; it reads back
         // as an `Author` and validates.
@@ -438,8 +417,8 @@ done"#,
             let params = params_sent(&tool, &log, context_with_memory(worker.clone())).await;
             assert_eq!(
                 params["caller"],
-                author_forum_post_records(&dir, worker).await,
-                "a worker's call and a worker's post name the same author"
+                author_of(worker),
+                "a worker's call names the worker's own author"
             );
             let caller = as_author(&params["caller"]);
             assert_eq!(caller.group, of_chat.group);

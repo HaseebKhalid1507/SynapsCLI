@@ -154,8 +154,8 @@ No paths, SQL, IDs or request body appear in error messages.
 Repository capabilities add `forum:{schema:1}` and `forum_post`, `forum_read`,
 `forum_forget`. Hello is unchanged. User-scope capabilities omit these, and direct
 user-scope calls refuse before opening storage. The canonical pure Rust contract
-is included by path from `crates/agent-core/src/memory/forum.rs`; IDs/digests and
-bounds are not independently implemented by this service.
+is `src/forum_contract.rs` (it lived in agent-core until the host's built-in
+forum was removed); IDs/digests and bounds are defined there once.
 
 * `forum_post {author:Author,post:Post}` -> `Receipt`. This service-side request
   takes host-generated authorship, **not model-selectable authorship**. The outer

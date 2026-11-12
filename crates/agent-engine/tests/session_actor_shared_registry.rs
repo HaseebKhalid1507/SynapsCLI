@@ -1,8 +1,8 @@
 //! One host serves many chats (the daemon) and they share one tool registry.
 //! What a tool does for a chat, and which tools a chat is offered, belong to
 //! that chat: `context_checkpoint` writes into the calling chat's rollover
-//! state, and a chat that may not use a tool (no context management, no
-//! project forum) does not take it away from one that may.
+//! state, and a chat that may not use a tool (no context management) does
+//! not take it away from one that may.
 //!
 //! Drives the production actor → runtime → Anthropic transport against a
 //! loopback stub, like the other `session_actor_*` tests.
@@ -29,8 +29,6 @@ use tokio::sync::{mpsc, Semaphore};
 enum Reply {
     /// Calls `context_checkpoint` with this phase and note, then answers.
     Checkpoint(&'static str, &'static str),
-    /// Answers.
-    Text,
 }
 
 /// One request as the provider received it.
@@ -63,10 +61,6 @@ impl Provider {
         self.requests.lock().unwrap().iter().any(|r| {
             r.chat == chat && (r.tools.iter().any(|t| t == tool) || r.system.contains(&listed))
         })
-    }
-    fn requests_of(&self, chat: &str) -> usize {
-        let requests = self.requests.lock().unwrap();
-        requests.iter().filter(|r| r.chat == chat).count()
     }
     /// The tool results `chat` sent back, as JSON text.
     fn results_of(&self, chat: &str) -> String {
@@ -151,7 +145,6 @@ async fn answer(provider: Arc<Provider>, body: String) -> axum::response::Respon
     gate.acquire().await.unwrap().forget();
     match reply {
         Reply::Checkpoint(phase, note) => sse(checkpoint_sse(phase, note)),
-        Reply::Text => sse(SSE_HI.to_string()),
     }
 }
 
@@ -340,64 +333,4 @@ async fn a_chat_without_context_management_takes_nothing_from_one_that_has_it() 
     }
     end(&mut a.t).await;
     end(&mut b.t).await;
-}
-
-/// The project forum belongs to the Axel memory backend, and a chat whose
-/// folder's project cannot be resolved has no forum. Such a chat takes a
-/// turn first; a chat on the same host that has a forum is then still
-/// offered the forum tools, and the first never is.
-async fn the_forum_stays_with_the_chat_that_has_one(progressive: bool) {
-    // Never started: nothing in these turns calls the memory service.
-    let service = tempfile::tempdir().unwrap();
-    let config = format!(
-        "memory.backend = axel\nmemory.axel.executable = {}\nmemory.axel.brain = {}\n\
-         progressive_tool_disclosure = {progressive}\n",
-        service.path().join("no-such-service").display(),
-        service.path().join("brain.r8").display(),
-    );
-    let (_h, host, provider, mut arrivals) =
-        setup(&config, &[("alpha", Reply::Text), ("beta", Reply::Text)]).await;
-    // alpha's folder is a project of its own. beta's has a `.git` that is no
-    // repository, so its project is refused rather than guessed.
-    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    std::fs::write(dir_a.path().join(".synaps-project"), "").unwrap();
-    std::fs::write(dir_b.path().join(".git"), "not a repository\n").unwrap();
-    let mut a = Chat::start(&host, dir_a.path(), false).await;
-    let mut b = Chat::start(&host, dir_b.path(), false).await;
-    assert!(a.runtime.memory_backend_is_axel(), "alpha has a forum");
-    assert!(!b.runtime.memory_backend_is_axel(), "beta has none");
-
-    b.say("beta, hello").await;
-    started(&mut arrivals, "beta").await;
-    provider.release("beta");
-    b.idle().await;
-    a.say("alpha, hello").await;
-    started(&mut arrivals, "alpha").await;
-    provider.release("alpha");
-    a.idle().await;
-
-    assert!(provider.requests_of("alpha") > 0 && provider.requests_of("beta") > 0);
-    for tool in ["forum_post", "forum_read", "forum_forget"] {
-        assert!(provider.offered("alpha", tool), "alpha is offered {tool}");
-        assert!(!provider.offered("beta", tool), "beta is not offered {tool}");
-    }
-    for chat in ["alpha", "beta"] {
-        assert!(provider.offered(chat, "read"), "{chat}");
-    }
-    end(&mut a.t).await;
-    end(&mut b.t).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn a_chat_with_no_forum_does_not_take_the_forum_tools_from_one_that_has_it() {
-    the_forum_stays_with_the_chat_that_has_one(false).await;
-}
-
-/// The same under progressive disclosure, where the forum tools are not in
-/// the tools array but in the list of tools the chat may activate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn a_chat_with_no_forum_does_not_take_the_forum_tools_from_one_that_has_it_progressive() {
-    the_forum_stays_with_the_chat_that_has_one(true).await;
 }

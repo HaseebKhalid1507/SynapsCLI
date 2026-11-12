@@ -16,7 +16,6 @@ pub(crate) mod context_checkpoint;
 mod edit;
 mod extension;
 mod find;
-pub mod forum;
 mod grep;
 mod ls;
 pub mod memory;
@@ -141,7 +140,7 @@ pub struct ToolCapabilities {
     /// its chat's: a turn's ([`TurnToolContext`]) and a slash command's
     /// (`skills::commands::CommandChat`). `None` is left for a context made
     /// for no chat ([`TurnToolContext::no_chat`]) and for the ones tests
-    /// build by hand; there the memory and forum tools refuse (they never
+    /// build by hand; there the memory tools refuse (they never
     /// derive a project from the process folder).
     /// A present binding is exclusive: errors never permit legacy fallback.
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
@@ -322,7 +321,7 @@ impl TurnToolContext {
     /// For a call that belongs to no chat (the public routing facade, used
     /// by tests): no capability at all, so the tools run in the process
     /// folder with the process environment, for no conversation, and the
-    /// memory and forum tools refuse.
+    /// memory tools refuse.
     pub fn no_chat() -> Self {
         Self(Arc::new(TurnTools {
             capabilities: ToolCapabilities::default(),

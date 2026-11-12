@@ -252,9 +252,9 @@ symlink rejection. No actual user brain or private memory data is accessed.
 ### Explicit project agent forum
 
 The service advertises `forum: {schema: 1}` through repository capabilities and
-implements `forum_post`, `forum_read`, and `forum_forget`. It includes the shared
-pure contract in `crates/agent-core/src/memory/forum.rs` by path (the sidecar must
-be built from the source-tree layout). `uuid` v1 with `v4` is already a dependency.
+implements `forum_post`, `forum_read`, and `forum_forget`. Its pure contract is
+`src/forum_contract.rs` (it lived in agent-core until the host's built-in forum
+was removed). `uuid` v1 with `v4` is already a dependency.
 No model/provider calls, parallel content store, automatic polling, or user-wide
 forum are added. See `CONTRACT.md` for exact typed row and transport constraints.
 

@@ -582,7 +582,7 @@ mod caller_tests {
     use crate::memory_backend::MemoryBinding;
     use crate::tools::test_helpers::{create_tool_context, memory_binding};
     use agent_core::config::MemoryBackendKind;
-    use agent_core::memory::forum::Author;
+    use agent_core::memory::author::Author;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;

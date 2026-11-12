@@ -3,7 +3,7 @@
 //! selects a process, never a shell command or a model-controlled namespace.
 use crate::{Result, RuntimeError};
 use agent_core::config::{MemoryBackendConfig, MemoryBackendKind};
-use agent_core::memory::forum::Author;
+use agent_core::memory::author::Author;
 use agent_core::memory::store::{
     self, MemoryDescriptor, MemoryRecord, MemorySensitivity, NewMemoryRecord, ProjectMemoryQuery,
     ProjectScope,
@@ -12,7 +12,6 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 mod competing;
-pub mod forum;
 mod history;
 mod process;
 mod provisioning;
@@ -196,6 +195,8 @@ impl MemoryBinding {
     }
     /// Immutable execution provenance, not a saved conversation identity or
     /// an authorization grant. Ordinary clones retain this exact author.
+    /// Forwarded to extensions as `caller` on `tool.call`; an extension's
+    /// forum records it as the run's author.
     pub fn forum_author(&self) -> &Author {
         &self.0.author
     }

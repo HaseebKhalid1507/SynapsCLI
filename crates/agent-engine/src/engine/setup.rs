@@ -872,9 +872,9 @@ mod tests {
     }
 
     /// merge(112) DARK test: default config boots with legacy memory and is
-    /// offered no context_checkpoint and no forum tool — Axel features are
-    /// invisible until opted in. Both are in the registry, which every chat
-    /// on a host shares; what a chat is offered is its own.
+    /// offered no context_checkpoint, and no built-in forum tool exists.
+    /// `context_checkpoint` is in the registry, which every chat on a host
+    /// shares; what a chat is offered is its own.
     #[tokio::test]
     async fn default_config_is_dark_no_checkpoint_tool_legacy_binding() {
         let runtime = Runtime::new_headless();

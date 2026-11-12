@@ -576,8 +576,8 @@ impl Tool for DeferredExtensionTool {
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> crate::Result<String> {
         // Runs strictly AFTER the ExecutionGate authorized this exact call.
-        // Who calls: the author of the binding the context came with, the
-        // one `forum_post` records for this run. No binding, no caller: the
+        // Who calls: the author of the binding the context came with.
+        // No binding, no caller: the
         // stand-in made below is the process's, not a run's.
         let caller = ctx
             .capabilities

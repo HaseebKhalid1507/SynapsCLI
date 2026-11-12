@@ -1,6 +1,6 @@
-//! `caller` on an extension tool call made from a chat's turn is the forum
-//! author of that chat's own memory binding: the one `tools/forum.rs` reads
-//! (`binding.forum_author()`) for the chat's `forum_post`. One host, one
+//! `caller` on an extension tool call made from a chat's turn is the
+//! author of that chat's own memory binding (`binding.forum_author()`).
+//! One host, one
 //! recording extension, sessions run through the production actor →
 //! runtime → stream loop against a loopback stub, like
 //! `session_actor_hook_cwd.rs`.
@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_core::memory::forum::Author;
+use agent_core::memory::author::Author;
 use agent_engine::extensions::hooks::events::{HookEvent, HookResult};
 use agent_engine::extensions::runtime::process::RegisteredExtensionToolSpec;
 use agent_engine::extensions::runtime::ExtensionHandler;
@@ -78,7 +78,7 @@ impl ExtensionHandler for Recorder {
 
 /// The real `ExtensionTool` under the name the stub's turn calls, with a
 /// built-in origin so the default session tool set admits it. It notes the
-/// author of the context's binding, as `forum_post` would read it, and the
+/// author of the context's binding, and the
 /// call itself is `ExtensionTool::execute`. Turns here run one at a time.
 struct Admitted(agent_engine::tools::ExtensionTool, Arc<Recorder>);
 

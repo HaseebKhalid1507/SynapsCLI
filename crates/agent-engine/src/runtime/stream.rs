@@ -881,7 +881,6 @@ impl StreamMethods {
         // nothing of this chat is registered into it or removed from it.
         // What this chat is not offered (`chat_tools::withheld_tools`) is
         // withheld from its own session tool set below.
-        let forum_ready = memory_backend.is_axel();
         let system_prompt = if context_enabled {
             Some(format!(
                 "{}\n\n{}",
@@ -929,7 +928,6 @@ impl StreamMethods {
                 registry.catalog(),
                 progressive_tool_disclosure,
                 context_enabled,
-                forum_ready,
                 &tools_always_loaded,
             );
             retain_session_tool_set(
@@ -6377,36 +6375,6 @@ mod rich_output_tests {
             }
             assert_eq!((dropped, kept), (0, 5), "no image may be pruned from a valid history");
         }
-    }
-
-    /// DARK (§7): with the default (legacy) memory backend the forum_* tools
-    /// must not be advertised to the model — they can only error. The default
-    /// registry carries them; the per-turn gate in `run_stream_internal`
-    /// removes them from the request's tool list.
-    #[tokio::test]
-    async fn legacy_backend_does_not_advertise_forum_tools() {
-        let d = drive(
-            vec![
-                Arc::new(crate::tools::forum::ForumPostTool),
-                Arc::new(crate::tools::forum::ForumReadTool),
-                Arc::new(crate::tools::forum::ForumForgetTool),
-                Arc::new(RichTool),
-            ],
-            &[("toolu_1", "rich_stub")],
-            Arc::new(crate::extensions::hooks::HookBus::new()),
-        )
-        .await;
-        let names: Vec<String> = d.bodies[0]["tools"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|t| t["name"].as_str().map(str::to_owned))
-            .collect();
-        assert!(names.iter().any(|n| n == "rich_stub"), "registered tool must be advertised: {names:?}");
-        assert!(
-            !names.iter().any(|n| n.starts_with("forum_")),
-            "forum tools must be hidden under the legacy backend: {names:?}"
-        );
     }
 
     /// Native original-byte overflow triggers chunk retirement, not rejection.

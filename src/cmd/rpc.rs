@@ -1097,7 +1097,7 @@ async fn handle_tools_list(
     writer_tx: mpsc::Sender<RpcEvent>,
 ) {
     // As this session is offered it: the registry also holds tools a
-    // session without context management or a project forum never sees.
+    // session without context management never sees.
     let schema = {
         let st = state.lock().await;
         st.runtime.offered_tools_schema().await.as_ref().clone()

@@ -312,7 +312,7 @@ async fn exact_execute_starts_once_reuses_and_calls_only_exact_tool() {
 /// on a later call, and no `caller` key when the context has no binding.
 #[tokio::test]
 async fn a_deferred_tools_call_names_the_calling_runs_own_author() {
-    use agent_core::memory::forum::Author;
+    use agent_core::memory::author::Author;
     use agent_engine::memory_backend::MemoryBinding;
 
     hermetic_base_dir::pin();

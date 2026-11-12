@@ -70,11 +70,6 @@ impl ToolRegistry {
             Arc::new(crate::tools::memory::MemoryFetchTool),
             Arc::new(crate::tools::memory::MemoryStoreTool),
             Arc::new(crate::tools::memory::MemoryForgetTool),
-            // Explicit project forum tools remain deferred in the foreground;
-            // workers receive this narrow surface without authorization tools.
-            Arc::new(crate::tools::forum::ForumPostTool),
-            Arc::new(crate::tools::forum::ForumReadTool),
-            Arc::new(crate::tools::forum::ForumForgetTool),
             // Automatic context management's phase report. Registered here,
             // once, and stateless: it writes to the calling chat's rollover
             // state, which the call's context carries. A chat without
@@ -157,9 +152,6 @@ impl ToolRegistry {
             Arc::new(crate::tools::grep::GrepTool),
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
-            Arc::new(crate::tools::forum::ForumPostTool),
-            Arc::new(crate::tools::forum::ForumReadTool),
-            Arc::new(crate::tools::forum::ForumForgetTool),
         ];
         #[cfg(feature = "command-exec")]
         {
@@ -1122,15 +1114,16 @@ mod tests {
     fn test_tool_registry_new() {
         let registry = ToolRegistry::new();
 
-        // Includes model discovery/authorization, project memory primitives,
-        // the three explicit forum tools and `context_checkpoint`. Forum
-        // tools remain outside the progressive essential foreground core.
+        // Includes model discovery/authorization, project memory primitives
+        // and `context_checkpoint`. The built-in forum is gone (the Axel
+        // extension serves one).
         assert_eq!(
             registry.tools_schema().len(),
-            29 + usize::from(cfg!(windows))
+            26 + usize::from(cfg!(windows))
         );
-        for name in ["forum_post", "forum_read", "forum_forget", "context_checkpoint"] {
-            assert!(registry.get(name).is_some(), "missing {name}");
+        assert!(registry.get("context_checkpoint").is_some());
+        for name in ["forum_post", "forum_read", "forum_forget"] {
+            assert!(registry.get(name).is_none(), "{name} is no longer built in");
         }
 
         // Should find bash tool
@@ -1187,13 +1180,13 @@ mod tests {
     fn test_tool_registry_without_subagent() {
         let registry = ToolRegistry::without_subagent();
 
-        // 8 base + 3 shell + 3 forum tools (plus PowerShell on Windows).
+        // 8 base + 3 shell tools (plus PowerShell on Windows).
         assert_eq!(
             registry.tools_schema().len(),
-            14 + usize::from(cfg!(windows))
+            11 + usize::from(cfg!(windows))
         );
         for name in ["forum_post", "forum_read", "forum_forget"] {
-            assert!(registry.get(name).is_some(), "missing {name}");
+            assert!(registry.get(name).is_none(), "{name} is no longer built in");
         }
         // Should not have subagent tool
         assert!(registry.get("subagent").is_none());
@@ -1359,26 +1352,26 @@ mod tests {
     }
 
     /// `disabled_tools` on a worker: every listed built-in goes (`bash`,
-    /// `ls`, the forum tools alike), an extension tool keeps its place even
+    /// `ls` alike), an extension tool keeps its place even
     /// when listed (the foreground's boot pass runs before extensions
     /// register, so it keeps it too), and the schema matches the tool set.
     #[test]
     fn worker_set_disables_the_listed_built_ins_before_the_extension_merge() {
         let mut shared = ToolRegistry::empty();
         shared.register(Arc::new(OwnedTool("alpha:do_thing", Some("alpha"))));
-        let disabled: Vec<String> = ["bash", "shell_start", "ls", "forum_read", "alpha:do_thing"]
+        let disabled: Vec<String> = ["bash", "shell_start", "ls", "alpha:do_thing"]
             .map(String::from)
             .to_vec();
 
         let all = ToolRegistry::worker_set(&shared, &[]);
-        assert!(all.get("ls").is_some() && all.get("forum_read").is_some());
+        assert!(all.get("ls").is_some());
         let worker = ToolRegistry::worker_set(&shared, &disabled);
         let names: Vec<String> = worker
             .tools_schema()
             .iter()
             .filter_map(|t| t["name"].as_str().map(String::from))
             .collect();
-        for name in ["bash", "shell_start", "ls", "forum_read"] {
+        for name in ["bash", "shell_start", "ls"] {
             assert!(worker.get(name).is_none(), "{name} kept");
             assert!(!names.iter().any(|n| n == name), "{name} advertised: {names:?}");
         }
@@ -1415,35 +1408,12 @@ mod tests {
 
     #[cfg(feature = "command-exec")]
     #[test]
-    fn forum_membership_preserves_worker_bounds_and_foreground_disclosure() {
-        use crate::tools::activation::{SessionId, SessionToolSet};
-        use crate::tools::catalog::{ToolEffect, ToolId};
-        let main = ToolRegistry::new();
+    fn worker_registries_keep_their_bounds_with_extensions_merged() {
         let mut extensions = ToolRegistry::empty();
         extensions.register(Arc::new(OwnedTool("peer:probe", Some("peer"))));
         let merged = ToolRegistry::without_subagent_with_extensions(&extensions);
-        assert_eq!(merged.tools_schema().len(), 15 + usize::from(cfg!(windows)));
+        assert_eq!(merged.tools_schema().len(), 12 + usize::from(cfg!(windows)));
         assert!(merged.get("peer:probe").is_some());
-        for registry in [&main, &ToolRegistry::without_subagent(), &merged] {
-            for (name, effect) in [
-                ("forum_post", ToolEffect::NonIdempotent),
-                ("forum_read", ToolEffect::ReadOnly),
-                ("forum_forget", ToolEffect::NonIdempotent),
-            ] {
-                let tool = registry.get(name).unwrap();
-                assert_eq!(tool.origin(), crate::tools::ToolOrigin::Builtin);
-                assert_eq!(tool.effect(), effect);
-                assert!(registry.catalog().get(&ToolId::builtin(name)).is_some());
-                assert_eq!(
-                    registry
-                        .tools_schema()
-                        .iter()
-                        .filter(|schema| schema["name"] == name)
-                        .count(),
-                    1
-                );
-            }
-        }
         for registry in [ToolRegistry::without_subagent(), merged] {
             for name in [
                 "subagent",
@@ -1466,18 +1436,6 @@ mod tests {
             for name in ["bash", "write", "edit", "multi_edit"] {
                 assert!(registry.get(name).is_some(), "worker must retain {name}");
             }
-        }
-        let session = SessionToolSet::progressive_core_for_catalog(
-            SessionId::parse("forum-foreground-test").unwrap(),
-            main.catalog(),
-        );
-        let projection = main.session_tools_schema(&session);
-        for name in ["forum_post", "forum_read", "forum_forget"] {
-            assert!(!session.is_core(&ToolId::builtin(name)));
-            assert!(!projection
-                .schema
-                .iter()
-                .any(|schema| schema["name"] == name));
         }
     }
 
