@@ -3363,17 +3363,20 @@ mod command_tests {
 
 /// Initial and stale-catalog replacement use the same opted-in core surface.
 /// Only existing builtin IDs are included; never resurrect a disabled tool.
+/// `always_loaded` is `tools.always_loaded` (see
+/// [`SessionToolSet::progressive_core_with`](crate::tools::activation::SessionToolSet::progressive_core_with)).
 pub(crate) fn context_tool_set(
     session: crate::tools::activation::SessionId,
     catalog: &crate::tools::catalog::ToolCatalog,
     progressive: bool,
     context_enabled: bool,
+    always_loaded: &[crate::tools::catalog::ToolId],
 ) -> crate::tools::activation::SessionToolSet {
     use crate::tools::{activation::SessionToolSet, catalog::ToolId};
     if !progressive {
         return SessionToolSet::default_core_for_catalog(session, catalog);
     }
-    let minimal = SessionToolSet::progressive_core_for_catalog(session.clone(), catalog);
+    let minimal = SessionToolSet::progressive_core_with(session.clone(), catalog, always_loaded);
     if !context_enabled {
         return minimal;
     }
@@ -3441,20 +3444,20 @@ mod lifecycle_tests {
                 Default::default(),
             ))),
         ));
-        let initial = context_tool_set(session.clone(), registry.catalog(), true, true);
+        let initial = context_tool_set(session.clone(), registry.catalog(), true, true, &[]);
         for name in ["context_checkpoint", "memory_search", "memory_fetch"] {
             assert!(ExecutionGate::authorize_wire_call(&registry, &initial, name).is_ok());
         }
         // Same core derivation the stale-set rebuild uses
         // (`stream::rebuild_stale_tool_set`, regression-tested below).
         registry.disable(&["write".into()]);
-        let rebuilt = context_tool_set(session.clone(), registry.catalog(), true, true);
+        let rebuilt = context_tool_set(session.clone(), registry.catalog(), true, true, &[]);
         assert!(ExecutionGate::authorize_wire_call(&registry, &rebuilt, "memory_fetch").is_ok());
         registry.disable(&["memory_fetch".into()]);
-        let disabled = context_tool_set(session.clone(), registry.catalog(), true, true);
+        let disabled = context_tool_set(session.clone(), registry.catalog(), true, true, &[]);
         assert!(!disabled.is_core(&ToolId::builtin("memory_fetch")));
         assert!(ExecutionGate::authorize_wire_call(&registry, &disabled, "memory_fetch").is_err());
-        let off = context_tool_set(session, registry.catalog(), true, false);
+        let off = context_tool_set(session, registry.catalog(), true, false, &[]);
         assert!(!off.is_core(&ToolId::builtin("memory_search")));
     }
 
@@ -3477,7 +3480,7 @@ mod lifecycle_tests {
         };
         let mut registry = ToolRegistry::new();
         registry.register(checkpoint());
-        let mut initial = context_tool_set(session.clone(), registry.catalog(), true, true);
+        let mut initial = context_tool_set(session.clone(), registry.catalog(), true, true, &[]);
         let deferred = ToolId::builtin("shell_start");
         assert!(
             !initial.is_core(&deferred),
@@ -3510,6 +3513,7 @@ mod lifecycle_tests {
             registry.catalog(),
             true,
             true,
+            &[],
         );
         assert!(dropped.is_empty(), "nothing drifted: {dropped:?}");
         assert!(!rebuilt.is_stale(registry.catalog()));
@@ -3532,6 +3536,7 @@ mod lifecycle_tests {
             registry.catalog(),
             true,
             false,
+            &[],
         );
         assert!(!off.is_core(&ToolId::builtin("memory_search")));
         assert!(ExecutionGate::authorize_wire_call(&registry, &off, "shell_start").is_ok());

@@ -627,6 +627,7 @@ impl Runtime {
                 true,
                 context_enabled,
                 forum_ready,
+                &self.tools_always_loaded,
             );
             // The SAME selection a turn start makes (`retain_session_tool_set`),
             // through its pure half: nothing is written back.

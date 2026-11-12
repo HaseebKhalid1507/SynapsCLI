@@ -877,7 +877,7 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             Some("false" | "0" | "off" | "no") => "off".to_string(),
             _ => "auto".to_string(),
         },
-        "disabled_tools" | "disabled_skills" => list_config_display(key),
+        "disabled_tools" | "disabled_skills" | "tools.always_loaded" => list_config_display(key),
         // Appearance
         "max_fps" => ranged_config_display(key, 1..=1000, 60),
         "scroll_lines" => ranged_config_display(key, 1..=20, 3),

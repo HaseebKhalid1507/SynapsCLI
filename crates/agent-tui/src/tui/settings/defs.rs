@@ -667,6 +667,10 @@ define_settings! {
         "When the model asks to activate tools: auto allows (default), prompt asks you, deny refuses. Takes effect next launch.",
         |_app, value| config_edit("tools.activation_confirm", value);
 
+    "tools.always_loaded", "Always-loaded tools", ToolLimits, EditorKind::Text { numeric: false },
+        "With progressive tools on: tools kept loaded from the first request, comma-separated ids as activate_tools takes them (e.g. ext.axel:search, builtin:subagent). Ids not installed are skipped. Empty = none. Takes effect next launch.",
+        |_app, value| config_edit("tools.always_loaded", value);
+
     "process_scopes", "Process scopes", ToolLimits, EditorKind::Cycler(&["auto", "off"]),
         "Run the daemon, bash commands and shells in their own systemd scopes so the OOM killer stops one runaway command, not the terminal (Linux; default auto). Applies to commands started afterwards; the daemon's own scope changes next launch. Env SYNAPS_PROCESS_SCOPES overrides.",
         |_app, value| config_edit("process_scopes", value);

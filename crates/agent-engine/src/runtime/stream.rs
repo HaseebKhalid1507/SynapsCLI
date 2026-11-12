@@ -203,6 +203,8 @@ pub(super) struct StreamSession {
     pub(super) turn_correlation_id: String,
     /// Opt-in Task 18 policy. False preserves the full-schema request path.
     pub(super) progressive_tool_disclosure: bool,
+    /// `tools.always_loaded`: ids joined to the progressive core.
+    pub(super) tools_always_loaded: Arc<[crate::tools::catalog::ToolId]>,
     /// `tools.deferred_loading` (Anthropic deferred tool definitions).
     pub(super) deferred_tool_loading: bool,
     /// `tools.activation_confirm` policy (auto | prompt | deny).
@@ -496,15 +498,21 @@ pub(super) fn rebuild_stale_tool_set(
     catalog: &crate::tools::catalog::ToolCatalog,
     progressive: bool,
     context_enabled: bool,
+    always_loaded: &[crate::tools::catalog::ToolId],
 ) -> (
     crate::tools::activation::SessionToolSet,
     Vec<crate::tools::activation::DroppedActivation>,
 ) {
     // What the chat is not offered was settled at turn start and holds for
     // the turn: the rebuilt set withholds what the stale one did.
-    let fresh =
-        super::continuation::context_tool_set(session, catalog, progressive, context_enabled)
-            .withholding(set.withheld().cloned());
+    let fresh = super::continuation::context_tool_set(
+        session,
+        catalog,
+        progressive,
+        context_enabled,
+        always_loaded,
+    )
+    .withholding(set.withheld().cloned());
     if crate::tools::activation::carry_forward_enabled() {
         set.carry_activations_into(fresh, catalog)
     } else {
@@ -759,6 +767,7 @@ impl StreamMethods {
             delegation_parent,
             turn_correlation_id,
             progressive_tool_disclosure,
+            tools_always_loaded,
             deferred_tool_loading,
             activation_confirm,
             tool_session_id,
@@ -921,6 +930,7 @@ impl StreamMethods {
                 progressive_tool_disclosure,
                 context_enabled,
                 forum_ready,
+                &tools_always_loaded,
             );
             retain_session_tool_set(
                 &retained_tool_set,
@@ -1218,6 +1228,7 @@ impl StreamMethods {
                             registry.catalog(),
                             progressive_tool_disclosure,
                             context_enabled,
+                            &tools_always_loaded,
                         );
                         for d in &dropped {
                             tracing::warn!(
@@ -4483,6 +4494,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-test".into(),
             progressive_tool_disclosure: progressive,
+            tools_always_loaded: Arc::from([]),
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
@@ -6581,6 +6593,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-f19".into(),
             progressive_tool_disclosure: false,
+            tools_always_loaded: Arc::from([]),
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,

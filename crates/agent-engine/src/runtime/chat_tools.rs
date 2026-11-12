@@ -39,8 +39,9 @@ pub(super) fn chat_tool_set(
     progressive: bool,
     context_enabled: bool,
     forum_ready: bool,
+    always_loaded: &[ToolId],
 ) -> SessionToolSet {
-    super::continuation::context_tool_set(session, catalog, progressive, context_enabled)
+    super::continuation::context_tool_set(session, catalog, progressive, context_enabled, always_loaded)
         .withholding(withheld_tools(context_enabled, forum_ready))
 }
 
@@ -97,8 +98,8 @@ mod tests {
     #[test]
     fn two_chats_on_one_registry_are_each_offered_their_own_tools() {
         let registry = ToolRegistry::new();
-        let has = chat_tool_set(session("has"), registry.catalog(), false, true, true);
-        let lacks = chat_tool_set(session("lacks"), registry.catalog(), false, false, false);
+        let has = chat_tool_set(session("has"), registry.catalog(), false, true, true, &[]);
+        let lacks = chat_tool_set(session("lacks"), registry.catalog(), false, false, false, &[]);
         for name in FORUM.into_iter().chain(["context_checkpoint"]) {
             assert!(allowed(&registry, &has, name), "{name}");
             assert!(!allowed(&registry, &lacks, name), "{name}");
@@ -118,10 +119,10 @@ mod tests {
         assert_eq!(sent.len() + 4, whole.len());
 
         // One of the two things each: only what that chat lacks is withheld.
-        let no_forum = chat_tool_set(session("nf"), registry.catalog(), false, true, false);
+        let no_forum = chat_tool_set(session("nf"), registry.catalog(), false, true, false, &[]);
         assert!(allowed(&registry, &no_forum, "context_checkpoint"));
         assert!(!allowed(&registry, &no_forum, "forum_read"));
-        let no_context = chat_tool_set(session("nc"), registry.catalog(), false, false, true);
+        let no_context = chat_tool_set(session("nc"), registry.catalog(), false, false, true, &[]);
         assert!(!allowed(&registry, &no_context, "context_checkpoint"));
         assert!(allowed(&registry, &no_context, "forum_read"));
     }
@@ -147,8 +148,8 @@ mod tests {
         let registry = ToolRegistry::new();
         let catalog = registry.catalog();
         let post = ToolId::builtin("forum_post");
-        let mut has = chat_tool_set(session("has"), catalog, true, true, true);
-        let mut lacks = chat_tool_set(session("lacks"), catalog, true, false, false);
+        let mut has = chat_tool_set(session("has"), catalog, true, true, true, &[]);
+        let mut lacks = chat_tool_set(session("lacks"), catalog, true, false, false, &[]);
         assert!(allowed(&registry, &has, "context_checkpoint"));
         assert!(!allowed(&registry, &lacks, "context_checkpoint"));
 
@@ -182,7 +183,7 @@ mod tests {
         for progressive in [false, true] {
             let mut registry = ToolRegistry::new();
             let id = session("lacks");
-            let lacks = chat_tool_set(id.clone(), registry.catalog(), progressive, false, false);
+            let lacks = chat_tool_set(id.clone(), registry.catalog(), progressive, false, false, &[]);
             registry.register(Arc::new(Late));
             assert!(lacks.is_stale(registry.catalog()));
             let (rebuilt, _) = crate::runtime::stream::rebuild_stale_tool_set(
