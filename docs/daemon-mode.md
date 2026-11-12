@@ -656,7 +656,7 @@ C: bye | socket close = Detach (turn keeps running)
   daemon's `Attached` carries `conversation.api_messages = []` + `conversation.messages_len` + a
   `display_tail {items:[{kind:user|thinking|text|tool_use,…}], omitted, times?}` projected by
   `session::display::display_tail` — the SAME filter the in-process TUI applies to its history, so Local
-  and Socket render byte-identical transcripts (golden test, `differential.sh` S pane). `times` holds each
+  and Socket render byte-identical transcripts (golden test). `times` holds each
   item's message time (RFC 3339 UTC, parallel to `items`), omitted when no item has one (legacy history,
   an older daemon). The conn
   forwarder drops `Stream(MessageHistory)` for Digest clients (they key on the `Conversation` digest that

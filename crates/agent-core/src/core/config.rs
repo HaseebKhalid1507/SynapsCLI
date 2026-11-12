@@ -1779,7 +1779,7 @@ fn write_comma_list_locked(key: &str, values: &[String]) -> std::io::Result<()> 
 
 /// The `shell.*` keys removed in 0.12.0. They were parsed but read by
 /// nothing (the shell tool always used its defaults). A config that still
-/// sets them loads silently, without a warning, for one release.
+/// sets them loads; the keys are ignored silently, without a warning.
 pub const REMOVED_SHELL_KEYS: &[&str] = &[
     "shell.max_sessions",
     "shell.idle_timeout",
@@ -2382,7 +2382,7 @@ fn apply_config_content_with(
             "memory.backend" if val != "axel" => removed_other_backend = true,
             "memory.backend" | "memory.user_scope" | "memory.axel.executable"
             | "memory.axel.brain" => removed_axel_backend = true,
-            // Removed in 0.12.0, accepted silently for one release.
+            // Removed in 0.12.0, ignored silently.
             key if REMOVED_SHELL_KEYS.contains(&key) => {}
             _ => {
                 // Handle namespaced keys
@@ -5335,7 +5335,7 @@ api_retries = 5
         assert!(!cfg.events.auto_turn, "unrecognised auto_turn still fails safe to false");
     }
 
-    /// The `shell.*` keys removed in 0.12.0 load silently for one release:
+    /// The `shell.*` keys removed in 0.12.0 are ignored silently:
     /// whatever their values, no warning and no diagnostic.
     #[test]
     fn removed_shell_keys_load_silently() {

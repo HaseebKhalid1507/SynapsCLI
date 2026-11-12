@@ -497,7 +497,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `telemetry` | string | off | Per-request API telemetry: `off`, `basic` (Anthropic streaming calls: turns, keep-warm, workers; timing incl. `ttft_ms`, usage, `cost_usd` estimated at API list prices, the persisted conversation `session_id` plus the request-trace `runtime_session_id`/`turn_id`/`trace_request_id`, worker identity on subagent records, plus the `cache_diag` verdict when `cache_diagnostics` is on), `full` (adds rate-limit headers). JSONL at `~/.cache/synaps/api-log.jsonl` (0600, O_NOFOLLOW); `basic`/`full` also write the metadata-only `~/.cache/synaps/request-trace.jsonl` ([docs/trace-schema.md](docs/trace-schema.md)) |
 | `telemetry_log_generations` | int | 1 | Rotated generations kept for `api-log.jsonl` and `request-trace.jsonl` (each rotates at 50 MB): `<log>.1` (newest) .. `<log>.N` (oldest), 1–100. `1` is the historical single `<log>.1`. Read when the session's telemetry writer starts |
 | `cache_diagnostics` | bool | false | Anthropic cache diagnostics: each turn sends `diagnostics.previous_message_id` and records the server's reason: how this request diverges from the previous request in the chain, not what the cache did (it can appear on a full cache hit — read it with `cache_read_input_tokens`). An unknown or nonexistent previous id returns 200 with `previous_message_not_found`. Written to `cache_diag` in `api-log.jsonl` (telemetry `basic`+) and `cache.server_diagnosis` in the request trace. Beta header `cache-diagnosis-2026-04-07` on API-key auth only; a rejection turns it off for the session and the request is re-sent without it |
-| `shell.*` / `server.*` | — | — | Namespaced config families parsed by `parse_shell_config_key` / `parse_server_config_key` in `crates/agent-core/src/core/config.rs` — see those functions for the full key list. `server.*` is only `server.auto_approve_confirms` now: the other keys of the removed `synaps server` (and the removed watcher's `bridge.*` keys) load with one deprecation warning and are ignored |
+| `shell.*` / `server.*` | — | — | `shell.*`: the eight keys were removed in 0.12.0 and are ignored silently (`REMOVED_SHELL_KEYS` in `crates/agent-core/src/core/config.rs`). `server.*`: parsed by `parse_server_config_key` in the same file; it is only `server.auto_approve_confirms` now: the other keys of the removed `synaps server` (and the removed watcher's `bridge.*` keys) load with one deprecation warning and are ignored |
 
 ---
 
@@ -572,7 +572,6 @@ Located in `crates/agent-engine/src/runtime/mod.rs`. The single source of truth 
 Owns: `model`, `thinking_budget`, `system_prompt`, `ToolRegistry` (behind `Arc<RwLock>`), HTTP client, telemetry level, limits (`max_tool_output`, `bash_timeout`, `bash_max_timeout`, `subagent_timeout`, `api_retries`).
 
 Key entry points:
-- `run_single(&self, prompt)` → `Result<String>` — one-shot, no streaming. Used by headless paths.
 - `run_stream(&self, prompt, cancel)` → stream of `StreamEvent` — fire-and-forget (synthesizes messages).
 - `run_stream_with_messages(...)` → stream with caller-supplied message history. **Used by TUI.**
 

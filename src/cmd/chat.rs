@@ -4,13 +4,8 @@
 //! compaction) but renders to stdin/stdout. Built for scripting,
 //! piping, SSH, CI, and agent benchmark frameworks like Harbor.
 //!
-//! C4a: chat continues turns when pending runtime events are injected at
-//! turn end (AutoTriggerEvents), bounded by AUTO_TURN_CAP.
-//!
-//! C4b: blocking read_line replaced with tokio::io::stdin + select! against
-//! event_queue.notified(), so runtime events wake the prompt immediately.
-//! Exactly ONE waiter on notified() exists while idle at the prompt.
-//! Piped stdin, EOF, and CRLF behaviour are preserved.
+//! Runs on the `SessionActor`; event auto-turns and their cap live in the
+//! actor.
 
 /// Entry point. Runs on the `SessionActor` via `LocalTransport` (A2).
 pub async fn run(
