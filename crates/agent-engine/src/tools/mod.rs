@@ -142,7 +142,6 @@ pub struct ToolCapabilities {
     /// for no chat ([`TurnToolContext::no_chat`]) and for the ones tests
     /// build by hand; there the memory tools refuse (they never
     /// derive a project from the process folder).
-    /// A present binding is exclusive: errors never permit legacy fallback.
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     /// Parent-session telemetry for the subagents this context spawns: they
     /// record at the same level through the parent's session writer. `None`

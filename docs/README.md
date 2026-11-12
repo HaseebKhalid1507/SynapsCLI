@@ -29,6 +29,7 @@ Durable references live here at the top level. Working history is filed by kind 
 
 | Directory | Contents |
 |---|---|
+| [upgrading/](upgrading/) | Per-release upgrade notes. |
 | [specs/](specs/) | Design specifications. |
 | [plans/](plans/) | Implementation plans. |
 | [reviews/](reviews/) | Code and architecture review records. |

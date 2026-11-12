@@ -999,7 +999,7 @@ pub enum SessionCommand {
     /// Resync after Lagged (B, day 3): actor re-sends history + turn_replay.
     Resync { client: ClientId, since_seq: u64 },
     /// Runtime-backed slash command (`engine::commands::handle_engine_command`:
-    /// /model /thinking /context /trace /memory /compact …). Reply =
+    /// /model /thinking /context /trace /compact …). Reply =
     /// `QueryResult { id, value: {"kind": .., "text": ..} }`.
     EngineCommand { id: u64, name: String, arg: String },
     /// (A3) dispatch.rs LoadSkill — pre-built tool_use/tool_result pair
