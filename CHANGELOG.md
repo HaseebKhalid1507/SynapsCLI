@@ -334,6 +334,23 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **The plugin sidecar system.** Plugins run their own process one way
+  now: as an extension. The second mechanism, built for voice dictation
+  and used only by `local-voice`, is deleted with no replacement: the
+  `provides.sidecar` manifest block (`PluginProvides`, `SidecarManifest`,
+  `SidecarLifecycle`, `SidecarModel`), the engine `sidecar` module, the
+  `sidecar.spawn_args` extension call, the `provides.sidecar.setup`
+  build-script fallback, `/sidecar`, the plugin-claimed `/<word>
+  toggle|status` routing, the header pill, the Settings → Sidecar page and
+  injected "Toggle key" rows, the toggle-key migration and the F8 key core
+  always bound. A `plugin.json` that still has `provides.sidecar` loads
+  with its extension, commands, keybinds and settings, the block ignored
+  with one log line; `/voice toggle|status` go to the plugin's own command;
+  `sidecar_toggle_key` loads, is ignored and warns once; a theme's
+  `sidecar.pill` is ignored. `/sidecar` is an unknown command. The trust
+  summary's "runs setup script on install" now reflects `extension.setup`.
+  See `docs/upgrading/0.12.0.md`.
+
 - **The Axel memory helper's source and its CI jobs.** `sidecars/axel-memory-service`
   (the `synaps-axel-memory-service` process the memory backend started, with
   its copy of the forum contract) is deleted, with the CI jobs `sidecar` and
