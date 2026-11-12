@@ -3126,10 +3126,11 @@ mod tests {
         );
         let text = log.text();
         assert_eq!(
-            text.matches(
+            text.matches(&format!(
                 "extension provider-only declares a context provider; built-in automatic \
-                 memory was removed in 0.12.0, the declaration is ignored"
-            )
+                 memory was removed in {}, the declaration is ignored",
+                agent_core::AXEL_BACKEND_REMOVED_IN
+            ))
             .count(),
             1,
             "one notice in the log: {text}"

@@ -6465,7 +6465,7 @@ mod memory_binding_tests {
         let chat = project();
         let config = agent_core::config::load_config_from_str(OLD_AXEL_CONFIG);
         assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
-        assert!(config.warnings[0].starts_with("memory.backend = axel is no longer supported"));
+        assert!(config.warnings[0].starts_with("The Axel memory backend (memory.backend = axel, "));
         assert_eq!(
             config.context_management.mode,
             agent_core::config::ContextManagementMode::Auto
