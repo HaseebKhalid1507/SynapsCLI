@@ -2886,6 +2886,38 @@ mod tests {
     }
 
     #[test]
+    fn tools_always_loaded_parses_ids_and_warns_on_malformed() {
+        use crate::orchestration::capability::ToolId;
+        assert!(super::load_config_from_str("").tools_always_loaded.is_empty());
+        let good = super::load_config_from_str(
+            "tools.always_loaded =  ext.axel:search ,builtin:subagent,, ext.axel:search \n",
+        );
+        assert_eq!(
+            good.tools_always_loaded,
+            vec![
+                ToolId::parse("ext.axel:search").unwrap(),
+                ToolId::parse("builtin:subagent").unwrap(),
+            ]
+        );
+        assert!(good.warnings.is_empty(), "{:?}", good.warnings);
+
+        let bad = super::load_config_from_str(
+            "tools.always_loaded = ext.axel:search, Axel Search, subagent\n",
+        );
+        assert_eq!(
+            bad.tools_always_loaded,
+            vec![ToolId::parse("ext.axel:search").unwrap()],
+            "a malformed id is dropped, the good ones are kept"
+        );
+        let warning = bad
+            .warnings
+            .iter()
+            .find(|w| w.contains("tools.always_loaded"))
+            .expect("malformed ids warn");
+        assert!(warning.contains("Axel Search") && warning.contains("subagent"), "{warning}");
+    }
+
+    #[test]
     fn secret_env_value_detects_credential_urls() {
         use super::is_secret_env_value as v;
         // user:password in the authority

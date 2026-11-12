@@ -1386,3 +1386,100 @@ async fn a17_activate_tools_answers_with_text_then_tool_references() {
     mcp.cleanup();
     ext.cleanup();
 }
+
+// ── a18: `tools.always_loaded` keeps a listed extension tool loaded ──────────
+
+/// `tools.always_loaded`, parsed from config as the host does, puts a listed
+/// extension tool in the LOADED tools of a progressive session (not
+/// deferred, no `activate_tools` needed), including when the extension
+/// registers after the session started: the round-top rebuild (a fresh
+/// progressive core with the list, activations carried, as
+/// `rebuild_stale_tool_set`) picks it up. Its unlisted sibling stays
+/// deferred; when the extension unloads the tool leaves the core.
+#[tokio::test]
+async fn a18_always_loaded_extension_tool_is_loaded_not_deferred() {
+    hermetic_base_dir::pin();
+    let ext = ext_fixture("a18");
+    let config = synaps_cli::config::load_config_from_str(
+        "progressive_tool_disclosure = true\n\
+         tools.always_loaded = ext.fixture-plugin:search, ext.absent:tool\n",
+    );
+    assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    let always = config.tools_always_loaded.clone();
+    let search = ToolId::extension("fixture-plugin", "search");
+    let sibling = ToolId::extension("fixture-plugin", "sibling");
+
+    let mut base = ToolRegistry::empty();
+    for name in ["bash", "read", "search_tools", "activate_tools"] {
+        base.register(Arc::new(InertTool::core(name)));
+    }
+    let registry = Arc::new(tokio::sync::RwLock::new(base));
+    let session = sid("a18");
+    // Session starts before the extension registers: nothing to load yet.
+    let initial = {
+        let reg = registry.read().await;
+        SessionToolSet::progressive_core_with(session.clone(), reg.catalog(), &always)
+    };
+    assert!(!initial.is_core(&search));
+
+    // Late registration (deferred extension load on the shared registry).
+    let mut mgr = ExtensionManager::new_with_tools(Arc::new(HookBus::new()), Arc::clone(&registry));
+    mgr.set_progressive_deferral(true);
+    mgr.load("fixture-plugin", &ext.manifest).await.unwrap();
+    assert!(ext.events().is_empty(), "deferred load must not spawn");
+    let runtime = mgr.extension_runtime();
+
+    let reg = registry.read().await;
+    assert!(initial.is_stale(reg.catalog()));
+    let (set, dropped) = initial.carry_activations_into(
+        SessionToolSet::progressive_core_with(session.clone(), reg.catalog(), &always),
+        reg.catalog(),
+    );
+    assert!(dropped.is_empty());
+    assert!(set.is_core(&search), "listed tool joins the core after late registration");
+    assert!(!set.is_core(&sibling), "unlisted sibling stays deferred");
+
+    let split = reg.deferred_tool_split(&set, &Default::default());
+    let api = |id: &ToolId| split.id_to_api.get(id.as_str()).cloned().expect("in split");
+    let names = |entries: &[Value]| -> BTreeSet<String> {
+        entries
+            .iter()
+            .filter_map(|e| e["name"].as_str().map(String::from))
+            .collect()
+    };
+    assert!(names(&split.loaded).contains(&api(&search)), "listed tool is loaded");
+    assert!(!names(&split.deferred).contains(&api(&search)), "listed tool is not deferred");
+    assert!(names(&split.deferred).contains(&api(&sibling)));
+
+    // Control: the same session without the list defers it.
+    let bare = SessionToolSet::progressive_core_for_catalog(session.clone(), reg.catalog());
+    let bare_split = reg.deferred_tool_split(&bare, &Default::default());
+    assert!(names(&bare_split.deferred).contains(&api(&search)));
+
+    // Callable as a core tool without activate_tools (lease spawns on call).
+    let authorized =
+        ExecutionGate::authorize_wire_call(&reg, &set, "fixture-plugin:search").unwrap();
+    let cap = ExtensionLeaseCapability::new(session.clone(), Arc::clone(&runtime));
+    let out = reg
+        .get(authorized.runtime_name())
+        .unwrap()
+        .execute(json!({"text": "x"}), ctx_full(None, None, None, Some(cap)))
+        .await
+        .unwrap();
+    assert_eq!(out, "called:search");
+    assert!(ExecutionGate::authorize_wire_call(&reg, &set, "fixture-plugin:sibling").is_err());
+    drop(reg);
+
+    // The extension goes away: the next rebuild drops it fail-closed.
+    runtime.terminate_all();
+    mgr.unload("fixture-plugin").await.unwrap();
+    let reg = registry.read().await;
+    assert!(set.is_stale(reg.catalog()));
+    let (gone, _) = set.carry_activations_into(
+        SessionToolSet::progressive_core_with(session, reg.catalog(), &always),
+        reg.catalog(),
+    );
+    assert!(!gone.is_core(&search));
+    assert!(ExecutionGate::authorize_wire_call(&reg, &gone, "fixture-plugin:search").is_err());
+    ext.cleanup();
+}
