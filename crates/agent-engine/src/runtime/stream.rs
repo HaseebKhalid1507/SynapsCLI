@@ -8228,25 +8228,29 @@ mod rich_output_tests {
             run.assert_quiet().await;
         }
 
-        /// Review fix 2: a tool-round ping never selects or re-binds an
-        /// account, and stops when the turn's account is cooling down. The
-        /// round still runs (an explicit selector keeps the turn on it); no
-        /// ping goes out.
+        /// A tool-round ping never selects or re-binds an account. Under the
+        /// default selector (an explicit account) the turn's account cooling
+        /// down does not stop it: the turn stays on that account, and the
+        /// cooldown may be another model's limit (2026-11-11: fable's weekly
+        /// window ran out and opus rounds lost their cache for want of a
+        /// ping). The round is kept warm and the next request reads the
+        /// prefix. (Under `auto` a cooling account stops the ping: auth.rs
+        /// `keepwarm_refresh_keeps_the_bound_seat_and_never_selects`.)
         #[tokio::test]
         #[serial_test::serial(synaps_base_dir)]
-        async fn a_round_on_a_cooling_account_sends_no_ping() {
+        async fn a_round_on_a_cooling_account_it_cannot_leave_is_still_kept_warm() {
             let _base = crate::test_env::BaseDirGuard::new();
             let run = run(
-                Script::short(),
+                Script::kept_warm(2),
                 Opts {
                     interval: Some(INTERVAL),
-                    tool_tail: Duration::from_millis(300),
                     account_cooling: true,
                     ..Default::default()
                 },
             )
             .await;
-            assert_eq!(run.requests.len(), 2, "no ping: {:?}", run.pings().len());
+            let pings = cache_sim::assert_round_kept_warm("cooling", &run.requests);
+            assert!(pings >= 2, "pinged while the round ran: {pings}");
             run.assert_quiet().await;
         }
 

@@ -550,7 +550,8 @@ impl Job {
                 }
             }
             // A ping never selects, switches or re-binds an account (the
-            // auth state is the turn's): it stops if its account is cooling.
+            // auth state is the turn's): under `auto` it stops if its
+            // account is cooling.
             if let Err(e) = super::auth::AuthMethods::refresh_if_needed(
                 Arc::clone(&self.auth),
                 &self.client,
