@@ -580,7 +580,6 @@ async fn production_bash_handoff_conserves_bytes_for_large_generated_output() {
             launch_cancel: None,
             memory_backend: None,
             telemetry: None,
-            watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
             subagent_registry: None,
@@ -592,12 +591,13 @@ async fn production_bash_handoff_conserves_bytes_for_large_generated_output() {
             tool_activation: None,
             mcp_leases: None,
             extension_leases: None,
-            memory_context: None,
             cwd: None,
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
             session_id: None,
+            hook_bus: None,
+            continuation: None,
         },
         limits: ToolLimits {
             max_tool_output: 4096,
@@ -810,7 +810,6 @@ async fn cancellation_closes_forwarder_and_releases_live_delegation_leases() {
             launch_cancel: None,
             memory_backend: None,
             telemetry: None,
-            watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
             subagent_registry: Some(Arc::clone(&registry)),
@@ -822,12 +821,13 @@ async fn cancellation_closes_forwarder_and_releases_live_delegation_leases() {
             tool_activation: None,
             mcp_leases: None,
             extension_leases: None,
-            memory_context: None,
             cwd: None,
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
             session_id: None,
+            hook_bus: None,
+            continuation: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -942,11 +942,11 @@ fn role_defaults_unlimited_only_for_foreground() {
     assert_eq!(fg.max_tool_calls, None);
     assert_eq!(fg.max_accumulated_tool_result_bytes, None);
     // Unattended roles keep a finite round cap.
-    for role in [TurnRole::Autonomous, TurnRole::Worker] {
+    for role in [TurnRole::Event, TurnRole::Worker] {
         let budget = TurnBudget::for_role(role);
         assert!(budget.max_provider_rounds.is_some_and(|r| r > 0));
     }
-    for role in [TurnRole::Foreground, TurnRole::Autonomous, TurnRole::Worker] {
+    for role in [TurnRole::Foreground, TurnRole::Event, TurnRole::Worker] {
         assert_eq!(TurnBudget::for_role(role).max_elapsed, None);
     }
 }

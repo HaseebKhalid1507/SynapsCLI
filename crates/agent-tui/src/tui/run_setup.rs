@@ -181,9 +181,9 @@ pub(crate) async fn run_setup(
             client_input: None,
             name: None,
             max_session_cost: None,
-            memory_mode: None,
             restore_parked: false,
             message_clock: None,
+            owned: None,
         })
         .await?;
     let (transport, snapshot) =
@@ -234,9 +234,6 @@ pub(crate) async fn run_setup(
         Some(ext_mgr_shared),
     )
     .await?;
-
-    // Legacy sidecar key migration
-    loop_arms::migrate_sidecar_toggle_key_to_claimed_plugins(&ctx.registry.lifecycle_claims());
 
     if !no_extensions {
         let session_id_for_hook = ctx.app.session.id.clone();

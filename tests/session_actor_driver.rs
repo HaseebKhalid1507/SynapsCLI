@@ -826,7 +826,7 @@ async fn revocation_restores_undelivered_steering() {
 /// FULL cycle more than once — arm → turn1 → terminal(Done) → poll → turn2 →
 /// terminal(Done) — not just that a single turn starts.
 ///
-/// The mechanism (copied from `tests/session_actor_differential.rs`): stand up a
+/// The mechanism: stand up a
 /// local HTTP stub answering the Anthropic API with canned SSE so each driver
 /// turn actually COMPLETES (Terminal::Success → `DriverTurnOutcome{Success}`).
 /// The `autonomous` plugin is armed with NO `--turns`, so it proposes UNBOUNDED
@@ -1098,8 +1098,7 @@ fn sse_prompt_fixture(id: &str) -> &'static str {
     )
 }
 
-/// Builtin tool that prompts through the stream's `SecretPromptHandle`. Copied
-/// from `session_actor_differential.rs::PromptFixtureTool`.
+/// Builtin tool that prompts through the stream's `SecretPromptHandle`.
 struct PromptFixtureTool;
 
 #[async_trait::async_trait]

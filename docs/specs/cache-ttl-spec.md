@@ -464,7 +464,10 @@ time, so the owner opts in). `Observe` attaches and test clients never do.
 `synaps rpc` (stdin/stdout JSON) runs its own runtime without the session
 actor, so keep-warm cannot reach it either way; drive the daemon instead
 (`synaps chat`, or an rpc/server client attached to a daemon session) and
-turn on `cache_keepwarm_headless`.
+turn on `cache_keepwarm_headless`. An **owned** session (bound to the client
+that created it, `docs/daemon-mode.md`) never keeps warm, opt-in or not, and
+refuses `/keepwarm <mode>`: its pings would be spend its owning client never
+sees in its usage frames.
 
 Per session: `/keepwarm [status|off|auto|<N>h]`. `auto` stops by the cost
 bound below or `cache_keepwarm_auto_max_hours` after the session went idle
@@ -929,6 +932,48 @@ cached something:
   api-log/telemetry record carries `"keepwarm": true`; usage goes to the
   turn's counters (turn budget) and the session / worker cost.
 
+**While the response streams.** The TTL runs from the start of the round's
+request, so a response can outlast it before any tool has run. In the
+`api-log.jsonl` of 2026-11-08 14:23 to 11-11 03:54 four worker requests
+followed such a response (375 s, 490 s, 524 s, and 294 s plus a 155 s
+tool) and rewrote 674k tokens, all four within three hours of one
+overnight run. Each was minutes of thinking and then a short tool call.
+Two more, 295 s and 309 s from start to start, read everything: an entry
+can outlive its TTL by a little, which is not something to rely on.
+Keep-warm that starts when the tools start is already too late: the entry
+is inside `LATE_GUARD` of expiry, or past it.
+
+So the round's task starts when its request is sent. The one thing it
+lacks while the response streams is the size of the cached prefix (the
+round's own usage is not booked until the response ends), and the
+transport passes that on from `message_start` (`RoundSignal`, in the
+request's `ApiOptions::round_signal`, never in a ping's). From then on a
+ping is due on the same schedule and under the same guards as while tools
+run. When the response ends asking for tools, the same task carries on
+while they run; when it asks for none (or is cut by a cancel), the task
+ends there, a ping in flight aborted and booked first.
+
+Unlike a tool round, a streaming response does not guarantee a next
+request: it may be the turn's last word. It is pinged anyway. A response
+that outlasts the TTL has lost its cache by the time it ends, whatever
+reads the prefix next (the tool results, a resume of the worker, the next
+user message), and waiting for a tool call to start is no use: in all four
+rewrites above the call came after the thinking, past the TTL. All eleven
+responses of 240 s or more that completed in that log went on to ask for
+tools. What the bet costs when it loses is one read of the prefix per 4.5
+minutes of a final answer, about 8% of the rewrite it insures against,
+under the same ski-rental bound. Where the session has an idle keep-warm,
+it schedules from the anchor the ping left.
+
+Two things differ while the response streams. The turn's `max_cost_usd`
+check counts the round's own request, not booked yet, at the most its
+input side can cost (a full write of the prefix). And a ping's usage is
+booked before the round's own; both are sums, and
+`UsageCounters::latest_context_tokens` (last writer wins) is the round's
+own unless a ping completes in the instant between the round's booking
+and the stream loop's read, in which case it is the same request plus the
+ping text, about 40 tokens more.
+
 It applies to the foreground and to workers (`apply_subagent_runtime_policy`,
 the one policy point of every spawn path: oneshot, start, resume, host and
 legacy runtimes). On a 1h TTL it fires only for a single tool round over
@@ -947,13 +992,20 @@ none for a short round, byte-level prefix equality, the request after the
 round reads the whole prefix; a ping in flight when the tools return
 completes and is booked as measured before the next request; one past the
 grace, or in flight at a cancel, is aborted and booked at its worst case;
-the control without keep-warm rewrites the prefix),
+the control without keep-warm rewrites the prefix; a response that thinks
+past the TTL before its tool call, and one long tool call, are pinged
+while they stream and the request after reads the whole prefix; a long
+final answer is pinged while it streams and nothing is sent after the
+turn), `runtime::tool_keepwarm::tests` (the signal and the cost cap),
+`runtime::api` (the transport reports the prefix at `message_start`, and
+nothing without a signal),
 `tools::subagent::worker_tool_keepwarm_tests` (no host) and
 `tests/worker_tool_keepwarm.rs` (host and legacy branches), each over
 oneshot, start and resume, with the key off as control. Deterministic: the
 simulated cache runs on a virtual clock the script moves (0.6 TTL per
 ping), and a round's tool returns when the sim releases it (after its Nth
-ping), so no assertion depends on how fast the machine is.
+ping), as does a held response, so no assertion depends on how fast the
+machine is.
 
 ## 8. `cache_ttl = auto` (the default)
 

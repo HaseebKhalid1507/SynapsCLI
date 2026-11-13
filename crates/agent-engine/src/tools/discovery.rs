@@ -26,7 +26,10 @@
 
 use serde_json::{json, Value};
 
-use super::activation::{activate_model_initiated, ActivationAuthority, SharedSessionToolSet};
+use super::activation::{
+    activate_model_initiated, ActivationAuthority, GrantIssuanceError, HostActivationError,
+    SharedSessionToolSet,
+};
 use super::catalog::{DiscoveryIndex, DiscoveryQuery, SearchLimits, ToolCatalog, ToolId};
 use super::{Tool, ToolContext, ToolOrigin, ToolOutput};
 use crate::{Result, RuntimeError};
@@ -221,9 +224,11 @@ impl Tool for SearchToolsTool {
     }
 
     fn description(&self) -> &str {
-        "Search locally known tools by keyword. Returns bounded compact \
-         descriptors with stable tool ids (never full schemas). Use \
-         activate_tools with an exact returned id to request activation."
+        "Search locally known tools by keywords, in any order. Ranked: exact \
+         id or name first, then the whole query as a substring, then the \
+         most keywords matched. Returns compact descriptors with stable tool \
+         ids (never full schemas). Use activate_tools with an exact returned \
+         id to request activation."
     }
 
     fn origin(&self) -> ToolOrigin {
@@ -236,7 +241,7 @@ impl Tool for SearchToolsTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Case-insensitive keyword matched against tool ids, summaries, and tags."
+                    "description": "Case-insensitive keywords matched against tool ids, summaries and tags. _ - : . also separate words: web_fetch and web fetch both work."
                 }
             },
             "required": ["query"]
@@ -248,17 +253,38 @@ impl Tool for SearchToolsTool {
         let query = require_query(&params)?;
         let limits = SearchLimits::new(SEARCH_TOOLS_MAX_RESULTS, SEARCH_TOOLS_MAX_RESULT_BYTES)
             .expect("static search_tools budgets are within caps");
-        let index = DiscoveryIndex::build(capability.catalog())
+        // A tool withheld from this session is not there to be found.
+        let catalog = {
+            let set = capability
+                .session_set()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            capability.catalog().without(set.withheld())
+        };
+        let index = DiscoveryIndex::build(&catalog)
             .map_err(|err| RuntimeError::Tool(format!("tool discovery unavailable: {err}")))?;
         let results = index.search(&query, &limits);
-        let body = json!({
+        let mut body = json!({
             "generation": results.generation(),
             "truncated": results.truncated(),
             "tools": results.hits(),
         });
+        if results.hits().is_empty() && !results.truncated() {
+            body["hint"] = Value::String(no_match_hint(query.needle()));
+        }
         serde_json::to_string(&body)
             .map_err(|err| RuntimeError::Tool(format!("failed to serialize search results: {err}")))
     }
+}
+
+/// Recovery advice for a search that matched nothing. An empty query is
+/// rejected, so listing everything is not an option to offer.
+fn no_match_hint(needle: &str) -> String {
+    format!(
+        "No tools matched '{needle}'. Try one shorter keyword or a synonym. \
+         Don't guess ids: activate_tools needs an exact id, as search_tools \
+         returns it."
+    )
 }
 
 // ── activate_tools ──────────────────────────────────────────────────────────
@@ -326,6 +352,22 @@ impl Tool for ActivateToolsTool {
     }
 }
 
+/// Typed activation failure → tool error. An unknown id is usually a
+/// guessed one: say that ids must be exact and come from search_tools.
+fn activation_denied(err: HostActivationError) -> RuntimeError {
+    match err {
+        HostActivationError::Issuance(GrantIssuanceError::UnknownTool(id)) => {
+            RuntimeError::Tool(format!(
+                "tool activation denied: unknown tool id '{id}'; nothing was \
+                 activated. activate_tools needs exact ids (namespace:name) as \
+                 search_tools returns them: search for the tool instead of \
+                 guessing its id."
+            ))
+        }
+        err => RuntimeError::Tool(format!("tool activation denied: {err}")),
+    }
+}
+
 impl ActivateToolsTool {
     /// Authorize and apply one activation batch. Returns the JSON summary
     /// text and the sorted canonical ids that were requested and are now
@@ -356,8 +398,9 @@ impl ActivateToolsTool {
                 .ok_or_else(|| RuntimeError::Tool("tool ids must be strings".to_string()))?;
             let id = ToolId::parse(raw).map_err(|err| {
                 RuntimeError::Tool(format!(
-                    "invalid tool id {:?}: {err} (exact namespace:name ids only; \
-                     wildcards and source-wide requests are not accepted)",
+                    "invalid tool id {:?}: {err} (exact namespace:name ids as \
+                     search_tools returns them; wildcards and source-wide \
+                     requests are not accepted)",
                     BoundedText::new(raw, ID_ECHO_MAX_BYTES).text
                 ))
             })?;
@@ -395,7 +438,7 @@ impl ActivateToolsTool {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let applied =
                 activate_model_initiated(authority, &mut set, capability.catalog(), &tool_ids)
-                    .map_err(|err| RuntimeError::Tool(format!("tool activation denied: {err}")))?;
+                    .map_err(activation_denied)?;
             (applied, set.schema_generation())
         };
         let ids: Vec<&str> = {

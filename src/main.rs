@@ -19,8 +19,6 @@ use clap::{Parser, Subcommand};
 
 use synaps_cli::tui;
 mod cmd;
-#[cfg(unix)]
-mod watcher;
 
 // ── Allocator ────────────────────────────────────────────────────────────────
 // Long-lived sessions serialize the ENTIRE conversation to a JSON body every
@@ -62,8 +60,8 @@ pub static MALLOC_CONF: &[u8] =
 #[derive(Parser)]
 #[command(
     name = "synaps",
-    about = "SynapsCLI — terminal-native AI agent runtime (TUI, headless, server, RPC)",
-    long_about = "SynapsCLI — terminal-native AI agent runtime.\n\nRun with no arguments for the interactive TUI. Subcommands provide headless chat,\na WebSocket server, autonomous agents, and event injection into running sessions.",
+    about = "SynapsCLI — terminal-native AI agent runtime (TUI, daemon, headless, RPC)",
+    long_about = "SynapsCLI — terminal-native AI agent runtime.\n\nRun with no arguments for the interactive TUI. Subcommands provide the session daemon,\nheadless chat, JSON-RPC, and event injection into running sessions.",
     version
 )]
 struct Cli {
@@ -163,40 +161,9 @@ enum Command {
         #[arg(long)]
         no_extensions: bool,
     },
-    /// WebSocket API server
-    Server {
-        #[arg(long, short, default_value = "3145")]
-        port: u16,
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        #[arg(long = "system", short = 's')]
-        system: Option<String>,
-        #[arg(long = "continue", value_name = "NAME_OR_ID")]
-        continue_session: Option<Option<String>>,
-        /// Auth token (overrides config). Empty string disables auth.
-        #[arg(long)]
-        token: Option<String>,
-        /// Auto-approve extension confirm hooks without prompting.
-        #[arg(long)]
-        auto_approve_confirms: bool,
-        /// Comma-separated allowed origins (overrides config).
-        #[arg(long)]
-        allowed_origins: Option<String>,
-    },
-    /// Headless autonomous agent
-    Agent {
-        #[arg(long)]
-        config: String,
-        #[arg(long, default_value = "manual start")]
-        trigger_context: String,
-    },
-    /// Agent supervisor and watcher
-    Watcher {
-        #[arg(default_value = "help")]
-        subcommand: String,
-        /// Additional arguments
-        args: Vec<String>,
-    },
+    // Removed subcommands: hidden one-release stubs (`cmd::removed`).
+    #[command(flatten)]
+    Removed(cmd::removed::RemovedCommand),
     /// OAuth login
     Login {
         /// Non-interactive: log in directly with a named provider (skips the picker). e.g. openai-codex, claude
@@ -342,10 +309,17 @@ enum Command {
         action: cmd::trace::TraceAction,
     },
     /// Unified retention: inspect/sweep/export/forget across sessions,
-    /// memory, indexes, traces, and logs (chain-integrity-safe).
+    /// memory, traces and logs (chain-integrity-safe).
     Retention {
         #[command(subcommand)]
         action: cmd::retention::RetentionAction,
+    },
+    /// Bring archives and notes into the plain-file stores from JSON Lines,
+    /// and print where a folder's memory lives. Prints one JSON document.
+    /// Exit code 0: nothing refused; 1: something refused; 2: the run stopped.
+    Memory {
+        #[command(subcommand)]
+        action: cmd::memory::MemoryAction,
     },
 }
 
@@ -577,6 +551,11 @@ fn thin_client_from<I: IntoIterator<Item = String>>(
             if !a.starts_with('-') {
                 continue;
             }
+        }
+        if matches!(a.as_str(), "--help" | "-h" | "--version" | "-V") {
+            // Help and version print and exit in clap; they must never start
+            // or adopt a daemon (`synaps attach --help` spawned one).
+            return None;
         }
         if a == "--attach" || a.starts_with("--attach=") {
             attach_flag = true;
@@ -815,9 +794,20 @@ async fn async_main() -> anyhow::Result<()> {
         cli.attach = Some(None);
         cli.new_session = true;
     }
+    if let Some(Command::Removed(stub)) = &cli.command {
+        cmd::removed::exit(stub.name());
+    }
     if matches!(cli.command, Some(Command::Prompt { .. })) {
         if let Some(Command::Prompt { action }) = cli.command {
             return cmd::prompt::run(action);
+        }
+        unreachable!();
+    }
+    // Before the profile, the config and anything that could start a daemon
+    // or a log: a dry run and `memory project` must create nothing.
+    if matches!(cli.command, Some(Command::Memory { .. })) {
+        if let Some(Command::Memory { action }) = cli.command {
+            std::process::exit(cmd::memory::run(action));
         }
         unreachable!();
     }
@@ -883,36 +873,7 @@ async fn async_main() -> anyhow::Result<()> {
         }) => {
             cmd::chat::run(continue_session, system, agent, profile, no_extensions).await?;
         }
-        Some(Command::Server {
-            port,
-            host,
-            system,
-            continue_session,
-            token,
-            auto_approve_confirms,
-            allowed_origins,
-        }) => {
-            cmd::server::run(
-                port,
-                host,
-                system,
-                continue_session,
-                cli.profile,
-                token,
-                auto_approve_confirms,
-                allowed_origins,
-            )
-            .await?;
-        }
-        Some(Command::Agent {
-            config,
-            trigger_context,
-        }) => {
-            cmd::agent::run(config, trigger_context).await;
-        }
-        Some(Command::Watcher { subcommand, args }) => {
-            cmd::watcher::run(subcommand, args).await;
-        }
+        Some(Command::Removed(_)) => unreachable!("handled above"),
         Some(Command::Login { provider, account }) => {
             cmd::login::run(cli.profile, provider, account)
                 .await
@@ -1029,12 +990,12 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Command::Completions { shell }) => {
             use clap::CommandFactory;
-            let mut cmd = Cli::command();
+            let mut cmd = cmd::removed::without_stubs(Cli::command());
             let name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
-        Some(Command::Prompt { .. }) => {
-            unreachable!("prompt dispatched before profile initialization")
+        Some(Command::Prompt { .. }) | Some(Command::Memory { .. }) => {
+            unreachable!("prompt and memory are dispatched before profile initialization")
         }
         Some(Command::Tools { action }) => {
             cmd::tools::run(action).await?;
@@ -1109,6 +1070,33 @@ mod worker_threads_tests {
         // `--attach` next to a subcommand is not the TUI attach path
         assert_eq!(thin_client_from(v(&["daemon", "status", "--attach"]), true, false), None);
         assert_eq!(thin_client_from(v(&[]), true, false), None);
+    }
+
+    /// `synaps attach --help` started a daemon before clap printed the help.
+    /// Help and version never take the thin-client path (which spawns one).
+    #[test]
+    fn help_and_version_never_take_the_daemon_path() {
+        use super::ThinClient::Line;
+        for flag in ["--help", "-h", "--version", "-V"] {
+            for argv in [
+                &["attach", flag][..],
+                &[flag, "attach"],
+                &["attach", "--create", flag],
+                &["--attach", flag],
+                &["--attach", "abc", flag],
+                &["--profile", "x", "attach", flag],
+                &[flag],
+            ] {
+                for adopt in [false, true] {
+                    assert_eq!(thin_client_from(v(argv), true, adopt), None, "{argv:?} adopt={adopt}");
+                }
+            }
+        }
+        // a value that looks like a help flag is still a value
+        assert_eq!(
+            thin_client_from(v(&["--system", "-h", "attach"]), true, false),
+            Some(Line { profile: None })
+        );
     }
 
     #[test]

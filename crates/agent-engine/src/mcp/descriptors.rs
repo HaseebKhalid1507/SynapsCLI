@@ -630,14 +630,6 @@ impl Tool for DeferredMcpTool {
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> crate::Result<String> {
         // Runs strictly AFTER the ExecutionGate authorized this exact call.
-        let binding = ctx
-            .capabilities
-            .memory_backend
-            .clone()
-            .unwrap_or_else(crate::memory_backend::MemoryBinding::configured_current);
-        if binding.exclusive() && crate::memory_backend::competing_memory_tool(self) {
-            return Err(crate::RuntimeError::Tool("independent MCP memory is disabled by the host-selected backend; use short memory tools".into()));
-        }
         // Without the typed session lease capability, a deferred tool NEVER
         // starts a process.
         let Some(leases) = ctx.capabilities.mcp_leases.clone() else {
@@ -661,7 +653,8 @@ impl Tool for DeferredMcpTool {
                 // drift, and live name/schema mismatch poison the pinned
                 // descriptor, so the EXACT session grant must fall with the
                 // lease. Transport/capacity/revocation-race failures are
-                // transient and must NOT revoke.
+                // transient and must NOT revoke; nor must a tool's own
+                // `isError` refusal (`ToolError`).
                 use super::lease::McpLeaseError;
                 if matches!(
                     err,
@@ -879,16 +872,12 @@ mod discovery_failure_tests {
 }
 
 #[cfg(test)]
-mod memory_guard_tests {
+mod memory_named_tool_tests {
     use super::*;
-    use agent_core::config::MemoryBackendKind::{self, Axel, Legacy};
 
-    const REFUSAL: &str =
-        "independent MCP memory is disabled by the host-selected backend; use short memory tools";
-
-    async fn call(server: &str, tool: &str, kind: MemoryBackendKind) -> String {
+    async fn call(server: &str, tool: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
-        let binding = crate::tools::test_helpers::memory_binding(kind, dir.path());
+        let binding = crate::tools::test_helpers::memory_binding(dir.path());
         let descriptor = CachedToolDescriptor {
             name: tool.into(),
             description: String::new(),
@@ -907,22 +896,20 @@ mod memory_guard_tests {
         }
     }
 
+    /// T-B7. An MCP tool named like a memory tool goes on to the lease
+    /// check like any other (no lease here, so nothing starts): the guard
+    /// that refused such names beside an exclusive backend is gone.
     #[tokio::test]
-    async fn an_exclusive_binding_refuses_mcp_memory_tool_names_and_their_wire_forms() {
-        for tool in ["memory_search", "memory_fetch", "memory.search", "Memory_Store"] {
-            assert_eq!(call("notes", tool, Axel).await, REFUSAL, "{tool}");
-        }
-    }
-
-    #[tokio::test]
-    async fn other_mcp_tools_and_legacy_bindings_reach_the_lease_check() {
-        for (server, tool, kind) in [
-            ("notes", "lookup", Axel),
-            // Offered as `ext__memory__search`, not as a memory tool's name.
-            ("memory", "search", Axel),
-            ("notes", "memory_search", Legacy),
+    async fn mcp_tools_named_like_memory_tools_reach_the_lease_check() {
+        for (server, tool) in [
+            ("notes", "lookup"),
+            ("memory", "search"),
+            ("notes", "memory_search"),
+            ("notes", "memory_fetch"),
+            ("notes", "memory.search"),
+            ("notes", "Memory_Store"),
         ] {
-            let message = call(server, tool, kind).await;
+            let message = call(server, tool).await;
             assert!(message.contains("is activation-deferred"), "{server}/{tool}: {message}");
         }
     }

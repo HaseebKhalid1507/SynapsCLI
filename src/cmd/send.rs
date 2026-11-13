@@ -185,17 +185,6 @@ fn build_event(
     }
 }
 
-/// Deliver an event to exactly one running session (no inbox fallback, no
-/// broadcast). Used by the watcher for targeted completion notices so that a
-/// supervisor never injects turns into arbitrary interactive sessions.
-#[cfg(unix)] // only the watcher (Unix-only) targets one session
-pub(crate) async fn send_event_to_session(query: &str, event: &Event) -> anyhow::Result<String> {
-    let reg = find_session_registration(query)
-        .ok_or_else(|| anyhow::anyhow!("no running session matches {:?}", query))?;
-    let json = serde_json::to_string(event)?;
-    send_with_retry(reg, &json, Some(query)).await
-}
-
 /// Socket attempts for an event addressed to one session, and the waits
 /// between them. A session that is streaming, or a daemon mid-reload, can
 /// refuse a connection for a moment; the event must still reach that

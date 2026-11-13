@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::extensions::manager::ExtensionManager;
 use crate::runtime::trace::extension as trace_ext;
-use crate::tools::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits};
+use crate::tools::TurnToolContext;
 
 type RouteResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -48,6 +48,15 @@ fn local_gate_session() -> crate::tools::activation::SessionId {
 /// identity (Task 16) scoping the execution gate inside the interior tool
 /// loop; `None` (internal/sync callers) fails closed to a locally minted
 /// identity with the same default-core policy.
+///
+/// `tool_context` is what the turn's tool calls are given: the one the
+/// caller's own tool loop makes its contexts from, so the tools of this
+/// loop run in the chat's folder with the chat's environment, act on the
+/// chat's project, and the hook events and `tool.call`s they cause name the
+/// conversation and the folder. `None` (internal callers) = a call for no
+/// chat ([`TurnToolContext::no_chat`]). The internal callers offer no tools
+/// (compaction), and a request that offers none runs none: the loop is
+/// entered only when `tools_schema` is not empty.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn route_extension_provider(
     manager: Arc<tokio::sync::RwLock<ExtensionManager>>,
@@ -65,7 +74,7 @@ pub(crate) async fn route_extension_provider(
     cancel: &tokio_util::sync::CancellationToken,
     tool_session_id: Option<&crate::tools::activation::SessionId>,
     session_tool_set: Option<&crate::tools::activation::SharedSessionToolSet>,
-    memory_backend: Option<&crate::memory_backend::MemoryBinding>,
+    tool_context: Option<&TurnToolContext>,
     trace: &crate::runtime::trace::TraceContext,
 ) -> RouteResult {
     let provider_runtime_id = format!("{}:{}", plugin_id, provider_id);
@@ -160,12 +169,13 @@ pub(crate) async fn route_extension_provider(
         // Generation-pinned for the WHOLE interior tool loop (Task 18): the
         // caller's schema (full set, or the flag-on session projection) is
         // snapshotted here and never re-projected between interior rounds.
-        // Sound because the interior loop's ToolContext carries
-        // `tool_activation: None` (below), so `activate_tools` cannot mutate
-        // the retained session set mid-loop — activations only surface on
-        // the next OUTER stream round, which re-projects. If activation
-        // capability is ever wired into this route, `tools` must be
-        // recomputed per interior round from the session set instead.
+        // Sound because the interior loop's ToolContext carries no
+        // `tool_activation` (a `TurnToolContext` never does; only a stream
+        // dispatch adds it), so `activate_tools` cannot mutate the retained
+        // session set mid-loop — activations only surface on the next OUTER
+        // stream round, which re-projects. If activation capability is ever
+        // wired into this route, `tools` must be recomputed per interior
+        // round from the session set instead.
         tools: tools_schema.as_ref().clone(),
         temperature,
         max_tokens,
@@ -282,10 +292,10 @@ pub(crate) async fn route_extension_provider(
         }
     } else {
         // Non-streaming turn (direct complete, or the tool loop when a shared
-        // registry exists). One outer turn == one transport attempt: the
-        // tool-loop helper may perform several interior provider.complete
-        // calls, which are deliberately not counted as separate attempts
-        // (see `trace::extension` module docs).
+        // registry exists and tools were offered). One outer turn == one
+        // transport attempt: the tool-loop helper may perform several
+        // interior provider.complete calls, which are deliberately not
+        // counted as separate attempts (see `trace::extension` module docs).
         // Populated by the tool-loop helper; stays 0 on the direct-complete
         // branch, where no loop runs.
         let mut tools_requested: u32 = 0;
@@ -303,11 +313,20 @@ pub(crate) async fn route_extension_provider(
             )
             .await,
         );
-        let result = if let Some(tools) = tools_shared {
-            let registry = tools.read().await;
+        // The tool loop runs what the model was offered. A request that
+        // offers no tools (compaction's) gets one provider call and nothing
+        // in its answer is run: such a request is no turn and has no tool
+        // context, so a tool call would run for no chat, in the process
+        // folder with the process environment.
+        let result = if let Some(tools) = tools_shared.filter(|_| tools_exposed) {
+            // A snapshot, not the lock: the loop's tools are the chat's and
+            // may read this registry themselves (starting a worker does),
+            // which under a read guard held for the whole provider round
+            // would wait for ever behind any writer that queued meanwhile.
+            let registry = tools.read().await.clone();
             // ═══ EXECUTION GATE (Task 16/17, spec §7.1) ═══ ONE session
             // tool set for the whole interior tool loop, resolved here
-            // under the SAME registry read guard the loop holds for the
+            // against the SAME registry snapshot the loop uses for the
             // entire outer call: the catalog cannot drift between interior
             // rounds, so one snapshot at one generation governs every tool
             // call the extension provider requests. When the runtime
@@ -327,54 +346,39 @@ pub(crate) async fn route_extension_provider(
                 registry.catalog(),
                 || tool_session_id.cloned().unwrap_or_else(local_gate_session),
             );
-            crate::extensions::runtime::process::complete_provider_with_tools(
-                handler.clone(),
-                params,
-                &registry,
-                &session_tools,
-                &hook_bus,
-                || ToolContext {
-                    channels: ToolChannels {
-                        tx_delta: None,
-                        tx_events: None,
-                    },
-                    capabilities: ToolCapabilities {
-                        session_allow_all: None,
-                        launch_cancel: None,
-                        memory_backend: memory_backend.cloned(),
-                        telemetry: None,
-                        watcher_exit_path: None,
-                        tool_register_tx: None,
-                        session_manager: None,
-                        subagent_registry: None,
-                        event_queue: None,
-                        delegation_parent: None,
-                        codex_parent_plan: None,
-                        secret_prompt: None,
-                        orchestration: None,
-                        tool_activation: None,
-                        mcp_leases: None,
-                        extension_leases: None,
-                        memory_context: None,
-                        cwd: None,
-                        env: None,
-                        env_stripped: Vec::new(),
-                        env_warned: Default::default(),
-                        session_id: None,
-                    },
-                    limits: ToolLimits {
-                        max_tool_output: 30000,
-                        max_tool_buffer: 256 * 1024,
-                        bash_timeout: 30,
-                        bash_max_timeout: 300,
-                        subagent_timeout: 300,
-                    },
-                },
-                30000,
-                8,
-                &mut tools_requested,
+            let turn_tools = tool_context.cloned().unwrap_or_else(TurnToolContext::no_chat);
+            // Raced against the turn's cancel as the stream loop races each
+            // tool call: a stop drops the round, the tool call it is running
+            // included, and ends below as a cancelled turn. `None` = cancelled.
+            let looped = crate::runtime::stream::await_tool_call(
+                cancel,
+                // Boxed: inline, the loop's future made the turn's future
+                // too large for a tokio worker's stack in a debug build.
+                Box::pin(crate::extensions::runtime::process::complete_provider_with_tools(
+                    handler.clone(),
+                    params,
+                    &registry,
+                    &session_tools,
+                    &hook_bus,
+                    // A call's context is made from the turn's, like a call of
+                    // the caller's own loop, the turn's event channel included
+                    // (never this route's `tx`: under usage metering that is a
+                    // relay which ends with the round, and a worker started
+                    // here reports for longer). No delta lane: these calls are
+                    // not announced to the frontend, so partial output would
+                    // have no tool call to belong to.
+                    || turn_tools.for_call(None),
+                    turn_tools.limits().max_tool_output,
+                    8,
+                    &mut tools_requested,
+                )),
             )
             .await
+            .0;
+            match looped {
+                Some(result) => result,
+                None => Err("operation canceled".to_string()),
+            }
         } else {
             handler.provider_complete(params).await
         };
@@ -416,5 +420,363 @@ pub(crate) async fn route_extension_provider(
                 Err(format!("extension provider: {e}").into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use crate::extensions::hooks::events::{HookEvent, HookResult};
+    use crate::extensions::runtime::process::{
+        ProviderCompleteParams, ProviderCompleteResult, RegisteredProviderModelSpec,
+        RegisteredProviderSpec,
+    };
+    use crate::extensions::runtime::ExtensionHandler;
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// Asks for the `sleeper` tool on every round.
+    struct AsksForSleeper;
+
+    #[async_trait::async_trait]
+    impl ExtensionHandler for AsksForSleeper {
+        fn id(&self) -> &str {
+            "asks-for-sleeper"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+        async fn provider_complete(
+            &self,
+            _params: ProviderCompleteParams,
+        ) -> Result<ProviderCompleteResult, String> {
+            Ok(ProviderCompleteResult {
+                content: vec![json!({
+                    "type": "tool_use", "id": "t1", "name": "sleeper", "input": {}
+                })],
+                stop_reason: Some("tool_use".to_string()),
+                usage: None,
+            })
+        }
+    }
+
+    /// A tool that takes 30 s, and says when it has started.
+    struct Sleeper(Arc<tokio::sync::Notify>);
+
+    #[async_trait::async_trait]
+    impl crate::Tool for Sleeper {
+        fn name(&self) -> &str {
+            "sleeper"
+        }
+        fn description(&self) -> &str {
+            "sleeps"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        async fn execute(&self, _params: Value, _ctx: crate::ToolContext) -> crate::Result<String> {
+            self.0.notify_one();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok("woke".to_string())
+        }
+    }
+
+    /// A stop while the extension model's tool loop runs a tool ends the
+    /// turn at once as cancelled; it does not wait for the tool.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_running_tool_call_in_the_extension_loop_is_cancelled() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut registry = crate::ToolRegistry::new();
+        registry.register(Arc::new(Sleeper(started.clone())));
+        let mut manager = ExtensionManager::new_with_tools(
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            Arc::new(tokio::sync::RwLock::new(registry)),
+        );
+        manager
+            .register_provider_handler_for_tests(
+                "plug",
+                RegisteredProviderSpec {
+                    id: "prov".to_string(),
+                    display_name: "Fake".to_string(),
+                    description: "fake provider".to_string(),
+                    models: vec![RegisteredProviderModelSpec {
+                        id: "model-x".to_string(),
+                        display_name: None,
+                        capabilities: json!({"streaming": false, "tool_use": true}),
+                        context_window: None,
+                    }],
+                    config_schema: None,
+                },
+                Arc::new(AsksForSleeper),
+            )
+            .unwrap();
+        let manager = Arc::new(tokio::sync::RwLock::new(manager));
+        let tools = Arc::new(vec![json!({
+            "name": "sleeper", "description": "sleeps", "input_schema": {"type": "object"}
+        })]);
+        let messages: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role": "user", "content": "go"}))];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let trace = crate::runtime::trace::TraceContext::disabled();
+
+        let route = route_extension_provider(
+            manager,
+            "plug",
+            "prov",
+            "model-x",
+            "plug:prov:model-x",
+            &tools,
+            &None,
+            &messages,
+            &tx,
+            None,
+            None,
+            0,
+            &cancel,
+            None,
+            None,
+            None,
+            &trace,
+        );
+        let stop = async {
+            tokio::time::timeout(Duration::from_secs(10), started.notified())
+                .await
+                .expect("the tool never started");
+            cancel.cancel();
+            std::time::Instant::now()
+        };
+        let (result, stopped_at) = tokio::time::timeout(
+            Duration::from_secs(10),
+            async { tokio::join!(route, stop) },
+        )
+        .await
+        .expect("the loop waited for the tool");
+        let waited = stopped_at.elapsed();
+        assert!(waited < Duration::from_secs(1), "returned {waited:?} after the stop");
+        let error = result.expect_err("a stopped turn is not a success").to_string();
+        assert_eq!(error, "operation canceled");
+    }
+}
+
+/// `caller` in the extension model's tool loop: a tool the model of a
+/// `plugin:provider:model` chat asks for is called with the turn's own tool
+/// context, so an extension tool among them is told the author of that
+/// chat's binding.
+#[cfg(test)]
+mod caller_tests {
+    use super::*;
+    use crate::extensions::hooks::events::{HookEvent, HookResult};
+    use crate::extensions::runtime::process::{
+        ProviderCompleteParams, ProviderCompleteResult, RegisteredExtensionToolSpec,
+        RegisteredProviderModelSpec, RegisteredProviderSpec,
+    };
+    use crate::extensions::runtime::ExtensionHandler;
+    use crate::memory_backend::MemoryBinding;
+    use crate::tools::test_helpers::{create_tool_context, memory_binding};
+    use agent_core::memory::author::Author;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+
+    /// A model that asks for `whoami` once a turn, then answers.
+    #[derive(Default)]
+    struct AsksWhoOnce(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ExtensionHandler for AsksWhoOnce {
+        fn id(&self) -> &str {
+            "asks-who"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+        async fn provider_complete(
+            &self,
+            _params: ProviderCompleteParams,
+        ) -> Result<ProviderCompleteResult, String> {
+            let asks = self.0.fetch_add(1, Ordering::SeqCst).is_multiple_of(2);
+            Ok(ProviderCompleteResult {
+                content: vec![if asks {
+                    json!({"type": "tool_use", "id": "t1", "name": "whoami", "input": {}})
+                } else {
+                    json!({"type": "text", "text": "done"})
+                }],
+                stop_reason: Some(if asks { "tool_use" } else { "end_turn" }.to_string()),
+                usage: None,
+            })
+        }
+    }
+
+    /// The extension behind `whoami`: `(session_id, caller)` of each
+    /// `tool.call`, as `ProcessExtension` would put them on the wire.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(Option<String>, Option<Author>)>>);
+
+    #[async_trait::async_trait]
+    impl ExtensionHandler for Recorder {
+        fn id(&self) -> &str {
+            "caller-recorder"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Continue
+        }
+        async fn call_tool_as(
+            &self,
+            _name: &str,
+            _input: Value,
+            session_id: Option<&str>,
+            _cwd: Option<&std::path::Path>,
+            caller: Option<&Author>,
+        ) -> Result<Value, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((session_id.map(str::to_string), caller.cloned()));
+            Ok(json!("here"))
+        }
+        async fn shutdown(&self) {}
+    }
+
+    /// The real `ExtensionTool` under the name the model asks for, with a
+    /// built-in origin so the loop's default tool set admits it.
+    struct Admitted(crate::tools::ExtensionTool);
+
+    #[async_trait::async_trait]
+    impl crate::Tool for Admitted {
+        fn name(&self) -> &str {
+            "whoami"
+        }
+        fn description(&self) -> &str {
+            "asks the recording extension who is calling"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        async fn execute(&self, params: Value, ctx: crate::ToolContext) -> crate::Result<String> {
+            self.0.execute(params, ctx).await
+        }
+    }
+
+    async fn one_turn(
+        manager: Arc<tokio::sync::RwLock<ExtensionManager>>,
+        tools: &Arc<Vec<Value>>,
+        messages: &[crate::SharedMessage],
+        trace: &crate::runtime::trace::TraceContext,
+        chat: &str,
+        binding: MemoryBinding,
+    ) {
+        let mut capabilities = create_tool_context().capabilities;
+        capabilities.memory_backend = Some(binding);
+        capabilities.session_id = Some(chat.to_string());
+        let turn_tools =
+            TurnToolContext::new(capabilities, TurnToolContext::no_chat().limits().clone(), None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let routed = route_extension_provider(
+            manager,
+            "plug",
+            "prov",
+            "model-x",
+            "plug:prov:model-x",
+            tools,
+            &None,
+            messages,
+            &tx,
+            None,
+            None,
+            0,
+            &cancel,
+            None,
+            None,
+            Some(&turn_tools),
+            trace,
+        )
+        .await;
+        assert!(routed.is_ok(), "{chat}: {:?}", routed.err().map(|e| e.to_string()));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_tool_call_in_the_extension_loop_names_the_turns_own_author() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let recorder = Arc::new(Recorder::default());
+        let mut registry = crate::ToolRegistry::new();
+        registry.register(Arc::new(Admitted(crate::tools::ExtensionTool::new(
+            "caller-recorder",
+            RegisteredExtensionToolSpec {
+                name: "whoami".into(),
+                description: "records the caller".into(),
+                input_schema: json!({"type": "object"}),
+            },
+            recorder.clone(),
+        ))));
+        let mut manager = ExtensionManager::new_with_tools(
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            Arc::new(tokio::sync::RwLock::new(registry)),
+        );
+        manager
+            .register_provider_handler_for_tests(
+                "plug",
+                RegisteredProviderSpec {
+                    id: "prov".to_string(),
+                    display_name: "Fake".to_string(),
+                    description: "fake provider".to_string(),
+                    models: vec![RegisteredProviderModelSpec {
+                        id: "model-x".to_string(),
+                        display_name: None,
+                        capabilities: json!({"streaming": false, "tool_use": true}),
+                        context_window: None,
+                    }],
+                    config_schema: None,
+                },
+                Arc::new(AsksWhoOnce::default()),
+            )
+            .unwrap();
+        let manager = Arc::new(tokio::sync::RwLock::new(manager));
+        let tools = Arc::new(vec![json!({
+            "name": "whoami", "description": "who", "input_schema": {"type": "object"}
+        })]);
+        let messages: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role": "user", "content": "go"}))];
+        let trace = crate::runtime::trace::TraceContext::disabled();
+
+        // One turn of a chat with `binding`, on the extension's model.
+        let turn = |chat: &'static str, binding: MemoryBinding| {
+            one_turn(manager.clone(), &tools, &messages, &trace, chat, binding)
+        };
+        let dirs = [base.path().join("a"), base.path().join("b")];
+        let bindings = dirs
+            .each_ref()
+            .map(|dir| memory_binding(dir));
+        turn("chat-a", bindings[0].clone()).await;
+        turn("chat-b", bindings[1].clone()).await;
+        turn("chat-a", bindings[0].clone()).await;
+
+        let calls = recorder.0.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        for ((session_id, caller), (chat, binding)) in
+            calls.iter().zip([("chat-a", &bindings[0]), ("chat-b", &bindings[1]), ("chat-a", &bindings[0])])
+        {
+            assert_eq!(session_id.as_deref(), Some(chat));
+            let caller = caller.as_ref().unwrap_or_else(|| panic!("{chat}: no caller"));
+            caller.validate().unwrap();
+            assert_eq!(caller, binding.author(), "{chat}: its own binding's author");
+        }
+        let (of_a, of_b) = (calls[0].1.clone().unwrap(), calls[1].1.clone().unwrap());
+        assert_ne!(of_a.actor, of_b.actor);
+        assert_ne!(of_a.group, of_b.group);
     }
 }

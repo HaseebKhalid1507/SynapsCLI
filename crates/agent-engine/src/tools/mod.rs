@@ -16,15 +16,15 @@ pub(crate) mod context_checkpoint;
 mod edit;
 mod extension;
 mod find;
-pub mod forum;
 mod grep;
 mod ls;
 pub mod memory;
-mod memory_context;
 mod multi_edit;
 #[cfg(feature = "command-exec")]
 mod powershell;
 pub(crate) mod read;
+mod search;
+mod unix_programs;
 mod secret_prompt;
 mod subagent;
 #[cfg(target_os = "linux")]
@@ -51,7 +51,6 @@ pub mod shell;
 pub(crate) mod util;
 pub(crate) mod utf8_stream;
 pub(crate) use util::expand_path;
-pub mod watcher_exit;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
@@ -68,7 +67,6 @@ pub use extension::ExtensionTool;
 pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
-pub use memory_context::MemoryContextTool;
 pub use multi_edit::MultiEditTool;
 pub(crate) use multi_edit::{label as multi_edit_label, paths as multi_edit_paths};
 #[cfg(feature = "command-exec")]
@@ -104,7 +102,6 @@ pub use subagent::{
     SubagentCollectTool, SubagentModelAuthorizeTool, SubagentModelsTool, SubagentResumeTool,
     SubagentStartTool, SubagentStatusTool, SubagentSteerTool, SubagentTool,
 };
-pub use watcher_exit::{WatcherExitTool, WATCHER_EXIT_ACK};
 pub use write::WriteTool;
 
 // Re-export util items used by sibling tool modules via `super::`
@@ -131,6 +128,7 @@ pub struct ToolChannels {
 }
 
 /// Runtime capability handles — shared services a tool may require.
+#[derive(Clone, Default)]
 pub struct ToolCapabilities {
     /// Parent-session extension Confirm latch: the set of extension ids the
     /// user chose "Allow all" for. Workers share the Arc (including live
@@ -138,15 +136,17 @@ pub struct ToolCapabilities {
     /// grants no `activate_tools` authority. None is for contexts without a
     /// parent session.
     pub session_allow_all: Option<Arc<SessionConfirmLatch>>,
-    /// Host-owned note storage binding. Runtime contexts always provide the
-    /// same binding; `None` is reserved for manually constructed contexts.
-    /// A present binding is exclusive: errors never permit legacy fallback.
+    /// Host-owned note storage binding. Every context made for a chat has
+    /// its chat's: a turn's ([`TurnToolContext`]) and a slash command's
+    /// (`skills::commands::CommandChat`). `None` is left for a context made
+    /// for no chat ([`TurnToolContext::no_chat`]) and for the ones tests
+    /// build by hand; there the memory tools refuse (they never
+    /// derive a project from the process folder).
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     /// Parent-session telemetry for the subagents this context spawns: they
     /// record at the same level through the parent's session writer. `None`
     /// (manual contexts) leaves workers `Off`.
     pub telemetry: Option<crate::runtime::telemetry::WorkerTelemetry>,
-    pub watcher_exit_path: Option<PathBuf>,
     pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
@@ -179,13 +179,6 @@ pub struct ToolCapabilities {
     /// (default for non-stream contexts) means deferred extension tools
     /// fail typed and start nothing.
     pub extension_leases: Option<crate::extensions::lease::ExtensionLeaseCapability>,
-    /// Session-scoped continuous-memory context capability (task A4, spec
-    /// §7.2): shared per-session memory state + host-owned grant scope.
-    /// `None` (default for non-stream contexts) means the `memory_context`
-    /// builtin can commit nothing — lease-granting actions fail typed,
-    /// while `status`/`disable` still answer deterministically `Off`
-    /// (memory off requires no infrastructure).
-    pub memory_context: Option<crate::runtime::memory_context::MemoryContextCapability>,
     /// Per-session working directory (Phase 2 daemons serve sessions from N
     /// directories in one process). `None` = inherit the process cwd — the
     /// only value Phase 1 ever sets, so behaviour is byte-identical.
@@ -193,7 +186,7 @@ pub struct ToolCapabilities {
     /// Per-session environment snapshot (session-identity T1). `None` =
     /// inherit process env. When `Some`, tools call `env_clear().envs()`
     /// so no daemon env leaks into session subprocesses.
-    pub env: Option<crate::session::types::SessionEnv>,
+    pub env: Option<crate::session::types::ToolEnv>,
     /// Names of env vars stripped as secrets (T5). Tools use this for
     /// loud notices when a command fails referencing a stripped var.
     pub env_stripped: Vec<String>,
@@ -208,9 +201,47 @@ pub struct ToolCapabilities {
     /// `params.session_id` so a daemon-shared plugin knows its caller.
     /// Not the lease scope (`tool_session_id`, a random runtime id).
     pub session_id: Option<String>,
+    /// Extension hook bus, for the notify-only events a builtin tool sends
+    /// (`memory_forget`: `on_memory_forgotten`). A worker carries its own
+    /// view, which sends nothing. `None` wherever no bus exists; the tool
+    /// then works the same and nothing is announced.
+    pub hook_bus: Option<Arc<crate::extensions::hooks::HookBus>>,
+    /// The calling chat's rollover state, where `context_checkpoint` records
+    /// its phase and note. The tool is one instance shared by every chat on
+    /// the host and has no state of its own. `None` for a context with no
+    /// chat: the tool refuses there. (A worker carries its own state, which
+    /// is never enabled, and its registry has no such tool.)
+    pub continuation: Option<crate::runtime::continuation::SharedContinuation>,
+}
+
+impl ToolCapabilities {
+    /// T5: a notice for each stripped secret `pick` selects that this
+    /// session was not told about yet (once per name per session). `bash`
+    /// picks the names a failed command references; `shell_start` all of
+    /// them, up front (an interactive shell's commands never reach a tool
+    /// that could tell).
+    pub(crate) fn stripped_env_notices(&self, pick: impl Fn(&str) -> bool) -> String {
+        let mut notice = String::new();
+        if self.env_stripped.is_empty() {
+            return notice;
+        }
+        let mut warned = self.env_warned.lock().unwrap_or_else(|p| p.into_inner());
+        for name in self.env_stripped.iter().filter(|n| pick(n)) {
+            if warned.insert(name.clone()) {
+                notice.push_str(&format!(
+                    "\nnote: ${name} was stripped from the session env as a secret; \
+                     reattach from a shell that has it \
+                     (synaps --system … from that shell) \
+                     — the daemon never receives credentials."
+                ));
+            }
+        }
+        notice
+    }
 }
 
 /// Configuration limits and timeouts.
+#[derive(Clone)]
 pub struct ToolLimits {
     /// Context-budget ceiling — final tool output entering history is truncated
     /// to this. Applied AFTER the `after_tool_call` hook so compression
@@ -230,6 +261,127 @@ pub struct ToolContext {
     pub channels: ToolChannels,
     pub capabilities: ToolCapabilities,
     pub limits: ToolLimits,
+}
+
+/// What the tool calls of one turn are given, whichever loop runs them.
+///
+/// A turn's tool calls are run by the loop that received the model's
+/// answer: the stream loop (its serial and its parallel lane) or, for a
+/// model an extension provides, the loop inside the provider round
+/// (`runtime::openai::extension_route`). The host builds one of these per
+/// turn and each loop makes every call's [`ToolContext`] from it
+/// ([`Self::for_call`]). So what one loop's tools are given, the others'
+/// are given too: there is no second list of fields to keep in step.
+///
+/// Two capabilities belong to one dispatch of the stream loop and are not
+/// part of the turn's context: `tool_activation` (the catalog snapshot of
+/// one provider round) and `tool_register_tx` (a channel that dispatch
+/// drains). The stream loop adds them with [`Self::for_dispatch`]. The
+/// extension model's loop does not have them, on purpose: its tool list is
+/// fixed for the whole provider round, so a tool activated inside it could
+/// not be offered or called there, and nothing would drain a registration.
+///
+/// The event channel is the turn's too (`tx_events` of every call): the
+/// stream's own sender, which outlives a provider round. Only the delta
+/// lane is made per call.
+///
+/// One pointer wide: it rides in `ApiOptions` and in the stream loop's
+/// state, where a copy of every capability per clone is stack the loop does
+/// not have to spare in a debug build.
+#[derive(Clone)]
+pub struct TurnToolContext(Arc<TurnTools>);
+
+struct TurnTools {
+    capabilities: ToolCapabilities,
+    limits: ToolLimits,
+    events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+}
+
+impl TurnToolContext {
+    /// `capabilities` as the host has them for this turn. Its
+    /// `tool_activation` and `tool_register_tx` are per dispatch
+    /// ([`Self::for_dispatch`]) and are dropped here. `events` is the
+    /// turn's event channel (`None`: the turn has no frontend to tell).
+    pub fn new(
+        mut capabilities: ToolCapabilities,
+        limits: ToolLimits,
+        events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    ) -> Self {
+        capabilities.tool_activation = None;
+        capabilities.tool_register_tx = None;
+        Self(Arc::new(TurnTools {
+            capabilities,
+            limits,
+            events,
+        }))
+    }
+
+    /// For a call that belongs to no chat (the public routing facade, used
+    /// by tests): no capability at all, so the tools run in the process
+    /// folder with the process environment, for no conversation, and the
+    /// memory tools refuse.
+    pub fn no_chat() -> Self {
+        Self(Arc::new(TurnTools {
+            capabilities: ToolCapabilities::default(),
+            limits: ToolLimits {
+                max_tool_output: 30000,
+                max_tool_buffer: 256 * 1024,
+                bash_timeout: 30,
+                bash_max_timeout: 300,
+                subagent_timeout: 300,
+            },
+            events: None,
+        }))
+    }
+
+    /// This turn's context for one dispatch of the stream loop: with the
+    /// round's activation capability and the dispatch's registration channel.
+    pub fn for_dispatch(
+        &self,
+        tool_register_tx: tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>,
+        tool_activation: crate::tools::discovery::ActivationCapability,
+    ) -> Self {
+        let mut capabilities = self.0.capabilities.clone();
+        capabilities.tool_register_tx = Some(tool_register_tx);
+        capabilities.tool_activation = Some(tool_activation);
+        Self(Arc::new(TurnTools {
+            capabilities,
+            limits: self.0.limits.clone(),
+            events: self.0.events.clone(),
+        }))
+    }
+
+    /// The context of one tool call. `tx_delta` is the call's own lane for
+    /// partial output (`None` where the call is not shown as it runs).
+    pub fn for_call(&self, tx_delta: Option<crate::tools::output::DeltaSender>) -> ToolContext {
+        ToolContext {
+            channels: ToolChannels {
+                tx_delta,
+                tx_events: self.0.events.clone(),
+            },
+            capabilities: self.0.capabilities.clone(),
+            limits: self.0.limits.clone(),
+        }
+    }
+
+    pub fn capabilities(&self) -> &ToolCapabilities {
+        &self.0.capabilities
+    }
+
+    pub fn limits(&self) -> &ToolLimits {
+        &self.0.limits
+    }
+}
+
+/// Fields elided: capabilities hold handles, and a session's forwarded
+/// secrets must not be printed.
+impl std::fmt::Debug for TurnToolContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnToolContext")
+            .field("session_id", &self.0.capabilities.session_id)
+            .field("cwd", &self.0.capabilities.cwd)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Explicit runtime-origin identity of a registered tool implementation.
@@ -394,10 +546,115 @@ pub trait Tool: Send + Sync {
     fn concurrency_key(&self, _validated_input: &Value) -> Option<ConcurrencyKey> {
         None
     }
+
+    /// [`Self::concurrency_key`] for a call made in `cwd`, the chat's folder
+    /// (`None`: the process folder). The scheduler asks this one. A tool
+    /// whose key is a path resolves a relative one against `cwd`, as its
+    /// `execute` does, so the key names the file the call will touch; a
+    /// tool whose key does not depend on the folder has nothing to add.
+    fn concurrency_key_in(
+        &self,
+        validated_input: &Value,
+        _cwd: Option<&std::path::Path>,
+    ) -> Option<ConcurrencyKey> {
+        self.concurrency_key(validated_input)
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
+
+#[cfg(test)]
+mod stripped_env_notice_tests {
+    /// One notice per picked stripped name, once per session (the shared
+    /// set), the same text `bash` and `shell_start` print.
+    #[test]
+    fn notices_name_each_picked_secret_once_per_session() {
+        let mut caps = super::test_helpers::create_tool_context().capabilities;
+        assert_eq!(caps.stripped_env_notices(|_| true), "", "nothing stripped: nothing to say");
+        caps.env_stripped = vec!["GH_TOKEN".into(), "AWS_SECRET_ACCESS_KEY".into()];
+        let first = caps.stripped_env_notices(|n| n == "GH_TOKEN");
+        assert!(first.contains("note: $GH_TOKEN was stripped from the session env as a secret"), "{first}");
+        assert!(!first.contains("AWS_SECRET_ACCESS_KEY"), "{first}");
+        let all = caps.stripped_env_notices(|_| true);
+        assert!(all.contains("$AWS_SECRET_ACCESS_KEY") && !all.contains("$GH_TOKEN"), "{all}");
+        assert_eq!(caps.stripped_env_notices(|_| true), "", "each name once");
+    }
+}
+
+#[cfg(test)]
+mod turn_tool_context_tests {
+    use super::*;
+
+    /// A turn's context is carried by pointer. Held by value in
+    /// `ApiOptions` and the stream loop's state it overflowed a 2 MiB
+    /// worker stack in a debug build (`session_actor_cache_keepwarm`).
+    #[test]
+    fn a_turns_tool_context_is_one_pointer_wide() {
+        eprintln!(
+            "ToolCapabilities: {} bytes, ToolContext: {} bytes",
+            std::mem::size_of::<ToolCapabilities>(),
+            std::mem::size_of::<ToolContext>(),
+        );
+        assert_eq!(
+            std::mem::size_of::<Option<TurnToolContext>>(),
+            std::mem::size_of::<usize>()
+        );
+    }
+
+    /// The two capabilities of one stream dispatch are not a turn's: `new`
+    /// drops them, `for_dispatch` adds them to its own copy only, and a
+    /// call's context is the turn's otherwise.
+    #[test]
+    fn dispatch_capabilities_never_reach_the_turns_context() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let turn = TurnToolContext::new(
+            ToolCapabilities {
+                tool_register_tx: Some(tx.clone()),
+                session_id: Some("chat-A".into()),
+                env_stripped: vec!["SECRET".into()],
+                ..Default::default()
+            },
+            TurnToolContext::no_chat().limits().clone(),
+            Some(events.clone()),
+        );
+        assert!(turn.capabilities().tool_register_tx.is_none());
+
+        let set = crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
+            crate::tools::activation::SessionId::parse("turn-tools").unwrap(),
+            &crate::tools::catalog::ToolCatalog::empty(),
+        );
+        let dispatch = turn.for_dispatch(
+            tx,
+            crate::tools::discovery::ActivationCapability::new(
+                crate::tools::catalog::ToolCatalog::empty(),
+                Arc::new(std::sync::RwLock::new(set)),
+                crate::tools::activation::ActivationAuthority::ModelConfirmed,
+            ),
+        );
+        let (of_turn, of_dispatch) = (turn.for_call(None), dispatch.for_call(None));
+        assert!(of_turn.capabilities.tool_register_tx.is_none());
+        assert!(of_turn.capabilities.tool_activation.is_none());
+        assert!(of_dispatch.capabilities.tool_register_tx.is_some());
+        assert!(of_dispatch.capabilities.tool_activation.is_some());
+        for ctx in [&of_turn, &of_dispatch] {
+            assert_eq!(ctx.capabilities.session_id.as_deref(), Some("chat-A"));
+            assert_eq!(ctx.capabilities.env_stripped, ["SECRET"]);
+            // The turn's event channel, whichever loop makes the call.
+            assert!(ctx
+                .channels
+                .tx_events
+                .as_ref()
+                .is_some_and(|tx| tx.same_channel(&events)));
+            assert!(ctx.channels.tx_delta.is_none());
+        }
+        let none = TurnToolContext::no_chat().for_call(None);
+        assert!(none.channels.tx_events.is_none());
+        assert!(none.capabilities.session_id.is_none() && none.capabilities.env.is_none());
+        assert!(none.capabilities.memory_backend.is_none());
+    }
+}
 
 #[cfg(test)]
 mod tool_output_tests {

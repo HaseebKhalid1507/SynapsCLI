@@ -83,6 +83,7 @@ async fn assert_worker_sees_only_transforms(
         "RAW 10k lines".to_string(),
         30_000,
         None,
+        None,
     )
     .await;
     assert_eq!(replaced, "CRUSHED", "{path}: the worker's bash result is replaced");
@@ -91,6 +92,7 @@ async fn assert_worker_sees_only_transforms(
         "bash",
         None,
         serde_json::json!({"command": "rm -rf /"}),
+        None,
         None,
     )
     .await;

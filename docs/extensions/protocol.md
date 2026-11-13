@@ -42,7 +42,7 @@ Content-Length: <byte-length-of-body>\r\n
 ```
 Content-Length: <byte-length>\r\n
 \r\n
-{"jsonrpc":"2.0","id":"evt-001","method":"hook.handle","params":{"kind":"before_tool_call","tool_name":"bash","tool_runtime_name":"bash","tool_input":{"command":"ls -la"},"tool_output":null,"message":null,"session_id":null,"transcript":null,"data":null}}
+{"jsonrpc":"2.0","id":"evt-001","method":"hook.handle","params":{"kind":"before_tool_call","tool_name":"bash","tool_runtime_name":"bash","tool_input":{"command":"ls -la"},"tool_output":null,"message":null,"session_id":null,"cwd":"/home/u/project","transcript":null,"data":null}}
 ```
 
 **Example frame (extension → runtime):**
@@ -206,7 +206,12 @@ Called when the model invokes an extension-provided tool declared during
   "params": {
     "name": "echo",
     "input": { "text": "hello" },
-    "session_id": "20261014-050933-a06f"
+    "session_id": "20261014-050933-a06f",
+    "cwd": "/home/u/project",
+    "caller": {
+      "actor": "actor-0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "group": "group-00112233445566778899aabbccddeeff"
+    }
   }
 }
 ```
@@ -215,12 +220,59 @@ Called when the model invokes an extension-provided tool declared during
 |--------------|----------------|-------------|
 | `name`       | string         | The extension's own tool name, as declared in `capabilities.tools` (not the `plugin-id:name` runtime name). |
 | `input`      | object         | The arguments the model supplied. |
-| `session_id` | string \| null | The conversation that invoked the tool: the same value the hook events carry. `null` for workers/subagents, the extension-provider tool route, contexts with no conversation, and when `SYNAPS_HOOK_SESSION_ID=0`. Always present. |
+| `session_id` | string \| null | The conversation that invoked the tool: the same value the hook events carry. `null` for workers/subagents, for the host's own calls to a memory extension (capture and recall), and when `SYNAPS_HOOK_SESSION_ID=0`. Always present. |
+| `cwd`        | string \| null | The folder the caller runs in: the same value the hook events carry. Set for workers too (their parent chat's folder) and for the host's own memory calls (the chat's folder). Not canonicalised by Synaps. `null` only when the path is not valid UTF-8, or when the folder to report is the host process's own and it cannot be read. Always present. |
+| `caller`     | object, optional | Which run makes the call; see below. The key is absent when the host has none to give: never `null`. |
 
 In daemon mode one extension process serves every session, so key any
 per-caller tool state on `params.session_id` (see
-[session-id.md](session-id.md)). Older hosts omit the field; treat a
-missing key like `null`.
+[session-id.md](session-id.md)) and scope per-project behaviour on
+`params.cwd` (see [hooks.md](hooks.md#cwd-the-chats-working-folder)). Older
+hosts omit these fields; treat a missing key like `null`.
+
+#### `caller`: the run that makes the call
+
+A chat and each of its workers (subagents) is a run of its own, and the
+host gives every run an author. `caller` is that author, the one an
+extension's project forum records when the same run posts:
+
+| Field    | Type             | Description |
+|----------|------------------|-------------|
+| `actor`  | string           | `actor-` and 32 lowercase hex digits. The run. Two workers of one chat have different actors. |
+| `group`  | string           | `group-` and 32 lowercase hex digits. The chat and all the workers under it share one. |
+| `parent` | string, optional | The `actor` of the run that started this one. Absent for a chat (not `null`); a worker carries its chat's actor, a worker's worker its worker's. Never equal to `actor`. |
+
+No other field is sent.
+
+- **The host writes it, and only the host.** `caller` is a key of `params`
+  that the host writes beside `input`, never from it. A model cannot set it
+  or change it, and no run is ever given another run's. An extension may go
+  by it: the run `caller` names is the run that is calling.
+- **Its values are not secret.** The same `actor` and `group` appear in
+  an extension's forum posts and tool results that models read, so a model can know the
+  author of a run that is not its own. An extension must therefore never
+  accept an author from tool `input` (an `actor`, `group` or `parent`
+  argument, or anything else the model writes). Who is calling is
+  `params.caller` and nothing else.
+- **A call with no `caller` exists.** The key is absent for the host's own
+  calls to a memory extension (capture and recall), which no run makes;
+  for a call with no memory binding behind it (a model an extension
+  provides, called outside a chat's turn); and from a host older than this
+  field. The host never makes one up, and never sends one that is not of
+  the shape above. Such a call must get no access that depends on who is
+  calling: it is an unknown caller, not some default caller.
+- **It identifies one life of a run, not the chat.** Every call a chat
+  makes names the same author until the host builds the chat anew. After a
+  park and wake (the daemon parks a chat that no client is attached to), a
+  daemon reload or restart, or `--continue`, the same chat has a new
+  `actor` and a new `group`. A resumed worker is a new run with a new
+  `actor`. `session_id` is what stays the same for a chat: key on it what
+  must still belong to the chat afterwards. A worker's call has no
+  `session_id` (it is `null`), so `group` is what ties a worker to its
+  chat, and only within one life: an extension learns which chat a `group`
+  belongs to from a call the chat itself makes, which carries both, and
+  workers started after the chat is built anew are in its new group.
+- `SYNAPS_HOOK_SESSION_ID=0` does not affect it.
 
 **Response:**
 
@@ -315,6 +367,7 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
   "tool_output": null,
   "message": null,
   "session_id": null,
+  "cwd": "/home/u/project",
   "transcript": null,
   "data": null
 }
@@ -328,9 +381,10 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 | `tool_input`        | object \| null  | `before_tool_call`, `after_tool_call`         | The raw input arguments passed to the tool                       |
 | `tool_output`       | string \| null  | `after_tool_call`                             | The result returned by the tool (size-limited preview: ~32 KB prefix + marker) |
 | `message`           | string \| null  | `before_message`, `on_message_complete`, `on_compaction` | User/assistant/summary message content for message hooks         |
-| `session_id`        | string \| null  | `on_compaction`, `on_session_start`, `on_session_end` | Stable identifier for the current or newly-created session       |
+| `session_id`        | string \| null  | `on_compaction`, `on_session_start`, `on_session_end`, `on_context_archived`, `on_memory_forgotten` | Stable identifier for the current or newly-created session       |
+| `cwd`               | string \| null  | all                                           | The chat's working folder, as the client gave it (not canonicalised); see [hooks.md](hooks.md#cwd-the-chats-working-folder) |
 | `transcript`        | array \| null   | `on_session_end`                              | Conversation transcript delivered at session end                 |
-| `data`              | any             | all                                           | Extension-defined pass-through data; `null` in runtime events    |
+| `data`              | any             | all                                           | Per-hook payload (`on_message_complete`, `on_compaction`, `on_context_archived`, `on_memory_forgotten`); `null` on the other hooks |
 
 Fields that are not applicable to the current hook are always `null`, never omitted. You can safely access any field without a key-existence check.
 
@@ -351,6 +405,7 @@ messages compacted.
   "tool_output": null,
   "message": "Compacted summary text...",
   "session_id": "20260501-120000-abcd",
+  "cwd": "/home/u/project",
   "transcript": null,
   "data": {
     "old_session_id": "20260501-110000-wxyz",
@@ -361,14 +416,102 @@ messages compacted.
 }
 ```
 
+### `on_context_archived`
+
+`on_context_archived` is sent after a context rollover has sealed a window of
+a chat into an archive file. It requires `privacy.llm_content` and is
+notify-only: the host does not wait for the response and discards it, so the
+handler can neither delay nor change the rollover. Delivery is best effort,
+unordered, and one archive can be announced more than once. A window over
+what one archive may hold is sealed as several, and then one event is sent
+per archive, first part first, with `data.part` of `data.parts` and
+`data.first_source_index` saying where it belongs. See
+[hooks.md](hooks.md#notify-only-hooks) for the rules and for every field.
+
+```json
+{
+  "kind": "on_context_archived",
+  "tool_name": null,
+  "tool_runtime_name": null,
+  "tool_input": null,
+  "tool_output": null,
+  "message": null,
+  "session_id": "20260501-120000-abcd",
+  "cwd": "/home/u/project",
+  "transcript": null,
+  "data": {
+    "archive_id": "9f2c1a7e04b35d6688c1f0a2b7d94e13",
+    "path": "/home/u/.synaps-cli/context-archives/<64 hex>/s000001/9f2c1a7e04b35d6688c1f0a2b7d94e13.json",
+    "project_key": "p0123456789abcdef",
+    "message_count": 212,
+    "source_message_count": 240,
+    "window": 4,
+    "part": 1,
+    "parts": 1,
+    "first_source_index": 0,
+    "reduced_messages": 0
+  }
+}
+```
+
+### `on_memory_forgotten`
+
+`on_memory_forgotten` is sent after the `memory_forget` tool has forgotten an
+archived context window or a note. It requires `session.lifecycle`, carries
+ids only, and is notify-only like `on_context_archived`: the host does not
+wait for the response and discards it. `data.kind` is `"archive"` or
+`"note"`; for an archive `data.id` is the `archive_id` that
+`on_context_archived` announced. Nothing is sent for a forget that failed.
+See [hooks.md](hooks.md#on_memory_forgotten).
+
+```json
+{
+  "kind": "on_memory_forgotten",
+  "tool_name": null,
+  "tool_runtime_name": null,
+  "tool_input": null,
+  "tool_output": null,
+  "message": null,
+  "session_id": "20260501-120000-abcd",
+  "cwd": "/home/u/project",
+  "transcript": null,
+  "data": {
+    "id": "9f2c1a7e04b35d6688c1f0a2b7d94e13",
+    "kind": "archive",
+    "project_key": "p0123456789abcdef",
+    "scope": "repository"
+  }
+}
+```
+
 ### `on_message_complete`
 
 `on_message_complete` is emitted after an assistant response is completed and
-added to session history. It requires `privacy.llm_content` and supports
-`continue` plus the advisory [`context_phase`](#context_phase) result. It can
-never block, modify, or inject. `message` contains concatenated assistant text
+added to session history (an empty reply is not). It requires
+`privacy.llm_content` and supports `continue` plus the advisory
+[`context_phase`](#context_phase) result. It can never block, modify, or
+inject. `message` contains concatenated assistant text
 blocks when present; tool-use blocks are summarized in `data` instead of being
 serialized into `message`.
+
+A turn fires one event per assistant message. `has_tool_use: false` marks an
+assistant message that asked for no tools; `has_tool_use: true`, one that asked
+for tools, whether or not they ran (a usage budget or a rejected
+`context_checkpoint` batch can stop them). The `message` may be empty: a model
+that has nothing to add after its tool calls ends the turn on an empty reply,
+and that reply is still reported (`message: ""`, `content_block_count: 0`).
+
+The event with `has_tool_use: false` is not "the turn is done":
+
+- A turn can have more than one. A steering message that arrives after a reply
+  without tools, or the Muse nudge after a reply that announced an action
+  without doing it, continues the turn, and the next reply gets its own event.
+- A turn can end without one. A turn that stops after a tool round, because it
+  was cancelled, ran out of a turn budget (tool calls, tool-result bytes,
+  provider rounds, wall clock) or failed, ends on an event with
+  `has_tool_use: true`.
+- An empty reply that is an error, a cancel or over a usage budget is not
+  reported at all.
 
 ```json
 {
@@ -379,6 +522,7 @@ serialized into `message`.
   "tool_output": null,
   "message": "The build passed.",
   "session_id": null,
+  "cwd": "/home/u/project",
   "transcript": null,
   "data": {
     "content_block_count": 1,
@@ -767,12 +911,22 @@ Relative command paths and local argument paths are resolved from the plugin dir
 | Permission           | What it unlocks                                                                            |
 |----------------------|--------------------------------------------------------------------------------------------|
 | `tools.intercept`    | Allows subscription to `before_tool_call` and `after_tool_call`.                           |
-| `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`.                     |
-| `session.lifecycle`  | Enables receipt of `on_session_start` and `on_session_end` events; also the second key for the advisory `context_phase` result on `on_message_complete`. |
+| `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`, and to `on_context_archived` (its path leads to conversation content). |
+| `session.lifecycle`  | Enables receipt of `on_session_start`, `on_session_end` and `on_memory_forgotten` events; also the second key for the advisory `context_phase` result on `on_message_complete`. |
 | `tools.register`    | Register extension-provided tools during initialization.                                    |
 | `providers.register`| Register extension-provided provider metadata during initialization. Chat routing is not wired yet. |
 
 Reserved future permissions are rejected if declared today: `tools.override`.
+
+`context_providers.register` and the manifest key `deferred.context_providers`
+are accepted and ignored. They declared a provider for built-in automatic
+memory, which was removed in 0.12.0. A manifest that still has them loads as
+its other parts say, its tools and hooks work, the declaration decides
+nothing about when the extension starts, and the host logs one line saying it
+is ignored. A manifest that declares only a context provider starts at load
+like one with an empty `deferred` block, and fails to load like one if its
+command does not start. An
+extension that provides capture and recall does it through hooks.
 
 Permissions are enforced before hook subscriptions are installed. Unknown permission strings are rejected, reserved permission strings are rejected, and a hook subscription without its required permission fails manifest loading.
 
@@ -788,6 +942,10 @@ SynapsCLI is designed to degrade gracefully when extensions misbehave. If your e
 - **Sends a malformed response** — treated as `continue`. The error is logged through SynapsCLI tracing.
 - **Crashes or closes stdout** — the runtime restarts the process and retries the request. If retry also fails, hook delivery fails open for that call.
 - **Sends an error object** instead of a result — treated as `continue`. The error message is logged.
+
+The notify-only hooks (`on_context_archived`, `on_memory_forgotten`) go
+further: the host does not wait for the response at all, so none of the above
+can delay what they report.
 
 After three restart attempts, the extension health becomes `Failed`; subsequent hook calls continue fail-open.
 

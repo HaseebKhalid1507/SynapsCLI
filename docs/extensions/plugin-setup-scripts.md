@@ -20,7 +20,7 @@ Synaps runs post-install work after a plugin source tree is cloned or updated.
 }
 ```
 
-- `extension.setup` takes precedence over legacy `provides.sidecar.setup`.
+- `extension.setup` is the only setup slot. The old `provides.sidecar.setup` slot is ignored since 0.12.0.
 - `extension.command` for shipped binaries must be plugin-relative. Absolute paths and `..` traversal are rejected. Bare PATH commands remain supported for interpreter-style extensions.
 - `extension.prebuilt` keys use compact host triples such as `linux-x86_64`, `linux-arm64`, `darwin-x86_64`, `darwin-arm64`, `windows-x86_64`, and `windows-arm64`.
 - Prebuilt `url` must be HTTPS in production builds. `file://` is accepted only in tests.
@@ -30,7 +30,7 @@ Synaps runs post-install work after a plugin source tree is cloned or updated.
 
 1. If `extension.command` already resolves to an executable plugin-relative file, setup is skipped.
 2. If a matching `extension.prebuilt` asset exists, Synaps downloads it with request timeouts and a 128 MiB size cap, verifies SHA-256 while streaming, extracts it through a sandbox, and verifies `extension.command`.
-3. If no prebuilt matches, Synaps runs `extension.setup` (or legacy sidecar setup) with `bash` from the plugin directory.
+3. If no prebuilt matches, Synaps runs `extension.setup` with `bash` from the plugin directory.
 4. After setup, Synaps verifies the declared extension binary exists and is executable.
 
 ## Prebuilt archive layout

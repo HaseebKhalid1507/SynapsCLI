@@ -256,8 +256,8 @@ fn plugin_marketplace_is_refused_mid_turn() {
     let _base = BaseDir::new();
     let mut h = streaming_harness();
     open_settings_mid_turn(&mut h);
-    // Plugins is the 9th category (Model … Memory, Plugins).
-    for _ in 0..8 {
+    // Plugins is the 8th category (Model … Appearance, Plugins).
+    for _ in 0..7 {
         h.key(KeyCode::Down, KeyModifiers::NONE);
     }
     h.key(KeyCode::Tab, KeyModifiers::NONE);

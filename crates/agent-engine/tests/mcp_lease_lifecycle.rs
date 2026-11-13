@@ -21,7 +21,9 @@ use agent_engine::tools::activation::{
     activate_exact_for_user, ExecutionGate, SessionId, SessionToolSet,
 };
 use agent_engine::tools::catalog::{SchemaDigest, ToolId};
-use agent_engine::tools::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits, ToolRegistry};
+use agent_engine::tools::{
+    Tool, ToolCapabilities, ToolChannels, ToolContext, ToolLimits, ToolRegistry,
+};
 use serde_json::{json, Value};
 
 // ── fixture plumbing ────────────────────────────────────────────────────────
@@ -159,7 +161,6 @@ fn ctx_with(cap: Option<McpLeaseCapability>) -> ToolContext {
             launch_cancel: None,
             memory_backend: None,
             telemetry: None,
-            watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
             subagent_registry: None,
@@ -171,12 +172,13 @@ fn ctx_with(cap: Option<McpLeaseCapability>) -> ToolContext {
             tool_activation: None,
             mcp_leases: cap,
             extension_leases: None,
-            memory_context: None,
             cwd: None,
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
             session_id: None,
+            hook_bus: None,
+            continuation: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -890,6 +892,176 @@ async fn schema_mismatch_revokes_grant_but_transport_errors_do_not() {
             .is_some(),
         "transient transport failure must NOT revoke the grant"
     );
+    fx.cleanup();
+}
+
+// ── an isError tool result is a tool error, not a transport failure ─────────
+
+/// A fresh manager leasing `fx` as `srv`, a registry holding its dormant
+/// tools, and the dormant `echo_tool`.
+fn leased_srv(fx: &Fixture) -> (Arc<McpRuntimeManager>, ToolRegistry, Arc<dyn Tool>) {
+    let fp = server_config_fingerprint(&fx.config);
+    let (source, _) = shared_source(fx.config.clone());
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
+    let mut registry = ToolRegistry::new();
+    let tools = dormant_tools_for_config(&config_with(fx.config.clone()), &seeded_cache(&fp));
+    registry.try_register_batch(tools.clone()).unwrap();
+    let echo = tools
+        .into_iter()
+        .find(|t| t.name() == "ext__srv__echo_tool")
+        .unwrap();
+    (manager, registry, echo)
+}
+
+#[tokio::test]
+async fn mcp_is_error_result_reaches_the_model_as_a_tool_error() {
+    let fx = fixture("is-error", "call_error", advertised_tools());
+    let fp = server_config_fingerprint(&fx.config);
+    let (manager, _registry, echo) = leased_srv(&fx);
+    let digest = SchemaDigest::of_schema(&echo_schema());
+    let err = manager
+        .call_exact(
+            &sid(),
+            "srv",
+            &fp,
+            "echo_tool",
+            &digest,
+            json!({"text":"x"}),
+        )
+        .await
+        .expect_err("an isError result is an error");
+    assert!(!matches!(err, McpLeaseError::Transport(..)), "{err:?}");
+    assert_eq!(err.to_string(), "MCP tool error from server 'srv': nope");
+
+    let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
+    let err = echo
+        .execute(json!({"text":"x"}), ctx_with(Some(cap)))
+        .await
+        .expect_err("the tool said no");
+    assert_eq!(
+        err.to_string(),
+        "Tool execution failed: MCP tool error from server 'srv': nope"
+    );
+    assert!(
+        !err.to_string().to_lowercase().contains("transport"),
+        "{err}"
+    );
+    manager.terminate_all();
+    fx.cleanup();
+}
+
+/// A `catalog` server refused an out-of-scope item with
+/// `isError: true`; the model read it as a broken server.
+#[tokio::test]
+async fn mcp_out_of_scope_refusal_names_its_server_and_no_transport() {
+    let text = "Tool failed (out_of_scope: the requested item is outside this session's scope)";
+    let mut fx = fixture("is-error-scope", "call_error", advertised_tools());
+    fx.config
+        .env
+        .insert("MCP_FIXTURE_CALL_TEXT".to_string(), text.to_string());
+    let fp = server_config_fingerprint(&fx.config);
+    let cfg = fx.config.clone();
+    let source: ConfigSource =
+        Arc::new(move |server: &str| (server == "catalog").then(|| cfg.clone()));
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
+    let mut cache = seeded_cache(&fp);
+    let entry = cache.servers.remove("srv").unwrap();
+    cache.servers.insert("catalog".to_string(), entry);
+    let config = McpConfig {
+        mcp_servers: HashMap::from([("catalog".to_string(), fx.config.clone())]),
+    };
+    let tools = dormant_tools_for_config(&config, &cache);
+    let echo = tools
+        .iter()
+        .find(|t| t.name() == "ext__catalog__echo_tool")
+        .unwrap();
+
+    let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
+    let err = echo
+        .execute(json!({"text":"x"}), ctx_with(Some(cap)))
+        .await
+        .expect_err("the server refused");
+    // Before: "Tool execution failed: MCP transport failure for server
+    // 'catalog': Tool failed (out_of_scope: …)".
+    assert_eq!(
+        err.to_string(),
+        format!("Tool execution failed: MCP tool error from server 'catalog': {text}")
+    );
+    manager.terminate_all();
+    fx.cleanup();
+}
+
+#[tokio::test]
+async fn mcp_call_transport_failures_keep_transport_and_todays_text() {
+    let digest = SchemaDigest::of_schema(&echo_schema());
+    for (tag, mode, want) in [
+        (
+            "call-rpc-error",
+            "call_rpc_error",
+            "MCP transport failure for server 'srv': MCP error (code -32603) from server; \
+             10-byte provider message withheld",
+        ),
+        (
+            "call-eof",
+            "call_eof",
+            "MCP transport failure for server 'srv': MCP server closed its output stream (EOF)",
+        ),
+    ] {
+        let fx = fixture(tag, mode, advertised_tools());
+        let fp = server_config_fingerprint(&fx.config);
+        let (manager, _registry, _echo) = leased_srv(&fx);
+        let err = manager
+            .call_exact(
+                &sid(),
+                "srv",
+                &fp,
+                "echo_tool",
+                &digest,
+                json!({"text":"x"}),
+            )
+            .await
+            .expect_err(mode);
+        assert!(
+            matches!(err, McpLeaseError::Transport(..)),
+            "{mode}: {err:?}"
+        );
+        assert_eq!(err.to_string(), want, "{mode}");
+        manager.terminate_all();
+        fx.cleanup();
+    }
+}
+
+#[tokio::test]
+async fn mcp_is_error_result_does_not_revoke_the_grant_or_the_lease() {
+    let fx = fixture("is-error-grant", "call_error", advertised_tools());
+    let (manager, registry, echo) = leased_srv(&fx);
+    let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
+    let shared = shared_set_with_activations(&registry);
+    for _ in 0..2 {
+        echo.execute(
+            json!({"text":"x"}),
+            ctx_full(cap.clone(), activation_cap_for(&registry, &shared)),
+        )
+        .await
+        .expect_err("the tool said no");
+    }
+    assert!(
+        shared
+            .read()
+            .unwrap()
+            .activation(&ToolId::mcp("srv", "echo_tool"))
+            .is_some(),
+        "a tool's own refusal must not revoke the grant"
+    );
+    assert_eq!(manager.lease_count(), 1, "nor end the lease");
+    assert_eq!(fx.count("spawn"), 1, "the second call reuses the child");
+    manager.terminate_all();
     fx.cleanup();
 }
 

@@ -7,17 +7,8 @@
 //! [`extension.command`] points at) get built without forcing the
 //! user to run `scripts/setup.sh` by hand.
 //!
-//! Two manifest slots are recognised, in priority order:
-//!
-//! 1. `extension.setup` — the extension's own build script. Checked
-//!    first because the extension binary is what the host will spawn
-//!    immediately on session start.
-//! 2. `provides.sidecar.setup` — the sidecar's build script (legacy
-//!    slot; still honoured for sidecar-only plugins).
-//!
-//! At most one script runs per install. Plugins that ship both an
-//! extension and a sidecar from one repo should drive both builds
-//! from a single `scripts/setup.sh` referenced via `extension.setup`.
+//! The setup script is the manifest's `extension.setup`. At most one
+//! script runs per install.
 //!
 //! ## Security
 //!
@@ -768,20 +759,9 @@ pub fn resolve_setup_script(
     manifest: &PluginManifest,
     plugin_dir: &Path,
 ) -> Result<Option<PathBuf>, SetupError> {
-    // 1. Extension setup wins. The extension binary is what the host
-    //    spawns immediately on session start, so its build script gets
-    //    priority over the sidecar's.
     if let Some(ext) = manifest.extension.as_ref() {
         if let Some(setup) = ext.setup.as_deref() {
             return validate_setup_path(setup, plugin_dir).map(Some);
-        }
-    }
-    // 2. Fall back to the sidecar's setup (legacy slot).
-    if let Some(provides) = manifest.provides.as_ref() {
-        if let Some(sidecar) = provides.sidecar.as_ref() {
-            if let Some(setup) = sidecar.setup.as_deref() {
-                return validate_setup_path(setup, plugin_dir).map(Some);
-            }
         }
     }
     Ok(None)
@@ -790,8 +770,6 @@ pub fn resolve_setup_script(
 /// Security-validate a setup-script path declared in the manifest and
 /// resolve it to an absolute path inside `plugin_dir`.
 ///
-/// Shared by both the `extension.setup` and `provides.sidecar.setup`
-/// resolution paths so the rules stay identical.
 fn validate_setup_path(setup: &str, plugin_dir: &Path) -> Result<PathBuf, SetupError> {
     let setup_path = Path::new(setup);
     if setup_path.is_absolute()
@@ -946,7 +924,6 @@ pub async fn run_setup_script(
 mod tests {
     use super::*;
     use crate::extensions::manifest::{ExtensionManifest, ExtensionRuntime};
-    use crate::skills::manifest::{PluginProvides, SidecarManifest};
     use std::fs;
 
     #[test]
@@ -982,26 +959,7 @@ mod tests {
     }
 
     fn manifest_with_setup(setup: Option<&str>) -> PluginManifest {
-        PluginManifest {
-            name: "test-plugin".to_string(),
-            version: None,
-            description: None,
-            keybinds: vec![],
-            compatibility: None,
-            commands: vec![],
-            extension: None,
-            help_entries: vec![],
-            provides: Some(PluginProvides {
-                sidecar: Some(SidecarManifest {
-                    command: "bin/sidecar".to_string(),
-                    setup: setup.map(|s| s.to_string()),
-                    protocol_version: 1,
-                    model: None,
-                    lifecycle: None,
-                }),
-            }),
-            settings: None,
-        }
+        manifest_with_extension_setup(setup)
     }
 
     /// Build an extension-only manifest with the given setup-script slot.
@@ -1027,25 +985,8 @@ mod tests {
                 config: vec![],
             }),
             help_entries: vec![],
-            provides: None,
             settings: None,
         }
-    }
-
-    /// Build a manifest with BOTH extension and sidecar setup slots.
-    /// Used to verify extension wins when both are present.
-    fn manifest_with_both_setup(ext_setup: &str, side_setup: &str) -> PluginManifest {
-        let mut m = manifest_with_extension_setup(Some(ext_setup));
-        m.provides = Some(PluginProvides {
-            sidecar: Some(SidecarManifest {
-                command: "bin/sidecar".to_string(),
-                setup: Some(side_setup.to_string()),
-                protocol_version: 1,
-                model: None,
-                lifecycle: None,
-            }),
-        });
-        m
     }
 
     #[test]
@@ -1054,14 +995,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let res = resolve_setup_script(&m, dir.path()).unwrap();
         assert!(res.is_none());
-    }
-
-    #[test]
-    fn resolve_returns_none_when_no_provides() {
-        let mut m = manifest_with_setup(None);
-        m.provides = None;
-        let dir = tempfile::tempdir().unwrap();
-        assert!(resolve_setup_script(&m, dir.path()).unwrap().is_none());
     }
 
     #[test]
@@ -1142,12 +1075,12 @@ mod tests {
     fn install_log_path_substitutes_colons() {
         let path = install_log_path(
             Path::new("/tmp/logs"),
-            "sample-sidecar",
+            "sample-plugin",
             "2026-05-02T19:30:45-04:00",
         );
         assert_eq!(
             path,
-            PathBuf::from("/tmp/logs/install/sample-sidecar-2026-05-02T19-30-45-04-00.log")
+            PathBuf::from("/tmp/logs/install/sample-plugin-2026-05-02T19-30-45-04-00.log")
         );
     }
 
@@ -1262,65 +1195,6 @@ mod tests {
         assert!(matches!(err, SetupError::NotFound { .. }), "got {err:?}");
     }
 
-    #[test]
-    fn resolve_prefers_extension_setup_over_sidecar_setup() {
-        // When both slots are populated, extension wins — the host spawns
-        // the extension binary first on session start, so its build must
-        // run first.
-        let dir = tempfile::tempdir().unwrap();
-        let scripts = dir.path().join("scripts");
-        fs::create_dir(&scripts).unwrap();
-        fs::write(scripts.join("ext.sh"), "#!/bin/bash\necho ext").unwrap();
-        fs::write(scripts.join("side.sh"), "#!/bin/bash\necho side").unwrap();
-        let m = manifest_with_both_setup("scripts/ext.sh", "scripts/side.sh");
-        let resolved = resolve_setup_script(&m, dir.path()).unwrap().unwrap();
-        assert!(
-            resolved.ends_with("scripts/ext.sh"),
-            "expected extension setup to win, got {resolved:?}"
-        );
-    }
-
-    #[test]
-    fn resolve_falls_back_to_sidecar_when_extension_has_no_setup() {
-        // Plugin has an extension but no extension.setup, plus a sidecar
-        // with setup. The sidecar's setup should still run (legacy slot
-        // remains honoured).
-        let dir = tempfile::tempdir().unwrap();
-        let scripts = dir.path().join("scripts");
-        fs::create_dir(&scripts).unwrap();
-        fs::write(scripts.join("side.sh"), "#!/bin/bash\necho side").unwrap();
-        let mut m = manifest_with_extension_setup(None); // extension present, no setup
-        m.provides = Some(PluginProvides {
-            sidecar: Some(SidecarManifest {
-                command: "bin/sidecar".to_string(),
-                setup: Some("scripts/side.sh".to_string()),
-                protocol_version: 1,
-                model: None,
-                lifecycle: None,
-            }),
-        });
-        let resolved = resolve_setup_script(&m, dir.path()).unwrap().unwrap();
-        assert!(resolved.ends_with("scripts/side.sh"));
-    }
-
-    #[test]
-    fn resolve_returns_none_when_neither_slot_has_setup() {
-        // Plugin has both extension and sidecar declared, but neither
-        // declares a setup script — function returns Ok(None).
-        let dir = tempfile::tempdir().unwrap();
-        let mut m = manifest_with_extension_setup(None);
-        m.provides = Some(PluginProvides {
-            sidecar: Some(SidecarManifest {
-                command: "bin/sidecar".to_string(),
-                setup: None,
-                protocol_version: 1,
-                model: None,
-                lifecycle: None,
-            }),
-        });
-        assert!(resolve_setup_script(&m, dir.path()).unwrap().is_none());
-    }
-
     // ---- verify_extension_command tests (slice C) ----
 
     /// Helper: build a manifest whose extension declares `command`.
@@ -1346,7 +1220,6 @@ mod tests {
                 config: vec![],
             }),
             help_entries: vec![],
-            provides: None,
             settings: None,
         }
     }
@@ -1354,7 +1227,8 @@ mod tests {
     #[test]
     fn verify_returns_ok_none_when_no_extension() {
         let dir = tempfile::tempdir().unwrap();
-        let m = manifest_with_setup(None); // sidecar-only manifest
+        let mut m = manifest_with_setup(None);
+        m.extension = None;
         assert_eq!(verify_extension_command(&m, dir.path()).unwrap(), None);
     }
 
@@ -1512,7 +1386,6 @@ mod tests {
                 config: vec![],
             }),
             help_entries: vec![],
-            provides: None,
             settings: None,
         }
     }

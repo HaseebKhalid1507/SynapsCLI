@@ -310,14 +310,7 @@ pub(crate) fn spawn_session_background_gated(
         let shutdown = watcher_shutdown.clone();
         let gate = Arc::clone(&inbox_gate);
         tokio::spawn(async move {
-            crate::events::watch_inbox_gated(
-                inbox_dir,
-                event_queue,
-                shutdown,
-                crate::events::ingest::accept_all,
-                gate,
-            )
-            .await;
+            crate::events::watch_inbox_gated(inbox_dir, event_queue, shutdown, gate).await;
         })
     };
 
@@ -408,8 +401,8 @@ pub(crate) struct SessionBootResult {
     pub(crate) continue_info: Option<ContinueInfo>,
 }
 
-/// The session lock for a `boot()` host that drives `Runtime` itself (rpc,
-/// `synaps server`). Continuing a session that another process (a TUI, the
+/// The session lock for a `boot()` host that drives `Runtime` itself
+/// (`synaps rpc`). Continuing a session that another process (a TUI, the
 /// daemon, another rpc) holds is REFUSED: two writers would fork its history
 /// and the older one's saves would overwrite the newer's. So is continuing
 /// a session already compacted into a successor (its history is closed). A
@@ -446,8 +439,7 @@ pub fn lock_session(
 /// the draft.
 ///
 /// Run ONLY by the holder of the session lock, after taking it (actor
-/// create, unpark and `/resume`; rpc and `synaps server` after
-/// `lock_session`): a draft under a lock held elsewhere belongs to a turn
+/// create, unpark and `/resume`; rpc after `lock_session`): a draft under a lock held elsewhere belongs to a turn
 /// that is running right now. Legacy chat takes no lock and never recovers.
 /// Loading itself (`resolve_or_create_session`) leaves the draft alone.
 ///
@@ -879,26 +871,21 @@ mod tests {
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Off);
     }
 
-    /// merge(112) DARK test: default config boots with legacy memory and no
-    /// context_checkpoint tool — Axel features are invisible until opted in.
-    #[test]
-    fn default_config_is_dark_no_checkpoint_tool_legacy_binding() {
+    /// DARK test: default config is offered no context_checkpoint, and no
+    /// built-in forum tool exists.
+    /// `context_checkpoint` is in the registry, which every chat on a host
+    /// shares; what a chat is offered is its own.
+    #[tokio::test]
+    async fn default_config_is_dark_no_checkpoint_tool() {
         let runtime = Runtime::new_headless();
-        // Default memory backend must be legacy (no Axel sidecar spawn).
-        assert!(
-            !runtime.memory_backend_exclusive(),
-            "default config must NOT be exclusive (Axel); it must be legacy"
-        );
-        // The tool registry must not contain context_checkpoint.
-        let tools = runtime.tools_shared();
-        let registry = tools.blocking_read();
-        let has_checkpoint = registry
-            .iter_tools_sorted()
-            .iter()
-            .any(|t| t.name() == "context_checkpoint");
-        assert!(
-            !has_checkpoint,
-            "context_checkpoint must not appear in the default tool set"
-        );
+        let offered = runtime.offered_tools_schema().await;
+        let names: Vec<&str> = offered.iter().filter_map(|t| t["name"].as_str()).collect();
+        for dark in ["context_checkpoint", "forum_post", "forum_read", "forum_forget"] {
+            assert!(
+                !names.contains(&dark),
+                "{dark} must not appear in the default tool set: {names:?}"
+            );
+        }
+        assert!(names.contains(&"read"), "{names:?}");
     }
 }

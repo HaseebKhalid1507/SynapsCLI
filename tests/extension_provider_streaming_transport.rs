@@ -40,7 +40,7 @@ async fn process_extension_dispatches_notifications_to_subscriber() {
     let (_sub_id, mut rx) = handler.subscribe_notifications().await;
 
     let result = handler
-        .call_tool("trigger", serde_json::json!({}))
+        .call_tool_no_chat("trigger", serde_json::json!({}))
         .await
         .expect("tool.call should succeed despite interleaved notifications");
     assert_eq!(result["status"], "ok");
@@ -103,7 +103,7 @@ async fn notification_flood_is_backpressured_not_retained() {
     let call_handler = std::sync::Arc::clone(&handler);
     let call = tokio::spawn(async move {
         call_handler
-            .call_tool("trigger_flood", serde_json::json!({}))
+            .call_tool_no_chat("trigger_flood", serde_json::json!({}))
             .await
     });
 

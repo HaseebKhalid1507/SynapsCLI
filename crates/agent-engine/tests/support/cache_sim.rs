@@ -17,12 +17,18 @@
 //!
 //! Replies, by the last message: the keep-warm ping text gets `ok`; a
 //! `tool_result` gets `done`; anything else gets the configured `tool_use`.
+//! A reply arrives whole unless the [`Script`] holds it open after its
+//! first events, until the round has seen some pings: a response that
+//! thinks for a long time before its tool call ([`Streamed::Thinking`]), one
+//! long tool call ([`Streamed::ToolCall`]), or a long final answer
+//! ([`Script::answer_pings`]).
 //!
 //! Determinism: the cache runs on a VIRTUAL clock that only the [`Script`]
 //! moves, and the tool of a round runs until the sim releases it (creates
 //! the round's `go` file, `{go}` in the tool input) — at once, or after the
-//! round's Nth ping. So whether the prefix expires, and how many pings a
-//! round sees before its tool returns, never depends on how fast the test
+//! round's Nth ping; a held response goes on after its Nth ping too. So
+//! whether the prefix expires, and how many pings a round sees before its
+//! response ends or its tool returns, never depends on how fast the test
 //! machine is; real time only paces the pings (the interval override).
 #![allow(dead_code)]
 
@@ -53,6 +59,26 @@ pub struct Script {
     /// The Nth ping of the sim's life (1-based) is held — recorded and
     /// billed, its response withheld — until [`release_held`].
     pub hold_ping: Option<usize>,
+    /// How a response that asks for a tool arrives.
+    pub stream: Streamed,
+    /// Pings the reply to a tool result waits for once its text block has
+    /// started (`0` = it arrives whole): a long final answer.
+    pub answer_pings: usize,
+}
+
+/// How a response that asks for a tool arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Streamed {
+    /// Whole, at once.
+    #[default]
+    AtOnce,
+    /// `message_start` and the start of a text block, then nothing until
+    /// the round has seen `pings` pings, then a short tool call: minutes of
+    /// thinking before the call (`0` = at once).
+    Thinking { pings: usize },
+    /// `message_start` and the start of the `tool_use` block, held the same
+    /// way, then its input: one long tool call.
+    ToolCall { pings: usize },
 }
 
 /// The virtual TTL of the scripts (the real 5m one; nothing waits for it).
@@ -69,6 +95,8 @@ impl Script {
             per_ping: TTL * 3 / 5,
             release_after: pings,
             hold_ping: None,
+            stream: Streamed::AtOnce,
+            answer_pings: 0,
         }
     }
 
@@ -81,6 +109,8 @@ impl Script {
             per_ping: Duration::ZERO,
             release_after: 0,
             hold_ping: None,
+            stream: Streamed::AtOnce,
+            answer_pings: 0,
         }
     }
 
@@ -92,6 +122,19 @@ impl Script {
             per_ping: Duration::ZERO,
             release_after: 0,
             hold_ping: None,
+            stream: Streamed::AtOnce,
+            answer_pings: 0,
+        }
+    }
+
+    /// A response that outlasts the TTL on its own: it is held (see
+    /// [`Streamed`]) while the round's pings move the clock by 0.6 TTL
+    /// each, so by the time it ends the round's prefix is older than the
+    /// TTL unless they refreshed it. The tool itself returns at once.
+    pub fn long_response(stream: Streamed) -> Self {
+        Self {
+            stream,
+            ..Self::kept_warm(0)
         }
     }
 }
@@ -151,6 +194,13 @@ pub struct Sim {
     held: Arc<tokio::sync::Notify>,
     /// `requests.len()` when the held ping was released.
     pub held_released_at: Option<usize>,
+    /// Pings the response being held still waits for (counted per round).
+    stream_wait: Option<usize>,
+    /// Lets the held response go on.
+    stream_gate: Arc<tokio::sync::Notify>,
+    /// `requests.len()` when the held response was let go on: its request
+    /// and everything that arrived while it streamed.
+    pub stream_released_at: Option<usize>,
 }
 
 impl Sim {
@@ -167,6 +217,9 @@ impl Sim {
             go_dir: tempfile::tempdir().unwrap(),
             held: Arc::default(),
             held_released_at: None,
+            stream_wait: None,
+            stream_gate: Arc::default(),
+            stream_released_at: None,
         }
     }
 
@@ -179,6 +232,17 @@ impl Sim {
     /// The pings so far.
     pub fn pings(&self) -> usize {
         self.pings
+    }
+
+    /// Hold the response to the request being answered until the round has
+    /// seen `pings` more pings; the gate that lets it go on.
+    fn hold_stream(&mut self, pings: usize) -> Arc<tokio::sync::Notify> {
+        self.round_pings = 0;
+        self.stream_wait = Some(pings);
+        self.stream_released_at = None;
+        // A fresh gate per held response: no wake-up left from an earlier one.
+        self.stream_gate = Arc::default();
+        Arc::clone(&self.stream_gate)
     }
 }
 
@@ -263,34 +327,87 @@ impl Sim {
     }
 }
 
-fn sse(id: &str, usage: (u64, u64, u64), block: Value, delta: Value, stop: &str) -> String {
+fn usage_json(usage: (u64, u64, u64)) -> Value {
     let (read, write, input) = usage;
-    let usage = json!({
+    json!({
         "input_tokens": input,
         "output_tokens": 1,
         "cache_creation_input_tokens": write,
         "cache_read_input_tokens": read,
-    });
-    let mut out = format!(
-        "data: {}\n\n",
+    })
+}
+
+fn event(v: Value) -> String {
+    format!("data: {v}\n\n")
+}
+
+fn message_start(id: &str, usage: (u64, u64, u64)) -> String {
+    event(
         json!({"type":"message_start","message":{"id":id,"type":"message","role":"assistant",
             "content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,
-            "usage":usage}})
-    );
-    out += &format!(
-        "data: {}\n\n",
-        json!({"type":"content_block_start","index":0,"content_block":block})
-    );
-    out += &format!(
-        "data: {}\n\n",
-        json!({"type":"content_block_delta","index":0,"delta":delta})
-    );
-    out += "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
-    out += &format!(
-        "data: {}\n\n",
-        json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":null},"usage":usage})
-    );
-    out + "data: {\"type\":\"message_stop\"}\n\n"
+            "usage":usage_json(usage)}}),
+    )
+}
+
+fn block_start(index: usize, block: Value) -> String {
+    event(json!({"type":"content_block_start","index":index,"content_block":block}))
+}
+
+fn block_delta(index: usize, delta: Value) -> String {
+    event(json!({"type":"content_block_delta","index":index,"delta":delta}))
+}
+
+fn block_stop(index: usize) -> String {
+    event(json!({"type":"content_block_stop","index":index}))
+}
+
+fn message_end(usage: (u64, u64, u64), stop: &str) -> String {
+    event(
+        json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":null},
+            "usage":usage_json(usage)}),
+    ) + &event(json!({"type":"message_stop"}))
+}
+
+fn text_block() -> Value {
+    json!({"type":"text","text":""})
+}
+
+fn text_delta(text: &str) -> Value {
+    json!({"type":"text_delta","text":text})
+}
+
+/// A whole one-block response.
+fn sse(id: &str, usage: (u64, u64, u64), block: Value, delta: Value, stop: &str) -> String {
+    message_start(id, usage)
+        + &block_start(0, block)
+        + &block_delta(0, delta)
+        + &block_stop(0)
+        + &message_end(usage, stop)
+}
+
+/// A response in two parts: `head` now, `tail` once `gate` lets it go on.
+struct Held {
+    head: String,
+    gate: Arc<tokio::sync::Notify>,
+    tail: String,
+}
+
+impl Held {
+    fn into_response(self) -> axum::response::Response {
+        use futures::StreamExt;
+        let Held { head, gate, tail } = self;
+        let rest = async move {
+            let _ = tokio::time::timeout(Duration::from_secs(600), gate.notified()).await;
+            Ok::<_, std::convert::Infallible>(tail)
+        };
+        let body =
+            futures::stream::once(async move { Ok(head) }).chain(futures::stream::once(rest));
+        (
+            [("content-type", "text/event-stream")],
+            axum::body::Body::from_stream(body),
+        )
+            .into_response()
+    }
 }
 
 /// Serve the simulated provider. A request that is neither a ping nor
@@ -319,7 +436,7 @@ pub async fn spawn(script: Script, tool: &str, input: Value) -> (String, Arc<Mut
                             raw.to_vec()
                         };
                         let body: Value = serde_json::from_slice(&bytes).unwrap();
-                        let (reply, hold) = {
+                        let (reply, hold, stream) = {
                             let mut sim = state.lock().unwrap();
                             let (read, write, uncached) = sim.bill(&body);
                             let req = Req {
@@ -337,6 +454,8 @@ pub async fn spawn(script: Script, tool: &str, input: Value) -> (String, Arc<Mut
                             sim.seq += 1;
                             let call_id = format!("toolu_{}", sim.seq);
                             let mut hold = None;
+                            // A reply that is held open after its head.
+                            let mut stream = None;
                             let reply = if req.is_ping() {
                                 sim.pings += 1;
                                 sim.round_pings += 1;
@@ -344,6 +463,12 @@ pub async fn spawn(script: Script, tool: &str, input: Value) -> (String, Arc<Mut
                                 sim.now += step;
                                 if sim.round_pings >= sim.script.release_after {
                                     sim.release_tool();
+                                }
+                                if sim.stream_wait.is_some_and(|n| sim.round_pings >= n) {
+                                    sim.stream_wait = None;
+                                    // This ping included (logged below).
+                                    sim.stream_released_at = Some(sim.requests.len() + 1);
+                                    sim.stream_gate.notify_one();
                                 }
                                 if sim.script.hold_ping == Some(sim.pings) {
                                     hold = Some(Arc::clone(&sim.held));
@@ -356,13 +481,19 @@ pub async fn spawn(script: Script, tool: &str, input: Value) -> (String, Arc<Mut
                                     "end_turn",
                                 )
                             } else if req.has_tool_result() {
-                                sse(
-                                    "msg_done",
-                                    usage,
-                                    json!({"type":"text","text":""}),
-                                    json!({"type":"text_delta","text":"done"}),
-                                    "end_turn",
-                                )
+                                let wait = sim.script.answer_pings;
+                                if wait > 0 {
+                                    stream = Some(Held {
+                                        head: message_start("msg_done", usage)
+                                            + &block_start(0, text_block())
+                                            + &block_delta(0, text_delta("do")),
+                                        gate: sim.hold_stream(wait),
+                                        tail: block_delta(0, text_delta("ne"))
+                                            + &block_stop(0)
+                                            + &message_end(usage, "end_turn"),
+                                    });
+                                }
+                                sse("msg_done", usage, text_block(), text_delta("done"), "end_turn")
                             } else {
                                 let go = sim.go_dir.path().join(&call_id);
                                 let tool_input = input.replace("{go}", go.to_str().unwrap());
@@ -374,22 +505,51 @@ pub async fn spawn(script: Script, tool: &str, input: Value) -> (String, Arc<Mut
                                 if sim.script.release_after == 0 {
                                     sim.release_tool();
                                 }
-                                sse(
-                                    "msg_tool",
-                                    usage,
-                                    json!({"type":"tool_use","id":call_id,"name":tool,"input":{}}),
-                                    json!({"type":"input_json_delta","partial_json":tool_input}),
-                                    "tool_use",
-                                )
+                                sim.stream_wait = None;
+                                let call =
+                                    json!({"type":"tool_use","id":call_id,"name":tool,"input":{}});
+                                let call_input =
+                                    json!({"type":"input_json_delta","partial_json":tool_input});
+                                let streaming = sim.script.stream;
+                                match streaming {
+                                    Streamed::Thinking { pings } if pings > 0 => {
+                                        stream = Some(Held {
+                                            head: message_start("msg_tool", usage)
+                                                + &block_start(0, text_block())
+                                                + &block_delta(0, text_delta("thinking")),
+                                            gate: sim.hold_stream(pings),
+                                            tail: block_stop(0)
+                                                + &block_start(1, call.clone())
+                                                + &block_delta(1, call_input.clone())
+                                                + &block_stop(1)
+                                                + &message_end(usage, "tool_use"),
+                                        });
+                                    }
+                                    Streamed::ToolCall { pings } if pings > 0 => {
+                                        stream = Some(Held {
+                                            head: message_start("msg_tool", usage)
+                                                + &block_start(0, call.clone()),
+                                            gate: sim.hold_stream(pings),
+                                            tail: block_delta(0, call_input.clone())
+                                                + &block_stop(0)
+                                                + &message_end(usage, "tool_use"),
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                                sse("msg_tool", usage, call, call_input, "tool_use")
                             };
                             sim.requests.push(req);
-                            (reply, hold)
+                            (reply, hold, stream)
                         };
                         if let Some(held) = hold {
                             let _ = tokio::time::timeout(Duration::from_secs(600), held.notified())
                                 .await;
                         }
-                        ([("content-type", "text/event-stream")], reply).into_response()
+                        match stream {
+                            Some(stream) => stream.into_response(),
+                            None => ([("content-type", "text/event-stream")], reply).into_response(),
+                        }
                     }
                 },
             ),

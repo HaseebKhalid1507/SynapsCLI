@@ -4,6 +4,1305 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Claude Fable 5.2.** `anthropic/claude-fable-5-2` is in the known-model
+  list, so the model picker shows it and `subagent_model_authorize` can grant
+  it to workers (before, a worker could only get it by inheriting a chat that
+  was already on it). It uses adaptive thinking and the 1M context window like
+  Fable 5.1. Costs are shown at its documented $8 / $40 per million tokens
+  (cache reads 0.025×, $0.20), not Fable 5.1's $10 / $50; Mythos 5.2 the same.
+
+- **`tools.always_loaded`.** Under `progressive_tool_disclosure`, a
+  comma-separated list of tool ids (as `activate_tools` takes them, e.g.
+  `ext.axel:search, builtin:subagent`) that join the session core, so they
+  are loaded from the first request instead of waiting for an activation the
+  model may never make. Only cataloged tools with a verified source join
+  (the activation trust rule); absent ids are skipped, an extension that
+  registers later gets its listed tools loaded at the next request, and a
+  listed tool that disappears is dropped fail-closed. Malformed ids are a
+  config warning. No effect without disclosure. Also in `/settings` (Tool
+  limits).
+
+- **`synaps memory import-archives | import-notes | project`**, the command
+  for moving saved archives and notes into the plain-file stores from
+  somewhere else. The input is JSON Lines (`-` is standard input, anything
+  else must be a regular file and all inputs are opened before a line is
+  imported; blank lines are skipped; a line over 16 MiB and 4 KiB is refused
+  without being read into memory): for archives one archive record per line,
+  the object an archive file holds; for notes a note line or a tombstone line.
+  There is no default destination: exactly one of `--as-recorded` (each line
+  under the project it names), `--cwd DIR` (the project of that folder, as for
+  a chat started there) or `--project-key KEY` is required; `--cwd` is refused
+  while `SYNAPS_PROJECT_ROOT` is set. Every decision about a line is the
+  store's own (`ArchiveStore::import`, `import_line_in`), so a second run of
+  the same input stores nothing and a forget is never undone. Each run prints
+  one JSON document: the inputs with their line counts and SHA-256, the totals
+  `read`, `stored`, `already_present`, `forgotten`, `kept_forgotten`,
+  `refused`, `balanced`, `stopped`, a block for each project and an entry for
+  each line with its id, outcome and, when refused, the name of the check. No
+  field holds content. Exit code 0 when nothing was refused, 1 when something
+  was or when an archive forget may not have reached every copy (those ids are
+  in `forgets_not_complete`), 2 when the run stopped or the command line could
+  not be used; a store that stops at a record is named in `stopped` with the
+  record's id and the project directory. `--dry-run` writes nothing (no
+  directory, no lock file, no mode) and prints what the real run prints. The
+  base (`SYNAPS_BASE_DIR`, or `~/.synaps-cli`) must be an absolute path, and a
+  real run does not create it: an empty `SYNAPS_BASE_DIR` or a base that is
+  not there is exit code 2. A real `import-notes` holds `memory/.import.lock`
+  for the whole run and a second one stops with "another import is running"; a
+  note tombstone that could not be applied is counted and named
+  (`tombstones_not_applied`); under `--as-recorded` its id is looked for in
+  every project's notes file under the base before it is refused, so a note
+  that an earlier command stored is forgotten. `synaps memory project [--cwd
+  DIR]` prints a folder's project key, archive directory and notes file, and
+  whether `SYNAPS_PROJECT_ROOT` is overriding the folder; it creates nothing.
+  The command never reads `memory.backend` and sends no hook. New in the
+  store: `memory::store::project_notes_file`, and `open_lock_file` is public
+  (the import lock is opened with it, never through a link). See "Moving
+  archives between machines or projects" in
+  `docs/extensions/context-archives.md`.
+- **Context archives: `ArchiveStore::import`**, the store side of moving
+  archives into the plain-file store from somewhere else. It takes one
+  archive record (the JSON object an archive file holds) and stores it as
+  it is, under its own id, with its own `created_ms` as the file's time;
+  nothing is recomputed to make a record fit, and the only field an import
+  may change is `scope` (`rehome`). An id is looked up as a fetch looks it
+  up and a digest as a seal does, so the same line a second time changes
+  nothing and says so (`Present`); a tombstone that comes in forgets
+  (`Forgotten`), and a forget that is already here is kept
+  (`KeptForgotten`). A record is refused, with the name of the check and
+  nothing written, when a read of the store would refuse it, when its
+  content does not hash to its digest, when its scope is not the store's,
+  when its id holds other content, or when its content was forgotten here.
+  A dry run writes nothing at all (no file, shelf, lock file or mode) and
+  answers what the real run would. With `ArchiveStore::for_scope` and
+  `existing_scope` (a project directory by its name), `record_scope` and
+  `project_scope`. No format change.
+- **Extensions: `tool.call` carries `caller`**, the run that makes the call:
+  `{"actor", "group", "parent"}`, the run's author (what an extension's
+  forum can record as the poster). A chat and each of its workers is a run
+  of its own (workers share the chat's `group` and name the run that
+  started them as `parent`; a chat has no `parent` key), so an extension
+  can tell them apart. The key is absent when the call has no memory
+  binding behind it and for the host's own memory calls; the host never
+  invents one. The host writes it beside `input`, never from it, so an
+  extension may go by it; its values are not secret, and it names one life
+  of a run (`session_id` is what stays the same for a chat). Additive: an
+  extension that ignores it is unaffected. See `docs/extensions/protocol.md`.
+- **Extensions: the context archive file format is a documented contract.**
+  An extension may read the files under `context-archives/` directly.
+  `docs/extensions/context-archives.md` describes where they are, every field
+  of the version 1 record, what `version` means, what Synaps will not change
+  without a new version, what a reader must tolerate and must not do,
+  tombstones, windows stored as several archives, reduced messages and legacy
+  slot files. It comes with real files as fixtures
+  (`docs/extensions/fixtures/context-archives/`) and a reference reader in
+  Python (`examples/extensions/context_archive_reader.py`). The store's
+  behaviour is unchanged; new tests
+  (`crates/agent-core/tests/context_archive_format.rs`) fail if it would
+  write, or stop reading, something the document does not describe.
+- **Owned daemon sessions.** A client can create a session bound to its
+  connection (`Attach::Create{owned}`; `SocketTransport::create_owned`;
+  `synaps attach --owned`). When the owner disconnects for any reason
+  (clean detach, EOF, socket error, the process killed), the daemon
+  cancels a running turn as `Cancel` does, saves the journal and ends the
+  session (`Ended{owner_gone}` to observers): the in-process lifetime that
+  headless callers abort and time out by. Only the owner drives an owned
+  session (others watch); an owner that lags is disconnected
+  (`Bye{owner_lagged}`) rather than losing frames. Owned sessions never
+  park, idle-end or pin, and never keep the prompt cache warm
+  (`cache_keepwarm_headless` does not apply to them). After `synaps daemon
+  reload` the owner re-binds
+  with a token within `SYNAPS_DAEMON_OWNER_REBIND_SECS` (30 s, counted from
+  when the new daemon accepts connections; never later than
+  `SYNAPS_DAEMON_OWNER_RESTORE_CAP_SECS`, 300 s, plus the grace), else the
+  session ends.
+  Daemons advertise the capability in `Welcome.features`; a client asking an
+  older daemon fails loudly. Opt-in `forward_secrets` (owned only) passes
+  the secret env vars the daemon normally strips to the session's tools
+  (`bash`, `grep`/`find`/`ls`, the interactive shell), in memory only.
+  Plain sessions are unchanged, except for the interactive shell below.
+- **Extensions: every hook event and `tool.call` carries `cwd`**, the
+  working folder of the chat it is for, so an extension can scope what it
+  does by project. Under the daemon one extension process serves every
+  chat, and `cwd` is the chat's folder, not the daemon's. Subagent workers
+  report their parent chat's folder. Always present (`null` only if the
+  path is not valid UTF-8), not canonicalised, additive: an extension that
+  ignores it is unaffected. See `docs/extensions/hooks.md`.
+- **Extensions: `on_context_archived` hook.** When context rollover seals a
+  chat's older messages into an archive file, extensions that subscribe
+  (`privacy.llm_content`) are told the archive's id, the file that holds it,
+  the project, the message counts and the chat's `session_id` and `cwd`, so
+  an extension that indexes history can keep up. It is notify-only: the host
+  never waits for the handler, and a slow, hung, crashed or absent extension
+  cannot delay, fail or change a rollover. The events are sent once the
+  rollover is committed: every archive of the window is on disk and the new
+  window is saved. A rollover that is given up before that announces
+  nothing. Best effort and unordered; one
+  archive can be announced more than once.
+  Additive: existing extensions are unaffected, and an extension that names
+  the hook does not load on an older Synaps. A window sealed as several
+  archives (see "An oversized context window no longer fails rollover"
+  below) sends one event per archive, first part first, with `part`, `parts`,
+  `first_source_index` and `reduced_messages` saying where each belongs; a
+  window that fits one archive is one event with `part` 1 of `parts` 1. See
+  `docs/extensions/hooks.md`.
+- **Extensions: `on_memory_forgotten` hook.** After the `memory_forget` tool
+  has forgotten an archived context window or a note, extensions that
+  subscribe (`session.lifecycle`) are told its id, whether it was an archive
+  or a note, the project and scope, and the calling chat's `session_id` and
+  `cwd`. Ids only, no content. Notify-only like `on_context_archived`: the
+  tool's result and timing never depend on an extension, and a forget that
+  failed is not announced. Not sent for a
+  forget made by a subagent worker or by `synaps retention`; the tombstone
+  on disk is the record.
+
+### Changed
+
+- **Context archives: the store's record check names the check that
+  failed** (version, scope, id, logical, digest, a per-archive limit,
+  `source_index` order, digest of the content, a tombstone with
+  `created_ms`), for the archive import that is built on it. Internal: a
+  read still answers `invalid archive record` for every one of them, and
+  what is read and refused is unchanged.
+- **`synaps retention sweep --max-disk-bytes N` no longer deletes saved notes
+  unless `--include-notes` is given.** When the budget
+  was still exceeded after the derived indexes and the oldest sessions,
+  traces and logs were gone, the sweep evicted notes of every class, oldest
+  first, until none was left, and could then still fail because protected
+  sessions alone were over the budget. One mistyped number deleted every
+  note. Without `--include-notes` the budget now never touches a note: an
+  unmet budget is the error it was, saying no note was deleted, and the
+  notes files are left as they were. With `--include-notes` the budget
+  evicts notes as before. `--include-notes` no longer needs
+  `--max-age-days`; it can be given with `--max-disk-bytes` alone. The
+  `sweep` help says what can delete notes and what cannot.
+  `RetentionError::BudgetUnmet` has a new field, `notes_kept`.
+- **`synaps retention sweep --max-age-days N` no longer deletes saved notes.**
+  An age sweep, run to prune sessions, traces and logs, also deleted every
+  note older than N days, whatever its retention class, although a `standard`
+  note is documented as "kept until explicitly forgotten or swept by disk
+  budget". The age now applies to sessions, traces, logs and tool-output spill
+  only. A note saved with an expiry of its own (`max_age_days`) still expires
+  by that on every sweep, a forgotten note is still removed, and
+  `--max-disk-bytes` evicts notes only with `--include-notes` (entry above).
+  `--include-notes` restores the old behaviour.
+- **The file archive store never refuses a rollover for being full, and never
+  deletes or replaces an archive.** A project could hold 128 context archives
+  (forgotten ones included) and 256 MiB, for good; after that every rollover
+  failed with "archive segment budget exhausted" and the turn ended. New
+  archives now go to numbered shelf directories under
+  `context-archives/<project hash>/` (`s000001/`, `s000002/`, ..., 128
+  archives each, one `<archive id>.json` per archive) with no cap on count or
+  total size. Fetching an archive opens one file instead of reading the whole
+  store. History search returns the newest matches first (it was oldest first)
+  and stops after reading 1,024 archives or 256 MiB; when that leaves older
+  archives unread, `memory_search` with `source=history` says so in one line
+  with the number it did read. Existing `000.json` to `127.json` files keep
+  working where they are, with no migration. The limits on a single archive
+  (16 MiB, 4,096 messages) are unchanged. **Downgrading:** an older Synaps
+  pointed at the same directory sees only the old slot files. Archives sealed
+  by this version stay on disk but it cannot fetch them, and a chat resumed
+  there restarts its window count ("Going back to 0.11.1" in
+  `docs/upgrading/0.12.0.md`).
+- **An oversized context window no longer fails rollover.** A window over what
+  one archive may hold (4,096 messages, 16 MiB, 65,536 visited nodes, or a
+  tool input nested more than about 29 levels deep) failed the seal with
+  "archive commit failed; history retained"; the turn ended, and the same
+  window failed again on every later attempt, so the chat could never roll
+  over. Such a window is now sealed as several consecutive archives. The first
+  message of the new window lists every part in order with the range of the
+  old window it covers and the number of messages stored, for example
+  `ctx-<id> (source messages #0-#2499, 2431 archived), ctx-<id> (#2500-#4999,
+  2402 archived)`, and `memory_fetch` works on each part by its id; inside a
+  part `source_index` starts again at 0, and the message says how to find
+  source message `#i` there. A single message that is too large for one
+  archive by itself is stored with its oversized payloads left out, each
+  marked in place, and the new window says so: the one case where an archive
+  is not exact. Up to 32 parts are listed by id (the newest), and fewer when
+  naming them all would put the new window over the request budget; the other
+  ones are counted with their range and found with `memory_search`. A list of
+  parts that is not the whole window, in order, fails the rollover with the
+  history kept. If sealing stops between two parts the rollover fails with the
+  history kept, as before, and the next attempt does not write again a part
+  whose content is already on disk. A window that fits one archive is
+  unchanged: the same archive, the same message, the same saved session. The
+  limits on one archive are unchanged. See
+  `docs/specs/context-continuation.md`.
+- **A rollover waits for a busy archive store instead of failing, and reading
+  history takes no lock.** A rollover whose
+  project archive was locked by another Synaps process failed at once with
+  "archive busy". Saving an archive and `memory_forget` now wait up to 5
+  seconds for the other process and only then report "archive busy" (history
+  is kept, as before). `memory_fetch` and `memory_search` with
+  `source=history` no longer take the lock for archives in shelf directories:
+  they are never busy, never wait behind a save, and change nothing on disk.
+  A fetch that overlaps a `memory_forget` of the same archive returns the
+  whole archive or "not found". Old `000.json` to `127.json` files are still
+  read under the lock, with the same wait.
+- **Daemon sessions: the interactive shell (`shell_start`) starts from the
+  session's env**, like `bash`, instead of the daemon's own. It no longer
+  sees the env the daemon inherited, nor the secrets the daemon strips from
+  a client's env; it says which secrets the session lacks, as `bash` does
+  when a failed command references one. As with `bash`, a pinned session
+  created over SSH keeps that login's `SSH_AUTH_SOCK`, which is dead once
+  you log out.
+- **`synaps daemon close` without `--attached`** is now decided by the
+  session itself, together with the close: a client that attaches between
+  the daemon's check and the close is no longer closed under.
+
+- **`grep` runs ripgrep's engine in-process, and understands `a|b`.** It ran
+  GNU grep in basic regex mode, where `a|b`, `+`, `?`, `{n}` and `( )` are
+  literal characters, and it ignored grep's exit status and stderr, so an
+  error also read "No matches found.". In local session history 336 of 448
+  grep tool calls (75%) returned "No matches found."; replaying the 256 of
+  those whose paths still exist with Rust regex finds matches in 228 (89%),
+  mostly `|` alternations. The tool no longer spawns `grep`: it walks and
+  searches with ripgrep's crates (`ignore`, `grep-regex`, `grep-searcher`),
+  so it behaves the same on Linux, macOS and Windows (no Git for Windows
+  needed for grep) and works in the hardened `--no-default-features` build.
+  The output format (`path:line:text`, `path-line-text` context, `--`
+  separators) is unchanged. Behaviour changes:
+  - **Regex dialect is Rust regex** (ripgrep's): `a|b`, `+`, `?`, `{n}`,
+    `\d`, `\b`, `(?i)` work as written; `\|` is a literal pipe; no
+    lookaround or backreferences. Escape `(` `[` `{` to match them
+    literally: `fn main() {`, which used to match, is now an invalid
+    pattern (write `fn main\(\) \{`). An invalid pattern is a tool error
+    with the parse error and a hint, and a missing path is a tool error,
+    instead of "No matches found.".
+  - **`.gitignore` is respected** (in a git repo), with `.ignore`,
+    `.git/info/exclude` and the global git excludes, as ripgrep does.
+    `node_modules` and `target` stay skipped everywhere. The new
+    `no_ignore: true` parameter searches all of them. `.git`, `.svn`, `.hg`,
+    `.bzr`, `.jj` and `.sl` are never searched.
+  - **Hidden files are searched** (`.github/`, `.env.example`, …).
+  - **Binary files are skipped**; the ones that match are listed in a note
+    instead of GNU's "Binary file … matches" lines (or nothing at all, as
+    GNU grep 3.5+ wrote those to stderr). Unreadable files are counted in a
+    note with the first error, beside the matches, instead of vanishing.
+  - Results are sorted by path. Lines over 500 characters are cut. A search
+    that hits the 15 s deadline (or is cancelled) returns what it found with
+    a note, instead of an error and nothing, and stops instead of running
+    on. Output stops at the 256 KiB tool buffer, on a whole line and with
+    the same truncation footer, instead of being read in full and cut
+    after. Links inside the tree are not followed, and FIFOs and devices
+    are never read.
+  - The `grep` schema gained `no_ignore` and a new description, so the
+    first request after upgrading rewrites the prompt cache once.
+- **`find` runs on the same in-process walker, and respects `.gitignore`.**
+  It ran GNU `find`, which on Windows needed Git for Windows and in the
+  hardened `--no-default-features` build still spawned a process. Its
+  `-not -path` filters hid the contents of `node_modules`, `.git` and
+  `target` only after walking every entry, so a big `node_modules` was
+  walked in full on every call, and a project whose own path ran through a
+  directory of one of those names (say `~/target/app`) found nothing. It now
+  walks with grep's walker (`ignore` and `globset`, no process), so it
+  behaves the same on Linux, macOS and Windows (no Git for Windows needed
+  for find) and works in the hardened build. The output is unchanged: one
+  path per line, as `find PATH` printed it. Behaviour changes:
+  - **`.gitignore` is respected** (in a git repo), with `.ignore`,
+    `.git/info/exclude` and the global git excludes, as grep does.
+    `node_modules` and `target` are pruned everywhere: not walked and no
+    longer listed themselves. The new `no_ignore: true` parameter lists all
+    of them. `.git`, `.svn`, `.hg`, `.bzr`, `.jj` and `.sl` are never listed
+    or entered; an explicit `path` is always walked. Hidden files are still
+    listed.
+  - Results are sorted (by name, a directory before its entries). Output
+    stops at the 256 KiB tool buffer, on a whole path and with grep's
+    truncation footer. A find that hits the 10 s deadline (or is cancelled)
+    returns what it found with a note, instead of an error and nothing, and
+    stops.
+  - A missing path is an error instead of "No files found.", and errors
+    such as an unreadable directory are reported in a note beside the
+    results. A `pattern` with a `/` (which never matched a name) is an
+    error pointing at `path`; an invalid glob is an error with the parse
+    error.
+  - The `find` schema gained `no_ignore` and a new description; it ships
+    with grep's schema change, so the prompt cache is rewritten once for
+    both.
+  - When `grep` or `find` under a directory finds nothing and ignore rules
+    applied, the result adds one line: ignored files and `node_modules`/
+    `target` weren't searched, and `no_ignore: true` includes them. A
+    gitignored `.env` used to be found by GNU grep and find; without the
+    note, the empty result reads as "it doesn't exist".
+
+### Removed
+
+- **The plugin sidecar system.** Plugins run their own process one way
+  now: as an extension. The second mechanism, built for voice dictation
+  and used only by `local-voice`, is deleted with no replacement: the
+  `provides.sidecar` manifest block (`PluginProvides`, `SidecarManifest`,
+  `SidecarLifecycle`, `SidecarModel`), the engine `sidecar` module, the
+  `sidecar.spawn_args` extension call, the `provides.sidecar.setup`
+  build-script fallback, `/sidecar`, the plugin-claimed `/<word>
+  toggle|status` routing, the header pill, the Settings → Sidecar page and
+  injected "Toggle key" rows, the toggle-key migration and the F8 key core
+  always bound. A `plugin.json` that still has `provides.sidecar` loads
+  with its extension, commands, keybinds and settings, the block ignored
+  with one log line; `/voice toggle|status` go to the plugin's own command;
+  `sidecar_toggle_key` loads, is ignored and warns once; a theme's
+  `sidecar.pill` is ignored. `/sidecar` is an unknown command. The trust
+  summary's "runs setup script on install" now reflects `extension.setup`.
+  See `docs/upgrading/0.12.0.md`.
+
+- **The eight `shell.*` config keys.** `shell.max_sessions`,
+  `shell.idle_timeout`, `shell.readiness_timeout_ms`,
+  `shell.max_readiness_timeout_ms`, `shell.default_rows`,
+  `shell.default_cols`, `shell.readiness_strategy` and `shell.max_output`
+  were parsed but never read: interactive shells always ran with the
+  built-in limits, and still do. They are no longer parsed or validated,
+  and `SynapsConfig::shell` is gone (`ShellConfig` moved to
+  `tools::shell::config`). A config that still sets them loads, ignores
+  them and shows one warning per start naming the keys it sets:
+  `shell.max_sessions, … no longer do anything (removed in 0.12.0; they
+  were never read): delete these lines`.
+
+- **The lexical memory index and the `memory-index` retention domain.**
+  `memory::index` (the staged segment index under `<base>/memory/index/`,
+  T33) is deleted with its tests and benchmark: nothing outside its tests
+  ever built or searched it. Retention loses the domain that held it:
+  `synaps retention inspect` has no `memory_index` entry in `domains` (and
+  `total_bytes` no longer counts `<base>/memory/index/`), `synaps retention
+  forget memory-index <id>` is refused as an unknown domain, and a sweep no
+  longer deletes index directories (rewriting a note file, or as the first
+  stage of a disk budget). The session metadata index
+  (`<base>/sessions/index.jsonl`) is a different thing and is unchanged.
+
+- **`Runtime::run_single` and the non-streaming turn call.** The
+  non-streaming single-prompt loop (`Runtime::run_single`) and the
+  `ApiMethods::call_api` request it made are deleted, with the tool-result
+  helpers only that loop used. Nothing in Synaps called them: every turn
+  streams. An embedder that called `run_single` should use `run_stream`.
+  Compaction's non-streaming call (`call_api_simple`) is unchanged.
+
+- **The inline `synaps chat` loop.** The pre-actor chat loop behind the
+  `legacy_inline` Cargo feature and `SYNAPS_CHAT_INLINE=1` is deleted, with
+  the feature itself and the engine stream adapter only it used
+  (`engine::stream::process_stream_event`, `EngineStreamEvent`,
+  `StreamCompletion`, `SubagentTracker`; `repair_history_after_failure`
+  stays) and `engine::reactor::AUTO_TURN_CAP_CONFIG_KEY`. `synaps chat` runs
+  on the session actor exactly as before. A build that passes
+  `--features legacy_inline` now fails: drop the flag.
+
+- **The frozen reference reactor and its differential tests.**
+  `tests/support/reference_reactor{,_ext}.rs`,
+  `tests/session_actor_differential.rs`, `tests/tui_transport_differential.rs`
+  and `scripts/tui-e2e/differential.sh` compared the actor and the TUI with
+  copies of the pre-actor code; their scenarios are now asserted directly
+  (six new actor tests in `tests/session_actor_scenarios.rs`, the rest by
+  existing actor and TUI harness tests).
+
+- **The Axel memory helper's source and its CI jobs.**
+  `sidecars/axel-memory-service` (the `synaps-axel-memory-service` process the
+  memory backend started, with its copy of the forum contract) is deleted,
+  with the CI jobs `sidecar` and `sidecar-macos-check` that built and checked
+  it. Nothing in Synaps starts it any more (the backend switch is removed,
+  below). An installed copy keeps working for whatever still calls it, but
+  nothing here builds a new one. Upgrading from a `memory.backend = axel` setup is
+  described in `docs/upgrading/0.12.0.md` (new).
+- **Repository identity.** The opt-in Git repository identity (a random key
+  kept in `synaps-memory-identity.json` in Git's common directory, shared by
+  every worktree of a repository) is gone with the backend it served:
+  `RepositoryIdentity`, `ProjectScope::discover_repository` and the public
+  `ProjectScope::user_scope` and `from_key` constructors. Nothing in Synaps
+  read it any more. Notes and archives keep their `project-<key>` files and
+  folders, keyed by the chat's folder exactly as before; a marker file left
+  in a repository is ignored.
+
+- **The memory backend switch.** Notes and context archives are plain files
+  under the base directory, always; there is no backend to select and no
+  helper process. `memory.backend`, `memory.user_scope`,
+  `memory.axel.executable` and `memory.axel.brain` are removed keys: a config
+  that still has them loads and starts as before (daemon, TUI and every
+  `synaps` subcommand), nothing about them is validated, and nothing can fail
+  because of them. `memory.backend = axel`, or any of the other three with any
+  value, gets one warning per start: `The Axel memory backend (memory.backend
+  = axel, memory.user_scope, memory.axel.*) is no longer supported: since
+  0.12.0 Synaps keeps context archives and notes in plain files under its base
+  directory, always, and Axel is an extension. This session uses plain files.
+  Archives and notes saved to the Axel brain are not read any more: move them
+  once with "axel synaps-export" (Axel v2) and "synaps memory import-archives"
+  / "import-notes", install the Axel extension for recall and the forum, then
+  remove the memory.backend, memory.user_scope and memory.axel.* lines. See
+  https://github.com/HaseebKhalid1507/SynapsCLI/blob/dev/docs/upgrading/0.12.0.md`.
+  A `memory.backend` line with any other value, alone, gets `memory.backend is
+  ignored: plain files are the only memory storage since 0.12.0. Remove this
+  line`. `/settings` loses the four rows and its Memory page, and refuses to
+  write one of these keys. What can no longer happen: a turn refused with
+  "selected memory backend unavailable", `/context auto` refused for the
+  backend, a chat that will not continue because the Axel service could not
+  verify its archive. A resumed chat whose archive is not in its folder's
+  store goes on at window 1, and `/context status` says so: `archive ctx-<id>,
+  which this chat continues from, is not in this folder's archive store, so
+  earlier windows cannot be fetched. If you opened the chat from another
+  folder than before, open it from that one.` A chat whose folder has no
+  project gets `archive ctx-<id>, which this chat continues from, cannot be
+  looked up: this chat's folder has no project, so earlier windows cannot be
+  fetched.` instead. `memory_search`, `memory_fetch`, `memory_store` and
+  `memory_forget` have no `scope` parameter any more (`docs/tools.json`).
+  `scope: "repository"` is still accepted and ignored; any other value is
+  refused with `memory: user-wide notes are not available; omit scope`.
+  `project` is unchanged. **User-wide notes (`scope=user`) have no home in
+  Synaps now**; the ones in an Axel brain stay there. `on_memory_forgotten`
+  always has `scope: "repository"`. The guard that refused extension and MCP
+  tools named like the memory tools (`memory_search`, `memory:search`, ...)
+  under the Axel backend is gone: such a tool runs like any other. The
+  extension protocol's `memory.append` and `memory.query` are never refused
+  for the backend, and a plugin named `axel-memory-manager` loads like any
+  other. `synaps retention inspect | sweep | export | forget` act on the plain
+  files only: the `history` domain of `forget` and the Axel reports
+  (`"backend": "axel"`, `axel-memory-index.json`) are gone. Code:
+  `memory_backend::{process, provisioning, competing}`, the `Backend` enum and
+  the RPC half of `MemoryBinding` (now the base directory, the project and the
+  run's author; `forum_author()` is `author()`, `fork_for_worker()` is
+  `for_worker()`), `MemoryBackendKind`, `MemoryBackendConfig`,
+  `context_archive::project_archive`, `Runtime::apply_memory_backend_config`
+  (now `bind_memory()`), `ExtensionManager::bind_memory_backend`.
+  `docs/reviews/context-resume-axel-boundary.md` is removed.
+- **The built-in project forum.** The tools `forum_post`, `forum_read` and
+  `forum_forget` are gone from the registry, from workers and from
+  `docs/tools.json` (26 built-in tools now), with the code behind them
+  (`tools::forum`, `memory_backend::forum`, `agent_core::memory::forum`) and
+  the forum paragraph core appended to every worker's system prompt under
+  `memory.backend = axel`. The Axel extension serves the forum as
+  `axel_forum_post`, `axel_forum_read` and `axel_forum_forget` (tool ids
+  `ext.axel:forum_post`, …); forum posts in an Axel brain are not exported
+  and stay in the brain. Tell workers
+  about it in `<base>/subagent-preamble.md`, which is still prepended to
+  every worker prompt. A run's author stays: it is
+  `agent_core::memory::author::Author`, and `tool.call` still sends it to
+  extensions as `caller`. `docs/agent-forum.md`, `docs/specs/agent-forum.md` and
+  `docs/reviews/forum-*.md` are removed.
+- **The files-to-Axel migration.** `synaps retention memory-scope`, `synaps
+  retention upgrade-memory` and `synaps retention migrate-memory` are gone,
+  with the code behind them (`memory_backend::migration`,
+  `memory_backend::repository_migration`) and the archive store's migration
+  export (`ArchiveStore::export_records`, `context_archive::export_in`,
+  `MAX_STORE_BYTES`). Typing one of them is now clap's `error: unrecognized
+  subcommand '<name>'`, exit code 2. The way to move archives and notes into
+  the plain-file stores is `synaps memory import-archives | import-notes`.
+  `synaps retention inspect | sweep | export | forget` are unchanged on plain
+  files. The specs `docs/specs/memory-migration.md`,
+  `shared-axel-repositories.md` and `axel-host-backend.md` are removed.
+- **The automatic-memory config keys and extension context providers.**
+  The eleven keys `memory.default_mode`, `memory.default_mode_confirmed`,
+  `memory.recall_max_records`, `memory.recall_max_tokens`,
+  `memory.recall_timeout_ms`, `memory.capture_tools`,
+  `memory.capture_assistant`, `memory.capture_user`,
+  `memory.auto_consolidate`, `memory.local_embeddings` and `memory.gliner`
+  are removed keys now. A config that has any of them, with any value,
+  starts as before and gets one warning per start: `memory.default_mode,
+  memory.recall_* and memory.capture_* (and memory.auto_consolidate,
+  memory.local_embeddings, memory.gliner) are ignored: built-in automatic
+  memory was removed in 0.12.0; an extension provides capture and recall
+  through hooks. Remove these lines`. The old warning that asked for
+  `memory.default_mode_confirmed = true` is gone, and `/settings` refuses
+  to write one of these keys.
+  An extension manifest that declares `deferred.context_providers` or asks
+  for the permission `context_providers.register` loads as its other parts
+  say, and its tools and hooks work; the declaration is not validated,
+  grants nothing and no longer decides when the extension starts. A
+  manifest that declared only a context provider used to wait for
+  `/memory on`, which no longer exists, so it never started; it now starts
+  at load like a manifest with an empty `deferred` block, and, like one,
+  fails to load if its command does not start (the other extensions still
+  load). Loading it logs `extension <id> declares a context provider;
+  built-in automatic memory was removed in 0.12.0, the declaration is
+  ignored`. The host's context-provider catalog
+  (`extensions/context_provider.rs`) and the continuous-memory review
+  documents under `docs/reviews/` and `docs/decisions/` are deleted.
+  `/memory` now answers `/memory was removed in 0.12.0: automatic memory is
+  not built into Synaps any more; an extension provides it (Axel). Synaps
+  itself captures nothing automatically.`
+- **Built-in automatic memory (capture and recall) is out of the engine.** The
+  runtime no longer holds a memory lease, asks a context provider for recalled
+  text before a turn, or sends a finished turn or a compaction summary to a
+  capture provider; the history-import preview went with them
+  (`runtime/memory_context.rs`, `memory_history.rs`, `chat_capture.rs`,
+  `capture_worker.rs`, `axel_context.rs`). Nothing could switch this on since
+  `/memory` and the `memory_context` tool were removed, so a turn behaves as
+  before. An extension does this work now, on the hook bus: no hook kind, hook
+  event field or protocol method changed. Unchanged too: context rollover, the
+  archive store and the four memory tools. The context budget's memory lane is
+  always empty.
+- **The per-session memory mode.** A session no longer records a memory
+  choice (`SessionConfig::memory_mode`), a rebuilt runtime (unpark, daemon
+  reload) no longer restores one, and no session runtime applies
+  `memory.default_mode` any more: built-in automatic memory stays off. A
+  saved reload record or a create request that still carries `memory_mode`
+  loads as before; the value is read and ignored.
+- **The `memory_context` tool, `/memory` and the "Default memory mode"
+  settings row.** Built-in automatic memory (capture and recall) has left
+  core for an extension, and these were its outermost users; it was off
+  unless switched on by hand. The model no longer has a `memory_context`
+  tool. `/memory`, with any
+  argument, now answers one line: `/memory was removed in 0.12.0: automatic
+  memory is not built into Synaps any more; an extension provides it (Axel).
+  Synaps itself captures nothing automatically.` `/settings` has no
+  `memory.default_mode`
+  row.
+
+- **Breaking: `synaps agent` and `synaps watcher` are gone.** The watcher
+  supervisor and the headless agents it started (`~/.synaps-cli/watcher/<name>/`
+  with `config.toml`, `soul.md`, `handoff.json`; `manual`/`always`/`watch`
+  triggers, `wake_if`, per-agent limits, the `watcher_exit` tool, heartbeat
+  mirroring to the bridge) are removed. Run long-lived headless work as a
+  pinned daemon session instead: `synaps daemon` runs the sessions,
+  `synaps --attach --keep-warm` (or `synaps daemon pin <ID|NAME>`) pins one
+  so it is never parked and survives a daemon restart, `turn_budget.*`
+  bounds each turn, and `synaps send --session <name>` starts event turns
+  in it (see `docs/daemon-mode.md`, *Pinning a session*). The watcher's
+  limits map to `turn_budget.event.max_tool_calls`,
+  `turn_budget.event.max_elapsed_secs` (per turn) and, for spend, the
+  session's `max_session_cost`: a hard USD ceiling checked after every
+  usage event that cancels the turn when crossed. It is set in the session
+  config a daemon client sends on create; no CLI flag or config key sets
+  it yet. `turn_budget.event.max_cost_usd` caps one turn. There is no
+  equivalent of `max_daily_cost_usd`, `max_session_tokens` or the
+  per-agent memory/CPU/nice limits. For this release both commands are
+  hidden stubs: with any arguments they print one line to stderr
+  ("`synaps agent` was removed in 0.12.0: pin a daemon session (synaps
+  --attach --keep-warm, or synaps daemon pin) and drive it with synaps
+  send --session <name>. See <docs/daemon-mode.md link>") and exit 2, on
+  every platform. The release after this one removes the stubs. Nothing
+  under `~/.synaps-cli/watcher/` is read or deleted; remove it by hand.
+- **Watcher-only config keys are ignored.** `turn_budget.autonomous.*`
+  (read only by `synaps agent`) and `bridge.uds_path`,
+  `bridge.heartbeat_mirror`, `bridge.heartbeat_timeout_ms` (watcher
+  heartbeat mirroring) no longer do anything. A config that sets them
+  still loads, with one startup warning per group saying to remove the
+  lines; their `/settings` rows are gone. Turns started by events keep
+  their own `turn_budget.event.*` keys, with the same defaults the
+  autonomous role had (24 rounds, no renewals, 96 tool calls, 8 MiB of
+  tool results).
+- **Engine API: watcher-only surface removed.** `TurnBudget::max_total_tokens`
+  (only the watcher set it) is gone; `BudgetDimension::TotalTokens` stays,
+  reserved, because its label and capture tag are on the wire. The inbox
+  filter (`events::InboxFilter`, `accept_all`, `watch_inbox_filtered`) is
+  gone and `watch_inbox_gated` no longer takes a filter: every consumer
+  took every file. Also gone: `TurnRole::Autonomous`, `BridgeConfig`, the
+  `watcher_exit` tool and `ToolContext`/`Runtime` `watcher_exit_path`.
+- **Breaking: `synaps server` (the WebSocket API server) is gone.** It ran
+  its own copy of the engine loop on one session, outside the daemon. The
+  session daemon is the API now: `synaps daemon`, a line-JSON protocol on a
+  local socket ("Protocol summary" in
+  [docs/daemon-mode.md](docs/daemon-mode.md)), shared by every client of a
+  session. For a browser UI, use
+  [synaps-dash](https://github.com/HaseebKhalid1507/synaps-dash), a plain
+  extension that serves the browser over HTTP/WebSocket and attaches to the
+  daemon as an ordinary client. `synaps rpc` is unchanged. For this release
+  `synaps server` is a hidden stub, like `synaps agent`: with any arguments
+  it prints one line to stderr pointing at the daemon protocol doc and
+  synaps-dash, and exits 2; it is not in `--help` or shell completions.
+- **The `server.token`, `server.allowed_origins` and
+  `server.max_message_size` config keys are ignored.** A config that still
+  sets them loads, with one startup warning saying to remove the lines (it
+  names the keys, never their values). `server.auto_approve_confirms` keeps
+  its meaning: it still approves every extension confirm in every mode. The
+  token file the old server wrote, `~/.synaps-cli/server-token` (or
+  `~/.synaps-cli/<profile>/server-token` under `--profile`), is no longer
+  read or written; delete it.
+- **Engine API: `agent_core::protocol` removed.** The server's WebSocket
+  wire types (`ClientMessage`, `ServerMessage`, `HistoryEntry`) had no other
+  user. The daemon protocol (`session::wire`, and `ClientKind::Server`,
+  which synaps-dash attaches as) is unchanged.
+
+- **Engine API: an extension tool call says who it is for.**
+  `ExtensionHandler::call_tool`, `ExtensionRuntimeManager::call_exact` and
+  `ExtensionLeaseCapability::call_exact` are gone. They sent `session_id:
+  null` and the process folder, which under the daemon is the daemon's, and
+  nothing in the engine called them. Use `call_tool_for` (now the trait's
+  only tool-call method; its default serves no tools) and `call_exact_for`,
+  which take the conversation id and the folder. A call that belongs to no
+  chat is spelled `call_tool_no_chat` / `call_exact_no_chat`; both exist for
+  tests only (the `testing` feature). Also changed for the same reason:
+  `skills::commands::execute_plugin_command_with_tools` takes the chat it
+  is run for (`skills::commands::CommandChat`: id, folder, memory binding
+  and environment; a runtime's own is `Runtime::command_chat()`),
+  `skills::commands::execute_plugin_command` takes the environment to
+  spawn with, `runtime::continuation::restore_window` takes the memory
+  binding, and `runtime::continuation::archive_store` is gone.
+
+### Fixed
+
+- **Extensions: the `on_message_complete` pages say what `has_tool_use: false`
+  means.** It marks an assistant message that asked for no tools, not the end
+  of a turn: steering or the Muse nudge can continue a turn after one, and a
+  turn that stops after a tool round (a cancel, a turn budget, an error) ends
+  on an event with `has_tool_use: true`. `protocol.md` also says an empty
+  reply is not added to history. Documentation only.
+- **`on_message_complete` fires for a reply that crosses a usage budget, and
+  for a rejected `context_checkpoint` batch.** Both replies are kept in
+  history, but the turn stopped (`max_cost_usd`, `max_context_tokens`) or
+  asked the model again without the event, so an extension never saw that
+  message end, text included. Each now gets exactly one event;
+  `has_tool_use` says whether the message asked for tools (always `true`
+  for the rejected batch). Nothing else about either path changes.
+- **Context archives: a lookup that stops at a bad file names it.** When
+  the newest file under an archive id is not a valid record and no older
+  shelf has one, a fetch, a forget or an import now says `the newest file
+  under this id is not its record: <shelf>/<id>.json: <error>` instead of
+  the bare `invalid archive record`, so a stopped `synaps memory
+  import-archives` names the file as well as the id and the project
+  directory.
+- **Extensions: the context archive format page says where a linked base
+  works, and what an import changes.** A base that is a symbolic link works
+  for the archive store only; the session journal and drafts still refuse
+  it. An imported archive keeps its id and
+  its `created_ms`, so the same content can be under two ids (each fetched
+  by itself, both forgotten together), and a shelf is in the order of
+  writing, not of `created_ms`. Also: which unread files a forget passes
+  over, and that a lock file with a second name keeps its mode.
+- **Context archives: a lock file with a second name keeps its mode, and
+  `memory_forget` says what to do about a file it could not use.** A lock
+  file open to group or others was closed to them even when it had a
+  second name (a hard-link backup), which changed the backup's file too;
+  such a file is now used as it is. And when a forget is "NOT COMPLETE",
+  the tool said to call it again "once it can be read", which never comes
+  true for a file that is not a valid record. It now names the project
+  folder the file is in and says to remove or repair the file first.
+- **Context archives: a base that links to a folder that is away is an
+  error, not a project with no archives.** With the Synaps folder a link to
+  a disk that was not mounted, a search answered nothing, a fetch "not
+  found" and a resume "has no archive store", as for a project that never
+  saved anything. Reading now fails with `the archive base is a link to a
+  folder that is not there`. A base that does not exist is still no store.
+- **Context archives: an import that finds its record already stored
+  confirms it on disk.** A run cut by a power loss after a file was renamed
+  into place and before its directory was synced left a record the next
+  run answered "present" for, without the sync a forget does in the same
+  case. A real run now syncs the shelf (or the project directory, for a
+  legacy slot) before it answers that a record or its tombstone is already
+  there. A dry run still touches nothing.
+- **Context archives: an import refuses a `created_ms` that has not come,
+  and dates the file after it has its name.** A record dated more than a
+  day after this machine's clock is refused (`created_ms is more than a day
+  after this machine's clock`): its file would have been the newest on its
+  shelf in every search, for good. And the record's old time was put on the
+  temporary file before the rename, where a sweep of stale temporary files
+  by another writer could take it for a leftover. It is now set on the file
+  once it is under its id, and synced. A write stopped between the two
+  leaves the whole record with the time of the write.
+- **Context archives: forget is not "complete" over a copy it failed to
+  read.** When a forget read the other archive files of a project for the
+  window's digest, any file it could not read was passed over in silence.
+  That is right for a file the store never reads (a link, a FIFO, a file
+  closed to its owner, one too large to be an archive). A read that failed
+  for a passing reason (an I/O error, no descriptor or memory left) said
+  nothing about the file, which could be a live copy. Such a file now
+  counts as not reached: the forget answers "not complete" and names it.
+- **Context archives: an imported tombstone is refused while its content is
+  live under any other id.** A tombstone line whose own id held nothing was
+  checked only where a save looks for its content (the two ids cut from the
+  digest, and the legacy slots). The same content, live under another
+  imported id, was not seen: the tombstone was stored and that copy was
+  still fetched and searched. The import now reads every archive file of
+  the project for the digest, as a forget does, and refuses the line with
+  the id of the live copy; a dry run answers the same. If a file that may
+  hold such a copy cannot be read, the import stops instead of guessing.
+- **A turn that ends on an empty reply after tool calls now fires
+  `on_message_complete`.** When the model had nothing to add after its tool
+  results, the turn was marked complete without the event, so an extension
+  that waits for `has_tool_use: false` to act "when the turn is done" never
+  saw that turn end. It now gets one event with `message: ""`,
+  `content_block_count: 0` and `has_tool_use: false`, built by the same code
+  as every other one. A normal turn still gets exactly one such event.
+- **Context archives: a forgotten archive stays forgotten whatever id it is
+  stored under.** An archive brought in by `ArchiveStore::import` keeps the
+  id it had, which is not one of the two ids a seal derives from the
+  digest. Forgetting such an archive already left a tombstone under the
+  digest's own id, so the same window is not sealed again (now tested for
+  it); an imported tombstone is now written with that tombstone first, by
+  the same step; and a forget now reads every archive file on the shelves
+  for its digest, so forgetting the copy a chat sealed also forgets a copy
+  of the same content under an imported id (it used to stay readable, and
+  the forget said it was complete). A file under another id that names the
+  content and is not a valid record makes the forget "not complete". The
+  format page says so in "Tombstones". A forget is slower by one read of
+  each archive file in the project.
+- **Context archives: nothing is written that a read would refuse.** The
+  store checked a projection it was handed for its digest and its chat, and
+  not for what a read also checks: a note over 8,192 bytes, more than 4,096
+  messages, a `source_index` that does not rise or is not below the count.
+  Such a record was written, answered `Ok`, and was from then on an invalid
+  file under a name taken for good. Now the bytes about to be written go
+  through the reader's own check first; a record that would not be read
+  back is refused with the name of the check and nothing is written. A seal
+  of a chat's messages never produced such a record and is unchanged.
+- **A resumed head's marker is read by one rule; a log line no longer names
+  the wrong host.** Two small things:
+  - A resumed chat's context head with `window` 0 in its marker was taken,
+    archive link and all. It is refused now: the chat goes on at window 1
+    without the link, and a warning says so. And "has the form of an
+    archive id" is one function on the three paths that read such a marker:
+    32 lowercase hex characters, which is what the store writes. Two of the
+    paths took capitals too; a marker naming an id in capitals is now
+    invalid there.
+  - The two warnings about a chat's folder that is gone or cannot be looked
+    at began "daemon:", and an unpark in a host that is not the daemon
+    writes them too. They no longer name a host.
+- **Extensions: `caller` is tested on the three paths that had no test.**
+  A `tool.call` made from the deferred-tool lane, from a tool-backed
+  `/plugin:command` and from the tool loop of a model an extension provides
+  carried `caller`, but nothing checked it: a dropped argument on any of
+  them would have passed every test. Each now has a test that the
+  extension is told the calling chat's own author, the same on a later
+  call, and a different one for a second chat
+  (`tests/extension_lease_lifecycle.rs`,
+  `tests/session_actor_plugin_command_caller.rs`,
+  `runtime/openai/extension_route.rs`). Tests only.
+- **Extensions: the contract says what `caller` can be relied on for.**
+  `docs/extensions/protocol.md` and `contract.json` told extension authors
+  "Do not grant access because a call carries a given `caller`". That was
+  wrong: the host writes `caller` beside `input` and never from it, a model
+  cannot set it, and no run is given another's, so it is exactly what an
+  extension can go by. The pages now say that, and what is true instead:
+  the values are not secret (models read them in forum posts), so an
+  extension must never accept an author from tool input; a call with no
+  `caller` (the host's own calls, an older host) must get no access that
+  depends on who is calling; and `caller` identifies one life of a run.
+  After a park and wake, a daemon reload or restart, or `--continue`, the
+  same chat has a new `actor` and `group`; `session_id` is what stays the
+  same for a chat, and a worker's call has none, so `group` ties a worker
+  to its chat only within one life. No code changed; a new test in
+  `tests/extensions_contract.rs` holds the two pages to these statements.
+- **A directory that cannot be opened for its sync is logged.** A save into
+  a directory that may be written but not opened for reading (mode `0300`,
+  for example) succeeds without the directory being synced, for notes and
+  for every private file. That was silent. Each such save now logs one
+  warning with the directory and the error: after a power cut the name of a
+  file newly created there may be missing. Nothing else changes: the save
+  still answers as it did.
+- **`synaps retention sweep --max-disk-bytes`: a budget that cannot be met
+  deletes nothing.** A budget smaller than what the
+  sweep may not delete (the sessions named chains point at, and saved notes
+  when `--include-notes` is not given) can never be met. The sweep still
+  deleted every other session, trace and log, oldest first, and only then
+  answered "disk budget unmet". It now adds up what it may not delete
+  before its first deletion and, when the budget is below that, stops
+  there: no file is removed or rewritten (an age given with the same
+  command is not applied either), and the error says how many bytes are
+  protected. A budget that can be met is met as before.
+- **Extensions: the context archive format page says what the store does.**
+  `docs/extensions/context-archives.md` was wrong or silent in several
+  places. It now states: a shelf is `s` and exactly six digits (`s000001` to
+  `s999999` are written; no name with seven digits is a shelf), and the
+  reference reader (`examples/extensions/context_archive_reader.py`) accepts
+  exactly those; which shelf a new archive goes to, and what happens to a
+  shelf name that is a file or a link; that content is not stored again
+  only where the first copy can be seen, and that an id can be on two
+  shelves; that a new id is the first or the last 32 characters of the
+  digest; the names of the temporary files and when they are removed; that
+  a file under a window's name that is not a valid record makes a forget
+  "NOT COMPLETE" and is passed over by a seal and a lookup; the rules of
+  the `lock` file; and that the base directory may be reached through a
+  link while nothing below it may be one.
+- **Context archives: a base directory reached through a link works.** The
+  store refused any link on the way to its base, so with `~/.synaps-cli`
+  (or a directory above it) a link to another disk, no context could be
+  saved, read or forgotten. It also opened every directory from `/` down
+  for reading, so a parent that can be passed through but not listed
+  refused it too. The base path is now resolved once, when the store is
+  opened, and the store lives in the real directory; a parent of an
+  existing base need not be listable. Below the base nothing changed:
+  `context-archives`, a project directory, a shelf or a file that is a link
+  is still refused and never followed.
+- **Context archives: a lock file with a second name, or read-only, no
+  longer refuses every save.** The store wanted `lock` in a project's
+  archive directory to have exactly one link and opened it read-write. A
+  backup made with hard links (`cp -al`, rsync `--link-dest`) gives it a
+  second name and a restore can leave it read-only; after either, nothing
+  could be saved or forgotten in that project. The lock file is only ever
+  locked, never written or read, so it is now used whenever it is a regular
+  file of this user, whatever its link count and mode (a read-only one is
+  opened for reading; the lock excludes all the same). Its mode is changed
+  only to clear group and other bits. A lock file that is a link (never
+  followed), not a regular file, another user's, or closed to its owner is
+  still refused, and the error now gives its path, what is wrong with it
+  and the fix (`rm` it: it holds no data).
+- **Context archives: a fetch and a forget by id look past a file of that
+  name that is not a record.** A lookup by id stopped at the newest shelf
+  that had any file under the id. If that file was not a valid record (a
+  damaged copy, a stray file, a link), the fetch failed, and so did
+  `memory_forget` of that id, while the valid archive on an older shelf
+  kept its text. A lookup now goes on to the older shelves: a fetch returns
+  the valid archive, and a forget turns it into a tombstone and answers
+  "NOT COMPLETE", naming the file it passed over. When no shelf has a valid
+  record under the id, the error is the same as before. When the file
+  passed over is a damaged tombstone of the same content, the older copy is
+  not returned ("not found") and a forget still reaches it.
+- **Context archives: the store checks a projection it is handed before it
+  writes it.** The entry an import will use (`seal_projection`) took the
+  projection's digest as given and wrote the record under the store's own
+  chat whatever chat the projection named. A projection of another chat, or
+  one with a digest that is not the digest of its content, was stored as a
+  file no read accepts, under a name that was then taken for good; a digest
+  that is not 64 ASCII characters panicked. All of these are now refused
+  with an error before the lock is taken, and nothing is written. Nothing
+  calls this entry with such a projection today; a normal save is unchanged.
+- **Context archives: forget is not "complete" over a damaged copy.** A file
+  under one of the window's own names that could be read but is not a valid
+  record (a copy cut short, say) can still hold the window's text.
+  Forgetting the window used to pass over such a file in silence and
+  `memory_forget` answered a plain "Forgot". The file is now counted with
+  the places that could not be read, as a legacy slot in that state already
+  was: the answer says "NOT COMPLETE" and names the file. The file itself is
+  left as it is. A valid record of another window under that name, and a
+  damaged tombstone of this one, do not count.
+- **Context archives: a forgotten window stays forgotten when a newer shelf
+  has another file under its name.** A save looks for the window under its
+  id on every shelf, newest first, and used to stop at the first shelf that
+  had any file under that name. If that file was not the window (a damaged
+  copy, a stray file, a link), the tombstone on an older shelf was not seen
+  and the window was stored again, live, under its second id. A save now
+  looks in the older shelves too: a tombstone there refuses the save, and a
+  live copy there is returned instead of a second copy being written. The
+  name counts as taken only when no shelf holds the window or its tombstone.
+
+- **Notes: one rule for a directory that cannot be synced, and a lock file
+  that cannot be opened is named.** The notes store tolerated `EINVAL` and
+  `ENOTSUP` from a directory sync, and `write_atomic_private` also
+  `PermissionDenied` (a directory that can be written but not opened for
+  reading). Both now call `private_fs::sync_dir`, which tolerates all three,
+  so such a directory no longer makes every save answer "written, not
+  confirmed". A notes lock file that cannot be opened (a symlink, another
+  owner) fails the save with "cannot open the notes lock file <path>"
+  instead of the bare OS error; nothing is written, as before.
+- **Notes: "written, not confirmed" names the note.** When the sync after a
+  save or a forget failed, `memory_store` and `memory_forget` told the model
+  to search, with nothing exact to search for. The error
+  (`MemoryError::WrittenUnconfirmed`, now `{ id, cause }`) carries the
+  note's id, and the tools say "fetch mem-… with memory_fetch to check". A
+  record without an id (an extension's `memory.append`) and the end of an
+  import run have none and keep the old text.
+- **Notes: the end of an import syncs every file, and says which one
+  failed.** `ImportRun::finish` stopped at the first file or directory
+  whose sync failed, so the files after it were not synced, and the error
+  did not say which file it was. It now tries every file and every
+  directory and returns the first failure as before
+  (`WrittenUnconfirmed`), with the path that failed.
+
+- **Context rollover: "1 earlier archive not listed here".** The first
+  message of a window whose list of archives was shortened to leave one out
+  said "1 earlier archives"; it has its singular. A list that could not be
+  shortened because its text was not found in the message, which would
+  have gone unnoticed, now fails a debug build and is logged once in a
+  release build. New test: a window sealed as several archives whose full
+  list fails only the 1,024-token shrink check names fewer of them.
+- **Context rollover: resume uses only archive ids from a session file,
+  and a bounded number of them.** A resumed chat's first message lists the
+  archives of its last window. Every string in that list was fetched as an
+  archive, one whole file each, and written to the log when the fetch
+  failed; the archive the marker names was logged as it was even when it
+  was not an id. Only a string of 32 lowercase hex characters is now
+  fetched or logged. At most 64 listed archives are looked up and the rest
+  are logged as one count, and for a marker whose archive is not an id the
+  log gives its length.
+- **Context rollover: a resume whose archive lookup keeps failing is
+  settled by the next rollover, and is looked up once per turn.** A resumed
+  chat whose saved window names an archive that cannot be read (a damaged
+  file, not a missing one) goes on at window 1 and looks again at the next
+  turn. It looked twice at every turn start, and went on doing so after the
+  chat had rolled over, with a warning each time. A committed rollover now
+  settles the state, and the second lookup of a turn start, which repeated
+  the first for the same store, is gone. `docs/extensions/hooks.md` now
+  says that `(session_id, window)` is not unique across a resume (such a
+  chat announces window 2 again, for other archives): key on `archive_id`.
+- **Daemon: a restored chat's folder under a file is dropped as absent.**
+  A saved folder whose path runs through something that is not a directory
+  (a file where one of its parents was) cannot exist, but looking at it
+  fails with "not a directory" and not with "not found", so the restore
+  kept it. It is now dropped like an absent folder, with the warning. Only
+  failures that can pass (permission, I/O, a mount that is away) keep the
+  folder.
+- **Daemon: a restored chat keeps a folder that cannot be looked at, and
+  every dropped folder is logged.** A reload and the restore of a pinned
+  session drop a chat's folder when it is gone; the chat then runs its
+  tools and keeps its memory in the daemon's folder and project. "Gone" was
+  `is_dir()` being false, which it is for any failure, so a folder on a
+  mount that was away for a moment, or one the daemon had no permission to
+  look at, moved the chat as well, with no log line. Both restores now use
+  one rule: the folder is dropped only when its path does not exist or is
+  not a directory, and kept on any other error. Each drop, and each folder
+  kept although it could not be looked at, is a warning that names the
+  folder and the chat.
+- **Context rollover: a rollover that cannot be recorded writes no
+  archives.** The size of the new window is estimated before the seal, when
+  the archives it will name are not known. A window sealed as several
+  archives has a longer first message than the estimate, and a rollover
+  whose message was then not under the request budget failed after the
+  seal: the window's archives stayed on disk with nothing naming them, and
+  again at each later attempt. The budget is now held before the seal, on
+  an upper bound of that message for any way the window can be cut, so such
+  a rollover is refused with the history kept and nothing written. The
+  refusal comes up to about 200 tokens below the budget, for a window that
+  turns out to be one archive too. The check after the seal stays as a last
+  line; it can still refuse only when the store returns a longer working
+  note than it was given, and then says that the archives were written.
+  `docs/specs/context-continuation.md` also says again how a window is cut
+  (filled part by part from its start) and what a retry on a grown window
+  writes.
+- **Extensions: a handler that times out on an archive event is not sent
+  the rest of that rollover's events.** A window sealed as `n` archives
+  sends `n` `on_context_archived` events to each handler, one after the
+  other. A handler that did not answer one within 5 s was sent the next all
+  the same, so a slow extension had `n` requests in its input and was busy
+  for `n` times its own time; calls to one extension are made one at a
+  time, so every `before_tool_call` sent to it meanwhile timed out and the
+  tool ran. A handler's sequence now ends at its first timeout (logged
+  once, with the number of events not sent); other handlers still get every
+  event, undelayed. An extension that needs every archive must be able to
+  catch up by listing the store (`docs/extensions/hooks.md`). Not changed:
+  a `before_tool_call` that times out still lets the tool run.
+
+- **Docs: `docs/extensions/session-id.md` no longer describes a worker on
+  a model an extension provides.** No such worker can exist; the page now
+  says why (a worker's model is an authorized `provider/model` id). The
+  folder tests of hook events and extension tool calls
+  (`session_actor_hook_cwd`) now check in every case that the extension
+  heard from no session but the test's own.
+- **Extension models: stop ends a tool call in their tool loop.** On a
+  `plugin:provider:model` model the loop that runs the model's tool calls
+  did not watch the turn's cancel, so after stop the turn waited for the
+  running command to finish (now up to the configured limits, not 30 s).
+  The loop is now raced against the cancel the way the ordinary tool loop
+  races each call: stop drops the running call and the turn ends as
+  cancelled at once (trace and audit record it as cancelled). The loop's
+  own rounds are not part of the chat's history, so nothing is added there.
+- **Memory: a chat whose folder has no project gets no memory lease.** Such
+  a chat (no folder, or a folder that cannot be resolved) was granted
+  leases under the one id `project-unresolved`, so two of them sent a
+  memory extension the same project id for capture and recall, and one
+  could be handed what the other captured. Now no id is invented: memory
+  is off for that chat. `/memory` answers that it is unavailable, the
+  default mode and a restored `/memory` choice log one warning, and the
+  turn runs without recall. A chat woken from park after its folder was
+  deleted wakes without that folder (in the daemon's folder and its
+  project), as a daemon reload and a pinned restore already did; a folder
+  that exists but cannot be checked right now is kept.
+- **Notes: a save made while a notes file is rewritten is no longer lost.**
+  `synaps retention sweep` and `synaps retention forget memory` rewrite
+  `memory/<ns>.jsonl` and rename the new file over the old one. A note saved
+  between their read and their rename went into the file that was replaced,
+  after the save had reported success. Every save and every rewrite now
+  holds a lock on `memory/<ns>.jsonl.lock` (an empty file beside the notes
+  file, never removed; it is not a notes file and is not listed, counted,
+  swept or exported). A save waits up to 5 seconds for it, then fails and
+  writes nothing; a sweep or forget that cannot get it fails and rewrites
+  nothing. The lock also stops a line from landing on another writer's torn
+  line. A version older than this one does not take the lock: do not run a
+  sweep from one version while another version saves notes.
+- **Notes: a forgotten note stays forgotten across sweep, eviction and
+  forget.** A rewrite of `memory/<ns>.jsonl` used to write the kept notes
+  only, so after `synaps retention sweep` had dropped a forgotten note its
+  tombstone line was gone too, and an import of an export that still held
+  the note stored it again. Every rewrite now keeps every tombstone line
+  (about 70 bytes each), including when the disk budget evicts notes. A
+  sweep that finds only live notes and tombstones leaves the file alone.
+- **Notes: `synaps retention sweep` and `retention forget memory` read a
+  notes file that has a line which is not UTF-8.** A save cut off inside a
+  multi-byte character leaves such a line in `memory/<ns>.jsonl` for good,
+  and the sweep, the eviction under a disk budget and `retention forget
+  memory` then failed on the whole file, on every run. They now read the
+  file line by line and treat that line as any line that does not parse:
+  the sweep and the eviction drop it when they rewrite (the sweep counts
+  it in `memory_records_dropped`), and `retention forget memory` writes it
+  back unchanged.
+- **Notes: every save syncs the `memory/` directory, and a rewritten file's
+  rename is synced.** A save synced the directory only when it found no
+  file or an empty one, which does not say the file's name is on disk
+  (another save may have just created it, or a sweep just renamed a new
+  file over it). Every save now syncs the directory, and the folder a new
+  `memory/` was made in. Files replaced by write-then-rename (notes after
+  a sweep, the quota keeper's state, the session list cache, the MCP
+  descriptor cache, captured trace bundles) sync their directory after the
+  rename; a file system that refuses to sync a directory is tolerated
+  there. A save costs one directory sync more than before.
+- **Extensions: `memory.query` ends on a read error that will not go
+  away.** It skipped every read error, and a lasting one comes back on
+  every read, so the query never returned. It now skips only a line that
+  is not UTF-8 and returns any other read error.
+- **Notes: `memory_store` and `memory_forget` say when a note was written but
+  not confirmed on disk.** If the sync after the write failed, the tool
+  reported a plain error although the note (or the forget) was already in
+  the file; a retry then made a second note, or answered "not found". The
+  tools now say that it was written and tell the model to search before
+  saving again. An extension's `memory.append` gets the same distinct
+  message ("written, but not confirmed on disk").
+- **`synaps retention forget memory <ns>:<id>` takes any record id.** It
+  refused an id that did not start with `mem-`, so a note that was imported
+  with another kind of id could not be forgotten from the command line. It
+  now takes any id of 1 to 128 bytes without whitespace or control
+  characters, and still matches it exactly.
+- **Notes: a line with `"tags": null` is read as a note with no tags.** The
+  plain-file store skipped such a line.
+- **Notes: a saved note is on disk before `memory_store` says it is saved.**
+  A note was written to
+  `memory/project-<key>.jsonl` but not synced, so a crash or a power cut
+  straight after the tool reported success could lose it. A save now syncs
+  the file before it returns, and the `memory/` directory too when the file
+  is new; so does the line `memory_forget` appends, and an extension's
+  `memory.append`. A save costs one file sync more than before. The file
+  format is unchanged, and older versions read the files as before.
+- **A chat switched to an extension-provided model sends that extension no
+  keep-warm request, and needs no Anthropic credential.** The check for "is
+  this model Anthropic's" asked only for a route, and every model id
+  without a `/` routes to Anthropic; `plugin:provider:model` has none. So a
+  chat with a keep-warm period on a Claude model that was switched with
+  `/model` to an extension's model kept its period, and each keep-warm
+  probe (documented as sending nothing) and each ping was a full request to
+  that extension, with the chat's tool list, for no chat: a tool call in the
+  answer ran in the daemon's folder. The period now ends at its next check
+  ("model … is not on the native Anthropic transport") and nothing is sent.
+  The same check made every turn on an extension's model refresh the
+  Anthropic credential first, at turn start and before each round: with a
+  credential broker that has no Anthropic account, or an OAuth login that
+  could not be refreshed, the turn failed although the extension needs no
+  Anthropic token. It is no longer asked for. Usage: an extension's model
+  now runs under the turn's usage meter like every other non-Anthropic
+  model, but its transport reports no usage event, so, as before, its
+  rounds are not counted against the turn's token and cost budgets.
+- **Daemon: two writes of one file in one tool round no longer run at
+  once when one names it by a relative path.** `write` and `edit` calls of
+  one round that target the same file run one after the other, in the
+  model's order. Which file a relative path names was worked out in the
+  folder the process runs in, so in a daemon chat `notes.md` and
+  `/the/chat/notes.md` counted as two files and could be written at the
+  same time. It is now worked out in the chat's folder, the way the write
+  itself is. Without the daemon nothing changes. `Tool` gains
+  `concurrency_key_in(input, cwd)`, which the scheduler calls; its default
+  is the existing `concurrency_key(input)`, so a tool that does not
+  implement it behaves as before.
+- **Compaction on an extension-provided model runs no tools.** With
+  `compaction_model` set to a non-streaming model an extension provides, a
+  summary answer that contained a tool call had that call run, although a
+  compaction request offers the model no tools: for no chat, in the process
+  folder with the process environment (under the daemon, the daemon's).
+  Every built-in tool (`bash`, `write`, …) and every loaded extension and
+  MCP tool could be called that way, and the model was then asked again, up
+  to eight times. A request that offers no
+  tools now gets one provider call; the text of the answer is the summary
+  and a tool call in it is ignored. Compaction on such a model whose answer
+  is text only, and every chat turn, are unchanged. With or without the
+  daemon.
+- **Daemon: a plugin's shell slash command gets the chat's environment,
+  and a tool-backed one the chat's memory binding.** A plugin slash command
+  backed by a shell command (`"command": …` in the plugin manifest) was
+  spawned with the daemon's whole environment, whichever chat it was typed
+  in: the daemon's `PATH`, `HOME` and virtualenv, and any variable the
+  client had stripped as a secret, if the daemon's own environment had it.
+  It is now spawned with the session's environment, the one the chat's
+  `bash` gets. It still runs from the plugin's own folder. A slash command
+  backed by an extension tool is handed the chat's memory binding instead of
+  working one out from the daemon's folder; nothing a user sees changes
+  there. Without the daemon the environment and the folder were already the
+  chat's.
+- **Daemon: commands run by an extension-provided model get the chat's
+  environment, and its tools everything else a chat's tools get.** A model
+  served by an extension (`plugin:provider:model`) runs its tool calls in a
+  loop of its own, and that loop built its tool context by hand, with the
+  chat's folder and project but nothing else of the chat. In a daemon-hosted
+  chat `bash` there ran in the chat's folder with the daemon's whole
+  environment: the daemon's `PATH`, `HOME` and virtualenv, and any variable
+  the client had stripped as a secret, if the daemon's own environment had
+  it. That loop now makes each call's context from the one the turn's other
+  tool calls are made from, so the two cannot differ again. For a chat on
+  such a model this means: commands get the session's environment and the
+  stripped-secret notice; the `shell_*` tools have the chat's shell
+  sessions (they answered "Shell sessions not available"); an extension's
+  Confirm prompts the user and "Allow all" is remembered (it was refused:
+  "no interactive prompt is available"); `context_checkpoint` acts on the
+  chat; and output and time limits are the
+  configured `max_tool_output`, `bash_timeout`, `bash_max_timeout` and
+  `subagent_timeout`, not 30,000 bytes and 30 / 300 / 300 seconds. The
+  `subagent*` tools are handed the chat's delegation policy, worker
+  registry and event queue, and deferred MCP and extension tools the
+  session's leases; without them they answered "delegation policy
+  unavailable" and started nothing. Still not there: `activate_tools` and
+  `search_tools`, because the tool list of one provider round is fixed.
+  Without the daemon the environment was already the same; the rest
+  changes there too. Engine API: `tools::TurnToolContext`;
+  `ToolCapabilities` is `Clone + Default`.
+- **Daemon: a chat's `context_checkpoint` reaches that chat, and no chat takes
+  a tool away from another.** Every chat on a daemon shares one tool registry,
+  and three things that belong to one chat were kept in it. A chat with
+  context management on registered `context_checkpoint`, bound to its own
+  rollover state, at the start of every turn, replacing the last chat's: with
+  two such chats mid-turn, the phase and note one reported (the note is its
+  unfinished work, up to 8,192 bytes) were written into the other's state, the
+  reporter was answered "recorded", and its own state got nothing. A chat with
+  context management off removed the tool from the registry, so a chat that
+  had it got "Unknown tool" mid-turn. Now the registry holds one
+  `context_checkpoint`, which writes to the state of the chat that called it,
+  and a chat with no use for a tool is not offered it; the registry is never
+  changed for one chat. Also gone with this: every such turn start advanced
+  the shared catalog generation, which made every other chat rebuild its tool
+  set mid-turn. A chat still sees exactly the tools it saw when it was alone
+  on a host, with two differences. `synaps tools export` and `docs/tools.json`
+  list `context_checkpoint`. `disabled_tools = context_checkpoint` is now
+  obeyed; it was undone at every turn start. Engine API: `ToolCapabilities`
+  has a `continuation` field (the calling chat's rollover state),
+  `ContextCheckpointTool` holds no state, `SessionToolSet::withholding`
+  records what a session is not offered, and `Runtime::offered_tools_schema`
+  is the registry's schema as one chat is offered it.
+- **Daemon: an extension tool run by a plugin slash command is told the
+  chat.** A tool-backed `/plugin:command` typed in a daemon-hosted chat sent
+  its `tool.call` with `session_id: null` and the daemon's folder as `cwd`.
+  It now carries the chat's id and the chat's folder, like a tool call in a
+  turn.
+- **Daemon: a chat resumed in the same project keeps its context-window
+  count.** With context management on, a
+  daemon-hosted chat that was resumed (`--continue`, a daemon reload or
+  restart, waking a parked chat) checked for its last archived window in the
+  project of the daemon's folder instead of its own. The archive is not
+  there, so the chat silently started counting windows from 1 again and
+  reported no archive. The check now uses the project of the folder the chat
+  is resumed in. That is where its rollover wrote the archive when the chat
+  comes back in the project it rolled over in: a daemon reload or restart,
+  waking a parked chat, `--continue` from a folder of that project. A chat
+  continued with `--continue` from a folder of another project takes that
+  folder's project, where the archive is not: it still starts counting
+  windows from 1, reports no archive, and cannot fetch its earlier windows
+  from there. No file moves; in-process hosts are unchanged.
+- **A resumed chat that does not find its archive says so, and a lookup that
+  merely failed is made again.** A chat whose saved window names an archive
+  that is not found used to go on at window 1 without a word. The log now
+  has a warning that names the archive and the project whose store was
+  searched, and tells the three causes apart: the chat has no project, the
+  project has no archive store, the store does not hold the archive. Only
+  those settle it. A lookup that fails for another reason (the store is
+  busy, something in it cannot be read) used to count as "no archive" for
+  good; it now leaves the question open, is logged, and is asked again at
+  the next request. For a window that was sealed as several archives, every
+  archive the saved window lists is looked up in the background and the log
+  names each one that cannot be read; this never delays or fails the resume.
+- **Daemon: a chat whose folder was deleted survives `synaps daemon reload`
+  with a project.** The reload restored the chat on the deleted path, where
+  no project can be found: memory tools answered "host project scope
+  unavailable" and the next rollover could not save its archive. It now
+  runs in the daemon's folder, as a pinned chat restored after its folder
+  was deleted already did.
+- **Daemon: memory tools called by an extension-provided model act on the
+  chat's project.** A model served by an extension (`plugin:provider:model`)
+  runs its tool calls in a loop of its own, and that loop gave the memory
+  tools no project. They fell back to the project of the process folder, so
+  in a daemon-hosted chat `memory_store`, `memory_search`, `memory_fetch` and
+  `memory_forget` read, wrote and forgot notes in the daemon's project. They
+  now use the chat's project, as tool calls in any other turn do. A memory
+  tool run with no project at all now refuses instead of guessing one.
+- **Daemon: tools called by an extension-provided model run in the chat's
+  folder.** A model served by an extension (`plugin:provider:model`) runs its
+  tool calls in a loop of its own, and that loop did not know the chat. In a
+  daemon-hosted chat its tools resolved relative paths and started commands
+  in the daemon's folder, and the `before_tool_call` / `after_tool_call`
+  events and `tool.call` requests they caused carried `session_id: null` and
+  the daemon's folder as `cwd`. They now run in the chat's folder and name
+  the chat and its folder, and a `memory_forget` there is announced with
+  `on_memory_forgotten`. Without the daemon the folders were already the
+  same; there only `session_id` changes, from `null` to the chat's id.
+
+- **Keep-warm now covers a response that streams past the cache TTL**
+  (`cache_keepwarm_tools`). The TTL runs from the start of a request, and
+  the keep-warm for long rounds only started once the tools did. A worker
+  that thought for more than five minutes before a tool call had lost its
+  5m cache before the tool ran, and the next request rewrote the whole
+  prefix at 1.25×: four such requests in one night's logs rewrote 674k
+  tokens, with nothing in the cache diagnostics to show for it (tools,
+  system and messages were unchanged). The round's keep-warm now starts
+  when its request is sent and pings while the response streams, on the
+  same schedule, guards and booking as while tools run. A long final
+  answer is pinged too (when a ping falls due nothing says it is the last
+  word; the prefix would otherwise be dead for a resume or the next
+  message), and nothing is sent once it ends. Nothing changes on a 1h TTL
+  short of a 55-minute response.
+- **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
+  program names: a stock Windows has no `grep` or `ls` ("program not
+  found"), and `find` resolved to `System32\find.exe`, an unrelated string
+  search, so the find tool reported "No files found" for files that exist.
+  `grep` and `find` now need no program (they search in-process, see
+  Changed). `ls` runs a GNU build: from a `PATH` directory outside the
+  Windows directory, else from Git for Windows' `usr\bin` (found next to
+  `git.exe` on `PATH` or in the standard install folders). Without one, the
+  call says to install Git for Windows or use the `powershell` tool. Git's
+  tools are MSYS programs, which expand wildcards in their own arguments
+  when started from a non-MSYS process, so `ls` runs with `noglob` added to
+  `MSYS`. Linux and macOS are unchanged.
+- **Windows: the `powershell` tool can run scripts.** A stock Windows
+  client has the `Restricted` execution policy, so `.\test.ps1` failed with
+  "running scripts is disabled on this system" and the model had to retry
+  with `powershell -ExecutionPolicy Bypass -File …`. The tool now starts
+  PowerShell with `-ExecutionPolicy Bypass` (process scope, inherited by the
+  PowerShells a command starts; a Group Policy setting still wins). Its
+  description says which PowerShell runs (7 when installed, else 5.1), not
+  to start another one inside it, and to call scripts directly; on a
+  machine without PowerShell 7 the model had first tried `pwsh`.
+- **Windows: grep and find cards show short paths.** Card rows kept full
+  `C:\Users\…\project\./src\file` paths, and grep rows were not
+  highlighted (the row was split at the drive colon). Paths under the
+  session folder now show relative to it and paths under the user profile
+  as `~\…`, matched case-insensitively with either separator, as on Linux.
+  On every platform, the `./` a tool given the path `.` leaves after the
+  session folder is dropped (`src/main.rs`, not `./src/main.rs`). Display
+  only: the tool result is unchanged.
+- **A one-shot `subagent` result keeps its responses apart.** Text from
+  each of the worker's responses was joined with nothing between them, so
+  the result (what the parent model reads, and the subagent card) ran
+  sentences together: "…read them all.Found 2 files…". Each response now
+  starts a new paragraph, as `subagent_start` workers already did.
+- **`subagent` and `subagent_start` no longer offer `role` and
+  `write_policy`.** Both tools advertised a worker role and a write policy
+  (`read_only`, `isolated_worktree`, or `non_overlapping_paths` with
+  scopes), but neither was ever read or enforced: every worker was
+  dispatched as an implementer, and a worker asked to be `read_only` could
+  still write files and run any command. Both parameters are gone from the
+  two schemas, about 1 KB off every request that lists the tools. A call
+  that still sends them runs as before: they are ignored, not refused. A
+  real read-only mode would have to restrict `bash` as well as the file
+  tools; that is tracked separately.
+- **`search_tools` matches keywords, not one literal string.** The whole
+  query had to appear verbatim in a tool's id, summary or tags: over six
+  weeks of sessions 30% of searches came back empty, every multi-word one
+  among them ("web fetch", "subagent start", "shell session"), and the
+  model then searched again, fell back to bash or guessed ids such as
+  `ext.web-tools:fetch`. The query is now split into keywords at spaces
+  and at `_`, `-`, `:` and `.`, so `web fetch`, `web_fetch` and `web-fetch`
+  find the same tools, in any order. Results are ranked: an exact id or
+  name first, then tools containing the whole query (everything that
+  matched before still matches, ahead of the rest), then the most keywords
+  matched, id hits above summary hits. In a query of several words,
+  one-letter and filler words (`a`, `the`, `for`, `tool`, …) are not
+  keywords, so "read a file" doesn't match every tool with an `a` in its
+  summary. An empty result says to try one
+  shorter keyword and not to guess ids, and `activate_tools` given an
+  unknown id says it needs an exact id from `search_tools`.
+- **Anthropic streams that send only keep-alive pings are retried.** A
+  stream that stayed connected but sent only pings waited indefinitely
+  (each ping reset the 90 s idle timer). It is now retried when no first
+  event arrives in 3 minutes, or no progress for 10 minutes.
+- **An unknown `/command` is never sent to the model.** Typed while a turn
+  was running, a `/name` the TUI didn't know (any plugin command in an
+  attached TUI) went to the model as steering text, arguments and all, so
+  `/nosuch secret-value` landed in the conversation and the session file.
+  `synaps attach` sent such lines idle too. Now nothing is sent: the TUI
+  says so (try it again when the turn ends), and `synaps attach` answers
+  "unknown command". To send text that starts with `/`, start it with
+  `//`: `//etc/hosts is wrong` sends `/etc/hosts is wrong`, idle or
+  mid-turn, in the TUI and in `synaps attach`.
+- **`bash` says when it stopped a command.** Output past the 256 KiB
+  tool buffer kills the command, but the result only ended
+  `[output truncated at N]`, which reads like a display cut of a command
+  that finished. It now says the command was stopped at that limit before
+  it finished and its exit status is unknown, and to redirect large output
+  to a file; the streamed output ends with the same notice and never shows
+  bytes past the cap. A timeout returned only `Command timed out after Ns`
+  and lost everything the command had printed; the error now says it was
+  stopped, notes when `bash_max_timeout` cut a timeout the model asked
+  for, and keeps the output from before the timeout (redacted, at most the
+  last 256 KiB). Caps, timeouts and kills are unchanged (the process group
+  on Unix, only the shell process on Windows); the same messages apply to
+  the Windows `powershell` tool.
+
 ## [0.11.1] — 2026-10-31
 
 Synaps runs on Windows now, with prebuilt x64 binaries and a PowerShell

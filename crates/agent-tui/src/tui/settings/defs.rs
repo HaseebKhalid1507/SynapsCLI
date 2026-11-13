@@ -31,37 +31,9 @@ pub(crate) const TYPED_CYCLERS: &[&str] = &["cache_keepwarm"];
 /// new config key cannot silently skip the settings UI. Keep this tight.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
-    // Dead config: parsed by `load_config` but read by nothing (the shell
-    // tool is built from `ShellConfig::default()`; no runtime consumer of
-    // the continuous-memory policy fields). No row until a PR wires the key
-    // up — that PR must move it back to a row in `define_settings!`.
-    ("shell.default_cols", NOT_READ_YET),
-    ("shell.default_rows", NOT_READ_YET),
-    ("shell.idle_timeout", NOT_READ_YET),
-    ("shell.max_output", NOT_READ_YET),
-    ("shell.max_sessions", NOT_READ_YET),
-    ("shell.readiness_strategy", NOT_READ_YET),
-    ("shell.readiness_timeout_ms", NOT_READ_YET),
-    ("shell.max_readiness_timeout_ms", NOT_READ_YET),
-    ("memory.capture_user", NOT_READ_YET),
-    ("memory.capture_assistant", NOT_READ_YET),
-    ("memory.capture_tools", NOT_READ_YET),
-    ("memory.recall_max_records", NOT_READ_YET),
-    ("memory.recall_max_tokens", NOT_READ_YET),
-    ("memory.recall_timeout_ms", NOT_READ_YET),
-    ("memory.auto_consolidate", NOT_READ_YET),
-    ("memory.local_embeddings", NOT_READ_YET),
-    ("memory.gliner", NOT_READ_YET),
-    ("server.token", "secret: never echoed in a TUI"),
     ("auth.machine_token", "secret: never echoed in a TUI"),
     ("auth.remote_endpoint", "credential-broker wiring set by deployment, not a preference"),
-    ("server.allowed_origins", "WebSocket server mode only"),
-    ("server.auto_approve_confirms", "security-sensitive WebSocket server-mode policy"),
-    ("server.max_message_size", "WebSocket server mode only"),
-    ("bridge.uds_path", "internal sidecar plumbing"),
-    ("bridge.heartbeat_mirror", "internal sidecar plumbing"),
-    ("bridge.heartbeat_timeout_ms", "internal sidecar plumbing"),
-    ("memory.default_mode_confirmed", "operator consent marker: must be set by hand"),
+    ("server.auto_approve_confirms", "security-sensitive: approves every extension confirm unasked"),
     ("subagent_max_concurrent", "legacy flat alias of subagent.max_concurrent (edit that row)"),
     ("subagent_max_total", "legacy flat alias of subagent.max_total (edit that row)"),
     ("favorite_models", "owned by the model picker (/models favorites)"),
@@ -71,11 +43,6 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("provider.*", "owned by the Providers tab (API keys)"),
     ("keybind.*", "keybind family (keybind registry), not a single setting"),
 ];
-
-/// Reason for dead-config exclusions (see `EXCLUDED_CONFIG_KEYS`).
-#[cfg_attr(not(test), allow(dead_code))]
-const NOT_READ_YET: &str =
-    "parsed but not read by the runtime yet (no-op); wiring it up must restore its settings row";
 
 /// Config-only rows: validate with the real config parser over the whole
 /// file as it would look after the write, so /settings can never persist a
@@ -368,23 +335,6 @@ define_settings! {
             }
         };
 
-    "sidecar_toggle_key", "Sidecar toggle key", Sidecar,
-        EditorKind::Cycler(&["F8", "F2", "F12", "C-V", "C-G"]),
-        "Keybind that toggles the active sidecar plugin. Takes effect immediately.",
-        |app, value| {
-            if let Some(kb) = app.keybinds.as_ref() {
-                match kb.write() {
-                    Ok(mut g) => {
-                        if let Err(e) = g.set_slash_command_key("sidecar toggle", value) {
-                            tracing::warn!("sidecar_toggle_key apply failed: {}", e);
-                        }
-                    }
-                    Err(_) => tracing::warn!("sidecar_toggle_key apply: registry poisoned"),
-                }
-            }
-            SettingApply::Local(Ok(()))
-        };
-
     "startup.quick_start", "Quick start", Startup, EditorKind::Cycler(&["on", "off"]),
         "Start without waiting for extensions to load (faster startup). The first message still waits for extensions to start before it is sent (up to the extensions-ready wait, 30 s by default, plus the extensions' session-start hooks). Takes effect next launch.",
         |_app, value| match value {
@@ -456,7 +406,7 @@ define_settings! {
         |_app, value| on_off("cache_keepwarm_headless", value);
 
     "cache_keepwarm_tools", "Keep-warm tool rounds", Context, EditorKind::Cycler(&["on", "off"]),
-        "Keep the prompt cache warm while a long tool call runs (builds, test sweeps, polls): once tools have run for the TTL minus a margin (4.5 min on 5m, 55 min on 1h), resend that round's request asking for a minimal reply so the next request reads the cache instead of rewriting it. Independent of idle keep-warm (default on). Applies to new sessions and workers.",
+        "Keep the prompt cache warm through a long round: a response that streams past the cache TTL (minutes of thinking, one long write) or tools that run past it (builds, test sweeps, polls). Once the round has run for the TTL minus a margin (4.5 min on 5m, 55 min on 1h), resend its request asking for a minimal reply so the next request reads the cache instead of rewriting it. Independent of idle keep-warm (default on). Applies to new sessions and workers.",
         |_app, value| on_off("cache_keepwarm_tools", value);
 
     "context_management.mode", "Context management", Context,
@@ -598,41 +548,6 @@ define_settings! {
         "Total bytes of tool results one turn may accumulate; a positive number, or unlimited (default: no limit) — turns you type or queue, plugin commands and session-driver turns, in the TUI, daemon sessions, synaps chat and rpc (event-started turns also apply the event budget). Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
         |_app, value| turn_limit("turn_budget.foreground.max_accumulated_tool_result_bytes", value);
 
-    "turn_budget.autonomous.max_cost_usd", "Autonomous cost (USD)", Budgets,
-        EditorKind::Text { numeric: false },
-        "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| budget_usd("turn_budget.autonomous.max_cost_usd", value);
-
-    "turn_budget.autonomous.max_elapsed_secs", "Autonomous time (s)", Budgets,
-        EditorKind::Text { numeric: true },
-        "Wall-clock seconds one turn may run; 0 = no limit (the default) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.autonomous.max_elapsed_secs", value);
-
-    "turn_budget.autonomous.max_tool_calls", "Autonomous tool calls", Budgets,
-        EditorKind::Text { numeric: false },
-        "Tool calls allowed in one turn; a positive number, or unlimited (default: 96) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| turn_limit("turn_budget.autonomous.max_tool_calls", value);
-
-    "turn_budget.autonomous.max_provider_rounds", "Autonomous rounds", Budgets,
-        EditorKind::Text { numeric: false },
-        "Model round-trips allowed in one turn before the allowance runs out; a positive number, or unlimited (default: 24) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| turn_limit("turn_budget.autonomous.max_provider_rounds", value);
-
-    "turn_budget.autonomous.max_round_renewals", "Autonomous renewals", Budgets,
-        EditorKind::Text { numeric: true },
-        "Automatic renewals of the round allowance after it runs out mid-turn (only with a round limit set); 0 = hard stop at the first exhaustion — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.autonomous.max_round_renewals", value);
-
-    "turn_budget.autonomous.max_context_tokens", "Autonomous ctx tokens", Budgets,
-        EditorKind::Text { numeric: true },
-        "Context tokens one turn may use — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| whole_number("turn_budget.autonomous.max_context_tokens", value);
-
-    "turn_budget.autonomous.max_accumulated_tool_result_bytes", "Autonomous tool bytes", Budgets,
-        EditorKind::Text { numeric: false },
-        "Total bytes of tool results one turn may accumulate; a positive number, or unlimited (default: 8 MiB) — watcher agent turns (synaps agent) only. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
-        |_app, value| turn_limit("turn_budget.autonomous.max_accumulated_tool_result_bytes", value);
-
     "turn_budget.event.max_cost_usd", "Event cost (USD)", Budgets,
         EditorKind::Text { numeric: false },
         "US dollars one turn may spend before it stops (decimal, e.g. 2.50) — turns a session starts by itself when events arrive (inbox messages, subagent completions); combined with the session budget, the stricter limit wins. Unset = the role's built-in default (remove the line from the config to restore it). Takes effect next launch.",
@@ -719,6 +634,10 @@ define_settings! {
         "When the model asks to activate tools: auto allows (default), prompt asks you, deny refuses. Takes effect next launch.",
         |_app, value| config_edit("tools.activation_confirm", value);
 
+    "tools.always_loaded", "Always-loaded tools", ToolLimits, EditorKind::Text { numeric: false },
+        "With progressive tools on: tools kept loaded from the first request, comma-separated ids as activate_tools takes them (e.g. ext.axel:search, builtin:subagent). Ids not installed are skipped. Empty = none. Takes effect next launch.",
+        |_app, value| config_edit("tools.always_loaded", value);
+
     "process_scopes", "Process scopes", ToolLimits, EditorKind::Cycler(&["auto", "off"]),
         "Run the daemon, bash commands and shells in their own systemd scopes so the OOM killer stops one runaway command, not the terminal (Linux; default auto). Applies to commands started afterwards; the daemon's own scope changes next launch. Env SYNAPS_PROCESS_SCOPES overrides.",
         |_app, value| config_edit("process_scopes", value);
@@ -741,28 +660,6 @@ define_settings! {
         "Lines scrolled per mouse-wheel event (1–20, default 3). Takes effect next launch.",
         |_app, value| whole_number("scroll_lines", value);
 
-    // ── Memory ───────────────────────────────────────────────────────────
-
-    "memory.default_mode", "Default memory mode", Memory,
-        EditorKind::Cycler(&["off", "recall_once", "recall_each_prompt", "capture_only", "capture_and_recall"]),
-        "Memory mode every new session starts in (default off). A non-off mode needs memory.default_mode_confirmed = true in the config, added by hand; until then this setting is refused. /memory off still turns it off for that session. Takes effect next launch.",
-        |_app, value| config_edit("memory.default_mode", value);
-
-    "memory.backend", "Memory backend", Memory, EditorKind::Cycler(&["legacy", "axel"]),
-        "Note storage: legacy (default) or axel (needs the Axel executable below). Selecting a backend never enables capture or recall. Restart required.",
-        |_app, value| config_edit("memory.backend", value);
-
-    "memory.user_scope", "User-wide notes", Memory, EditorKind::Cycler(&["true", "false"]),
-        "Allow user-wide notes in addition to project notes (default false). Never grants capture or history consent. Restart required.",
-        |_app, value| config_edit("memory.user_scope", value);
-
-    "memory.axel.executable", "Axel executable", Memory, EditorKind::Text { numeric: false },
-        "Absolute path to the Axel memory service executable (never looked up on PATH). Restart required.",
-        |_app, value| config_edit("memory.axel.executable", value);
-
-    "memory.axel.brain", "Axel brain", Memory, EditorKind::Text { numeric: false },
-        "Absolute path to a shared Axel brain file (unset = the private per-user default). Restart required.",
-        |_app, value| config_edit("memory.axel.brain", value);
 }
 
 #[cfg(test)]
@@ -793,15 +690,6 @@ mod tests {
             EditorKind::Cycler(opts) => assert_eq!(opts, &["on", "off"]),
             _ => panic!("tui_streaming_glow editor should be a Cycler"),
         }
-    }
-
-    #[test]
-    fn sidecar_toggle_key_setting_is_in_sidecar_category() {
-        let def = ALL_SETTINGS
-            .iter()
-            .find(|d| d.key == "sidecar_toggle_key")
-            .expect("sidecar_toggle_key setting should be defined");
-        assert_eq!(def.category, Category::Sidecar);
     }
 
     #[test]
@@ -847,24 +735,8 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_toggle_key_static_setting_still_defined_for_backward_compat() {
-        // Phase 8 slice 8A.4: even after `visible_categories(claims)`
-        // hides the global Sidecar page when a plugin claims its own
-        // settings_category, the static def stays in ALL_SETTINGS so
-        // legacy users without claimed plugins keep a working toggle
-        // and config round-trips remain stable.
-        let def = ALL_SETTINGS
-            .iter()
-            .find(|d| d.key == "sidecar_toggle_key")
-            .expect("sidecar_toggle_key setting must remain in ALL_SETTINGS for back-compat");
-        assert_eq!(def.category, Category::Sidecar);
-        match def.editor {
-            EditorKind::Cycler(opts) => {
-                assert!(opts.contains(&"F8"));
-                assert!(opts.contains(&"C-V"));
-            }
-            _ => panic!("expected Cycler editor for sidecar_toggle_key"),
-        }
+    fn sidecar_toggle_key_has_no_settings_row() {
+        assert!(ALL_SETTINGS.iter().all(|d| d.key != "sidecar_toggle_key"));
     }
 
     fn app_with_model(model: &str) -> crate::tui::app::App {
@@ -1001,14 +873,7 @@ mod tests {
                 continue;
             };
             for option in options.iter() {
-                // A non-off default mode is valid only alongside the
-                // operator's hand-set consent latch (spec §12).
-                let latch = if def.key == "memory.default_mode" {
-                    "memory.default_mode_confirmed = true\n"
-                } else {
-                    ""
-                };
-                let content = format!("{latch}{} = {option}\n", def.key);
+                let content = format!("{} = {option}\n", def.key);
                 temp.write(&content);
                 let config = synaps_cli::config::load_config();
                 if !config.warnings.is_empty() {
@@ -1088,7 +953,6 @@ mod tests {
             "tui_background_opaque",
             "tui_streaming_glow",
             "theme_transition",
-            "sidecar_toggle_key",
             "startup.quick_start",
             "startup.extensions_ready_timeout_secs",
             "daemon.idle_exit_secs",
@@ -1341,16 +1205,11 @@ mod tests {
             assert!(is_err(d("turn_budget.worker.max_provider_rounds", "0")));
             assert!(is_ok(d("turn_budget.worker.max_provider_rounds", "unlimited")));
             assert!(is_ok(d("turn_budget.worker.max_provider_rounds", "128")));
-            assert!(is_err(d("turn_budget.autonomous.max_accumulated_tool_result_bytes", "0")));
-            assert!(is_ok(d("turn_budget.autonomous.max_accumulated_tool_result_bytes", "unlimited")));
+            assert!(is_err(d("turn_budget.event.max_accumulated_tool_result_bytes", "0")));
+            assert!(is_ok(d("turn_budget.event.max_accumulated_tool_result_bytes", "unlimited")));
             assert!(is_ok(d("max_fps", "144")));
             assert!(is_err(d("max_fps", "0")));
             assert!(is_err(d("scroll_lines", "21")));
-            let absolute = if cfg!(windows) { r"C:\srv\axel\brain.r8" } else { "/srv/axel/brain.r8" };
-            assert!(is_ok(d("memory.axel.brain", absolute)));
-            assert!(is_err(d("memory.axel.brain", "brain.r8")));
-            assert!(is_err(d("memory.user_scope", "yes")));
-            assert!(is_err(d("memory.backend", "sqlite")));
         }
 
         // Cross-key rules see the rest of the file.
@@ -1361,56 +1220,6 @@ mod tests {
         assert_eq!(
             synaps_cli::config::read_config_value("subagent.max_concurrent"),
             None
-        );
-
-        // A non-off default memory mode needs the hand-set consent latch.
-        temp.write("");
-        assert!(is_ok(apply_setting_dispatch(
-            "memory.default_mode",
-            "off",
-            &mut app
-        )));
-        assert!(is_err(apply_setting_dispatch(
-            "memory.default_mode",
-            "capture_and_recall",
-            &mut app
-        )));
-        assert!(is_err(apply_setting_dispatch(
-            "memory.default_mode",
-            "everything",
-            &mut app
-        )));
-        temp.write("memory.default_mode_confirmed = true\n");
-        assert!(is_ok(apply_setting_dispatch(
-            "memory.default_mode",
-            "capture_and_recall",
-            &mut app
-        )));
-        drop(temp);
-    }
-
-    /// The default-mode row shows the effective mode: off until the
-    /// operator's consent latch is set alongside it.
-    #[test]
-    fn memory_default_mode_display_requires_the_consent_latch() {
-        use super::super::draw::config_row_display;
-        let _lock = config_lock();
-        let temp = TempConfig::new("memory.default_mode = capture_and_recall\n");
-        assert_eq!(
-            config_row_display("memory.default_mode").as_deref(),
-            Some("off")
-        );
-        temp.write(
-            "memory.default_mode = capture_and_recall\nmemory.default_mode_confirmed = true\n",
-        );
-        assert_eq!(
-            config_row_display("memory.default_mode").as_deref(),
-            Some("capture_and_recall")
-        );
-        temp.write("memory.default_mode = bogus\nmemory.default_mode_confirmed = true\n");
-        assert_eq!(
-            config_row_display("memory.default_mode").as_deref(),
-            Some("off")
         );
         drop(temp);
     }

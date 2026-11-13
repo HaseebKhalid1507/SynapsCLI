@@ -25,9 +25,6 @@ pub const AUTO_TURN_CAP: u32 = 5;
 /// Sentinel: `events.auto_turn_cap = 0` disables the cap entirely.
 pub const AUTO_TURN_UNLIMITED: u32 = 0;
 
-/// The config key users should raise when the cap trips (used in messages).
-pub const AUTO_TURN_CAP_CONFIG_KEY: &str = "events.auto_turn_cap";
-
 /// Single source of truth for "has the consecutive auto-turn cap been hit?"
 ///
 /// * `cap == 0` (`AUTO_TURN_UNLIMITED`) → never reached.
@@ -280,22 +277,6 @@ pub fn claim_auto_turn_with_cap(counter: &mut u32, cap: u32) -> bool {
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Returns `true` when the agent idle loop should park on `queue.notified()`
-/// instead of immediately nagging with a user message.
-///
-/// Invariant: exactly one waiter on `queue.notified()` exists in agent mode.
-/// The caller **must** drop any registry lock before awaiting the future.
-///
-/// Conditions to wait:
-/// * At least one child subagent is still running, **or**
-/// * The event queue already has items (drain them first on loop-top).
-#[inline]
-pub fn idle_should_wait(children_running: bool, queue_len: usize) -> bool {
-    children_running || queue_len > 0
-}
-
 // ─── terminal_flush seam for integration testing ─────────────────────────────
 
 /// Pure decision logic mirroring `terminal_flush` from `cmd/rpc.rs` for use in
@@ -441,7 +422,8 @@ mod tests {
         assert!(drained[0].formatted.contains("hello"));
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
-        assert!(messages[0]["content"].as_str().unwrap().contains("hello"));
+        // Byte-equal: the model sees exactly the canonical rendering.
+        assert_eq!(messages[0]["content"].as_str(), Some(drained[0].formatted.as_str()));
         assert!(pending.is_empty());
         assert!(q.is_empty());
     }
@@ -686,33 +668,6 @@ mod tests {
         let messages = vec![user_msg("hello")];
         let result = wake_action(&drained, &messages, false, true, 0);
         assert_eq!(result, WakeAction::RunTurn);
-    }
-
-    // ── idle_should_wait truth table ─────────────────────────────────────────
-
-    #[test]
-    fn idle_should_wait_false_when_no_children_no_queue() {
-        assert!(!idle_should_wait(false, 0));
-    }
-
-    #[test]
-    fn idle_should_wait_true_when_children_running() {
-        assert!(idle_should_wait(true, 0));
-    }
-
-    #[test]
-    fn idle_should_wait_true_when_queue_nonempty() {
-        assert!(idle_should_wait(false, 1));
-    }
-
-    #[test]
-    fn idle_should_wait_true_when_both_children_and_queue() {
-        assert!(idle_should_wait(true, 3));
-    }
-
-    #[test]
-    fn idle_should_wait_true_when_large_queue() {
-        assert!(idle_should_wait(false, 999));
     }
 
     // ── claim_auto_turn boundary tests ─────────────────────────────────────

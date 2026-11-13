@@ -20,7 +20,7 @@ impl PathBase {
     pub(crate) fn new(cwd: Option<PathBuf>) -> Self {
         Self {
             cwd,
-            home: std::env::var_os("HOME")
+            home: home_dir_var()
                 .map(PathBuf::from)
                 .filter(|h| h.is_absolute() && h != Path::new("/")),
         }
@@ -28,35 +28,71 @@ impl PathBase {
 
     /// `p` relative to the cwd when under it, `~/…` when under home,
     /// otherwise unchanged. Only absolute, component-boundary matches count
-    /// (`/a/bc` is not under `/a/b`).
+    /// (`/a/bc` is not under `/a/b`). On Windows `C:\…` paths count too,
+    /// matched case-insensitively with `\` and `/` alike.
     pub(crate) fn shorten<'a>(&self, p: &'a str) -> Cow<'a, str> {
-        if !p.starts_with('/') {
-            return Cow::Borrowed(p);
-        }
-        let under = |base: &Path| -> Option<&'a str> {
-            let b = base.to_str()?.trim_end_matches('/');
-            if b.is_empty() {
-                return None;
-            }
-            let rest = p.strip_prefix(b)?;
-            if rest.is_empty() {
-                Some("")
-            } else {
-                rest.strip_prefix('/')
-            }
-        };
-        if let Some(rest) = self.cwd.as_deref().and_then(under) {
-            return Cow::Borrowed(if rest.is_empty() { "." } else { rest });
-        }
-        if let Some(rest) = self.home.as_deref().and_then(under) {
-            return Cow::Owned(if rest.is_empty() {
-                "~".to_string()
-            } else {
-                format!("~/{rest}")
-            });
-        }
-        Cow::Borrowed(p)
+        shorten_in(p, self.cwd.as_deref(), self.home.as_deref(), cfg!(windows))
     }
+}
+
+/// The home directory variable: `USERPROFILE` on Windows (`HOME` when a
+/// Unix-style shell set only that), `HOME` elsewhere.
+fn home_dir_var() -> Option<std::ffi::OsString> {
+    if cfg!(windows) {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME")
+    }
+}
+
+fn is_absolute(p: &str, windows: bool) -> bool {
+    if !windows {
+        return p.starts_with('/');
+    }
+    matches!(p.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic())
+        || p.starts_with('/')
+        || p.starts_with("\\\\")
+}
+
+/// [`PathBase::shorten`] with the platform as a parameter, so both rule sets
+/// are tested everywhere.
+fn shorten_in<'a>(p: &'a str, cwd: Option<&Path>, home: Option<&Path>, windows: bool) -> Cow<'a, str> {
+    if !is_absolute(p, windows) {
+        return Cow::Borrowed(p);
+    }
+    let is_sep = move |c: char| c == '/' || (windows && c == '\\');
+    // Same byte length as the input: `\` → `/` and ASCII lowercase only.
+    let norm = |s: &str| if windows { s.replace('\\', "/").to_ascii_lowercase() } else { s.to_string() };
+    let np = norm(p);
+    // (rest, the separator after the base) when `p` is under `base`.
+    let under = |base: &Path| -> Option<(&'a str, char)> {
+        let nb = norm(base.to_str()?);
+        let nb = nb.trim_end_matches('/');
+        if nb.is_empty() || !np.starts_with(nb) {
+            return None;
+        }
+        let rest = &p[nb.len()..];
+        let Some(sep) = rest.chars().next() else {
+            return Some(("", '/'));
+        };
+        let mut rest = rest.strip_prefix(is_sep)?;
+        // `<cwd>/./x` (a tool given the path `.`) reads as `x`.
+        while let Some(r) = rest.strip_prefix('.').and_then(|r| r.strip_prefix(is_sep)) {
+            rest = r;
+        }
+        Some((rest, sep))
+    };
+    if let Some((rest, _)) = cwd.and_then(under) {
+        return Cow::Borrowed(if rest.is_empty() { "." } else { rest });
+    }
+    if let Some((rest, sep)) = home.and_then(under) {
+        return Cow::Owned(if rest.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~{sep}{rest}")
+        });
+    }
+    Cow::Borrowed(p)
 }
 
 #[cfg(test)]
@@ -68,6 +104,34 @@ mod tests {
             cwd: Some("/home/u/Projects/synaps".into()),
             home: Some("/home/u".into()),
         }
+    }
+
+    /// Windows card paths: drive paths under the session folder are relative,
+    /// matched case-insensitively with either separator; under the user
+    /// profile `~\…`; the `\./` a tool given `.` produces is dropped.
+    #[test]
+    fn windows_paths_shorten_under_cwd_then_profile() {
+        let cwd = Path::new(r"C:\Users\Haseeb\smoke-proj");
+        let home = Path::new(r"C:\Users\Haseeb");
+        let s = |p| shorten_in(p, Some(cwd), Some(home), true).into_owned();
+        assert_eq!(s(r"C:\Users\Haseeb\smoke-proj\./README.md"), "README.md");
+        assert_eq!(s(r"C:\Users\Haseeb\smoke-proj\src\calc.ps1"), r"src\calc.ps1");
+        assert_eq!(s("c:/users/haseeb/smoke-proj/docs/notes.md"), "docs/notes.md");
+        assert_eq!(s(r"C:\Users\Haseeb\smoke-proj"), ".");
+        assert_eq!(s(r"C:\Users\Haseeb\smoke-projx\a"), r"~\smoke-projx\a");
+        assert_eq!(s(r"C:\Users\Haseeb\AppData\Local\Temp\x.txt"), r"~\AppData\Local\Temp\x.txt");
+        assert_eq!(s(r"D:\other\x"), r"D:\other\x");
+        assert_eq!(s(r"src\rel.ps1"), r"src\rel.ps1");
+        // The Unix rules never treat a drive path as absolute.
+        assert_eq!(shorten_in(r"C:\Users\Haseeb\a", Some(cwd), Some(home), false), r"C:\Users\Haseeb\a");
+    }
+
+    #[test]
+    fn a_dot_component_after_the_cwd_is_dropped() {
+        let b = base();
+        assert_eq!(b.shorten("/home/u/Projects/synaps/./src/main.rs"), "src/main.rs");
+        assert_eq!(b.shorten("/home/u/Projects/synaps/."), ".");
+        assert_eq!(b.shorten("/home/u/Projects/synaps/.hidden"), ".hidden");
     }
 
     #[test]

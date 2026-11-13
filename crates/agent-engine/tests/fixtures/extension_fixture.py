@@ -7,7 +7,7 @@ assumptions, no sockets, no network. The extension host clears the child
 environment, so ALL behavior is driven by argv:
 
   argv[1]  spy log path (append-only event log: spawn / request:<method>
-           / call:<tool> / hook:<kind> / provider:<model> / sidecar /
+           / call:<tool> / hook:<kind> / provider:<model> /
            shutdown / eof)
   argv[2]  path to a JSON array of tools to register at initialize
            (objects with name/description/input_schema)
@@ -230,6 +230,26 @@ while True:
     method = request.get("method", "")
     if method == "tool.call":
         called = str(request.get("params", {}).get("name"))
+        # Who the host says the call is for, next to the spy log (the spy
+        # event stream existing tests assert on is unchanged).
+        try:
+            with open(SPY + ".callers.jsonl", "a", encoding="utf-8") as f:
+                params = request.get("params", {})
+                json.dump({
+                    "name": called,
+                    "session_id": params.get("session_id"),
+                    "has_cwd": "cwd" in params,
+                    "cwd": params.get("cwd"),
+                    # The project the host says the call is about (recall and
+                    # capture inputs carry one; other tools' do not).
+                    "project_id": (params.get("input") or {}).get("project_id"),
+                    # The run the host says makes the call (absent key: no run).
+                    "has_caller": "caller" in params,
+                    "caller": params.get("caller"),
+                }, f)
+                f.write("\n")
+        except OSError:
+            pass
         if called == RECALL_TOOL_NAME:
             recall_calls += 1
             log("recall:%d" % recall_calls)
@@ -275,9 +295,6 @@ while True:
             "content": [{"type": "text", "text": "provider-reply"}],
             "stop_reason": "end_turn",
         })
-    elif method == "sidecar.spawn_args":
-        log("sidecar")
-        respond(request, {"args": ["--fixture-sidecar"]})
     elif method == "context_provider.recall":
         respond(request, recall_response(request.get("params", {})))
     elif method == "tool.call":

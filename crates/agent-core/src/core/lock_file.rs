@@ -53,6 +53,29 @@ fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     imp::try_lock_exclusive(file)
 }
 
+/// Try to take a lock until it is had or `wait` has run out, sleeping `poll`
+/// between tries. `attempt` returns `Ok(None)` while the lock is held
+/// elsewhere; an error ends the wait at once. `Ok(None)` from here means the
+/// wait ran out: the caller fails its operation, it never goes on unlocked.
+/// The lock is always tried at least once, so a zero `wait` never waits.
+pub fn lock_within<T>(
+    wait: std::time::Duration,
+    poll: std::time::Duration,
+    mut attempt: impl FnMut() -> io::Result<Option<T>>,
+) -> io::Result<Option<T>> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Some(lock) = attempt()? {
+            return Ok(Some(lock));
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(poll.min(deadline - now));
+    }
+}
+
 #[cfg(not(windows))]
 mod imp {
     pub(super) fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {

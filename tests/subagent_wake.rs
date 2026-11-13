@@ -508,7 +508,6 @@ fn live_reactive_subagent_end_to_end() {
                 launch_cancel: None,
                 memory_backend: None,
                 telemetry: None,
-                watcher_exit_path: None,
                 tool_register_tx: None,
                 session_manager: None,
                 subagent_registry: Some(Arc::clone(&registry)),
@@ -520,12 +519,13 @@ fn live_reactive_subagent_end_to_end() {
                 tool_activation: None,
                 mcp_leases: None,
                 extension_leases: None,
-                memory_context: None,
                 cwd: None,
                 env: None,
                 env_stripped: Vec::new(),
                 env_warned: Default::default(),
                 session_id: None,
+                hook_bus: None,
+                continuation: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,
@@ -595,7 +595,6 @@ fn live_reactive_subagent_end_to_end() {
                 launch_cancel: None,
                 memory_backend: None,
                 telemetry: None,
-                watcher_exit_path: None,
                 tool_register_tx: None,
                 session_manager: None,
                 subagent_registry: Some(Arc::clone(&registry)),
@@ -607,12 +606,13 @@ fn live_reactive_subagent_end_to_end() {
                 tool_activation: None,
                 mcp_leases: None,
                 extension_leases: None,
-                memory_context: None,
                 cwd: None,
                 env: None,
                 env_stripped: Vec::new(),
                 env_warned: Default::default(),
                 session_id: None,
+                hook_bus: None,
+                continuation: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,
@@ -717,56 +717,22 @@ fn c2_reap_finished_poison_safe() {
     reap_finished(&registry, None);
 }
 
-// ── C3: agent idle_should_wait reactive wait ──────────────────────────────────
+// ── C3: reactive wait ─────────────────────────────────────────────────────────
 //
-// Verify that `idle_should_wait` integrates correctly with the real EventQueue
-// notified() path: when a subagent completion event arrives, a waiter wakes
-// and sees the event via drain.
-
-/// C3-S1: idle_should_wait returns false when registry empty + queue empty.
-#[test]
-fn c3_idle_should_wait_no_children_no_events() {
-    use agent_engine::engine::reactor::idle_should_wait;
-    use agent_engine::events::EventQueue;
-    let q = Arc::new(EventQueue::new(16));
-    assert!(!idle_should_wait(false, q.len()));
-}
-
-/// C3-S2: idle_should_wait true when queue has items.
-#[test]
-fn c3_idle_should_wait_queue_has_items() {
-    use agent_engine::engine::reactor::idle_should_wait;
-    use agent_engine::events::types::Event;
-    use agent_engine::events::EventQueue;
-    let q = Arc::new(EventQueue::new(16));
-    q.push(Event::simple("test", "ping", None)).unwrap();
-    assert!(idle_should_wait(false, q.len()));
-}
-
-/// C3-S3: idle_should_wait true when children running.
-#[test]
-fn c3_idle_should_wait_children_running() {
-    use agent_engine::engine::reactor::idle_should_wait;
-    use agent_engine::events::EventQueue;
-    let q = Arc::new(EventQueue::new(16));
-    assert!(idle_should_wait(true, q.len())); // queue empty, but children running
-}
+// A waiter on the real EventQueue's notified() path wakes when a subagent
+// completion event arrives and sees the event via drain.
 
 /// C3-S4: notified() wakes within timeout when event pushed (drain + inject path).
 #[tokio::test]
 async fn c3_notified_wakes_when_event_arrives() {
     use agent_core::SharedMessage;
-    use agent_engine::engine::reactor::{drain_event_queue, idle_should_wait};
+    use agent_engine::engine::reactor::drain_event_queue;
     use agent_engine::events::types::Event;
     use agent_engine::events::EventQueue;
     use std::sync::Arc;
 
     let q = Arc::new(EventQueue::new(16));
     let q2 = Arc::clone(&q);
-
-    // Simulate: no children, no events → would not wait (idle_should_wait=false)
-    // But if we pretend children_running=true, we wait. Then the "finalizer" pushes.
-    assert!(!idle_should_wait(false, q.len()));
 
     // Spawn a task that pushes an event after 50ms (simulating finalizer)
     tokio::spawn(async move {

@@ -1,7 +1,8 @@
 //! `synaps attach [ID] [--create] [--continue X]` — thin line client over
 //! `SocketTransport` (PLAN-phase2 §2.11, B5).
 //!
-//! stdin lines → `Submit` (or `Steer` while streaming); `/abort` → `Cancel`;
+//! stdin lines → `Submit` (or `Steer` while streaming; `//text` sends
+//! `/text`, any other unknown `/name` is never sent); `/abort` → `Cancel`;
 //! `/detach` or Ctrl-C → `Detach` (the turn keeps running); `/sessions`;
 //! prompts render as `[prompt #id] title: prompt > ` (echo off for Secret) or,
 //! for `PromptKind::Confirm`, `[confirm #id] title\n<body>\n(y/n): ` with echo
@@ -43,6 +44,16 @@ pub(crate) struct AttachArgs {
     /// at once). With --create / --continue.
     #[arg(long = "name", value_name = "NAME")]
     pub name: Option<String>,
+    /// Create an OWNED session, bound to this client: it ends (any running
+    /// turn cancelled, the journal kept) when this client exits or
+    /// disconnects. Implies --create.
+    #[arg(long, conflicts_with_all = ["id", "keep_warm"])]
+    pub owned: bool,
+    /// With --owned: also forward this shell's secret env vars (GH_TOKEN,
+    /// AWS_* …, normally stripped) so the session's tools see them. Held in
+    /// the daemon's memory only, never written to disk.
+    #[arg(long = "forward-secrets", requires = "owned")]
+    pub forward_secrets: bool,
 }
 
 impl AttachArgs {
@@ -206,7 +217,7 @@ impl Client {
             "/new" => {
                 let _ = self.t.send(SessionCommand::NewSession).await;
             }
-            "/help" => self.out("/detach /close [force] /abort /save /new /sessions /model NAME /cmd NAME [ARG] /auto ARGS /pin on|off (alias /keep-warm on|off)\n"),
+            "/help" => self.out("/detach /close [force] /abort /save /new /sessions /model NAME /cmd NAME [ARG] /auto ARGS /pin on|off (alias /keep-warm on|off); //TEXT sends /TEXT\n"),
             // C1 (P9): arm a driver headlessly. Mirrors the TUI's `/auto` →
             // `DriverStart` routing (dispatch.rs) but without an in-process
             // ExtensionManager: the actor validates `session.drive` on
@@ -236,10 +247,12 @@ impl Client {
                 let _ = self.t.send(SessionCommand::Set { id: 0, setting: SessionSetting::Model { model } }).await;
             }
             text => {
-                let cmd = if self.streaming {
-                    SessionCommand::Steer { text: text.to_string() }
-                } else {
-                    SessionCommand::Submit { text: text.to_string(), attachments: vec![] }
+                let cmd = match text_command(text, self.streaming) {
+                    Ok(cmd) => cmd,
+                    Err(name) => {
+                        self.out(&format!("[unknown command: /{name} (try /help)]\n"));
+                        return true;
+                    }
                 };
                 match self.t.send(cmd).await {
                     Ok(()) => {}
@@ -250,6 +263,30 @@ impl Client {
         }
         true
     }
+}
+
+/// A stdin line no verb above matched: `Submit`, or `Steer` while
+/// streaming. `//text` sends `/text`; a bare `/` is text. Any other `/name`
+/// is `Err(name)`: an unknown command, never sent (the line may hold a
+/// secret).
+fn text_command(text: &str, streaming: bool) -> Result<SessionCommand, &str> {
+    let text = match text.strip_prefix('/') {
+        Some(rest) if rest.starts_with('/') => rest,
+        Some(rest) if !rest.is_empty() => {
+            return Err(rest.split(char::is_whitespace).next().unwrap_or(""))
+        }
+        _ => text,
+    };
+    Ok(if streaming {
+        SessionCommand::Steer {
+            text: text.to_string(),
+        }
+    } else {
+        SessionCommand::Submit {
+            text: text.to_string(),
+            attachments: vec![],
+        }
+    })
 }
 
 /// C1 (P9): parse an `/auto [ARGS]` line into a `DriverStart` triple. The
@@ -326,7 +363,7 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_na
     }
 
     let mode = args.attach_mode();
-    let attach = if args.create || args.continue_session.is_some() {
+    let attach = if args.create || args.continue_session.is_some() || args.owned {
         Attach::Create {
             config: SessionConfig {
                 continue_session: args.continue_session.clone().map(Some),
@@ -338,6 +375,7 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_na
                 ..Default::default()
             },
             mode,
+            owned: args.owned.then(|| OwnedCreate { forward_secrets: args.forward_secrets.then(capture_client_secrets) }),
         }
     } else if let Some(id) = &args.id {
         let id = resolve_id(&conn.welcome.sessions, id).unwrap_or_else(|| SessionId::from(id.as_str()));
@@ -348,6 +386,7 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_na
         Attach::Create {
             config: SessionConfig { cwd: Some(client_cwd), keep_warm: args.keep_warm, ..Default::default() },
             mode,
+            owned: None,
         }
     } else {
         eprintln!("several sessions; pick one:");
@@ -390,7 +429,11 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_na
             _ = tokio::signal::ctrl_c() => {
                 if c.streaming {
                     if c.quit_guard.press(std::time::Instant::now()) {
-                        c.out("\n[detaching; the session keeps running]\n");
+                        c.out(if c.t.is_session_owner() {
+                            "\n[leaving; this owned session ends with its turn cancelled]\n"
+                        } else {
+                            "\n[detaching; the session keeps running]\n"
+                        });
                         break;
                     } else {
                         eprintln!("\n{}", agent_tui::tui::quit_guard::NOTICE_LINE);
@@ -543,6 +586,11 @@ mod tests {
         let a = Cli::parse_from(["attach", "--create", "--name", "ambient"]).args;
         assert!(a.create);
         assert_eq!(a.name.as_deref(), Some("ambient"));
+        let a = Cli::parse_from(["attach", "--owned", "--forward-secrets"]).args;
+        assert!(a.owned && a.forward_secrets && !a.create);
+        assert!(Cli::try_parse_from(["attach", "--forward-secrets"]).is_err(), "--forward-secrets needs --owned");
+        assert!(Cli::try_parse_from(["attach", "--owned", "--keep-warm"]).is_err(), "an owned session cannot be pinned");
+        assert!(Cli::try_parse_from(["attach", "abc", "--owned"]).is_err(), "--owned creates");
     }
 
     #[test]
@@ -557,6 +605,34 @@ mod tests {
         assert_eq!(a, "");
         let (_, _, a) = parse_auto_command("/auto   ");
         assert_eq!(a, "");
+    }
+
+    /// An unknown `/name` line is never sent, idle or streaming: it may hold
+    /// a secret. `//text` sends `/text`; plain text and a bare `/` are text.
+    #[test]
+    fn unknown_slash_lines_are_never_sent() {
+        for streaming in [false, true] {
+            let sent = |line: &str| match text_command(line, streaming) {
+                Ok(SessionCommand::Steer { text }) if streaming => text,
+                Ok(SessionCommand::Submit { text, attachments })
+                    if !streaming && attachments.is_empty() =>
+                {
+                    text
+                }
+                Ok(other) => panic!("{line:?} streaming={streaming}: {other:?}"),
+                Err(name) => panic!("{line:?} streaming={streaming}: unknown /{name}"),
+            };
+            assert_eq!(
+                text_command("/nosuch secret-value", streaming).err(),
+                Some("nosuch")
+            );
+            assert_eq!(text_command("/nosuch", streaming).err(), Some("nosuch"));
+            assert_eq!(text_command("/ secret-value", streaming).err(), Some(""));
+            assert_eq!(sent("//x"), "/x");
+            assert_eq!(sent("//etc/hosts is wrong"), "/etc/hosts is wrong");
+            assert_eq!(sent("fix the tests"), "fix the tests");
+            assert_eq!(sent("/"), "/");
+        }
     }
 }
 
