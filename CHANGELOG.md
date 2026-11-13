@@ -166,10 +166,13 @@ All notable changes to this project will be documented in this file.
   name, title (cut to 120 characters), model, cwd, times, message count and
   `live` (the daemon holds that journal). `named_only` and `limit` (default
   200, at most 1000) filter the list, and `truncated` says more matched.
-  It's additive with no protocol bump. A daemon that has it lists
-  `saved_sessions` in `Welcome.features`; an older one answers the frame
-  with "unknown variant". Resume a row with `Attach::Create` and
-  `continue_session` set to its id or name.
+  A named conversation is never hidden as noise. The daemon reads the
+  catalog one load at a time on one thread, and a slow read never holds up
+  another connection, a command or a reload. It's additive with no
+  protocol bump. A daemon that has it lists `saved_sessions` in
+  `Welcome.features`; an older one answers the frame with "unknown
+  variant". Resume a row with `Attach::Create` and `continue_session` set
+  to its id.
   [docs/daemon-mode.md](docs/daemon-mode.md#listing-saved-sessions-saved_sessions)
 
 ### Changed

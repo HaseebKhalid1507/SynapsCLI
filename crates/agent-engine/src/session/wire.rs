@@ -224,14 +224,16 @@ pub enum ClientFrame {
     /// attached connection, like `Sessions`): the SAVED sessions on disk,
     /// named ones included, whether or not this daemon holds them — what
     /// the TUI's `/sessions` Past tab lists, one row per conversation (a
-    /// compacted predecessor folds into its chain head). Newest
+    /// compacted predecessor folds into its chain head; a named one is
+    /// never hidden as noise). Newest
     /// `updated_at` first, at most `limit` rows (absent = 200, capped at
     /// 1000). `named_only` keeps named conversations only. Reply:
     /// `SavedSessionList`, or `Error` if the sessions dir cannot be read.
     /// Gated on [`FEATURE_SAVED_SESSIONS`]: an older daemon answers `Error`
     /// "malformed frame: unknown variant `saved_sessions`, ..." and keeps
     /// the connection usable. Resume a row with `Attach::Create` and
-    /// `config.continue_session: Some(Some(id or name))`.
+    /// `config.continue_session: Some(Some(id))` (by id: a `/chain name`
+    /// can shadow a session name).
     SavedSessions {
         #[serde(default)]
         named_only: bool,
@@ -517,14 +519,15 @@ pub enum DaemonFrame {
 }
 
 /// One saved conversation in `SavedSessionList` (its chain head when it was
-/// compacted). Headers only: never message bodies beyond the title, never
-/// credentials.
+/// compacted). Headers only: never message bodies beyond the title (the
+/// user's own text, one line, no control characters), never credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedSessionInfo {
     /// Journal id of the chain head (`20261110-202033-64fb`); what
     /// `continue_session` takes.
     pub id: String,
-    /// The head's name, else the newest named predecessor's.
+    /// The head's name, else the newest named predecessor's. For display;
+    /// resume by `id`.
     #[serde(default)]
     pub name: Option<String>,
     /// Header title, else the first user message, trimmed to
@@ -2462,14 +2465,18 @@ mod tests {
     fn saved_sessions_is_a_feature_and_older_daemons_reject_it_as_an_unknown_variant() {
         assert!(daemon_features().iter().any(|f| f == FEATURE_SAVED_SESSIONS));
         assert_eq!(FEATURE_SAVED_SESSIONS, "saved_sessions");
-        #[derive(Debug, Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
-        enum OldClientFrame {
-            Ping,
-            Sessions,
-        }
-        let err = decode_line::<OldClientFrame>(r#"{"type":"saved_sessions","named_only":true,"limit":200}"#).unwrap_err();
-        assert!(err.contains("unknown variant `saved_sessions`"), "{err}");
+        // This build decodes the frame...
+        let frame = r#"{"type":"saved_sessions","named_only":true,"limit":200}"#;
+        assert!(matches!(
+            decode_line::<ClientFrame>(frame),
+            Ok(ClientFrame::SavedSessions { named_only: true, limit: Some(200) })
+        ));
+        // ...and an unknown type gets the error a daemon without it sends
+        // for `saved_sessions` (the conn loop's `malformed frame: {e}`),
+        // which now lists it as known.
+        let err = decode_line::<ClientFrame>(r#"{"type":"saved_sessions_v2"}"#).unwrap_err();
+        assert!(err.contains("unknown variant `saved_sessions_v2`, expected one of"), "{err}");
+        assert!(err.contains("`saved_sessions`"), "{err}");
         let dbg = format!("{:?}", ClientFrame::SavedSessions { named_only: true, limit: Some(5) });
         assert_eq!(dbg, "SavedSessions { named_only: true, limit: Some(5) }");
     }

@@ -7,6 +7,8 @@
 mod phase2;
 
 use std::path::Path;
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -164,7 +166,8 @@ async fn saved_sessions_lists_conversations_and_a_name_resumes_through_the_daemo
     let two = list(&sock, false, Some(2)).await;
     assert_eq!(two.sessions.len(), 2);
     assert!(two.truncated);
-    assert_eq!(ids(&two), ids(&all)[..2]);
+    // DELTA, held, may have been saved (moved up) since `all`.
+    assert!(order_without(&all, DELTA).starts_with(&order_without(&two, DELTA)), "{:?}", ids(&two));
     let exact = list(&sock, false, Some(4)).await;
     assert!(!exact.truncated, "exactly `limit` matched");
     let named_two = list(&sock, true, Some(2)).await;
@@ -172,5 +175,135 @@ async fn saved_sessions_lists_conversations_and_a_name_resumes_through_the_daemo
 
     drop(t);
     SocketTransport::shutdown(&sock, false).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), d.wait()).await.expect("daemon wait");
+}
+
+/// A raw client, to drive the frames by hand.
+struct Raw {
+    r: BufReader<agent_engine::ipc::ClientReadHalf>,
+    w: agent_engine::ipc::ClientWriteHalf,
+}
+
+impl Raw {
+    async fn hello(p: &Path) -> Self {
+        let (r, w) = agent_engine::ipc::split_client(agent_engine::ipc::connect(p).await.unwrap());
+        let mut c = Self { r: BufReader::new(r), w };
+        c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+        assert!(matches!(c.recv().await, Some(DaemonFrame::Welcome(_))));
+        c
+    }
+    async fn send(&mut self, f: &ClientFrame) {
+        self.w.write_all(encode_line(f).unwrap().as_bytes()).await.unwrap();
+    }
+    /// `None` = EOF.
+    async fn recv(&mut self) -> Option<DaemonFrame> {
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), self.r.read_line(&mut line)).await.expect("timely").unwrap();
+        (n > 0).then(|| decode_line(line.trim_end()).unwrap())
+    }
+    /// The next frame that is not a session event.
+    async fn recv_reply(&mut self) -> Option<DaemonFrame> {
+        loop {
+            match self.recv().await {
+                Some(DaemonFrame::Event(_)) => continue,
+                other => return other,
+            }
+        }
+    }
+}
+
+async fn wait_requests(d: &Daemon, n: usize) {
+    let t0 = std::time::Instant::now();
+    while d.state.saved.requests() < n {
+        assert!(t0.elapsed() < Duration::from_secs(10), "{} of {n} requests reached the daemon", d.state.saved.requests());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Many clients listing at once cost the daemon ONE catalog load (one
+/// blocking thread, no pool); each gets the full answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn concurrent_listings_share_one_catalog_load() {
+    let guard = HomeGuard::new();
+    seed_home(&guard);
+    let d = start(&guard).await;
+    let sock = d.paths.sock.clone();
+    let held = d.state.saved.hold().await;
+    let n = 12;
+    let jobs: Vec<_> = (0..n)
+        .map(|i| {
+            let sock = sock.clone();
+            tokio::spawn(async move { list(&sock, i % 2 == 0, None).await })
+        })
+        .collect();
+    wait_requests(&d, n).await;
+    assert_eq!(d.state.saved.loads(), 0);
+    drop(held);
+    for (i, j) in jobs.into_iter().enumerate() {
+        let l = j.await.unwrap();
+        let want: &[&str] = if i % 2 == 0 { &[ALPHA, GAMMA, DELTA] } else { &[ALPHA, BRAVO, GAMMA, DELTA] };
+        assert_eq!(ids(&l), want, "request {i}");
+    }
+    assert_eq!(d.state.saved.loads(), 1, "{n} concurrent requests, one load");
+    d.shutdown_token().cancel();
+    tokio::time::timeout(Duration::from_secs(20), d.wait()).await.expect("daemon wait");
+}
+
+/// On an attached connection the listing is answered, and a slow one
+/// (the loader held) blocks nothing: the client's frames are still read
+/// (`Ping` → `Pong`) and a reload still says `Bye{Reloading}` at once,
+/// with no listing after it. A control connection waiting on a listing
+/// gets its `Bye{Reloading}` too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_slow_listing_never_holds_up_commands_or_a_reload() {
+    let guard = HomeGuard::new();
+    seed_home(&guard);
+    let d = start(&guard).await;
+    let sock = d.paths.sock.clone();
+
+    let mut a = Raw::hello(&sock).await;
+    let config = SessionConfig { cwd: Some(guard.home.path().to_path_buf()), env: None, persist: false, ..Default::default() };
+    a.send(&ClientFrame::Attach(Attach::create(config, AttachMode::Mirror))).await;
+    loop {
+        match a.recv().await.expect("attached") {
+            DaemonFrame::Attached(_) => break,
+            DaemonFrame::Event(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    a.send(&ClientFrame::SavedSessions { named_only: true, limit: Some(2) }).await;
+    match a.recv_reply().await {
+        Some(DaemonFrame::SavedSessionList { sessions, truncated }) => {
+            assert_eq!(sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), [ALPHA, GAMMA]);
+            assert!(truncated);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let held = d.state.saved.hold().await;
+    let before = d.state.saved.requests();
+    a.send(&ClientFrame::SavedSessions { named_only: false, limit: None }).await;
+    let mut c = Raw::hello(&sock).await;
+    c.send(&ClientFrame::SavedSessions { named_only: false, limit: None }).await;
+    wait_requests(&d, before + 2).await;
+    a.send(&ClientFrame::Ping).await;
+    assert!(matches!(a.recv_reply().await, Some(DaemonFrame::Pong { .. })), "frames are read while the catalog loads");
+
+    let t0 = std::time::Instant::now();
+    d.state.fire_announce();
+    for (who, conn) in [("attached", &mut a), ("control", &mut c)] {
+        match conn.recv_reply().await {
+            Some(DaemonFrame::Bye { reason: Some(ByeReason::Reloading { .. }) }) => {}
+            other => panic!("{who}: {other:?}"),
+        }
+        let rest = conn.recv().await;
+        assert!(rest.is_none(), "{who}: nothing after the Bye: {rest:?}");
+    }
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    drop(held);
+    d.state.reset_announce();
+    d.shutdown_token().cancel();
     tokio::time::timeout(Duration::from_secs(20), d.wait()).await.expect("daemon wait");
 }

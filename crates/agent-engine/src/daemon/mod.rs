@@ -227,6 +227,9 @@ pub struct DaemonState {
     pub pins: Arc<pins::PinBook>,
     /// A cold start's pin restore is running (holds the idle exit).
     pub restoring: AtomicBool,
+    /// `SavedSessions`: one catalog load at a time, shared by the requests
+    /// that arrive while it runs.
+    pub saved: saved::SavedLoader,
 }
 
 impl DaemonState {
@@ -451,6 +454,7 @@ impl Daemon {
             meta,
             pins: Arc::new(pins::PinBook::for_active_profile()),
             restoring: AtomicBool::new(false),
+            saved: saved::SavedLoader::default(),
         });
         state.host.set_pin_sink(Arc::clone(&state.pins) as Arc<dyn crate::session::PinSink>);
 

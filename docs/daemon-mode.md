@@ -498,10 +498,18 @@ D: {"type":"saved_session_list","sessions":[{"id":"20261110-202033-64fb","name":
   (`session_catalog::load_catalog` and its noise rules: no junk ids, no
   sandbox cwds, no sessions under 3 messages), read from the daemon's
   profile. One row per conversation: a compacted predecessor folds into its
-  chain head (`compacted_into`), the row's `id` is the head's, `name` the
-  head's (else the newest named predecessor's), and `created_at` the chain's
-  first session's. A chain head, or a session the daemon holds, is not
-  hidden for having few messages. A broken chain (a cycle) is not listed.
+  chain head (`compacted_into`, however long the chain), the row's `id` is
+  the head's, `name` the head's (else the newest named predecessor's), and
+  `created_at` the chain's first session's. A chain that loops back on
+  itself is not listed. A chain whose successor is missing from disk ends
+  at the last session there; resuming that row reports the missing
+  successor.
+- The noise rules never hide a NAMED conversation: names are unique, so a
+  hidden named session would block its name while nobody could see it. An
+  unnamed one is judged on the cwd the row shows (a successor's
+  predecessor's, when the successor has none of its own). A compacted
+  chain, or a session the daemon holds, is not hidden for having few
+  messages either: a fresh successor holds just the summary.
 - Unlike the Past tab, sessions the daemon holds stay in the list:
   `live: true` when it holds a session on that journal
   (`SessionMeta.journal_id`, which is not the session id after a
@@ -510,15 +518,22 @@ D: {"type":"saved_session_list","sessions":[{"id":"20261110-202033-64fb","name":
   only. `limit` defaults to 200 and is capped at 1000; `truncated` is set
   when more rows matched.
 - `title` is the header title, else the first user message (from the
-  preview cache, when it is fresh), on one line, at most 120 characters.
-  `name`, `cwd` and `message_count` may be `null`. Headers only: no message
-  bodies past the title, nothing secret.
-- The catalog read runs on a blocking thread; it delays only the
-  connection that asked. An unreadable sessions dir is `error`.
+  preview cache the TUI keeps; the daemon never builds it, so it may be
+  empty), on one line with no control characters, at most 120 characters.
+  `name`, `cwd` and `message_count` may be `null`. Times are RFC 3339 and
+  may carry fractional seconds. Headers only: no message bodies past the
+  title, but the title is the user's own text.
+- The catalog is read on one blocking thread, one load at a time for the
+  whole daemon: a request that arrives while a load runs waits for it and
+  shares its result. On a control connection the wait still answers stop
+  and reload with their `bye`; on an attached one the listing runs beside
+  the connection, so commands, reload and the session's end are never
+  held up by it. An unreadable sessions dir is `error`.
 - To resume a row, `attach` with `attach:"create"` and
-  `config.continue_session` set to its `id` or `name` (resolved like
-  `--continue`: chain → name → id, then `compacted_into` forward). A
-  session the daemon already holds is attached to, not opened twice.
+  `config.continue_session` set to its `id` (resolved like `--continue`,
+  then `compacted_into` forward). A session the daemon already holds is
+  attached to, not opened twice. Resume by `id`: `name` is for display. A
+  name also resolves, but a `/chain name` of the same text wins over it.
 - `SocketTransport::saved_sessions` / `Connected::saved_sessions` wrap it
   and return `DaemonTooOld` without sending anything when the daemon does
   not list the feature.
