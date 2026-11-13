@@ -499,7 +499,7 @@ fn cancel_pending_temp(temp_dir: &std::path::Path) {
 }
 
 /// If the manifest at `final_dir/.synaps-plugin/plugin.json` declares
-/// `provides.sidecar.setup`, run it. Returns:
+/// `extension.setup`, run it. Returns:
 /// - `Ok(None)` if no setup is declared (nothing to do)
 /// - `Ok(Some(log_path))` if setup ran successfully (caller may surface
 ///   the log path as informational)
@@ -1923,7 +1923,7 @@ mod tests {
     }
 
     /// Slice B: post-install setup hook runs the manifest's
-    /// `provides.sidecar.setup` script after `finalize_pending_install`.
+    /// `extension.setup` script after `finalize_pending_install`.
     /// Test it via the helper directly (`run_post_install_setup_for_dir`)
     /// so we don't have to spin up a whole install flow with a real git
     /// fixture just to assert the hook fires.
@@ -1939,7 +1939,7 @@ mod tests {
         std::fs::create_dir_all(&synaps_dir).unwrap();
         std::fs::write(
             synaps_dir.join("plugin.json"),
-            r#"{"name":"hook-test","provides":{"sidecar":{"command":"bin/x","setup":"scripts/setup.sh","protocol_version":1}}}"#,
+            r#"{"name":"hook-test","extension":{"runtime":"process","command":"python3","setup":"scripts/setup.sh"}}"#,
         ).unwrap();
         let scripts = plugin_dir.path().join("scripts");
         std::fs::create_dir(&scripts).unwrap();
@@ -2004,7 +2004,7 @@ mod tests {
         std::fs::create_dir_all(&synaps_dir).unwrap();
         std::fs::write(
             synaps_dir.join("plugin.json"),
-            r#"{"name":"fail-test","provides":{"sidecar":{"command":"bin/x","setup":"fail.sh","protocol_version":1}}}"#,
+            r#"{"name":"fail-test","extension":{"runtime":"process","command":"python3","setup":"fail.sh"}}"#,
         ).unwrap();
         let setup = plugin_dir.path().join("fail.sh");
         std::fs::write(&setup, "#!/bin/bash\necho boom\nexit 13\n").unwrap();

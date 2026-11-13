@@ -844,9 +844,15 @@ fn classify_stream_outcome(
 /// Extensible — new flags go here instead of adding parameters to 4 signatures.
 #[derive(Debug, Clone, Default)]
 pub struct ApiOptions {
-    /// Immutable host binding for extension-provider interior tool execution.
-    /// `None` is only for internal/test callers without a runtime capability.
-    pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
+    /// What the tool calls of this turn are given, for the tool loop of an
+    /// extension-provided model (`openai::extension_route`): the very
+    /// [`TurnToolContext`](crate::tools::TurnToolContext) the stream loop
+    /// makes its own tools' contexts from, so that loop's
+    /// tools run in the chat's folder with the chat's environment, for the
+    /// chat. `None` (keep-warm pings, compaction, tests): a request that
+    /// runs no tool for a chat; a tool that loop runs then gets
+    /// `TurnToolContext::no_chat`.
+    pub tool_context: Option<crate::tools::TurnToolContext>,
     /// Opt into the 1M context window beta header.
     pub use_1m_context: bool,
     /// Configured prompt-cache TTL (spec: cache-ttl). Resolved to a wire
@@ -917,7 +923,7 @@ pub struct ApiOptions {
     pub telemetry: Option<crate::runtime::telemetry::TelemetryWriter>,
     /// Runtime-scoped tool-session identity (Task 16). Scopes the execution
     /// gate for extension-provider interior tool loops reached through
-    /// `try_route`. Stream turns (and `run_single`) thread the Runtime's
+    /// `try_route`. Stream turns thread the Runtime's
     /// host session; `None` (internal helpers, tests) makes the extension
     /// route fail closed to a locally minted identity with the identical
     /// default-core policy — never to ungated execution.
@@ -1302,7 +1308,7 @@ impl ApiMethods {
                     options.codex_request_role,
                     options.tool_session_id.as_ref(),
                     options.session_tool_set.as_ref(),
-                    options.memory_backend.as_ref(),
+                    options.tool_context.as_ref(),
                     &options.trace,
                     options.suppress_stream_deltas,
                 )

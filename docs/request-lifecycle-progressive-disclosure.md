@@ -24,6 +24,34 @@ other dynamically registered capabilities remain cataloged but absent from the
 request until an exact session activation is authorized. Subagent registries do
 not gain the activation gateways.
 
+## Always-loaded tools
+
+`tools.always_loaded` adds chosen tools to that core, so the model has them
+from the first request without calling `activate_tools`:
+
+```text
+tools.always_loaded = ext.axel:search, ext.axel:recall, builtin:subagent
+```
+
+- **Ids** are canonical `namespace:name`, exactly as `activate_tools` and
+  `search_tools` show them (`builtin:…`, `ext.<extension>:…`,
+  `mcp.<server>:…`, `plugin.<plugin>:…`). A malformed id is reported as a
+  config warning and skipped; the rest of the list still applies.
+- **Trust:** a listed tool joins only if activation could grant it — a
+  verified source whose provenance matches (`is_activatable_record`). An
+  `Unverified` tool is never loaded, listed or not.
+- **Absent ids are skipped, not errors.** The core is re-derived whenever the
+  catalog changes (turn start and the round-top rebuild), so an extension
+  that registers its tools after the session started gets its listed tools
+  loaded at the next request, and a listed tool that disappears (extension
+  unloaded, `disabled_tools`) leaves the core fail-closed, as any core tool.
+- **Everywhere the progressive core is built:** foreground, daemon sessions,
+  keep-warm pings and subagent runtimes take the same list from config.
+  (Workers currently run without disclosure, so they already load everything.)
+- **Without disclosure** the key changes nothing: every trusted tool is
+  already loaded. Each listed tool's schema is part of the cached prefix of
+  every request, so keep the list short.
+
 Skill *tool schemas* are handled here. Lazy reading of dormant skill bodies is a
 separate Task 21 concern; this flag does not claim that boot is body-lazy yet.
 

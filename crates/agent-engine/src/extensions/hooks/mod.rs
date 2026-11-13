@@ -4,6 +4,10 @@
 //! Without any handlers, `emit()` is a no-op fast path (<1µs).
 //!
 //! Tool-specific hooks filter by tool name before dispatching.
+//!
+//! Notify-only kinds ([`HookKind::is_notification`]) go out through
+//! [`HookBus::notify`]: the caller does not wait, and no handler can delay,
+//! fail or change what the caller is doing.
 
 pub mod events;
 
@@ -12,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
+use futures::FutureExt;
 use tokio::sync::RwLock;
 
 use self::events::{HookEvent, HookKind, HookResult};
@@ -20,6 +25,12 @@ use crate::extensions::permissions::{Permission, PermissionSet};
 
 /// Default timeout for a single hook handler call.
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Most [`HookBus::notify`] deliveries in flight on one bus. A notify-only
+/// event that arrives while this many are still being delivered is dropped,
+/// never queued, so handlers that are slow while events keep coming cost at
+/// most this many tasks, each ended by [`HANDLER_TIMEOUT`].
+const NOTIFY_MAX_IN_FLIGHT: usize = 64;
 
 fn extensions_trace_enabled() -> bool {
     std::env::var("SYNAPS_EXTENSIONS_TRACE")
@@ -98,6 +109,12 @@ pub struct HandlerRegistration {
     pub permissions: PermissionSet,
 }
 
+impl std::fmt::Debug for HookBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookBus").finish_non_exhaustive()
+    }
+}
+
 /// The central hook dispatcher.
 ///
 /// Thread-safe: uses `RwLock` so multiple concurrent emitters can read
@@ -124,6 +141,9 @@ pub struct HookBus {
     /// `Some(host)`: this bus is a subagent worker's view of `host`
     /// ([`Self::worker_transforms`]) and has no handlers of its own.
     transforms_of: Option<Arc<HookBus>>,
+    /// One permit per [`Self::notify`] delivery in flight
+    /// ([`NOTIFY_MAX_IN_FLIGHT`]).
+    notify_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl HookBus {
@@ -134,6 +154,7 @@ impl HookBus {
             session_injection: RwLock::new(HashMap::new()),
             generations: std::sync::Mutex::new(HashMap::new()),
             transforms_of: None,
+            notify_slots: Arc::new(tokio::sync::Semaphore::new(NOTIFY_MAX_IN_FLIGHT)),
         }
     }
 
@@ -593,6 +614,9 @@ impl HookBus {
     ///     fire-and-forget notification calls (deck, d20, jawz-widget,
     ///     synaps-tasks all write to their own stores independently).
     ///
+    /// The notify-only kinds do not come through here: [`notify`](Self::notify)
+    /// delivers to each handler on its own.
+    ///
     /// **Do NOT use for** `before_tool_call` / `after_tool_call` / `before_message`
     /// hooks where `Block` / `Modify` / `Replace` / `Inject` semantics require a
     /// defined winner when two handlers disagree — `join_all` completion order is
@@ -715,6 +739,149 @@ impl HookBus {
         } else {
             HookResult::Continue
         }
+    }
+
+    /// Deliver a notify-only event ([`HookKind::is_notification`]) without
+    /// waiting for anyone. Returns at once and cannot fail: the caller's
+    /// work is already done and no handler can delay, fail or change it.
+    ///
+    /// The handlers run concurrently on one detached task, each under
+    /// [`HANDLER_TIMEOUT`], so the task ends within that time of the event
+    /// being ready and holds nothing of the caller's. Every result, error,
+    /// timeout and panic is ignored, and costs the other handlers nothing
+    /// ([`Self::notify_with`]). Delivery is best effort and unordered; the
+    /// event is dropped when
+    ///
+    /// - nobody subscribes to the kind (then nothing is spawned at all),
+    /// - this is a worker's view ([`Self::worker_transforms`]),
+    /// - [`NOTIFY_MAX_IN_FLIGHT`] deliveries are still in flight (logged),
+    /// - there is no Tokio runtime to deliver on, or it shuts down first.
+    ///
+    /// A handler that is stopped is not started again by a late delivery
+    /// (`ProcessExtension::shutdown` is terminal).
+    pub fn notify(self: &Arc<Self>, event: HookEvent) {
+        self.notify_with(event.kind, async move { Some(event) });
+    }
+
+    /// [`Self::notify`] for events that cost something to build (a file
+    /// lookup): `events` runs on the detached task, inside the same in-flight
+    /// limit, and is not polled at all when the delivery would be dropped.
+    /// The build is not under the handler timeout, so it must end on its own.
+    ///
+    /// What it yields is `None`, `Some(event)` or a `Vec` of events. Several
+    /// are one delivery, on the one task: every handler is sent them in that
+    /// order, the next once it has answered the one before. So a caller with
+    /// many events to send takes one in-flight slot, not one each, and
+    /// cannot have its later events dropped because its earlier ones are
+    /// still in flight. An event of another kind than `kind` is not sent.
+    ///
+    /// Each handler gets the sequence on its own. One that does not answer
+    /// an event within [`HANDLER_TIMEOUT`] is sent no more of this delivery
+    /// (logged once, with the number not sent): the request that timed out
+    /// is still in its input, and each further one would keep it busy, and
+    /// its other hooks waiting, that much longer. Nobody else's events are
+    /// held up or dropped by it, and the task ends within one timeout of
+    /// the slowest answer. A handler that panics on an event loses that
+    /// event and nothing more: it is sent the next, and the other handlers
+    /// are not touched. (That is where a panic unwinds. The release profile
+    /// aborts on any panic, here as anywhere.)
+    pub fn notify_with<F, I>(self: &Arc<Self>, kind: HookKind, events: F)
+    where
+        F: std::future::Future<Output = I> + Send + 'static,
+        I: IntoIterator<Item = HookEvent> + Send,
+        I::IntoIter: Send,
+    {
+        if !kind.is_notification() {
+            // A hook whose answer matters must be awaited (`emit`).
+            tracing::error!(hook = %kind.as_str(), "notify used for a hook that is not notify-only; nothing sent");
+            return;
+        }
+        if self.is_worker_view() || !self.may_have_subscriber(kind) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let Ok(slot) = Arc::clone(&self.notify_slots).try_acquire_owned() else {
+            tracing::warn!(
+                hook = %kind.as_str(),
+                in_flight = NOTIFY_MAX_IN_FLIGHT,
+                "Notify-only hook event dropped: earlier deliveries are still in flight"
+            );
+            return;
+        };
+        let bus = Arc::clone(self);
+        runtime.spawn(async move {
+            let _slot = slot;
+            let events: Vec<HookEvent> =
+                events.await.into_iter().filter(|event| event.kind == kind).collect();
+            bus.deliver_notifications(kind, &events).await;
+        });
+    }
+
+    /// One [`Self::notify_with`] delivery: `events`, in order, to every
+    /// handler of `kind`, the handlers independent of each other.
+    async fn deliver_notifications(&self, kind: HookKind, events: &[HookEvent]) {
+        let registrations = {
+            let handlers = self.handlers.read().await;
+            handlers.get(&kind).cloned().unwrap_or_default()
+        }; // lock dropped here, as in `emit`
+        let sequences = registrations.iter().map(|reg| async move {
+            let wanted = |event: &HookEvent| {
+                reg.tool_filter
+                    .as_deref()
+                    .is_none_or(|filter| tool_filter_matches(filter, event))
+                    && reg.matcher.as_ref().is_none_or(|m| m.matches(event))
+            };
+            for (sent, event) in events.iter().enumerate() {
+                if !wanted(event) {
+                    continue;
+                }
+                // The answer is discarded. A panic is caught here, so it ends
+                // this one call and not the task every handler shares.
+                let call = tokio::time::timeout(HANDLER_TIMEOUT, reg.handler.handle(event));
+                match std::panic::AssertUnwindSafe(call).catch_unwind().await {
+                    Ok(Ok(_answer)) => {}
+                    Ok(Err(_timeout)) => {
+                        // The host has given up on this call; the handler
+                        // has not. Sending it the rest would only add to
+                        // what it is behind by, and to the time its other
+                        // hooks time out in.
+                        let not_sent =
+                            events[sent + 1..].iter().filter(|event| wanted(event)).count();
+                        tracing::warn!(
+                            hook = %kind.as_str(),
+                            extension = %reg.handler.id(),
+                            timeout_secs = HANDLER_TIMEOUT.as_secs(),
+                            not_sent,
+                            "Notify-only hook handler timed out — the later events of this delivery are not sent to it"
+                        );
+                        break;
+                    }
+                    Err(_panic) => tracing::error!(
+                        hook = %kind.as_str(),
+                        extension = %reg.handler.id(),
+                        "Notify-only hook handler panicked — event skipped for it"
+                    ),
+                }
+            }
+        });
+        join_all(sequences).await;
+    }
+
+    /// Whether `kind` may have a subscriber, without waiting: `true` while
+    /// the handler list is being changed (the delivery task then looks).
+    fn may_have_subscriber(&self, kind: HookKind) -> bool {
+        match self.handlers.try_read() {
+            Ok(handlers) => handlers.get(&kind).is_some_and(|regs| !regs.is_empty()),
+            Err(_) => true,
+        }
+    }
+
+    /// [`Self::notify`] deliveries still in flight.
+    #[cfg(test)]
+    pub(crate) fn notifies_in_flight(&self) -> usize {
+        NOTIFY_MAX_IN_FLIGHT - self.notify_slots.available_permits()
     }
 
     /// Remove all handlers for a given extension ID.
@@ -860,6 +1027,7 @@ mod tests {
             "RAW 10k lines".to_string(),
             30_000,
             None,
+            None,
         )
         .await;
 
@@ -882,6 +1050,7 @@ mod tests {
             serde_json::json!({}),
             "RAW".to_string(),
             30_000,
+            None,
             None,
         )
         .await;
@@ -968,6 +1137,7 @@ mod tests {
             serde_json::json!({}),
             "ORIGINAL".to_string(),
             30_000,
+            None,
             None,
         )
         .await;
@@ -1908,12 +2078,13 @@ mod tests {
                 tool_activation: None,
                 mcp_leases: None,
                 extension_leases: None,
-                memory_context: None,
                 cwd: None,
                 env: None,
                 env_stripped: Vec::new(),
                 env_warned: Default::default(),
                 session_id: None,
+                hook_bus: None,
+                continuation: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30_000,
@@ -1940,6 +2111,7 @@ mod tests {
             serde_json::json!({"command": "yes hello | head -c 150000"}),
             output,
             30_000,
+            None,
             None,
         )
         .await;
@@ -1981,6 +2153,7 @@ mod tests {
             "tiny original".to_string(),
             30_000,
             None,
+            None,
         )
         .await;
 
@@ -2005,6 +2178,7 @@ mod tests {
             serde_json::json!({}),
             huge.clone(),
             30_000,
+            None,
             None,
         )
         .await;
@@ -2036,6 +2210,7 @@ mod tests {
             multibyte,
             30_000,
             None,
+            None,
         )
         .await;
         assert!(result.is_char_boundary(result.len()));
@@ -2062,6 +2237,7 @@ mod tests {
             serde_json::json!({}),
             "orig".to_string(),
             30_000,
+            None,
             None,
         )
         .await;
@@ -2199,6 +2375,7 @@ mod worker_view_tests {
             output.to_string(),
             30_000,
             None,
+            None,
         )
         .await
     }
@@ -2266,6 +2443,7 @@ mod worker_view_tests {
             "bash",
             None,
             serde_json::json!({"command": "rm -rf /"}),
+            None,
             None,
         )
         .await;
@@ -2439,5 +2617,483 @@ mod worker_view_tests {
         assert!(nested.is_worker_view());
         assert!(Arc::ptr_eq(nested.transforms_of.as_ref().unwrap(), &host));
         assert_eq!(nested.handler_count().await, 0);
+    }
+}
+
+/// A hook subscriber for tests of code that sends notify-only events.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Records the events it is sent and counts the calls it was entered
+    /// for and the ones it answered. `delay` is slept first
+    /// (`Duration::MAX`: never answers); its first `panics` calls panic
+    /// instead of answering.
+    pub(crate) struct Listener {
+        pub(crate) id: String,
+        delay: Duration,
+        panics: usize,
+        result: HookResult,
+        seen: std::sync::Mutex<Vec<HookEvent>>,
+        answered: AtomicUsize,
+    }
+
+    impl Listener {
+        fn build(id: &str, delay: Duration, panics: usize, result: HookResult) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.into(),
+                delay,
+                panics,
+                result,
+                seen: Default::default(),
+                answered: AtomicUsize::new(0),
+            })
+        }
+        pub(crate) fn answering(id: &str, result: HookResult) -> Arc<Self> {
+            Self::build(id, Duration::ZERO, 0, result)
+        }
+        pub(crate) fn prompt(id: &str) -> Arc<Self> {
+            Self::answering(id, HookResult::Continue)
+        }
+        pub(crate) fn slow(id: &str, delay: Duration) -> Arc<Self> {
+            Self::build(id, delay, 0, HookResult::Continue)
+        }
+        pub(crate) fn hanging(id: &str) -> Arc<Self> {
+            Self::slow(id, Duration::MAX)
+        }
+        pub(crate) fn panicking(id: &str) -> Arc<Self> {
+            Self::build(id, Duration::ZERO, usize::MAX, HookResult::Continue)
+        }
+        /// Panics on the first event it is sent and answers every later one.
+        pub(crate) fn panicking_once(id: &str) -> Arc<Self> {
+            Self::build(id, Duration::ZERO, 1, HookResult::Continue)
+        }
+
+        /// Subscribe to `kind` on `bus`, holding only the permission that
+        /// kind requires.
+        pub(crate) async fn subscribe(self: &Arc<Self>, bus: &HookBus, kind: HookKind) {
+            let mut permissions = PermissionSet::new();
+            permissions.grant(kind.required_permission());
+            bus.subscribe(kind, self.clone(), None, None, permissions)
+                .await
+                .unwrap();
+        }
+
+        /// Every event this listener was entered for, in arrival order.
+        pub(crate) fn events(&self) -> Vec<HookEvent> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// (entered, answered)
+        pub(crate) fn calls(&self) -> (usize, usize) {
+            (self.seen.lock().unwrap().len(), self.answered.load(Ordering::SeqCst))
+        }
+
+        /// The first `count` events, once that many have arrived. Deliveries
+        /// are detached, so a test has to wait for them; 30 s without them
+        /// is a failure.
+        pub(crate) async fn wait_for(&self, count: usize) -> Vec<HookEvent> {
+            let waited = tokio::time::timeout(Duration::from_secs(30), async {
+                while self.seen.lock().unwrap().len() < count {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            let events = self.events();
+            assert!(waited.is_ok(), "{}: expected {count} events, got {events:?}", self.id);
+            events
+        }
+    }
+
+    #[async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for Listener {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            let call = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(event.clone());
+                seen.len()
+            };
+            if self.delay == Duration::MAX {
+                std::future::pending::<()>().await;
+            }
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            if call <= self.panics {
+                panic!("notify test: this handler panics on purpose");
+            }
+            self.answered.fetch_add(1, Ordering::SeqCst);
+            self.result.clone()
+        }
+        async fn shutdown(&self) {}
+    }
+}
+
+/// [`HookBus::notify`]: fire and forget. The caller never waits, every
+/// answer is discarded, and the detached delivery is bounded in time
+/// ([`HANDLER_TIMEOUT`]) and in number ([`NOTIFY_MAX_IN_FLIGHT`]). Time is
+/// Tokio's paused clock, so "did not wait" is exact and cannot flake.
+#[cfg(test)]
+mod notify_tests {
+    use super::test_support::Listener;
+    use super::*;
+    use crate::extensions::permissions::Permission;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const KIND: HookKind = HookKind::OnContextArchived;
+
+    fn event() -> HookEvent {
+        HookEvent::on_context_archived("chat", &"a".repeat(32), None, "p0", 1, 1, 2)
+    }
+
+    async fn bus_with(listeners: &[&Arc<Listener>]) -> Arc<HookBus> {
+        let bus = Arc::new(HookBus::new());
+        for listener in listeners {
+            listener.subscribe(&bus, KIND).await;
+        }
+        bus
+    }
+
+    /// Let the detached deliveries run, without reaching any handler timer.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_returns_before_a_hanging_handler() {
+        let slow = Listener::slow("slow", Duration::from_secs(60));
+        let bus = bus_with(&[&slow]).await;
+        let (virtual_start, real_start) = (tokio::time::Instant::now(), Instant::now());
+        bus.notify(event());
+        // Not one tick of the paused clock: nothing was awaited. The real
+        // bound is loose on purpose; waiting would cost the 5 s timeout.
+        assert_eq!(virtual_start.elapsed(), Duration::ZERO);
+        assert!(real_start.elapsed() < Duration::from_secs(1));
+        assert_eq!(slow.calls(), (0, 0), "the handler runs on the detached task");
+        assert_eq!(bus.notifies_in_flight(), 1);
+
+        // The delivery is still waiting just before the handler timeout...
+        tokio::time::sleep(HANDLER_TIMEOUT - Duration::from_millis(1)).await;
+        assert_eq!(slow.calls(), (1, 0));
+        assert_eq!(bus.notifies_in_flight(), 1);
+        // ...and gone just after it: the task ended, the handler never answered.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(bus.notifies_in_flight(), 0);
+        assert_eq!(slow.calls(), (1, 0));
+    }
+
+    /// The panicking handler is first in line: its panic used to end the
+    /// task before the healthy one was called at all.
+    #[tokio::test(start_paused = true)]
+    async fn notify_survives_a_panicking_handler() {
+        let (bad, good) = (Listener::panicking("bad"), Listener::prompt("good"));
+        let bus = bus_with(&[&bad, &good]).await;
+        bus.notify(event());
+        settle().await;
+        assert_eq!(bad.calls(), (1, 0));
+        assert_eq!(good.calls(), (1, 1), "the healthy listener got the event");
+        assert_eq!(bus.notifies_in_flight(), 0, "the panic released its slot");
+        // The bus still delivers, here and on its awaited paths.
+        bus.unsubscribe_all("bad").await;
+        bus.notify(event());
+        settle().await;
+        assert!(good.calls().1 >= 1, "{:?}", good.calls());
+        assert_eq!(bus.emit(&HookEvent::before_message("hi")).await, HookResult::Continue);
+        assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_ignores_block_and_inject_results() {
+        let listeners = [
+            Listener::answering("block", HookResult::Block { reason: "no".into() }),
+            Listener::answering("inject", HookResult::Inject { content: "ctx".into() }),
+            Listener::answering("replace", HookResult::Replace { output: "x".into() }),
+            Listener::answering("confirm", HookResult::confirm("sure?")),
+            Listener::answering("phase", HookResult::ContextPhase { phase: "new_task".into() }),
+            Listener::prompt("plain"),
+        ];
+        let bus = bus_with(&listeners.iter().collect::<Vec<_>>()).await;
+        bus.notify(event());
+        settle().await;
+        // Nobody's answer stopped the others, and none had any effect.
+        for listener in &listeners {
+            assert_eq!(listener.calls(), (1, 1), "{}", listener.id);
+        }
+        assert_eq!(bus.session_injection_for("chat").await, None);
+        assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_with_no_subscribers_is_a_no_op() {
+        // A subscriber to another kind only.
+        let other = Listener::prompt("other");
+        let bus = Arc::new(HookBus::new());
+        other.subscribe(&bus, HookKind::BeforeMessage).await;
+        bus.notify(event());
+        assert_eq!(bus.notifies_in_flight(), 0, "no task was spawned");
+        // An event that costs something to build is not even built.
+        let built = Arc::new(AtomicBool::new(false));
+        let flag = built.clone();
+        bus.notify_with(KIND, async move {
+            flag.store(true, Ordering::SeqCst);
+            Some(event())
+        });
+        assert_eq!(bus.notifies_in_flight(), 0);
+        settle().await;
+        assert!(!built.load(Ordering::SeqCst));
+        assert_eq!(other.calls(), (0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_on_worker_view_sends_nothing() {
+        let listener = Listener::prompt("listener");
+        let host = bus_with(&[&listener]).await;
+        let worker = HookBus::worker_transforms(&host);
+        worker.notify(event());
+        settle().await;
+        assert_eq!(listener.calls(), (0, 0));
+        assert_eq!((worker.notifies_in_flight(), host.notifies_in_flight()), (0, 0));
+        // The same event on the host bus is delivered.
+        host.notify(event());
+        settle().await;
+        assert_eq!(listener.calls(), (1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_reaches_every_subscriber_concurrently() {
+        // The slow one is first in line; `emit` would make the fast one wait.
+        let slow = Listener::slow("slow", Duration::from_secs(3));
+        let fast = Listener::prompt("fast");
+        let bus = bus_with(&[&slow, &fast]).await;
+        bus.notify(event());
+        settle().await;
+        assert_eq!(fast.calls(), (1, 1), "answered without waiting for the slow one");
+        assert_eq!(slow.calls(), (1, 0));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(slow.calls(), (1, 1));
+        assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    /// Handlers that never answer while events keep coming: at most
+    /// `NOTIFY_MAX_IN_FLIGHT` deliveries exist, the rest are dropped rather
+    /// than queued, and the bus delivers again once the timeout clears them.
+    #[tokio::test(start_paused = true)]
+    async fn notify_drops_events_beyond_the_in_flight_limit() {
+        let stuck = Listener::hanging("stuck");
+        let bus = bus_with(&[&stuck]).await;
+        for _ in 0..NOTIFY_MAX_IN_FLIGHT + 10 {
+            bus.notify(event());
+        }
+        assert_eq!(bus.notifies_in_flight(), NOTIFY_MAX_IN_FLIGHT);
+        settle().await;
+        assert_eq!(stuck.calls(), (NOTIFY_MAX_IN_FLIGHT, 0), "the extra ten were dropped");
+        tokio::time::sleep(HANDLER_TIMEOUT).await;
+        assert_eq!(bus.notifies_in_flight(), 0, "every delivery ended at the timeout");
+        bus.notify(event());
+        settle().await;
+        assert_eq!(stuck.calls(), (NOTIFY_MAX_IN_FLIGHT + 1, 0));
+    }
+
+    /// An event built on the detached task: the caller does not wait for the
+    /// build either, and a build that yields nothing sends nothing.
+    #[tokio::test(start_paused = true)]
+    async fn notify_with_builds_the_event_off_the_callers_path() {
+        let listener = Listener::prompt("listener");
+        let bus = bus_with(&[&listener]).await;
+        let started = tokio::time::Instant::now();
+        bus.notify_with(KIND, async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Some(event())
+        });
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        settle().await;
+        assert_eq!(listener.calls(), (0, 0), "still being built");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(listener.calls(), (1, 1));
+
+        bus.notify_with(KIND, async { None });
+        // An event of another kind than the one announced is not sent.
+        bus.notify_with(KIND, async { Some(HookEvent::on_session_start("chat")) });
+        settle().await;
+        assert_eq!(listener.calls(), (1, 1));
+        assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    /// Several events from one build are one delivery: one slot, sent to a
+    /// handler in order. More of them than the in-flight limit lose none.
+    #[tokio::test(start_paused = true)]
+    async fn notify_with_sends_several_events_in_order_as_one_delivery() {
+        let numbered = |n: usize| part(n, NOTIFY_MAX_IN_FLIGHT + 6);
+        let listener = Listener::prompt("listener");
+        let bus = bus_with(&[&listener]).await;
+        let count = NOTIFY_MAX_IN_FLIGHT + 6;
+        bus.notify_with(KIND, async move {
+            let mut events: Vec<_> = (1..=count).map(numbered).collect();
+            // One of another kind in the middle is skipped, not a stop.
+            events.insert(3, HookEvent::on_session_start("chat"));
+            events
+        });
+        assert_eq!(bus.notifies_in_flight(), 1);
+        settle().await;
+        assert_eq!(parts_seen(&listener), (1..=count as u64).collect::<Vec<_>>());
+        assert_eq!(bus.notifies_in_flight(), 0);
+
+        // A handler that never answers: the delivery ends at the first
+        // event's timeout, and the second is not sent.
+        let hung = Listener::hanging("hung");
+        let bus = bus_with(&[&hung]).await;
+        bus.notify_with(KIND, async move { vec![numbered(1), numbered(2)] });
+        settle().await;
+        assert_eq!(parts_seen(&hung), [1]);
+        assert_eq!(bus.notifies_in_flight(), 1);
+        tokio::time::sleep(HANDLER_TIMEOUT).await;
+        settle().await;
+        assert_eq!(bus.notifies_in_flight(), 0);
+        assert_eq!(hung.calls(), (1, 0));
+    }
+
+    fn part(n: usize, of: usize) -> HookEvent {
+        event().with_part(n, of, 0, 0)
+    }
+
+    fn parts_seen(listener: &Listener) -> Vec<u64> {
+        let events = listener.events();
+        events.iter().map(|event| event.data["part"].as_u64().unwrap()).collect()
+    }
+
+    /// Two handlers, the first of which never answers. The healthy one used
+    /// to get each later part only when the stuck one's 5 s for the part
+    /// before had run out, so the last of `n` parts up to 5·(n-1) s late. It
+    /// now has them all at once, in order.
+    ///
+    /// The stuck one is sent the first part and no other. It used to be sent
+    /// the next at each timeout, so an extension that was only slow had `n`
+    /// requests in its input after 5·n s and was busy for `n` times its own
+    /// time, with every other hook sent to it (a `before_tool_call`) timing
+    /// out meanwhile. Its backlog is now one event whatever `n` is, and the
+    /// delivery's slot is free after one timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_handler_does_not_delay_another_handlers_parts() {
+        const PARTS: usize = 4;
+        let (stuck, healthy) = (Listener::hanging("stuck"), Listener::prompt("healthy"));
+        let bus = bus_with(&[&stuck, &healthy]).await;
+        bus.notify_with(KIND, async { (1..=PARTS).map(|n| part(n, PARTS)).collect::<Vec<_>>() });
+        settle().await;
+        assert_eq!(parts_seen(&healthy), [1, 2, 3, 4], "none waited for the stuck handler");
+        assert_eq!(healthy.calls(), (PARTS, PARTS));
+        assert_eq!(parts_seen(&stuck), [1]);
+        assert_eq!(bus.notifies_in_flight(), 1);
+
+        // The stuck handler's sequence ends at its first timeout, and the
+        // delivery with it: parts 2 to 4 are never sent to it.
+        tokio::time::sleep(HANDLER_TIMEOUT).await;
+        settle().await;
+        assert_eq!(bus.notifies_in_flight(), 0, "one timeout, not one per part");
+        assert_eq!(parts_seen(&stuck), [1]);
+        tokio::time::sleep(HANDLER_TIMEOUT * PARTS as u32).await;
+        assert_eq!((stuck.calls(), healthy.calls()), ((1, 0), (PARTS, PARTS)));
+
+        // A handler that is slow but answers in time is sent every part.
+        let slow = Listener::slow("slow", HANDLER_TIMEOUT - Duration::from_millis(1));
+        let bus = bus_with(&[&slow]).await;
+        bus.notify_with(KIND, async { (1..=PARTS).map(|n| part(n, PARTS)).collect::<Vec<_>>() });
+        tokio::time::sleep(HANDLER_TIMEOUT * PARTS as u32).await;
+        assert_eq!(slow.calls(), (PARTS, PARTS));
+        assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    /// A handler that panics on part 1 of several. It used to end the
+    /// delivery task: no handler got parts 2 and 3, and the one behind it in
+    /// line did not get part 1 either. The panic now costs that handler that
+    /// event.
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_on_the_first_part_loses_only_that_part_for_that_handler() {
+        let (bad, good) = (Listener::panicking_once("bad"), Listener::prompt("good"));
+        let bus = bus_with(&[&bad, &good]).await;
+        bus.notify_with(KIND, async { (1..=3).map(|n| part(n, 3)).collect::<Vec<_>>() });
+        settle().await;
+        assert_eq!(parts_seen(&good), [1, 2, 3]);
+        assert_eq!(good.calls(), (3, 3));
+        assert_eq!(parts_seen(&bad), [1, 2, 3], "it is sent the parts after the panic");
+        assert_eq!(bad.calls(), (3, 2), "and answers them");
+        assert_eq!(bus.notifies_in_flight(), 0);
+
+        // A handler that panics on every part costs the other nothing.
+        let (bad, good) = (Listener::panicking("bad"), Listener::prompt("good"));
+        let bus = bus_with(&[&bad, &good]).await;
+        bus.notify_with(KIND, async { (1..=3).map(|n| part(n, 3)).collect::<Vec<_>>() });
+        settle().await;
+        assert_eq!((parts_seen(&good), good.calls()), (vec![1, 2, 3], (3, 3)));
+        assert_eq!(bad.calls(), (3, 0));
+        assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    /// A hook whose answer matters cannot be sent this way.
+    #[tokio::test(start_paused = true)]
+    async fn notify_refuses_a_hook_that_is_not_notify_only() {
+        let listener = Listener::answering("guard", HookResult::Block { reason: "no".into() });
+        let bus = Arc::new(HookBus::new());
+        listener.subscribe(&bus, HookKind::BeforeToolCall).await;
+        bus.notify(HookEvent::before_tool_call("bash", serde_json::json!({})));
+        settle().await;
+        assert_eq!(listener.calls(), (0, 0));
+        assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    /// No runtime to deliver on (a synchronous caller): nothing is sent and
+    /// nothing panics.
+    #[test]
+    fn notify_outside_a_runtime_sends_nothing() {
+        let listener = Listener::prompt("listener");
+        let bus = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(bus_with(&[&listener]));
+        bus.notify(event());
+        assert_eq!(bus.notifies_in_flight(), 0);
+        assert_eq!(listener.calls(), (0, 0));
+    }
+
+    /// The path leads to conversation content: `privacy.llm_content`.
+    #[tokio::test]
+    async fn on_context_archived_needs_llm_content_to_subscribe() {
+        let bus = HookBus::new();
+        let mut perms = PermissionSet::new();
+        perms.grant(Permission::SessionLifecycle);
+        let err = bus
+            .subscribe(KIND, Listener::prompt("nosy"), None, None, perms.clone())
+            .await
+            .unwrap_err();
+        assert!(err.contains("privacy.llm_content"), "{err}");
+        perms.grant(Permission::LlmContent);
+        bus.subscribe(KIND, Listener::prompt("ok"), None, None, perms)
+            .await
+            .unwrap();
+    }
+
+    /// Ids only, no content: `session.lifecycle`, and nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn on_memory_forgotten_needs_session_lifecycle_and_is_delivered_by_notify() {
+        let forgotten = HookKind::OnMemoryForgotten;
+        let bus = Arc::new(HookBus::new());
+        let mut perms = PermissionSet::new();
+        perms.grant(Permission::LlmContent);
+        let err = bus
+            .subscribe(forgotten, Listener::prompt("nosy"), None, None, perms)
+            .await
+            .unwrap_err();
+        assert!(err.contains("session.lifecycle"), "{err}");
+
+        let listener = Listener::prompt("indexer");
+        listener.subscribe(&bus, forgotten).await;
+        bus.notify(HookEvent::on_memory_forgotten(Some("chat"), "mem-1", "note", "p0", "repository"));
+        settle().await;
+        assert_eq!(listener.calls(), (1, 1));
+        assert_eq!(listener.events()[0].data["id"], "mem-1");
     }
 }

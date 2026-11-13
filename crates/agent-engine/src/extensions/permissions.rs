@@ -32,11 +32,9 @@ pub enum Permission {
     ToolsRegister,
     /// Can register new providers.
     ProvidersRegister,
-    /// Can declare dormant memory/context contribution providers
-    /// (continuous-memory spec §7.1). Distinct from `ProvidersRegister`
-    /// (model/LLM providers): this gates only passive context-provider
-    /// capability metadata; activation additionally requires an exact
-    /// memory-context lease (task A6).
+    /// Accepted and inert: it parses, so a manifest that asks for it still
+    /// loads, and it grants nothing. It gated context-provider declarations
+    /// for built-in automatic memory, which was removed.
     ContextProvidersRegister,
     /// Can read from the local memory store via `memory.query`.
     MemoryRead,

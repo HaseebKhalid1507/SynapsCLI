@@ -14,8 +14,16 @@ impl Tool for EditTool {
         &self,
         validated_input: &serde_json::Value,
     ) -> Option<super::ConcurrencyKey> {
+        self.concurrency_key_in(validated_input, None)
+    }
+
+    fn concurrency_key_in(
+        &self,
+        validated_input: &serde_json::Value,
+        cwd: Option<&std::path::Path>,
+    ) -> Option<super::ConcurrencyKey> {
         Some(
-            match super::util::canonical_path_key(validated_input["path"].as_str()?) {
+            match super::util::canonical_path_key_in(validated_input["path"].as_str()?, cwd) {
                 Some(key) => super::ConcurrencyKey::Key(key),
                 None => super::ConcurrencyKey::Serialize,
             },

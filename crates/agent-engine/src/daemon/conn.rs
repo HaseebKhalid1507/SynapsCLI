@@ -419,10 +419,6 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                 config.owned = Some(OwnedConfig { token: token.clone(), restored: false });
                 owner_claim = Some(OwnerClaim { token, forward_secrets: owned.forward_secrets });
             }
-            // Recorded by the actor from `/memory` (and carried by reload's
-            // rehydrate, which does not come through here); a client turns
-            // memory on or off with `/memory`, not by create config.
-            config.memory_mode = None;
             if config.cwd.is_none() {
                 config.cwd = Some(hello.cwd.clone());
             }

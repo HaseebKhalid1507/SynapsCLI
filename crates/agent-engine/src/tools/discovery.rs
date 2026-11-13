@@ -253,7 +253,15 @@ impl Tool for SearchToolsTool {
         let query = require_query(&params)?;
         let limits = SearchLimits::new(SEARCH_TOOLS_MAX_RESULTS, SEARCH_TOOLS_MAX_RESULT_BYTES)
             .expect("static search_tools budgets are within caps");
-        let index = DiscoveryIndex::build(capability.catalog())
+        // A tool withheld from this session is not there to be found.
+        let catalog = {
+            let set = capability
+                .session_set()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            capability.catalog().without(set.withheld())
+        };
+        let index = DiscoveryIndex::build(&catalog)
             .map_err(|err| RuntimeError::Tool(format!("tool discovery unavailable: {err}")))?;
         let results = index.search(&query, &limits);
         let mut body = json!({

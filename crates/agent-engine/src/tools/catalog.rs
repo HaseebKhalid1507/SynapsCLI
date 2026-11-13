@@ -437,6 +437,18 @@ impl ToolCatalog {
         self.entries.values()
     }
 
+    /// A copy of this catalog without `ids`, at the same generation: the
+    /// catalog as a session that is not offered those tools sees it
+    /// ([`super::activation::SessionToolSet::withholding`]). A view for
+    /// reading; the registry's own catalog is unchanged.
+    pub fn without<'a>(&self, ids: impl IntoIterator<Item = &'a ToolId>) -> Self {
+        let mut view = self.clone();
+        for id in ids {
+            view.entries.remove(id);
+        }
+        view
+    }
+
     /// Insert one capability. Duplicate IDs fail closed (no silent
     /// replacement, no generation advance); generation exhaustion fails
     /// closed (no entry change). On success the catalog generation advances

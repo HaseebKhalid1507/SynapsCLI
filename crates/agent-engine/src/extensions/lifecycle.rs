@@ -30,10 +30,6 @@ pub const DECLARED_MAX_PROVIDERS: usize = 16;
 pub const DECLARED_NAME_MAX_BYTES: usize = 128;
 pub const DECLARED_DESCRIPTION_MAX_BYTES: usize = 1024;
 pub const DECLARED_SCHEMA_MAX_BYTES: usize = 64 * 1024;
-/// Bound on passive memory/context contribution provider declarations
-/// (continuous-memory spec §7.1). Deliberately small: one extension has no
-/// legitimate reason to contribute many distinct context surfaces.
-pub const DECLARED_MAX_CONTEXT_PROVIDERS: usize = 8;
 
 /// OPTIONAL additive manifest block. Absent => legacy eager lifecycle.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -49,16 +45,13 @@ pub struct DeferredDeclarations {
     /// Optional lifecycle hint for extensions without tools/providers.
     #[serde(default)]
     pub lifecycle: Option<DeferredLifecycle>,
-    /// TYPED memory/context contribution provider declarations
-    /// (continuous-memory spec §7.1). ADDITIVE: absent => empty =>
-    /// byte-compatible with every existing manifest (`skip_serializing_if`
-    /// keeps serialized output identical too). COMPLETELY UNRELATED to
-    /// `providers` above (model/LLM provider metadata): a context provider
-    /// is dormant capability metadata that never spawns anything at load
-    /// and stays dormant until an exact memory-context lease (task A6) is
-    /// granted.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context_providers: Vec<DeclaredExtensionContextProvider>,
+    /// Accepted and ignored. Built-in automatic memory, which this declared
+    /// a provider for, was removed; the key stays so a manifest written for
+    /// it still loads. Whatever JSON it holds is neither validated nor read:
+    /// it cannot fail a load, classify the extension or grant anything
+    /// (see [`ignored_context_provider_notice`]).
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub context_providers: Value,
 }
 
 /// Passive provider declaration, field-compatible with the runtime's
@@ -92,28 +85,6 @@ pub struct DeclaredExtensionProviderModel {
 pub const DECLARED_MAX_PROVIDER_MODELS: usize = 64;
 pub const DECLARED_DISPLAY_MAX_BYTES: usize = 256;
 
-/// Passive MEMORY/CONTEXT contribution provider declaration
-/// (continuous-memory spec §7.1) — e.g. Axel's
-/// `extension:axel-memory-manager:project-memory`. DISTINCT from
-/// [`DeclaredExtensionProvider`] (model/LLM provider metadata): this
-/// declares a dormant context-contribution capability. Discovery, schema
-/// export, status inspection, and normal first prompts never spawn the
-/// owning extension; activation is exclusively a future exact
-/// memory-context lease (task A6).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct DeclaredExtensionContextProvider {
-    /// Local provider id (no ':'; the runtime address is composed as
-    /// `extension:<plugin>:<id>`). Bounded like other declared names.
-    pub id: String,
-    /// Capability label (e.g. "project-memory"), bounded like a name.
-    pub capability: String,
-    /// Human-readable description, bounded like other declared descriptions.
-    #[serde(default)]
-    pub description: String,
-    /// Declared context payload schema version; 0 is invalid (fail closed).
-    pub schema_version: u32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeferredLifecycle {
@@ -143,38 +114,55 @@ pub enum ExtensionClass {
     Provider,
     HookLifecycle,
     UiSidecar,
-    /// ONLY memory/context contribution providers declared
-    /// (continuous-memory spec §7.1): dormant until an exact
-    /// memory-context lease is granted (task A6).
-    ContextProvider,
     Mixed,
 }
 
-/// Whether a deferred block declares at least one memory/context
-/// contribution provider (continuous-memory spec §7.1).
-pub fn has_context_provider(declared: &DeferredDeclarations) -> bool {
-    !declared.context_providers.is_empty()
+/// The line to log when a manifest still declares a context provider (the
+/// `deferred.context_providers` key with anything in it, or the
+/// `context_providers.register` permission), `None` when it declares
+/// neither. The extension loads as if the declaration were absent: its
+/// tools and hooks work, and nothing starts it "on a memory lease", because
+/// no such lease exists any more.
+pub fn ignored_context_provider_notice(id: &str, manifest: &ExtensionManifest) -> Option<String> {
+    let declared_field = manifest.deferred.as_ref().is_some_and(|deferred| {
+        match &deferred.context_providers {
+            Value::Null => false,
+            Value::Array(items) => !items.is_empty(),
+            Value::Object(fields) => !fields.is_empty(),
+            _ => true,
+        }
+    });
+    let declared_permission = manifest
+        .permissions
+        .iter()
+        .any(|permission| permission == "context_providers.register");
+    (declared_field || declared_permission).then(|| {
+        format!(
+            "extension {id} declares a context provider; built-in automatic memory was removed \
+             in {}, the declaration is ignored",
+            agent_core::AXEL_BACKEND_REMOVED_IN
+        )
+    })
 }
 
 /// Classify a manifest from its passive declarations. Pure and local.
+/// `deferred.context_providers` is not one of them: it is ignored, so a
+/// manifest that declares only that classifies like one with an empty
+/// `deferred` block.
 pub fn classify(manifest: &ExtensionManifest) -> ExtensionClass {
     let Some(deferred) = &manifest.deferred else {
         return ExtensionClass::LegacyEager;
     };
     let tools = !deferred.tools.is_empty();
     let providers = !deferred.providers.is_empty();
-    let context = has_context_provider(deferred);
     let hooks = !manifest.hooks.is_empty() || deferred.lifecycle == Some(DeferredLifecycle::Hook);
     let user = deferred.lifecycle == Some(DeferredLifecycle::User);
-    // With `context == false` this is EXACTLY the pre-context-provider
-    // matrix: existing manifests classify byte-for-byte as before.
-    match (tools, providers, context, hooks, user) {
-        (false, false, false, false, false) => ExtensionClass::LegacyEager,
-        (true, false, false, false, false) => ExtensionClass::ToolOnly,
-        (false, true, false, false, false) => ExtensionClass::Provider,
-        (false, false, true, false, false) => ExtensionClass::ContextProvider,
-        (false, false, false, true, false) => ExtensionClass::HookLifecycle,
-        (false, false, false, false, true) => ExtensionClass::UiSidecar,
+    match (tools, providers, hooks, user) {
+        (false, false, false, false) => ExtensionClass::LegacyEager,
+        (true, false, false, false) => ExtensionClass::ToolOnly,
+        (false, true, false, false) => ExtensionClass::Provider,
+        (false, false, true, false) => ExtensionClass::HookLifecycle,
+        (false, false, false, true) => ExtensionClass::UiSidecar,
         _ => ExtensionClass::Mixed,
     }
 }
@@ -200,11 +188,6 @@ pub fn earliest_trigger(manifest: &ExtensionManifest) -> ActivationTrigger {
         ExtensionClass::Provider => ActivationTrigger::ProviderSelection,
         ExtensionClass::HookLifecycle => ActivationTrigger::FirstAuthorizedHookEvent,
         ExtensionClass::UiSidecar => ActivationTrigger::UserAction,
-        // A context provider is dormant until an exact memory-context
-        // lease, which only an explicit host-authorized user action (e.g.
-        // `/memory on`, task A6) can grant — never a hook, provider
-        // selection, or tool search.
-        ExtensionClass::ContextProvider => ActivationTrigger::UserAction,
         ExtensionClass::Mixed => {
             let deferred = manifest.deferred.as_ref();
             let hooks = !manifest.hooks.is_empty()
@@ -318,34 +301,6 @@ pub fn validate_deferred(deferred: &DeferredDeclarations) -> Result<(), &'static
             }
         }
     }
-    // Memory/context contribution providers (continuous-memory spec §7.1):
-    // bounded exactly like the other declared types; any violation fails
-    // the WHOLE manifest closed.
-    if deferred.context_providers.len() > DECLARED_MAX_CONTEXT_PROVIDERS {
-        return Err("too_many_declared_context_providers");
-    }
-    let mut context_provider_ids: HashSet<&str> = HashSet::new();
-    for provider in &deferred.context_providers {
-        // The validated newtype is the single id policy source: non-empty,
-        // bounded, ASCII-safe, no ':' (runtime address composability).
-        if super::context_provider::ContextProviderId::parse(&provider.id).is_err() {
-            return Err("invalid_declared_context_provider_id");
-        }
-        if !context_provider_ids.insert(provider.id.as_str()) {
-            return Err("duplicate_declared_context_provider_id");
-        }
-        if !valid_name(&provider.capability) {
-            return Err("invalid_declared_context_provider_capability");
-        }
-        if provider.description.is_empty()
-            || provider.description.len() > DECLARED_DESCRIPTION_MAX_BYTES
-        {
-            return Err("invalid_declared_context_provider_description");
-        }
-        if provider.schema_version == 0 {
-            return Err("invalid_declared_context_provider_schema_version");
-        }
-    }
     // Lifecycle conflict policy: `user` means user-triggered ONLY — it must
     // never silently cover active tool/provider capabilities.
     if deferred.lifecycle == Some(DeferredLifecycle::User)
@@ -379,13 +334,6 @@ pub fn validate_manifest_deferred(manifest: &ExtensionManifest) -> Result<(), &'
     }
     if !deferred.providers.is_empty() && !has_permission("providers.register") {
         return Err("deferred_providers_require_providers_register_permission");
-    }
-    // Mirror of the provider gate above for memory/context contribution
-    // providers (continuous-memory spec §7.1): dormant descriptor metadata
-    // still grants future runtime reach, so it MUST be backed by the exact
-    // permission the eventual lease-backed registration would require.
-    if !deferred.context_providers.is_empty() && !has_permission("context_providers.register") {
-        return Err("deferred_context_providers_require_context_providers_register_permission");
     }
     if deferred.lifecycle == Some(DeferredLifecycle::Hook) && manifest.hooks.is_empty() {
         return Err("hook_lifecycle_requires_hook_subscriptions");
@@ -628,14 +576,13 @@ impl Tool for DeferredExtensionTool {
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> crate::Result<String> {
         // Runs strictly AFTER the ExecutionGate authorized this exact call.
-        let binding = ctx
+        // Who calls: the author of the binding the context came with.
+        // No binding, no caller.
+        let caller = ctx
             .capabilities
             .memory_backend
-            .clone()
-            .unwrap_or_else(crate::memory_backend::MemoryBinding::configured_current);
-        if binding.exclusive() && crate::memory_backend::competing_memory_tool(self) {
-            return Err(crate::RuntimeError::Tool("independent extension memory is disabled by the selected host backend; use short memory tools".into()));
-        }
+            .as_ref()
+            .map(|binding| binding.author().clone());
         // Without the typed session lease capability, a deferred extension
         // tool NEVER starts a process.
         let Some(leases) = ctx.capabilities.extension_leases.clone() else {
@@ -646,12 +593,14 @@ impl Tool for DeferredExtensionTool {
             )));
         };
         match leases
-            .call_exact_for(
+            .call_exact_as(
                 &self.plugin_id,
                 &self.tool_name,
                 &self.expected_digest,
                 params,
                 ctx.capabilities.session_id.as_deref(),
+                ctx.capabilities.cwd.as_deref(),
+                caller.as_ref(),
             )
             .await
         {
@@ -754,29 +703,6 @@ mod tests {
         }
     }
 
-    fn declared_context_provider(id: &str) -> DeclaredExtensionContextProvider {
-        DeclaredExtensionContextProvider {
-            id: id.to_string(),
-            capability: "project-memory".to_string(),
-            description: "Project memory context contributions".to_string(),
-            schema_version: 1,
-        }
-    }
-
-    fn with_context_providers(
-        permissions: &[&str],
-        context_providers: Vec<DeclaredExtensionContextProvider>,
-    ) -> ExtensionManifest {
-        let mut m = base_manifest(permissions);
-        m.deferred = Some(DeferredDeclarations {
-            context_providers,
-            ..DeferredDeclarations::default()
-        });
-        m
-    }
-
-    // ── regression proof: empty/absent context_providers change NOTHING ─
-
     #[test]
     fn a_deferred_extension_tool_names_its_registered_operation() {
         let tool = DeferredExtensionTool::new("plug", &declared_tool("memory_fetch"));
@@ -793,30 +719,25 @@ mod tests {
         assert_eq!(earliest_trigger(&legacy), ActivationTrigger::Eager);
         legacy.validate("legacy").unwrap();
 
-        // Empty deferred block (context_providers defaulted empty).
+        // Empty deferred block.
         let mut empty = base_manifest(&["tools.register"]);
         empty.deferred = Some(DeferredDeclarations::default());
-        assert!(empty
-            .deferred
-            .as_ref()
-            .is_some_and(|d| d.context_providers.is_empty() && !has_context_provider(d)));
+        assert!(ignored_context_provider_notice("empty", &empty).is_none());
         assert_eq!(classify(&empty), ExtensionClass::LegacyEager);
         assert_eq!(earliest_trigger(&empty), ActivationTrigger::Eager);
         empty.validate("empty").unwrap();
 
         // A deferred block WITHOUT the context_providers key deserializes
-        // to the empty default (additive/byte-compatible) and does not
-        // reappear on serialization.
+        // to null and the key does not appear on serialization.
         let d: DeferredDeclarations = serde_json::from_value(json!({
             "tools": [], "providers": []
         }))
         .unwrap();
-        assert!(d.context_providers.is_empty());
+        assert!(d.context_providers.is_null());
         let round = serde_json::to_value(&d).unwrap();
         assert!(round.get("context_providers").is_none());
 
-        // Pre-existing classes are untouched when context_providers is
-        // empty: tool-only stays ToolOnly...
+        // Tool-only stays ToolOnly...
         let mut tool_only = base_manifest(&["tools.register"]);
         tool_only.deferred = Some(DeferredDeclarations {
             tools: vec![declared_tool("t")],
@@ -842,172 +763,136 @@ mod tests {
         assert_eq!(classify(&hooky), ExtensionClass::HookLifecycle);
     }
 
-    // ── context-provider-only classification + permission gate ──────────
+    // ── a declared context provider is accepted and ignored ─────────────
 
-    #[test]
-    fn context_provider_only_manifest_classifies_distinctly_and_requires_permission() {
-        let m = with_context_providers(
-            &["context_providers.register"],
-            vec![declared_context_provider("project-memory")],
-        );
-        assert!(m.deferred.as_ref().is_some_and(has_context_provider));
-        assert_eq!(classify(&m), ExtensionClass::ContextProvider);
-        // Dormant until an explicit user/host action grants a lease —
-        // never eager, never tool-search/hook/provider triggered.
-        assert_eq!(earliest_trigger(&m), ActivationTrigger::UserAction);
-        m.validate("axel-memory-manager").unwrap();
-
-        // WITHOUT the exact permission the whole manifest fails closed.
-        let ungated = with_context_providers(
-            &["tools.register"],
-            vec![declared_context_provider("project-memory")],
-        );
-        let err = ungated.validate("axel-memory-manager").unwrap_err();
-        assert!(
-            err.contains(
-                "deferred_context_providers_require_context_providers_register_permission"
-            ),
-            "{err}"
-        );
-        // The model/LLM provider permission does NOT cover it.
-        let wrong_gate = with_context_providers(
-            &["providers.register"],
-            vec![declared_context_provider("project-memory")],
-        );
-        assert!(wrong_gate.validate("axel-memory-manager").is_err());
+    fn provider_declaration() -> Value {
+        json!([{
+            "id": "project-memory",
+            "capability": "project-memory",
+            "description": "Project memory context contributions",
+            "schema_version": 1
+        }])
     }
 
-    #[test]
-    fn mixed_combinations_with_context_providers_still_classify_mixed() {
-        // tools + context providers => Mixed (both permissions required).
-        let mut m = with_context_providers(
-            &["tools.register", "context_providers.register"],
-            vec![declared_context_provider("project-memory")],
-        );
-        m.deferred.as_mut().unwrap().tools = vec![declared_tool("t")];
-        assert_eq!(classify(&m), ExtensionClass::Mixed);
-        m.validate("plug").unwrap();
-        // Tool activation stays the Mixed trigger — context providers
-        // never advance a Mixed extension's earliest trigger.
-        assert_eq!(earliest_trigger(&m), ActivationTrigger::ExactToolActivation);
+    fn notice(id: &str) -> String {
+        format!(
+            "extension {id} declares a context provider; built-in automatic memory was removed \
+             in {}, the declaration is ignored",
+            agent_core::AXEL_BACKEND_REMOVED_IN
+        )
     }
 
-    // ── bounds: fail the WHOLE manifest closed ─────────────────────────
-
+    /// The trigger that started such an extension (`/memory on`) is gone,
+    /// so "start on user action" would mean "never". A manifest whose
+    /// `deferred` block holds only a context provider classifies like one
+    /// with an empty block, and the field changes no other class.
     #[test]
-    fn too_many_declared_context_providers_are_rejected() {
-        let at_cap: Vec<_> = (0..DECLARED_MAX_CONTEXT_PROVIDERS)
-            .map(|i| declared_context_provider(&format!("p{i}")))
-            .collect();
-        with_context_providers(&["context_providers.register"], at_cap)
-            .validate("plug")
-            .unwrap();
+    fn a_declared_context_provider_does_not_classify_the_extension() {
+        let only: ExtensionManifest = serde_json::from_value(json!({
+            "runtime": "process",
+            "command": "/bin/false",
+            "permissions": ["context_providers.register"],
+            "deferred": {"context_providers": provider_declaration()}
+        }))
+        .unwrap();
+        only.validate("axel-memory-manager").unwrap();
+        assert_eq!(classify(&only), ExtensionClass::LegacyEager);
+        assert_eq!(earliest_trigger(&only), ActivationTrigger::Eager);
+        assert_ne!(earliest_trigger(&only), ActivationTrigger::UserAction);
 
-        let over: Vec<_> = (0..=DECLARED_MAX_CONTEXT_PROVIDERS)
-            .map(|i| declared_context_provider(&format!("p{i}")))
-            .collect();
-        let m = with_context_providers(&["context_providers.register"], over);
+        // With tools beside it: a tool extension, started by its tool.
+        let with_tools: ExtensionManifest = serde_json::from_value(json!({
+            "runtime": "process",
+            "command": "/bin/false",
+            "permissions": ["tools.register", "context_providers.register"],
+            "deferred": {
+                "tools": [{"name": "t", "description": "declared t", "input_schema": {"type": "object"}}],
+                "context_providers": provider_declaration()
+            }
+        }))
+        .unwrap();
+        with_tools.validate("plug").unwrap();
+        assert_eq!(classify(&with_tools), ExtensionClass::ToolOnly);
+        assert_eq!(earliest_trigger(&with_tools), ActivationTrigger::ExactToolActivation);
+
+        // With a hook beside it: started by its first hook event.
+        let with_hook: ExtensionManifest = serde_json::from_value(json!({
+            "runtime": "process",
+            "command": "/bin/false",
+            "permissions": ["tools.intercept", "context_providers.register"],
+            "hooks": [{"hook": "before_tool_call"}],
+            "deferred": {"context_providers": provider_declaration()}
+        }))
+        .unwrap();
+        with_hook.validate("plug").unwrap();
+        assert_eq!(classify(&with_hook), ExtensionClass::HookLifecycle);
         assert_eq!(
-            validate_deferred(m.deferred.as_ref().unwrap()),
-            Err("too_many_declared_context_providers")
+            earliest_trigger(&with_hook),
+            ActivationTrigger::FirstAuthorizedHookEvent
         );
-        assert!(m.validate("plug").is_err());
     }
 
+    /// Loading a manifest that declares the field or the permission says so
+    /// in one line; one that declares neither says nothing.
     #[test]
-    fn oversized_or_hostile_context_provider_fields_are_rejected() {
-        let check = |p: DeclaredExtensionContextProvider, reason: &'static str| {
-            let m = with_context_providers(&["context_providers.register"], vec![p]);
-            assert_eq!(validate_deferred(m.deferred.as_ref().unwrap()), Err(reason));
-            assert!(m.validate("plug").is_err());
+    fn a_declared_context_provider_is_reported_as_ignored() {
+        let with = |permissions: &[&str], deferred: Option<Value>| -> ExtensionManifest {
+            let mut manifest = json!({
+                "runtime": "process",
+                "command": "/bin/false",
+                "permissions": permissions,
+            });
+            if let Some(deferred) = deferred {
+                manifest["deferred"] = deferred;
+            }
+            serde_json::from_value(manifest).unwrap()
         };
-        // Oversized id (one byte over the declared-name budget).
-        check(
-            declared_context_provider(&"i".repeat(DECLARED_NAME_MAX_BYTES + 1)),
-            "invalid_declared_context_provider_id",
-        );
-        // Empty and colon ids fail through the same newtype policy.
-        check(
-            declared_context_provider(""),
-            "invalid_declared_context_provider_id",
-        );
-        check(
-            declared_context_provider("has:colon"),
-            "invalid_declared_context_provider_id",
-        );
-        // Oversized / empty / control-char capability.
-        let mut p = declared_context_provider("p");
-        p.capability = "c".repeat(DECLARED_NAME_MAX_BYTES + 1);
-        check(p, "invalid_declared_context_provider_capability");
-        let mut p = declared_context_provider("p");
-        p.capability = String::new();
-        check(p, "invalid_declared_context_provider_capability");
-        let mut p = declared_context_provider("p");
-        p.capability = "ctrl\u{7}".to_string();
-        check(p, "invalid_declared_context_provider_capability");
-        // Oversized / empty description.
-        let mut p = declared_context_provider("p");
-        p.description = "d".repeat(DECLARED_DESCRIPTION_MAX_BYTES + 1);
-        check(p, "invalid_declared_context_provider_description");
-        let mut p = declared_context_provider("p");
-        p.description = String::new();
-        check(p, "invalid_declared_context_provider_description");
-        // Zero schema version.
-        let mut p = declared_context_provider("p");
-        p.schema_version = 0;
-        check(p, "invalid_declared_context_provider_schema_version");
-        // Duplicate ids.
-        let m = with_context_providers(
-            &["context_providers.register"],
-            vec![
-                declared_context_provider("dup"),
-                declared_context_provider("dup"),
-            ],
-        );
-        assert_eq!(
-            validate_deferred(m.deferred.as_ref().unwrap()),
-            Err("duplicate_declared_context_provider_id")
-        );
-        // Exact-cap fields pass (bounds are exact, not fuzzy).
-        let mut p = declared_context_provider(&"i".repeat(DECLARED_NAME_MAX_BYTES));
-        p.capability = "c".repeat(DECLARED_NAME_MAX_BYTES);
-        p.description = "d".repeat(DECLARED_DESCRIPTION_MAX_BYTES);
-        with_context_providers(&["context_providers.register"], vec![p])
-            .validate("plug")
-            .unwrap();
+        // The field, with or without the permission.
+        for permissions in [&["context_providers.register"][..], &["tools.register"][..]] {
+            let m = with(permissions, Some(json!({"context_providers": provider_declaration()})));
+            assert_eq!(ignored_context_provider_notice("mem", &m), Some(notice("mem")));
+        }
+        // The permission alone.
+        let m = with(&["context_providers.register"], None);
+        assert_eq!(ignored_context_provider_notice("mem", &m), Some(notice("mem")));
+        // Neither, or an empty declaration: nothing to say.
+        for deferred in [
+            None,
+            Some(json!({})),
+            Some(json!({"context_providers": []})),
+            Some(json!({"context_providers": null})),
+        ] {
+            let m = with(&["tools.register"], deferred);
+            assert_eq!(ignored_context_provider_notice("plain", &m), None);
+        }
     }
 
-    // ── dormant descriptors: fail closed without the permission ─────────
-
+    /// The field is not validated any more, so nothing in it can fail a
+    /// load: not a missing permission, not a count, not a shape that the
+    /// old typed declaration would have refused to parse.
     #[test]
-    fn dormant_descriptors_are_minted_only_for_validated_gated_manifests() {
-        use super::super::context_provider::dormant_context_provider_descriptors;
-        let m = with_context_providers(
-            &["context_providers.register"],
-            vec![declared_context_provider("project-memory")],
-        );
-        let descriptors = dormant_context_provider_descriptors("axel-memory-manager", &m);
-        assert_eq!(descriptors.len(), 1);
-        assert_eq!(
-            descriptors[0].runtime_address(),
-            "extension:axel-memory-manager:project-memory"
-        );
-        assert_eq!(descriptors[0].schema_version(), 1);
-
-        // Missing permission => NOTHING is minted (unauthorized dormant
-        // metadata would still be future runtime reach).
-        let ungated = with_context_providers(
-            &["tools.register"],
-            vec![declared_context_provider("project-memory")],
-        );
-        assert!(dormant_context_provider_descriptors("axel-memory-manager", &ungated).is_empty());
-        // Colon plugin ids would break the composed runtime address.
-        assert!(dormant_context_provider_descriptors("bad:plugin", &m).is_empty());
-        // No deferred block => nothing.
-        assert!(
-            dormant_context_provider_descriptors("p", &base_manifest(&["tools.register"]))
-                .is_empty()
-        );
+    fn a_declared_context_provider_can_never_fail_a_manifest() {
+        let many: Vec<Value> = (0..64).map(|i| json!({"id": format!("p{i}")})).collect();
+        for declaration in [
+            provider_declaration(),
+            json!([{"id": "has:colon", "capability": "", "schema_version": 0}]),
+            json!([{"id": "dup"}, {"id": "dup"}]),
+            Value::Array(many),
+            json!("project-memory"),
+            json!({"id": "project-memory"}),
+            json!(7),
+        ] {
+            let m: ExtensionManifest = serde_json::from_value(json!({
+                "runtime": "process",
+                "command": "/bin/false",
+                "permissions": ["tools.register"],
+                "deferred": {"context_providers": declaration.clone()}
+            }))
+            .unwrap_or_else(|e| panic!("{declaration} must parse: {e}"));
+            m.validate("plug")
+                .unwrap_or_else(|e| panic!("{declaration} must validate: {e}"));
+            assert_eq!(classify(&m), ExtensionClass::LegacyEager, "{declaration}");
+        }
     }
 
     // ── T291 D4: manifest-time ids must be validated by the SAME function
@@ -1075,17 +960,11 @@ mod tests {
         );
     }
 
-    // ── an exclusive memory binding refuses aliased memory tools ────────
+    // ── a deferred tool named like a memory tool is not refused for it ──
 
-    const MEMORY_REFUSAL: &str = "independent extension memory is disabled by the selected host backend; use short memory tools";
-
-    async fn call_deferred(
-        plugin: &str,
-        operation: &str,
-        kind: agent_core::config::MemoryBackendKind,
-    ) -> String {
+    async fn call_deferred(plugin: &str, operation: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
-        let binding = crate::tools::test_helpers::memory_binding(kind, dir.path());
+        let binding = crate::tools::test_helpers::memory_binding(dir.path());
         let tool = DeferredExtensionTool::new(plugin, &declared_tool(operation));
         match tool
             .execute(json!({}), crate::tools::test_helpers::context_with_memory(binding))
@@ -1096,32 +975,10 @@ mod tests {
         }
     }
 
-    /// Regression: `memory:search` is offered as `memory_search`, yet only
-    /// its operation `search` was checked.
-    #[tokio::test]
-    async fn an_exclusive_binding_refuses_deferred_extension_memory_aliases() {
-        use agent_core::config::MemoryBackendKind::Axel;
-        for (plugin, operation) in [
-            ("memory", "search"),
-            ("memory", "fetch"),
-            ("Memory", "Search"),
-            ("plug", "memory.store"),
-            ("plug", "MEMORY_STORE"),
-            ("axel-memory-manager", "memory_search"),
-            ("axel-memory-manager", "memory_forget"),
-        ] {
-            assert_eq!(
-                call_deferred(plugin, operation, Axel).await,
-                MEMORY_REFUSAL,
-                "{plugin}:{operation}"
-            );
-        }
-    }
-
     /// The suffixed wire name the model sees beside the host's own tool
-    /// reaches the deferred alias, which refuses.
+    /// reaches the deferred alias, which goes on to the lease check.
     #[tokio::test]
-    async fn the_suffixed_wire_name_of_a_deferred_alias_is_refused() {
+    async fn the_suffixed_wire_name_of_a_deferred_alias_reaches_the_lease_check() {
         let dir = tempfile::tempdir().unwrap();
         let registry = crate::tools::ToolRegistry::from_tools_for_tests(vec![
             Arc::new(crate::tools::memory::MemorySearchTool),
@@ -1132,23 +989,21 @@ mod tests {
         let alias = registry
             .get(registry.runtime_name_for_api("memory_search_2"))
             .expect("alias registered");
-        let binding = crate::tools::test_helpers::memory_binding(
-            agent_core::config::MemoryBackendKind::Axel,
-            dir.path(),
-        );
+        let binding = crate::tools::test_helpers::memory_binding(dir.path());
         match alias
             .execute(json!({}), crate::tools::test_helpers::context_with_memory(binding))
             .await
         {
-            Err(crate::RuntimeError::Tool(message)) => assert_eq!(message, MEMORY_REFUSAL),
-            other => panic!("expected the memory refusal, got {other:?}"),
+            Err(crate::RuntimeError::Tool(message)) => {
+                assert!(message.contains("is activation-deferred"), "{message}")
+            }
+            other => panic!("expected the lease refusal, got {other:?}"),
         }
     }
 
     /// A nested `:` (`plug:memory:fetch`) cannot reach a deferred tool: the
     /// manifest refuses `:` in declared tool names, and a plugin id with `:`
-    /// gets no deferred tools. The classifier still covers it for other
-    /// routes (`memory_backend::competing`).
+    /// gets no deferred tools.
     #[test]
     fn a_nested_colon_name_never_becomes_a_deferred_tool() {
         assert_eq!(
@@ -1167,18 +1022,23 @@ mod tests {
         assert!(dormant_extension_tools("plug:memory", &manifest).is_empty());
     }
 
-    /// Other tools, and every tool without an exclusive binding, go on to
-    /// the lease check exactly as before (no lease here, so nothing starts).
+    /// T-B7. Every deferred tool, a memory tool's name or alias included,
+    /// goes on to the lease check (no lease here, so nothing starts): the
+    /// guard that refused such names beside an exclusive backend is gone.
     #[tokio::test]
-    async fn other_deferred_tools_and_legacy_bindings_reach_the_lease_check() {
-        use agent_core::config::MemoryBackendKind::{Axel, Legacy};
-        for (plugin, operation, kind) in [
-            ("weather", "search", Axel),
-            ("memory", "summarize", Axel),
-            ("memory", "search", Legacy),
-            ("axel-memory-manager", "memory_search", Legacy),
+    async fn deferred_tools_named_like_memory_tools_reach_the_lease_check() {
+        for (plugin, operation) in [
+            ("weather", "search"),
+            ("memory", "summarize"),
+            ("memory", "search"),
+            ("memory", "fetch"),
+            ("Memory", "Search"),
+            ("plug", "memory.store"),
+            ("plug", "MEMORY_STORE"),
+            ("axel-memory-manager", "memory_search"),
+            ("axel-memory-manager", "memory_forget"),
         ] {
-            let message = call_deferred(plugin, operation, kind).await;
+            let message = call_deferred(plugin, operation).await;
             assert!(
                 message.contains("is activation-deferred"),
                 "{plugin}:{operation}: {message}"

@@ -98,7 +98,7 @@ where
 /// Cancellation wins over a ready tool, and the last precheck is inside the
 /// execution future, immediately before its first poll. Track whether it was
 /// polled: an unstarted non-idempotent tool is NOT an interrupted side effect.
-async fn await_tool_call<F: std::future::Future>(
+pub(crate) async fn await_tool_call<F: std::future::Future>(
     cancel: &CancellationToken,
     call: F,
 ) -> (Option<F::Output>, bool) {
@@ -132,10 +132,6 @@ fn validated_tool_output(model: &str, output: crate::ToolOutput) -> (String, Opt
 pub(super) struct StreamSession {
     // Context continuation
     pub(super) memory_backend: crate::memory_backend::MemoryBinding,
-    pub(super) memory_context: Option<super::memory_context::MemoryContextCapability>,
-    /// Set only at a successful, non-cancelled terminal assistant boundary.
-    /// Error/budget/cancel paths leave this empty, even when they return Ok.
-    pub(super) final_capture_history: Arc<Mutex<Option<Vec<SharedMessage>>>>,
     /// Marked at the turn's normal end (see `TurnCompletion`).
     pub(super) turn_completion: super::types::TurnCompletion,
     pub(super) context_window: u64,
@@ -207,6 +203,8 @@ pub(super) struct StreamSession {
     pub(super) turn_correlation_id: String,
     /// Opt-in Task 18 policy. False preserves the full-schema request path.
     pub(super) progressive_tool_disclosure: bool,
+    /// `tools.always_loaded`: ids joined to the progressive core.
+    pub(super) tools_always_loaded: Arc<[crate::tools::catalog::ToolId]>,
     /// `tools.deferred_loading` (Anthropic deferred tool definitions).
     pub(super) deferred_tool_loading: bool,
     /// `tools.activation_confirm` policy (auto | prompt | deny).
@@ -500,16 +498,71 @@ pub(super) fn rebuild_stale_tool_set(
     catalog: &crate::tools::catalog::ToolCatalog,
     progressive: bool,
     context_enabled: bool,
+    always_loaded: &[crate::tools::catalog::ToolId],
 ) -> (
     crate::tools::activation::SessionToolSet,
     Vec<crate::tools::activation::DroppedActivation>,
 ) {
-    let fresh =
-        super::continuation::context_tool_set(session, catalog, progressive, context_enabled);
+    // What the chat is not offered was settled at turn start and holds for
+    // the turn: the rebuilt set withholds what the stale one did.
+    let fresh = super::continuation::context_tool_set(
+        session,
+        catalog,
+        progressive,
+        context_enabled,
+        always_loaded,
+    )
+    .withholding(set.withheld().cloned());
     if crate::tools::activation::carry_forward_enabled() {
         set.carry_activations_into(fresh, catalog)
     } else {
         (fresh, Vec::new())
+    }
+}
+
+/// Fire `on_message_complete` for one finished assistant message and apply
+/// an advisory work phase the extension reports back. The one place the
+/// event is built. Called once for every assistant message the stream loop
+/// keeps (pushed to history, or the empty reply after a tool round, which
+/// is not pushed): the normal path, the empty reply, the usage-budget stop
+/// and the batched `context_checkpoint` rejection. A response the loop
+/// drops (an empty reply that is an error, a cancel or over a usage
+/// budget) gets no event.
+///
+/// An extension may report an advisory work phase; it is applied exactly
+/// like the model's own `context_checkpoint` (no note) and is never
+/// capacity or permission authority.
+async fn emit_message_complete(
+    hook_bus: &crate::extensions::hooks::HookBus,
+    continuation: &super::continuation::SharedContinuation,
+    context_enabled: bool,
+    session_id: Option<&str>,
+    cwd: Option<&std::path::Path>,
+    content: &[Value],
+    has_tool_use: bool,
+) {
+    let assistant_text = assistant_text_from_content(content);
+    let context_management = continuation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .hook_context_management();
+    let hook_event = HookEvent::on_message_complete(
+        &assistant_text,
+        json!({
+            "content_block_count": content.len(),
+            "has_tool_use": has_tool_use,
+            "context_management": context_management,
+        }),
+    )
+    .with_session(session_id)
+    .with_cwd(cwd);
+    if let HookResult::ContextPhase { phase } = hook_bus.emit(&hook_event).await {
+        if context_enabled {
+            continuation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .report_hook_phase(&phase);
+        }
     }
 }
 
@@ -671,8 +724,6 @@ impl StreamMethods {
     ) -> Result<()> {
         let StreamSession {
             memory_backend,
-            memory_context,
-            final_capture_history,
             turn_completion,
             context_window,
             continuation,
@@ -716,6 +767,7 @@ impl StreamMethods {
             delegation_parent,
             turn_correlation_id,
             progressive_tool_disclosure,
+            tools_always_loaded,
             deferred_tool_loading,
             activation_confirm,
             tool_session_id,
@@ -803,19 +855,10 @@ impl StreamMethods {
         if context_enabled {
             super::continuation::record_turn_start(&continuation, &mut messages);
         }
-        if context_enabled && memory_backend.exclusive() && !memory_backend.is_axel() {
-            return Err(crate::RuntimeError::Config(
-                "automatic context management requires a configured memory backend; selected backend unavailable and no fallback; history unchanged".into(),
-            ));
-        }
         if context_enabled {
-            if !memory_backend.exclusive() {
-                super::continuation::restore_window(&messages, &continuation);
-            }
-            let mut registry = prepare_or_cancel!(tools.write());
-            registry.register(Arc::new(
-                crate::tools::context_checkpoint::ContextCheckpointTool(continuation.clone()),
-            ));
+            // The window of a resumed head was restored above
+            // (`validate_restored_history`).
+            let registry = prepare_or_cancel!(tools.read());
             for name in ["memory_search", "memory_fetch"] {
                 if registry.get(name).is_none_or(|tool| {
                     tool.origin() != crate::tools::ToolOrigin::Builtin
@@ -824,22 +867,15 @@ impl StreamMethods {
                 }
             }
         } else {
-            prepare_or_cancel!(tools.write()).disable(&["context_checkpoint".into()]);
             continuation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .update_advisory(None);
         }
-        // DARK (§7): the project forum lives in the Axel backend. Under the
-        // legacy backend every forum_* call errors in `require_forum`, so do
-        // not spend catalog tokens advertising tools the model can never use.
-        if !memory_backend.is_axel() {
-            prepare_or_cancel!(tools.write()).disable(&[
-                "forum_post".into(),
-                "forum_read".into(),
-                "forum_forget".into(),
-            ]);
-        }
+        // The registry is the host's and every chat on it shares it, so
+        // nothing of this chat is registered into it or removed from it.
+        // What this chat is not offered (`chat_tools::withheld_tools`) is
+        // withheld from its own session tool set below.
         let system_prompt = if context_enabled {
             Some(format!(
                 "{}\n\n{}",
@@ -882,11 +918,12 @@ impl StreamMethods {
         // pins), never silently absorbed.
         let session_tool_set: crate::tools::activation::SharedSessionToolSet = {
             let registry = tools.read().await;
-            let fresh = super::continuation::context_tool_set(
+            let fresh = super::chat_tools::chat_tool_set(
                 tool_session_id.clone(),
                 registry.catalog(),
                 progressive_tool_disclosure,
                 context_enabled,
+                &tools_always_loaded,
             );
             retain_session_tool_set(
                 &retained_tool_set,
@@ -903,7 +940,6 @@ impl StreamMethods {
         // minting a fresh set.
         let mut options = options;
         options.session_tool_set = Some(std::sync::Arc::clone(&session_tool_set));
-        let options = options;
         // Host activation policy for MODEL-INITIATED `activate_tools`:
         // confirmation authority comes exclusively from host configuration
         // (explicit server auto-approve), never from model-authored JSON.
@@ -925,6 +961,51 @@ impl StreamMethods {
             )
         });
         let _extension_session_scope = extension_session_scope;
+
+        // What every tool call of this turn is given. Both dispatch lanes
+        // below make their contexts from it, and so does the tool loop of
+        // an extension-provided model, which gets it through `options`:
+        // those are this chat's tool calls too, in the chat's folder, with
+        // its environment, for its conversation.
+        let turn_tools = crate::tools::TurnToolContext::new(
+            crate::tools::ToolCapabilities {
+                session_allow_all: Some(session_allow_all.clone()),
+                launch_cancel: Some(cancel.clone()),
+                memory_backend: Some(memory_backend.clone()),
+                telemetry: Some(worker_telemetry),
+                // Per dispatch: `TurnToolContext::for_dispatch`.
+                tool_register_tx: None,
+                tool_activation: None,
+                session_manager: Some(session_manager),
+                subagent_registry: Some(subagent_registry.clone()),
+                event_queue: Some(event_queue),
+                delegation_parent,
+                codex_parent_plan,
+                secret_prompt: secret_prompt.clone(),
+                orchestration: orchestration.clone(),
+                mcp_leases: mcp_lease_capability,
+                extension_leases: extension_lease_capability,
+                cwd: cwd.clone(),
+                env,
+                env_stripped,
+                env_warned,
+                session_id: session_id.clone(),
+                hook_bus: Some(hook_bus.clone()),
+                continuation: Some(continuation.clone()),
+            },
+            crate::tools::ToolLimits {
+                max_tool_output,
+                max_tool_buffer: 256 * 1024,
+                bash_timeout,
+                bash_max_timeout,
+                subagent_timeout,
+            },
+            // The stream's own sender: a tool may keep it past the round
+            // that ran the call (a worker reporting as it goes).
+            Some(tx.clone()),
+        );
+        options.tool_context = Some(turn_tools.clone());
+        let options = options;
 
         let (activation_authority, activation_prompt_allowed) =
             activation_policy(activation_confirm, auto_approve_confirms);
@@ -1140,6 +1221,7 @@ impl StreamMethods {
                             registry.catalog(),
                             progressive_tool_disclosure,
                             context_enabled,
+                            &tools_always_loaded,
                         );
                         for d in &dropped {
                             tracing::warn!(
@@ -1207,7 +1289,8 @@ impl StreamMethods {
             let turn_injected_context: Option<String> = if let Some(ref msg_text) = last_user_msg {
                 let hook_event =
                     crate::extensions::hooks::events::HookEvent::before_message(msg_text)
-                        .with_session(session_id.as_deref());
+                        .with_session(session_id.as_deref())
+                        .with_cwd(cwd.as_deref());
                 if let crate::extensions::hooks::events::HookResult::Inject { content } =
                     hook_bus.emit(&hook_event).await
                 {
@@ -1335,7 +1418,17 @@ impl StreamMethods {
                 };
                 &projected_options
             } else {
+                // Flag off: the whole registry, minus what this chat is not
+                // offered. `None` (it withholds nothing the registry has)
+                // keeps the registry's cached Arc.
+                let offered = {
+                    let session_set = session_tool_set
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    tools_snapshot.tools_schema_without(session_set.withheld())
+                };
                 metered_options = super::api::ApiOptions {
+                    request_tools_schema: offered.or_else(|| options.request_tools_schema.clone()),
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
                     request_correlation: request_correlation.clone(),
                     retention_frontier,
@@ -1525,7 +1618,17 @@ impl StreamMethods {
                                 }
                                 super::continuation::persist_head(&prepared, &continuation, &tx)
                                     .await?;
-                                messages = prepared.commit(&continuation)?;
+                                // Saved, acknowledged and committed: only now
+                                // are extensions told the window's archives
+                                // (`on_context_archived`), so a rollover given
+                                // up above was never announced. Notify-only,
+                                // never awaited; nothing below depends on it.
+                                messages = prepared.commit_and_announce(
+                                    &continuation,
+                                    &hook_bus,
+                                    &memory_backend,
+                                    cwd.as_deref(),
+                                )?;
                                 budget_meter.start_context_segment();
                                 segment_has_provider_round = false;
                                 let window = continuation
@@ -1856,13 +1959,21 @@ impl StreamMethods {
                     let after_tool_result = budget_meter.rounds_used() > 1;
                     if after_tool_result && !cancel.is_cancelled() {
                         // Legitimate empty end_turn after tool results — clean finish.
-                        // A clean finish is a terminal completion: publish the
-                        // history for memory capture like the normal end_turn path.
+                        // It is still the turn's last assistant message: an
+                        // extension that acts "when the turn is done" waits
+                        // for the event with `has_tool_use: false`, and the
+                        // tool rounds before this one all said `true`.
+                        emit_message_complete(
+                            &hook_bus,
+                            &continuation,
+                            context_enabled,
+                            session_id.as_deref(),
+                            cwd.as_deref(),
+                            content,
+                            false,
+                        )
+                        .await;
                         turn_completion.mark_completed();
-                        *final_capture_history
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(messages.clone());
                         send_history!();
                         return Ok(());
                     }
@@ -1898,6 +2009,17 @@ impl StreamMethods {
 
                 if let Some(dimension) = usage_exhausted {
                     // Keep the paid-for response; none of its calls run.
+                    // It is in history, so extensions see it end.
+                    emit_message_complete(
+                        &hook_bus,
+                        &continuation,
+                        context_enabled,
+                        session_id.as_deref(),
+                        cwd.as_deref(),
+                        content,
+                        !tool_uses.is_empty(),
+                    )
+                    .await;
                     if !tool_uses.is_empty() {
                         let content = format!(
                             "{}: turn {} budget exhausted",
@@ -1932,35 +2054,32 @@ impl StreamMethods {
                     && tool_uses.len() > 1
                     && tool_uses.iter().any(|t| t["name"] == "context_checkpoint")
                 {
+                    // The message asked for tools (none run); it is in
+                    // history, so extensions see it end.
+                    emit_message_complete(
+                        &hook_bus,
+                        &continuation,
+                        context_enabled,
+                        session_id.as_deref(),
+                        cwd.as_deref(),
+                        content,
+                        true,
+                    )
+                    .await;
                     messages.push(Arc::new(json!({"role":"user","content":tool_uses.iter().map(|t|json!({"type":"tool_result","tool_use_id":t["id"],"is_error":true,"content":"No tools executed: context_checkpoint must be called alone so the host can assess rollover before more work."})).collect::<Vec<_>>()})));
                     continue;
                 }
 
-                let assistant_text = assistant_text_from_content(content);
-                let context_management = continuation
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .hook_context_management();
-                let hook_event = HookEvent::on_message_complete(
-                    &assistant_text,
-                    json!({
-                        "content_block_count": content.len(),
-                        "has_tool_use": !tool_uses.is_empty(),
-                        "context_management": context_management,
-                    }),
+                emit_message_complete(
+                    &hook_bus,
+                    &continuation,
+                    context_enabled,
+                    session_id.as_deref(),
+                    cwd.as_deref(),
+                    content,
+                    !tool_uses.is_empty(),
                 )
-                .with_session(session_id.as_deref());
-                // An extension may report an advisory work phase; it is
-                // applied exactly like the model's own `context_checkpoint`
-                // (no note) and is never capacity or permission authority.
-                if let HookResult::ContextPhase { phase } = hook_bus.emit(&hook_event).await {
-                    if context_enabled {
-                        continuation
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .report_hook_phase(&phase);
-                    }
-                }
+                .await;
 
                 // If no tool uses, check for steering messages before finishing.
                 // Steering can redirect the model even when it has no more tool calls.
@@ -2021,12 +2140,6 @@ impl StreamMethods {
                                 }
                             }
                         }
-                        if !cancel.is_cancelled() {
-                            *final_capture_history
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(messages.clone());
-                        }
                         if !response_cancelled {
                             turn_completion.mark_completed();
                         }
@@ -2044,6 +2157,17 @@ impl StreamMethods {
                 // Channel for dynamic tool registration (MCP connect uses this)
                 let (tool_reg_tx, mut tool_reg_rx) =
                     tokio::sync::mpsc::unbounded_channel::<Vec<Arc<dyn crate::Tool>>>();
+                // The turn's tool context for this dispatch: with the
+                // channel above and this round's catalog snapshot.
+                let dispatch_tools = turn_tools.for_dispatch(
+                    tool_reg_tx.clone(),
+                    crate::tools::discovery::ActivationCapability::new(
+                        catalog_snapshot.clone(),
+                        std::sync::Arc::clone(&session_tool_set),
+                        activation_authority,
+                    )
+                    .with_host_prompt(activation_prompt_allowed),
+                );
                 // blocks". On cancellation we synthesize a "Canceled by user" result for any
                 // remaining tools so message history stays valid.
                 let mut tool_results = Vec::new();
@@ -2201,6 +2325,7 @@ impl StreamMethods {
                                         Some(&runtime_name),
                                         input.clone(),
                                         session_id.as_deref(),
+                                        cwd.as_deref(),
                                     )
                                     .await,
                                     secret_prompt.as_ref(),
@@ -2230,11 +2355,7 @@ impl StreamMethods {
                                         &input,
                                         cwd.as_deref(),
                                     );
-                                    match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
-                                            channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), telemetry: Some(worker_telemetry.clone()), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone() },
-                                            limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
-                                        })).await {
+                                    match await_tool_call(&cancel, tool.execute_rich(input, dispatch_tools.for_call(Some(tx_d)))).await {
                                         (Some(res), _) => {
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks) = match res {
@@ -2255,6 +2376,7 @@ impl StreamMethods {
                                                 output.clone(),
                                                 max_tool_output,
                                                 session_id.as_deref(),
+                                                cwd.as_deref(),
                                                 tool_spill.is_enabled(),
                                             ).await;
                                             // Hook policy: a Replace transform wins over the rich
@@ -2486,7 +2608,8 @@ impl StreamMethods {
                                                     LaneKind::Concurrent
                                                 }
                                                 crate::tools::catalog::ToolEffect::IdempotentWrite => {
-                                                    match implementation.concurrency_key(input) {
+                                                    // In the chat's folder, where the call will run.
+                                                    match implementation.concurrency_key_in(input, cwd.as_deref()) {
                                                         Some(crate::tools::ConcurrencyKey::Key(key)) => LaneKind::Keyed(key),
                                                         Some(crate::tools::ConcurrencyKey::Serialize) | None => LaneKind::Serial,
                                                     }
@@ -2574,37 +2697,17 @@ impl StreamMethods {
                         let dedupe_history_inner = Arc::clone(&dedupe_history);
                         let request_correlation_inner = request_correlation.clone();
                         let trace_inner = round_options.trace.clone();
-                        let delegation_parent_inner = delegation_parent.clone();
-                        let codex_parent_plan_inner = codex_parent_plan.clone();
                         let cancel_token = cancel.clone();
                         let turn_completion_inner = turn_completion.clone();
-                        let tool_reg_tx_inner = tool_reg_tx.clone();
-                        let session_mgr = session_manager.clone();
-                        let registry_inner = subagent_registry.clone();
-                        let eq_inner = event_queue.clone();
+                        let dispatch_tools_inner = dispatch_tools.clone();
                         let hook_bus_inner = hook_bus.clone();
                         let prompt_inner = secret_prompt.clone();
                         let model_inner = model.clone();
                         let cwd_inner = cwd.clone();
-                        let env_inner = env.clone();
-                        let env_stripped_inner = env_stripped.clone();
-                        let env_warned_inner = env_warned.clone();
-                        let memory_backend_inner = memory_backend.clone();
-                        let worker_telemetry_inner = worker_telemetry.clone();
-                        let memory_context_inner = memory_context.clone();
                         let session_id_inner = session_id.clone();
                         let tool_spill_inner = tool_spill.clone();
                         let auto_approve_inner = auto_approve_confirms;
                         let session_allow_all_inner = session_allow_all.clone();
-                        let orchestration_inner = orchestration.clone();
-                        let mcp_leases_inner = mcp_lease_capability.clone();
-                        let extension_leases_inner = extension_lease_capability.clone();
-                        let activation_inner = crate::tools::discovery::ActivationCapability::new(
-                            catalog_snapshot.clone(),
-                            std::sync::Arc::clone(&session_tool_set),
-                            activation_authority,
-                        )
-                        .with_host_prompt(activation_prompt_allowed);
 
                         join_set.spawn(async move {
                             let mut lane_results: Vec<(String, bool, Option<String>, Value)> = Vec::new();
@@ -2648,6 +2751,7 @@ impl StreamMethods {
                                             Some(&runtime_name_for_hook),
                                             input.clone(),
                                             session_id_inner.as_deref(),
+                                            cwd_inner.as_deref(),
                                         ).await,
                                         prompt_inner.as_ref(),
                                         auto_approve_inner,
@@ -2696,11 +2800,7 @@ impl StreamMethods {
                                     );
                                     let tx_d = delta_channel.sender;
 
-                                    match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
-                                            channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), telemetry: Some(worker_telemetry_inner.clone()), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), session_id: session_id_inner.clone() },
-                                            limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
-                                        })).await {
+                                    match await_tool_call(&cancel_token, t.execute_rich(input, dispatch_tools_inner.for_call(Some(tx_d)))).await {
                                         (Some(res), _) => {
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks, errored) = match res {
@@ -2715,6 +2815,7 @@ impl StreamMethods {
                                                 output.clone(),
                                                 max_tool_output,
                                                 session_id_inner.as_deref(),
+                                                cwd_inner.as_deref(),
                                                 tool_spill_inner.is_enabled(),
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
@@ -4190,6 +4291,7 @@ mod rich_output_tests {
                     summary.clone(),
                     10,
                     None,
+                    None,
                     keep_uncut,
                 )
                 .await;
@@ -4216,6 +4318,7 @@ mod rich_output_tests {
                         json!({}),
                         summary,
                         10,
+                        None,
                         None,
                     )
                     .await
@@ -4350,9 +4453,7 @@ mod rich_output_tests {
         model: &str,
     ) -> StreamSession {
         StreamSession {
-            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
-            memory_context: None,
-            final_capture_history: Arc::new(Mutex::new(None)),
+            memory_backend: crate::memory_backend::MemoryBinding::for_cwd(std::env::current_dir().ok()),
             turn_completion: Default::default(),
             context_window: 200_000,
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
@@ -4410,6 +4511,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-test".into(),
             progressive_tool_disclosure: progressive,
+            tools_always_loaded: Arc::from([]),
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
@@ -5128,6 +5230,7 @@ mod rich_output_tests {
     /// an advisory `new_task` phase.
     struct PhaseHook {
         seen: Mutex<Vec<Value>>,
+        messages: Mutex<Vec<Option<String>>>,
     }
     #[async_trait::async_trait]
     impl crate::extensions::runtime::ExtensionHandler for PhaseHook {
@@ -5136,6 +5239,7 @@ mod rich_output_tests {
         }
         async fn handle(&self, event: &HookEvent) -> HookResult {
             self.seen.lock().unwrap().push(event.data.clone());
+            self.messages.lock().unwrap().push(event.message.clone());
             HookResult::ContextPhase {
                 phase: "new_task".into(),
             }
@@ -5149,6 +5253,7 @@ mod rich_output_tests {
         let bus = Arc::new(crate::extensions::hooks::HookBus::new());
         let hook = Arc::new(PhaseHook {
             seen: Mutex::new(Vec::new()),
+            messages: Mutex::new(Vec::new()),
         });
         let mut perms = PermissionSet::new();
         perms.grant(crate::extensions::permissions::Permission::LlmContent);
@@ -5190,6 +5295,8 @@ mod rich_output_tests {
         assert_eq!(seen.len(), 2, "one hook per assistant message: {seen:?}");
         assert_eq!(seen[0]["content_block_count"], 1);
         assert_eq!(seen[0]["has_tool_use"], true);
+        // A normal turn says "this was the last message" exactly once.
+        assert_eq!(seen[1]["has_tool_use"], false);
         assert_eq!(
             seen[0]["context_management"],
             json!({"enabled": true, "band": "normal", "phase": "unknown"})
@@ -5486,6 +5593,90 @@ mod rich_output_tests {
         }
     }
 
+    /// A hook event's kind, `session_id` and `cwd`.
+    type Who = (HookKind, Option<String>, Option<String>);
+    /// Records what each hook event says about who it is for.
+    struct WhoProbe(std::sync::Mutex<Vec<Who>>);
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for WhoProbe {
+        fn id(&self) -> &str {
+            "who-probe"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.0.lock().unwrap().push((
+                event.kind,
+                event.session_id.clone(),
+                event.cwd.clone(),
+            ));
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+    }
+
+    /// Every hook the stream loop emits names the stream's folder, on the
+    /// serial and the parallel tool lane: a daemon chat's own folder (never
+    /// the process's), a worker's parent folder although a worker has no
+    /// conversation id, and the process folder for a stream with none of
+    /// its own (in-process hosts).
+    #[tokio::test]
+    async fn stream_hooks_carry_the_streams_cwd() {
+        const KINDS: [HookKind; 4] = [
+            HookKind::BeforeMessage,
+            HookKind::BeforeToolCall,
+            HookKind::AfterToolCall,
+            HookKind::OnMessageComplete,
+        ];
+        let chat = tempfile::tempdir().unwrap();
+        let process = std::env::current_dir().unwrap();
+        assert_ne!(chat.path(), process.as_path());
+        let one = &[("toolu_1", "session_probe")][..];
+        let two = &[("toolu_1", "session_probe"), ("toolu_2", "session_probe")][..];
+        for (conversation, cwd, uses) in [
+            (Some("conv-1"), Some(chat.path()), one),
+            (Some("conv-2"), Some(chat.path()), two),
+            (None, Some(chat.path()), two),
+            (Some("conv-3"), None, one),
+        ] {
+            let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+            let probe = Arc::new(WhoProbe(Default::default()));
+            for kind in KINDS {
+                let mut perms = PermissionSet::new();
+                perms.grant(kind.required_permission());
+                bus.subscribe(kind, probe.clone(), None, None, perms)
+                    .await
+                    .unwrap();
+            }
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let _ = drive_configured(
+                "claude-sonnet-4-6",
+                initial,
+                vec![Arc::new(SessionProbe(Default::default()))],
+                uses,
+                bus,
+                std::time::Duration::from_secs(20),
+                |session| {
+                    session.session_id = conversation.map(str::to_string);
+                    session.cwd = cwd.map(std::path::Path::to_path_buf);
+                },
+            )
+            .await;
+            let seen = probe.0.lock().unwrap().clone();
+            let folder = cwd.unwrap_or(&process).to_str().map(str::to_string);
+            for kind in KINDS {
+                let events: Vec<_> = seen.iter().filter(|e| e.0 == kind).collect();
+                let per_call = matches!(kind, HookKind::BeforeToolCall | HookKind::AfterToolCall);
+                assert!(
+                    if per_call { events.len() == uses.len() } else { !events.is_empty() },
+                    "{kind:?} under {conversation:?}: {seen:?}"
+                );
+                for (_, session_id, event_cwd) in events {
+                    assert_eq!(session_id.as_deref(), conversation, "{kind:?}");
+                    assert_eq!(event_cwd, &folder, "{kind:?} under {conversation:?}");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn rich_output_and_hook_replace() {
@@ -5637,6 +5828,99 @@ mod rich_output_tests {
             ],
             "queued before any result, started right after the call ahead finished"
         );
+    }
+
+    /// `write`, as the scheduler and the disk see it, to one fixed path: the
+    /// harness's tool calls carry no input. The lane key, the effect and the
+    /// write itself are the production tool's.
+    struct WriteTo {
+        name: &'static str,
+        path: String,
+    }
+    impl WriteTo {
+        fn input(&self) -> Value {
+            json!({"path": self.path, "content": self.name})
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for WriteTo {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "writes its own name to its path"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::WriteTool.effect()
+        }
+        fn concurrency_key(&self, _input: &Value) -> Option<crate::tools::ConcurrencyKey> {
+            crate::tools::WriteTool.concurrency_key(&self.input())
+        }
+        fn concurrency_key_in(
+            &self,
+            _input: &Value,
+            cwd: Option<&std::path::Path>,
+        ) -> Option<crate::tools::ConcurrencyKey> {
+            crate::tools::WriteTool.concurrency_key_in(&self.input(), cwd)
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            crate::tools::WriteTool.execute(self.input(), ctx).await
+        }
+    }
+
+    /// One round writes a file of the chat's folder twice, once by a
+    /// relative path and once by its absolute one. They are one file, so
+    /// they share a lane: the second is queued behind the first and its
+    /// content is what the file ends with. The lane key of the relative
+    /// path used to be made in the folder the process runs in (the daemon's,
+    /// for a daemon chat), a different key from the absolute path's, and
+    /// the two writes ran at once.
+    #[tokio::test]
+    async fn a_relative_and_an_absolute_write_of_one_file_share_a_lane() {
+        let chat = tempfile::tempdir().unwrap();
+        let file = chat.path().join("notes.md");
+        assert_ne!(
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            chat.path().canonicalize().unwrap(),
+            "the chat's folder is not the process's"
+        );
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        let d = drive_configured(
+            "claude-sonnet-4-6",
+            initial,
+            vec![
+                Arc::new(WriteTo {
+                    name: "write_relative",
+                    path: "notes.md".into(),
+                }),
+                Arc::new(WriteTo {
+                    name: "write_absolute",
+                    path: file.to_str().unwrap().into(),
+                }),
+            ],
+            &[("toolu_1", "write_relative"), ("toolu_2", "write_absolute")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            std::time::Duration::from_secs(20),
+            |session| session.cwd = Some(chat.path().to_path_buf()),
+        )
+        .await;
+        assert_eq!(
+            d.tool_signals,
+            vec![
+                "queued:toolu_2",
+                "result:toolu_1",
+                "started:toolu_2",
+                "result:toolu_2",
+            ],
+            "one file, one lane: the second write waits for the first"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "write_absolute");
     }
 
     /// Calls that never wait get no queue signal at all: reads before the
@@ -6112,36 +6396,6 @@ mod rich_output_tests {
         }
     }
 
-    /// DARK (§7): with the default (legacy) memory backend the forum_* tools
-    /// must not be advertised to the model — they can only error. The default
-    /// registry carries them; the per-turn gate in `run_stream_internal`
-    /// removes them from the request's tool list.
-    #[tokio::test]
-    async fn legacy_backend_does_not_advertise_forum_tools() {
-        let d = drive(
-            vec![
-                Arc::new(crate::tools::forum::ForumPostTool),
-                Arc::new(crate::tools::forum::ForumReadTool),
-                Arc::new(crate::tools::forum::ForumForgetTool),
-                Arc::new(RichTool),
-            ],
-            &[("toolu_1", "rich_stub")],
-            Arc::new(crate::extensions::hooks::HookBus::new()),
-        )
-        .await;
-        let names: Vec<String> = d.bodies[0]["tools"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|t| t["name"].as_str().map(str::to_owned))
-            .collect();
-        assert!(names.iter().any(|n| n == "rich_stub"), "registered tool must be advertised: {names:?}");
-        assert!(
-            !names.iter().any(|n| n.starts_with("forum_")),
-            "forum tools must be hidden under the legacy backend: {names:?}"
-        );
-    }
-
     /// Native original-byte overflow triggers chunk retirement, not rejection.
     #[tokio::test]
     async fn history_media_limit_replays_chunk_retirement() {
@@ -6265,12 +6519,10 @@ mod rich_output_tests {
             uuid::Uuid::new_v4()
         ))
         .unwrap();
-        let hook_bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let (hook_bus, hook) = phase_hook_bus(false).await;
 
         let session = StreamSession {
-            memory_backend: crate::memory_backend::MemoryBinding::legacy_current(),
-            memory_context: None,
-            final_capture_history: Arc::new(Mutex::new(None)),
+            memory_backend: crate::memory_backend::MemoryBinding::for_cwd(std::env::current_dir().ok()),
             turn_completion: Default::default(),
             context_window: 200_000,
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
@@ -6328,6 +6580,7 @@ mod rich_output_tests {
             delegation_parent: None,
             turn_correlation_id: "turn-f19".into(),
             progressive_tool_disclosure: false,
+            tools_always_loaded: Arc::from([]),
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
@@ -6386,6 +6639,169 @@ mod rich_output_tests {
             history[2]["content"][0]["type"] == "tool_result",
             "F19: third message must be tool_result"
         );
+
+        // The extension is told the turn's last message is done: one event
+        // for the tool round, and exactly one, with empty text, for the
+        // empty reply that ended the turn.
+        let seen = hook.seen.lock().unwrap().clone();
+        let messages = hook.messages.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one event per assistant message: {seen:?}");
+        assert_eq!(seen[0]["has_tool_use"], true);
+        assert_eq!(seen[1]["has_tool_use"], false);
+        assert_eq!(seen[1]["content_block_count"], 0);
+        assert_eq!(messages[0].as_deref(), Some("pre-tool text"));
+        assert_eq!(messages[1].as_deref(), Some(""));
+    }
+
+    /// One provider round: a text block (when `text` is not empty), then
+    /// `tool_uses` with empty input. Ends `tool_use` if it has tools.
+    fn sse_text_and_tools(text: &str, tool_uses: &[(&str, &str)]) -> String {
+        let usage = json!({"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0});
+        let mut events = vec![json!({"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":usage}})];
+        let mut index = 0;
+        if !text.is_empty() {
+            events.push(json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}));
+            events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}));
+            events.push(json!({"type":"content_block_stop","index":index}));
+            index += 1;
+        }
+        for (id, name) in tool_uses {
+            events.push(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name}}));
+            events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":"{}"}}));
+            events.push(json!({"type":"content_block_stop","index":index}));
+            index += 1;
+        }
+        let stop = if tool_uses.is_empty() { "end_turn" } else { "tool_use" };
+        events.push(json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":null},"usage":usage}));
+        events.push(json!({"type":"message_stop"}));
+        events.iter().map(|ev| format!("data: {ev}\n\n")).collect()
+    }
+
+    struct EndedTurn {
+        hook: Arc<PhaseHook>,
+        provider_calls: usize,
+        history: Vec<SharedMessage>,
+        errors: usize,
+    }
+
+    /// Run one turn whose first round is `first_round` (later rounds answer
+    /// "done"), with an `on_message_complete` recorder subscribed.
+    async fn run_turn_recording_messages(
+        first_round: String,
+        configure: impl FnOnce(&mut StreamSession),
+    ) -> EndedTurn {
+        let (base_url, mock) = spawn_mock(first_round).await;
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TextTool));
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let (hook_bus, hook) = phase_hook_bus(false).await;
+        let mut session = harness_session(
+            base_url,
+            Arc::new(RwLock::new(registry)),
+            tx,
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default()),
+            hook_bus,
+            tool_session_id,
+            Default::default(),
+            false,
+            "claude-sonnet-4-6",
+        );
+        configure(&mut session);
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            StreamMethods::run_stream_internal(session, initial),
+        )
+        .await
+        .expect("stream loop must finish")
+        .expect("the turn ends Ok");
+        let mut history = Vec::new();
+        let mut errors = 0;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
+                StreamEvent::Session(SessionEvent::Error(_)) => errors += 1,
+                _ => {}
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        EndedTurn {
+            hook,
+            provider_calls: mock.calls.load(Ordering::SeqCst),
+            history,
+            errors,
+        }
+    }
+
+    /// A reply that crosses a usage budget is kept in history and ends the
+    /// turn; extensions are told it ended, once, with its text.
+    #[tokio::test]
+    async fn a_reply_over_the_usage_budget_fires_on_message_complete_once() {
+        let over_budget = |s: &mut StreamSession| s.turn_budget.max_context_tokens = Some(5);
+
+        // A final text reply: it asked for no tools.
+        let ended =
+            run_turn_recording_messages(sse_text_and_tools("over budget", &[]), over_budget).await;
+        assert_eq!(ended.provider_calls, 1, "the budget ends the turn after one round");
+        assert!(ended.errors > 0, "the turn ends on the budget error");
+        assert_eq!(ended.history.last().unwrap()["role"], "assistant", "kept in history");
+        let seen = ended.hook.seen.lock().unwrap().clone();
+        let messages = ended.hook.messages.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "exactly one event: {seen:?}");
+        assert_eq!(seen[0]["has_tool_use"], false);
+        assert_eq!(messages[0].as_deref(), Some("over budget"));
+
+        // A reply that asked for a tool: the call never runs, the event
+        // still says the message asked for one.
+        let ended = run_turn_recording_messages(
+            sse_text_and_tools("calling a tool", &[("toolu_1", "text_stub")]),
+            over_budget,
+        )
+        .await;
+        assert_eq!(ended.provider_calls, 1);
+        let seen = ended.hook.seen.lock().unwrap().clone();
+        let messages = ended.hook.messages.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "exactly one event: {seen:?}");
+        assert_eq!(seen[0]["has_tool_use"], true);
+        assert_eq!(messages[0].as_deref(), Some("calling a tool"));
+    }
+
+    /// A batch that calls `context_checkpoint` next to another tool is
+    /// rejected, but the message is in history: extensions see it end, once,
+    /// with `has_tool_use: true`, and then the turn's next reply.
+    #[tokio::test]
+    async fn a_rejected_checkpoint_batch_fires_on_message_complete_once() {
+        let ended = run_turn_recording_messages(
+            sse_text_and_tools(
+                "checkpoint and work",
+                &[("toolu_1", "context_checkpoint"), ("toolu_2", "text_stub")],
+            ),
+            |s| s.continuation = auto_continuation(),
+        )
+        .await;
+        assert_eq!(ended.provider_calls, 2, "rejected, then the model answers again");
+        assert_eq!(ended.errors, 0);
+        assert!(
+            ended
+                .history
+                .iter()
+                .any(|m| m.to_string().contains("context_checkpoint must be called alone")),
+            "the batch was rejected"
+        );
+        let seen = ended.hook.seen.lock().unwrap().clone();
+        let messages = ended.hook.messages.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one event per assistant message: {seen:?}");
+        assert_eq!(seen[0]["has_tool_use"], true);
+        assert_eq!(seen[0]["content_block_count"], 3);
+        assert_eq!(messages[0].as_deref(), Some("checkpoint and work"));
+        assert_eq!(seen[1]["has_tool_use"], false);
+        assert_eq!(messages[1].as_deref(), Some("done"));
     }
 
     // ── Tool output virtualisation, through the real tool-result → history
@@ -7300,6 +7716,683 @@ mod rich_output_tests {
         assert_eq!(second.history[0]["content"], BRIEF, "the original brief survives the resume");
         let text = second.history.iter().map(|m| m.to_string()).collect::<String>();
         assert!(text.contains("RESUME: now the docs"), "the resume instructions survive the rollover");
+    }
+
+    // ── An extension-provided model runs its own tool loop inside one
+    // provider round (`openai::extension_route`). Those are the chat's tool
+    // calls too: the stream is the chat's, as `Runtime::run_stream` builds
+    // it, in a folder that is not the host process's.
+    mod extension_model_tools {
+        use super::*;
+        use crate::extensions::hooks::HookBus;
+        use crate::extensions::manager::ExtensionManager;
+        use crate::extensions::runtime::process::{
+            ProviderCompleteParams, ProviderCompleteResult, RegisteredProviderModelSpec,
+            RegisteredProviderSpec,
+        };
+        use crate::memory_backend::MemoryBinding;
+        use crate::test_env::{BaseDirGuard, EnvVarGuard};
+
+        /// A provider whose model first asks for `calls`, then answers. It
+        /// keeps the tool results the host hands back.
+        struct Scripted {
+            calls: Vec<Value>,
+            results: std::sync::Mutex<Vec<Value>>,
+        }
+        #[async_trait::async_trait]
+        impl crate::extensions::runtime::ExtensionHandler for Scripted {
+            fn id(&self) -> &str {
+                "plug"
+            }
+            async fn handle(&self, _event: &HookEvent) -> HookResult {
+                HookResult::Continue
+            }
+            async fn shutdown(&self) {}
+            async fn provider_complete(
+                &self,
+                params: ProviderCompleteParams,
+            ) -> std::result::Result<ProviderCompleteResult, String> {
+                let results: Vec<Value> = params
+                    .messages
+                    .iter()
+                    .filter_map(|m| m["content"].as_array())
+                    .flatten()
+                    .filter(|block| block["type"] == "tool_result")
+                    .cloned()
+                    .collect();
+                let content = if results.is_empty() {
+                    self.calls.clone()
+                } else {
+                    *self.results.lock().unwrap() = results;
+                    vec![json!({"type": "text", "text": "done"})]
+                };
+                Ok(ProviderCompleteResult {
+                    content,
+                    stop_reason: None,
+                    usage: None,
+                })
+            }
+        }
+
+        fn call(id: &str, tool: &str, input: Value) -> Value {
+            json!({"type": "tool_use", "id": id, "name": tool, "input": input})
+        }
+
+        /// Make `plug:prov:model-x` the model `provider` serves, and route
+        /// to it. As the host wires it: the manager shares `bus` and `tools`.
+        fn serve(provider: Arc<Scripted>, bus: Arc<HookBus>, tools: Arc<RwLock<ToolRegistry>>) {
+            let mut manager = ExtensionManager::new_with_tools(bus, tools);
+            manager
+                .register_provider_handler_for_tests(
+                    "plug",
+                    RegisteredProviderSpec {
+                        id: "prov".into(),
+                        display_name: "Scripted".into(),
+                        description: "scripted provider".into(),
+                        models: vec![RegisteredProviderModelSpec {
+                            id: "model-x".into(),
+                            display_name: None,
+                            capabilities: json!({"streaming": false, "tool_use": true}),
+                            context_window: None,
+                        }],
+                        config_schema: None,
+                    },
+                    provider,
+                )
+                .unwrap();
+            crate::runtime::openai::set_extension_manager_for_routing(Arc::new(RwLock::new(
+                manager,
+            )));
+        }
+
+        /// One turn on the extension's model; `configure` makes the stream
+        /// the chat's. Returns the tool results the model was handed.
+        ///
+        /// `bus` is the stream's. The extension manager gets another: in a
+        /// host the two are one object, and with one object a test cannot
+        /// tell which of them a tool was handed.
+        async fn turn(
+            calls: Vec<Value>,
+            extra_tools: Vec<Arc<dyn Tool>>,
+            bus: Arc<HookBus>,
+            configure: impl FnOnce(&mut StreamSession),
+        ) -> Vec<Value> {
+            turn_on(calls, extra_tools, Arc::new(HookBus::new()), bus, configure).await
+        }
+
+        /// [`turn`], with the extension manager's bus given too.
+        async fn turn_on(
+            calls: Vec<Value>,
+            extra_tools: Vec<Arc<dyn Tool>>,
+            managers_bus: Arc<HookBus>,
+            bus: Arc<HookBus>,
+            configure: impl FnOnce(&mut StreamSession),
+        ) -> Vec<Value> {
+            assert!(!Arc::ptr_eq(&managers_bus, &bus));
+            let mut registry = ToolRegistry::new();
+            for tool in extra_tools {
+                registry.register(tool);
+            }
+            let tools = Arc::new(RwLock::new(registry));
+            let provider = Arc::new(Scripted {
+                calls,
+                results: Default::default(),
+            });
+            serve(provider.clone(), managers_bus, tools.clone());
+            let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+            let mut session = harness_session(
+                // Never dialled: the model is not Anthropic's.
+                "http://127.0.0.1:9".into(),
+                tools,
+                tx,
+                crate::tools::shell::SessionManager::new(
+                    crate::tools::shell::ShellConfig::default(),
+                ),
+                bus,
+                crate::tools::activation::SessionId::parse(&format!(
+                    "test-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ))
+                .unwrap(),
+                Default::default(),
+                false,
+                "plug:prov:model-x",
+            );
+            configure(&mut session);
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let run = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                StreamMethods::run_stream_internal(session, initial),
+            )
+            .await;
+            crate::runtime::openai::clear_extension_manager_for_routing();
+            run.expect("the stream loop finishes").expect("the turn completes");
+            let results = provider.results.lock().unwrap().clone();
+            results
+        }
+
+        /// A compaction request offers the model no tools, so nothing in its
+        /// answer is run. The same answer, a `write` call, is run when it
+        /// comes in a chat's turn; from compaction, which is no turn and has
+        /// no tool context, it used to be run all the same, for no chat: in
+        /// the process folder with the process environment, which under the
+        /// daemon are the daemon's.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn a_compaction_answer_with_a_tool_call_runs_no_tool() {
+            let _base = BaseDirGuard::new();
+            let dir = tempfile::tempdir().unwrap();
+            let write = |file: &std::path::Path| {
+                call("call-1", "write", json!({"path": file.to_str().unwrap(), "content": "x"}))
+            };
+
+            // In a chat's turn the call is the chat's, and runs.
+            let in_turn = dir.path().join("written-in-a-turn");
+            let results = turn(vec![write(&in_turn)], vec![], Arc::new(HookBus::new()), |session| {
+                session.session_id = Some("chat-A".into());
+            })
+            .await;
+            assert_eq!(results[0].get("is_error"), None, "{results:?}");
+            assert!(in_turn.exists());
+
+            // From compaction it is nobody's, and does not.
+            let in_compaction = dir.path().join("written-for-no-chat");
+            let provider = Arc::new(Scripted {
+                calls: vec![json!({"type": "text", "text": "SUMMARY"}), write(&in_compaction)],
+                results: Default::default(),
+            });
+            serve(
+                provider.clone(),
+                Arc::new(HookBus::new()),
+                Arc::new(RwLock::new(ToolRegistry::new())),
+            );
+            let mut rt = crate::Runtime::new_headless();
+            rt.set_compaction_model(Some("plug:prov:model-x".to_string()));
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                rt.compact_call(vec![Arc::new(json!({"role": "user", "content": "summarise"}))]),
+            )
+            .await;
+            crate::runtime::openai::clear_extension_manager_for_routing();
+
+            assert!(!in_compaction.exists(), "a tool ran for a compaction request");
+            assert!(
+                provider.results.lock().unwrap().is_empty(),
+                "the model was asked again, with a tool result"
+            );
+            assert_eq!(summary.expect("compaction finishes").unwrap(), "SUMMARY");
+        }
+
+        /// A note the model stores from that loop is filed under the chat's
+        /// project, the one the stream's own tools use, and the project of
+        /// the folder the process runs in is left alone.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn its_memory_tools_act_on_the_chats_project_not_the_hosts() {
+            let _base = BaseDirGuard::new();
+            let _root = EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+            // The chat's folder is a project of its own, apart from the host's.
+            let chat = tempfile::tempdir().unwrap();
+            std::fs::write(chat.path().join(".synaps-project"), "").unwrap();
+            let chats = crate::tools::test_helpers::memory_binding(chat.path());
+            let hosts = MemoryBinding::for_cwd(std::env::current_dir().ok());
+            assert_ne!(chats.scope().unwrap().key(), hosts.scope().unwrap().key());
+
+            let results = turn(
+                vec![call("call-1", "memory_store", json!({"content": "NOTE_FROM_THE_CHAT"}))],
+                vec![],
+                Arc::new(HookBus::new()),
+                |session| {
+                    session.session_id = Some("chat-A".into());
+                    session.cwd = Some(chat.path().to_path_buf());
+                    session.memory_backend = chats.clone();
+                },
+            )
+            .await;
+            assert_eq!(results[0].get("is_error"), None, "{results:?}");
+
+            let query = || agent_core::memory::store::ProjectMemoryQuery {
+                content_contains: Some("NOTE_FROM_THE_CHAT".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                chats.search(query()).await.unwrap().len(),
+                1,
+                "filed under the chat's project"
+            );
+            assert!(
+                hosts.search(query()).await.unwrap().is_empty(),
+                "nothing written to the host's project"
+            );
+        }
+
+        /// What a tool's context says about who called it: the conversation,
+        /// its folder, and which hook bus it was given ([`at`]).
+        type Caller = (Option<String>, Option<PathBuf>, usize);
+        struct CallerProbe(Arc<std::sync::Mutex<Vec<Caller>>>);
+        #[async_trait::async_trait]
+        impl Tool for CallerProbe {
+            fn name(&self) -> &str {
+                "caller_probe"
+            }
+            fn description(&self) -> &str {
+                "records who its context says called it"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object","properties":{}})
+            }
+            fn origin(&self) -> crate::tools::ToolOrigin {
+                crate::tools::ToolOrigin::Builtin
+            }
+            fn effect(&self) -> crate::tools::catalog::ToolEffect {
+                crate::tools::catalog::ToolEffect::ReadOnly
+            }
+            async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+                self.0.lock().unwrap().push((
+                    ctx.capabilities.session_id.clone(),
+                    ctx.capabilities.cwd.clone(),
+                    at(ctx.capabilities.hook_bus.as_ref()),
+                ));
+                Ok("probed".to_string())
+            }
+        }
+
+        /// The loop's tools run in the chat's folder (a relative path names
+        /// the chat's file), their context names the chat, and so do the
+        /// hooks around them. None of it is the host process's folder. The
+        /// hook bus in their context is the stream's, not the extension
+        /// manager's.
+        ///
+        /// The hooks around a call are listened for on both buses: the loop
+        /// sends them on the manager's, which in a host is the bus every
+        /// chat's stream holds too. (A worker's stream holds a view of its
+        /// own instead, but a worker is never given an extension's model.)
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn its_tools_run_in_the_chats_folder_and_its_hooks_name_the_chat() {
+            let _base = BaseDirGuard::new();
+            let chat = tempfile::tempdir().unwrap();
+            let process = std::env::current_dir().unwrap();
+            assert_ne!(chat.path(), process.as_path());
+            // Only the chat's folder holds this file.
+            std::fs::write(chat.path().join("where.txt"), "IN_THE_CHATS_FOLDER").unwrap();
+            assert!(!process.join("where.txt").exists());
+
+            let (managers_bus, bus) = (Arc::new(HookBus::new()), Arc::new(HookBus::new()));
+            let hooks = Arc::new(WhoProbe(Default::default()));
+            for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
+                for listened in [&managers_bus, &bus] {
+                    let mut perms = PermissionSet::new();
+                    perms.grant(kind.required_permission());
+                    listened
+                        .subscribe(kind, hooks.clone(), None, None, perms)
+                        .await
+                        .unwrap();
+                }
+            }
+            let callers = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let results = turn_on(
+                vec![
+                    call("call-1", "read", json!({"path": "where.txt"})),
+                    call("call-2", "caller_probe", json!({})),
+                ],
+                vec![Arc::new(CallerProbe(callers.clone()))],
+                managers_bus.clone(),
+                bus.clone(),
+                |session| {
+                    session.session_id = Some("chat-A".into());
+                    session.cwd = Some(chat.path().to_path_buf());
+                },
+            )
+            .await;
+
+            assert_eq!(results.len(), 2, "{results:?}");
+            assert_eq!(results[0].get("is_error"), None, "{results:?}");
+            assert!(
+                results[0]["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("IN_THE_CHATS_FOLDER")),
+                "read ran in the chat's folder: {results:?}"
+            );
+            assert_eq!(
+                *callers.lock().unwrap(),
+                vec![(
+                    Some("chat-A".to_string()),
+                    Some(chat.path().to_path_buf()),
+                    at(Some(&bus))
+                )],
+                "the extension manager's bus is at {}",
+                at(Some(&managers_bus))
+            );
+            let folder = chat.path().to_str().map(str::to_string);
+            let events = hooks.0.lock().unwrap().clone();
+            assert_eq!(events.len(), 4, "before and after, for both calls: {events:?}");
+            for (kind, session_id, cwd) in events {
+                assert_eq!(session_id.as_deref(), Some("chat-A"), "{kind:?}");
+                assert_eq!(cwd, folder, "{kind:?}: the process folder is {process:?}");
+            }
+        }
+
+        /// A variable the host process has too, with its own value.
+        const WHOSE: &str = "SYNAPS_TEST_LEAKS2_WHOSE";
+        /// A variable the session had stripped as a secret.
+        const STRIPPED: &str = "SYNAPS_TEST_LEAKS2_STRIPPED";
+
+        /// Which handle a context holds: its address, 0 for none.
+        fn at<T: ?Sized>(handle: Option<&Arc<T>>) -> usize {
+            handle.map_or(0, |handle| Arc::as_ptr(handle) as *const () as usize)
+        }
+
+        /// What a tool's context gives it, in a form two contexts can be
+        /// compared in: values, and for the handles a session shares, which
+        /// one it is.
+        #[derive(Debug, Clone, PartialEq)]
+        struct Given {
+            session_id: Option<String>,
+            cwd: Option<PathBuf>,
+            /// Whether its commands get a session environment at all, and
+            /// [`WHOSE`] as they would see it.
+            session_env: bool,
+            whose: Option<String>,
+            stripped: Vec<String>,
+            /// Output, buffer, bash, bash max, subagent.
+            limits: (usize, usize, u64, u64, u64),
+            project: Option<String>,
+            shells: usize,
+            allow_all: usize,
+            warned: usize,
+            rollover: usize,
+            hook_bus: usize,
+            workers: usize,
+            wakes: usize,
+            secret_prompt: bool,
+            launch_cancel: bool,
+            telemetry: bool,
+            events: bool,
+            /// These three belong to one dispatch of the stream loop.
+            activation: bool,
+            registration: bool,
+            delta: bool,
+        }
+
+        struct GivenProbe(Arc<std::sync::Mutex<Vec<Given>>>);
+        #[async_trait::async_trait]
+        impl Tool for GivenProbe {
+            fn name(&self) -> &str {
+                "given_probe"
+            }
+            fn description(&self) -> &str {
+                "records what its context gives it"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object","properties":{}})
+            }
+            fn origin(&self) -> crate::tools::ToolOrigin {
+                crate::tools::ToolOrigin::Builtin
+            }
+            fn effect(&self) -> crate::tools::catalog::ToolEffect {
+                crate::tools::catalog::ToolEffect::ReadOnly
+            }
+            async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+                let caps = &ctx.capabilities;
+                let limits = &ctx.limits;
+                self.0.lock().unwrap().push(Given {
+                    session_id: caps.session_id.clone(),
+                    cwd: caps.cwd.clone(),
+                    session_env: caps.env.is_some(),
+                    whose: caps
+                        .env
+                        .as_ref()
+                        .and_then(|env| env.get(WHOSE))
+                        .map(str::to_string),
+                    stripped: caps.env_stripped.clone(),
+                    limits: (
+                        limits.max_tool_output,
+                        limits.max_tool_buffer,
+                        limits.bash_timeout,
+                        limits.bash_max_timeout,
+                        limits.subagent_timeout,
+                    ),
+                    project: caps
+                        .memory_backend
+                        .as_ref()
+                        .and_then(|binding| binding.scope().ok())
+                        .map(|scope| scope.key().to_string()),
+                    shells: at(caps.session_manager.as_ref()),
+                    allow_all: at(caps.session_allow_all.as_ref()),
+                    warned: at(Some(&caps.env_warned)),
+                    rollover: at(caps.continuation.as_ref()),
+                    hook_bus: at(caps.hook_bus.as_ref()),
+                    workers: at(caps.subagent_registry.as_ref()),
+                    wakes: at(caps.event_queue.as_ref()),
+                    secret_prompt: caps.secret_prompt.is_some(),
+                    launch_cancel: caps.launch_cancel.is_some(),
+                    telemetry: caps.telemetry.is_some(),
+                    events: ctx.channels.tx_events.is_some(),
+                    activation: caps.tool_activation.is_some(),
+                    registration: caps.tool_register_tx.is_some(),
+                    delta: ctx.channels.tx_delta.is_some(),
+                });
+                Ok("probed".to_string())
+            }
+        }
+
+        /// The loop's tools are given what the stream loop's own tools are
+        /// given for the same chat: the session's environment and stripped
+        /// list (not the process's), its shell sessions, secret prompt,
+        /// allow-all latch, rollover state and limits, the very same
+        /// handles. The one difference is what belongs to a single dispatch
+        /// of the stream loop.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn its_tools_are_given_what_the_stream_loops_tools_are_given() {
+            let _base = BaseDirGuard::new();
+            // The host process's value: under the daemon, the daemon's.
+            let _whose = EnvVarGuard::set(WHOSE, "the-process");
+            let chat = tempfile::tempdir().unwrap();
+            let bus = Arc::new(HookBus::new());
+            let shells = crate::tools::shell::SessionManager::new(
+                crate::tools::shell::ShellConfig::default(),
+            );
+            let latch = Arc::new(crate::tools::SessionConfirmLatch::new());
+            let warned: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+                Default::default();
+            let rollover = crate::runtime::continuation::SharedContinuation::default();
+            let workers = Arc::new(Mutex::new(
+                crate::runtime::subagent::SubagentRegistry::new(),
+            ));
+            let wakes = Arc::new(crate::events::EventQueue::new(100));
+            let (prompt_tx, _prompt_rx) = mpsc::unbounded_channel();
+            let prompt = crate::tools::SecretPromptHandle::new(prompt_tx);
+            // A daemon-hosted chat: everything of its own, none of it the
+            // harness defaults (which are also what a context for no chat
+            // carries).
+            let daemon_chat = |session: &mut StreamSession| {
+                session.session_id = Some("chat-A".into());
+                session.cwd = Some(chat.path().to_path_buf());
+                session.env = Some(vec![(WHOSE.to_string(), "the-chat".to_string())].into());
+                session.env_stripped = vec![STRIPPED.to_string()];
+                session.env_warned = warned.clone();
+                session.session_manager = shells.clone();
+                session.session_allow_all = latch.clone();
+                session.continuation = rollover.clone();
+                session.subagent_registry = workers.clone();
+                session.event_queue = wakes.clone();
+                session.secret_prompt = Some(prompt.clone());
+                session.max_tool_output = 12_345;
+                session.bash_timeout = 7;
+                session.bash_max_timeout = 77;
+                session.subagent_timeout = 777;
+            };
+
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            // The same chat's tool call, run by the extension model's loop …
+            turn(
+                vec![call("call-1", "given_probe", json!({}))],
+                vec![Arc::new(GivenProbe(seen.clone()))],
+                bus.clone(),
+                &daemon_chat,
+            )
+            .await;
+            // … and by the stream loop itself, on a model that is not an
+            // extension's.
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let _ = drive_configured(
+                "claude-sonnet-4-6",
+                initial,
+                vec![Arc::new(GivenProbe(seen.clone()))],
+                &[("toolu_1", "given_probe")],
+                bus.clone(),
+                std::time::Duration::from_secs(20),
+                &daemon_chat,
+            )
+            .await;
+
+            let seen = seen.lock().unwrap().clone();
+            let [extension, stream] = &seen[..] else {
+                panic!("one call in each loop: {seen:?}");
+            };
+            assert_eq!(extension.session_id.as_deref(), Some("chat-A"));
+            assert_eq!(extension.cwd.as_deref(), Some(chat.path()));
+            assert!(extension.session_env, "the process environment is inherited");
+            assert_eq!(
+                extension.whose.as_deref(),
+                Some("the-chat"),
+                "the process has {:?}",
+                std::env::var(WHOSE)
+            );
+            assert_eq!(extension.stripped, [STRIPPED]);
+            assert_eq!(extension.limits, (12_345, 256 * 1024, 7, 77, 777));
+            assert_eq!(extension.shells, at(Some(&shells)));
+            assert_eq!(extension.allow_all, at(Some(&latch)));
+            assert_eq!(extension.warned, at(Some(&warned)));
+            assert_eq!(extension.rollover, at(Some(&rollover)));
+            assert_eq!(extension.hook_bus, at(Some(&bus)));
+            assert_eq!(extension.workers, at(Some(&workers)));
+            assert_eq!(extension.wakes, at(Some(&wakes)));
+            assert!(extension.secret_prompt && extension.launch_cancel && extension.telemetry);
+            assert!(extension.project.is_some() && extension.events);
+            assert!(!extension.activation && !extension.registration && !extension.delta);
+            // Field for field the stream loop's, but for its dispatch's three.
+            assert_eq!(
+                *stream,
+                Given {
+                    activation: true,
+                    registration: true,
+                    delta: true,
+                    ..extension.clone()
+                }
+            );
+        }
+
+        /// Keeps the event channel its context was given.
+        type EventChannel = Option<mpsc::UnboundedSender<StreamEvent>>;
+        struct EventsProbe(Arc<std::sync::Mutex<Option<EventChannel>>>);
+        #[async_trait::async_trait]
+        impl Tool for EventsProbe {
+            fn name(&self) -> &str {
+                "events_probe"
+            }
+            fn description(&self) -> &str {
+                "keeps the event channel it was given"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object","properties":{}})
+            }
+            fn origin(&self) -> crate::tools::ToolOrigin {
+                crate::tools::ToolOrigin::Builtin
+            }
+            fn effect(&self) -> crate::tools::catalog::ToolEffect {
+                crate::tools::catalog::ToolEffect::ReadOnly
+            }
+            async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+                *self.0.lock().unwrap() = Some(ctx.channels.tx_events.clone());
+                Ok("probed".to_string())
+            }
+        }
+
+        /// A tool in that loop reports on the stream's own event channel,
+        /// as a tool of the stream loop does. Not on the channel the
+        /// provider route was handed: an extension's model is not
+        /// Anthropic's, so its route runs under usage metering, whose
+        /// channel is a relay that ends with the provider round, and a
+        /// worker started there would go silent.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn its_tools_report_on_the_streams_event_channel() {
+            let _base = BaseDirGuard::new();
+            let given = Arc::new(std::sync::Mutex::new(None));
+            let streams = Arc::new(std::sync::Mutex::new(None));
+            let streams_in = streams.clone();
+            turn(
+                vec![call("call-1", "events_probe", json!({}))],
+                vec![Arc::new(EventsProbe(given.clone()))],
+                Arc::new(HookBus::new()),
+                move |session| {
+                    session.session_id = Some("chat-A".into());
+                    *streams_in.lock().unwrap() = Some(session.tx.clone());
+                },
+            )
+            .await;
+            let given = given.lock().unwrap().take().expect("the probe ran");
+            let given = given.expect("its context has an event channel");
+            let streams = streams.lock().unwrap().take().unwrap();
+            assert!(
+                given.same_channel(&streams),
+                "the tool was given a channel that is not the stream's"
+            );
+        }
+
+        /// A command the loop runs gets the session's environment: the
+        /// chat's value of a variable the host process also has, and no
+        /// value for one the session had stripped as a secret, which the
+        /// failed command is told about. It runs in the chat's folder.
+        #[cfg(all(unix, feature = "command-exec"))]
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, extension_routing)]
+        async fn a_command_it_runs_gets_the_sessions_environment_not_the_processs() {
+            let _base = BaseDirGuard::new();
+            let _whose = EnvVarGuard::set(WHOSE, "the-process");
+            let _secret = EnvVarGuard::set(STRIPPED, "the-process-secret");
+            let chat = tempfile::tempdir().unwrap();
+            std::fs::write(chat.path().join("only-in-the-chats-folder"), "").unwrap();
+            let command = format!(
+                "printf '%s|%s|' \"${}\" \"${{{}-absent}}\"; ls; exit 3",
+                WHOSE, STRIPPED
+            );
+            let results = turn(
+                vec![call("call-1", "bash", json!({"command": command}))],
+                vec![],
+                Arc::new(HookBus::new()),
+                |session| {
+                    session.session_id = Some("chat-A".into());
+                    session.cwd = Some(chat.path().to_path_buf());
+                    session.env = Some(
+                        vec![
+                            ("PATH".to_string(), std::env::var("PATH").unwrap_or_default()),
+                            (WHOSE.to_string(), "the-chat".to_string()),
+                        ]
+                        .into(),
+                    );
+                    session.env_stripped = vec![STRIPPED.to_string()];
+                },
+            )
+            .await;
+
+            let output = results[0]["content"].as_str().unwrap_or_default();
+            assert!(output.contains("(exit 3)"), "the command ran: {results:?}");
+            assert!(
+                output.contains("the-chat|absent|"),
+                "the session's value, and nothing of the stripped variable: {output}"
+            );
+            assert!(!output.contains("the-process"), "{output}");
+            assert!(output.contains("only-in-the-chats-folder"), "{output}");
+            assert!(
+                output.contains(&format!("${STRIPPED} was stripped from the session env")),
+                "the stripped list reached the tool: {output}"
+            );
+        }
     }
 
     // ── Read dedupe, through the real tool-result → history path (single

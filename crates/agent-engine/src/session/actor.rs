@@ -671,13 +671,6 @@ pub struct SessionActor {
     pub(crate) reload_fence: Option<ReloadFence>,
     /// Owned sessions only (`SessionConfig::owned`): see `session::owned`.
     pub(crate) owned: Option<super::owned::OwnedState>,
-    /// Shared with the handle: `config.memory_mode`, readable by a reload
-    /// that gets no checkpoint reply.
-    pub(crate) memory_mode_slot: super::handle::MemoryModeSlot,
-    /// This runtime's memory has been seen active (a grant took effect).
-    /// Only then does "memory is off" mean consent was revoked; see
-    /// `effective_memory_mode`. Reset whenever the runtime is rebuilt.
-    pub(crate) memory_seen_active: bool,
     /// While parked: the exact tool activations the dropped runtime held,
     /// handed to the runtime the unpark builds (and to a reload record
     /// written while parked). Empty while live.
@@ -705,6 +698,13 @@ fn release_fresh_lock(lock: Option<agent_core::session_lock::SessionLock>, conti
     }
 }
 
+/// The chat's folder as an unpark rebuilds it: the rule of a reload and of
+/// a pinned session ([`crate::daemon::reload::restorable_folder`]), so that
+/// the three ways a chat comes back agree on what a gone folder is.
+fn live_folder(cwd: Option<std::path::PathBuf>, chat: &str) -> Option<std::path::PathBuf> {
+    crate::daemon::reload::restorable_folder(cwd, chat)
+}
+
 impl SessionActor {
     /// = today's `setup::boot()` per session (foreground_runtime →
     /// resolve_session_and_prompt → journal lock → set_cwd → model override →
@@ -716,14 +716,7 @@ impl SessionActor {
     ) -> Result<(SessionHandle, SessionTask)> {
         // cwd goes in BEFORE apply_config (inside foreground_runtime_for) so the
         // one-shot memory binding scopes to the session's project (§4).
-        // A session that made its own `/memory` choice (carried by a reload)
-        // gets that, not the operator default.
-        let mut runtime = host
-            .foreground_runtime_with(cfg.cwd.clone(), cfg.memory_mode.is_none())
-            .await?;
-        if let Some(mode) = cfg.memory_mode {
-            runtime.restore_session_memory_mode(mode);
-        }
+        let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
         let config: crate::SynapsConfig = (**host.config()).clone();
         let client_input = cfg.client_input.unwrap_or(config.client_input);
 
@@ -863,7 +856,13 @@ impl SessionActor {
                     "extensions_ready timed out — on_session_start may miss late extensions"
                 );
             }
-            super::session_start::run_at_create(host, runtime.hook_bus(), &sb.session.id).await;
+            super::session_start::run_at_create(
+                host,
+                runtime.hook_bus(),
+                &sb.session.id,
+                cfg.cwd.as_deref(),
+            )
+            .await;
         }
 
         let id = SessionId::from(sb.session.id.clone());
@@ -927,7 +926,6 @@ impl SessionActor {
                 name,
                 keep_warm: keep_warm_cell,
                 cache_keepwarm,
-                memory_mode,
             },
         ) = SessionHandle::new(meta.clone(), view);
         let handle = handle.with_owner_token(cfg.owned.as_ref().map(|o| o.token.clone()));
@@ -941,7 +939,6 @@ impl SessionActor {
             client_input: Some(client_input),
             ..Default::default()
         }));
-        *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
         let session_start = if cfg.await_extensions {
             super::session_start::SessionStart::Done
@@ -953,11 +950,12 @@ impl SessionActor {
                 host,
                 Arc::clone(&hook_bus),
                 Arc::clone(&journal_id),
+                cfg.cwd.clone(),
                 ext_ready_timeout,
             )
         };
 
-        let mut actor = SessionActor {
+        let actor = SessionActor {
             id,
             meta,
             config: cfg,
@@ -1032,12 +1030,8 @@ impl SessionActor {
             },
             reload_fence: None,
             owned,
-            memory_mode_slot: memory_mode,
-            memory_seen_active: false,
             parked_tool_activations: Vec::new(),
         };
-        // Whether the build's grant (default or restored choice) took.
-        actor.observe_memory();
         if actor.keep_warm {
             actor.note_pin();
         }
@@ -1233,10 +1227,6 @@ impl SessionActor {
     /// hands off on `Idle` must never see the previous state. Per-round
     /// saves stay in the background; this waits once per turn.
     pub(crate) async fn announce_idle(&mut self) {
-        // A turn may have revoked memory consent (the `memory_context`
-        // tool): keep the handle's slot current for a reload that gets no
-        // checkpoint reply.
-        self.sync_memory_choice();
         self.flush_saves().await;
         // Before `Idle`, so a test that saw `Idle` knows the hook is in line.
         #[cfg(any(test, feature = "testing"))]
@@ -1311,11 +1301,7 @@ impl SessionActor {
     pub(crate) fn reload_record(&self) -> SessionReloadRecord {
         let view = self.view.load();
         SessionReloadRecord {
-            // A consent revocation since the last record counts.
-            config: SessionConfig {
-                memory_mode: self.effective_memory_mode(),
-                ..self.config.clone()
-            },
+            config: self.config.clone(),
             keep_warm: self.keep_warm,
             lifecycle: SessionLifecycle::from_u8(
                 self.lifecycle.load(std::sync::atomic::Ordering::Acquire),
@@ -2595,9 +2581,6 @@ impl SessionActor {
         }
         self.runtime.session_manager().shutdown_all();
         self.turn_replay.clear();
-        // The unparked runtime is built from `config.memory_mode`: a
-        // revocation made without `/memory` must be recorded first.
-        self.sync_memory_choice();
         // The runtime's exact tool activations outlive it: the unparked
         // runtime restores them, so the tools array (the start of the cached
         // prompt prefix) and the model's tools are what they were.
@@ -2664,6 +2647,10 @@ impl SessionActor {
             }
         }
 
+        // A folder deleted while the chat was parked is dropped, as reload
+        // drops it: the chat wakes in the daemon's folder and its project,
+        // not with a dead path that has no project at all.
+        self.config.cwd = live_folder(self.config.cwd.take(), &journal_id);
         let host = Arc::clone(&self.host);
         let cfg = self.config.clone();
         let queue = Arc::clone(&self.event_queue);
@@ -2672,14 +2659,8 @@ impl SessionActor {
         let view = self.view.load_full();
         let build = async move {
             let config: crate::SynapsConfig = (**host.config()).clone();
-            // §4: cwd before apply_config — see `create`. The session's own
-            // `/memory` choice, if it made one, instead of the default.
-            let mut runtime = host
-                .foreground_runtime_with(cfg.cwd.clone(), cfg.memory_mode.is_none())
-                .await?;
-            if let Some(mode) = cfg.memory_mode {
-                runtime.restore_session_memory_mode(mode);
-            }
+            // §4: cwd before apply_config — see `create`.
+            let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
             runtime.set_event_queue(queue);
             let mut sb = if journal_present {
                 crate::engine::setup::resolve_session_and_prompt(
@@ -2757,9 +2738,6 @@ impl SessionActor {
             let name = self.conv.session.name.clone();
             self.mirror_name(name);
         }
-        // A fresh runtime: whether its grant took effect is its own.
-        self.memory_seen_active = false;
-        self.observe_memory();
         self.publish_view().await;
         self.state = AttachState::Detached { running: false };
         self.set_lifecycle(SessionLifecycle::Live);
@@ -2926,6 +2904,7 @@ impl SessionActor {
             &self.host,
             Arc::clone(&self.hook_bus),
             Arc::clone(&self.journal_id),
+            self.config.cwd.clone(),
             extensions_ready_timeout(&self.host.config()),
         );
     }
@@ -2997,9 +2976,6 @@ impl SessionActor {
         // any foreground turn that starts while armed.)
         let auto_approve = self.config.auto_approve_confirms && self.driver.is_none();
         // Stamp this turn's worker launches before the stream can start any.
-        // A grant made since the last turn (e.g. while the session was
-        // being rebuilt) is seen before this turn can revoke it.
-        self.observe_memory();
         self.turn_worker_generation = self
             .runtime
             .subagent_registry()
@@ -5619,6 +5595,7 @@ impl SessionActor {
         crate::extensions::loader::emit_session_end(
             &hook_bus,
             &session_id,
+            self.config.cwd.as_deref(),
             api_messages,
             budgets::HOOKS_TIMEOUT,
         )
@@ -5803,8 +5780,8 @@ impl SessionTask {
     }
 
     /// Test seam: a clone of this session's runtime. Clones share the
-    /// memory-consent state, so a harness can revoke consent the way the
-    /// `memory_context` tool's capability does (`memory_context_disable`).
+    /// session's state (continuation, tool set), so a harness can change a
+    /// setting on it before the task runs.
     #[cfg(any(test, feature = "testing"))]
     pub fn runtime_for_harness(&self) -> crate::Runtime {
         (*self.0.runtime).clone()
@@ -5958,6 +5935,44 @@ async fn await_stopped_workers(
         .filter(|(_, s)| s.read().unwrap_or_else(|p| p.into_inner()).stopped_by_reload)
         .map(|(id, _)| id.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod live_folder_tests {
+    use super::live_folder;
+
+    #[test]
+    fn only_a_missing_folder_or_a_file_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("chat");
+        std::fs::create_dir(&folder).unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(live_folder(None, "chat"), None);
+        assert_eq!(live_folder(Some(folder.clone()), "chat"), Some(folder.clone()));
+        assert_eq!(live_folder(Some(file.clone()), "chat"), None, "not a folder");
+        assert_eq!(live_folder(Some(file.join("below")), "chat"), None, "below a file");
+        assert_eq!(live_folder(Some(tmp.path().join("gone")), "chat"), None, "absent");
+    }
+
+    /// A folder that cannot be looked at now (here: a parent without
+    /// search permission) may be back later: it is kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_checked_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let locked = tmp.path().join("locked");
+        let folder = locked.join("chat");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::metadata(&folder).is_err();
+        let kept = live_folder(Some(folder.clone()), "chat");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if denied {
+            assert_eq!(kept, Some(folder));
+        }
+    }
 }
 
 #[cfg(test)]

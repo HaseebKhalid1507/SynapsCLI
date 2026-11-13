@@ -25,9 +25,6 @@ pub const AUTO_TURN_CAP: u32 = 5;
 /// Sentinel: `events.auto_turn_cap = 0` disables the cap entirely.
 pub const AUTO_TURN_UNLIMITED: u32 = 0;
 
-/// The config key users should raise when the cap trips (used in messages).
-pub const AUTO_TURN_CAP_CONFIG_KEY: &str = "events.auto_turn_cap";
-
 /// Single source of truth for "has the consecutive auto-turn cap been hit?"
 ///
 /// * `cap == 0` (`AUTO_TURN_UNLIMITED`) → never reached.

@@ -3,10 +3,10 @@
 //! markers in `synaps_engine::engine::interrupt`), never by a host key.
 //!
 //! A host key (`_synaps_context`) would make a rolled-back 0.10.2 take the
-//! note for a context-archive marker and refuse every turn under Axel
-//! memory, so the note stays ordinary text on disk and on the wire. Readers
-//! that must not treat it as something the user said (turn starts, archive
-//! projection, memory capture) ask [`is_tool_in_flight_note`].
+//! note for a context-archive marker, so the note stays ordinary text on
+//! disk and on the wire. Readers that must not treat it as something the
+//! user said (turn starts, archive projection, worker context) ask
+//! [`is_tool_in_flight_note`].
 
 use serde_json::Value;
 

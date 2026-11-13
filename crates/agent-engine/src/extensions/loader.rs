@@ -4,6 +4,7 @@
 //! snappy by running discovery/loading in the background and streaming progress
 //! events back to the UI (which can render them as toasts).
 
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
@@ -47,8 +48,13 @@ impl ExtensionLoaderEvent {
 /// in-process hosts get that from [`spawn_discover_and_load`] itself; the
 /// daemon's `SessionActor` awaits `EngineHost::extensions_ready()` first.
 /// Never re-runs discovery. Returns `true` when something was injected.
-pub async fn emit_session_start(hook_bus: &Arc<super::hooks::HookBus>, session_id: &str) -> bool {
-    let event = HookEvent::on_session_start(session_id);
+/// `cwd` is the session's folder (`None` = the process folder).
+pub async fn emit_session_start(
+    hook_bus: &Arc<super::hooks::HookBus>,
+    session_id: &str,
+    cwd: Option<&Path>,
+) -> bool {
+    let event = HookEvent::on_session_start(session_id).with_cwd(cwd);
     if let HookResult::Inject { content } = hook_bus.emit(&event).await {
         tracing::debug!(
             len = content.len(),
@@ -68,14 +74,15 @@ pub async fn emit_session_start(hook_bus: &Arc<super::hooks::HookBus>, session_i
 /// afterwards. Returns `false` if the budget elapsed (handlers may not have
 /// flushed; the transcript is already saved by the caller, so nothing is
 /// lost). Per session, not per process: every session in a daemon gets its
-/// own end event.
+/// own end event. `cwd` as for [`emit_session_start`].
 pub async fn emit_session_end(
     hook_bus: &Arc<super::hooks::HookBus>,
     session_id: &str,
+    cwd: Option<&Path>,
     transcript: Option<Vec<crate::SharedMessage>>,
     budget: std::time::Duration,
 ) -> bool {
-    let event = HookEvent::on_session_end(session_id, transcript);
+    let event = HookEvent::on_session_end(session_id, transcript).with_cwd(cwd);
     let completed = match tokio::time::timeout(budget, hook_bus.emit_concurrent(&event)).await {
         Ok(_) => {
             tracing::debug!(session = %session_id, "on_session_end hooks completed");
@@ -139,7 +146,8 @@ pub fn spawn_discover_and_load(
         // Extensions are now subscribed; the event has somewhere to land.
         if let Some(session_id) = session_id {
             let hook_bus = manager.read().await.hook_bus().clone();
-            emit_session_start(&hook_bus, &session_id).await;
+            // In-process hosts: the session runs in the process folder.
+            emit_session_start(&hook_bus, &session_id, None).await;
         }
 
         // Ready BEFORE Finished, as before.

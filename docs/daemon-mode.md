@@ -549,8 +549,8 @@ nothing until the first real turn. The restore holds the daemon's idle exit.
 - `SYNAPS_DAEMON_RESTORE_PINS=0` starts a daemon without restoring (the pin book
   is kept for the next start).
 - Not restored: `/system` overrides, `/settings` knobs changed in the session
-  (thinking, model override beyond the journal's, auto-approve), `/memory`
-  choice, running workers. The conversation, model, name and env come from the
+  (thinking, model override beyond the journal's, auto-approve), running
+  workers. The conversation, model, name and env come from the
   journal.
 - At boot: `deploy/synaps-daemon.service` (systemd user unit, with
   `loginctl enable-linger`) starts the daemon, and with it every pin.
@@ -656,7 +656,7 @@ C: bye | socket close = Detach (turn keeps running)
   daemon's `Attached` carries `conversation.api_messages = []` + `conversation.messages_len` + a
   `display_tail {items:[{kind:user|thinking|text|tool_use,…}], omitted, times?}` projected by
   `session::display::display_tail` — the SAME filter the in-process TUI applies to its history, so Local
-  and Socket render byte-identical transcripts (golden test, `differential.sh` S pane). `times` holds each
+  and Socket render byte-identical transcripts (golden test). `times` holds each
   item's message time (RFC 3339 UTC, parallel to `items`), omitted when no item has one (legacy history,
   an older daemon). The conn
   forwarder drops `Stream(MessageHistory)` for Digest clients (they key on the `Conversation` digest that
@@ -1201,16 +1201,12 @@ note: $GH_TOKEN was stripped from the session env as a secret; reattach from a s
 
 Honest list of behaviour changes on this branch on the plain in-process path (`synaps`, `synaps chat` — no `--attach`):
 
-1. **`synaps chat` runs on `SessionActor`** (`LocalTransport`, in-process). The differential test
-   (`tests/session_actor_differential.rs`) compares the actor against a *frozen re-derivation* of the
-   inline engine halves (not a verbatim copy; it has no abort/prompt/save) on **three scenarios only**:
-   plain turn, provider error repairing history, idle auto-turn to cap. **Tool loop, steer-mid-stream,
-   queue-while-busy, cancel (history + marker), secret-prompt round-trip are asserted by actor unit
-   tests, not by the differential.** `tests/chat_stdin.rs` is unchanged and green but never runs a turn through a
-   stub. The kill-switch `SYNAPS_CHAT_INLINE=1` only exists in a `--features legacy_inline` build.
-   Cancel diverges from the frozen oracle by design: the oracle folds an `ABORT CONTEXT` recap into the
-   next user message; the actor keeps the interrupted turn as history plus an interruption marker
-   (`cancel_keeps_real_history_where_the_oracle_folded_a_recap` pins both sides).
+1. **`synaps chat` runs on `SessionActor`** (`LocalTransport`, in-process). The actor's turn
+   scenarios are asserted directly (`tests/session_actor_scenarios.rs` and
+   `crates/agent-engine/tests/session_actor*.rs`); the frozen-reference differential that compared it
+   with the pre-actor inline loop was removed in 0.12.0, with the inline loop and its kill-switch
+   (`SYNAPS_CHAT_INLINE=1`, `--features legacy_inline`). Cancel keeps the interrupted turn as history
+   plus an interruption marker (`session_actor_interrupt.rs`).
 2. **MCP descriptor cache write-back is ON by default, in-process too** (`docs/mcp.md`): after the first
    `tools/list` on an exact lease the listing is written to `~/.synaps-cli/mcp-descriptors.json`, so the
    *next* boot registers dormant MCP tools it did not know before → tool list, system prompt and the
@@ -1276,9 +1272,8 @@ compiles that grammar's regexes → **≈ 13.7 MB** idle until the syntect idle 
 dump bytes, not heap. On `[madvise]`/`[never]` kernels the re-exec is skipped (nothing is
 huge-mapped before `main`); the remaining knobs are applied in-process.
 
-The socket differential (`SYNAPS_TUI_E2E_SOCKET=1 scripts/tui-e2e/differential.sh`) compares
-**content order**, not layout: its normaliser drops blank rows, `█` cursor rows and the
-`│Extensions` line before diffing L against S.
+The socket differential (`SYNAPS_TUI_E2E_SOCKET=1 scripts/tui-e2e/differential.sh`, removed in
+0.12.0 with the reference-binary differential it extended) compared **content order**, not layout.
 
 ### Fix round: daemon-tree RssAnon column (§9 of the phase-2 review)
 

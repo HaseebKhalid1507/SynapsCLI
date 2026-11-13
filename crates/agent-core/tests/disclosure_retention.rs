@@ -3,13 +3,14 @@
 //! - Every disclosure class is enforced at the ONE model-visibility gate
 //!   (sentinel test per class; consent and redaction fail CLOSED).
 //! - Unified retention spans sessions (incl. compaction parents), memory,
-//!   memory indexes, traces, and logs: max age + disk budget, headless
+//!   traces, and logs: max age + disk budget, headless
 //!   inspect/export/forget, and chain integrity — a sweep never leaves a
 //!   named chain pointing at a deleted session.
 
 use agent_core::disclosure::{gate_for_model, may_persist, DisclosureClass, ModelVisibility};
 use agent_core::retention::{
-    export, forget, inspect, sweep_at, RetentionDomain, RetentionPolicy, RetentionRoots,
+    export, forget, inspect, sweep_at, RetentionDomain, RetentionError, RetentionPolicy,
+    RetentionRoots,
 };
 use tempfile::TempDir;
 
@@ -194,6 +195,7 @@ fn age_sweep_never_leaves_named_chains_dangling() {
         &RetentionPolicy {
             max_age_days: Some(30),
             max_disk_bytes: None,
+            include_notes: false,
         },
         now,
     )
@@ -226,8 +228,8 @@ fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
     write_session(&h.roots, "old-parent", 10 * DAY_MS, Some("fresh-successor"));
     write_session(&h.roots, "fresh-successor", 99 * DAY_MS, None);
 
-    // Memory: an expired record (per-record retention), an old record under
-    // the global age, a fresh record, and a tombstoned one.
+    // Memory: an expired record (per-record retention), a record older than
+    // the global age, a newer record, and a tombstoned one.
     let memory = h.roots.base_dir.join("memory").join("project-p11.jsonl");
     let lines = [
         format!(
@@ -252,10 +254,6 @@ fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
         ),
     ];
     std::fs::write(&memory, lines.join("\n") + "\n").unwrap();
-    // A stale derived index dir for that namespace must be dropped too.
-    let index_dir = h.roots.base_dir.join("memory/index/project-p11");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    std::fs::write(index_dir.join("manifest.json"), "{}").unwrap();
 
     // Traces and logs (mtime-aged: everything is "now"-written, so use a
     // future now to age them past the budget).
@@ -271,10 +269,42 @@ fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
         &RetentionPolicy {
             max_age_days: Some(30),
             max_disk_bytes: None,
+            include_notes: false,
         },
         sweep_clock,
     )
     .unwrap();
+
+    // The age given to the sweep is for sessions, traces and logs. It does
+    // not reach notes: of the four, the sweep drops the one past its OWN
+    // retention class and the forgotten one, and keeps the two `Standard`
+    // notes however old they are.
+    let rewritten = std::fs::read_to_string(&memory).unwrap();
+    assert!(!rewritten.contains("expired by record retention"));
+    assert!(
+        !rewritten.contains("tombstoned body"),
+        "a forgotten note's line is purged physically"
+    );
+    assert_eq!(
+        rewritten,
+        format!("{}\n{}\n{}\n", lines[1], lines[2], lines[4]),
+        "both notes without an expiry of their own, and the tombstone"
+    );
+    assert_eq!(outcome.memory_records_dropped, 2);
+
+    // With `include_notes` the age applies to notes as well (what every
+    // age sweep did before).
+    let with_notes = sweep_at(
+        &h.roots,
+        &RetentionPolicy {
+            max_age_days: Some(30),
+            max_disk_bytes: None,
+            include_notes: true,
+        },
+        sweep_clock,
+    )
+    .unwrap();
+    assert_eq!(with_notes.memory_records_dropped, 2);
 
     assert!(
         !session_exists(&h.roots, "old-parent"),
@@ -285,22 +315,18 @@ fn age_sweep_spans_compaction_parents_memory_traces_and_logs() {
     assert!(!session_exists(&h.roots, "fresh-successor"));
 
     let rewritten = std::fs::read_to_string(&memory).unwrap();
-    assert!(!rewritten.contains("expired by record retention"));
     assert!(!rewritten.contains("expired by global age"));
-    assert!(
-        !rewritten.contains("tombstoned body"),
-        "tombstones purge physically"
+    // The forgotten note's tombstone line stays (an id and a time, no content): it is what
+    // keeps the note forgotten if an export that still holds it is imported.
+    assert_eq!(
+        rewritten,
+        format!("{}\n", lines[4]),
+        "the tombstone is the one line left"
     );
-    assert!(!rewritten.contains("mem-dead"));
     // mem-new is 99d old at sweep time (now+40d) minus ts 99d → 41d → also
     // aged out under the 30-day budget.
     assert!(!rewritten.contains("fresh survivor"));
-    assert!(outcome.memory_records_dropped >= 4);
 
-    assert!(
-        !index_dir.exists(),
-        "derived index dropped with its namespace"
-    );
     assert!(!h.roots.cache_dir.join("request-trace.jsonl").exists());
     assert!(!h.roots.config_dir.join("synaps.log.2020-01-01").exists());
 }
@@ -329,6 +355,7 @@ fn memory_survivors_and_recent_artifacts_are_kept() {
         &RetentionPolicy {
             max_age_days: Some(30),
             max_disk_bytes: None,
+            include_notes: false,
         },
         now,
     )
@@ -356,6 +383,7 @@ fn disk_budget_deletes_oldest_first_but_never_chain_heads() {
         &RetentionPolicy {
             max_age_days: None,
             max_disk_bytes: Some(total - 10),
+            include_notes: false,
         },
         now,
     )
@@ -447,6 +475,7 @@ fn sessions_take_their_tool_output_spill_dirs_with_them() {
     let policy = RetentionPolicy {
         max_age_days: Some(30),
         max_disk_bytes: None,
+        include_notes: false,
     };
     write_session(&h.roots, "old", 10 * DAY_MS, None);
     write_session(&h.roots, "fresh", 99 * DAY_MS, None);
@@ -472,6 +501,7 @@ fn worker_spill_dirs_age_out_by_mtime_against_the_same_cutoff() {
     let policy = RetentionPolicy {
         max_age_days: Some(30),
         max_disk_bytes: None,
+        include_notes: false,
     };
     // Workers have no session file: only the age pass removes their dir.
     let worker = write_spill(&h.roots, "session-4242-1700000000000-0");
@@ -495,7 +525,6 @@ fn forget_rejects_path_traversal_ids_for_every_domain() {
             RetentionDomain::Sessions,
             RetentionDomain::Traces,
             RetentionDomain::Logs,
-            RetentionDomain::MemoryIndex,
         ] {
             let err = forget(&h.roots, domain, id).unwrap_err();
             assert!(
@@ -507,11 +536,7 @@ fn forget_rejects_path_traversal_ids_for_every_domain() {
     // Single-component domains additionally reject nested ids; Traces
     // accepts VALIDATED nested relative ids (CP-13 fix2) — a nonexistent
     // one errors without touching anything outside the cache root.
-    for domain in [
-        RetentionDomain::Sessions,
-        RetentionDomain::Logs,
-        RetentionDomain::MemoryIndex,
-    ] {
+    for domain in [RetentionDomain::Sessions, RetentionDomain::Logs] {
         let err = forget(&h.roots, domain, "a/b").unwrap_err();
         assert!(
             err.to_string().contains("invalid"),
@@ -563,7 +588,7 @@ fn memory_forget_requires_exact_live_record_ids() {
 // ─── CP-13 fix1: budget enforcement + fail-closed chains ─────────────────────
 
 #[test]
-fn disk_budget_evicts_derived_indexes_and_oldest_memory_records() {
+fn disk_budget_evicts_oldest_memory_records() {
     let h = harness();
     let now = 100 * DAY_MS;
 
@@ -590,26 +615,18 @@ fn disk_budget_evicts_derived_indexes_and_oldest_memory_records() {
     ));
     std::fs::write(&memory, lines.join("\n") + "\n").unwrap();
 
-    // A fat derived index dir — free win, evicted before any data.
-    let index_dir = h.roots.base_dir.join("memory/index/project-p44");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    std::fs::write(index_dir.join("seg-000000.jsonl"), "z".repeat(4_000)).unwrap();
-
     // Budget: room for roughly the two fresh records only.
     let outcome = sweep_at(
         &h.roots,
         &RetentionPolicy {
             max_age_days: None,
             max_disk_bytes: Some(700),
+            include_notes: true,
         },
         now,
     )
     .unwrap();
 
-    assert!(
-        !index_dir.exists(),
-        "derived index evicted first (no data loss)"
-    );
     let rewritten = std::fs::read_to_string(&memory).unwrap();
     assert!(rewritten.contains("fresh keep one") && rewritten.contains("fresh keep two"));
     assert!(
@@ -635,6 +652,7 @@ fn unsatisfiable_disk_budget_returns_a_typed_unmet_error() {
         &RetentionPolicy {
             max_age_days: None,
             max_disk_bytes: Some(10),
+            include_notes: false,
         },
         now,
     )
@@ -648,6 +666,234 @@ fn unsatisfiable_disk_budget_returns_a_typed_unmet_error() {
         session_exists(&h.roots, "pinned"),
         "protected head untouched"
     );
+}
+
+/// Without `include_notes` the notes files are not touched by a budget, byte
+/// for byte. With it they are evicted, oldest first, for a budget that can
+/// be met; a budget below the protected session cannot be, and then no note
+/// is deleted either.
+#[test]
+fn disk_budget_deletes_notes_only_with_include_notes() {
+    let h = harness();
+    let now = 100 * DAY_MS;
+    write_session(&h.roots, "pinned", 10 * DAY_MS, None);
+    write_chain(&h.roots, "keep", "pinned");
+    let memory = h.roots.base_dir.join("memory");
+    let notes = |ns: &str, id: &str, ts: u64| {
+        format!(
+            r#"{{"namespace":"{ns}","timestamp_ms":{ts},"content":"note {id}","tags":[],"id":"{id}","project":"p"}}"#
+        ) + "\n"
+    };
+    let files = [
+        (
+            memory.join("project-a.jsonl"),
+            notes("project-a", "mem-a1", DAY_MS) + &notes("project-a", "mem-a2", 99 * DAY_MS),
+        ),
+        (
+            memory.join("project-b.jsonl"),
+            notes("project-b", "mem-b1", 2 * DAY_MS),
+        ),
+    ];
+    for (path, text) in &files {
+        std::fs::write(path, text).unwrap();
+    }
+    let policy = |include_notes, budget| RetentionPolicy {
+        max_age_days: None,
+        max_disk_bytes: Some(budget),
+        include_notes,
+    };
+    let untouched = || {
+        for (path, text) in &files {
+            assert_eq!(std::fs::read(path).unwrap(), text.as_bytes(), "{}", path.display());
+        }
+    };
+
+    let err = sweep_at(&h.roots, &policy(false, 10), now).unwrap_err();
+    assert!(
+        matches!(err, RetentionError::BudgetUnmet { notes_kept: true, .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("no note was deleted"), "{err}");
+    untouched();
+    assert!(session_exists(&h.roots, "pinned"));
+
+    // Below the protected session: unmet whatever is evicted, so nothing is.
+    let err = sweep_at(&h.roots, &policy(true, 10), now).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RetentionError::BudgetUnmet { notes_kept: false, nothing_deleted: true, .. }
+        ),
+        "{err}"
+    );
+    untouched();
+
+    // Room for the protected session and nothing else: every note goes.
+    let pinned = std::fs::metadata(h.roots.config_dir.join("sessions/pinned.json"))
+        .unwrap()
+        .len();
+    let outcome = sweep_at(&h.roots, &policy(true, pinned), now).unwrap();
+    assert_eq!(outcome.memory_records_dropped, 3);
+    for (path, _) in &files {
+        let left = std::fs::read_to_string(path).unwrap();
+        assert!(!left.contains("mem-"), "every note evicted: {left}");
+    }
+    assert!(session_exists(&h.roots, "pinned"));
+}
+
+/// Every file and folder under the harness, with each file's bytes.
+fn tree(h: &Harness) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    fn walk(
+        dir: &std::path::Path,
+        out: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.insert(path.clone(), None);
+                walk(&path, out);
+            } else {
+                out.insert(path.clone(), Some(std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Default::default();
+    walk(h._tmp.path(), &mut out);
+    out
+}
+
+fn note_line(id: &str, ts: u64) -> String {
+    format!(
+        r#"{{"namespace":"project-a","timestamp_ms":{ts},"content":"note {id}","tags":[],"id":"{id}","project":"p"}}"#
+    )
+}
+
+/// A budget below what the sweep may not delete can never be met. The sweep
+/// used to delete every unprotected session, trace and log on the way to
+/// saying so. It now says so first: every file is where it was, with the
+/// bytes it had, and the error names how much is protected.
+#[test]
+fn a_budget_below_what_is_protected_deletes_nothing() {
+    let h = harness();
+    let now = 100 * DAY_MS;
+    let sessions = h.roots.config_dir.join("sessions");
+    write_session(&h.roots, "pinned", 10 * DAY_MS, None);
+    write_chain(&h.roots, "keep", "pinned");
+    std::fs::write(sessions.join("pinned.journal"), "journal of the head\n").unwrap();
+    // What a sweep deletes when it runs: old sessions (by age and by
+    // budget), a journal with no session, a trace, a log, and a forgotten
+    // note's line.
+    write_session(&h.roots, "old-a", 10 * DAY_MS, None);
+    write_session(&h.roots, "old-b", 20 * DAY_MS, None);
+    std::fs::write(sessions.join("ghost.journal"), "no session\n").unwrap();
+    std::fs::write(h.roots.cache_dir.join("trace.jsonl"), "t".repeat(300)).unwrap();
+    std::fs::write(h.roots.config_dir.join("synaps.log"), "l".repeat(300)).unwrap();
+    let (gone, live) = (note_line("mem-gone", DAY_MS), note_line("mem-live", 2 * DAY_MS));
+    let tombstone = r#"{"tombstone":"mem-gone"}"#;
+    std::fs::write(
+        h.roots.base_dir.join("memory/project-a.jsonl"),
+        format!("{gone}\n{live}\n{tombstone}\n"),
+    )
+    .unwrap();
+
+    let len = |name: &str| std::fs::metadata(sessions.join(name)).unwrap().len();
+    let head = len("pinned.json") + len("pinned.journal");
+    // The notes as this sweep would leave them: the forgotten one is not
+    // protected, its tombstone and the live note are.
+    let notes = (live.len() + 1 + tombstone.len() + 1) as u64;
+    let before = tree(&h);
+
+    for (include_notes, protected) in [(false, head + notes), (true, head)] {
+        let err = sweep_at(
+            &h.roots,
+            &RetentionPolicy {
+                max_age_days: Some(1),
+                max_disk_bytes: Some(protected - 1),
+                include_notes,
+            },
+            now,
+        )
+        .unwrap_err();
+        let (protected_bytes, budget, remaining) = match &err {
+            RetentionError::BudgetUnmet {
+                nothing_deleted: true,
+                protected_chain_heads: 1,
+                notes_kept,
+                protected_bytes,
+                budget,
+                remaining,
+            } if *notes_kept != include_notes => (*protected_bytes, *budget, *remaining),
+            other => panic!("include_notes {include_notes}: {other}"),
+        };
+        assert_eq!((protected_bytes, budget), (protected, protected - 1));
+        assert_eq!(remaining, inspect(&h.roots).unwrap().total_bytes);
+        let said = err.to_string();
+        assert!(said.contains("nothing was deleted"), "{said}");
+        assert!(said.contains(&format!("{protected} bytes this sweep may not delete")), "{said}");
+        assert_eq!(said.contains("every saved note"), !include_notes, "{said}");
+        assert_eq!(tree(&h), before, "include_notes {include_notes}: {said}");
+    }
+}
+
+/// A budget that can be met is met as before: the oldest unprotected
+/// session goes first and the sweep stops when the total fits. A budget of
+/// exactly what is protected can be met, and is.
+#[test]
+fn a_budget_that_can_be_met_still_deletes_the_oldest_sessions_first() {
+    let h = harness();
+    let now = 100 * DAY_MS;
+    write_session(&h.roots, "pinned", 5 * DAY_MS, None);
+    write_chain(&h.roots, "keep", "pinned");
+    write_session(&h.roots, "older", 10 * DAY_MS, None);
+    write_session(&h.roots, "newer", 90 * DAY_MS, None);
+    let notes = h.roots.base_dir.join("memory/project-a.jsonl");
+    let text = note_line("mem-live", DAY_MS) + "\n";
+    std::fs::write(&notes, &text).unwrap();
+    let budget = |bytes| RetentionPolicy {
+        max_age_days: None,
+        max_disk_bytes: Some(bytes),
+        include_notes: false,
+    };
+    let total = || inspect(&h.roots).unwrap().total_bytes;
+
+    let outcome = sweep_at(&h.roots, &budget(total() - 1), now).unwrap();
+    assert_eq!(outcome.deleted_files, 1);
+    assert!(!session_exists(&h.roots, "older"), "the oldest goes first");
+    assert!(session_exists(&h.roots, "newer") && session_exists(&h.roots, "pinned"));
+
+    let pinned = std::fs::metadata(h.roots.config_dir.join("sessions/pinned.json"))
+        .unwrap()
+        .len();
+    let protected = pinned + text.len() as u64;
+    let outcome = sweep_at(&h.roots, &budget(protected), now).unwrap();
+    assert_eq!(outcome.deleted_files, 1);
+    assert!(!session_exists(&h.roots, "newer"));
+    assert!(session_exists(&h.roots, "pinned"));
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), text);
+    assert_eq!(total(), protected);
+
+    // Notes may go, but a tombstone line never does: with a budget the
+    // head alone fits, everything that can be evicted is, and the answer
+    // is still "unmet", after the fact this time.
+    std::fs::write(&notes, format!("{text}{{\"tombstone\":\"mem-other\"}}\n")).unwrap();
+    let err = sweep_at(
+        &h.roots,
+        &RetentionPolicy {
+            include_notes: true,
+            ..budget(pinned)
+        },
+        now,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RetentionError::BudgetUnmet { nothing_deleted: false, notes_kept: false, .. }
+        ),
+        "{err}"
+    );
+    assert!(!err.to_string().contains("nothing was deleted"), "{err}");
+    assert!(!std::fs::read_to_string(&notes).unwrap().contains("mem-live"));
 }
 
 #[test]
@@ -664,6 +910,7 @@ fn malformed_chain_files_fail_closed_without_destructive_sweep() {
         &RetentionPolicy {
             max_age_days: Some(30),
             max_disk_bytes: None,
+            include_notes: false,
         },
         now,
     )
@@ -761,24 +1008,13 @@ fn cache_retention_is_recursive_and_confined() {
     let outside = h.roots.base_dir.join("outside-data.jsonl");
     std::fs::write(&outside, "keep me\n").unwrap();
     std::os::unix::fs::symlink(&outside, h.roots.cache_dir.join("sub/escape.jsonl")).unwrap();
-    // Index files for the honest MemoryIndex count (M5).
-    let index_dir = h.roots.base_dir.join("memory/index/project-x");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    std::fs::write(index_dir.join("manifest.json"), "{}").unwrap();
-    std::fs::write(index_dir.join("seg-000000.jsonl"), "d\n").unwrap();
-
-    // Inspect sees nested cache files and real index file counts.
+    // Inspect sees nested cache files.
     let report = inspect(&h.roots).unwrap();
     let domain = |d: RetentionDomain| report.domains.iter().find(|x| x.domain == d).unwrap();
     assert_eq!(
         domain(RetentionDomain::Traces).files,
         2,
         "recursive cache count (symlinks excluded)"
-    );
-    assert_eq!(
-        domain(RetentionDomain::MemoryIndex).files,
-        2,
-        "actual index file count, not zero"
     );
 
     // Sweep ages out nested files but never the symlink target.
@@ -787,6 +1023,7 @@ fn cache_retention_is_recursive_and_confined() {
         &RetentionPolicy {
             max_age_days: Some(30),
             max_disk_bytes: None,
+            include_notes: false,
         },
         agent_core::epoch_millis() + 40 * DAY_MS,
     )

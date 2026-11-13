@@ -63,8 +63,9 @@ for itself before the next rollover, and workers run hundreds of rounds.
    legacy local `ArchiveStore` (`context-windows-v1`, redacted) or, when Axel
    is exclusive, an Axel RPC. The model retrieves evicted context with
    `memory_search(source=history)` and `memory_fetch`.
-5. **`context_checkpoint` and the working note.** Registered only in auto
-   mode. The model reports a phase (`plan`, `execute`, `wrap_up`,
+5. **`context_checkpoint` and the working note.** Offered only to a chat in
+   auto mode (the registry holds it for every chat on the host; a chat
+   without context management is not offered it). The model reports a phase (`plan`, `execute`, `wrap_up`,
    `new_task`) and an optional note. A boundary report in the pressure band
    rolls over early; the note rides into the successor. The rollover itself
    does **not** depend on it: the rollover band triggers regardless.

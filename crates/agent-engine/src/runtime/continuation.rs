@@ -4,7 +4,7 @@
 //! elapsed time; cumulative resource/cost budgets remain unchanged.
 use crate::{memory_backend::MemoryBinding, Result, RuntimeError, SharedMessage};
 use agent_core::config::{ContextManagementConfig, ContextManagementMode};
-use agent_core::context_archive::{ArchiveRef, ArchiveStore};
+use agent_core::context_archive::{ArchivePart, ArchiveRef, ArchiveStore};
 use agent_core::core::context_policy::{
     ContextAction, ContextAssessment, ContextBand, ContextReason, ContextState, WorkPhase,
 };
@@ -145,9 +145,11 @@ pub struct ContinuationState {
     /// A head save was requested but not durably acknowledged. Only an explicit
     /// session reload/reset resolves that uncertainty; mode toggles do not.
     pub durability_blocked: bool,
-    /// Restored Axel metadata is only syntactic until the host service verifies
-    /// the durable source. Never infer from a restored head while this is set.
-    restore_pending: bool,
+    /// The archive a resumed head names that its project's store does not
+    /// hold ([`restore_window`]): the chat goes on at window 1 and the
+    /// earlier windows cannot be fetched. `/context status` says so.
+    /// Cleared on reset and by a committed rollover.
+    missing_archive: Option<MissingArchive>,
     /// Latest provider-reported vs estimated footprint of one request. Kept
     /// across rollovers (same tokenizer); cleared with the session binding.
     pub token_calibration: Option<TokenCalibration>,
@@ -176,7 +178,7 @@ impl Default for ContinuationState {
             latest_archive: None,
             last_band: None,
             durability_blocked: false,
-            restore_pending: false,
+            missing_archive: None,
             token_calibration: None,
             calibration_model: None,
             usage_anchor: None,
@@ -347,15 +349,32 @@ pub(crate) fn context_band_str(band: ContextBand) -> &'static str {
     }
 }
 
-pub fn archive_store() -> std::io::Result<ArchiveStore> {
+/// Tests only: the file store of the project the process folder is in.
+/// Production never asks the process folder, which under the daemon is the
+/// daemon's and not the chat's: a chat's window is sealed through its
+/// [`MemoryBinding`] (`history_seal_window`) and looked up on resume with
+/// [`existing_archive_store_in`].
+#[cfg(test)]
+pub(crate) fn archive_store() -> std::io::Result<ArchiveStore> {
     let cwd = std::env::current_dir()?;
     let scope = agent_core::memory::store::ProjectScope::discover(&cwd)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     archive_store_in(&agent_core::config::base_dir(), &scope)
 }
 
-/// Caller resolves scope before crossing a thread boundary. An ambient cwd or
-/// environment change during a blocking operation must not redirect its data.
+/// A project's file store opened for a read: unlike the open a seal makes
+/// (`ArchiveStore::new`) this creates no directory, changes no mode and
+/// syncs nothing. `None` when the project has no archive. The caller names
+/// the project; nothing here reads the process folder.
+fn existing_archive_store_in(
+    base: &std::path::Path,
+    scope: &agent_core::memory::store::ProjectScope,
+) -> std::io::Result<Option<ArchiveStore>> {
+    ArchiveStore::open_existing(base, scope.key(), ARCHIVE_NAMESPACE)
+}
+
+/// Tests only: a named project's file store, opened as a seal opens it.
+#[cfg(test)]
 pub(crate) fn archive_store_in(
     base: &std::path::Path,
     scope: &agent_core::memory::store::ProjectScope,
@@ -363,6 +382,8 @@ pub(crate) fn archive_store_in(
     archive_store_for_session(base, scope, ARCHIVE_NAMESPACE)
 }
 
+/// Tests only: the same, for one conversation's id.
+#[cfg(test)]
 fn archive_store_for_session(
     base: &std::path::Path,
     scope: &agent_core::memory::store::ProjectScope,
@@ -580,10 +601,189 @@ pub(super) fn tool_groups(messages: &[SharedMessage]) -> Vec<usize> {
     (0..messages.len()).map(|i| find(&mut parent, i)).collect()
 }
 
+/// The archive that holds the window's source message `index`: of the parts
+/// a window was sealed as, the one whose range contains it (the last one for
+/// an index past them all, which parts that cover the window never have).
+fn part_containing(parts: &[ArchivePart], index: usize) -> Option<&ArchiveRef> {
+    let ends_after = |part: &&ArchivePart| {
+        index < part.first_source_index + part.archive.source_message_count
+    };
+    parts.iter().find(ends_after).or(parts.last()).map(|part| &part.archive)
+}
+
+/// Most parts of one window that the continuation message lists by id: the
+/// last ones, which hold the newest messages and the ones the list of dropped
+/// requests points at. Earlier parts are counted, with the range they cover.
+/// The bound is on the message. Its size is estimated before the parts are
+/// known, so a rollover lists fewer than this when naming them all would
+/// fail one of the two checks it made on the estimate
+/// ([`rollover_for_boundary`]); the host metadata lists every part.
+const LISTED_PARTS: usize = 32;
+
+/// What a window of `len` messages is taken to be sealed as before it is
+/// sealed, for the size estimate: the fewest parts the message limit allows,
+/// one for a window within it.
+fn assumed_parts(len: usize) -> Vec<ArchivePart> {
+    let limit = agent_core::context_archive::MAX_MESSAGES;
+    (0..len.div_ceil(limit).max(1))
+        .map(|part| {
+            let first = part * limit;
+            let count = (len - first).min(limit);
+            ArchivePart {
+                archive: ArchiveRef {
+                    id: "0".repeat(32),
+                    message_count: count,
+                    source_message_count: count,
+                },
+                first_source_index: first,
+                reduced_messages: 0,
+            }
+        })
+        .collect()
+}
+
+/// An upper bound on the size of the new window when the store seals this
+/// one as several parts, whatever the parts are: the head with one part
+/// named, which is as short as [`rollover_for_boundary`] can make it, with
+/// every number in its sentence as wide as that number can be. `None` for a
+/// window of fewer than two messages, which cannot be sealed as several.
+///
+/// The parts decide nothing in the head but that sentence and the id in the
+/// stub of a first request too large to keep, which is 32 characters
+/// whichever part it is: which messages are retained, the list of dropped
+/// requests, the note and the manifest are the same for any part list. The
+/// sentence is ASCII, which the estimate charges by the character, so a
+/// sentence with no more characters is not estimated higher. Given parts
+/// that cover a window of `len` messages ([`check_cover`]), the widest are:
+///
+/// - the last index of the parts not named: `len - 2`, and the first of the
+///   one named: `len - 1`, as here;
+/// - the messages the named part stores: no more than it covers, so `len`;
+/// - its reduced messages and the window's, which nothing bounds: the
+///   largest number there is, on the named part;
+/// - the number of parts not named: `len - 1`. That one cannot be made up
+///   without as many parts, so it is "1" here, and its other digits and
+///   the plural's "s" ("1 earlier archive", "2 earlier archives") are
+///   added, a token each (more than the estimate charges for a character).
+///
+/// It is not a bound on a head whose note is longer than `note`: see
+/// [`rollover_for_boundary`].
+fn largest_split_head(
+    messages: &[SharedMessage],
+    note: &str,
+    window: u64,
+    target: SuccessorBudget,
+    turn_start: Option<&str>,
+    workers: &str,
+) -> Option<u64> {
+    let len = messages.len();
+    if len < 2 {
+        return None;
+    }
+    let part = |first: usize, covers: usize, stored: usize, reduced: usize| ArchivePart {
+        archive: ArchiveRef {
+            id: "0".repeat(32),
+            message_count: stored,
+            source_message_count: covers,
+        },
+        first_source_index: first,
+        reduced_messages: reduced,
+    };
+    let widest = [part(0, len - 1, len - 1, 0), part(len - 1, 1, len, usize::MAX)];
+    let mut head = successor_from_parts(messages, &widest, note, window, target, turn_start, workers);
+    head[0] = relisted(&head[0], &widest, widest.len(), 1);
+    let more_characters = u64::from((len - 1).ilog10()) + 1;
+    Some(super::context::estimate_history(&head).saturating_add(more_characters))
+}
+
+/// Where the window that was just archived is: the sentence the continuation
+/// message says it in, and the host's record of the parts (`archives` in the
+/// message's metadata).
+///
+/// A window sealed whole as one archive, which is every window within the
+/// per-archive limits, gets the sentence it always had and no record: the
+/// metadata's `archive` already says everything. A window sealed as several
+/// parts lists them in source order, each with its range of the window's
+/// source messages and the number of messages stored, because inside a part
+/// `memory_fetch` counts `source_index` from that part's first message. A
+/// part holding a message that was stored reduced says so. At most `listed`
+/// parts, the last ones, are named by id; the record has every part.
+fn archived_evidence(parts: &[ArchivePart], listed: usize) -> (String, Option<Value>) {
+    const VIA: &str = "available via memory_search(source=history) and memory_fetch if a specific needed fact is missing";
+    let last_index = |part: &ArchivePart| {
+        part.first_source_index + part.archive.source_message_count.saturating_sub(1)
+    };
+    let reduced: usize = parts.iter().map(|part| part.reduced_messages).sum();
+    let mut text = match parts {
+        [whole] => format!(
+            "Earlier eligible source evidence: ctx-{} ({} messages), {VIA}.",
+            whole.archive.id, whole.archive.message_count
+        ),
+        _ => {
+            let unlisted = parts.len().saturating_sub(listed);
+            let mut listed: Vec<String> = Vec::new();
+            // The first range says what the numbers are.
+            let mut label = "source messages ";
+            if unlisted > 0 {
+                let archives = if unlisted == 1 { "archive" } else { "archives" };
+                listed.push(format!(
+                    "{unlisted} earlier {archives} not listed here ({label}#{}-#{})",
+                    parts[0].first_source_index,
+                    last_index(&parts[unlisted - 1]),
+                ));
+                label = "";
+            }
+            for part in &parts[unlisted..] {
+                listed.push(format!(
+                    "ctx-{} ({label}#{}-#{}, {} archived{})",
+                    part.archive.id,
+                    part.first_source_index,
+                    last_index(part),
+                    part.archive.message_count,
+                    match part.reduced_messages {
+                        0 => String::new(),
+                        n => format!(", {n} reduced"),
+                    },
+                ));
+                label = "";
+            }
+            format!(
+                "Earlier eligible source evidence, in source order: {}, {VIA}; within each archive memory_fetch's source_index starts again at 0: source message #i is the row whose source_index is i minus the first number of its range, and since start counts archived messages it is at that start or a lower one.",
+                listed.join(", ")
+            )
+        }
+    };
+    match reduced {
+        0 => {}
+        1 => text.push_str(" 1 message was too large for one archive and is stored with its oversized payloads omitted, each marked in place."),
+        n => text.push_str(&format!(" {n} messages were too large for one archive and are stored with their oversized payloads omitted, each marked in place.")),
+    }
+    let record = (parts.len() != 1 || reduced > 0).then(|| {
+        parts
+            .iter()
+            .map(|part| {
+                let mut entry = json!({
+                    "id": part.archive.id,
+                    "first": part.first_source_index,
+                    "count": part.archive.source_message_count,
+                    "messages": part.archive.message_count,
+                });
+                if part.reduced_messages > 0 {
+                    entry["reduced"] = json!(part.reduced_messages);
+                }
+                entry
+            })
+            .collect()
+    });
+    (text, record)
+}
+
 /// Stub for a first request too large to pin; carried across later windows.
+/// It names the archive that holds the request: of `parts`, the one whose
+/// range contains it.
 fn pinned_stub(
     messages: &[SharedMessage],
-    archive: &ArchiveRef,
+    parts: &[ArchivePart],
     first: Option<usize>,
 ) -> Option<Value> {
     if let Some(stub) = messages
@@ -597,7 +797,7 @@ fn pinned_stub(
     }
     first.map(|i| {
         json!({
-            "archive": archive.id,
+            "archive": part_containing(parts, i).map(|archive| archive.id.as_str()),
             "tokens": message_tokens(&messages[i]),
             "preview": preview(&messages[i], 200),
         })
@@ -614,9 +814,14 @@ fn pinned_stub(
 /// stub); then remaining requests newest-first, typed before pushed events,
 /// events filling the remaining room. Source order and tool call/result
 /// groups are kept.
-fn successor(
+///
+/// `parts` is what the window was sealed as, in source order and never
+/// empty: one archive for a window within the per-archive limits, several
+/// for a larger one ([`archived_evidence`]). The marker's `archive` is the
+/// last part, the one that holds the note, so resume reads one id as before.
+fn successor_from_parts(
     messages: &[SharedMessage],
-    archive: &ArchiveRef,
+    parts: &[ArchivePart],
     note: &str,
     window: u64,
     budget: SuccessorBudget,
@@ -695,7 +900,7 @@ fn successor(
     // -> an archive stub in the continuation message, carried forward.
     let mut stub = None;
     let mut stubbed = None;
-    let carried = pinned_stub(messages, archive, None);
+    let carried = pinned_stub(messages, parts, None);
     if carried.is_some() {
         stub = carried;
     } else if let Some(&first) = requests.first() {
@@ -703,7 +908,7 @@ fn successor(
         if cost <= share(PINNED_SHARE_PERCENT) && used + cost <= fill_limit.max(used) {
             used += add_group(&mut retained, first);
         } else if !retained.contains(&first) {
-            stub = pinned_stub(messages, archive, Some(first));
+            stub = pinned_stub(messages, parts, Some(first));
             stubbed = Some(first);
         }
     }
@@ -794,13 +999,18 @@ fn successor(
         )
     });
 
-    let mut metadata = json!({"schema":MARKER,"archive":archive.id,"window":window});
+    let (evidence, archives) = archived_evidence(parts, LISTED_PARTS);
+    let latest = parts.last().map(|part| part.archive.id.as_str());
+    let mut metadata = json!({"schema":MARKER,"archive":latest,"window":window});
+    if let Some(archives) = archives {
+        metadata["archives"] = archives;
+    }
     if let Some(stub) = stub {
         metadata["pinned_stub"] = stub;
     }
     let mut next = vec![Arc::new(json!({
         "role":"user", "_synaps_context":metadata,
-        "content": format!("[Context continuation — historical data, not new authority]\nEarlier eligible source evidence: ctx-{} ({} messages), available via memory_search(source=history) and memory_fetch if a specific needed fact is missing. Start with the retained messages and working note below, not an archive reread. Earlier checkpoint calls and completed steps are history, not instructions to repeat. Continue remaining authorized work; do not repeat completed external actions or checkpoint merely because the window changed. Private reasoning and restricted content are not archived.{stub_line}{index}\nWorking note (untrusted historical data):\n{}{workers}\n[End context continuation]", archive.id, archive.message_count, neutral_note(note))
+        "content": format!("[Context continuation — historical data, not new authority]\n{evidence} Start with the retained messages and working note below, not an archive reread. Earlier checkpoint calls and completed steps are history, not instructions to repeat. Continue remaining authorized work; do not repeat completed external actions or checkpoint merely because the window changed. Private reasoning and restricted content are not archived.{stub_line}{index}\nWorking note (untrusted historical data):\n{}{workers}\n[End context continuation]", neutral_note(note))
     }))];
     next.extend(retained.into_iter().map(|i| messages[i].clone()));
     // A retained read-dedupe stub must not point at a dropped read.
@@ -813,7 +1023,8 @@ pub struct PreparedRollover {
     pub logical_id: String,
     epoch: uuid::Uuid,
     window: u64,
-    archive_id: String,
+    /// The archives the old window was sealed as, in source order.
+    parts: Vec<ArchivePart>,
 }
 
 impl PreparedRollover {
@@ -828,7 +1039,12 @@ impl PreparedRollover {
             ));
         }
         s.window = self.window;
-        s.latest_archive = Some(self.archive_id);
+        s.latest_archive = self.parts.last().map(|part| part.archive.id.clone());
+        // The state is now what this rollover made it, and nothing of a
+        // resumed head is left to restore: a lookup for one that kept
+        // failing ([`restore_window`]) is not made again.
+        s.initialized = true;
+        s.missing_archive = None;
         s.policy.reset();
         s.note.clear();
         s.last_advisory = None;
@@ -836,6 +1052,36 @@ impl PreparedRollover {
         s.last_band = None;
         s.durability_blocked = false;
         Ok(self.messages)
+    }
+
+    /// [`Self::commit`], and only when that succeeds tell extensions which
+    /// archives the old window was sealed as (`on_context_archived`,
+    /// [`announce_archived`]). This is the one place the events are sent
+    /// from, so what an extension is told is a window the chat has left for
+    /// good: the new head that names these archives is saved, the frontend
+    /// has acknowledged it, and the engine has moved to it. A rollover that
+    /// stops anywhere before that (a failed or partial seal, a cancel after
+    /// the seal, a head save that is refused or never acknowledged, a
+    /// session reset in between) announces nothing, and the attempt that
+    /// does complete announces its own parts once.
+    ///
+    /// The send is after the save, not with it: if the process dies between
+    /// the two, or before the detached delivery has run, the saved session
+    /// names archives no extension was told of, and nothing sends the
+    /// events later. An extension that needs every archive lists the store
+    /// when it starts.
+    pub(crate) fn commit_and_announce(
+        self,
+        state: &SharedContinuation,
+        hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+        binding: &MemoryBinding,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SharedMessage>> {
+        let (session_id, window, parts) =
+            (self.logical_id.clone(), self.window, self.parts.clone());
+        let messages = self.commit(state)?;
+        announce_archived(hook_bus, binding, session_id, window, parts, cwd);
+        Ok(messages)
     }
 }
 
@@ -938,19 +1184,19 @@ pub(crate) async fn rollover_for_boundary(
     };
     // Validate candidate BEFORE writing. A giant latest request/tail cannot be
     // fixed by repeatedly rolling over; retain original history and stop instead.
-    let placeholder = ArchiveRef {
-        id: "0".repeat(32),
-        message_count: messages.len(),
-        source_message_count: messages.len(),
-    };
-    let candidate = successor(
+    // The parts are not known before the seal: assume the fewest the message
+    // limit allows (`assumed_parts`). A split made by another limit gives
+    // more parts, about 30 tokens for each one listed, that this estimate
+    // does not see; the head is measured again after the seal, below, and
+    // names fewer parts if it has to.
+    let candidate = successor_from_parts(
         messages,
-        &placeholder,
+        &assumed_parts(messages.len()),
         &note,
         window,
         target,
         turn_start.as_deref(),
-            workers,
+        workers,
     );
     let estimate = super::context::estimate_history(&candidate);
     let original = super::context::estimate_history(messages);
@@ -960,152 +1206,544 @@ pub(crate) async fn rollover_for_boundary(
         // hard admission decides whether this no-op can continue.
         return Ok(RolloverPreparation::Unproductive);
     }
-    if estimate >= budget {
+    // The budget is a limit, and a rollover that is refused on it after the
+    // seal leaves a window of archives nothing names: so it is refused here
+    // unless the head fits however the window is cut. What the head will be
+    // cannot be known here, because the seal decides the parts. With one
+    // part named it is as short as it gets, and `largest_split_head` is at
+    // least that for any parts. This refuses up to about 200 tokens below
+    // the budget, the wording of a split window that this window may not
+    // need, and a window sealed as one archive pays that too.
+    let largest = largest_split_head(messages, &note, window, target, turn_start.as_deref(), workers)
+        .map_or(estimate, |split| split.max(estimate));
+    if largest >= budget {
         return Err(RuntimeError::Config(format!(
-            "context rollover retained history exceeds the safe request budget (estimated {estimate} tokens, budget {budget}); history retained"
+            "context rollover retained history exceeds the safe request budget (estimated {largest} tokens, budget {budget}); history retained"
         )));
     }
-    let (reference, stored_note) = tokio::select! {
+    // Every part is on disk or this fails: a window that was only partly
+    // sealed has no part list, so nothing can record or announce it.
+    let (parts, stored_note) = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(RuntimeError::Session("rollover canceled; active history retained".into())),
-        result = binding.history_seal(&logical_id, messages, &note) =>
+        result = binding.history_seal_window(&logical_id, messages, &note) =>
             result.map_err(|e| RuntimeError::Session(format!("archive commit failed; history retained: {e}")))?,
     };
+    #[cfg(test)]
+    let parts = SEALED_AS.with(|forced| forced.borrow_mut().take()).unwrap_or(parts);
+    // The old window is dropped on the word of this list, and the head, the
+    // marker and the hook events are written from it.
+    check_cover(&parts, messages.len()).map_err(|why| {
+        RuntimeError::Session(format!(
+            "archive commit failed; history retained: the archives the store returned are not the window ({why})"
+        ))
+    })?;
     if cancel.is_cancelled() {
         return Err(RuntimeError::Session(
             "rollover canceled; history retained".into(),
         ));
     }
+    let mut next = successor_from_parts(
+        messages,
+        &parts,
+        &stored_note,
+        window,
+        target,
+        turn_start.as_deref(),
+        workers,
+    );
+    // The two checks above were made on an estimate: a head that lists the
+    // parts assumed before the seal. A window cut into more parts than that
+    // has a longer list, about 30 tokens a part, which neither check saw.
+    // Both are made again here on the real head, and while it fails one the
+    // list names one part fewer, the earliest first: that part stays
+    // counted, with the range it covers, and every part stays in the head's
+    // metadata. Nothing is sealed again. A window sealed as one archive is
+    // never touched here.
+    if parts.len() > 1 {
+        let passes = |real: u64| {
+            (time_checkpoint || real.saturating_add(1024) < original) && real < budget
+        };
+        let mut listed = LISTED_PARTS.min(parts.len());
+        let mut real = super::context::estimate_history(&next);
+        while !passes(real) && listed > 1 {
+            next[0] = relisted(&next[0], &parts, listed, listed - 1);
+            listed -= 1;
+            real = super::context::estimate_history(&next);
+        }
+        // With one part listed the list cannot get shorter. That head can
+        // still be longer than the estimate, by fixed wording whatever the
+        // number of parts: the sentence of a split window where one archive
+        // was assumed, and the one about reduced messages (under 200 tokens
+        // together). The shrink check's 1,024 tokens are a margin, and a
+        // rollover that saves that little less is still made. The budget is
+        // a limit, so the head is held to it.
+        //
+        // The check before the seal has already refused every window whose
+        // head could be over the budget for its parts, so this is the last
+        // line and not a path. One thing can still bring a rollover here:
+        // the head carries the note the store returns, not the one it was
+        // given. That is the note as the store's redactor left it, or, when
+        // the last part's content was sealed before, the note it was sealed
+        // with then (up to the store's note limit). Only the seal knows
+        // either, so a longer one cannot be refused before it. The archives
+        // are written by now; the error says so.
+        if real >= budget {
+            return Err(RuntimeError::Config(format!(
+                "context rollover retained history exceeds the safe request budget (estimated {real} tokens, budget {budget}); history retained; the window's archives were already written"
+            )));
+        }
+    }
     Ok(RolloverPreparation::Ready(PreparedRollover {
-        messages: successor(
-            messages,
-            &reference,
-            &stored_note,
-            window,
-            target,
-            turn_start.as_deref(),
-            workers,
-        ),
+        messages: next,
         logical_id,
         epoch,
         window,
-        archive_id: reference.id,
+        parts,
     }))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the list the next seal on this thread is taken to have
+    /// returned, in place of the store's own (a store that answers wrongly).
+    static SEALED_AS: std::cell::RefCell<Option<Vec<ArchivePart>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether `parts`, the archives a store says it sealed a window of `len`
+/// source messages as, are that window: in source order, each starting
+/// where the one before it ends, the first at message 0 and the last ending
+/// with the window. `Err` says what is wrong, for the rollover's error.
+///
+/// The store is trusted with the content of each archive. This is only that
+/// its list adds up, which costs nothing to check and is what the rollover
+/// drops the old window on.
+fn check_cover(parts: &[ArchivePart], len: usize) -> std::result::Result<(), String> {
+    let total = parts.len();
+    let mut next = 0usize;
+    for (n, part) in parts.iter().enumerate() {
+        let covers = part.archive.source_message_count;
+        if part.first_source_index != next {
+            return Err(format!(
+                "part {} of {total} starts at source message #{}, not #{next}",
+                n + 1,
+                part.first_source_index
+            ));
+        }
+        if covers == 0 && total > 1 {
+            return Err(format!("part {} of {total} covers no message", n + 1));
+        }
+        if part.archive.message_count > covers {
+            return Err(format!(
+                "part {} of {total} stores {} messages and covers {covers}",
+                n + 1,
+                part.archive.message_count
+            ));
+        }
+        next = next.saturating_add(covers);
+    }
+    match (total, next == len) {
+        (0, _) => Err(format!("no archive for a window of {len} source messages")),
+        (_, false) => Err(format!(
+            "{total} parts cover {next} source messages of the window's {len}"
+        )),
+        (_, true) => Ok(()),
+    }
+}
+
+/// `head`, the continuation message of a window sealed as `parts`, naming
+/// `to` of them by id where it names `from`. Nothing else in it changes:
+/// the sentence that lists the parts is the first thing in the message.
+///
+/// The sentence is found by its text. A head that does not hold it as
+/// [`archived_evidence`] writes it for `from` parts would come back
+/// unchanged, and the caller's loop would count its list down without
+/// making the message any shorter: that is a bug in this file, so it fails
+/// a debug build and is logged, once, in a release build.
+fn relisted(head: &SharedMessage, parts: &[ArchivePart], from: usize, to: usize) -> SharedMessage {
+    let mut message = (**head).clone();
+    let before = message["content"].as_str().unwrap_or_default();
+    let (old, new) = (archived_evidence(parts, from).0, archived_evidence(parts, to).0);
+    let text = before.replacen(&old, &new, 1);
+    let relisted = old == new || text != before;
+    debug_assert!(relisted, "the head does not hold the list of {from} parts it was written with");
+    if !relisted {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                from,
+                to,
+                "context rollover: the continuation message does not hold the list of archives it \
+                 was written with, so the list could not be shortened; the message is kept as it is"
+            )
+        });
+    }
+    message["content"] = Value::String(text);
+    Arc::new(message)
+}
+
+/// Tell extensions which archives a window was sealed as
+/// (`on_context_archived`). Called by [`PreparedRollover::commit_and_announce`]
+/// once the rollover is committed, and from nowhere else.
+///
+/// One event per archive the window was sealed as: one for a window within
+/// the per-archive limits, and for a larger one an event per part, first
+/// part first, each saying which part of how many it is, where in the window
+/// it starts and how many of its messages are stored reduced. They are one
+/// delivery, so a window of many parts cannot run into the bus's in-flight
+/// limit and lose its own later parts, and each handler is sent them in
+/// order without waiting for any other handler.
+///
+/// Notify-only. It returns at once, awaits nothing and cannot fail, so no
+/// rollover and no turn depends on an extension. The file lookups and the
+/// delivery run on the hook bus's detached, bounded task
+/// ([`HookBus::notify_with`]); with no subscriber not even the lookups
+/// happen.
+///
+/// A worker's bus sends nothing.
+///
+/// [`HookBus::notify_with`]: crate::extensions::hooks::HookBus::notify_with
+fn announce_archived(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    binding: &MemoryBinding,
+    session_id: String,
+    window: u64,
+    parts: Vec<ArchivePart>,
+    cwd: Option<&std::path::Path>,
+) {
+    use crate::extensions::hooks::events::{HookEvent, HookKind};
+    let Ok(scope) = binding.scope() else {
+        return;
+    };
+    let (base, project_key) = (binding.base().to_owned(), scope.key().to_owned());
+    let cwd = cwd.map(std::path::Path::to_path_buf);
+    hook_bus.notify_with(HookKind::OnContextArchived, async move {
+        let key = project_key.clone();
+        let ids: Vec<String> = parts.iter().map(|part| part.archive.id.clone()).collect();
+        // One file each; `None` where it cannot be located.
+        let paths = tokio::task::spawn_blocking(move || {
+            let file = |id: &String| {
+                agent_core::context_archive::archive_file(&base, &key, id).ok().flatten()
+            };
+            ids.iter().map(file).collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        let announce = |(index, part): (usize, &ArchivePart)| {
+            HookEvent::on_context_archived(
+                &session_id,
+                &part.archive.id,
+                paths.get(index).and_then(|path| path.as_deref()),
+                &project_key,
+                part.archive.message_count,
+                part.archive.source_message_count,
+                window,
+            )
+            .with_part(index + 1, parts.len(), part.first_source_index, part.reduced_messages)
+            .with_cwd(cwd.as_deref())
+        };
+        parts.iter().enumerate().map(announce).collect::<Vec<_>>()
+    });
+}
+
+/// The archive a resumed head names that could not be restored, and whether
+/// that is because the chat's folder has no project to look in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MissingArchive {
+    id: String,
+    no_project: bool,
+}
+
+/// What looking up the archive a resumed head names found.
+enum Lookup {
+    Found,
+    /// The chat's folder has no project, so there is no store to look in.
+    NoProject(String),
+    /// It is not there, and looking again would not find it: why.
+    Absent(String),
+    /// The lookup itself failed, so nothing is known: why.
+    Failed(String),
+}
+
+/// Look archive `id` up in the file store of `binding`'s project, as a
+/// resume needs to know it. A read: the store is opened as it is and nothing
+/// is created for a project that has no archive.
+///
+/// `NoProject` is a chat whose folder has no project: there is nowhere to
+/// look. `Absent` is the two ways of not being there, told apart in its
+/// text: the project has no archive store, the store does not hold the id (the store's own "not found", which it gives only
+/// when it could read everything the archive might be in). Anything else,
+/// such as a busy store, a shelf that cannot be read or an I/O error, is
+/// `Failed`.
+fn look_up(binding: &MemoryBinding, id: &str) -> Lookup {
+    let scope = match binding.scope() {
+        Ok(scope) => scope,
+        Err(error) => {
+            return Lookup::NoProject(format!("the chat has no project to look in ({error})"))
+        }
+    };
+    let project = format!("project {} ({})", scope.key(), scope.root().display());
+    let store = match existing_archive_store_in(binding.base(), scope) {
+        Ok(Some(store)) => store,
+        Ok(None) => return Lookup::Absent(format!("{project} has no archive store")),
+        Err(error) => {
+            return Lookup::Failed(format!("the archive store of {project} could not be opened: {error}"))
+        }
+    };
+    match store.fetch(id, 0, 1) {
+        Ok(_) => Lookup::Found,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && error.to_string() == agent_core::context_archive::NOT_FOUND =>
+        {
+            Lookup::Absent(format!(
+                "the archive store of {project} does not hold it (missing, forgotten, or sealed in another project)"
+            ))
+        }
+        Err(error) => Lookup::Failed(format!(
+            "the archive store of {project} could not be read for it: {error}"
+        )),
+    }
 }
 
 /// Resume restores only window metadata from a verified source reference. It
 /// never enables mode or reconstructs capability/consent from model text.
-pub fn restore_window(messages: &[SharedMessage], state: &SharedContinuation) {
-    let mut s = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if s.initialized {
-        return;
+///
+/// The reference is the archive the head's marker names, and it is looked
+/// up in the file store of `binding`: the project of the folder the chat
+/// runs in now, which under the daemon is not the project of the process
+/// folder. That is the store the chat's rollover sealed the archive into
+/// (`MemoryBinding::history_seal_window`) only if the chat is resumed in
+/// the project it rolled over in. A chat continued from a folder of another
+/// project (`--continue` takes the folder of the client that resumes it) is
+/// looked up in that project, where the archive is not.
+///
+/// - Found: the window number and the archive link are restored.
+/// - Not there (no project, no archive store, no such archive): the chat
+///   goes on at window 1 without an archive link, and a warning says which
+///   archive was looked for, in which project's store, and which of the
+///   three it was.
+/// - The lookup failed for another reason (a busy store, something that
+///   could not be read): nothing is settled. A warning says why, the chat
+///   goes on at window 1, and the next call looks again. That is once at
+///   each turn start, until a lookup answers or the chat rolls over: a
+///   committed rollover settles the state by itself
+///   ([`PreparedRollover::commit`]), with the window it made, numbered
+///   from where the chat then was.
+///
+/// The lookup reads a file and can wait for a busy store, so the state lock
+/// is not held across it. A head that lists several parts
+/// (`_synaps_context.archives`) has its other parts checked afterwards
+/// ([`warn_unavailable_parts`]), which nothing waits for.
+pub fn restore_window(
+    messages: &[SharedMessage],
+    state: &SharedContinuation,
+    binding: &MemoryBinding,
+) {
+    let (named, window, listed, passed_over, epoch, chat) = {
+        let mut s = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if s.initialized {
+            return;
+        }
+        let marker = messages
+            .iter()
+            .find_map(|m| (m["_synaps_context"]["schema"] == MARKER).then_some(&m["_synaps_context"]));
+        let Some((marker, named)) = marker.and_then(|marker| Some((marker, marker["archive"].as_str()?)))
+        else {
+            s.initialized = true;
+            return;
+        };
+        // What the marker holds is what a session file held: nothing of it
+        // is fetched, kept or logged unless it has the form of an id.
+        // A rollover numbers its windows from 2; no marker it writes holds
+        // 0. Such a marker is refused whole, before anything is looked up.
+        if marker["window"].as_u64() == Some(0) {
+            tracing::warn!(
+                session = %s.logical_id,
+                "resumed chat: its context head's marker has window 0, which no rollover \
+                 writes; the chat goes on at window 1 without its archive link"
+            );
+            s.initialized = true;
+            return;
+        }
+        let named = if is_archive_id(named) { Ok(named.to_owned()) } else { Err(named.len()) };
+        let (listed, passed_over) = listed_parts(marker, named.as_deref().ok());
+        let window = marker["window"].as_u64().unwrap_or(1);
+        (named, window, listed, passed_over, s.epoch, s.logical_id.clone())
+    };
+
+    // Off the lock from here: a file is read.
+    let lookup = match &named {
+        Ok(id) => look_up(binding, id),
+        Err(_) => Lookup::Absent(String::new()),
+    };
+    match (&lookup, &named) {
+        (Lookup::Found, _) => {}
+        (_, Err(bytes)) => tracing::warn!(
+            session = %chat,
+            "resumed chat: its context head's marker names no archive ({bytes} bytes that are \
+             not an archive id); the chat goes on at window 1 without its archive link"
+        ),
+        (Lookup::Absent(why) | Lookup::NoProject(why), Ok(id)) => tracing::warn!(
+            session = %chat,
+            archive = %format_args!("ctx-{id}"),
+            "resumed chat: the archive its context head names was not found: {why}; \
+             the chat goes on at window 1 without its archive link"
+        ),
+        (Lookup::Failed(why), Ok(id)) => tracing::warn!(
+            session = %chat,
+            archive = %format_args!("ctx-{id}"),
+            "resumed chat: the archive its context head names could not be looked up: {why}; \
+             its window number is not restored yet and the lookup is made again on the next request"
+        ),
     }
-    s.initialized = true;
-    let Some(marker) = messages
-        .iter()
-        .find_map(|m| (m["_synaps_context"]["schema"] == MARKER).then_some(&m["_synaps_context"]))
-    else {
-        return;
-    };
-    let Some(id) = marker["archive"].as_str() else {
-        return;
-    };
-    if archive_store()
-        .and_then(|store| store.fetch(id, 0, 1))
-        .is_ok()
+
     {
-        s.latest_archive = Some(id.into());
-        s.window = marker["window"].as_u64().unwrap_or(1);
+        let mut s = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Reset to another conversation meanwhile, or settled by another call.
+        if s.epoch != epoch || s.initialized {
+            return;
+        }
+        match lookup {
+            Lookup::Found => {
+                s.latest_archive = named.ok();
+                s.window = window;
+            }
+            // Kept for `/context status`: the log is not where a user looks.
+            Lookup::Absent(_) => {
+                s.missing_archive = named.ok().map(|id| MissingArchive { id, no_project: false })
+            }
+            Lookup::NoProject(_) => {
+                s.missing_archive = named.ok().map(|id| MissingArchive { id, no_project: true })
+            }
+            Lookup::Failed(_) => return,
+        }
+        s.initialized = true;
+    }
+    if passed_over.unchecked > 0 || passed_over.not_ids > 0 {
+        tracing::warn!(
+            session = %chat,
+            checked = listed.len(),
+            unchecked = passed_over.unchecked,
+            not_ids = passed_over.not_ids,
+            "resumed chat: not every earlier archive its context head lists is looked up: at most \
+             {CHECKED_PARTS} are, and an entry that does not hold an archive id is not"
+        );
+    }
+    if !listed.is_empty() {
+        warn_unavailable_parts(binding.clone(), chat, listed);
     }
 }
 
-/// Capture only host marker syntax, without authorizing mode or touching a
-/// filesystem. Missing/malformed references remain pending and fail validation.
-fn restore_window_syntactic(messages: &[SharedMessage], state: &SharedContinuation) {
-    let mut s = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if s.initialized {
-        return;
+/// Whether `id` has the form of an archive id: 32 lowercase hex characters.
+/// The one rule for every reader of a resumed head's marker
+/// ([`restore_window`], [`listed_parts`]), so that they cannot disagree
+/// about a marker. Lowercase only: the store writes its ids so (the first
+/// or last 32 characters of a digest printed in lowercase, or an imported
+/// id of the same form) and looks an id up as a file name, which an
+/// uppercase spelling is not.
+fn is_archive_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Most parts of a resumed head's list that are looked up
+/// ([`warn_unavailable_parts`]). Each lookup reads a whole archive file, and
+/// the list comes from a session file, which bounds nothing.
+const CHECKED_PARTS: usize = 64;
+
+/// Entries of a resumed head's part list that are not looked up.
+#[derive(Default)]
+struct PassedOver {
+    /// Ids beyond the first [`CHECKED_PARTS`] (a repeated one may be
+    /// counted more than once).
+    unchecked: usize,
+    /// Entries whose `id` is not an archive id.
+    not_ids: usize,
+}
+
+/// The parts a resumed head lists (`archives` of `marker`) that are to be
+/// looked up: the first [`CHECKED_PARTS`] ids, each once, without `named`,
+/// which [`restore_window`] looks up itself (parts with the same content are
+/// one archive). Only a string with the form of an id is copied out of the
+/// list; everything else in it is counted.
+fn listed_parts(marker: &Value, named: Option<&str>) -> (Vec<String>, PassedOver) {
+    let mut seen: std::collections::HashSet<&str> = named.into_iter().collect();
+    let (mut listed, mut passed_over) = (Vec::new(), PassedOver::default());
+    for part in marker["archives"].as_array().into_iter().flatten() {
+        match part["id"].as_str().filter(|id| is_archive_id(id)) {
+            None => passed_over.not_ids += 1,
+            Some(id) if seen.contains(id) => {}
+            Some(_) if listed.len() == CHECKED_PARTS => passed_over.unchecked += 1,
+            Some(id) => {
+                seen.insert(id);
+                listed.push(id.to_owned());
+            }
+        }
     }
-    s.initialized = true;
-    if let Some(marker) = messages.iter().find_map(|m| m.get("_synaps_context")) {
-        s.restore_pending = true;
-        if marker["schema"] == MARKER {
-            s.latest_archive = marker["archive"]
-                .as_str()
-                .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
-                .map(str::to_owned);
-            s.window = marker["window"].as_u64().filter(|w| *w > 0).unwrap_or(1);
+    (listed, passed_over)
+}
+
+/// A resumed head that lists the parts of a split window: warn for each of
+/// `ids` (the parts other than the one the marker names, which
+/// [`restore_window`] has looked up) that the chat's store cannot give back.
+/// The head tells the model those archives are available, and without this
+/// a missing or damaged one is noticed only when the model fetches it.
+///
+/// A warning is all it is: nothing waits for it and the resume does not
+/// depend on it. Each lookup reads a whole archive file, so the check runs
+/// detached, on the blocking pool (or a thread of its own where there is no
+/// runtime), holding no lock. With no project or no store there is nothing
+/// to add to the one warning `restore_window` has given.
+fn warn_unavailable_parts(binding: MemoryBinding, chat: String, ids: Vec<String>) {
+    // The detached thread logs where the caller does.
+    let log = tracing::dispatcher::get_default(Clone::clone);
+    let check = move || {
+        tracing::dispatcher::with_default(&log, || {
+            let Ok(scope) = binding.scope() else {
+                return;
+            };
+            let Ok(Some(store)) = existing_archive_store_in(binding.base(), scope) else {
+                return;
+            };
+            for id in ids {
+                if let Err(error) = store.fetch(&id, 0, 1) {
+                    tracing::warn!(
+                        session = %chat,
+                        archive = %format_args!("ctx-{id}"),
+                        project = %scope.key(),
+                        "resumed chat: its context head lists an earlier archive that its project's \
+                         store cannot give back ({error}); memory_fetch of it will fail"
+                    );
+                }
+            }
+        })
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn_blocking(check);
+        }
+        Err(_) => {
+            let thread = std::thread::Builder::new().name("context-parts-check".into());
+            let _ = thread.spawn(check);
         }
     }
 }
 
-/// Host-only async pre-inference barrier for resumed Axel context heads. Call
-/// even when automatic management is off: mode is not evidence of durability.
-/// No hidden note is fetched or injected during validation. A failed lookup
-/// leaves the barrier pending, and resetting the binding invalidates late work.
+/// What a turn does with a resumed head before its first request:
+/// [`restore_window`], whose lookup never refuses the turn. A head whose
+/// archive is not in the chat's store goes on at window 1. Call even when
+/// automatic management is off.
 pub async fn validate_restored_history(
     messages: &[SharedMessage],
     state: &SharedContinuation,
     binding: &MemoryBinding,
 ) -> Result<()> {
-    if !binding.exclusive() {
-        restore_window(messages, state);
-        return Ok(());
-    }
-    // Inspect this actual request even if reset/another request initialized the
-    // state already. A loaded marker must never bypass verification because an
-    // earlier empty head (or legacy binding) set `initialized` first.
-    let mut markers = messages.iter().filter_map(|m| m.get("_synaps_context"));
-    let Some(marker) = markers.next() else {
-        let mut s = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if s.restore_pending {
-            return Err(RuntimeError::Session(
-                "restored context archive marker is missing; stopped before inference".into(),
-            ));
-        }
-        s.initialized = true;
-        return Ok(());
-    };
-    let epoch = {
-        let mut s = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        s.restore_pending = true;
-        s.epoch
-    };
-    let valid = marker["schema"] == MARKER && markers.next().is_none();
-    let id = marker["archive"]
-        .as_str()
-        .filter(|id| valid && id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()));
-    let window = marker["window"].as_u64().filter(|w| *w > 0);
-    let (Some(id), Some(window)) = (id, window) else {
-        return Err(RuntimeError::Session(
-            "restored context archive marker is invalid; stopped before inference".into(),
-        ));
-    };
-    binding.history_fetch(id, 0, 1).await.map_err(|e| {
-        RuntimeError::Session(format!(
-            "restored context archive could not be verified; stopped before inference: {e}"
-        ))
-    })?;
-    let mut s = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if s.epoch != epoch {
-        return Err(RuntimeError::Session(
-            "restored context belongs to a superseded session binding".into(),
-        ));
-    }
-    s.latest_archive = Some(id.to_owned());
-    s.window = window;
-    s.initialized = true;
-    s.restore_pending = false;
+    restore_window(messages, state, binding);
     Ok(())
 }
 
@@ -1126,11 +1764,7 @@ impl crate::Runtime {
                 ..Default::default()
             };
         }
-        if self.memory_backend_exclusive() {
-            restore_window_syntactic(messages, &self.continuation);
-        } else {
-            restore_window(messages, &self.continuation);
-        }
+        restore_window(messages, &self.continuation, &self.memory_backend);
     }
     pub fn context_management_enabled(&self) -> bool {
         self.continuation
@@ -1148,7 +1782,20 @@ impl crate::Runtime {
             self.context_window(),
         )
         .ok();
-        format!("context management: {} | window {} | capacity {} | pressure {} | rollover {} | archive {}\nAutomatic rollover preserves eligible source evidence in the selected memory backend and starts a fresh wall-clock allowance; permissions, running environment and other resource/cost budgets are unchanged.",s.config.mode.as_str(),s.window,self.context_window(),thresholds.map_or(0,|t|t.pressure_tokens),thresholds.map_or(0,|t|t.rollover_tokens),s.latest_archive.as_deref().unwrap_or("none"))
+        let mut status = format!("context management: {} | window {} | capacity {} | pressure {} | rollover {} | archive {}\nAutomatic rollover preserves eligible source evidence in this folder's archive store and starts a fresh wall-clock allowance; permissions, running environment and other resource/cost budgets are unchanged.",s.config.mode.as_str(),s.window,self.context_window(),thresholds.map_or(0,|t|t.pressure_tokens),thresholds.map_or(0,|t|t.rollover_tokens),s.latest_archive.as_deref().unwrap_or("none"));
+        match &s.missing_archive {
+            Some(MissingArchive { id, no_project: true }) => status.push_str(&format!(
+                "\narchive ctx-{id}, which this chat continues from, cannot be looked up: this \
+                 chat's folder has no project, so earlier windows cannot be fetched."
+            )),
+            Some(MissingArchive { id, no_project: false }) => status.push_str(&format!(
+                "\narchive ctx-{id}, which this chat continues from, is not in this folder's \
+                 archive store, so earlier windows cannot be fetched. If you opened the chat \
+                 from another folder than before, open it from that one."
+            )),
+            None => {}
+        }
+        status
     }
     pub fn context_management_command(&self, arg: &str) -> std::result::Result<String, String> {
         if arg.is_empty() || arg == "status" {
@@ -1172,15 +1819,6 @@ impl crate::Runtime {
             _ => return Err("try /context auto | off | status (session-only); config context_management.mode persists the preference".into()),
         }
         if cfg.mode == ContextManagementMode::Auto {
-            if self.memory_backend_exclusive() && !self.memory_backend.is_axel() {
-                return Err("selected memory backend is unavailable; automatic rollover refused; mode unchanged".into());
-            }
-            if self
-                .memory_backend_reconfigure_denied
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return Err("memory backend selection changed; restart before enabling automatic rollover; mode unchanged".into());
-            }
             self.memory_backend.scope().map_err(|e| e.to_string())?;
         }
         if cfg.mode == ContextManagementMode::Auto && !cfg!(unix) {
@@ -1380,6 +2018,34 @@ pub(crate) fn neutral_note(note: &str) -> String {
         .collect()
 }
 
+/// A window sealed whole as the one archive `archive`: what every window
+/// within the per-archive limits is.
+#[cfg(test)]
+fn whole_window(archive: ArchiveRef) -> ArchivePart {
+    ArchivePart {
+        archive,
+        first_source_index: 0,
+        reduced_messages: 0,
+    }
+}
+
+/// [`successor_from_parts`] of a window sealed whole as one archive. The
+/// tests written when a window was always one archive call this, unchanged:
+/// they are the proof that such a window's successor is what it was.
+#[cfg(test)]
+fn successor(
+    messages: &[SharedMessage],
+    archive: &ArchiveRef,
+    note: &str,
+    window: u64,
+    budget: SuccessorBudget,
+    turn_start: Option<&str>,
+    workers: &str,
+) -> Vec<SharedMessage> {
+    let parts = [whole_window(archive.clone())];
+    successor_from_parts(messages, &parts, note, window, budget, turn_start, workers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1403,7 +2069,11 @@ mod tests {
             logical_id: "durability-test".into(),
             epoch: state.lock().unwrap().epoch,
             window: 2,
-            archive_id: "a".repeat(32),
+            parts: vec![whole_window(ArchiveRef {
+                id: "a".repeat(32),
+                message_count: 5,
+                source_message_count: 5,
+            })],
         }
     }
 
@@ -1601,7 +2271,7 @@ mod tests {
         assert!(rollover(
             &messages,
             &state,
-            &MemoryBinding::legacy_current(),
+            &MemoryBinding::for_process_cwd(),
             100_000,
             SuccessorBudget::UNBOUNDED,
             &cancel
@@ -1632,7 +2302,7 @@ mod tests {
         let prepared = rollover(
             &messages,
             &state,
-            &MemoryBinding::legacy_current(),
+            &MemoryBinding::for_process_cwd(),
             100_000,
             SuccessorBudget::UNBOUNDED,
             &Default::default(),
@@ -1652,16 +2322,89 @@ mod tests {
         assert_eq!(source.len(), messages.len());
         assert_eq!(source[1], messages[1]);
         let restored = Arc::new(Mutex::new(ContinuationState::default()));
-        restore_window(&next, &restored);
+        restore_window(&next, &restored, &MemoryBinding::for_process_cwd());
         let s = restored.lock().unwrap();
         assert_eq!(s.window, 2);
         assert!(!s.enabled());
     }
+    /// Resuming a chat whose head names an archive looks the archive up,
+    /// which is a read: in a project with no archive it creates nothing to
+    /// find that out. It used to open the store as a seal does, and made
+    /// `context-archives` and the project directory.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn restore_window_creates_nothing_in_a_project_without_archives() {
+        let env = BaseDirGuard::new();
+        let marker = json!({"schema": MARKER, "archive": "a".repeat(32), "window": 3});
+        let head = vec![Arc::new(
+            json!({"role":"user","content":"resumed","_synaps_context":marker}),
+        )];
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        let window = state.lock().unwrap().window;
+        restore_window(&head, &state, &MemoryBinding::for_process_cwd());
+        let s = state.lock().unwrap();
+        assert!(s.initialized);
+        assert_eq!((s.latest_archive.as_deref(), s.window), (None, window));
+        assert_eq!(std::fs::read_dir(env.path()).unwrap().count(), 0);
+    }
+
+    /// The file store used to hold 128 archives per project for good; with
+    /// those in place every further rollover failed with "archive commit
+    /// failed; history retained" and the turn ended.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn rollover_is_ready_when_the_project_already_holds_128_archives() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        for index in 0..128 {
+            let window = vec![Arc::new(
+                json!({"role":"assistant","content":format!("earlier window {index}")}),
+            )];
+            binding
+                .history_seal("earlier-session", &window, "")
+                .await
+                .unwrap();
+        }
+        let messages = history();
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            s.config.mode = ContextManagementMode::Auto;
+            s.checkpoint(WorkPhase::Execute, Some("keep this note"))
+                .unwrap();
+        }
+        let prepared = rollover_for_boundary(
+            &messages,
+            &state,
+            &binding,
+            100_000,
+            SuccessorBudget::UNBOUNDED,
+            &Default::default(),
+            false,
+            "",
+        )
+        .await
+        .unwrap();
+        let RolloverPreparation::Ready(prepared) = prepared else {
+            panic!("the 129th archive must be sealed and the window rolled");
+        };
+        prepared.commit(&state).unwrap();
+        let id = state.lock().unwrap().latest_archive.clone().unwrap();
+        assert_eq!(state.lock().unwrap().window, 2);
+        let sealed = binding.history_fetch(&id, 0, 10).await.unwrap();
+        assert_eq!(sealed.len(), messages.len());
+        // The earlier 128 are all still there, behind the new one.
+        let (rows, stopped_after) = binding.history_search_scan("earlier window", 32).await.unwrap();
+        assert_eq!((rows.len(), stopped_after), (32, None));
+        let (rows, _) = binding.history_search_scan("earlier window 0\"", 32).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn eligible_archive_budget_preserves_rollover_head_barrier_and_failure_state() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         for eligible_overflow in [false, true] {
             let state = Arc::new(Mutex::new(ContinuationState::default()));
             {
@@ -1678,7 +2421,6 @@ mod tests {
                     "content":"eligible prior evidence ".repeat(5000)})
             });
             let original = messages.clone();
-            let before = binding.history_search("", 8).await.unwrap();
             let result = rollover(
                 &messages,
                 &state,
@@ -1695,30 +2437,205 @@ mod tests {
                 assert!(s.latest_archive.is_none());
                 assert_eq!(s.note, "keep this note");
             }
+            // A message over what one archive holds used to fail the seal
+            // ("archive commit failed; history retained") on every attempt.
+            let prepared = match result {
+                Ok(prepared) => prepared,
+                Err(e) => panic!("eligible_overflow={eligible_overflow}: {e}"),
+            };
+            let reduced: Vec<&ArchivePart> = prepared
+                .parts
+                .iter()
+                .filter(|part| part.reduced_messages > 0)
+                .collect();
+            let text = prepared.messages[0]["content"].as_str().unwrap().to_owned();
             if eligible_overflow {
-                let error = match result {
-                    Ok(_) => panic!("oversized eligible archive accepted"),
-                    Err(e) => e,
-                };
-                assert!(error
-                    .to_string()
-                    .contains("archive commit failed; history retained"));
-                assert_eq!(binding.history_search("", 8).await.unwrap(), before);
+                // It is a part of its own, stored reduced and marked, and
+                // the new window says so; the rest of the window is exact.
+                assert_eq!(reduced.len(), 1, "{:?}", prepared.parts);
+                let part = reduced[0];
+                assert_eq!(
+                    (part.first_source_index, part.archive.source_message_count, part.reduced_messages),
+                    (1, 1, 1)
+                );
+                let stored = binding.history_fetch(&part.archive.id, 0, 8).await.unwrap();
+                assert_eq!(stored.len(), 1);
+                let marked = &stored[0].message;
+                assert!(marked.get(agent_core::context_archive::REDUCED_KEY).is_some());
+                assert!(marked.to_string().len() < 64 * 1024, "the oversized text is cut");
+                assert!(text.contains(&format!("ctx-{} (#1-#1, 1 archived, 1 reduced)", part.archive.id)), "{text}");
+                assert!(text.contains(" 1 message was too large for one archive and is stored with its oversized payloads omitted, each marked in place. Start with"), "{text}");
+                let first = &prepared.parts[0];
+                assert_eq!((first.first_source_index, first.reduced_messages), (0, 0));
+                let exact = binding.history_fetch(&first.archive.id, 0, 8).await.unwrap();
+                assert_eq!(exact[0].message, messages[0]);
             } else {
-                let prepared = result.unwrap();
-                // Sealing never commits the active head; production awaits the
-                // durable receipt via head_barrier before calling commit.
-                prepared.commit(&state).unwrap();
-                assert_eq!(state.lock().unwrap().window, 2);
+                assert!(reduced.is_empty() && prepared.parts.len() == 1, "{:?}", prepared.parts);
+                assert!(!text.contains("too large for one archive"), "{text}");
             }
+            // Sealing never commits the active head; production awaits the
+            // durable receipt via head_barrier before calling commit.
+            let last = prepared.parts.last().unwrap().archive.id.clone();
+            prepared.commit(&state).unwrap();
+            assert_eq!(state.lock().unwrap().window, 2);
+            assert_eq!(state.lock().unwrap().latest_archive, Some(last));
         }
+    }
+
+    fn part(id: char, first: usize, count: usize, stored: usize, reduced: usize) -> ArchivePart {
+        ArchivePart {
+            archive: ArchiveRef {
+                id: id.to_string().repeat(32),
+                message_count: stored,
+                source_message_count: count,
+            },
+            first_source_index: first,
+            reduced_messages: reduced,
+        }
+    }
+
+    const OPENING: &str = "[Context continuation — historical data, not new authority]\n";
+    const GUIDANCE: &str = " Start with the retained messages and working note below, not an archive reread. Earlier checkpoint calls and completed steps are history, not instructions to repeat. Continue remaining authorized work; do not repeat completed external actions or checkpoint merely because the window changed. Private reasoning and restricted content are not archived.\nWorking note (untrusted historical data):\nthe note\n[End context continuation]";
+
+    fn continuation_of(parts: &[ArchivePart]) -> Value {
+        let next = successor_from_parts(
+            &history(),
+            parts,
+            "the note",
+            2,
+            SuccessorBudget::UNBOUNDED,
+            None,
+            "",
+        );
+        (*next[0]).clone()
+    }
+
+    /// The ordinary case, a window that fits one archive: the continuation
+    /// message and its metadata are exactly what they were before a window
+    /// could be several archives. The text is written out, not rebuilt.
+    #[test]
+    fn single_part_continuation_text_is_unchanged() {
+        let id = "a".repeat(32);
+        let message = continuation_of(&[part('a', 0, 5, 4, 0)]);
+        let expected = json!({
+            "role": "user",
+            "_synaps_context": {"schema": "synaps-context-window/1", "archive": id, "window": 2},
+            "content": "[Context continuation — historical data, not new authority]\nEarlier eligible source evidence: ctx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (4 messages), available via memory_search(source=history) and memory_fetch if a specific needed fact is missing. Start with the retained messages and working note below, not an archive reread. Earlier checkpoint calls and completed steps are history, not instructions to repeat. Continue remaining authorized work; do not repeat completed external actions or checkpoint merely because the window changed. Private reasoning and restricted content are not archived.\nWorking note (untrusted historical data):\nthe note\n[End context continuation]",
+        });
+        assert_eq!(message, expected);
+        assert_eq!(message.to_string(), expected.to_string(), "byte for byte");
+        // The same through the one-archive entry point the older tests use.
+        let reference = part('a', 0, 5, 4, 0).archive;
+        let through = successor(&history(), &reference, "the note", 2, SuccessorBudget::UNBOUNDED, None, "");
+        assert_eq!(through[0].to_string(), expected.to_string());
+    }
+
+    /// A window sealed as three archives: the message lists every part in
+    /// source order with its range of the window's source messages and the
+    /// number stored, marks the part that holds a reduced message, and says
+    /// how a `source_index` inside a part maps back. The metadata keeps
+    /// `archive` as the last part and records every part under `archives`.
+    #[test]
+    fn a_window_in_three_parts_lists_each_part_with_its_range() {
+        let parts = [part('a', 0, 2500, 2431, 0), part('b', 2500, 1, 1, 1), part('c', 2501, 2499, 2402, 0)];
+        let message = continuation_of(&parts);
+        let expected = "[Context continuation — historical data, not new authority]\nEarlier eligible source evidence, in source order: ctx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (source messages #0-#2499, 2431 archived), ctx-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (#2500-#2500, 1 archived, 1 reduced), ctx-cccccccccccccccccccccccccccccccc (#2501-#4999, 2402 archived), available via memory_search(source=history) and memory_fetch if a specific needed fact is missing; within each archive memory_fetch's source_index starts again at 0: source message #i is the row whose source_index is i minus the first number of its range, and since start counts archived messages it is at that start or a lower one. 1 message was too large for one archive and is stored with its oversized payloads omitted, each marked in place. Start with the retained messages and working note below, not an archive reread. Earlier checkpoint calls and completed steps are history, not instructions to repeat. Continue remaining authorized work; do not repeat completed external actions or checkpoint merely because the window changed. Private reasoning and restricted content are not archived.\nWorking note (untrusted historical data):\nthe note\n[End context continuation]";
+        assert_eq!(message["content"], expected);
+        assert_eq!(
+            message["_synaps_context"],
+            json!({
+                "schema": "synaps-context-window/1",
+                "archive": "c".repeat(32),
+                "window": 2,
+                "archives": [
+                    {"id": "a".repeat(32), "first": 0, "count": 2500, "messages": 2431},
+                    {"id": "b".repeat(32), "first": 2500, "count": 1, "messages": 1, "reduced": 1},
+                    {"id": "c".repeat(32), "first": 2501, "count": 2499, "messages": 2402},
+                ],
+            })
+        );
+        // Host-only, like the rest of the marker: never on a provider wire.
+        let wire = wire_messages(&[Arc::new(message)]).unwrap();
+        assert!(!wire[0].to_string().contains("archives"));
+
+        // Two halves with the same content are one archive, listed once for
+        // each range it stands for; several reduced messages are counted.
+        let twins = [part('a', 0, 4096, 4096, 2), part('a', 4096, 4096, 4096, 1)];
+        let text = continuation_of(&twins)["content"].as_str().unwrap().to_owned();
+        let listed = format!("{OPENING}Earlier eligible source evidence, in source order: ctx-{a} (source messages #0-#4095, 4096 archived, 2 reduced), ctx-{a} (#4096-#8191, 4096 archived, 1 reduced), available via", a = "a".repeat(32));
+        assert!(text.starts_with(&listed), "{text}");
+        assert!(text.contains("a lower one. 3 messages were too large for one archive and are stored with their oversized payloads omitted, each marked in place. Start with"), "{text}");
+    }
+
+    /// One archive holding a message that was stored reduced (a window of
+    /// one oversized message): the usual sentence, plus the notice, and the
+    /// host record that the ordinary case does not need.
+    #[test]
+    fn a_single_reduced_part_keeps_the_usual_sentence_and_says_so() {
+        let message = continuation_of(&[part('a', 0, 5, 5, 1)]);
+        let expected = format!("{OPENING}Earlier eligible source evidence: ctx-{} (5 messages), available via memory_search(source=history) and memory_fetch if a specific needed fact is missing. 1 message was too large for one archive and is stored with its oversized payloads omitted, each marked in place.{GUIDANCE}", "a".repeat(32));
+        assert_eq!(message["content"], expected);
+        assert_eq!(message["_synaps_context"]["archive"], "a".repeat(32));
+        assert_eq!(
+            message["_synaps_context"]["archives"],
+            json!([{"id": "a".repeat(32), "first": 0, "count": 5, "messages": 5, "reduced": 1}])
+        );
+    }
+
+    /// The message lists at most [`LISTED_PARTS`] parts by id, the last ones,
+    /// and counts the earlier ones with the range they cover, so its size is
+    /// bounded however a window was cut. The host metadata still records
+    /// every part.
+    #[test]
+    fn parts_beyond_the_listed_limit_are_counted_with_their_range() {
+        let ids = "0123456789abcdef";
+        let parts: Vec<ArchivePart> = (0..LISTED_PARTS + 5)
+            .map(|n| part(ids.chars().nth(n % 16).unwrap(), n * 10, 10, 10, usize::from(n == 2)))
+            .collect();
+        let message = continuation_of(&parts);
+        let text = message["content"].as_str().unwrap();
+        assert_eq!(text.matches("ctx-").count(), LISTED_PARTS, "{text}");
+        let listed = format!(
+            "{OPENING}Earlier eligible source evidence, in source order: 5 earlier archives not listed here (source messages #0-#49), ctx-{} (#50-#59, 10 archived), ctx-{} (#60-#69, 10 archived), ",
+            "5".repeat(32),
+            "6".repeat(32),
+        );
+        assert!(text.starts_with(&listed), "{text}");
+        // One part that is not listed is "1 earlier archive".
+        let (one, _) = archived_evidence(&parts[..3], 2);
+        let singular = "in source order: 1 earlier archive not listed here (source messages #0-#9), ctx-1111";
+        assert!(one.contains(singular), "{one}");
+        let (two, _) = archived_evidence(&parts[..3], 1);
+        assert!(two.contains("in source order: 2 earlier archives not listed here (source messages #0-#19), ctx-2222"), "{two}");
+        // The newest part is the last one listed.
+        assert!(text.contains(&format!("ctx-{} (#360-#369, 10 archived), available via memory_search(source=history)", "4".repeat(32))), "{text}");
+        // A reduced message in a part that is not listed is still counted.
+        assert!(text.contains(" 1 message was too large for one archive"), "{text}");
+        let archives = message["_synaps_context"]["archives"].as_array().unwrap();
+        assert_eq!(archives.len(), LISTED_PARTS + 5);
+        assert_eq!(archives[2], json!({"id": "2".repeat(32), "first": 20, "count": 10, "messages": 10, "reduced": 1}));
+        assert_eq!(message["_synaps_context"]["archive"], "4".repeat(32));
+        // Exactly the limit: all listed, nothing counted.
+        let text = continuation_of(&parts[..LISTED_PARTS])["content"].as_str().unwrap().to_owned();
+        assert_eq!(text.matches("ctx-").count(), LISTED_PARTS);
+        assert!(text.starts_with(&format!("{OPENING}Earlier eligible source evidence, in source order: ctx-{} (source messages #0-#9, 10 archived), ", "0".repeat(32))), "{text}");
+        assert!(!text.contains("not listed"), "{text}");
+    }
+
+    #[test]
+    fn part_containing_maps_a_window_index_to_its_archive() {
+        let parts = [part('a', 0, 3, 3, 0), part('b', 3, 1, 1, 0), part('c', 4, 2, 2, 0)];
+        let holder = |index| part_containing(&parts, index).map(|archive| archive.id.chars().next().unwrap());
+        let holders: Vec<_> = (0..6).map(holder).collect();
+        assert_eq!(holders, [Some('a'), Some('a'), Some('a'), Some('b'), Some('c'), Some('c')]);
+        assert!(part_containing(&[], 0).is_none());
     }
 
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn no_shrink_is_typed_and_does_not_write_or_change_checkpoint_state() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let messages = vec![Arc::new(
             json!({"role":"user", "content":"Retain every requirement. ".repeat(4000)}),
         )];
@@ -1771,7 +2688,7 @@ mod tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn shrinking_but_oversized_candidate_and_time_boundary_still_fail_closed() {
         let _env = BaseDirGuard::new();
-        let binding = MemoryBinding::legacy_current();
+        let binding = MemoryBinding::for_process_cwd();
         let messages = vec![
             Arc::new(json!({"role":"user", "content":"Pinned instruction ".repeat(4000)})),
             Arc::new(
@@ -1814,7 +2731,7 @@ mod tests {
         assert!(rollover(
             &messages,
             &state,
-            &MemoryBinding::legacy_current(),
+            &MemoryBinding::for_process_cwd(),
             1000,
             SuccessorBudget::UNBOUNDED,
             &Default::default()
@@ -1835,12 +2752,6 @@ mod command_tests {
         let rt = crate::Runtime::new_headless();
         rt.continuation.lock().unwrap().durability_blocked = true;
         rt.context_management_command("off").unwrap();
-        assert!(rt
-            .run_single("must not dispatch")
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("unresolved"));
         let mut stream = rt
             .run_stream("must not dispatch".into(), Default::default())
             .await;
@@ -1856,57 +2767,230 @@ mod command_tests {
         assert!(!rt.continuation.lock().unwrap().durability_blocked);
     }
 
+    /// T-B6. A saved head whose marker names an archive that its project's
+    /// store does not hold: the turn is not refused, the chat goes on at
+    /// window 1, and `/context status` says which archive is missing and
+    /// what to do. Once the archive is imported into the chat's project,
+    /// loading the chat again restores its window and the line is gone. The
+    /// same head loaded from a folder of another project: window 1 and the
+    /// line; from the folder that holds the archive: the window.
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
-    async fn axel_restore_is_syntactic_until_host_validation_even_when_mode_off() {
+    async fn a_missing_archive_opens_the_chat_at_window_1_and_status_says_so() {
+        use agent_core::context_archive::{
+            archive_file, project_scope, ArchiveStore, ImportOutcome, ImportSeen, NOT_FOUND,
+        };
         let env = crate::test_env::BaseDirGuard::new();
-        let mut rt = crate::Runtime::new_headless();
-        rt.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig {
-            kind: agent_core::config::MemoryBackendKind::Axel,
-            executable: Some(env.path().join("missing-service")),
-            brain: Some(env.path().join("brain.r8")),
-            user_scope: false,
-        });
-        let messages = vec![Arc::new(json!({"role":"user","content":"historical data",
-            "_synaps_context":{"schema":MARKER,"archive":"a".repeat(32),"window":4}}))];
-        rt.reset_context_continuation("synthetic-resumed", &messages);
-        assert!(!rt.context_management_enabled());
-        assert_eq!(rt.continuation.lock().unwrap().window, 4);
-        for _ in 0..2 {
-            assert!(
-                validate_restored_history(&messages, &rt.continuation, &rt.memory_backend)
-                    .await
-                    .is_err()
-            );
-            assert!(rt.continuation.lock().unwrap().restore_pending);
-        }
-        assert!(!env.path().join("context-archives").exists());
-        assert!(!env.path().join("brain.r8").exists());
-        // An earlier empty request must not make a later loaded marker trusted.
-        rt.reset_context_continuation("synthetic-empty", &[]);
-        assert!(rt.continuation.lock().unwrap().initialized);
-        assert!(
-            validate_restored_history(&messages, &rt.continuation, &rt.memory_backend)
-                .await
-                .is_err()
+        let _root = crate::test_env::EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        let project = || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".synaps-project"), "").unwrap();
+            dir
+        };
+        // A session runtime as the host builds it: folder first, then bound.
+        let runtime_in = |folder: &std::path::Path| {
+            let mut rt = crate::Runtime::new_headless();
+            rt.set_cwd(Some(folder.to_path_buf()));
+            rt.bind_memory();
+            rt
+        };
+        let key = |rt: &crate::Runtime| rt.memory_backend.scope().unwrap().key().to_owned();
+        let opened = |rt: &crate::Runtime| {
+            let s = rt.continuation.lock().unwrap();
+            (s.latest_archive.clone(), s.window)
+        };
+        const MISSING: &str = "is not in this folder's archive store";
+
+        // The window was sealed in another folder's project.
+        let (own, other) = (project(), project());
+        let elsewhere = runtime_in(other.path());
+        let window = vec![Arc::new(json!({"role":"assistant","content":"the earlier window"}))];
+        let (sealed, _) = elsewhere
+            .memory_backend
+            .history_seal("chat", &window, "note")
+            .await
+            .unwrap();
+        let head = vec![Arc::new(json!({"role":"user","content":"carry on",
+            "_synaps_context":{"schema":MARKER,"archive":sealed.id,"window":4}}))];
+        let line = format!(
+            "archive ctx-{}, which this chat continues from, is not in this folder's archive \
+             store, so earlier windows cannot be fetched. If you opened the chat from another \
+             folder than before, open it from that one.",
+            sealed.id
         );
-        assert_eq!(rt.continuation.lock().unwrap().window, 1);
-        assert!(rt.continuation.lock().unwrap().latest_archive.is_none());
+
+        // Opened in a folder whose store does not hold the archive.
+        let rt = runtime_in(own.path());
+        assert_ne!(key(&rt), key(&elsewhere));
+        rt.reset_context_continuation("chat", &head);
+        assert_eq!(opened(&rt), (None, 1));
+        // The barrier before the first request passes, every time.
+        for _ in 0..2 {
+            validate_restored_history(&head, &rt.continuation, &rt.memory_backend)
+                .await
+                .expect("a missing archive does not refuse the turn");
+            assert_eq!(opened(&rt), (None, 1));
+        }
+        let status = rt.context_management_status();
+        assert!(status.contains(" | window 1 | ") && status.contains(" | archive none\n"), "{status}");
+        assert_eq!(status.lines().last(), Some(line.as_str()), "{status}");
+        assert_eq!(status.matches(MISSING).count(), 1, "{status}");
+        assert_eq!(rt.context_management_command("status").unwrap(), status);
+        let fetch = rt.memory_backend.history_fetch(&sealed.id, 0, 1).await.unwrap_err();
+        assert!(fetch.to_string().contains(NOT_FOUND), "{fetch}");
+
+        // The archive is imported into the chat's project, as
+        // `synaps memory import-archives --cwd` does it.
+        let file = archive_file(env.path(), &key(&elsewhere), &sealed.id).unwrap().expect("the sealed file");
+        let record = std::fs::read(file).unwrap();
+        let store = ArchiveStore::for_scope(env.path(), &project_scope(&key(&rt)).unwrap()).unwrap();
+        let done = store
+            .import(record.trim_ascii(), true, false, &mut ImportSeen::default())
+            .unwrap()
+            .expect("the record is accepted");
+        assert_eq!(done.outcome, ImportOutcome::Stored);
+        // The open chat is as it was; loaded again, it has its window.
+        assert_eq!(opened(&rt), (None, 1));
+        let again = runtime_in(own.path());
+        again.reset_context_continuation("chat", &head);
+        assert_eq!(opened(&again), (Some(sealed.id.clone()), 4));
+        let status = again.context_management_status();
+        assert!(status.contains(" | window 4 | ") && !status.contains(MISSING), "{status}");
+
+        // The same head from a third folder, and from the folder it was
+        // sealed in.
+        let third = project();
+        let stray = runtime_in(third.path());
+        stray.reset_context_continuation("chat", &head);
+        assert_eq!(opened(&stray), (None, 1));
+        assert_eq!(stray.context_management_status().lines().last(), Some(line.as_str()));
+        let home = runtime_in(other.path());
+        home.reset_context_continuation("chat", &head);
+        assert_eq!(opened(&home), (Some(sealed.id.clone()), 4));
+        assert!(!home.context_management_status().contains(MISSING));
+
+        // A head with no marker, or after a reset to another chat: no line.
+        stray.reset_context_continuation("another-chat", &[]);
+        assert!(!stray.context_management_status().contains(MISSING));
+    }
+
+    /// A saved head resumed by a chat whose folder has no project: the turn
+    /// is not refused, the chat goes on at window 1, and `/context status`
+    /// says the folder has no project, not to open the chat from another
+    /// folder.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_resumed_chat_with_no_project_says_so_in_status() {
+        let _env = crate::test_env::BaseDirGuard::new();
+        let _root = crate::test_env::EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        let sealed_in = tempfile::tempdir().unwrap();
+        std::fs::write(sealed_in.path().join(".synaps-project"), "").unwrap();
+        let mut elsewhere = crate::Runtime::new_headless();
+        elsewhere.set_cwd(Some(sealed_in.path().to_path_buf()));
+        elsewhere.bind_memory();
+        let window = vec![Arc::new(json!({"role":"assistant","content":"the earlier window"}))];
+        let (sealed, _) = elsewhere
+            .memory_backend
+            .history_seal("chat", &window, "note")
+            .await
+            .unwrap();
+        let head = vec![Arc::new(json!({"role":"user","content":"carry on",
+            "_synaps_context":{"schema":MARKER,"archive":sealed.id,"window":4}}))];
+
+        let mut rt = crate::Runtime::new_headless();
+        rt.memory_backend = crate::memory_backend::MemoryBinding::for_cwd(None);
+        assert!(rt.memory_backend.scope().is_err(), "no folder, no project");
+        rt.reset_context_continuation("chat", &head);
+        validate_restored_history(&head, &rt.continuation, &rt.memory_backend)
+            .await
+            .expect("a chat with no project is not refused");
+        {
+            let s = rt.continuation.lock().unwrap();
+            assert_eq!((s.latest_archive.clone(), s.window), (None, 1));
+        }
+        let status = rt.context_management_status();
+        let line = format!(
+            "archive ctx-{}, which this chat continues from, cannot be looked up: this chat's \
+             folder has no project, so earlier windows cannot be fetched.",
+            sealed.id
+        );
+        assert_eq!(status.lines().last(), Some(line.as_str()), "{status}");
+        assert!(!status.contains("another folder"), "{status}");
+    }
+
+    /// A chat the daemon hosts runs in its own folder, and its windows are
+    /// archived under that folder's project (`MemoryBinding::history_seal`).
+    /// Resuming it looks for the archive there, through the runtime's own
+    /// binding, not in the project of the folder the process runs in.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_resumed_chat_looks_for_its_archive_in_its_own_project_not_the_hosts() {
+        let _env = crate::test_env::BaseDirGuard::new();
+        let _root = crate::test_env::EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        // The chat's folder is a project of its own, apart from the host's.
+        let chat = tempfile::tempdir().unwrap();
+        std::fs::write(chat.path().join(".synaps-project"), "").unwrap();
+        // A session runtime as the host builds it: folder first, then bound.
+        let runtime_in = |folder: Option<&std::path::Path>| {
+            let mut rt = crate::Runtime::new_headless();
+            rt.set_cwd(folder.map(std::path::Path::to_path_buf));
+            rt.bind_memory();
+            rt
+        };
+        let window = |text: &str| vec![Arc::new(json!({"role":"assistant","content":text}))];
+        let head = |archive: &str| {
+            vec![Arc::new(json!({"role":"user","content":"carry on",
+                "_synaps_context":{"schema":MARKER,"archive":archive,"window":4}}))]
+        };
+        let restored = |rt: &crate::Runtime| {
+            let s = rt.continuation.lock().unwrap();
+            (s.latest_archive.clone(), s.window)
+        };
+
+        let (chats, hosts) = (runtime_in(Some(chat.path())), runtime_in(None));
+        assert_ne!(
+            chats.memory_backend.scope().unwrap().key(),
+            hosts.memory_backend.scope().unwrap().key(),
+            "the chat's folder and the process folder are different projects"
+        );
+        // The chat's rollover seals a window through its binding.
+        let (sealed, _) = chats
+            .memory_backend
+            .history_seal("chat", &window("the chat's window"), "note")
+            .await
+            .unwrap();
+
+        // Resumed in its folder (a new runtime, as `--continue` or a daemon
+        // restart builds): its window bookkeeping carries on.
+        let resumed = runtime_in(Some(chat.path()));
+        resumed.reset_context_continuation("chat", &head(&sealed.id));
+        assert_eq!(
+            restored(&resumed),
+            (Some(sealed.id.clone()), 4),
+            "not restarted at window 1 for want of an archive in the host's project"
+        );
+
+        // An archive only the host's project holds is not this chat's.
+        let (foreign, _) = hosts
+            .memory_backend
+            .history_seal("other", &window("the host project's window"), "note")
+            .await
+            .unwrap();
+        let resumed = runtime_in(Some(chat.path()));
+        resumed.reset_context_continuation("chat", &head(&foreign.id));
+        assert_eq!(restored(&resumed), (None, 1));
     }
 
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
-    async fn unavailable_backend_never_rolls_over_into_local_archive() {
+    async fn a_chat_without_a_project_never_rolls_over_into_an_archive() {
         let env = crate::test_env::BaseDirGuard::new();
         let mut rt = crate::Runtime::new_headless();
-        rt.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig {
-            kind: agent_core::config::MemoryBackendKind::Unavailable,
-            ..Default::default()
-        });
+        rt.inherit_memory_binding(&MemoryBinding::for_cwd(None));
         assert!(rt
             .context_management_command("auto")
             .unwrap_err()
-            .contains("unavailable"));
+            .contains("host project scope unavailable"));
         let messages = vec![Arc::new(
             json!({"role":"assistant","content":"prior evidence ".repeat(5000)}),
         )];
@@ -1928,25 +3012,6 @@ mod command_tests {
         assert_eq!(serde_json::to_vec(&messages).unwrap(), before);
         assert_eq!(rt.continuation.lock().unwrap().window, 1);
         assert!(!env.path().join("context-archives").exists());
-    }
-
-    #[test]
-    #[serial_test::serial(synaps_base_dir)]
-    fn configured_axel_allows_host_auto_without_opening_any_store() {
-        let env = crate::test_env::BaseDirGuard::new();
-        let mut rt = crate::Runtime::new_headless();
-        rt.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig {
-            kind: agent_core::config::MemoryBackendKind::Axel,
-            executable: Some(env.path().join("host-service")),
-            brain: Some(env.path().join("brain.r8")),
-            user_scope: false,
-        });
-        if cfg!(unix) {
-            rt.context_management_command("auto").unwrap();
-            assert!(rt.context_management_enabled());
-        }
-        assert!(!env.path().join("context-archives").exists());
-        assert!(!env.path().join("brain.r8").exists());
     }
 
     /// Incident 2026-10-13: rollover waited on near-continuous workers for
@@ -2007,7 +3072,11 @@ mod command_tests {
             logical_id: "grace-test".into(),
             epoch,
             window: 2,
-            archive_id: "a".repeat(32),
+            parts: vec![whole_window(ArchiveRef {
+                id: "a".repeat(32),
+                message_count: 0,
+                source_message_count: 0,
+            })],
         }
         .commit(&state)
         .unwrap();
@@ -2319,17 +3388,20 @@ mod command_tests {
 
 /// Initial and stale-catalog replacement use the same opted-in core surface.
 /// Only existing builtin IDs are included; never resurrect a disabled tool.
+/// `always_loaded` is `tools.always_loaded` (see
+/// [`SessionToolSet::progressive_core_with`](crate::tools::activation::SessionToolSet::progressive_core_with)).
 pub(crate) fn context_tool_set(
     session: crate::tools::activation::SessionId,
     catalog: &crate::tools::catalog::ToolCatalog,
     progressive: bool,
     context_enabled: bool,
+    always_loaded: &[crate::tools::catalog::ToolId],
 ) -> crate::tools::activation::SessionToolSet {
     use crate::tools::{activation::SessionToolSet, catalog::ToolId};
     if !progressive {
         return SessionToolSet::default_core_for_catalog(session, catalog);
     }
-    let minimal = SessionToolSet::progressive_core_for_catalog(session.clone(), catalog);
+    let minimal = SessionToolSet::progressive_core_with(session.clone(), catalog, always_loaded);
     if !context_enabled {
         return minimal;
     }
@@ -2397,21 +3469,169 @@ mod lifecycle_tests {
                 Default::default(),
             ))),
         ));
-        let initial = context_tool_set(session.clone(), registry.catalog(), true, true);
+        let initial = context_tool_set(session.clone(), registry.catalog(), true, true, &[]);
         for name in ["context_checkpoint", "memory_search", "memory_fetch"] {
             assert!(ExecutionGate::authorize_wire_call(&registry, &initial, name).is_ok());
         }
         // Same core derivation the stale-set rebuild uses
         // (`stream::rebuild_stale_tool_set`, regression-tested below).
         registry.disable(&["write".into()]);
-        let rebuilt = context_tool_set(session.clone(), registry.catalog(), true, true);
+        let rebuilt = context_tool_set(session.clone(), registry.catalog(), true, true, &[]);
         assert!(ExecutionGate::authorize_wire_call(&registry, &rebuilt, "memory_fetch").is_ok());
         registry.disable(&["memory_fetch".into()]);
-        let disabled = context_tool_set(session.clone(), registry.catalog(), true, true);
+        let disabled = context_tool_set(session.clone(), registry.catalog(), true, true, &[]);
         assert!(!disabled.is_core(&ToolId::builtin("memory_fetch")));
         assert!(ExecutionGate::authorize_wire_call(&registry, &disabled, "memory_fetch").is_err());
-        let off = context_tool_set(session, registry.catalog(), true, false);
+        let off = context_tool_set(session, registry.catalog(), true, false, &[]);
         assert!(!off.is_core(&ToolId::builtin("memory_search")));
+    }
+
+    /// A fake tool with a chosen runtime name and origin.
+    struct OriginTool(&'static str, crate::tools::ToolOrigin);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for OriginTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "always-loaded fixture"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            self.1.clone()
+        }
+        fn extension_id(&self) -> Option<&str> {
+            match &self.1 {
+                crate::tools::ToolOrigin::Extension { .. } => self.0.split(':').next(),
+                _ => None,
+            }
+        }
+        async fn execute(
+            &self,
+            _: Value,
+            _: crate::tools::ToolContext,
+        ) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn axel_search() -> Arc<OriginTool> {
+        Arc::new(OriginTool(
+            "axel:search",
+            crate::tools::ToolOrigin::Extension {
+                extension_id: "axel".into(),
+            },
+        ))
+    }
+
+    fn ids(raw: &[&str]) -> Vec<ToolId> {
+        raw.iter().map(|r| ToolId::parse(r).unwrap()).collect()
+    }
+
+    /// `tools.always_loaded`: listed ids join the progressive core only when
+    /// cataloged and activatable; absent, unverified and disabled (withheld)
+    /// ones are skipped; without disclosure the list changes nothing.
+    #[test]
+    fn always_loaded_joins_progressive_core_only_when_cataloged_and_trusted() {
+        let session = crate::tools::activation::SessionId::parse("always-loaded").unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(axel_search());
+        registry.register(Arc::new(OriginTool("rogue", crate::tools::ToolOrigin::Unknown)));
+        let rogue = ToolId::unclassified("rogue");
+        assert!(registry.catalog().get(&rogue).is_some(), "fixture: unverified tool cataloged");
+        let mut list = ids(&["ext.axel:search", "ext.axel:recall", "builtin:memory_store"]);
+        list.push(rogue.clone());
+
+        let bare = context_tool_set(session.clone(), registry.catalog(), true, false, &[]);
+        let set = context_tool_set(session.clone(), registry.catalog(), true, false, &list);
+        let search = ToolId::extension("axel", "search");
+        assert!(!bare.is_core(&search), "deferred without the list");
+        assert!(set.is_core(&search), "listed extension tool is core");
+        assert!(set.is_core(&ToolId::builtin("memory_store")));
+        assert!(!set.is_core(&ToolId::extension("axel", "recall")), "absent id skipped");
+        assert!(!set.is_core(&rogue), "unverified tool never core");
+        assert!(ExecutionGate::authorize_wire_call(&registry, &set, "rogue").is_err());
+        assert_eq!(
+            set.core_ids().count(),
+            bare.core_ids().count() + 2,
+            "exactly the two admissible ids join"
+        );
+        assert!(registry
+            .session_tools_schema(&set)
+            .schema
+            .iter()
+            .any(|t| t["name"].as_str().is_some_and(|n| n.contains("axel"))));
+        assert!(ExecutionGate::authorize_wire_call(&registry, &set, "axel:search").is_ok());
+        assert!(ExecutionGate::authorize_wire_call(&registry, &bare, "axel:search").is_err());
+
+        // Context management on: the context reads AND the list.
+        let ctx = context_tool_set(session.clone(), registry.catalog(), true, true, &list);
+        assert!(ctx.is_core(&search) && ctx.is_core(&ToolId::builtin("memory_fetch")));
+
+        // Withheld (disabled_tools): gone from the catalog, so skipped.
+        registry.disable(&["memory_store".into()]);
+        let withheld = context_tool_set(session.clone(), registry.catalog(), true, false, &list);
+        assert!(!withheld.is_core(&ToolId::builtin("memory_store")));
+        assert!(withheld.is_core(&search));
+
+        // No disclosure: the full trusted core, identical with or without the list.
+        let full = context_tool_set(session.clone(), registry.catalog(), false, false, &[]);
+        let full_listed = context_tool_set(session, registry.catalog(), false, false, &list);
+        assert_eq!(
+            full.core_ids().collect::<Vec<_>>(),
+            full_listed.core_ids().collect::<Vec<_>>()
+        );
+        assert!(!full_listed.is_core(&rogue));
+    }
+
+    /// An extension that registers AFTER the session started: its listed tool
+    /// joins at the next round-top rebuild; when it disappears the rebuild
+    /// drops it fail-closed.
+    #[test]
+    fn always_loaded_late_registration_joins_at_round_top_and_drops_when_gone() {
+        let session = crate::tools::activation::SessionId::parse("always-loaded-late").unwrap();
+        let list = ids(&["ext.axel:search"]);
+        let search = ToolId::extension("axel", "search");
+        let mut registry = ToolRegistry::new();
+        let initial = context_tool_set(session.clone(), registry.catalog(), true, true, &list);
+        assert!(!initial.is_core(&search), "not registered yet");
+
+        registry.register(axel_search());
+        assert!(initial.is_stale(registry.catalog()));
+        let (rebuilt, dropped) = crate::runtime::stream::rebuild_stale_tool_set(
+            &initial,
+            session.clone(),
+            registry.catalog(),
+            true,
+            true,
+            &list,
+        );
+        assert!(dropped.is_empty());
+        assert!(rebuilt.is_core(&search), "late-registered listed tool joins the core");
+        assert!(rebuilt.is_core(&ToolId::builtin("memory_fetch")), "context reads kept");
+        assert!(registry
+            .session_tools_schema(&rebuilt)
+            .schema
+            .iter()
+            .any(|t| t["name"].as_str().is_some_and(|n| n.contains("axel"))));
+        let wire = "axel:search";
+        assert!(ExecutionGate::authorize_wire_call(&registry, &rebuilt, wire).is_ok());
+
+        registry.disable(&["axel:search".into()]);
+        assert!(rebuilt.is_stale(registry.catalog()));
+        let (gone, _) = crate::runtime::stream::rebuild_stale_tool_set(
+            &rebuilt,
+            session,
+            registry.catalog(),
+            true,
+            true,
+            &list,
+        );
+        assert!(!gone.is_core(&search), "vanished tool leaves the core");
+        assert!(ExecutionGate::authorize_wire_call(&registry, &gone, wire).is_err());
     }
 
     /// Regression (2026-10-12, `rollover requires admitted builtin history
@@ -2433,7 +3653,7 @@ mod lifecycle_tests {
         };
         let mut registry = ToolRegistry::new();
         registry.register(checkpoint());
-        let mut initial = context_tool_set(session.clone(), registry.catalog(), true, true);
+        let mut initial = context_tool_set(session.clone(), registry.catalog(), true, true, &[]);
         let deferred = ToolId::builtin("shell_start");
         assert!(
             !initial.is_core(&deferred),
@@ -2466,6 +3686,7 @@ mod lifecycle_tests {
             registry.catalog(),
             true,
             true,
+            &[],
         );
         assert!(dropped.is_empty(), "nothing drifted: {dropped:?}");
         assert!(!rebuilt.is_stale(registry.catalog()));
@@ -2488,6 +3709,7 @@ mod lifecycle_tests {
             registry.catalog(),
             true,
             false,
+            &[],
         );
         assert!(!off.is_core(&ToolId::builtin("memory_search")));
         assert!(ExecutionGate::authorize_wire_call(&registry, &off, "shell_start").is_ok());
@@ -2842,6 +4064,52 @@ mod budget_tests {
         assert!(marker2.contains(&format!("ctx-{}", "a".repeat(32))));
     }
 
+    /// A first request too large to pin is replaced by a stub naming the
+    /// archive that holds it. For a window sealed as several parts that is
+    /// the part whose range contains the request, which need not be the last
+    /// one (the one resume reads), and a later window carries it unchanged.
+    #[test]
+    fn pinned_stub_names_the_part_holding_the_first_request() {
+        let mut huge = event_heavy_history(50);
+        huge[0] = user(format!("HUGE CHARTER {}", "c".repeat(120_000)));
+        // Two answers come first, so the first request is source message #2.
+        huge.insert(0, assistant("an earlier answer"));
+        huge.insert(1, assistant("and another"));
+        let total = huge.len();
+        let part = |id: char, first: usize, count: usize| ArchivePart {
+            archive: ArchiveRef {
+                id: id.to_string().repeat(32),
+                message_count: count,
+                source_message_count: count,
+            },
+            first_source_index: first,
+            reduced_messages: 0,
+        };
+        for (parts, holder) in [
+            (vec![part('a', 0, 3), part('b', 3, total - 3)], 'a'),
+            (vec![part('a', 0, 2), part('b', 2, 1), part('c', 3, total - 3)], 'b'),
+            (vec![part('a', 0, 1), part('b', 1, total - 1)], 'b'),
+        ] {
+            let next = successor_from_parts(&huge, &parts, "", 2, budget(), None, "");
+            assert!(!contains(&next, &huge[2]), "too large to keep");
+            let id = holder.to_string().repeat(32);
+            let marker = &next[0]["_synaps_context"];
+            assert_eq!(marker["pinned_stub"]["archive"], id);
+            assert_eq!(marker["archive"], parts.last().unwrap().archive.id);
+            let text = next[0]["content"].as_str().unwrap();
+            assert!(
+                text.contains(&format!(
+                    "it is archived in ctx-{id} (memory_search(source=history)). It begins: HUGE CHARTER"
+                )),
+                "{text}"
+            );
+            // The next window is sealed elsewhere; the stub still names `id`.
+            let later = successor_from_parts(&next, &[part('d', 0, next.len())], "", 3, budget(), None, "");
+            assert_eq!(later[0]["_synaps_context"]["pinned_stub"]["archive"], id);
+            assert!(later[0]["content"].as_str().unwrap().contains(&format!("it is archived in ctx-{id} ")));
+        }
+    }
+
     #[test]
     fn fresh_successor_does_not_rethrash_on_new_task() {
         // ~260k tokens of retained user requests: the old successor stayed
@@ -3175,40 +4443,35 @@ mod budget_tests {
         assert_eq!(wire[3]["content"], m[3]["content"], "the note's text is sent");
 
         let restored = Arc::new(Mutex::new(ContinuationState::default()));
-        restore_window_syntactic(&m, &restored);
-        assert!(!restored.lock().unwrap().restore_pending, "no archive marker here");
+        restore_window(&m, &restored, &MemoryBinding::for_cwd(None));
+        let s = restored.lock().unwrap();
+        assert!(s.latest_archive.is_none() && s.missing_archive.is_none(), "no archive marker here");
     }
 
     /// A resumed history holding the note passes restore validation
-    /// unchanged under Axel memory: the archive-marker readers never see
-    /// it. (A `_synaps_context`-tagged note made 0.10.2's readers stop
-    /// every turn: "restored context archive marker is invalid".)
+    /// unchanged: the archive-marker readers never see it. (A
+    /// `_synaps_context`-tagged note made 0.10.2's readers stop every turn:
+    /// "restored context archive marker is invalid".)
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
-    async fn resumed_history_with_the_tool_note_passes_axel_restore_validation() {
+    async fn resumed_history_with_the_tool_note_passes_restore_validation() {
         use crate::engine::interrupt::{
             append_marker, tool_in_flight_note_message, InterruptReason,
         };
         let env = crate::test_env::BaseDirGuard::new();
-        let mut rt = crate::Runtime::new_headless();
-        rt.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig {
-            kind: agent_core::config::MemoryBackendKind::Axel,
-            executable: Some(env.path().join("missing-service")),
-            brain: Some(env.path().join("brain.r8")),
-            user_scope: false,
-        });
+        let rt = crate::Runtime::new_headless();
         let mut messages = vec![user("REAL TASK"), assistant("Let me look")];
         messages.push(tool_in_flight_note_message(InterruptReason::User, &["bash".into()]));
         append_marker(&mut messages, InterruptReason::User);
         rt.reset_context_continuation("synthetic-resumed", &messages);
-        assert!(!rt.continuation.lock().unwrap().restore_pending);
+        assert!(rt.continuation.lock().unwrap().missing_archive.is_none());
         for _ in 0..2 {
             validate_restored_history(&messages, &rt.continuation, &rt.memory_backend)
                 .await
-                .expect("no archive marker: nothing to verify, the turn may run");
-            assert!(!rt.continuation.lock().unwrap().restore_pending);
+                .expect("no archive marker: nothing to look up, the turn may run");
+            assert!(rt.continuation.lock().unwrap().missing_archive.is_none());
         }
-        assert!(!env.path().join("brain.r8").exists(), "nothing fetched");
+        assert!(!env.path().join("context-archives").exists(), "nothing looked up or made");
     }
 
     #[test]
@@ -3431,7 +4694,7 @@ mod rollover_path_tests {
         rollover_for_boundary(
             messages,
             state,
-            &MemoryBinding::legacy_current(),
+            &MemoryBinding::for_process_cwd(),
             1_000_000,
             target,
             &Default::default(),
@@ -3578,7 +4841,7 @@ mod rollover_path_tests {
         let refused = rollover_for_boundary(
             &messages,
             &auto_state(),
-            &MemoryBinding::legacy_current(),
+            &MemoryBinding::for_process_cwd(),
             200_000,
             target,
             &Default::default(),
@@ -3640,6 +4903,834 @@ mod rollover_path_tests {
             roll(&build(above), &state, none).await,
             Ok(RolloverPreparation::Ready(_))
         ));
+    }
+
+    /// `n` one-line messages: host framing, which is not archived, then
+    /// requests and answers in turn. Over 4,096 of them is more than one
+    /// archive holds, at a few hundred kilobytes.
+    fn long_window(n: usize) -> Vec<SharedMessage> {
+        let mut messages = vec![msg(json!({"role":"system","content":"host framing"}))];
+        messages.extend((1..n).map(|i| match i % 2 {
+            1 => user(format!("request {i}")),
+            _ => msg(json!({"role":"assistant","content":format!("answer {i}")})),
+        }));
+        messages
+    }
+
+    const SMALL_TARGET: SuccessorBudget = SuccessorBudget {
+        history_tokens: 5_000,
+    };
+
+    /// Every message `parts` hold, read as `memory_fetch` reads them (by id,
+    /// with start and limit), each with its index in the window: the part's
+    /// first index plus the `source_index` the fetch reports.
+    async fn read_back(
+        binding: &MemoryBinding,
+        parts: &[ArchivePart],
+    ) -> Vec<(usize, SharedMessage)> {
+        let mut read = Vec::new();
+        for part in parts {
+            let mut start = 0;
+            loop {
+                let page = binding.history_fetch(&part.archive.id, start, 128).await.unwrap();
+                if page.is_empty() {
+                    break;
+                }
+                start += page.len();
+                read.extend(
+                    page.into_iter()
+                        .map(|row| (part.first_source_index + row.source_index, row.message)),
+                );
+            }
+            assert_eq!(start, part.archive.message_count, "{part:?}");
+        }
+        read
+    }
+
+    /// The archived messages of `window`, with their index in it.
+    fn archivable(window: &[SharedMessage]) -> Vec<(usize, SharedMessage)> {
+        let kept = |(_, m): &(usize, SharedMessage)| m["role"] != "system";
+        window.iter().cloned().enumerate().filter(kept).collect()
+    }
+
+    /// A window of more messages than one archive holds used to fail the
+    /// seal, and with it the rollover and the turn, on every attempt. It is
+    /// now sealed as consecutive parts, and the new window says where each
+    /// part is, to the model in the text and to the host in the metadata.
+    /// How many parts and where they are cut is the store's business: every
+    /// expectation here is read from the parts the seal returned.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn oversized_window_rolls_over_in_parts() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let messages = long_window(5_000);
+        assert!(messages.len() > agent_core::context_archive::MAX_MESSAGES);
+        let state = auto_state();
+        state
+            .lock()
+            .unwrap()
+            .checkpoint(WorkPhase::Execute, Some("the working note"))
+            .unwrap();
+        let prepared = ready(roll(&messages, &state, SMALL_TARGET).await);
+        let parts = prepared.parts.clone();
+
+        // Consecutive parts that cover the window, each within one archive.
+        assert!(parts.len() > 1, "{parts:?}");
+        let mut covered = 0;
+        for part in &parts {
+            assert_eq!(part.first_source_index, covered);
+            assert!(part.archive.source_message_count <= agent_core::context_archive::MAX_MESSAGES);
+            assert_eq!(part.reduced_messages, 0);
+            covered += part.archive.source_message_count;
+        }
+        assert_eq!(covered, messages.len());
+        // Nothing is lost and nothing is there twice: fetching every part by
+        // id, page by page, gives each archivable message once, in order.
+        assert!(read_back(&binding, &parts).await == archivable(&messages));
+
+        // The model is told every part, in order, each with its range of the
+        // window and the number of messages stored (the first part's range
+        // includes the system message, which is not archived).
+        let (first, last) = (&parts[0], parts.last().unwrap());
+        assert_eq!(first.archive.message_count + 1, first.archive.source_message_count);
+        let text = prepared.messages[0]["content"].as_str().unwrap();
+        let ranges: Vec<String> = parts
+            .iter()
+            .enumerate()
+            .map(|(n, part)| {
+                format!(
+                    "ctx-{} ({}#{}-#{}, {} archived)",
+                    part.archive.id,
+                    if n == 0 { "source messages " } else { "" },
+                    part.first_source_index,
+                    part.first_source_index + part.archive.source_message_count - 1,
+                    part.archive.message_count,
+                )
+            })
+            .collect();
+        let listed = format!(
+            "Earlier eligible source evidence, in source order: {}, available via memory_search(source=history) and memory_fetch if a specific needed fact is missing; within each archive memory_fetch's source_index starts again at 0: source message #i is the row whose source_index is i minus the first number of its range, and since start counts archived messages it is at that start or a lower one. Start with",
+            ranges.join(", "),
+        );
+        assert!(text.contains(&listed), "{text}");
+        // That sentence, followed for the last source message of the first
+        // part, which stores one message fewer than it covers. `start`
+        // counts stored messages: at `start` = i minus the first number
+        // there is no row at all, and the row is at a lower one.
+        let i = first.first_source_index + first.archive.source_message_count - 1;
+        let wanted = i - first.first_source_index;
+        assert!(wanted >= 1, "{first:?}");
+        let at = binding.history_fetch(&first.archive.id, wanted, 1).await.unwrap();
+        assert!(at.is_empty(), "start counted source messages: {at:?}");
+        let lower = binding.history_fetch(&first.archive.id, wanted - 1, 1).await.unwrap();
+        assert_eq!((lower[0].source_index, &lower[0].message), (wanted, &messages[i]));
+        assert!(text.contains("-#4999, "), "the last range ends the window: {text}");
+        // A `#i` in the list of dropped requests is an index in the window.
+        let dropped: Vec<usize> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("- #")?.split(' ').next()?.parse().ok())
+            .collect();
+        assert!(dropped.len() > 10, "{text}");
+        for i in dropped {
+            assert!(text.contains(&format!("\n- #{i} user: request {i}\n")), "{i}: {text}");
+        }
+        // The note is stored once, with the last part.
+        assert!(text.contains("Working note (untrusted historical data):\nthe working note\n"));
+        for part in &parts {
+            let note = if part == last { "the working note" } else { "" };
+            assert_eq!(binding.history_note(&part.archive.id).await.unwrap(), note);
+        }
+
+        // The host's record: `archive` is the last part, as resume reads it,
+        // and `archives` is every part.
+        let marker = &prepared.messages[0]["_synaps_context"];
+        assert_eq!(marker["archive"], last.archive.id);
+        assert_eq!(marker["window"], 2);
+        let record = |part: &ArchivePart| {
+            json!({"id": part.archive.id, "first": part.first_source_index,
+                "count": part.archive.source_message_count, "messages": part.archive.message_count})
+        };
+        assert_eq!(marker["archives"], Value::Array(parts.iter().map(record).collect()));
+
+        // Extensions are told every part, first part first, each with the
+        // file that holds it (`on_context_archived`), once it is committed.
+        use crate::extensions::hooks::{events::HookKind, test_support::Listener, HookBus};
+        let bus = Arc::new(HookBus::new());
+        let listener = Listener::prompt("indexer");
+        listener.subscribe(&bus, HookKind::OnContextArchived).await;
+        let next = prepared.commit_and_announce(&state, &bus, &binding, None).unwrap();
+        let events = listener.wait_for(parts.len()).await;
+        assert_eq!(events.len(), parts.len());
+        let mut files = std::collections::HashSet::new();
+        for (n, (event, part)) in events.iter().zip(&parts).enumerate() {
+            let data = &event.data;
+            assert_eq!(data["archive_id"], json!(part.archive.id));
+            assert_eq!((&data["part"], &data["parts"]), (&json!(n + 1), &json!(parts.len())));
+            assert_eq!(data["first_source_index"], json!(part.first_source_index));
+            let file = std::path::PathBuf::from(data["path"].as_str().unwrap());
+            assert!(file.is_file(), "{file:?}");
+            assert!(files.insert(file), "each part has its own file: {events:?}");
+        }
+
+        assert_eq!(state.lock().unwrap().window, 2);
+        assert_eq!(state.lock().unwrap().latest_archive.as_ref(), Some(&last.archive.id));
+        let restored = Arc::new(Mutex::new(ContinuationState::default()));
+        restore_window(&next, &restored, &binding);
+        let s = restored.lock().unwrap();
+        assert_eq!((s.window, s.latest_archive.as_ref()), (2, Some(&last.archive.id)));
+    }
+
+    /// `n` tool calls, each with its result, whose inputs are 40,000 nodes
+    /// each. One archive admits 65,536, so no two of the calls share an
+    /// archive: a window holding them is sealed as at least `n` parts,
+    /// however the store cuts it.
+    fn wide_calls(n: usize) -> Vec<SharedMessage> {
+        let wide = json!(vec![0; 40_000]);
+        let pair = |n: usize| {
+            let id = format!("wide-{n}");
+            let call = json!([{"type":"tool_use","id":id,"name":"plot","input":wide}]);
+            let result = json!([{"type":"tool_result","tool_use_id":id,"content":"plotted"}]);
+            [
+                msg(json!({"role":"assistant","content":call})),
+                msg(json!({"role":"user","content":result})),
+            ]
+        };
+        (0..n).flat_map(pair).collect()
+    }
+
+    /// The size of the head that rollover checks before it seals `messages`
+    /// (no note, no workers, window 2): the one built for the assumed parts.
+    fn checked_size(messages: &[SharedMessage]) -> u64 {
+        let assumed = assumed_parts(messages.len());
+        let candidate = successor_from_parts(messages, &assumed, "", 2, SMALL_TARGET, None, "");
+        estimate_history(&candidate)
+    }
+
+    /// A rollover of `messages` that must fit `budget`.
+    async fn roll_within(
+        messages: &[SharedMessage],
+        state: &SharedContinuation,
+        budget: u64,
+    ) -> Result<RolloverPreparation> {
+        let binding = MemoryBinding::for_process_cwd();
+        let none = Default::default();
+        rollover_for_boundary(messages, state, &binding, budget, SMALL_TARGET, &none, false, "").await
+    }
+
+    /// How many parts the continuation message of `head` names by id.
+    fn named_in(head: &[SharedMessage]) -> usize {
+        let text = head[0]["content"].as_str().unwrap();
+        let list = text.split(", available via").next().unwrap();
+        list.matches("ctx-").count()
+    }
+
+    /// The shrink check and the budget check are made before the seal, on a
+    /// head that lists as many parts as the message limit alone implies:
+    /// two for this window. It is sealed as at least six, and the head that
+    /// names them all is larger than the one that was checked, by about 30
+    /// tokens a part, which neither check saw: under a budget the checked
+    /// head just fitted, the new window was over it. Both checks are now
+    /// made again on the real head, which names only as many of the last
+    /// parts as pass them.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_window_cut_into_more_parts_than_estimated_names_as_many_as_the_budget_admits() {
+        let _env = BaseDirGuard::new();
+        let mut messages = long_window(4_200);
+        messages.splice(10..10, wide_calls(6));
+        assert_eq!(assumed_parts(messages.len()).len(), 2);
+        let checked = checked_size(&messages);
+        let state = auto_state();
+
+        // With room in the budget every part is named, up to the bound.
+        let roomy = ready(roll_within(&messages, &state, 1_000_000).await);
+        let parts = roomy.parts.clone();
+        assert!(parts.len() >= 6, "the six wide inputs cannot share an archive: {parts:?}");
+        let all = LISTED_PARTS.min(parts.len());
+        assert_eq!(named_in(&roomy.messages), all);
+
+        // The lowest budget the rollover is not refused on before the seal
+        // (one over the bound it holds there). The checked head is under
+        // it, and the head with every part named is not: it is what was
+        // checked plus the parts nobody had counted.
+        let bound = largest_split_head(&messages, "", 2, SMALL_TARGET, None, "").unwrap();
+        let budget = bound + 1;
+        assert!(checked < budget, "{checked} checked, {bound} held to");
+        let unchecked = estimate_history(&roomy.messages);
+        assert!(unchecked >= budget, "{unchecked} tokens with every part named; {checked} checked");
+        let prepared = ready(roll_within(&messages, &state, budget).await);
+        assert_eq!(prepared.parts, parts);
+        let real = estimate_history(&prepared.messages);
+        assert!(real < budget, "the head is {real} tokens; the budget is {budget}");
+        // Fewer parts are named, and they are the last ones; the others are
+        // counted, with the range they cover.
+        let text = prepared.messages[0]["content"].as_str().unwrap();
+        let listed = named_in(&prepared.messages);
+        assert!((1..all).contains(&listed), "{listed} of {all}: {text}");
+        let (unlisted, named) = parts.split_at(parts.len() - listed);
+        let summary = format!(
+            "in source order: {} earlier archive{} not listed here (source messages #0-#{}), ctx-{} (#{}-#",
+            unlisted.len(),
+            if unlisted.len() == 1 { "" } else { "s" },
+            named[0].first_source_index - 1,
+            named[0].archive.id,
+            named[0].first_source_index,
+        );
+        assert!(text.contains(&summary), "{summary}\n{text}");
+        let mut from = 0;
+        for part in named {
+            let at = text[from..].find(&format!("ctx-{} (", part.archive.id));
+            from += at.expect("the last parts are listed, in order") + 1;
+        }
+        // No more were taken off than had to be: one more does not fit.
+        let mut longer = prepared.messages.clone();
+        longer[0] = relisted(&longer[0], &parts, listed, listed + 1);
+        assert_eq!(named_in(&longer), listed + 1);
+        assert!(estimate_history(&longer) >= budget);
+
+        // The host's record is not shortened: every part, and the last one
+        // as the archive resume reads.
+        let marker = &prepared.messages[0]["_synaps_context"];
+        assert_eq!(marker["archives"].as_array().unwrap().len(), parts.len());
+        assert_eq!(marker["archive"], parts.last().unwrap().archive.id);
+        prepared.commit(&state).unwrap();
+        assert_eq!(state.lock().unwrap().window, 2);
+    }
+
+    /// Every file under `dir`, at any depth.
+    fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let paths = entries.map(|entry| entry.unwrap().path());
+        paths
+            .flat_map(|path| if path.is_dir() { files_under(&path) } else { vec![path] })
+            .collect()
+    }
+
+    /// A window within the message limit is estimated as one archive, with
+    /// the one-archive sentence, and can be sealed as several. Naming one
+    /// part and counting the rest is as short as its list gets, and that
+    /// head is still longer than the estimate, by the wording of the
+    /// split-window sentence: the same however many parts there are. The
+    /// request budget is a limit, so a rollover whose shortest head is not
+    /// under it fails with the history kept.
+    ///
+    /// It used to fail after the seal: in that band of budgets the window's
+    /// archives were written and then named by nothing, once more at every
+    /// attempt on the window as it grew. It is now refused before the seal,
+    /// on an upper bound of that head, and writes no file.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_split_that_was_estimated_as_one_archive_is_held_to_the_budget_with_one_part_named() {
+        let env = BaseDirGuard::new();
+        let mut messages = vec![user("charter")];
+        messages.extend(wide_calls(6));
+        messages.extend((0..40).map(|i| event(i, 1_100)));
+        messages.extend(tail("t", 200));
+        assert_eq!(assumed_parts(messages.len()).len(), 1);
+        let checked = checked_size(&messages);
+        let state = auto_state();
+        // What the rollover holds to the budget before it seals.
+        let bound = largest_split_head(&messages, "", 2, SMALL_TARGET, None, "").unwrap();
+        let band = bound - checked;
+        assert!((1..260).contains(&band), "the wording of a split window: {band} tokens");
+        let refused_in = |result: Result<RolloverPreparation>, budget: u64| {
+            let refused = match result {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("budget {budget}: the head could be at or over it"),
+            };
+            assert!(refused.contains("exceeds the safe request budget"), "{refused}");
+            assert!(refused.ends_with("history retained"), "refused before the seal: {refused}");
+            let s = state.lock().unwrap();
+            assert_eq!((s.window, s.latest_archive.as_ref()), (1, None));
+        };
+
+        // The band, in a store that holds nothing: the head that was
+        // checked is under each of these budgets, and nothing is written.
+        for budget in [checked + 1, checked + band / 2, bound] {
+            refused_in(roll_within(&messages, &state, budget).await, budget);
+            let written = files_under(env.path());
+            assert!(written.is_empty(), "budget {budget}: {written:?}");
+        }
+        // Just below the band it rolls over.
+        let prepared = ready(roll_within(&messages, &state, bound + 1).await);
+        assert!(prepared.parts.len() >= 6, "{:?}", prepared.parts);
+        assert!(estimate_history(&prepared.messages) < bound + 1);
+        assert!(named_in(&prepared.messages) >= 1);
+        let sealed = files_under(env.path()).len();
+        assert!(sealed >= 6, "{sealed} files");
+
+        // With room in the budget every part is named.
+        let roomy = ready(roll_within(&messages, &state, 1_000_000).await);
+        let parts = roomy.parts.clone();
+        assert!(parts.len() >= 6, "{parts:?}");
+        let all = LISTED_PARTS.min(parts.len());
+        assert_eq!(named_in(&roomy.messages), all);
+        // The shortest head names one part. It is over what was checked by
+        // wording alone.
+        let mut shortest = roomy.messages.clone();
+        shortest[0] = relisted(&shortest[0], &parts, all, 1);
+        let floor = estimate_history(&shortest);
+        let over = floor.saturating_sub(checked);
+        assert!((1..200).contains(&over), "the longer sentence, and no list: {over} tokens");
+        // The bound is a bound: the real shortest head is not over it. It
+        // is above it only by numbers this window's parts do not reach.
+        assert!(floor <= bound, "{floor} > {bound}");
+        assert!(bound - floor < 100, "{bound} against {floor}");
+
+        // A budget the shortest real head is not under is refused as the
+        // others were, before the seal.
+        refused_in(roll_within(&messages, &state, floor).await, floor);
+        assert_eq!(files_under(env.path()).len(), sealed);
+
+        // The shortest head, as the rollover makes it: one part named.
+        let mut prepared = ready(roll_within(&messages, &state, bound + 1).await);
+        assert_eq!(prepared.parts, parts);
+        let named = named_in(&prepared.messages);
+        prepared.messages[0] = relisted(&prepared.messages[0], &parts, named, 1);
+        assert_eq!(named_in(&prepared.messages), 1);
+        let text = prepared.messages[0]["content"].as_str().unwrap();
+        let last = parts.last().unwrap();
+        let named = format!(
+            "in source order: {} earlier archives not listed here (source messages #0-#{}), ctx-{} (#{}-#{}, ",
+            parts.len() - 1,
+            last.first_source_index - 1,
+            last.archive.id,
+            last.first_source_index,
+            messages.len() - 1,
+        );
+        assert!(text.contains(&named), "{named}\n{text}");
+        assert_eq!(estimate_history(&prepared.messages), floor);
+    }
+
+    /// The shrink check alone fails after the seal: the budget is far above
+    /// any head of this window. Before the seal the rollover is taken to
+    /// save more than 1,024 tokens, on a head with the one-archive sentence.
+    /// Sealed as several parts, the head that names them all saves less
+    /// than that. Parts are taken off its list, earliest first, until it
+    /// saves more than 1,024 tokens again, and no further.
+    ///
+    /// The window keeps its wide tool calls (their results follow the last
+    /// answer, so they are the tail every rollover keeps) and drops one
+    /// event, whose size is what the rollover saves.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_split_whose_full_list_would_fail_only_the_shrink_check_names_fewer_parts() {
+        const BUDGET: u64 = 10_000_000;
+        let _env = BaseDirGuard::new();
+        let none = SuccessorBudget { history_tokens: 0 };
+        let wide = json!(vec![0; 40_000]);
+        let build = |bytes: usize| {
+            let mut m = vec![user("charter"), event(0, bytes), user("TURN-START: continue")];
+            let id = |n: usize| format!("wide-{n}");
+            m.extend((0..6).map(|n| {
+                msg(json!({"role":"assistant","content":[{"type":"tool_use","id":id(n),"name":"plot","input":wide}]}))
+            }));
+            let results: Vec<Value> = (0..6)
+                .map(|n| json!({"type":"tool_result","tool_use_id":id(n),"content":"plotted"}))
+                .collect();
+            m.push(msg(json!({"role":"user","content":results})));
+            m
+        };
+        // What a head of `m` saves: the one checked before the seal, and
+        // any other.
+        let saves = |m: &[SharedMessage], head: &[SharedMessage]| {
+            estimate_history(m) as i64 - estimate_history(head) as i64
+        };
+        let checked = |m: &[SharedMessage]| {
+            let assumed = assumed_parts(m.len());
+            assert_eq!(assumed.len(), 1);
+            saves(m, &successor_from_parts(m, &assumed, "", 2, none, None, ""))
+        };
+        let roll = |m: Vec<SharedMessage>| async move {
+            let (binding, state, cancel) = (MemoryBinding::for_process_cwd(), auto_state(), Default::default());
+            let rolled = rollover_for_boundary(&m, &state, &binding, BUDGET, none, &cancel, false, "").await;
+            (ready(rolled), m)
+        };
+
+        // With a large event dropped every part is named. That shows what
+        // the list costs: the shortest head and the full one, against the
+        // one that was checked.
+        let (roomy, m) = roll(build(20_000)).await;
+        let parts = roomy.parts.clone();
+        let all = LISTED_PARTS.min(parts.len());
+        assert!(all >= 6, "six inputs that cannot share an archive: {parts:?}");
+        assert_eq!(named_in(&roomy.messages), all);
+        let mut shortest = roomy.messages.clone();
+        shortest[0] = relisted(&shortest[0], &parts, all, 1);
+        let (least, most) = (checked(&m) - saves(&m, &shortest), checked(&m) - saves(&m, &roomy.messages));
+        assert!(0 < least && least + 40 < most, "the list costs {least} to {most} tokens");
+
+        // An event sized so that the checked head saves 1,024 tokens and
+        // about half of that list.
+        let wanted = 1024 + (least + most) / 2;
+        let sizes: Vec<usize> = (1_000..20_000).collect();
+        let bytes = sizes[sizes.partition_point(|&b| checked(&build(b)) < wanted)];
+        assert!(checked(&build(bytes)) >= wanted && checked(&build(bytes - 1)) < wanted);
+        let (prepared, m) = roll(build(bytes)).await;
+        assert_eq!(prepared.parts.len(), parts.len());
+        let parts = prepared.parts.clone();
+        let named = named_in(&prepared.messages);
+        assert!((1..all).contains(&named), "{named} of {all} parts named");
+        // The head saves more than 1,024 tokens, and with one more part
+        // named, as with all of them, it would not.
+        assert!(saves(&m, &prepared.messages) > 1024);
+        let mut longer = prepared.messages.clone();
+        longer[0] = relisted(&longer[0], &parts, named, named + 1);
+        assert!(saves(&m, &longer) <= 1024);
+        longer[0] = relisted(&longer[0], &parts, named + 1, all);
+        assert_eq!(named_in(&longer), all);
+        assert!(saves(&m, &longer) <= 1024);
+        // The budget had nothing to do with it.
+        assert!(estimate_history(&longer) < BUDGET / 2);
+        assert_eq!(prepared.messages[0]["_synaps_context"]["archives"].as_array().unwrap().len(), parts.len());
+    }
+
+    /// The old window is dropped on the word of the list of parts the store
+    /// returns, and the head, the marker and the hook events are written
+    /// from it. Rollover took that list as it came. A list that is not the
+    /// window (no part, a part missing, parts out of order, a part twice, an
+    /// end that is short) now fails the rollover as a failed seal does: the
+    /// history is kept and nothing is recorded. Every wrong list here is
+    /// made from the parts the store really returned.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_part_list_that_is_not_the_window_fails_the_rollover_with_the_history_kept() {
+        let _env = BaseDirGuard::new();
+        let mut messages = vec![user("charter")];
+        messages.extend(wide_calls(3));
+        messages.extend((0..40).map(|i| event(i, 1_100)));
+        messages.extend(tail("t", 200));
+        let state = auto_state();
+        let parts = ready(roll(&messages, &state, SMALL_TARGET).await).parts.clone();
+        assert!(parts.len() >= 3, "three inputs that cannot share an archive: {parts:?}");
+        assert_eq!(check_cover(&parts, messages.len()), Ok(()));
+
+        let without = |n: usize| {
+            let mut list = parts.clone();
+            list.remove(n);
+            list
+        };
+        let mut swapped = parts.clone();
+        swapped.swap(0, 1);
+        let mut twice = parts.clone();
+        twice.insert(1, parts[0].clone());
+        let mut short = parts.clone();
+        {
+            let last = &mut short.last_mut().unwrap().archive;
+            last.source_message_count -= 1;
+            last.message_count = last.message_count.min(last.source_message_count);
+        }
+        let mut empty = parts.clone();
+        empty.insert(1, ArchivePart {
+            archive: ArchiveRef { id: "0".repeat(32), message_count: 0, source_message_count: 0 },
+            first_source_index: parts[1].first_source_index,
+            reduced_messages: 0,
+        });
+        let mut overfull = parts.clone();
+        overfull[0].archive.message_count = parts[0].archive.source_message_count + 1;
+        let wrong = [
+            ("no part", Vec::new(), "no archive for a window of"),
+            ("the last part is missing", without(parts.len() - 1), "source messages of the window's"),
+            ("the first part is missing", without(0), "part 1 of"),
+            ("a part in the middle is missing", without(1), "part 2 of"),
+            ("two parts are swapped", swapped, "part 1 of"),
+            ("a part is there twice", twice, "part 2 of"),
+            ("the last part ends before the window does", short, "source messages of the window's"),
+            ("a part covers nothing", empty, "covers no message"),
+            ("a part stores more than it covers", overfull, "stores"),
+        ];
+        for (case, list, said) in wrong {
+            SEALED_AS.with(|forced| *forced.borrow_mut() = Some(list));
+            let error = match roll(&messages, &state, SMALL_TARGET).await {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("{case}: the rollover went through"),
+            };
+            let refused = "archive commit failed; history retained: the archives the store returned are not the window (";
+            assert!(error.contains(refused), "{case}: {error}");
+            assert!(error.contains(said), "{case}: {error}");
+            let s = state.lock().unwrap();
+            assert_eq!((s.window, s.latest_archive.as_ref()), (1, None), "{case}");
+        }
+
+        // The store's own list is the window, and the same call rolls over.
+        let prepared = ready(roll(&messages, &state, SMALL_TARGET).await);
+        assert_eq!(prepared.parts, parts);
+        prepared.commit(&state).unwrap();
+        assert_eq!(state.lock().unwrap().window, 2);
+    }
+
+    /// One chat, rolled over once over `window` and saved: the new head goes
+    /// to the chat's session file, as a frontend saves it. Returns the chat's
+    /// id and what the window was sealed as.
+    async fn rolled_and_saved(window: &[SharedMessage]) -> (String, Vec<ArchivePart>) {
+        let mut session = agent_core::core::session::Session::new("claude-sonnet-4-6", "low", None);
+        let state = auto_state();
+        state.lock().unwrap().logical_id = session.id.clone();
+        let prepared = ready(roll(window, &state, SMALL_TARGET).await);
+        let parts = prepared.parts.clone();
+        session.api_messages = prepared.commit(&state).unwrap();
+        session.save().await.unwrap();
+        (session.id, parts)
+    }
+
+    /// That chat opened again: its head loaded from the session file and
+    /// bound to a runtime that has never seen it, as a frontend does on load.
+    fn reopen(chat: &str) -> (crate::Runtime, Vec<SharedMessage>) {
+        let head = agent_core::core::session::Session::load(chat).unwrap().api_messages;
+        let rt = crate::Runtime::new_headless();
+        rt.reset_context_continuation(chat, &head);
+        (rt, head)
+    }
+
+    /// Resume reads one id from the marker, `archive`. For a window sealed as
+    /// several parts that is the last part, so a chat that rolled over in
+    /// parts, was closed and is opened again gets the same window bookkeeping
+    /// as one whose window was a single archive, and carries on from it.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_chat_rolled_over_in_parts_reopens_like_a_single_archive_chat() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        // Two chats at the same point: one whose window fitted one archive,
+        // one whose window was sealed as several. Both are then closed.
+        let (single_chat, single_parts) = rolled_and_saved(&long_window(3_000)).await;
+        let messages = long_window(5_000);
+        let (chat, parts) = rolled_and_saved(&messages).await;
+        assert!(single_parts.len() == 1 && parts.len() > 1, "{single_parts:?} {parts:?}");
+        let single_id = single_parts[0].archive.id.clone();
+        let last_id = parts.last().unwrap().archive.id.clone();
+
+        // Both are opened again.
+        let (single_rt, _) = reopen(&single_chat);
+        let (rt, head) = reopen(&chat);
+        let bookkeeping = |rt: &crate::Runtime| {
+            let s = rt.continuation.lock().unwrap();
+            (
+                s.window,
+                s.latest_archive.clone(),
+                (s.initialized, s.missing_archive.is_some(), s.durability_blocked),
+                s.note.clone(),
+            )
+        };
+        let restored = |id: &str| (2, Some(id.to_owned()), (true, false, false), String::new());
+        assert_eq!(bookkeeping(&single_rt), restored(&single_id));
+        assert_eq!(bookkeeping(&rt), restored(&last_id));
+        assert_eq!(
+            rt.context_management_status().replace(&last_id, "<archive>"),
+            single_rt.context_management_status().replace(&single_id, "<archive>")
+        );
+        assert!(rt.context_management_status().contains(" | window 2 | "));
+        // The barrier before the first request of the reopened chat passes.
+        validate_restored_history(&head, &rt.continuation, &binding)
+            .await
+            .unwrap();
+        assert_eq!(bookkeeping(&rt), restored(&last_id));
+
+        // The part list came back from the session file, for the host and
+        // for the model, and every part is still fetched by the id it names.
+        let marker = &head[0]["_synaps_context"];
+        assert_eq!(marker["archive"], last_id);
+        let text = head[0]["content"].as_str().unwrap();
+        let recorded = marker["archives"].as_array().unwrap();
+        assert_eq!(recorded.len(), parts.len());
+        for (entry, part) in recorded.iter().zip(&parts) {
+            assert_eq!(entry["id"], part.archive.id);
+            assert_eq!(entry["first"], part.first_source_index);
+            assert_eq!(entry["count"], part.archive.source_message_count);
+            assert!(text.contains(&format!("ctx-{} (", part.archive.id)), "{text}");
+        }
+        assert!(read_back(&binding, &parts).await == archivable(&messages));
+
+        // It carries on: the next rollover is window 3, sealed as one
+        // archive, and the parts of the earlier window stay fetchable.
+        let mut grown = head.clone();
+        grown.extend((0..400).map(|i| event(i, 1_100)));
+        grown.extend(tail("later", 200));
+        let next = rollover_for_boundary(
+            &grown,
+            &rt.continuation,
+            &binding,
+            1_000_000,
+            SMALL_TARGET,
+            &Default::default(),
+            false,
+            "",
+        )
+        .await;
+        let next = ready(next).commit(&rt.continuation).unwrap();
+        assert_eq!(bookkeeping(&rt).0, 3);
+        assert_eq!(next[0]["_synaps_context"]["window"], 3);
+        assert!(next[0]["_synaps_context"].get("archives").is_none());
+        assert!(read_back(&binding, &parts).await == archivable(&messages));
+    }
+
+    /// A seal that stops between two parts (a full disk, a busy lock, a
+    /// cancelled turn) leaves the earlier parts on disk. The rollover fails
+    /// with the history kept, records nothing and announces nothing: a part
+    /// list exists only for a window that was sealed whole. The same
+    /// rollover again finds the parts that are there, writes the missing
+    /// ones, and gives the list it would have given the first time.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_rollover_interrupted_between_parts_keeps_history_and_a_retry_completes_it() {
+        interrupted_then_retried(Vec::new()).await;
+    }
+
+    /// What usually happens instead: the turn failed, the user wrote again,
+    /// and the retry runs on a window that has grown. It is sealed as that
+    /// window is then cut, which need not be the list of the first attempt.
+    /// Whatever the first attempt wrote stays on disk, the chat refers to
+    /// the parts of the attempt that completed, and only those are
+    /// announced.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_rollover_interrupted_between_parts_is_completed_on_the_window_as_it_has_grown() {
+        interrupted_then_retried(tail("t2", 200)).await;
+    }
+
+    /// A rollover whose seal stops before the last part, then the rollover
+    /// again once the store takes that part, on the window with `grown_by`
+    /// added to it. Nothing here knows where the window is cut or into how
+    /// many parts, beyond more than one.
+    async fn interrupted_then_retried(grown_by: Vec<SharedMessage>) {
+        use crate::extensions::hooks::{events::HookKind, test_support::Listener, HookBus};
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let scope = binding.scope().unwrap().clone();
+        // Three inputs no two of which fit one archive.
+        let mut messages = vec![user("charter")];
+        messages.extend(wide_calls(3));
+        messages.extend((0..40).map(|i| event(i, 1_100)));
+        messages.extend(tail("t", 200));
+        let bus = Arc::new(HookBus::new());
+        let listener = Listener::prompt("indexer");
+        listener.subscribe(&bus, HookKind::OnContextArchived).await;
+        let state = auto_state();
+        state
+            .lock()
+            .unwrap()
+            .checkpoint(WorkPhase::Execute, Some("the working note"))
+            .unwrap();
+        let chat = state.lock().unwrap().logical_id.clone();
+
+        // What this window is sealed as, learned in a store of its own (a
+        // part's id depends on the chat and the content, not on the store).
+        let elsewhere = tempfile::tempdir().unwrap();
+        let expected = archive_store_for_session(elsewhere.path(), &scope, &chat)
+            .unwrap()
+            .seal_window(&messages, "the working note")
+            .unwrap();
+        let (last, earlier) = expected.parts.split_last().unwrap();
+        assert!(!earlier.is_empty(), "{:?}", expected.parts);
+        let last = &last.archive.id;
+
+        // Something that is not a file sits where the last part belongs,
+        // under both names a seal can give it. One such thing does not stop
+        // a seal: it stores the part under its second id, the other half of
+        // the digest. With both names taken the part cannot be stored.
+        // (Another chat's archive shows which directory that is.)
+        let file_of =
+            |id: &str| agent_core::context_archive::archive_file(binding.base(), scope.key(), id);
+        let digest = {
+            let file = agent_core::context_archive::archive_file(elsewhere.path(), scope.key(), last)
+                .unwrap()
+                .unwrap();
+            let record: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+            record["digest"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(digest[..32], **last);
+        let (other, _) = binding
+            .history_seal("another-chat", &[user("another chat")], "")
+            .await
+            .unwrap();
+        let shelf = file_of(&other.id).unwrap().unwrap().parent().unwrap().to_owned();
+        let obstacles = [&digest[..32], &digest[32..]].map(|id| shelf.join(format!("{id}.json")));
+        for obstacle in &obstacles {
+            std::fs::create_dir(obstacle).unwrap();
+        }
+
+        let error = match roll(&messages, &state, SMALL_TARGET).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a window that is only partly sealed must not roll over"),
+        };
+        assert!(error.contains("archive commit failed; history retained"), "{error}");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!((s.window, s.latest_archive.as_ref()), (1, None));
+            assert_eq!(s.note, "the working note");
+            assert!(!s.durability_blocked);
+        }
+        // The parts before it were written: ordinary archives that nothing
+        // refers to.
+        let stamp = |file: &std::path::Path| {
+            let modified = std::fs::metadata(file).unwrap().modified().unwrap();
+            (std::fs::read(file).unwrap(), modified)
+        };
+        let mut written = Vec::new();
+        for part in earlier {
+            let file = file_of(&part.archive.id).unwrap().expect("an earlier part is on disk");
+            written.push((stamp(&file), file));
+        }
+        let page = binding.history_fetch(&earlier[0].archive.id, 0, 1).await.unwrap();
+        assert_eq!(page[0].message, messages[0]);
+        // And nothing was announced: there is no rollover to commit, and
+        // only a committed one sends the events.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(listener.events().len(), 0);
+
+        // The rollover again once the obstacles are gone, on the window as
+        // it is by then.
+        for obstacle in &obstacles {
+            std::fs::remove_dir(obstacle).unwrap();
+        }
+        let same_window = grown_by.is_empty();
+        messages.extend(grown_by);
+        let prepared = ready(roll(&messages, &state, SMALL_TARGET).await);
+        let parts = prepared.parts.clone();
+        assert!(parts.len() > 1, "{parts:?}");
+        let mut covered = 0;
+        for part in &parts {
+            assert_eq!(part.first_source_index, covered, "{parts:?}");
+            covered += part.archive.source_message_count;
+        }
+        assert_eq!(covered, messages.len());
+        assert!(read_back(&binding, &parts).await == archivable(&messages));
+        if same_window {
+            assert_eq!(parts, expected.parts);
+            for (before, file) in &written {
+                assert!(stamp(file) == *before, "an earlier part was found, not written again");
+            }
+            assert!(file_of(last).unwrap().is_some());
+        }
+        // What the first attempt wrote is still there, in the list or not.
+        for part in earlier {
+            binding.history_fetch(&part.archive.id, 0, 1).await.unwrap();
+        }
+        let named = &parts.last().unwrap().archive.id;
+        assert_eq!(binding.history_note(named).await.unwrap(), "the working note");
+
+        // The chat refers to the parts of this attempt, and they are what
+        // is announced, once.
+        let next = prepared.commit_and_announce(&state, &bus, &binding, None).unwrap();
+        let marker = &next[0]["_synaps_context"];
+        assert_eq!(marker["archive"], **named);
+        let ids: Vec<Value> = parts.iter().map(|part| json!(part.archive.id)).collect();
+        let recorded: Vec<Value> =
+            marker["archives"].as_array().unwrap().iter().map(|entry| entry["id"].clone()).collect();
+        assert_eq!(recorded, ids);
+        {
+            let s = state.lock().unwrap();
+            assert_eq!((s.window, s.latest_archive.as_ref()), (2, Some(named)));
+        }
+        let events = listener.wait_for(parts.len()).await;
+        let announced: Vec<Value> =
+            events.iter().map(|event| event.data["archive_id"].clone()).collect();
+        assert_eq!(announced, ids);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(listener.events().len(), parts.len(), "each part once");
     }
 }
 
@@ -4317,5 +6408,928 @@ mod calibration_transport_tests {
         assert_eq!(out.heads.len(), 1, "exactly one rollover");
         let head = crate::runtime::context::estimate_history(&out.heads[0]);
         assert!((40_000..=93_333).contains(&head), "head {head}");
+    }
+}
+
+/// `on_context_archived`: what a committed rollover sends for its archives
+/// ([`PreparedRollover::commit_and_announce`]), and when nothing is sent.
+/// The stream loop's call, and a hook that hangs, fails or dies, are covered
+/// through the real loop in `tests/context_rollover_recovery.rs`.
+#[cfg(test)]
+mod archived_hook_tests {
+    use super::*;
+    use crate::extensions::hooks::events::HookKind;
+    use crate::extensions::hooks::test_support::Listener;
+    use crate::extensions::hooks::HookBus;
+    use crate::test_env::BaseDirGuard;
+
+    pub(super) const CHAT: &str = "chat-under-test";
+
+    pub(super) fn window() -> Vec<SharedMessage> {
+        vec![
+            Arc::new(json!({"role":"user","content":"Build the plan. Do not deploy."})),
+            Arc::new(json!({"role":"assistant","content":"prior evidence ".repeat(5000)})),
+            Arc::new(json!({"role":"user","content":"Write the spec first."})),
+            Arc::new(json!({"role":"assistant","content":"The spec is written."})),
+        ]
+    }
+
+    /// [`window`] with three tool calls in it whose inputs are 40,000 nodes
+    /// each. One archive admits 65,536, so no two of them share an archive
+    /// and the window is sealed as several, however the store cuts it.
+    pub(super) fn split_window() -> Vec<SharedMessage> {
+        let mut messages = window();
+        let wide = json!(vec![0; 40_000]);
+        for n in 0..3 {
+            let id = format!("wide-{n}");
+            let call = json!([{"type":"tool_use","id":id,"name":"plot","input":wide}]);
+            let result = json!([{"type":"tool_result","tool_use_id":id,"content":"plotted"}]);
+            messages.insert(2 + 2 * n, Arc::new(json!({"role":"assistant","content":call})));
+            messages.insert(3 + 2 * n, Arc::new(json!({"role":"user","content":result})));
+        }
+        messages
+    }
+
+    pub(super) fn chat_state() -> SharedContinuation {
+        let state = Arc::new(Mutex::new(ContinuationState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            s.logical_id = CHAT.into();
+            s.config.mode = ContextManagementMode::Auto;
+        }
+        state
+    }
+
+    pub(super) async fn seal(
+        binding: &MemoryBinding,
+        state: &SharedContinuation,
+        messages: &[SharedMessage],
+    ) -> PreparedRollover {
+        let sealed = rollover_for_boundary(
+            messages,
+            state,
+            binding,
+            100_000,
+            SuccessorBudget::UNBOUNDED,
+            &Default::default(),
+            false,
+            "",
+        )
+        .await
+        .unwrap();
+        match sealed {
+            RolloverPreparation::Ready(prepared) => prepared,
+            RolloverPreparation::Unproductive => panic!("the window must roll over"),
+        }
+    }
+
+    async fn listening() -> (Arc<HookBus>, Arc<Listener>) {
+        let bus = Arc::new(HookBus::new());
+        let listener = Listener::prompt("indexer");
+        listener.subscribe(&bus, HookKind::OnContextArchived).await;
+        (bus, listener)
+    }
+
+    /// A rollover of `state`'s chat that was never sealed: no file holds
+    /// its archive.
+    fn unsealed(state: &SharedContinuation) -> PreparedRollover {
+        PreparedRollover {
+            messages: Vec::new(),
+            logical_id: CHAT.into(),
+            epoch: state.lock().unwrap().epoch,
+            window: 2,
+            parts: vec![whole_window(ArchiveRef {
+                id: "a".repeat(32),
+                message_count: 3,
+                source_message_count: 4,
+            })],
+        }
+    }
+
+    /// Long enough for a delivery that was started to arrive.
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// An archive's id is one half of its digest: the first, or the second
+    /// when something else already has the first as its name. Nothing may
+    /// work one out from the other, so the id the seal returned is the one
+    /// that has to reach everything written from it. Here the first and the
+    /// last part of a split window are stored under their second ids, and
+    /// those are the ids in the continuation message, in the marker (the
+    /// last part is the archive resume looks up), in the hook events with
+    /// the files they name, and the ids the parts are fetched by.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_part_stored_under_its_second_id_is_named_by_it_in_the_head_the_marker_and_the_event() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let scope = binding.scope().unwrap().clone();
+        let (bus, listener) = listening().await;
+        let (messages, state) = (split_window(), chat_state());
+
+        // What the window is sealed as with nothing in the way, learned in
+        // a store of its own: the cut, and each part's digest.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let usual = archive_store_for_session(elsewhere.path(), &scope, CHAT)
+            .unwrap()
+            .seal_window(&messages, "")
+            .unwrap()
+            .parts;
+        assert!(usual.len() > 1, "{usual:?}");
+        let digest_of = |part: &ArchivePart| {
+            let id = &part.archive.id;
+            let file = agent_core::context_archive::archive_file(elsewhere.path(), scope.key(), id)
+                .unwrap()
+                .unwrap();
+            let record: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+            let digest = record["digest"].as_str().unwrap().to_owned();
+            assert_eq!(digest[..32], **id, "with nothing in the way, the first half");
+            digest
+        };
+
+        // Something that is not a file has the first half as its name, for
+        // the first part and for the last. (Another chat's archive shows
+        // which directory that is.)
+        let (other, _) = binding
+            .history_seal("another-chat", &[Arc::new(json!({"role":"user","content":"another chat"}))], "")
+            .await
+            .unwrap();
+        let file_of =
+            |id: &str| agent_core::context_archive::archive_file(binding.base(), scope.key(), id);
+        let shelf = file_of(&other.id).unwrap().unwrap().parent().unwrap().to_owned();
+        let moved = [0, usual.len() - 1];
+        let mut second = vec![None; usual.len()];
+        for n in moved {
+            let digest = digest_of(&usual[n]);
+            std::fs::create_dir(shelf.join(format!("{}.json", &digest[..32]))).unwrap();
+            second[n] = Some(digest[32..].to_owned());
+        }
+
+        // The same window, cut the same way; the two parts have other ids.
+        let prepared = seal(&binding, &state, &messages).await;
+        let parts = prepared.parts.clone();
+        assert_eq!(parts.len(), usual.len());
+        for ((part, usual), second) in parts.iter().zip(&usual).zip(&second) {
+            assert_eq!(part.first_source_index, usual.first_source_index);
+            assert_eq!(part.archive.source_message_count, usual.archive.source_message_count);
+            assert_eq!(part.archive.message_count, usual.archive.message_count);
+            assert_eq!(&part.archive.id, second.as_ref().unwrap_or(&usual.archive.id));
+        }
+        let last = second[usual.len() - 1].clone().unwrap();
+
+        // The continuation message lists each part by the id it has.
+        let text = prepared.messages[0]["content"].as_str().unwrap().to_owned();
+        let mut from = 0;
+        for part in &parts {
+            let at = text[from..].find(&format!("ctx-{} (", part.archive.id));
+            from += at.unwrap_or_else(|| panic!("{} is listed, in order: {text}", part.archive.id)) + 1;
+        }
+        for n in moved {
+            assert!(!text.contains(&usual[n].archive.id), "not the half that is not its name: {text}");
+        }
+
+        // So does the marker, and its `archive` is the last part's.
+        let next = prepared.commit_and_announce(&state, &bus, &binding, None).unwrap();
+        let marker = &next[0]["_synaps_context"];
+        let ids: Vec<Value> = parts.iter().map(|part| json!(part.archive.id)).collect();
+        let recorded: Vec<Value> =
+            marker["archives"].as_array().unwrap().iter().map(|entry| entry["id"].clone()).collect();
+        assert_eq!(recorded, ids);
+        assert_eq!(marker["archive"], json!(last));
+
+        // Each event names that id, and the file that holds the archive.
+        let events = listener.wait_for(parts.len()).await;
+        assert_eq!(events.len(), parts.len());
+        for (event, part) in events.iter().zip(&parts) {
+            let id = &part.archive.id;
+            assert_eq!(event.data["archive_id"], json!(id));
+            let path = std::path::PathBuf::from(event.data["path"].as_str().expect("a path"));
+            assert_eq!(path.file_name().unwrap().to_str().unwrap(), format!("{id}.json"));
+            assert!(path.is_file(), "{path:?}");
+            let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(record["id"], json!(id));
+            assert_eq!(file_of(id).unwrap().as_deref(), Some(path.as_path()));
+        }
+
+        // Fetched by the id it has; the other half of its digest is not
+        // its name.
+        for n in moved {
+            let stored = binding.history_fetch(&parts[n].archive.id, 0, 1).await.unwrap();
+            assert_eq!(stored.len(), 1);
+            assert!(binding.history_fetch(&usual[n].archive.id, 0, 1).await.is_err());
+        }
+        // And resume finds the chat's archive by the id the marker has.
+        let resumed = chat_state();
+        restore_window(&next, &resumed, &binding);
+        {
+            let s = resumed.lock().unwrap();
+            assert_eq!((s.window, s.latest_archive.as_ref()), (2, Some(&last)));
+        }
+        settle().await;
+        assert_eq!(listener.events().len(), parts.len(), "one event per part");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_sealed_window_is_announced_with_its_archive_file() {
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (bus, listener) = listening().await;
+        let (messages, state) = (window(), chat_state());
+        let prepared = seal(&binding, &state, &messages).await;
+        // The chat's folder, not the process's: only a stamped event has it.
+        let chat_folder = env.path().join("chat-folder");
+        assert_ne!(chat_folder, std::env::current_dir().unwrap());
+
+        // Sealed is not announced: the events go out with the commit.
+        settle().await;
+        assert!(listener.events().is_empty(), "{:?}", listener.events());
+        let next = prepared
+            .commit_and_announce(&state, &bus, &binding, Some(&chat_folder))
+            .unwrap();
+        let event = listener.wait_for(1).await.remove(0);
+
+        assert_eq!(event.kind, HookKind::OnContextArchived);
+        assert_eq!(event.session_id.as_deref(), Some(CHAT));
+        assert_eq!(event.cwd.as_deref(), chat_folder.to_str());
+        assert!(event.message.is_none() && event.transcript.is_none());
+        let data = &event.data;
+        let id = data["archive_id"].as_str().unwrap().to_owned();
+        assert_eq!(data["project_key"], json!(binding.scope().unwrap().key()));
+        assert_eq!(data["source_message_count"], json!(messages.len()));
+        assert_eq!(data["window"], json!(2));
+        assert_eq!((&data["part"], &data["parts"]), (&json!(1), &json!(1)));
+        assert_eq!(data["first_source_index"], json!(0));
+        assert_eq!(data["reduced_messages"], json!(0));
+
+        // The path is the file that holds this archive, a live record.
+        let path = std::path::PathBuf::from(data["path"].as_str().unwrap());
+        assert!(path.is_absolute() && path.starts_with(env.path()), "{path:?}");
+        assert_eq!(path.file_name().unwrap().to_str(), Some(format!("{id}.json").as_str()));
+        let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["id"], json!(id));
+        assert_eq!(record["body"]["state"], "live");
+        assert_eq!(record["body"]["source_message_count"], data["source_message_count"]);
+        assert_eq!(
+            json!(record["body"]["messages"].as_array().unwrap().len()),
+            data["message_count"]
+        );
+
+        // It is the archive the new window's marker names, and the one the
+        // chat's state now holds.
+        assert_eq!(next[0]["_synaps_context"]["archive"], json!(id));
+        assert_eq!(next[0]["_synaps_context"]["window"], data["window"]);
+        assert_eq!(state.lock().unwrap().latest_archive.as_deref(), Some(id.as_str()));
+
+        settle().await;
+        assert_eq!(listener.events().len(), 1, "one archive, one event");
+        assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    /// A window over what one archive holds is sealed as several: one event
+    /// per part, in order, each with its own archive and file, its place in
+    /// the window and how many of its messages are stored reduced. Together
+    /// they are the parts the new window's marker records.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn each_part_of_a_split_window_is_announced_with_its_own_file() {
+        let env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (bus, listener) = listening().await;
+        let (messages, state) = (split_window(), chat_state());
+        let prepared = seal(&binding, &state, &messages).await;
+        let parts = prepared.parts.clone();
+        assert!(parts.len() > 1, "{parts:?}");
+
+        let next = prepared.commit_and_announce(&state, &bus, &binding, None).unwrap();
+        let events = listener.wait_for(parts.len()).await;
+        assert_eq!(events.len(), parts.len());
+        let mut files = std::collections::HashSet::new();
+        let mut covered = 0;
+        for (index, (event, part)) in events.iter().zip(&parts).enumerate() {
+            assert_eq!(event.kind, HookKind::OnContextArchived);
+            assert_eq!(event.session_id.as_deref(), Some(CHAT));
+            let data = &event.data;
+            assert_eq!(data["archive_id"], json!(part.archive.id));
+            assert_eq!((&data["part"], &data["parts"]), (&json!(index + 1), &json!(parts.len())));
+            assert_eq!(data["first_source_index"], json!(covered));
+            assert_eq!(data["source_message_count"], json!(part.archive.source_message_count));
+            assert_eq!(data["message_count"], json!(part.archive.message_count));
+            assert_eq!(data["reduced_messages"], json!(part.reduced_messages));
+            assert_eq!(data["window"], json!(2));
+            assert_eq!(data["project_key"], json!(binding.scope().unwrap().key()));
+            covered += part.archive.source_message_count;
+            // Its own file, a live record of that archive.
+            let path = std::path::PathBuf::from(data["path"].as_str().unwrap());
+            assert!(path.starts_with(env.path()), "{path:?}");
+            let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(record["id"], data["archive_id"]);
+            assert_eq!(record["body"]["source_message_count"], data["source_message_count"]);
+            assert!(files.insert(path), "two parts, one file: {events:?}");
+        }
+        assert_eq!(covered, messages.len(), "the parts cover the window");
+
+        // The marker of the new window records the same parts, and names
+        // the last one as its archive.
+        let marker = &next[0]["_synaps_context"];
+        let recorded: Vec<&Value> = marker["archives"].as_array().unwrap().iter().collect();
+        assert_eq!(recorded.len(), events.len());
+        for (entry, event) in recorded.iter().zip(&events) {
+            assert_eq!(entry["id"], event.data["archive_id"]);
+            assert_eq!(entry["first"], event.data["first_source_index"]);
+            assert_eq!(entry["count"], event.data["source_message_count"]);
+            assert_eq!(entry["messages"], event.data["message_count"]);
+            let reduced = entry.get("reduced").cloned().unwrap_or(json!(0));
+            assert_eq!(reduced, event.data["reduced_messages"]);
+        }
+        assert_eq!(marker["archive"], events.last().unwrap().data["archive_id"]);
+
+        settle().await;
+        assert_eq!(listener.events().len(), parts.len(), "one event per part");
+        assert_eq!(bus.notifies_in_flight(), 0);
+    }
+
+    /// A window is announced by the rollover that commits it, once. A
+    /// rollover that sealed the window and was then given up (a cancel, a
+    /// head save that failed) sent nothing, so the attempt that follows,
+    /// which finds the archive already written, is the only announcement
+    /// under that `session_id` and `window`. The events used to go out
+    /// straight after the seal, once for each attempt.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_window_sealed_twice_is_announced_once_by_the_rollover_that_commits() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (bus, listener) = listening().await;
+        let (messages, state) = (window(), chat_state());
+        // Sealed, and abandoned before its head was saved.
+        let abandoned = seal(&binding, &state, &messages).await;
+        let sealed = abandoned.parts.clone();
+        drop(abandoned);
+        settle().await;
+        assert!(listener.events().is_empty(), "{:?}", listener.events());
+        assert_eq!(bus.notifies_in_flight(), 0);
+
+        // The same window again: the same projection, found on disk.
+        let prepared = seal(&binding, &state, &messages).await;
+        assert_eq!(prepared.parts, sealed);
+        prepared.commit_and_announce(&state, &bus, &binding, None).unwrap();
+        let events = listener.wait_for(1).await;
+        assert_eq!(events[0].data["archive_id"], json!(sealed[0].archive.id));
+        assert!(events[0].data["path"].is_string());
+        settle().await;
+        assert_eq!(listener.events().len(), 1, "announced once");
+        let listed = binding.history_search("", 8).await.unwrap();
+        assert_eq!(listed.len(), 1, "sealed once: {listed:?}");
+    }
+
+    /// The head was saved for a session binding that is no longer the
+    /// runtime's (the chat was reset or reloaded while the save was in
+    /// flight): the commit is refused and nothing is announced.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_rollover_whose_commit_is_refused_announces_nothing() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (bus, listener) = listening().await;
+        let (messages, state) = (window(), chat_state());
+        let prepared = seal(&binding, &state, &messages).await;
+        state.lock().unwrap().epoch = uuid::Uuid::new_v4();
+        let refused = prepared.commit_and_announce(&state, &bus, &binding, None);
+        assert!(refused.unwrap_err().to_string().contains("superseded session binding"));
+        assert_eq!(bus.notifies_in_flight(), 0, "no delivery was started");
+        settle().await;
+        assert!(listener.events().is_empty(), "{:?}", listener.events());
+        assert_eq!(state.lock().unwrap().window, 1);
+    }
+
+    /// A rollover whose archive no file holds is still announced, without a
+    /// path, and the lookup creates nothing. A binding with no project
+    /// announces nothing.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn an_archive_with_no_file_is_announced_without_a_path() {
+        let env = BaseDirGuard::new();
+        let (bus, listener) = listening().await;
+        let state = chat_state();
+        let nowhere = MemoryBinding::for_cwd(None);
+        unsealed(&state).commit_and_announce(&state, &bus, &nowhere, None).unwrap();
+        assert_eq!(bus.notifies_in_flight(), 0, "no delivery was started");
+        assert!(!env.path().join("context-archives").exists());
+
+        let files = crate::tools::test_helpers::memory_binding(env.path());
+        unsealed(&state).commit_and_announce(&state, &bus, &files, None).unwrap();
+        let events = listener.wait_for(1).await;
+        assert_eq!(events.len(), 1, "only the one with a project: {events:?}");
+        assert_eq!(events[0].data["path"], Value::Null);
+        assert_eq!(events[0].data["message_count"], json!(3));
+        assert!(!env.path().join("context-archives").exists(), "a lookup creates nothing");
+    }
+
+    /// A worker's windows are not in this store, and with nobody subscribed
+    /// not even the file lookup is started.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn nothing_is_announced_from_a_worker_or_without_a_subscriber() {
+        let env = BaseDirGuard::new();
+        let files = crate::tools::test_helpers::memory_binding(env.path());
+        let (host, listener) = listening().await;
+        let state = chat_state();
+        let worker = HookBus::worker_transforms(&host);
+        unsealed(&state).commit_and_announce(&state, &worker, &files, None).unwrap();
+        let silent = Arc::new(HookBus::new());
+        unsealed(&state).commit_and_announce(&state, &silent, &files, None).unwrap();
+        assert_eq!(
+            (worker.notifies_in_flight(), host.notifies_in_flight(), silent.notifies_in_flight()),
+            (0, 0, 0)
+        );
+        settle().await;
+        assert!(listener.events().is_empty());
+    }
+}
+
+/// What a resumed chat finds of the archives its head names, and what the
+/// log says when it does not find them ([`restore_window`]).
+#[cfg(test)]
+mod resume_tests {
+    use super::archived_hook_tests::{chat_state, seal, split_window, window, CHAT};
+    use super::*;
+    use crate::test_env::{BaseDirGuard, EnvVarGuard};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// The warnings of this thread, and of the detached part check it
+    /// starts, as the log file would have them.
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Log {
+        /// Capture from here until the guard is dropped.
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            let sink = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || sink.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        /// The lines about a resumed chat (the store logs what it passes
+        /// over, too).
+        fn lines(&self) -> Vec<String> {
+            let text = String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned();
+            let ours = |line: &&str| line.contains("resumed chat:");
+            text.lines().filter(ours).map(str::to_owned).collect()
+        }
+
+        /// Those lines once there are `count` of them, and whatever the
+        /// detached check adds in the fifth of a second after that.
+        async fn wait_for(&self, count: usize) -> Vec<String> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.lines().len() < count {
+                assert!(Instant::now() < deadline, "{count} lines expected: {:?}", self.lines());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.lines()
+        }
+
+        fn clear(&self) {
+            self.0.lock().unwrap().clear();
+        }
+    }
+
+    /// `messages` rolled over and committed, as chat [`CHAT`]: the new head
+    /// and what the window was sealed as.
+    async fn rolled_over(
+        binding: &MemoryBinding,
+        messages: &[SharedMessage],
+    ) -> (Vec<SharedMessage>, Vec<ArchivePart>) {
+        let state = chat_state();
+        let prepared = seal(binding, &state, messages).await;
+        let parts = prepared.parts.clone();
+        (prepared.commit(&state).unwrap(), parts)
+    }
+
+    /// (archive link, window, settled) of a chat's state.
+    fn restored(state: &SharedContinuation) -> (Option<String>, u64, bool) {
+        let s = state.lock().unwrap();
+        (s.latest_archive.clone(), s.window, s.initialized)
+    }
+
+    /// `head` resumed as a chat that was never open in this process.
+    fn resume(head: &[SharedMessage], binding: &MemoryBinding) -> (Option<String>, u64, bool) {
+        let state = chat_state();
+        restore_window(head, &state, binding);
+        restored(&state)
+    }
+
+    fn file_of(binding: &MemoryBinding, id: &str) -> PathBuf {
+        let key = binding.scope().unwrap().key();
+        agent_core::context_archive::archive_file(binding.base(), key, id)
+            .unwrap()
+            .expect("the archive's file")
+    }
+
+    /// Put something that is not a file where archive `id` is, keeping the
+    /// archive beside it: a lookup of `id` now fails, and not with "not
+    /// found". Returns what undoes it.
+    fn make_unreadable(binding: &MemoryBinding, id: &str) -> impl FnOnce() {
+        let file = file_of(binding, id);
+        let aside = file.with_extension("aside");
+        std::fs::rename(&file, &aside).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        move || {
+            std::fs::remove_dir(&file).unwrap();
+            std::fs::rename(&aside, &file).unwrap();
+        }
+    }
+
+    /// A folder that is a project of its own.
+    fn project() -> tempfile::TempDir {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join(".synaps-project"), "").unwrap();
+        folder
+    }
+
+    /// A session runtime as the host builds it for a chat in `folder`: the
+    /// folder first, then the binding of the chat's memory to that folder's
+    /// project.
+    fn runtime_in(folder: &Path) -> crate::Runtime {
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_cwd(Some(folder.to_path_buf()));
+        rt.bind_memory();
+        rt
+    }
+
+    fn assert_says(line: &str, said: &[&str]) {
+        for said in said {
+            assert!(line.contains(said), "{said:?} is not in: {line}");
+        }
+    }
+
+    /// `--continue` gives a chat the folder of the client that resumes it.
+    /// A window sealed with the chat in folder A is in A's project; the chat
+    /// continued from folder B looks in B's project, where it is not, and
+    /// goes on at window 1 without an archive link. That is the policy as it
+    /// stands, and this pins it. What is new is that it is no longer silent:
+    /// the log says which archive was looked for and in which project's
+    /// store, and the three ways of not finding it read differently.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_chat_continued_in_another_project_goes_on_at_window_1_and_the_log_says_where_it_looked() {
+        let _env = BaseDirGuard::new();
+        let _root = EnvVarGuard::remove("SYNAPS_PROJECT_ROOT");
+        let (a, b) = (project(), project());
+        let (in_a, in_b) = (runtime_in(a.path()), runtime_in(b.path()));
+        let key = |rt: &crate::Runtime| rt.memory_backend.scope().unwrap().key().to_owned();
+        let (key_a, key_b) = (key(&in_a), key(&in_b));
+        assert_ne!(key_a, key_b);
+
+        // The chat rolls over while it runs in folder A.
+        let (head, parts) = rolled_over(&in_a.memory_backend, &window()).await;
+        let archive = format!("ctx-{}", parts[0].archive.id);
+        let log = Log::default();
+        let _capture = log.capture();
+        let continued_in = |folder: &Path| {
+            let rt = runtime_in(folder);
+            rt.reset_context_continuation(CHAT, &head);
+            restored(&rt.continuation)
+        };
+
+        // Resumed in A: found, and nothing to say.
+        assert_eq!(continued_in(a.path()), (Some(parts[0].archive.id.clone()), 2, true));
+        assert_eq!(log.lines(), Vec::<String>::new());
+
+        // Continued in B, a project that has archived nothing.
+        assert_eq!(continued_in(b.path()), (None, 1, true));
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_says(&lines[0], &[&archive, &key_b, CHAT, "has no archive store", "goes on at window 1"]);
+        assert!(!lines[0].contains(&key_a), "{}", lines[0]);
+
+        // B has archives of its own, and not this one.
+        in_b.memory_backend.history_seal("another-chat", &window(), "").await.unwrap();
+        assert_eq!(continued_in(b.path()), (None, 1, true));
+        let lines = log.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_says(&lines[1], &[&archive, &key_b, "does not hold it", "sealed in another project"]);
+
+        // Continued in a folder that is not there: no project at all.
+        assert_eq!(continued_in(&b.path().join("gone")), (None, 1, true));
+        let lines = log.lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_says(&lines[2], &[&archive, "no project to look in"]);
+    }
+
+    /// Only an archive that is not there settles a resume. A lookup that
+    /// fails for another reason (here something that cannot be read is under
+    /// the archive's name; a busy store and an I/O error end the same way)
+    /// used to count as "no archive" too, and for good: the chat stayed at
+    /// window 1 without its archive link however often it was asked again.
+    /// It now settles nothing, says so, and the next call looks again.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_lookup_that_fails_settles_nothing_and_the_next_call_looks_again() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let id = parts[0].archive.id.clone();
+        let heal = make_unreadable(&binding, &id);
+
+        let log = Log::default();
+        let _capture = log.capture();
+        let state = chat_state();
+        restore_window(&head, &state, &binding);
+        assert_eq!(restored(&state), (None, 1, false), "nothing is settled");
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let key = binding.scope().unwrap().key();
+        assert_says(&lines[0], &[&format!("ctx-{id}"), key, "could not be looked up", "made again"]);
+        // Asked again while it still fails: still open, and said again.
+        restore_window(&head, &state, &binding);
+        assert_eq!(restored(&state), (None, 1, false));
+        assert_eq!(log.lines().len(), 2);
+
+        // The store can be read again: the same call finds the archive.
+        heal();
+        restore_window(&head, &state, &binding);
+        assert_eq!(restored(&state), (Some(id), 2, true));
+        assert_eq!(log.lines().len(), 2, "found: nothing more to say");
+    }
+
+    /// A lookup that fails for good (here something that is not a file under
+    /// the archive's name) was made again at every turn start for as long as
+    /// the chat lived, with a warning each time, also after the chat had
+    /// rolled over: the rollover wrote the window and the archive link into
+    /// the state and left it "not restored yet". A committed rollover now
+    /// settles it. The state is what the rollover made it, and no later call
+    /// looks anything up, whatever the new head names.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_committed_rollover_settles_a_resume_whose_lookup_kept_failing() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let _unreadable = make_unreadable(&binding, &parts[0].archive.id);
+
+        let log = Log::default();
+        let _capture = log.capture();
+        let state = chat_state();
+        restore_window(&head, &state, &binding);
+        assert_eq!(restored(&state), (None, 1, false), "nothing is settled");
+        assert_eq!(log.lines().len(), 1);
+
+        // The chat goes on at window 1 and rolls over.
+        let mut next = vec![head[0].clone()];
+        next.extend(window());
+        next.insert(2, Arc::new(json!({"role":"user","content":"And one more request."})));
+        let prepared = seal(&binding, &state, &next).await;
+        let sealed = prepared.parts.last().unwrap().archive.id.clone();
+        assert_ne!(sealed, parts[0].archive.id);
+        let new_head = prepared.commit(&state).unwrap();
+        let settled = (Some(sealed.clone()), 2, true);
+        assert_eq!(restored(&state), settled, "the rollover settles it");
+
+        // Nothing is looked up after that: not for the old head, and not
+        // for the new one, whose archive cannot be read either.
+        let _unreadable_too = make_unreadable(&binding, &sealed);
+        for head in [&head, &new_head, &new_head] {
+            restore_window(head, &state, &binding);
+            assert_eq!(restored(&state), settled);
+        }
+        assert_eq!(log.lines().len(), 1, "no lookup, so nothing more is said: {:?}", log.lines());
+    }
+
+    /// `head` with `key` of its marker set to `value`.
+    fn marked(head: &[SharedMessage], key: &str, value: Value) -> Vec<SharedMessage> {
+        let mut first = (*head[0]).clone();
+        first["_synaps_context"][key] = value;
+        let mut head = head.to_vec();
+        head[0] = Arc::new(first);
+        head
+    }
+
+    /// No rollover writes window 0. The resume once took such a marker,
+    /// archive link and all, and the chat went on at window 0. It is
+    /// refused whole now, and the barrier before the first request lets the
+    /// turn run.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_marker_with_window_0_is_refused_by_the_file_store_resume_too() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let id = parts[0].archive.id.clone();
+        assert_eq!(resume(&head, &binding), (Some(id), 2, true), "as it was sealed");
+
+        let zero = marked(&head, "window", json!(0));
+        let log = Log::default();
+        let _capture = log.capture();
+        assert_eq!(resume(&zero, &binding), (None, 1, true));
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_says(&lines[0], &["window 0", "goes on at window 1 without its archive link"]);
+
+        let state = chat_state();
+        validate_restored_history(&zero, &state, &binding).await.unwrap();
+        let s = state.lock().unwrap();
+        assert_eq!((s.latest_archive.clone(), s.window, s.initialized), (None, 1, true));
+    }
+
+    /// An archive id is 32 lowercase hex characters on every path that
+    /// reads a resumed head ([`is_archive_id`]). Here the file-store path:
+    /// the id in capitals is not looked up, and the log says the marker
+    /// names no archive.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn an_id_in_uppercase_is_no_archive_id_for_the_file_store_resume() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let id = parts[0].archive.id.clone();
+        // An id of digits alone has no capitals to test with.
+        let upper = if id.bytes().any(|b| b.is_ascii_lowercase()) {
+            id.to_uppercase()
+        } else {
+            "ABCDEF0123456789ABCDEF0123456789".to_string()
+        };
+        assert!(is_archive_id(&id) && !is_archive_id(&upper));
+
+        let log = Log::default();
+        let _capture = log.capture();
+        assert_eq!(resume(&marked(&head, "archive", json!(upper)), &binding), (None, 1, true));
+        let lines = log.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_says(&lines[0], &["names no archive", "32 bytes that are not an archive id"]);
+        assert!(!lines[0].contains(&upper), "what is not an id is not logged: {lines:?}");
+    }
+
+    /// `head` with its marker's `archives` replaced by entries of `ids`.
+    fn listing(head: &[SharedMessage], ids: impl IntoIterator<Item = String>) -> Vec<SharedMessage> {
+        let mut first = (*head[0]).clone();
+        let entries: Vec<Value> = ids.into_iter().map(|id| json!({"id": id, "first": 0, "count": 1, "messages": 1})).collect();
+        first["_synaps_context"]["archives"] = json!(entries);
+        let mut head = head.to_vec();
+        head[0] = Arc::new(first);
+        head
+    }
+
+    /// The marker is read from a session file, and resume used whatever
+    /// strings it held: every `archives[].id` was fetched, one whole archive
+    /// file each, with a warning carrying the string for each that failed,
+    /// and the marker's `archive` was logged as it was when it was not an
+    /// id. A long list is now looked up to a bound and the rest counted.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn resume_looks_up_a_bounded_number_of_the_parts_a_head_lists() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let found = (Some(parts[0].archive.id.clone()), 2, true);
+        // 200 ids no archive has, the first of them listed twice, and the
+        // archive the marker names, which is looked up as that.
+        let absent = |n: usize| format!("{n:032x}");
+        let mut ids: Vec<String> = (0..200).map(absent).collect();
+        ids.insert(1, absent(0));
+        ids.insert(2, parts[0].archive.id.clone());
+        let head = listing(&head, ids);
+
+        let log = Log::default();
+        let _capture = log.capture();
+        assert_eq!(resume(&head, &binding), found);
+        let lines = log.wait_for(CHECKED_PARTS + 1).await;
+        let looked_up: Vec<&String> =
+            lines.iter().filter(|line| line.contains("lists an earlier archive")).collect();
+        assert_eq!(looked_up.len(), CHECKED_PARTS, "{} lines", lines.len());
+        for (n, line) in looked_up.iter().enumerate() {
+            assert_says(line, &[&format!("ctx-{}", absent(n))]);
+        }
+        // One line for all the others.
+        assert_eq!(lines.len(), CHECKED_PARTS + 1, "{lines:?}");
+        let rest = lines.iter().find(|line| line.contains("not every earlier archive")).unwrap();
+        assert_says(rest, &[CHAT, "checked=64", "unchecked=136", "not_ids=0"]);
+    }
+
+    /// A string in the marker that is not an id is not an archive to fetch
+    /// and not something to write to the log, whatever it is: here 10 MB in
+    /// the marker's `archive` and in an `archives[].id`.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn resume_neither_fetches_nor_logs_a_marker_string_that_is_not_an_id() {
+        const BYTES: usize = 10 * 1024 * 1024;
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (head, parts) = rolled_over(&binding, &window()).await;
+        let id = parts[0].archive.id.clone();
+        let huge = "7".repeat(BYTES);
+        let log = Log::default();
+        let _capture = log.capture();
+        let logged = |log: &Log| log.0.lock().unwrap().len();
+
+        // In the list: counted, and the resume is what it would have been.
+        // Uppercase hex, and an id with something after it, are not ids.
+        let not_ids = [huge.clone(), id.to_uppercase(), format!("{id}/../x"), String::new()];
+        let listed = listing(&head, not_ids);
+        assert_eq!(resume(&listed, &binding), (Some(id.clone()), 2, true));
+        let lines = log.wait_for(1).await;
+        assert_eq!(lines.len(), 1, "nothing was looked up: {} lines", lines.len());
+        assert_says(&lines[0], &["not every earlier archive", "checked=0", "unchecked=0", "not_ids=4"]);
+        assert!(logged(&log) < 2_048, "{} bytes logged", logged(&log));
+
+        // As the archive the marker names: not found, settled, and the log
+        // has its length.
+        log.clear();
+        let mut first = (*head[0]).clone();
+        first["_synaps_context"]["archive"] = json!(huge);
+        let named = vec![Arc::new(first)];
+        assert_eq!(resume(&named, &binding), (None, 1, true));
+        let lines = log.wait_for(1).await;
+        assert_eq!(lines.len(), 1, "{} lines", lines.len());
+        assert_says(&lines[0], &[CHAT, "names no archive", &format!("{BYTES} bytes"), "goes on at window 1"]);
+        assert!(!lines[0].contains("ctx-"), "no archive is named");
+        assert!(logged(&log) < 2_048, "{} bytes logged", logged(&log));
+    }
+
+    /// A head that lists the parts of a split window tells the model each of
+    /// them is available. Resume looked up the last one only, so a missing
+    /// or damaged earlier part was noticed when the model fetched it. Each
+    /// listed part is now looked up, and the log names every one the store
+    /// cannot give back. The resume itself does not wait for that and does
+    /// not depend on it.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn resume_warns_for_each_listed_part_the_store_cannot_give_back() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (head, parts) = rolled_over(&binding, &split_window()).await;
+        let (last, earlier) = parts.split_last().unwrap();
+        assert!(earlier.len() >= 2, "three inputs that cannot share an archive: {parts:?}");
+        let (missing, damaged) = (&earlier[0].archive.id, &earlier[1].archive.id);
+        assert!(missing != damaged && missing != &last.archive.id && damaged != &last.archive.id);
+        let found = (Some(last.archive.id.clone()), 2, true);
+        let key = binding.scope().unwrap().key();
+        let log = Log::default();
+        let _capture = log.capture();
+
+        // Every part is there: nothing to say.
+        assert_eq!(resume(&head, &binding), found);
+        assert_eq!(log.wait_for(0).await, Vec::<String>::new());
+
+        // An earlier part's file is gone.
+        std::fs::remove_file(file_of(&binding, missing)).unwrap();
+        assert_eq!(resume(&head, &binding), found);
+        let lines = log.wait_for(1).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_says(&lines[0], &[&format!("ctx-{missing}"), key, CHAT, "lists an earlier archive"]);
+
+        // Another one cannot be read.
+        let _heal = make_unreadable(&binding, damaged);
+        log.clear();
+        assert_eq!(resume(&head, &binding), found);
+        let lines = log.wait_for(2).await;
+        assert_eq!(lines.len(), 2, "one line for each, in the head's order: {lines:?}");
+        assert_says(&lines[0], &[&format!("ctx-{missing}"), "lists an earlier archive"]);
+        assert_says(&lines[1], &[&format!("ctx-{damaged}"), "lists an earlier archive"]);
+    }
+
+    /// The marker names the last part, so forgetting it (`memory_forget`) is
+    /// what forgetting the single archive of a window is: the chat goes on
+    /// at window 1 without an archive link. It says so now, and the earlier
+    /// parts, which are all there, are not reported.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn resume_with_the_last_part_forgotten_goes_on_at_window_1_and_says_so() {
+        let _env = BaseDirGuard::new();
+        let binding = MemoryBinding::for_process_cwd();
+        let (head, parts) = rolled_over(&binding, &split_window()).await;
+        let (last, earlier) = parts.split_last().unwrap();
+        assert!(!earlier.is_empty(), "{parts:?}");
+        binding.history_forget(&last.archive.id).await.unwrap();
+
+        let log = Log::default();
+        let _capture = log.capture();
+        assert_eq!(resume(&head, &binding), (None, 1, true));
+        let lines = log.wait_for(1).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let key = binding.scope().unwrap().key();
+        let archive = format!("ctx-{}", last.archive.id);
+        assert_says(&lines[0], &[&archive, key, "was not found", "missing, forgotten", "goes on at window 1"]);
+        // The earlier parts are still fetched by the ids the head lists.
+        for part in earlier {
+            binding.history_fetch(&part.archive.id, 0, 1).await.unwrap();
+        }
     }
 }

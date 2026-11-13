@@ -1,4 +1,3 @@
-use crate::core::shell_config::ShellConfig;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -542,7 +541,7 @@ pub const MAX_CACHE_KEEPWARM_HOURS: u32 = 48;
 /// Default for `cache_keepwarm_auto_max_hours`: the longest an `auto` idle
 /// period may run. Without it the ski-rental bound alone lets a 0.05×
 /// cache-read model (Opus 5.5, Sonnet 5.5) ping ~39 times over ~36h and a
-/// 0.025× model (Fable 5.1, Mythos 5.1) ~79 times over ~72h under a 1h TTL,
+/// 0.025× model (Fable 5.1 / 5.2, Mythos 5.1 / 5.2) ~79 times over ~72h under a 1h TTL,
 /// keeping an abandoned session unparked for days. 24h: a user who steps
 /// away for a working day or overnight still comes back to a warm cache; a
 /// session left over a weekend parks. (Owner decision, task #444.)
@@ -1139,7 +1138,7 @@ fn removed_bridge_warning() -> String {
 }
 
 /// Parse `turn_budget.<role>.<field>` keys. Invalid values warn and keep
-/// the default (parity with shell.* parsing). `Err` carries the stderr
+/// the default. `Err` carries the stderr
 /// diagnostic. `Ok(Some(warning))`: applied, with a deprecation warning for
 /// `config.warnings` (shown at TUI startup and on stderr for headless
 /// hosts).
@@ -1224,161 +1223,69 @@ fn parse_turn_budget_config_key(
     Ok(deprecation)
 }
 
-/// Continuous-memory settings surface (Task A2, spec §12). Every field is
-/// fail-closed: unknown or invalid values warn and keep the compiled default.
-///
-/// This struct contains continuous-memory policy; backend selection lives in
-/// the separate `MemoryBackendConfig`.
-/// Secret handling, retention, and project-scope rules are deliberately NOT
-/// fields here — they are not configurable at all (spec §12: "Secret,
-/// retention, and project rules are not configurable to fail open").
-#[derive(Debug, Clone, PartialEq)]
-pub struct MemoryConfig {
-    /// Durable default memory mode. "off" unless the operator explicitly
-    /// consents via `memory.default_mode_confirmed = true` in the same
-    /// config parse pass (spec §12 operator-consent rule). Known values:
-    /// off | recall_once | recall_each_prompt | capture_only |
-    /// capture_and_recall (spec §6.1).
-    pub default_mode: String,
-    /// Operator-consent latch for `default_mode` (spec §12). Must be set to
-    /// `true` in the same parse pass for a non-"off" `default_mode` to take
-    /// effect; otherwise `default_mode` reverts to "off" with a warning.
-    pub default_mode_confirmed: bool,
-    /// Max records surfaced per recall (spec §10.3 budget).
-    pub recall_max_records: u32,
-    /// Max tokens surfaced per recall (spec §10.3 budget).
-    pub recall_max_tokens: u32,
-    /// Recall time budget in milliseconds (spec §16).
-    pub recall_timeout_ms: u64,
-    /// Tool-result capture policy: off | summary_only (spec §11).
-    pub capture_tools: String,
-    /// Capture assistant turns (spec §8.2).
-    pub capture_assistant: bool,
-    /// Capture user turns (spec §8.2).
-    pub capture_user: bool,
-    /// Background consolidation: off | on (spec §11.3, explicit opt-in).
-    pub auto_consolidate: String,
-    /// Local embedding models: off | on (spec §11.2, never implicit).
-    pub local_embeddings: String,
-    /// GLiNER entity extraction: off | on (spec §11.2, never implicit).
-    pub gliner: String,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            default_mode: "off".to_string(),
-            default_mode_confirmed: false,
-            recall_max_records: 8,
-            recall_max_tokens: 4096,
-            recall_timeout_ms: 150,
-            capture_tools: "summary_only".to_string(),
-            capture_assistant: true,
-            capture_user: true,
-            auto_consolidate: "off".to_string(),
-            local_embeddings: "off".to_string(),
-            gliner: "off".to_string(),
-        }
-    }
-}
-
-/// Memory mode strings accepted by `memory.default_mode` (spec §6.1,
-/// snake_case of `MemoryContextMode`). Anything else fails closed to the
-/// current value — `default_mode` can never silently become a non-off mode
-/// through an unrecognised string.
-const KNOWN_MEMORY_MODES: &[&str] = &[
-    "off",
-    "recall_once",
-    "recall_each_prompt",
-    "capture_only",
-    "capture_and_recall",
+/// The eleven keys of built-in automatic memory (capture and recall), which
+/// left core for an extension. Read, never validated, never able to fail
+/// anything: whatever their values, the family is reported with one warning
+/// so an old config still loads.
+const REMOVED_AUTOMATIC_MEMORY_KEYS: [&str; 11] = [
+    "memory.default_mode",
+    "memory.default_mode_confirmed",
+    "memory.recall_max_records",
+    "memory.recall_max_tokens",
+    "memory.recall_timeout_ms",
+    "memory.capture_tools",
+    "memory.capture_assistant",
+    "memory.capture_user",
+    "memory.auto_consolidate",
+    "memory.local_embeddings",
+    "memory.gliner",
 ];
-
-/// Parse `memory.<field>` keys (Task A2, spec §12). Invalid values warn and
-/// keep the default (parity with turn_budget.* parsing) — never fail open.
-/// `Err` carries the diagnostic the caller prints.
-fn parse_memory_config_key(memory: &mut MemoryConfig, key: &str, val: &str) -> Result<(), String> {
-    let Some(field) = key.strip_prefix("memory.") else {
-        return Ok(());
-    };
-    /// Strict boolean: recognised forms parse; anything else warns and
-    /// keeps the current (default) value.
-    fn parse_bool(slot: &mut bool, key: &str, val: &str) -> Result<(), String> {
-        match val {
-            "true" | "1" | "yes" | "on" => *slot = true,
-            "false" | "0" | "no" | "off" => *slot = false,
-            other => {
-                return Err(format!(
-                    "Warning: invalid value for {key}: '{other}', expected true/false — using default"
-                ))
-            }
-        }
-        Ok(())
-    }
-    /// Closed string-enum: value must be in `allowed`, else warn and keep
-    /// the current (default) value.
-    fn parse_enum(slot: &mut String, key: &str, val: &str, allowed: &[&str]) -> Result<(), String> {
-        if allowed.contains(&val) {
-            *slot = val.to_string();
-            Ok(())
-        } else {
-            Err(format!(
-                "Warning: invalid value for {key}: '{val}', expected one of {} — using default",
-                allowed.join("|")
-            ))
-        }
-    }
-    macro_rules! set_num {
-        ($slot:expr, $ty:ty) => {
-            match val.parse::<$ty>() {
-                Ok(parsed) => {
-                    $slot = parsed;
-                    Ok(())
-                }
-                Err(_) => Err(format!("Warning: invalid value for {key}: '{val}', using default")),
-            }
-        };
-    }
-    match field {
-        "default_mode" => parse_enum(&mut memory.default_mode, key, val, KNOWN_MEMORY_MODES),
-        "default_mode_confirmed" => parse_bool(&mut memory.default_mode_confirmed, key, val),
-        "recall_max_records" => set_num!(memory.recall_max_records, u32),
-        "recall_max_tokens" => set_num!(memory.recall_max_tokens, u32),
-        "recall_timeout_ms" => set_num!(memory.recall_timeout_ms, u64),
-        "capture_tools" => parse_enum(
-            &mut memory.capture_tools,
-            key,
-            val,
-            &["off", "summary_only"],
-        ),
-        "capture_assistant" => parse_bool(&mut memory.capture_assistant, key, val),
-        "capture_user" => parse_bool(&mut memory.capture_user, key, val),
-        "auto_consolidate" => parse_enum(&mut memory.auto_consolidate, key, val, &["off", "on"]),
-        "local_embeddings" => parse_enum(&mut memory.local_embeddings, key, val, &["off", "on"]),
-        "gliner" => parse_enum(&mut memory.gliner, key, val, &["off", "on"]),
-        other => Err(format!("Warning: unknown memory field '{other}'")),
-    }
+fn removed_automatic_memory_warning() -> String {
+    format!(
+        "memory.default_mode, memory.recall_* and memory.capture_* (and memory.auto_consolidate, \
+         memory.local_embeddings, memory.gliner) are ignored: built-in automatic memory was \
+         removed in {}; an extension provides capture and recall through hooks. Remove these lines",
+        crate::AXEL_BACKEND_REMOVED_IN
+    )
 }
 
-/// Host-owned note storage selection, independent of continuous-memory consent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MemoryBackendKind {
-    #[default]
-    Legacy,
-    Axel,
-    /// Invalid configuration must never select legacy storage implicitly.
-    Unavailable,
+/// The warning for a config that selected or configured the removed Axel
+/// memory backend: `memory.backend = axel`, or any of `memory.user_scope`,
+/// `memory.axel.executable`, `memory.axel.brain` with any value. There is
+/// one store now, plain files, so these keys are read, never validated and
+/// never able to fail anything: the config loads, on plain files.
+fn removed_axel_backend_warning() -> String {
+    format!(
+        "The Axel memory backend (memory.backend = axel, memory.user_scope, memory.axel.*) is no \
+         longer supported: since {v} Synaps keeps context archives and notes in plain files under \
+         its base directory, always, and Axel is an extension. This session uses plain files. \
+         Archives and notes saved to the Axel brain are not read any more: move them once with \
+         \"axel synaps-export\" (Axel v2) and \"synaps memory import-archives\" / \
+         \"import-notes\", install the Axel extension for recall and the forum, then remove the \
+         memory.backend, memory.user_scope and memory.axel.* lines. See \
+         https://github.com/HaseebKhalid1507/SynapsCLI/blob/dev/docs/upgrading/{v}.md",
+        v = crate::AXEL_BACKEND_REMOVED_IN
+    )
+}
+/// The warning for a config whose only such line is `memory.backend` with
+/// another value (`legacy`, or anything else).
+fn removed_memory_backend_warning() -> String {
+    format!(
+        "memory.backend is ignored: plain files are the only memory storage since {}. Remove \
+         this line",
+        crate::AXEL_BACKEND_REMOVED_IN
+    )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct MemoryBackendConfig {
-    pub kind: MemoryBackendKind,
-    /// Explicit absolute executable path; never resolved through PATH.
-    pub executable: Option<PathBuf>,
-    /// Optional absolute shared Axel brain path; absent uses the private user default.
-    pub brain: Option<PathBuf>,
-    /// Explicit host opt-in to user-wide notes. Never grants capture/history consent.
-    pub user_scope: bool,
+/// The warning for a config that still sets `sidecar_toggle_key`. The
+/// sidecar system is gone; the key is read and ignored.
+fn removed_sidecar_toggle_key_warning() -> String {
+    format!(
+        "sidecar_toggle_key is ignored: the plugin sidecar system was removed in {}, so core \
+         binds no toggle key any more. Plugin keybinds and the keybinds setting still work. \
+         Remove this line",
+        crate::SIDECAR_REMOVED_IN
+    )
 }
 
 /// Parsed configuration from the config file.
@@ -1565,6 +1472,13 @@ pub struct SynapsConfig {
     /// with `tool_reference` blocks, so an activation never changes the cached
     /// prompt prefix. `off` restores the per-activation tools-array change.
     pub tools_deferred_loading: bool,
+    /// `tools.always_loaded`: canonical tool ids (`ext.axel:search`,
+    /// `builtin:subagent`, as `activate_tools` takes them) that join the
+    /// session core under progressive disclosure, so they are loaded from the
+    /// first request instead of waiting for `activate_tools`. Only ids in the
+    /// catalog with a verified source are admitted (the activation trust
+    /// rule); absent ones are skipped. No effect without disclosure.
+    pub tools_always_loaded: Vec<crate::orchestration::capability::ToolId>,
     /// Opt-in session persistence strategy (Task 35, spec §9.8). `Json`
     /// (default) is the unchanged legacy full-rewrite path; `Journal` adds
     /// an append-only delta journal with periodic atomic snapshots. See
@@ -1573,7 +1487,6 @@ pub struct SynapsConfig {
     /// Built-in tools to disable by runtime name (e.g. "bash", "ls"). Removed
     /// from the registry at boot so they're never offered to the model.
     pub disabled_tools: Vec<String>,
-    pub shell: ShellConfig,
     pub server: ServerConfig,
     pub auth: AuthConfig,
     pub events: EventsConfig,
@@ -1581,10 +1494,6 @@ pub struct SynapsConfig {
     pub keybinds: std::collections::HashMap<String, String>,
     /// Typed per-role turn budgets (Task 23, spec §8.1).
     pub turn_budgets: TurnBudgetsConfig,
-    /// Continuous-memory settings surface (Task A2, spec §12).
-    pub memory: MemoryConfig,
-    /// Host-owned backend; selecting it does not enable recall or capture.
-    pub memory_backend: MemoryBackendConfig,
     /// Non-fatal problems found while parsing the config file (unknown keys,
     /// unparseable values). Surfaced once at startup — never block boot.
     pub warnings: Vec<String>,
@@ -1649,17 +1558,15 @@ impl Default for SynapsConfig {
             progressive_tool_disclosure: false,
             tools_activation_confirm: ActivationConfirm::default(),
             tools_deferred_loading: true,
+            tools_always_loaded: Vec::new(),
             session_persistence: crate::core::session_journal::SessionPersistence::default(),
             disabled_tools: Vec::new(),
-            shell: ShellConfig::default(),
             server: ServerConfig::default(),
             auth: AuthConfig::default(),
             events: EventsConfig::default(),
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
             turn_budgets: TurnBudgetsConfig::default(),
-            memory: MemoryConfig::default(),
-            memory_backend: MemoryBackendConfig::default(),
             warnings: Vec::new(),
         }
     }
@@ -1780,26 +1687,17 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "progressive_tool_disclosure",
     "tools.activation_confirm",
     "tools.deferred_loading",
+    "tools.always_loaded",
     "session_persistence",
-    "sidecar_toggle_key",
 ];
 
 /// Every key accepted by the namespaced family parsers that is NOT in
-/// [`KNOWN_CONFIG_KEYS`] (`shell.*`, `events.*`, `turn_budget.*`,
-/// `memory.*`, `server.*`, `auth.*`). Open-ended families whose
+/// [`KNOWN_CONFIG_KEYS`] (`events.*`, `turn_budget.*`,
+/// `server.*`, `auth.*`). Open-ended families whose
 /// suffix is user-chosen are listed as `prefix.*`. Keep this in sync when a
 /// parser learns a key: the /settings coverage test requires each entry to
 /// have a settings row or an explicit exclusion.
 pub const FAMILY_CONFIG_KEYS: &[&str] = &[
-    // parse_shell_config_key
-    "shell.max_sessions",
-    "shell.idle_timeout",
-    "shell.readiness_timeout_ms",
-    "shell.max_readiness_timeout_ms",
-    "shell.default_rows",
-    "shell.default_cols",
-    "shell.readiness_strategy",
-    "shell.max_output",
     // parse_events_config_key
     "events.auto_turn",
     "events.auto_turn_cap",
@@ -1825,23 +1723,6 @@ pub const FAMILY_CONFIG_KEYS: &[&str] = &[
     "turn_budget.worker.max_context_tokens",
     "turn_budget.worker.max_cost_usd",
     "turn_budget.worker.max_round_renewals",
-    // memory backend (top-level arms of apply_config_content)
-    "memory.backend",
-    "memory.user_scope",
-    "memory.axel.executable",
-    "memory.axel.brain",
-    // parse_memory_config_key
-    "memory.default_mode",
-    "memory.default_mode_confirmed",
-    "memory.recall_max_records",
-    "memory.recall_max_tokens",
-    "memory.recall_timeout_ms",
-    "memory.capture_tools",
-    "memory.capture_assistant",
-    "memory.capture_user",
-    "memory.auto_consolidate",
-    "memory.local_embeddings",
-    "memory.gliner",
     // parse_server_config_key
     "server.auto_approve_confirms",
     // parse_auth_config_key
@@ -1888,51 +1769,51 @@ fn parse_comma_list(val: &str) -> Vec<String> {
         .collect()
 }
 
+/// `tools.always_loaded`: comma-separated canonical tool ids. Returns the
+/// parsed ids (deduplicated, in order) and the raw spellings that failed
+/// [`ToolId::parse`](crate::orchestration::capability::ToolId::parse).
+fn parse_tool_id_list(val: &str) -> (Vec<crate::orchestration::capability::ToolId>, Vec<String>) {
+    let mut ids = Vec::new();
+    let mut bad = Vec::new();
+    for raw in parse_comma_list(val) {
+        match crate::orchestration::capability::ToolId::parse(&raw) {
+            Ok(id) if !ids.contains(&id) => ids.push(id),
+            Ok(_) => {}
+            Err(_) => bad.push(raw),
+        }
+    }
+    (ids, bad)
+}
+
 fn write_comma_list_locked(key: &str, values: &[String]) -> std::io::Result<()> {
     write_config_value_locked(key, &values.join(", "))
 }
 
-/// Parse shell.* configuration keys and update the ShellConfig. `Err`
-/// carries the diagnostic the caller prints.
-fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) -> Result<(), String> {
-    let invalid = || format!("Warning: invalid value for {key}: '{val}', using default");
-    match key {
-        "shell.max_sessions" => {
-            shell_config.max_sessions = val.parse::<usize>().map_err(|_| invalid())?;
-        }
-        "shell.idle_timeout" => {
-            let timeout = val.parse::<u64>().map_err(|_| invalid())?;
-            shell_config.idle_timeout = std::time::Duration::from_secs(timeout);
-        }
-        "shell.readiness_timeout_ms" => {
-            shell_config.readiness_timeout_ms = val.parse::<u64>().map_err(|_| invalid())?;
-        }
-        "shell.max_readiness_timeout_ms" => {
-            shell_config.max_readiness_timeout_ms = val.parse::<u64>().map_err(|_| invalid())?;
-        }
-        "shell.default_rows" => {
-            shell_config.default_rows = val.parse::<u16>().map_err(|_| invalid())?;
-        }
-        "shell.default_cols" => {
-            shell_config.default_cols = val.parse::<u16>().map_err(|_| invalid())?;
-        }
-        "shell.readiness_strategy" => {
-            let val_lower = val.to_lowercase();
-            match val_lower.as_str() {
-                "timeout" | "prompt" | "hybrid" => {
-                    shell_config.readiness_strategy = val.to_string();
-                }
-                _ => return Err(invalid()),
-            }
-        }
-        "shell.max_output" => {
-            shell_config.max_output = val.parse::<usize>().map_err(|_| invalid())?;
-        }
-        _ => {
-            // Unknown shell.* keys are preserved (not rejected)
-        }
-    }
-    Ok(())
+/// The `shell.*` keys removed in 0.12.0. They were parsed but read by
+/// nothing (the shell tool always used its defaults). A config that still
+/// sets them loads, ignores them and gets one warning naming the keys set.
+pub const REMOVED_SHELL_KEYS: &[&str] = &[
+    "shell.max_sessions",
+    "shell.idle_timeout",
+    "shell.readiness_timeout_ms",
+    "shell.max_readiness_timeout_ms",
+    "shell.default_rows",
+    "shell.default_cols",
+    "shell.readiness_strategy",
+    "shell.max_output",
+];
+
+/// The one warning for the removed `shell.*` keys a config sets, named in
+/// [`REMOVED_SHELL_KEYS`] order, each once.
+fn removed_shell_keys_warning(set: &[&str]) -> String {
+    format!(
+        "{} no longer {} anything (removed in {}; {} never read): delete {}",
+        set.join(", "),
+        if set.len() == 1 { "does" } else { "do" },
+        crate::REMOVED_IN,
+        if set.len() == 1 { "it was" } else { "they were" },
+        if set.len() == 1 { "this line" } else { "these lines" },
+    )
 }
 
 /// Parse server.* configuration keys and update the ServerConfig.
@@ -2043,7 +1924,7 @@ pub fn load_config_from_str(content: &str) -> SynapsConfig {
 }
 
 /// Every problem the parser reports for `content`: the `warnings` surfaced
-/// at startup plus the stderr-only diagnostics of the `shell.*`, `events.*`,
+/// at startup plus the stderr-only diagnostics of the `events.*`,
 /// `turn_budget.*` and `memory.*` families. Pure — prints nothing and
 /// touches no process state.
 pub fn config_content_problems(content: &str) -> Vec<String> {
@@ -2059,8 +1940,8 @@ pub fn config_content_problems(content: &str) -> Vec<String> {
 /// Runs the real parser over the config file as it would look after
 /// [`write_config_value`] and returns `Err` with the parser's own messages
 /// for any problem the edit introduces — invalid values, and cross-key
-/// rules such as `context_management` threshold ordering, `subagent`
-/// concurrency vs total, or `memory.default_mode` without operator consent.
+/// rules such as `context_management` threshold ordering or `subagent`
+/// concurrency vs total. A removed key is refused with its removal warning.
 /// Problems already present before the edit are not blamed on it.
 pub fn validate_config_edit(key: &str, value: &str) -> Result<(), String> {
     if key.contains(['=', '\n', '\r'])
@@ -2111,8 +1992,8 @@ pub fn load_config() -> SynapsConfig {
 /// Apply key=value config lines from `content` into `config`.
 /// Shared by `load_config` (file path) and `load_config_from_str` (test helper).
 fn apply_config_content(config: &mut SynapsConfig, content: &str) {
-    // The shell/events/turn_budget/memory families report to stderr (not
-    // `config.warnings`) — unchanged behaviour.
+    // The events/turn_budget families and an unknown `memory.*` key
+    // report to stderr (not `config.warnings`) — unchanged behaviour.
     apply_config_content_with(config, content, &mut |diagnostic: String| eprintln!("{diagnostic}"));
 }
 
@@ -2125,7 +2006,10 @@ fn apply_config_content_with(
     family_diagnostic: &mut dyn FnMut(String),
 ) {
     let mut invalid_context_management = false;
-    let mut invalid_memory_backend = false;
+    // The removed memory backend keys: which of their two warnings is due.
+    let (mut removed_axel_backend, mut removed_other_backend) = (false, false);
+    let mut removed_sidecar_toggle_key = false;
+    let mut removed_shell_keys = [false; REMOVED_SHELL_KEYS.len()];
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2464,10 +2348,9 @@ fn apply_config_content_with(
                     *field = Some(val.to_string());
                 }
             }
-            // Read directly by the keybind registry (`read_config_value`);
-            // recognised here so the /settings row never trips the
-            // unknown-key warning.
-            "sidecar_toggle_key" => {}
+            // Removed with the sidecar system: read, never applied, and
+            // reported once after the loop.
+            "sidecar_toggle_key" => removed_sidecar_toggle_key = true,
             "agent_name" => config.agent_name = Some(val.to_string()),
             "identity" => config.identity = Some(val.to_string()),
             "disabled_plugins" => {
@@ -2496,6 +2379,17 @@ fn apply_config_content_with(
                      keeping the default (auto)"
                 )),
             },
+            "tools.always_loaded" => {
+                let (ids, bad) = parse_tool_id_list(val);
+                config.tools_always_loaded = ids;
+                if !bad.is_empty() {
+                    config.warnings.push(format!(
+                        "tools.always_loaded: ignoring malformed tool id(s) {} — expected \
+                         namespace:name, e.g. ext.axel:search or builtin:subagent",
+                        bad.join(", ")
+                    ));
+                }
+            }
             "session_persistence" => {
                 match crate::core::session_journal::SessionPersistence::parse(val) {
                     Some(mode) => config.session_persistence = mode,
@@ -2508,50 +2402,21 @@ fn apply_config_content_with(
             "disabled_tools" => {
                 config.disabled_tools = parse_comma_list(val);
             }
-            "memory.backend" => {
-                config.memory_backend.kind = match val {
-                    "legacy" => MemoryBackendKind::Legacy,
-                    "axel" => MemoryBackendKind::Axel,
-                    _ => {
-                        invalid_memory_backend = true;
-                        config.warnings.push(format!(
-                            "memory.backend = {val} — expected legacy or axel; memory backend unavailable"
-                        ));
-                        MemoryBackendKind::Unavailable
-                    }
-                };
-            }
-            "memory.user_scope" => match val {
-                "true" => config.memory_backend.user_scope = true,
-                "false" => config.memory_backend.user_scope = false,
-                _ => {
-                    invalid_memory_backend = true;
-                    config.warnings.push("memory.user_scope — expected true or false; memory backend unavailable".into());
-                }
-            },
-            "memory.axel.executable" | "memory.axel.brain" => {
-                let path = PathBuf::from(val);
-                if !path.is_absolute() {
-                    invalid_memory_backend = true;
-                    config.warnings.push(format!(
-                        "{key} — expected an absolute path; memory backend unavailable"
-                    ));
-                }
-                // Retain invalid paths too: direct config consumers must not
-                // mistake an invalid explicit path for an absent default.
-                if key == "memory.axel.executable" {
-                    config.memory_backend.executable = Some(path);
-                } else {
-                    config.memory_backend.brain = Some(path);
+            // The removed memory backend keys. Read, never validated:
+            // whatever the values, the family is reported once, after the
+            // loop, and nothing else changes.
+            "memory.backend" if val != "axel" => removed_other_backend = true,
+            "memory.backend" | "memory.user_scope" | "memory.axel.executable"
+            | "memory.axel.brain" => removed_axel_backend = true,
+            // Removed in 0.12.0: ignored, reported once after the loop.
+            key if REMOVED_SHELL_KEYS.contains(&key) => {
+                if let Some(i) = REMOVED_SHELL_KEYS.iter().position(|k| *k == key) {
+                    removed_shell_keys[i] = true;
                 }
             }
             _ => {
                 // Handle namespaced keys
-                if key.starts_with("shell.") {
-                    if let Err(diagnostic) = parse_shell_config_key(&mut config.shell, key, val) {
-                        family_diagnostic(diagnostic);
-                    }
-                } else if key.starts_with("server.") {
+                if key.starts_with("server.") {
                     if let Some(warning) = parse_server_config_key(&mut config.server, key, val) {
                         if !config.warnings.contains(&warning) {
                             config.warnings.push(warning);
@@ -2596,11 +2461,14 @@ fn apply_config_content_with(
                         }
                         Err(diagnostic) => family_diagnostic(diagnostic),
                     }
-                } else if key.starts_with("memory.") {
-                    if let Err(diagnostic) = parse_memory_config_key(&mut config.memory, key, val)
-                    {
-                        family_diagnostic(diagnostic);
+                } else if REMOVED_AUTOMATIC_MEMORY_KEYS.contains(&key) {
+                    // One warning for the family, whatever the values.
+                    let warning = removed_automatic_memory_warning();
+                    if !config.warnings.contains(&warning) {
+                        config.warnings.push(warning);
                     }
+                } else if let Some(field) = key.strip_prefix("memory.") {
+                    family_diagnostic(format!("Warning: unknown memory field '{field}'"));
                 } else if key.starts_with("startup.") {
                     if let Err(reason) =
                         parse_startup_config_key(&mut config.startup, key, val)
@@ -2682,23 +2550,24 @@ fn apply_config_content_with(
         );
     }
 
-    // Any invalid backend setting poisons this parse pass, regardless of key
-    // order or later duplicate selectors. Never silently route to legacy.
-    if invalid_memory_backend {
-        config.memory_backend.kind = MemoryBackendKind::Unavailable;
+    // One line for the removed memory backend keys, however many there are
+    // and in whatever order: the Axel one when the config selected or
+    // configured Axel, else the one for a bare `memory.backend`.
+    if removed_axel_backend {
+        config.warnings.push(removed_axel_backend_warning());
+    } else if removed_other_backend {
+        config.warnings.push(removed_memory_backend_warning());
     }
-
-    // Fail-closed operator-consent rule (Task A2, spec §12): a non-"off"
-    // `memory.default_mode` takes effect only when the operator also set
-    // `memory.default_mode_confirmed = true` in this same parse pass.
-    // Checked after the loop so key order never matters.
-    if config.memory.default_mode != "off" && !config.memory.default_mode_confirmed {
-        config.warnings.push(format!(
-            "memory.default_mode = {} requires memory.default_mode_confirmed = true \
-             in the same config; reverting to off",
-            config.memory.default_mode
-        ));
-        config.memory.default_mode = "off".to_string();
+    if removed_sidecar_toggle_key {
+        config.warnings.push(removed_sidecar_toggle_key_warning());
+    }
+    let set_shell_keys: Vec<&str> = REMOVED_SHELL_KEYS
+        .iter()
+        .zip(removed_shell_keys)
+        .filter_map(|(k, set)| set.then_some(*k))
+        .collect();
+    if !set_shell_keys.is_empty() {
+        config.warnings.push(removed_shell_keys_warning(&set_shell_keys));
     }
 }
 
@@ -2983,6 +2852,38 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("tools.deferred_loading")));
+    }
+
+    #[test]
+    fn tools_always_loaded_parses_ids_and_warns_on_malformed() {
+        use crate::orchestration::capability::ToolId;
+        assert!(super::load_config_from_str("").tools_always_loaded.is_empty());
+        let good = super::load_config_from_str(
+            "tools.always_loaded =  ext.axel:search ,builtin:subagent,, ext.axel:search \n",
+        );
+        assert_eq!(
+            good.tools_always_loaded,
+            vec![
+                ToolId::parse("ext.axel:search").unwrap(),
+                ToolId::parse("builtin:subagent").unwrap(),
+            ]
+        );
+        assert!(good.warnings.is_empty(), "{:?}", good.warnings);
+
+        let bad = super::load_config_from_str(
+            "tools.always_loaded = ext.axel:search, Axel Search, subagent\n",
+        );
+        assert_eq!(
+            bad.tools_always_loaded,
+            vec![ToolId::parse("ext.axel:search").unwrap()],
+            "a malformed id is dropped, the good ones are kept"
+        );
+        let warning = bad
+            .warnings
+            .iter()
+            .find(|w| w.contains("tools.always_loaded"))
+            .expect("malformed ids warn");
+        assert!(warning.contains("Axel Search") && warning.contains("subagent"), "{warning}");
     }
 
     #[test]
@@ -3810,10 +3711,21 @@ mod tests {
         }
     }
 
+    /// An old config with every automatic-memory key still loads: one
+    /// warning for the family, with the exact text, and no key changes
+    /// anything. Garbage values are not validated, so they cannot add a
+    /// second warning or a diagnostic.
     #[test]
-    fn memory_keys_all_parse_with_consent() {
-        let config = super::load_config_from_str(
-            "memory.default_mode = capture_and_recall\n\
+    fn removed_automatic_memory_keys_still_load_with_one_warning() {
+        let expected = format!(
+            "memory.default_mode, memory.recall_* and memory.capture_* (and \
+             memory.auto_consolidate, memory.local_embeddings, memory.gliner) are ignored: \
+             built-in automatic memory was removed in {}; an extension provides capture and \
+             recall through hooks. Remove these lines",
+            crate::AXEL_BACKEND_REMOVED_IN
+        );
+        assert_eq!(super::removed_automatic_memory_warning(), expected);
+        let valid = "memory.default_mode = capture_and_recall\n\
              memory.default_mode_confirmed = true\n\
              memory.recall_max_records = 12\n\
              memory.recall_max_tokens = 2048\n\
@@ -3823,43 +3735,10 @@ mod tests {
              memory.capture_user = false\n\
              memory.auto_consolidate = on\n\
              memory.local_embeddings = on\n\
-             memory.gliner = on\n",
-        );
-        assert_eq!(config.memory.default_mode, "capture_and_recall");
-        assert!(config.memory.default_mode_confirmed);
-        assert_eq!(config.memory.recall_max_records, 12);
-        assert_eq!(config.memory.recall_max_tokens, 2048);
-        assert_eq!(config.memory.recall_timeout_ms, 250);
-        assert_eq!(config.memory.capture_tools, "off");
-        assert!(!config.memory.capture_assistant);
-        assert!(!config.memory.capture_user);
-        assert_eq!(config.memory.auto_consolidate, "on");
-        assert_eq!(config.memory.local_embeddings, "on");
-        assert_eq!(config.memory.gliner, "on");
-    }
-
-    #[test]
-    fn memory_defaults_match_spec_12() {
-        let config = super::load_config_from_str("");
-        assert_eq!(config.memory, super::MemoryConfig::default());
-        assert_eq!(config.memory.default_mode, "off");
-        assert!(!config.memory.default_mode_confirmed);
-        assert_eq!(config.memory.recall_max_records, 8);
-        assert_eq!(config.memory.recall_max_tokens, 4096);
-        assert_eq!(config.memory.recall_timeout_ms, 150);
-        assert_eq!(config.memory.capture_tools, "summary_only");
-        assert!(config.memory.capture_assistant);
-        assert!(config.memory.capture_user);
-        assert_eq!(config.memory.auto_consolidate, "off");
-        assert_eq!(config.memory.local_embeddings, "off");
-        assert_eq!(config.memory.gliner, "off");
-    }
-
-    #[test]
-    fn memory_unknown_values_fail_closed_to_defaults() {
-        let config = super::load_config_from_str(
-            "memory.default_mode = recall_everything_forever\n\
-             memory.default_mode_confirmed = true\n\
+             memory.gliner = on\n\
+             model = claude-sonnet-4-6\n";
+        let garbage = "memory.default_mode = recall_everything_forever\n\
+             memory.default_mode_confirmed = definitely\n\
              memory.recall_max_records = lots\n\
              memory.recall_max_tokens = -5\n\
              memory.recall_timeout_ms = fast\n\
@@ -3869,173 +3748,153 @@ mod tests {
              memory.auto_consolidate = aggressive\n\
              memory.local_embeddings = auto\n\
              memory.gliner = download\n\
-             memory.nosuchfield = 1\n",
+             model = claude-sonnet-4-6\n";
+        assert_eq!(valid.lines().filter(|l| l.contains("memory.")).count(), 11);
+        let plain = super::load_config_from_str("model = claude-sonnet-4-6\n");
+        for content in [valid, garbage] {
+            let config = super::load_config_from_str(content);
+            assert_eq!(config.warnings, std::slice::from_ref(&expected), "{:?}", config.warnings);
+            // The family reaches nothing else: the next key still parses.
+            assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-6"));
+            assert_eq!(config.context_management, plain.context_management);
+            // No stderr diagnostic either: the warning is all there is.
+            assert_eq!(super::config_content_problems(content), std::slice::from_ref(&expected));
+        }
+        // Each key alone gives the same one warning.
+        for key in super::REMOVED_AUTOMATIC_MEMORY_KEYS {
+            let config = super::load_config_from_str(&format!("{key} = on\n"));
+            assert_eq!(config.warnings, std::slice::from_ref(&expected), "{key}");
+        }
+        // The old consent warning is gone: an unconfirmed mode says only that
+        // the key is ignored.
+        let unconfirmed = super::load_config_from_str("memory.default_mode = recall_each_prompt\n");
+        assert_eq!(unconfirmed.warnings, std::slice::from_ref(&expected));
+        // A `memory.*` key that never existed is still reported as unknown,
+        // not as removed.
+        assert_eq!(
+            super::config_content_problems("memory.nosuchfield = 1\n"),
+            ["Warning: unknown memory field 'nosuchfield'".to_string()]
         );
-        // Unrecognised mode string must stay "off" — never a non-off mode.
-        assert_eq!(config.memory.default_mode, "off");
-        assert_eq!(config.memory.recall_max_records, 8);
-        assert_eq!(config.memory.recall_max_tokens, 4096);
-        assert_eq!(config.memory.recall_timeout_ms, 150);
-        assert_eq!(config.memory.capture_tools, "summary_only");
-        assert!(config.memory.capture_assistant);
-        assert!(config.memory.capture_user);
-        assert_eq!(config.memory.auto_consolidate, "off");
-        assert_eq!(config.memory.local_embeddings, "off");
-        assert_eq!(config.memory.gliner, "off");
     }
 
-    #[test]
-    fn memory_default_mode_without_consent_reverts_to_off() {
-        let config = super::load_config_from_str("memory.default_mode = recall_each_prompt\n");
-        assert_eq!(config.memory.default_mode, "off");
-        assert!(
-            config
-                .warnings
-                .iter()
-                .any(|w| w.contains("memory.default_mode_confirmed")),
-            "reversion must surface a warning; got: {:?}",
-            config.warnings
+    /// The first warning of the removed memory backend keys, as written.
+    fn axel_backend_warning() -> String {
+        let v = crate::AXEL_BACKEND_REMOVED_IN;
+        let expected = format!(
+            "The Axel memory backend (memory.backend = axel, memory.user_scope, \
+             memory.axel.*) is no longer supported: since {v} Synaps keeps context archives and \
+             notes in plain files under its base directory, always, and Axel is an extension. \
+             This session uses plain files. Archives and notes saved to the Axel brain are not \
+             read any more: move them once with \"axel synaps-export\" (Axel v2) and \
+             \"synaps memory import-archives\" / \"import-notes\", install the Axel extension \
+             for recall and the forum, then remove the memory.backend, memory.user_scope and \
+             memory.axel.* lines. See \
+             https://github.com/HaseebKhalid1507/SynapsCLI/blob/dev/docs/upgrading/{v}.md"
         );
-
-        // Explicit false consent is not consent.
-        let denied = super::load_config_from_str(
-            "memory.default_mode = capture_only\n\
-             memory.default_mode_confirmed = false\n",
-        );
-        assert_eq!(denied.memory.default_mode, "off");
-
-        // Garbage consent value fails closed — not consent.
-        let garbage = super::load_config_from_str(
-            "memory.default_mode = capture_only\n\
-             memory.default_mode_confirmed = definitely\n",
-        );
-        assert_eq!(garbage.memory.default_mode, "off");
+        assert_eq!(super::removed_axel_backend_warning(), expected);
+        expected
     }
 
-    #[test]
-    fn memory_consent_is_order_independent() {
-        // Consent key before the mode key.
-        let before = super::load_config_from_str(
-            "memory.default_mode_confirmed = true\n\
-             memory.default_mode = recall_once\n",
+    /// The second: a `memory.backend` line that is not `axel`, alone.
+    fn other_backend_warning() -> String {
+        let expected = format!(
+            "memory.backend is ignored: plain files are the only memory storage since {}. \
+             Remove this line",
+            crate::AXEL_BACKEND_REMOVED_IN
         );
-        assert_eq!(before.memory.default_mode, "recall_once");
-        // Consent key after the mode key.
-        let after = super::load_config_from_str(
-            "memory.default_mode = recall_once\n\
-             memory.default_mode_confirmed = true\n",
-        );
-        assert_eq!(after.memory.default_mode, "recall_once");
+        assert_eq!(super::removed_memory_backend_warning(), expected);
+        expected
     }
 
+    /// T-B1. A config that selected or configured the Axel backend still
+    /// loads: one warning with the exact text, whatever the values, their
+    /// order or how often a key appears, and nothing else is reported or
+    /// changed. What used to make the backend "unavailable" (a relative
+    /// brain, a helper that is not there, a bad `user_scope`) is among them.
     #[test]
-    fn memory_backend_defaults_are_independent_of_consent() {
-        let config = super::load_config_from_str("");
-        assert_eq!(config.memory_backend, super::MemoryBackendConfig::default());
-        assert_eq!(config.memory_backend.kind, super::MemoryBackendKind::Legacy);
-        let axel = super::load_config_from_str("memory.backend = axel\n");
-        assert_eq!(axel.memory_backend.kind, super::MemoryBackendKind::Axel);
-        assert_eq!(axel.memory, config.memory);
-        assert!(axel.warnings.is_empty());
-    }
-
-    #[test]
-    fn user_wide_notes_require_explicit_valid_opt_in() {
-        let default = super::load_config_from_str("memory.backend = axel\n");
-        assert!(!default.memory_backend.user_scope);
-        let enabled =
-            super::load_config_from_str("memory.backend = axel\nmemory.user_scope = true\n");
-        assert!(enabled.memory_backend.user_scope);
-        assert_eq!(enabled.memory, default.memory);
-        for bad in ["yes", "", "1", "TRUE"] {
-            let config = super::load_config_from_str(&format!(
-                "memory.user_scope = {bad}\nmemory.backend = axel\n"
-            ));
-            assert_eq!(
-                config.memory_backend.kind,
-                super::MemoryBackendKind::Unavailable
-            );
+    fn a_config_with_the_axel_backend_keys_loads_with_one_warning() {
+        let expected = axel_backend_warning();
+        for content in [
+            "memory.backend = axel\n",
+            "memory.backend = axel\nmemory.backend = axel\nmemory.backend = axel\n",
+            "memory.backend = axel\nmemory.axel.brain = relative/brain.r8\n",
+            "memory.backend = axel\nmemory.axel.brain = ~/brain\n",
+            "memory.backend = axel\nmemory.axel.executable = /nonexistent/synaps-axel-memory-service\n",
+            "memory.backend = axel\nmemory.axel.executable = \nmemory.axel.brain = \n",
+            "memory.backend = axel\nmemory.user_scope = true\n",
+            "memory.user_scope = yes\nmemory.backend = axel\n",
+            "memory.backend = axel\nmemory.user_scope = true\n\
+             memory.axel.executable = /opt/axel/service\nmemory.axel.brain = /opt/axel/brain.r8\n",
+            // Any of the other three alone, with any value.
+            "memory.user_scope = false\n",
+            "memory.user_scope = \n",
+            "memory.axel.executable = /opt/axel/service\n",
+            "memory.axel.brain = relative\n",
+            "memory.axel.brain = /a\nmemory.axel.brain = /b\nmemory.axel.brain = /c\n",
+            // With another selector beside them, in either order.
+            "memory.backend = legacy\nmemory.axel.brain = /opt/axel/brain.r8\n",
+            "memory.backend = axel\nmemory.backend = legacy\n",
+            "memory.backend = sqlite\nmemory.backend = axel\n",
+        ] {
+            let content = format!("{content}model = claude-sonnet-4-6\n");
+            let config = super::load_config_from_str(&content);
+            assert_eq!(config.warnings, std::slice::from_ref(&expected), "{content}");
+            // No stderr diagnostic either, and the next key still parses.
+            assert_eq!(super::config_content_problems(&content), std::slice::from_ref(&expected));
+            assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-6"), "{content}");
         }
     }
 
+    /// T-B1. `memory.backend` with any other value, and no other backend
+    /// key: the short warning, once. `sqlite`, a typo and an empty value
+    /// are no different from `legacy`.
     #[test]
-    fn memory_backend_invalid_selector_fails_closed() {
+    fn a_config_with_another_memory_backend_loads_with_the_short_warning() {
+        let expected = other_backend_warning();
         for content in [
+            "memory.backend = legacy\n",
+            "memory.backend = sqlite\n",
             "memory.backend = typo\n",
-            "memory.backend = \n",
             "memory.backend = unavailable\n",
-            "memory.backend = axel\nmemory.backend = typo\n",
-            "memory.backend = typo\nmemory.backend = legacy\n",
+            "memory.backend = \n",
+            "memory.backend = AXEL\n",
+            "memory.backend = legacy\nmemory.backend = sqlite\nmemory.backend = legacy\n",
         ] {
             let config = super::load_config_from_str(content);
-            assert_eq!(
-                config.memory_backend.kind,
-                super::MemoryBackendKind::Unavailable
-            );
-            assert!(config
-                .warnings
-                .iter()
-                .any(|w| w.contains("memory backend unavailable")));
+            assert_eq!(config.warnings, std::slice::from_ref(&expected), "{content}");
+            assert_eq!(super::config_content_problems(content), std::slice::from_ref(&expected));
         }
+        // No such line, no warning.
+        assert!(super::load_config_from_str("model = claude-sonnet-4-6\n").warnings.is_empty());
     }
 
+    /// T-B1. The removed families are independent and say nothing about each
+    /// other; `context_management.mode = auto` beside them is on and has no
+    /// warning of its own (it seals to plain files).
     #[test]
-    fn memory_backend_absolute_paths_are_preserved() {
-        let root = std::env::current_dir().unwrap();
-        let executable = root.join("fixture bin/axel");
-        let brain = root.join("fixture brain");
-        let config = super::load_config_from_str(&format!(
-            "memory.axel.brain = {}\nmemory.backend = axel\nmemory.axel.executable = {}\n",
-            brain.display(),
-            executable.display()
-        ));
-        assert_eq!(config.memory_backend.kind, super::MemoryBackendKind::Axel);
-        assert_eq!(config.memory_backend.executable, Some(executable));
-        assert_eq!(config.memory_backend.brain, Some(brain));
-        assert!(config.warnings.is_empty());
-    }
+    fn removed_memory_keys_do_not_touch_context_management_or_each_other() {
+        let content = "memory.backend = axel\n\
+             memory.user_scope = true\n\
+             memory.axel.executable = /nonexistent/service\n\
+             memory.axel.brain = relative/brain.r8\n\
+             memory.default_mode = capture_and_recall\n\
+             memory.gliner = on\n\
+             context_management.mode = auto\n";
+        let config = super::load_config_from_str(content);
+        assert_eq!(
+            config.warnings,
+            [super::removed_automatic_memory_warning(), axel_backend_warning()],
+        );
+        assert_eq!(config.context_management.mode, ContextManagementMode::Auto);
+        let plain = super::load_config_from_str("context_management.mode = auto\n");
+        assert!(plain.warnings.is_empty(), "{:?}", plain.warnings);
+        assert_eq!(config.context_management, plain.context_management);
 
-    #[test]
-    fn memory_backend_relative_or_empty_paths_fail_closed_in_any_order() {
-        for key in ["memory.axel.executable", "memory.axel.brain"] {
-            for path in ["relative/path", "~/brain", ""] {
-                for content in [
-                    format!("memory.backend = axel\n{key} = {path}\n"),
-                    format!("{key} = {path}\nmemory.backend = legacy\n"),
-                ] {
-                    let config = super::load_config_from_str(&content);
-                    assert_eq!(
-                        config.memory_backend.kind,
-                        super::MemoryBackendKind::Unavailable
-                    );
-                    assert!(config.warnings.iter().any(|w| w.contains("absolute path")));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn memory_config_surface_is_closed_by_construction() {
-        // Exhaustive struct literal — no `..Default::default()` spread. This
-        // fails to COMPILE if any field is added to or removed from
-        // MemoryConfig, pinning the exact memory.* config surface. Secret,
-        // retention, and project-scope semantics have no field here, so no
-        // `memory.secret*` / `memory.retention*` / `memory.project*` config
-        // key can exist (spec §12: those rules are not configurable to fail
-        // open). Asserted by construction, not by test disproof.
-        let _closed_surface = super::MemoryConfig {
-            default_mode: "off".to_string(),
-            default_mode_confirmed: false,
-            recall_max_records: 8,
-            recall_max_tokens: 4096,
-            recall_timeout_ms: 150,
-            capture_tools: "summary_only".to_string(),
-            capture_assistant: true,
-            capture_user: true,
-            auto_consolidate: "off".to_string(),
-            local_embeddings: "off".to_string(),
-            gliner: "off".to_string(),
-        };
+        let legacy = super::load_config_from_str(
+            "context_management.mode = auto\nmemory.backend = legacy\n",
+        );
+        assert_eq!(legacy.warnings, [other_backend_warning()]);
+        assert_eq!(legacy.context_management, plain.context_management);
     }
 
     use super::*;
@@ -4631,10 +4490,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    // Note: test_load_config_nonexistent_file removed — HOME env var mutation
-    // is not thread-safe and races with shell config tests. Coverage provided
-    // by shell::config::tests::test_shell_config_from_file.
-
     #[test]
     fn test_synaps_config_default() {
         let config = SynapsConfig::default();
@@ -4651,8 +4506,6 @@ mod tests {
         assert!(config.disabled_skills.is_empty());
         assert!(!config.progressive_tool_disclosure);
         assert_eq!(config.tools_activation_confirm, ActivationConfirm::Auto);
-        assert_eq!(config.shell.max_sessions, 5);
-        assert_eq!(config.shell.idle_timeout.as_secs(), 600);
         // Server config defaults
         assert!(!config.server.auto_approve_confirms);
     }
@@ -5483,46 +5336,50 @@ api_retries = 5
         assert!(bad.warnings.iter().any(|w| w.contains("context_window")));
     }
 
-    /// The /settings sidecar row writes `sidecar_toggle_key`; it is read by
-    /// the keybind registry and must not trip the unknown-key warning.
+    /// The sidecar system is gone: an old `sidecar_toggle_key` line loads,
+    /// is ignored, and is reported once however often it appears.
     #[test]
-    fn sidecar_toggle_key_is_a_known_key() {
-        let cfg = load_config_from_str("sidecar_toggle_key = F2\n");
-        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
-        assert!(KNOWN_CONFIG_KEYS.contains(&"sidecar_toggle_key"));
+    fn removed_sidecar_toggle_key_loads_and_warns_once() {
+        let expected = format!(
+            "sidecar_toggle_key is ignored: the plugin sidecar system was removed in {}, so \
+             core binds no toggle key any more. Plugin keybinds and the keybinds setting \
+             still work. Remove this line",
+            crate::SIDECAR_REMOVED_IN
+        );
+        assert_eq!(super::removed_sidecar_toggle_key_warning(), expected);
+        for content in [
+            "sidecar_toggle_key = F2\n",
+            "sidecar_toggle_key = F8\nmodel = claude-opus-4-7\nsidecar_toggle_key = C-V\n",
+            "sidecar_toggle_key = \n",
+        ] {
+            let cfg = load_config_from_str(content);
+            assert_eq!(cfg.warnings, vec![expected.clone()], "{content:?}");
+        }
+        assert!(!KNOWN_CONFIG_KEYS.contains(&"sidecar_toggle_key"));
         assert!(KNOWN_CONFIG_KEYS.contains(&"compaction_mode"));
         assert!(KNOWN_CONFIG_KEYS.contains(&"compaction_exclude"));
     }
 
     /// `config_content_problems` sees the stderr-only family diagnostics
-    /// (shell/events/turn_budget/memory) as well as `warnings`, and nothing
+    /// (events/turn_budget/memory) as well as `warnings`, and nothing
     /// for valid values.
     #[test]
     fn config_content_problems_covers_family_diagnostics() {
         for bad in [
-            "shell.max_sessions = lots",
-            "shell.readiness_strategy = eventually",
             "events.auto_turn = maybe",
             "events.auto_turn_cap = many",
             "turn_budget.worker.max_cost_usd = cheap",
             "turn_budget.nobody.max_tool_calls = 3",
-            "memory.capture_tools = everything",
-            "memory.recall_max_records = -1",
-            "memory.user_scope = yes",
+            "memory.nosuchfield = 1",
             "cache_ttl = forever",
         ] {
             let problems = config_content_problems(bad);
             assert!(!problems.is_empty(), "{bad} should be reported");
         }
         for good in [
-            "shell.max_sessions = 8",
-            "shell.readiness_strategy = prompt",
             "events.auto_turn = off",
             "events.auto_turn_cap = unlimited",
             "turn_budget.worker.max_cost_usd = 2.5",
-            "memory.capture_tools = off",
-            "memory.recall_max_records = 4",
-            "memory.user_scope = true",
             "cache_ttl = hybrid",
             "cache_ttl = auto",
         ] {
@@ -5530,9 +5387,39 @@ api_retries = 5
             assert!(problems.is_empty(), "{good}: {problems:?}");
         }
         // The family values still land exactly as before.
-        let cfg = load_config_from_str("shell.max_sessions = 8\nevents.auto_turn = maybe\n");
-        assert_eq!(cfg.shell.max_sessions, 8);
+        let cfg = load_config_from_str("events.auto_turn = maybe\n");
         assert!(!cfg.events.auto_turn, "unrecognised auto_turn still fails safe to false");
+    }
+
+    /// The `shell.*` keys removed in 0.12.0 load, are ignored and get one
+    /// warning naming each key set, once, in `REMOVED_SHELL_KEYS` order.
+    #[test]
+    fn removed_shell_keys_warn_once() {
+        assert_eq!(REMOVED_SHELL_KEYS.len(), 8);
+        for key in REMOVED_SHELL_KEYS {
+            assert!(!KNOWN_CONFIG_KEYS.contains(key) && !FAMILY_CONFIG_KEYS.contains(key));
+        }
+        let expected = format!(
+            "shell.max_sessions, shell.max_output no longer do anything (removed in {}; they \
+             were never read): delete these lines",
+            crate::REMOVED_IN
+        );
+        // Two keys, one of them twice, out of order: one warning naming both.
+        let content = "shell.max_output = big\nshell.max_sessions = 10\nmodel = m\n\
+             shell.max_output = huge\n";
+        let cfg = load_config_from_str(content);
+        assert_eq!(cfg.warnings, std::slice::from_ref(&expected), "{:?}", cfg.warnings);
+        assert_eq!(cfg.model.as_deref(), Some("m"), "the rest of the file still loads");
+        assert_eq!(config_content_problems(content), [expected]);
+        let one = load_config_from_str("shell.default_rows = 30\n");
+        assert_eq!(
+            one.warnings,
+            [format!(
+                "shell.default_rows no longer does anything (removed in {}; it was never read): \
+                 delete this line",
+                crate::REMOVED_IN
+            )]
+        );
     }
 
     #[test]
@@ -5589,14 +5476,6 @@ api_retries = 5
     fn family_config_keys_are_real_parser_keys() {
         let sample = |key: &str| -> &'static str {
             match key {
-                "shell.readiness_strategy" => "hybrid",
-                "memory.backend" => "legacy",
-                "memory.user_scope" | "memory.default_mode_confirmed" => "true",
-                "memory.default_mode" => "off",
-                "memory.capture_tools" => "summary_only",
-                "memory.capture_assistant" | "memory.capture_user" => "on",
-                "memory.auto_consolidate" | "memory.local_embeddings" | "memory.gliner" => "off",
-                "memory.axel.executable" | "memory.axel.brain" => ABSOLUTE_SAMPLE_PATH,
                 "events.auto_turn" => "on",
                 "server.auto_approve_confirms" => "false",
                 "auth.remote_endpoint" | "auth.machine_token" => "x",
@@ -5621,9 +5500,7 @@ api_retries = 5
             assert!(validate_config_edit("cache_ttl", "1h").is_ok());
             assert!(validate_config_edit("cache_ttl", "auto").is_ok());
             assert!(validate_config_edit("cache_ttl", "2h").is_err());
-            assert!(validate_config_edit("shell.max_output", "big").is_err());
-            assert!(validate_config_edit("memory.axel.brain", "relative/brain").is_err());
-            assert!(validate_config_edit("memory.axel.brain", ABSOLUTE_SAMPLE_PATH).is_ok());
+            assert!(validate_config_edit("events.auto_turn_cap", "many").is_err());
             assert!(validate_config_edit("model", "a\nb").is_err());
 
             // Cross-key rules see the rest of the file.
@@ -5633,11 +5510,27 @@ api_retries = 5
             std::fs::write(&cfg, "subagent.max_total = 8\n").unwrap();
             assert!(validate_config_edit("subagent.max_concurrent", "8").is_ok());
             assert!(validate_config_edit("subagent.max_concurrent", "9").is_err());
+            // A removed key is refused with its removal warning, whatever
+            // the value (the consent rule it once had went with the key).
             std::fs::write(&cfg, "").unwrap();
-            assert!(validate_config_edit("memory.default_mode", "recall_once").is_err());
-            assert!(validate_config_edit("memory.default_mode", "off").is_ok());
-            std::fs::write(&cfg, "memory.default_mode_confirmed = true\n").unwrap();
-            assert!(validate_config_edit("memory.default_mode", "recall_once").is_ok());
+            for value in ["recall_once", "off"] {
+                assert_eq!(
+                    validate_config_edit("memory.default_mode", value),
+                    Err(removed_automatic_memory_warning())
+                );
+            }
+            for (key, value) in [
+                ("memory.backend", "axel"),
+                ("memory.user_scope", "true"),
+                ("memory.axel.executable", ABSOLUTE_SAMPLE_PATH),
+                ("memory.axel.brain", "relative/brain"),
+            ] {
+                assert_eq!(validate_config_edit(key, value), Err(removed_axel_backend_warning()));
+            }
+            assert_eq!(
+                validate_config_edit("memory.backend", "legacy"),
+                Err(removed_memory_backend_warning())
+            );
 
             // A problem already in the file is not blamed on an unrelated edit.
             std::fs::write(&cfg, "cache_ttl = forever\n").unwrap();

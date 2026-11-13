@@ -66,7 +66,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap:
 
     render_categories(frame, sidebar, state, snap, &p);
     render_settings(frame, main, state, snap, &p);
-    render_footer(frame, footer, state, snap, &p);
+    render_footer(frame, footer, state, &p);
 
     if let Some(ActiveEditor::PluginCustom { render, .. }) = &state.edit_mode {
         render_plugin_custom_editor(frame, main, render, &p);
@@ -82,7 +82,7 @@ fn render_categories(
 ) {
     let focused = state.focus == Focus::Left;
     let mut lines = Vec::new();
-    let cats = visible_categories(&snap.lifecycle_claims);
+    let cats = visible_categories();
     let n_builtin = cats.len();
     for (i, cat) in cats.iter().enumerate() {
         lines.push(row_line(
@@ -148,7 +148,7 @@ fn render_settings(
         render_plugin_category(frame, area, state, snap, p);
         return;
     }
-    let current_cat = visible_categories(&snap.lifecycle_claims)
+    let current_cat = visible_categories()
         .get(state.category_idx)
         .copied()
         .unwrap_or(super::schema::Category::Plugins);
@@ -161,7 +161,7 @@ fn render_settings(
         return;
     }
     let focused = state.focus == Focus::Right;
-    let settings = state.current_settings(snap);
+    let settings = state.current_settings();
     let selected_key = settings.get(state.setting_idx).map(|d| d.key);
     let mut lines = section_title(p, current_cat.label());
     let mut focus = (0, 0);
@@ -620,14 +620,8 @@ fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usiz
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_footer(
-    frame: &mut Frame,
-    area: Rect,
-    state: &SettingsState,
-    snap: &RuntimeSnapshot,
-    p: &Palette,
-) {
-    let cats = visible_categories(&snap.lifecycle_claims);
+fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState, p: &Palette) {
+    let cats = visible_categories();
     let cat = cats
         .get(state.category_idx)
         .copied()
@@ -676,7 +670,7 @@ fn u64_config_display(key: &str, default: u64) -> String {
 /// opened on it starts empty, never with this placeholder.
 pub(crate) const NONE_DISPLAY: &str = "(none)";
 /// Shown for an unset key whose default lives elsewhere (role budgets,
-/// identity, Axel paths). A text editor opened on it starts empty.
+/// identity). A text editor opened on it starts empty.
 pub(crate) const DEFAULT_DISPLAY: &str = "(default)";
 
 /// Trimmed, non-empty raw config value.
@@ -877,35 +871,10 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             Some("false" | "0" | "off" | "no") => "off".to_string(),
             _ => "auto".to_string(),
         },
-        "disabled_tools" | "disabled_skills" => list_config_display(key),
+        "disabled_tools" | "disabled_skills" | "tools.always_loaded" => list_config_display(key),
         // Appearance
         "max_fps" => ranged_config_display(key, 1..=1000, 60),
         "scroll_lines" => ranged_config_display(key, 1..=20, 3),
-        // Memory
-        // The effective mode: a non-off value without the hand-set consent
-        // latch reverts to off in the parser, so it displays as off here.
-        "memory.default_mode" => {
-            let confirmed = bool_config_display("memory.default_mode_confirmed", false) == "on";
-            checked_config_display(
-                key,
-                |v| {
-                    confirmed
-                        && matches!(
-                            v,
-                            "recall_once"
-                                | "recall_each_prompt"
-                                | "capture_only"
-                                | "capture_and_recall"
-                        )
-                },
-                "off",
-            )
-        }
-        "memory.backend" => checked_config_display(key, |v| v == "axel", "legacy"),
-        "memory.user_scope" => checked_config_display(key, |v| v == "true", "false"),
-        "memory.axel.executable" | "memory.axel.brain" => {
-            raw_config(key).unwrap_or_else(|| DEFAULT_DISPLAY.to_string())
-        }
         _ => return None,
     };
     Some(v)
@@ -931,10 +900,6 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
                 "invisible".into()
             }
         }
-        "sidecar_toggle_key" => synaps_cli::config::read_config_value("sidecar_toggle_key")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "F8".to_string()),
         "theme_transition" => synaps_cli::config::read_config_value("theme_transition")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())

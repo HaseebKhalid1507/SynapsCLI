@@ -129,26 +129,53 @@ pub trait ExtensionHandler: Send + Sync {
         self.handle(event).await
     }
 
-    /// Call an extension-provided tool.
-    async fn call_tool(&self, _name: &str, _input: Value) -> Result<Value, String> {
-        Err("extension runtime does not support tool.call".to_string())
-    }
-
-    /// Call an extension-provided tool on behalf of a conversation.
+    /// Call an extension-provided tool on behalf of a conversation. The
+    /// only way to call a tool: every caller says who the call is for.
     ///
     /// `session_id` is the owning conversation id (`None` = worker/subagent
-    /// or no conversation). Runtimes that put it on the wire override this;
-    /// the default drops it and calls [`Self::call_tool`], so handlers that
-    /// predate the field (and wrappers that fail closed) keep their exact
-    /// behaviour.
+    /// or no conversation); `cwd` is the folder the caller runs in (`None` =
+    /// the process folder, which under the daemon is the daemon's, so a
+    /// call made for a chat passes the chat's). Default: this runtime
+    /// serves no tools.
     async fn call_tool_for(
         &self,
         name: &str,
         input: Value,
         session_id: Option<&str>,
+        cwd: Option<&std::path::Path>,
     ) -> Result<Value, String> {
-        let _ = session_id;
-        self.call_tool(name, input).await
+        let _ = (name, input, session_id, cwd);
+        Err("extension runtime does not support tool.call".to_string())
+    }
+
+    /// [`Self::call_tool_for`], naming the run that calls: `caller` is the
+    /// author of the calling run's memory binding (`None` = the call's
+    /// context has no binding), sent as `tool.call` `params.caller` so an
+    /// extension can tell a chat from each of its workers. What a registered
+    /// extension tool calls. Default: [`Self::call_tool_for`], for a handler
+    /// that has no wire to put it on.
+    async fn call_tool_as(
+        &self,
+        name: &str,
+        input: Value,
+        session_id: Option<&str>,
+        cwd: Option<&std::path::Path>,
+        caller: Option<&agent_core::memory::author::Author>,
+    ) -> Result<Value, String> {
+        let _ = caller;
+        self.call_tool_for(name, input, session_id, cwd).await
+    }
+
+    /// [`Self::call_tool_for`] for a call that belongs to no chat: on the
+    /// wire `session_id` is `null` and `cwd` is the process folder.
+    ///
+    /// Tests only (the `testing` feature). Production has no such call:
+    /// each one is made for a chat or a worker and says which folder. Should
+    /// a genuine one appear, un-gate this and call it by name instead of
+    /// passing `None, None`, so every no-chat call can be found by grep.
+    #[cfg(any(test, feature = "testing"))]
+    async fn call_tool_no_chat(&self, name: &str, input: Value) -> Result<Value, String> {
+        self.call_tool_for(name, input, None, None).await
     }
 
     /// Complete a chat request through an extension-provided model provider.
@@ -203,15 +230,6 @@ pub trait ExtensionHandler: Send + Sync {
     /// Fetch optional plugin capability/build/model information.
     async fn get_info(&self) -> Result<PluginInfo, String> {
         Err("extension runtime does not support info.get".to_string())
-    }
-
-    /// Ask the plugin to supply sidecar spawn arguments. Used by the
-    /// modality-neutral sidecar bootstrap path (see
-    /// `crate::sidecar::spawn`); plugins that don't host a sidecar
-    /// should leave the default `Err` in place. Core treats the
-    /// returned [`SidecarSpawnArgs::args`] as opaque.
-    async fn sidecar_spawn_args(&self) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
-        Err("extension runtime does not support sidecar.spawn_args".to_string())
     }
 
     /// Open a plugin-owned custom settings editor and return its initial render payload.
@@ -289,6 +307,69 @@ mod lifecycle_tests {
     fn default_lifecycle_snapshot_is_unavailable_through_trait_object() {
         let handler: &dyn ExtensionHandler = &UnsupportedHandler;
         assert_eq!(handler.lifecycle_snapshot(), None);
+    }
+
+    /// A runtime that implements no tool call serves none, whoever the call
+    /// is for.
+    #[tokio::test]
+    async fn default_call_tool_for_serves_no_tool() {
+        let handler: &dyn ExtensionHandler = &UnsupportedHandler;
+        let chat = std::env::temp_dir().join("chat-folder");
+        for (session_id, cwd) in [(Some("chat-A"), Some(chat.as_path())), (None, None)] {
+            let err = handler
+                .call_tool_for("any", serde_json::json!({}), session_id, cwd)
+                .await
+                .unwrap_err();
+            assert!(err.contains("does not support tool.call"), "{err}");
+        }
+    }
+
+    /// Who each tool call said it was for.
+    #[derive(Default)]
+    struct Callers(std::sync::Mutex<Vec<(Option<String>, Option<std::path::PathBuf>)>>);
+
+    #[async_trait]
+    impl ExtensionHandler for Callers {
+        fn id(&self) -> &str {
+            "callers"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::default()
+        }
+        async fn shutdown(&self) {}
+        async fn call_tool_for(
+            &self,
+            _name: &str,
+            _input: Value,
+            session_id: Option<&str>,
+            cwd: Option<&std::path::Path>,
+        ) -> Result<Value, String> {
+            self.0.lock().unwrap().push((
+                session_id.map(str::to_string),
+                cwd.map(std::path::Path::to_path_buf),
+            ));
+            Ok(Value::Null)
+        }
+    }
+
+    /// The one named way to call for no chat sends no conversation and no
+    /// folder; every other call carries what its caller passed.
+    #[tokio::test]
+    async fn only_the_named_no_chat_call_omits_the_caller() {
+        let handler = Callers::default();
+        let chat = std::env::temp_dir().join("chat-folder");
+        handler
+            .call_tool_for("t", serde_json::json!({}), Some("chat-A"), Some(&chat))
+            .await
+            .unwrap();
+        handler
+            .call_tool_no_chat("t", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            *handler.0.lock().unwrap(),
+            vec![(Some("chat-A".to_string()), Some(chat)), (None, None)]
+        );
     }
 }
 

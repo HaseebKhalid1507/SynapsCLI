@@ -29,14 +29,8 @@
 #                                           sent-bytes traces)
 #   output-stream RSS under backpressure .. stream_backpressure (bounded
 #                                           flood turns)
-#   memory retrieval 1K/10K/100K (1M*) .... memory_index BENCH lines
 #   session save 1/10/100 MiB ............. session_journal BENCH lines
 #   program-level phase 5 save/recovery ... phase5_context_memory BENCH line
-#
-#   * the 1M-record scale is documented as out of the local runtime budget
-#     (docs/decisions/T33-memory-index-no-sqlite.md); run it explicitly with
-#     `cargo test -p synaps-core --test memory_index --release -- --ignored
-#     bench_1m_records --test-threads=1 --nocapture` when the budget allows.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -60,9 +54,6 @@ if [[ "$FAST" == "1" ]]; then
 fi
 
 echo "== machine-readable benchmarks (BENCH lines below) =="
-run cargo test -p synaps-core --test memory_index --release -- \
-  --ignored bench_1k_records bench_10k_records bench_100k_records \
-  --test-threads=1 --nocapture
 run cargo test -p synaps-core --test session_journal --release -- \
   --ignored --test-threads=1 --nocapture
 run cargo test --test phase5_context_memory --release -- \
