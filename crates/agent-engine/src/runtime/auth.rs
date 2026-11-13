@@ -468,8 +468,16 @@ impl AuthMethods {
     /// served from memory while its token is fresh (and, locally, auth.json
     /// is unchanged), else re-vended by credential, honouring a held
     /// refused refresh. No bound account, an account the selector no longer
-    /// names, an account that is cooling down, or a failed re-vend stops
-    /// the ping with an error, never another account.
+    /// names, or a failed re-vend stops the ping with an error, never
+    /// another account.
+    ///
+    /// A cooldown on the account stops the ping only under `auto`, where the
+    /// next request leaves a cooling account and the cache is lost anyway.
+    /// An explicit selector keeps the session on its account, cooling or
+    /// not, and the account cools as a whole while a provider limit can be
+    /// one model's (one model's weekly window running out leaves the others
+    /// served): the ping goes, and a limit that does cover the model meets
+    /// its 429, which ends keep-warm like any refusal and bills no tokens.
     async fn refresh_for_keepwarm(
         auth: Arc<RwLock<AuthState>>,
         source: &CredentialSource,
@@ -504,17 +512,25 @@ impl AuthMethods {
             ));
         };
         if let Some(until_ms) = broker.active_cooldown(&cred) {
-            let now = crate::epoch_millis();
-            tracing::info!(
-                credential = %cred,
-                until_ms,
-                "keep-warm: the session's account is cooling down; not pinging and not switching"
-            );
-            return Err(RuntimeError::Auth(format!(
-                "account cooling: '{}' is cooling down until {}; keep-warm never switches accounts",
-                cred.account.label_str(),
-                super::anthropic_quota::describe_reset_utc(until_ms, now)
-            )));
+            if !matches!(selector, AccountSelector::Auto) {
+                tracing::info!(
+                    credential = %cred,
+                    until_ms,
+                    "keep-warm: the session's account is cooling down, but its selector keeps the session on it; pinging"
+                );
+            } else {
+                let now = crate::epoch_millis();
+                tracing::info!(
+                    credential = %cred,
+                    until_ms,
+                    "keep-warm: the session's account is cooling down; not pinging and not switching"
+                );
+                return Err(RuntimeError::Auth(format!(
+                    "account cooling: '{}' is cooling down until {}; keep-warm never switches accounts",
+                    cred.account.label_str(),
+                    super::anthropic_quota::describe_reset_utc(until_ms, now)
+                )));
+            }
         }
         if fresh && (source.is_remote() || !auth_file_changed(recorded_mtime)) {
             return Ok(());
@@ -2560,6 +2576,41 @@ mod tests {
         assert!(err.to_string().contains("account cooling"), "{err}");
         assert!(broker.auto().is_empty() && broker.explicit().is_empty());
         assert_eq!(auth.read().await.auth_token, "sk-HELD");
+    }
+
+    /// Under an explicit selector a cooling account does not stop a
+    /// keep-warm refresh: the session stays on that account, and the
+    /// cooldown may come from another model's limit (2026-11-11: fable's
+    /// weekly window ran out and every opus/sonnet ping was refused for five
+    /// hours while their requests were served). Fresh: served from memory.
+    /// Stale: re-vended by credential, never selected.
+    #[tokio::test]
+    async fn keepwarm_refresh_under_an_explicit_selector_pings_a_cooling_account() {
+        let source = remote("principal-A");
+        let explicit = || {
+            let mut broker = ScriptedBroker::new(AccountSelector::Account(
+                crate::auth::Account::parse("work").unwrap(),
+            ));
+            broker.cooling = vec!["anthropic@work".into()];
+            broker
+        };
+
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let broker = explicit();
+        AuthMethods::refresh_with_broker(Arc::clone(&auth), &source, &broker, None, RefreshPoint::KeepWarm)
+            .await
+            .expect("an explicit cooling account still pings");
+        assert!(broker.auto().is_empty() && broker.explicit().is_empty());
+        assert_eq!(auth.read().await.auth_token, "sk-HELD");
+
+        let auth = bound_state(&source, &work_cred(), STALE);
+        let broker = explicit();
+        AuthMethods::refresh_with_broker(Arc::clone(&auth), &source, &broker, None, RefreshPoint::KeepWarm)
+            .await
+            .expect("re-vended by credential");
+        assert!(broker.auto().is_empty(), "no selection");
+        assert_eq!(broker.explicit(), vec!["anthropic@work".to_string()]);
+        assert_eq!(auth.read().await.auth_token, "tok-explicit-anthropic@work");
     }
 
     /// Review fix 2: an explicit selector that no longer names the bound

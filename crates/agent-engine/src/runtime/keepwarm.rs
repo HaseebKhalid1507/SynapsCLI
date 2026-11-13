@@ -572,8 +572,8 @@ impl Runtime {
         self.validate_request_preflight().await?;
         let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
         if matches!(mode, KeepWarmMode::Send { .. }) {
-            // Never selects, switches or re-binds an account; a cooling
-            // account ends the period (the ping fails before sending).
+            // Never selects, switches or re-binds an account; under `auto` a
+            // cooling account ends the period (the ping fails before sending).
             self.refresh_for_keepwarm().await?;
         }
 
@@ -1520,13 +1520,16 @@ mod tests {
         }));
     }
 
-    /// Review fix 2: an idle keep-warm ping never selects, switches or
-    /// re-binds an account. The session's account cooling down (a limit met
-    /// elsewhere) stops it before anything is sent, saying so; the session
-    /// stays bound to its account.
+    /// An idle keep-warm ping never selects, switches or re-binds an
+    /// account. Under the default selector (an explicit account) the
+    /// session's account cooling down does not stop it: the session cannot
+    /// leave that account, and the cooldown may be another model's limit.
+    /// The ping goes on the same account and the session stays bound to it.
+    /// (Under `auto` a cooling account stops it: auth.rs
+    /// `keepwarm_refresh_keeps_the_bound_seat_and_never_selects`.)
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
-    async fn an_idle_ping_on_a_cooling_account_sends_nothing() {
+    async fn an_idle_ping_on_a_cooling_account_it_cannot_leave_still_pings() {
         let _base = crate::test_env::BaseDirGuard::new();
         let (url, mock) = spawn_mock().await;
         let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
@@ -1545,13 +1548,10 @@ mod tests {
         let report = rt
             .cache_keepwarm_ping(&history, fingerprint, &CancellationToken::new(), &tap)
             .await;
-        match &report.result {
-            Err(PingFailure::Fatal(why)) => assert!(why.contains("account cooling"), "{why}"),
-            other => panic!("the ping stops on the cooling account: {other:?}"),
-        }
-        assert!(!tap.was_sent());
+        assert_eq!(report.result, Ok(PingOutcome::Sent), "{report:?}");
+        assert!(tap.was_sent());
         assert!(report.notices.is_empty(), "{:?}", report.notices);
-        assert_eq!(mock.bodies.lock().unwrap().len(), 1, "only the turn was sent");
+        assert_eq!(mock.bodies.lock().unwrap().len(), 2, "the turn, then the ping");
         assert_eq!(rt.auth.read().await.bound_credential, bound, "not re-bound");
         assert_eq!(rt.auth.read().await.auth_token, "oauth-test-token");
     }

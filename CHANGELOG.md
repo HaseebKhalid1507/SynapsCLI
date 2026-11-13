@@ -185,6 +185,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Keep-warm on a cooling account you chose.** With an explicit account
+  (the default), a cooldown on it no longer stops keep-warm pings. A cooldown
+  covers the whole account, but the limit behind it can be one model's, or
+  already over: on 2026-11-11 a rejection at 04:10 EST left the account
+  cooling until Nov 16 although requests were served again within seconds,
+  and keep-warm refused 52 pings over ten hours (fable, then opus once
+  fable's own window ran out) while those models' requests went through.
+  The ping now goes; a limit that covers the model meets its 429, which ends
+  keep-warm and bills no tokens. Under `auto` a cooling account still stops
+  the ping (the next request leaves it).
+
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
   program names: a stock Windows has no `grep` or `ls` ("program not
   found"), and `find` resolved to `System32\find.exe`, an unrelated string
