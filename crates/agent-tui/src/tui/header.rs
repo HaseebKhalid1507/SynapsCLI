@@ -2,7 +2,7 @@
 //! screen, ending in a solid block whose colour is the state.
 //!
 //! ```text
-//!   SynapsCLI ❯ ~/Projects/SynapsCLI · fix-cache   voice  3 agents 4m12s  ⠋ thinking 12s  
+//!   SynapsCLI ❯ ~/Projects/SynapsCLI · fix-cache   3 agents 4m12s  ⠋ thinking 12s  
 //! ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 //! ```
 //!
@@ -16,8 +16,8 @@
 //! * Left: `Synaps`+`CLI` `❯` folder `·` session (`❯ worker` in a worker view).
 //! * Right end: the state block, flush to the right edge. Its cells and the
 //!   rim under it take the state's fill; dark ink holds 5:1 on it.
-//! * Wells, left of the block: square-ended 1½-row tiles for active/error
-//!   sidecar pills, `observing`, and the agent chip (count + longest clock).
+//! * Wells, left of the block: square-ended 1½-row tiles for `observing`,
+//!   other clients, and the agent chip (count + longest clock).
 //!
 //! Nothing moves at rest: the sweep and the spinner run only while a turn or
 //! a worker runs. Every colour is a theme token or a mix of two.
@@ -35,8 +35,7 @@ use ratatui::{
 
 use super::app::SPINNER_FRAMES;
 use super::neon_prompt::{color, contrast, mix, rgb, PromptFx, Rgb, Slab};
-use super::render_model::{RenderModel, SidecarPillSnap, SubagentSnap};
-use super::sidecar::SidecarUiStatus;
+use super::render_model::{RenderModel, SubagentSnap};
 use super::subagent_tray::legible;
 use super::text_metrics::{char_width, width as display_width};
 use super::theme::{background_is_opaque, Theme, THEME};
@@ -356,9 +355,6 @@ pub(crate) struct HeaderView<'a> {
     pub(crate) observing: bool,
     /// Clients attached to the session (see [`HeaderSnap::clients`]).
     pub(crate) clients: usize,
-    /// Active or failed sidecar pills: `(label, failed)`. Idle ones are
-    /// never listed.
-    pub(crate) pills: Vec<(String, bool)>,
     /// Running workers and the longest one's elapsed seconds.
     pub(crate) workers: usize,
     pub(crate) longest_worker_secs: u64,
@@ -378,7 +374,6 @@ impl<'a> HeaderView<'a> {
             &snap.activity,
             &model.subagents,
         );
-        let pills = header_pills(&model.sidecar_pills);
         let running = model.subagents.iter().filter(|s| !s.done);
         Self {
             status_connecting: model.status_text.is_some(),
@@ -391,7 +386,6 @@ impl<'a> HeaderView<'a> {
             watching: model.watch_banner.as_ref().map(|b| b.agent_name.as_str()),
             observing: snap.observing,
             clients: snap.clients,
-            pills,
             workers: running.clone().count(),
             longest_worker_secs: running
                 .map(|s| s.elapsed_secs.max(0.0) as u64)
@@ -408,23 +402,6 @@ impl<'a> HeaderView<'a> {
     fn spinner(&self) -> &'static str {
         SPINNER_FRAMES[(self.spinner_frame / 3) % SPINNER_FRAMES.len()]
     }
-}
-
-/// The sidecar pills worth a well: active (or armed) and failed ones, as
-/// `(label, failed)`. Idle and loading pills are hidden.
-fn header_pills(pills: &[SidecarPillSnap]) -> Vec<(String, bool)> {
-    pills
-        .iter()
-        .filter_map(|p| {
-            let label = p.display_name.clone().unwrap_or_else(|| "sidecar".into());
-            match &p.status {
-                SidecarUiStatus::Error(_) => Some((label, true)),
-                SidecarUiStatus::Active { .. } => Some((label, false)),
-                SidecarUiStatus::Idle if p.armed => Some((label, false)),
-                _ => None,
-            }
-        })
-        .collect()
 }
 
 // ─── colour ─────────────────────────────────────────────────────────────────
@@ -452,8 +429,6 @@ enum Role {
     Session,
     Agent,
     AgentClock,
-    Ready,
-    Err,
     Warn,
 }
 
@@ -468,8 +443,6 @@ fn tone(t: &Theme, role: Role) -> Rgb {
         Role::Session => rgb(t.claude_label, d.claude_label),
         Role::Agent => agent,
         Role::AgentClock => mix(agent, rgb(t.input_fg, d.input_fg), 0.35),
-        Role::Ready => rgb(t.status_ready, d.status_ready),
-        Role::Err => rgb(t.error_color, d.error_color),
         Role::Warn => rgb(t.warning_color, d.warning_color),
     }
 }
@@ -666,16 +639,9 @@ fn chip_spans(v: &HeaderView<'_>, compact: bool) -> Spans {
     ]
 }
 
-/// The pill and attach-mode wells: `(spans, tone)`.
+/// The attach-mode wells: `(spans, tone)`.
 fn well_items(v: &HeaderView<'_>) -> Vec<(Spans, Role)> {
-    let mut out: Vec<(Spans, Role)> = v
-        .pills
-        .iter()
-        .map(|(label, failed)| {
-            let role = if *failed { Role::Err } else { Role::Ready };
-            (vec![(label.clone(), role, false)], role)
-        })
-        .collect();
+    let mut out: Vec<(Spans, Role)> = Vec::new();
     if v.observing {
         out.push((vec![("observing".into(), Role::Warn, false)], Role::Warn));
     }
@@ -711,7 +677,7 @@ const BASE: Cfg = Cfg {
 };
 
 /// Applied cumulatively until the row fits (the mock's `LADDER`). The
-/// wordmark, the block, problems (error pills, `observing`) and the clocks
+/// wordmark, the block, problems (`observing`) and the clocks
 /// are never dropped.
 const LADDER: &[fn(&mut Cfg)] = &[
     |_| {},
@@ -1165,7 +1131,6 @@ mod tests {
             watching: None,
             observing: false,
             clients: 0,
-            pills: Vec::new(),
             workers: 0,
             longest_worker_secs: 0,
             fx: PromptFx::default(),
@@ -1204,7 +1169,6 @@ mod tests {
             turn_secs: Some(12),
             workers: 3,
             longest_worker_secs: 252,
-            pills: vec![("voice".into(), false)],
             ..view()
         }
     }
@@ -1416,7 +1380,7 @@ mod tests {
             ..thinking()
         };
         let buf = draw(&v, 140);
-        for word in ["voice", "observing", "3 agents"] {
+        for word in ["observing", "3 agents"] {
             let x = col_of(&buf, 0, word).unwrap_or_else(|| panic!("{word}: {:?}", row(&buf, 0)));
             // One pad cell, then the well's own end cell.
             for cx in [x - 2, x - 1, x] {
@@ -1430,39 +1394,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn idle_pills_are_hidden() {
-        let pill = |name: &str, status: SidecarUiStatus, armed: bool| SidecarPillSnap {
-            plugin_id: name.into(),
-            display_name: Some(name.into()),
-            status,
-            armed,
-        };
-        let pills = [
-            pill("idle", SidecarUiStatus::Idle, false),
-            pill("loading", SidecarUiStatus::Loading, false),
-            pill("armed", SidecarUiStatus::Idle, true),
-            pill(
-                "active",
-                SidecarUiStatus::Active {
-                    label: "listening".into(),
-                },
-                false,
-            ),
-            pill("broken", SidecarUiStatus::Error("x".into()), false),
-        ];
-        assert_eq!(
-            header_pills(&pills),
-            vec![
-                ("armed".into(), false),
-                ("active".into(), false),
-                ("broken".into(), true)
-            ]
-        );
-        let line = row(&draw(&view(), 120), 0);
-        assert!(!line.contains("idle"), "{line:?}");
-    }
-
     /// At rest the header is one fixed frame: no sweep, no spinner.
     #[test]
     fn nothing_moves_at_rest() {
@@ -1473,7 +1404,6 @@ mod tests {
                 ..view()
             },
             HeaderView {
-                pills: vec![("voice".into(), false)],
                 observing: true,
                 ..view()
             },
@@ -1551,7 +1481,6 @@ mod tests {
             session: "axon-overnight-cache-fix-followups-round-two-and-then-some",
             folder: "~/Projects/SynapsCLI-wt-cache-keepwarm",
             observing: true,
-            pills: vec![("voice".into(), false), ("dictate".into(), true)],
             watching: Some("spike"),
             ..thinking()
         };
@@ -1573,8 +1502,6 @@ mod tests {
                 let mut order = vec!["SynapsCLI"];
                 if v.observing {
                     order.extend([
-                        "voice",
-                        "dictate",
                         "observing",
                         "3 ",
                         "4m12s",
@@ -1598,7 +1525,7 @@ mod tests {
                     assert!(line.contains("v0.11.0"), "w={w}: {line:?}");
                 }
                 // Two clear cells between the left run and whatever follows.
-                let first_well = col_of(&buf, 0, "voice").map(|mut x| {
+                let first_well = col_of(&buf, 0, "observing").map(|mut x| {
                     let well = buf[(x, 0)].bg;
                     while buf[(x - 1, 0)].bg == well {
                         x -= 1;

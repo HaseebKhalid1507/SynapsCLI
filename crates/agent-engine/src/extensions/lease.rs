@@ -213,7 +213,7 @@ pub struct ExtensionRuntimeManager {
     idle_max: Duration,
     next_token: std::sync::atomic::AtomicU64,
     /// Host-scope session identity for HANDLER-based acquisition (hook
-    /// events, provider routing, user sidecar/command APIs). Bound at
+    /// events, provider routing, user command/settings APIs). Bound at
     /// engine boot to the Runtime's durable tool session, so a MIXED
     /// extension's tool leases and handler leases share ONE key — one
     /// shared child process per plugin. Unbound (tests/manual) falls back
@@ -562,7 +562,7 @@ impl ExtensionRuntimeManager {
 
     /// Acquire the shared validated per-plugin lease under the HOST scope
     /// for handler-based capabilities (hook events, provider routing, user
-    /// sidecar/command/settings APIs). Same record re-validation, exact
+    /// command/settings APIs). Same record re-validation, exact
     /// runtime declaration matching, single-flight, and teardown rules as
     /// exact tool calls — and, when the host scope is bound to the
     /// Runtime's tool session (engine boot), the SAME lease key: a Mixed
@@ -1031,7 +1031,7 @@ impl std::fmt::Debug for ExtensionSessionEndGuard {
 /// (Task 20 Commit C). Registered/subscribed at load WITHOUT a process;
 /// the first AUTHORIZED use (a matching hook event delivered by the
 /// permission-checked `HookBus` subscription, a selected provider
-/// complete/stream, or an explicit user sidecar/command/settings action)
+/// complete/stream, or an explicit user command/settings action)
 /// single-flights through the SAME per-plugin lease manager — starting
 /// and exact-validating the child once. Discovery, load, search, and
 /// diagnostics never acquire.
@@ -1179,14 +1179,6 @@ impl ExtensionHandler for LazyExtensionHandler {
     async fn get_info(&self) -> Result<crate::extensions::info::PluginInfo, String> {
         // Diagnostics must never spawn a deferred extension.
         Err("deferred extension info is unavailable without activation".to_string())
-    }
-
-    async fn sidecar_spawn_args(&self) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
-        // Explicit user sidecar action: a legitimate acquisition trigger.
-        let inner = self.live().await?;
-        let result = inner.handler.sidecar_spawn_args().await;
-        Self::touch(&inner);
-        result
     }
 
     async fn settings_editor_open(&self, category: &str, field: &str) -> Result<Value, String> {

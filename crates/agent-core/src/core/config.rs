@@ -1278,6 +1278,17 @@ fn removed_memory_backend_warning() -> String {
     )
 }
 
+/// The warning for a config that still sets `sidecar_toggle_key`. The
+/// sidecar system is gone; the key is read and ignored.
+fn removed_sidecar_toggle_key_warning() -> String {
+    format!(
+        "sidecar_toggle_key is ignored: the plugin sidecar system was removed in {}, so core \
+         binds no toggle key any more. Plugin keybinds and the keybinds setting still work. \
+         Remove this line",
+        crate::SIDECAR_REMOVED_IN
+    )
+}
+
 /// Parsed configuration from the config file.
 #[derive(Debug, Clone)]
 pub struct SynapsConfig {
@@ -1680,7 +1691,6 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "tools.deferred_loading",
     "tools.always_loaded",
     "session_persistence",
-    "sidecar_toggle_key",
 ];
 
 /// Every key accepted by the namespaced family parsers that is NOT in
@@ -2025,6 +2035,7 @@ fn apply_config_content_with(
     let mut invalid_context_management = false;
     // The removed memory backend keys: which of their two warnings is due.
     let (mut removed_axel_backend, mut removed_other_backend) = (false, false);
+    let mut removed_sidecar_toggle_key = false;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2363,10 +2374,9 @@ fn apply_config_content_with(
                     *field = Some(val.to_string());
                 }
             }
-            // Read directly by the keybind registry (`read_config_value`);
-            // recognised here so the /settings row never trips the
-            // unknown-key warning.
-            "sidecar_toggle_key" => {}
+            // Removed with the sidecar system: read, never applied, and
+            // reported once after the loop.
+            "sidecar_toggle_key" => removed_sidecar_toggle_key = true,
             "agent_name" => config.agent_name = Some(val.to_string()),
             "identity" => config.identity = Some(val.to_string()),
             "disabled_plugins" => {
@@ -2571,6 +2581,9 @@ fn apply_config_content_with(
         config.warnings.push(removed_axel_backend_warning());
     } else if removed_other_backend {
         config.warnings.push(removed_memory_backend_warning());
+    }
+    if removed_sidecar_toggle_key {
+        config.warnings.push(removed_sidecar_toggle_key_warning());
     }
 }
 
@@ -5345,13 +5358,26 @@ api_retries = 5
         assert!(bad.warnings.iter().any(|w| w.contains("context_window")));
     }
 
-    /// The /settings sidecar row writes `sidecar_toggle_key`; it is read by
-    /// the keybind registry and must not trip the unknown-key warning.
+    /// The sidecar system is gone: an old `sidecar_toggle_key` line loads,
+    /// is ignored, and is reported once however often it appears.
     #[test]
-    fn sidecar_toggle_key_is_a_known_key() {
-        let cfg = load_config_from_str("sidecar_toggle_key = F2\n");
-        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
-        assert!(KNOWN_CONFIG_KEYS.contains(&"sidecar_toggle_key"));
+    fn removed_sidecar_toggle_key_loads_and_warns_once() {
+        let expected = format!(
+            "sidecar_toggle_key is ignored: the plugin sidecar system was removed in {}, so \
+             core binds no toggle key any more. Plugin keybinds and the keybinds setting \
+             still work. Remove this line",
+            crate::SIDECAR_REMOVED_IN
+        );
+        assert_eq!(super::removed_sidecar_toggle_key_warning(), expected);
+        for content in [
+            "sidecar_toggle_key = F2\n",
+            "sidecar_toggle_key = F8\nmodel = claude-opus-4-7\nsidecar_toggle_key = C-V\n",
+            "sidecar_toggle_key = \n",
+        ] {
+            let cfg = load_config_from_str(content);
+            assert_eq!(cfg.warnings, vec![expected.clone()], "{content:?}");
+        }
+        assert!(!KNOWN_CONFIG_KEYS.contains(&"sidecar_toggle_key"));
         assert!(KNOWN_CONFIG_KEYS.contains(&"compaction_mode"));
         assert!(KNOWN_CONFIG_KEYS.contains(&"compaction_exclude"));
     }

@@ -289,7 +289,7 @@ pub struct ExtensionStatus {
 ///
 /// Two cases:
 /// 1. **Missing extension binary AND plugin declares
-///    `provides.sidecar.setup`** — the plugin ships source only (the
+///    `extension.setup`** — the plugin ships source only (the
 ///    binary is typically gitignored) and the setup script needs to
 ///    be run. The hint points the user at the exact command. This is
 ///    the common case for fresh marketplace installs of plugins that
@@ -297,7 +297,7 @@ pub struct ExtensionStatus {
 /// 2. **Anything else** — a generic hint pointing at the manifest contract.
 ///
 /// Pure function for unit-testability. Lives here (not in
-/// `ExtensionLoadFailure`) because the sidecar/setup convention is a
+/// `ExtensionLoadFailure`) because the setup convention is a
 /// plugin-layer concern.
 pub fn compute_extension_load_hint(
     error: &str,
@@ -1564,10 +1564,7 @@ impl ExtensionManager {
         };
         let outcome = self.reload(id, &resolved, Some(plugin_dir.clone())).await;
         let failure = outcome.as_ref().err().map(|e| {
-            let setup_script = json
-                .pointer("/extension/setup")
-                .and_then(|v| v.as_str())
-                .or_else(|| json.pointer("/provides/sidecar/setup").and_then(|v| v.as_str()));
+            let setup_script = json.pointer("/extension/setup").and_then(|v| v.as_str());
             let hint = compute_extension_load_hint(e, &plugin_dir, setup_script);
             let reason = if was_loaded {
                 format!("{e} (the previous instance was stopped, so '{id}' is not loaded now)")
@@ -1735,12 +1732,8 @@ impl ExtensionManager {
         out
     }
 
-    /// Ask a plugin for its sidecar spawn arguments. Best-effort —
-    /// plugins that don't host a sidecar (or pre-Phase-7 plugins that
-    /// haven't implemented the RPC yet) return `Err`. Callers are
-    /// expected to treat that as "no overrides; use manifest defaults".
-    /// Handler for explicit USER-triggered plugin APIs (sidecar spawn,
-    /// interactive commands, settings editors). Live extensions use their
+    /// Handler for explicit USER-triggered plugin APIs (interactive
+    /// commands, settings editors). Live extensions use their
     /// running handler; a DEFERRED extension (Task 20) gets a lazy handler
     /// whose first use acquires the shared per-plugin runtime lease — a
     /// user action is a legitimate activation trigger. Discovery/search/
@@ -1792,14 +1785,6 @@ impl ExtensionManager {
         self.eager_permissions
             .get(id)
             .is_some_and(|permissions| permissions.has(Permission::SessionDrive))
-    }
-
-    pub async fn sidecar_spawn_args(
-        &self,
-        id: &str,
-    ) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
-        let handler = self.user_action_handler(id)?;
-        handler.sidecar_spawn_args().await
     }
 
     /// Invoke an interactive plugin command on extension `id`. Streams
@@ -2251,13 +2236,7 @@ impl ExtensionManager {
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to load extension");
-                    let setup_script = json
-                        .pointer("/extension/setup")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| {
-                            json.pointer("/provides/sidecar/setup")
-                                .and_then(|v| v.as_str())
-                        });
+                    let setup_script = json.pointer("/extension/setup").and_then(|v| v.as_str());
                     let hint = compute_extension_load_hint(&e, &plugin_dir, setup_script);
                     let failure =
                         ExtensionLoadFailure::new(plugin_name, Some(manifest_path), e, hint);
@@ -2683,15 +2662,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         with_temp_base_dir(dir.path(), || {
             crate::extensions::config_store::write_plugin_config(
-                "sample-sidecar",
+                "sample-plugin",
                 "backend",
                 "cpu",
             )
             .unwrap();
-            crate::config::write_config_value("extension.sample-sidecar.backend", "auto").unwrap();
+            crate::config::write_config_value("extension.sample-plugin.backend", "auto").unwrap();
 
             let resolved = ExtensionManager::resolve_config(
-                "sample-sidecar",
+                "sample-plugin",
                 &[ExtensionConfigEntry {
                     key: "backend".to_string(),
                     value_type: None,
@@ -2717,10 +2696,10 @@ mod tests {
     fn resolve_config_keeps_legacy_global_extension_key_as_fallback() {
         let dir = tempfile::tempdir().unwrap();
         with_temp_base_dir(dir.path(), || {
-            crate::config::write_config_value("extension.sample-sidecar.backend", "auto").unwrap();
+            crate::config::write_config_value("extension.sample-plugin.backend", "auto").unwrap();
 
             let resolved = ExtensionManager::resolve_config(
-                "sample-sidecar",
+                "sample-plugin",
                 &[ExtensionConfigEntry {
                     key: "backend".to_string(),
                     value_type: None,
@@ -2855,8 +2834,8 @@ mod tests {
     #[test]
     fn hint_missing_binary_with_declared_setup_points_at_script() {
         let hint = compute_extension_load_hint(
-            "Failed to spawn extension 'sample-sidecar': No such file or directory (os error 2)",
-            std::path::Path::new("/home/u/.synaps-cli/plugins/sample-sidecar"),
+            "Failed to spawn extension 'sample-plugin': No such file or directory (os error 2)",
+            std::path::Path::new("/home/u/.synaps-cli/plugins/sample-plugin"),
             Some("scripts/setup.sh"),
         );
         assert!(
@@ -2864,7 +2843,7 @@ mod tests {
             "missing-binary case should be flagged: {hint}"
         );
         assert!(
-            hint.contains("/home/u/.synaps-cli/plugins/sample-sidecar"),
+            hint.contains("/home/u/.synaps-cli/plugins/sample-plugin"),
             "hint should include the plugin dir: {hint}"
         );
         assert!(

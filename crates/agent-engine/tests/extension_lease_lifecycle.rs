@@ -880,7 +880,7 @@ async fn durable_shared_scope_survives_turns_and_only_last_owner_terminates() {
     fx.cleanup();
 }
 
-// ── Commit C: provider / hook / sidecar / mixed / legacy classes ────────────
+// ── Commit C: provider / hook / user-lifecycle / mixed / legacy classes ────────────
 
 /// Flexible fixture: custom manifest JSON with fixture argv wired in.
 fn fixture_with(
@@ -1077,10 +1077,10 @@ async fn hook_class_first_authorized_matching_event_starts_once() {
 }
 
 #[tokio::test]
-async fn sidecar_class_stays_user_triggered() {
+async fn user_lifecycle_class_stays_user_triggered() {
     hermetic_base_dir::pin();
     let fx = fixture_with(
-        "sidecar-class",
+        "user-class",
         "ok",
         json!([]),
         None,
@@ -1092,15 +1092,15 @@ async fn sidecar_class_stays_user_triggered() {
     let (mgr, _registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
 
-    // Discovery/load leave the sidecar fully dormant.
+    // Discovery/load leave the extension fully dormant.
     assert!(fx.events().is_empty(), "user-lifecycle load must not spawn");
     assert!(mgr.is_deferred(PLUGIN));
 
-    // The explicit USER sidecar API is the legitimate trigger.
-    let args = mgr.sidecar_spawn_args(PLUGIN).await.unwrap();
-    assert_eq!(args.args, vec!["--fixture-sidecar".to_string()]);
+    // An explicit USER action (here: opening a settings editor) is the
+    // legitimate trigger.
+    mgr.settings_editor_open(PLUGIN, "cat", "field").await.unwrap();
     assert_eq!(fx.count("spawn"), 1);
-    assert_eq!(fx.count("sidecar"), 1);
+    assert_eq!(fx.count("request:settings.editor.open"), 1);
     runtime.terminate_all();
     fx.cleanup();
 }
