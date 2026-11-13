@@ -43,7 +43,9 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// `Pin`/`Pinned` (`synaps daemon pin`) follow the same rule, and so does
 /// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it).
 /// `ReloadExtension` and its two replies (`ExtensionReloaded`,
-/// `ExtensionReloadFailed`) follow it too.
+/// `ExtensionReloadFailed`) follow it too, and so does `SavedSessions` /
+/// `SavedSessionList` (also listed in `Welcome.features` as
+/// [`FEATURE_SAVED_SESSIONS`], so a client can tell before it asks).
 /// Owned sessions (`Attach::Create{owned}`) are additive as well, but an
 /// older daemon would IGNORE the unknown field and hand back an unowned
 /// session, so they are gated on [`FEATURE_OWNED_SESSIONS`] in
@@ -56,9 +58,21 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// `EndReason::OwnerGone`.
 pub const FEATURE_OWNED_SESSIONS: &str = "owned_sessions";
 
+/// `Welcome.features` entry: this daemon answers `ClientFrame::SavedSessions`
+/// with `DaemonFrame::SavedSessionList`. An older daemon answers that frame
+/// with `Error{"malformed frame: unknown variant `saved_sessions`…"}`, so
+/// clients check `Welcome::supports(FEATURE_SAVED_SESSIONS)` first.
+pub const FEATURE_SAVED_SESSIONS: &str = "saved_sessions";
+
+/// `SavedSessions.limit` when absent, and its ceiling.
+pub const SAVED_SESSIONS_DEFAULT_LIMIT: u32 = 200;
+pub const SAVED_SESSIONS_MAX_LIMIT: u32 = 1000;
+/// `SavedSessionInfo.title` is cut to this many characters (`…` included).
+pub const SAVED_SESSION_TITLE_CHARS: usize = 120;
+
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
-    vec![FEATURE_OWNED_SESSIONS.to_string()]
+    vec![FEATURE_OWNED_SESSIONS.to_string(), FEATURE_SAVED_SESSIONS.to_string()]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
@@ -206,6 +220,24 @@ pub enum ClientFrame {
     ReloadExtension {
         extension: String,
     },
+    /// Control fast path (no session, no attach; also answered on an
+    /// attached connection, like `Sessions`): the SAVED sessions on disk,
+    /// named ones included, whether or not this daemon holds them — what
+    /// the TUI's `/sessions` Past tab lists, one row per conversation (a
+    /// compacted predecessor folds into its chain head). Newest
+    /// `updated_at` first, at most `limit` rows (absent = 200, capped at
+    /// 1000). `named_only` keeps named conversations only. Reply:
+    /// `SavedSessionList`, or `Error` if the sessions dir cannot be read.
+    /// Gated on [`FEATURE_SAVED_SESSIONS`]: an older daemon answers `Error`
+    /// "malformed frame: unknown variant `saved_sessions`, ..." and keeps
+    /// the connection usable. Resume a row with `Attach::Create` and
+    /// `config.continue_session: Some(Some(id or name))`.
+    SavedSessions {
+        #[serde(default)]
+        named_only: bool,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
     Bye,
 }
 
@@ -250,6 +282,11 @@ impl std::fmt::Debug for ClientFrame {
             Self::ReloadExtension { extension } => f
                 .debug_struct("ReloadExtension")
                 .field("extension", extension)
+                .finish(),
+            Self::SavedSessions { named_only, limit } => f
+                .debug_struct("SavedSessions")
+                .field("named_only", named_only)
+                .field("limit", limit)
                 .finish(),
             Self::Bye => f.write_str("Bye"),
         }
@@ -470,6 +507,42 @@ pub enum DaemonFrame {
     AuthState {
         report: agent_core::auth::AuthStateReport,
     },
+    /// Reply to `SavedSessions`. `truncated`: more rows matched than the
+    /// request's `limit`.
+    SavedSessionList {
+        sessions: Vec<SavedSessionInfo>,
+        #[serde(default)]
+        truncated: bool,
+    },
+}
+
+/// One saved conversation in `SavedSessionList` (its chain head when it was
+/// compacted). Headers only: never message bodies beyond the title, never
+/// credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSessionInfo {
+    /// Journal id of the chain head (`20261110-202033-64fb`); what
+    /// `continue_session` takes.
+    pub id: String,
+    /// The head's name, else the newest named predecessor's.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Header title, else the first user message, trimmed to
+    /// [`SAVED_SESSION_TITLE_CHARS`]. May be empty.
+    #[serde(default)]
+    pub title: String,
+    pub model: String,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    /// When the conversation started (the chain's first session).
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// The head's message count; `None` when unknown (legacy file).
+    #[serde(default)]
+    pub message_count: Option<usize>,
+    /// This daemon holds a session on this journal (`SessionMeta.journal_id`).
+    #[serde(default)]
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2000,6 +2073,8 @@ mod tests {
                 clear: true,
             }),
             ClientFrame::ReloadExtension { extension: "subconscious".into() },
+            ClientFrame::SavedSessions { named_only: true, limit: Some(200) },
+            ClientFrame::SavedSessions { named_only: false, limit: None },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -2075,6 +2150,8 @@ mod tests {
             DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
             DaemonFrame::AuthState { report: auth_state_report() },
+            DaemonFrame::SavedSessionList { sessions: vec![saved_info()], truncated: true },
+            DaemonFrame::SavedSessionList { sessions: vec![], truncated: false },
         ];
         for f in frames {
             let line = encode_line(&f).unwrap();
@@ -2331,6 +2408,70 @@ mod tests {
         w.features = daemon_features();
         let new: Welcome = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
         assert!(new.supports(FEATURE_OWNED_SESSIONS));
+    }
+
+    fn saved_info() -> SavedSessionInfo {
+        use chrono::TimeZone;
+        SavedSessionInfo {
+            id: "20261110-202033-64fb".into(),
+            name: Some("axel".into()),
+            title: "wire the desktop app".into(),
+            model: "claude-opus-4-6".into(),
+            cwd: Some(PathBuf::from("/home/u/Projects/x")),
+            created_at: chrono::Utc.with_ymd_and_hms(2026, 11, 10, 20, 20, 33).unwrap(),
+            updated_at: chrono::Utc.with_ymd_and_hms(2026, 11, 12, 4, 0, 0).unwrap(),
+            message_count: Some(800),
+            live: true,
+        }
+    }
+
+    /// The thin-client contract (synaps-desktop is built against these
+    /// exact shapes).
+    #[test]
+    fn saved_sessions_frames_have_the_pinned_shape() {
+        let req = encode_line(&ClientFrame::SavedSessions { named_only: true, limit: Some(200) }).unwrap();
+        assert_eq!(req.trim_end(), r#"{"type":"saved_sessions","named_only":true,"limit":200}"#);
+        match decode_line::<ClientFrame>(r#"{"type":"saved_sessions"}"#).unwrap() {
+            ClientFrame::SavedSessions { named_only: false, limit: None } => {}
+            other => panic!("{other:?}"),
+        }
+        let reply = DaemonFrame::SavedSessionList { sessions: vec![saved_info()], truncated: false };
+        assert_eq!(
+            encode_line(&reply).unwrap().trim_end(),
+            concat!(
+                r#"{"type":"saved_session_list","sessions":[{"id":"20261110-202033-64fb","name":"axel","#,
+                r#""title":"wire the desktop app","model":"claude-opus-4-6","cwd":"/home/u/Projects/x","#,
+                r#""created_at":"2026-11-10T20:20:33Z","updated_at":"2026-11-12T04:00:00Z","#,
+                r#""message_count":800,"live":true}],"truncated":false}"#,
+            )
+        );
+        // Optional fields: absent decodes as None/false; None encodes as null.
+        let minimal = r#"{"type":"saved_session_list","sessions":[{"id":"i","model":"m","created_at":"2026-11-10T20:20:33Z","updated_at":"2026-11-10T20:20:33Z"}]}"#;
+        match decode_line::<DaemonFrame>(minimal).unwrap() {
+            DaemonFrame::SavedSessionList { sessions, truncated: false } => {
+                let s = &sessions[0];
+                assert!(s.name.is_none() && s.cwd.is_none() && s.message_count.is_none() && !s.live && s.title.is_empty());
+                let v = serde_json::to_value(s).unwrap();
+                assert!(v["name"].is_null() && v["cwd"].is_null() && v["message_count"].is_null(), "{v}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn saved_sessions_is_a_feature_and_older_daemons_reject_it_as_an_unknown_variant() {
+        assert!(daemon_features().iter().any(|f| f == FEATURE_SAVED_SESSIONS));
+        assert_eq!(FEATURE_SAVED_SESSIONS, "saved_sessions");
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientFrame {
+            Ping,
+            Sessions,
+        }
+        let err = decode_line::<OldClientFrame>(r#"{"type":"saved_sessions","named_only":true,"limit":200}"#).unwrap_err();
+        assert!(err.contains("unknown variant `saved_sessions`"), "{err}");
+        let dbg = format!("{:?}", ClientFrame::SavedSessions { named_only: true, limit: Some(5) });
+        assert_eq!(dbg, "SavedSessions { named_only: true, limit: Some(5) }");
     }
 }
 

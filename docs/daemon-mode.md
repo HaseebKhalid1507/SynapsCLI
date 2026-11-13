@@ -479,6 +479,50 @@ replaces any name.
 - An attached client cannot send `rename` (neither the control frame nor the
   engine command): it has `/saveas`.
 
+## Listing saved sessions (`saved_sessions`)
+
+A client that cannot read the sessions dir itself (synaps-desktop, a remote
+client) asks the daemon:
+
+```
+C: {"type":"saved_sessions","named_only":true,"limit":200}
+D: {"type":"saved_session_list","sessions":[{"id":"20261110-202033-64fb","name":"axel",
+    "title":"…","model":"claude-opus-4-6","cwd":"/home/u/Projects/x",
+    "created_at":"2026-11-10T20:20:33Z","updated_at":"2026-11-12T04:00:00Z",
+    "message_count":800,"live":true}],"truncated":false}
+```
+
+- A control frame: no attach, no session allocated. It is answered on an
+  attached connection too, like `sessions`.
+- The rows are the ones the `/sessions` Past tab lists
+  (`session_catalog::load_catalog` and its noise rules: no junk ids, no
+  sandbox cwds, no sessions under 3 messages), read from the daemon's
+  profile. One row per conversation: a compacted predecessor folds into its
+  chain head (`compacted_into`), the row's `id` is the head's, `name` the
+  head's (else the newest named predecessor's), and `created_at` the chain's
+  first session's. A chain head, or a session the daemon holds, is not
+  hidden for having few messages. A broken chain (a cycle) is not listed.
+- Unlike the Past tab, sessions the daemon holds stay in the list:
+  `live: true` when it holds a session on that journal
+  (`SessionMeta.journal_id`, which is not the session id after a
+  LinkedSuccessor compaction).
+- Newest `updated_at` first. `named_only` (default false) keeps named rows
+  only. `limit` defaults to 200 and is capped at 1000; `truncated` is set
+  when more rows matched.
+- `title` is the header title, else the first user message (from the
+  preview cache, when it is fresh), on one line, at most 120 characters.
+  `name`, `cwd` and `message_count` may be `null`. Headers only: no message
+  bodies past the title, nothing secret.
+- The catalog read runs on a blocking thread; it delays only the
+  connection that asked. An unreadable sessions dir is `error`.
+- To resume a row, `attach` with `attach:"create"` and
+  `config.continue_session` set to its `id` or `name` (resolved like
+  `--continue`: chain → name → id, then `compacted_into` forward). A
+  session the daemon already holds is attached to, not opened twice.
+- `SocketTransport::saved_sessions` / `Connected::saved_sessions` wrap it
+  and return `DaemonTooOld` without sending anything when the daemon does
+  not list the feature.
+
 ## Reloading one extension (`daemon reload-extension`)
 
 Extensions are daemon-wide: one process each, shared by every session. A new
@@ -621,13 +665,14 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions"]}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","saved_sessions"]}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
 C: rename{session_id, name?, expect?}         → D: renamed{session_id, name, in_memory_only?} | rename_failed{session_id, reason, message, taken_by?, current_name?} | refused{unknown_session} (→ daemon closes)
 C: reload_extension{extension}                → D: extension_reloaded{report} | extension_reload_failed{extension, message, unloaded} | refused{busy} (→ daemon closes)
+C: saved_sessions{named_only?, limit?}       → D: saved_session_list{sessions:[SavedSessionInfo], truncated} | error   (also on an attached connection)
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode, owned?:{forward_secrets?:[[k,v]]}}
 D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients, owner_token?} | error
 C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event", session_id, seq, ts, event:WireSessionEvent} …
@@ -692,6 +737,10 @@ C: bye | socket close = Detach (turn keeps running)
 - `reload_extension` follows it too: an older daemon answers "unknown variant `reload_extension`" and
   `synaps daemon reload-extension` exits 2; its two replies only answer it; refused on an attached
   connection.
+- `saved_sessions` follows it too, and is also listed in `Welcome.features` (`saved_sessions`), so
+  a client checks `Welcome.supports("saved_sessions")` before it asks; an older daemon answers
+  "unknown variant `saved_sessions`" and keeps the connection usable. `saved_session_list` only
+  answers it. See "Listing saved sessions".
 - First frame not `Hello` / malformed → `Refused{Protocol}`; oversize frame → `Error` + close;
   `Cmd` before `Attach` → `Error`, connection stays open.
 - **Client command whitelist** (`conn.rs::client_may_send`): an attached client may send `Submit`,

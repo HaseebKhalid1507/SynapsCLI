@@ -157,6 +157,20 @@ All notable changes to this project will be documented in this file.
   failed is not announced. Not sent for a
   forget made by a subagent worker or by `synaps retention`; the tombstone
   on disk is the record.
+- **Daemon: list saved sessions over the socket** (`saved_sessions`), for
+  clients that can't read the sessions dir themselves, like synaps-desktop
+  or a remote client. A control frame (no attach) that returns the saved
+  sessions the `/sessions` Past tab shows, named ones included, whether the
+  daemon holds them or not. Each conversation is one row: a compacted
+  predecessor folds into its chain head. Rows come newest first with id,
+  name, title (cut to 120 characters), model, cwd, times, message count and
+  `live` (the daemon holds that journal). `named_only` and `limit` (default
+  200, at most 1000) filter the list, and `truncated` says more matched.
+  It's additive with no protocol bump. A daemon that has it lists
+  `saved_sessions` in `Welcome.features`; an older one answers the frame
+  with "unknown variant". Resume a row with `Attach::Create` and
+  `continue_session` set to its id or name.
+  [docs/daemon-mode.md](docs/daemon-mode.md#listing-saved-sessions-saved_sessions)
 
 ### Changed
 

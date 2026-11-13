@@ -116,6 +116,8 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
             assert_eq!(w.protocol_version, PROTOCOL_VERSION);
             assert_eq!(w.daemon_version, binary_version());
             assert_eq!(w.pid, std::process::id());
+            assert!(w.supports(FEATURE_OWNED_SESSIONS), "{:?}", w.features);
+            assert!(w.supports(FEATURE_SAVED_SESSIONS), "{:?}", w.features);
         }
         other => panic!("{other:?}"),
     }
@@ -124,6 +126,9 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
     assert!(matches!(c.recv().await, Some(DaemonFrame::Error { .. })));
     c.send(&ClientFrame::Sessions).await;
     assert!(matches!(c.recv().await, Some(DaemonFrame::SessionList { .. })));
+    // The saved-sessions listing is a control frame too (empty HOME → empty).
+    c.send_line(r#"{"type":"saved_sessions","named_only":true,"limit":200}"#).await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::SavedSessionList { ref sessions, truncated: false }) if sessions.is_empty()));
     c.send(&ClientFrame::Bye).await;
     assert!(matches!(c.recv().await, Some(DaemonFrame::Bye { .. })));
 

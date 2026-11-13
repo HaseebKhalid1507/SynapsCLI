@@ -22,6 +22,7 @@ pub mod pins;
 pub mod registry;
 pub mod reload;
 pub mod rename;
+pub mod saved;
 #[cfg(windows)]
 pub(crate) mod win;
 

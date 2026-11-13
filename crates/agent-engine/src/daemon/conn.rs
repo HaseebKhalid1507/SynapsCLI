@@ -275,6 +275,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             Ok(Read::Frame(ClientFrame::Sessions)) => {
                 let _ = tx.send(DaemonFrame::SessionList { sessions: state.session_metas() }).await;
             }
+            // Off the event loop (`spawn_blocking`): a big sessions dir
+            // delays only this connection.
+            Ok(Read::Frame(ClientFrame::SavedSessions { named_only, limit })) => {
+                let _ = tx.send(super::saved::saved_sessions(&state, named_only, limit).await).await;
+            }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 tracing::info!(force, "daemon: shutdown requested over the socket");
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
@@ -752,6 +757,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             }
             Ok(Read::Frame(ClientFrame::Sessions)) => {
                 let _ = tx.send(DaemonFrame::SessionList { sessions: state.session_metas() }).await;
+            }
+            // Off the event loop (`spawn_blocking`): a big sessions dir
+            // delays only this connection.
+            Ok(Read::Frame(ClientFrame::SavedSessions { named_only, limit })) => {
+                let _ = tx.send(super::saved::saved_sessions(&state, named_only, limit).await).await;
             }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
