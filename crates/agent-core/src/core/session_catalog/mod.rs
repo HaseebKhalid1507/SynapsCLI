@@ -34,7 +34,7 @@ pub use query::{parse_query, DateBound, Query};
 pub use rename::{rename_past_session, rename_past_session_if, RenameError, SessionMtimes};
 pub use time::{Clock, When};
 pub use view::{
-    build_view, day_groups, noise_reasons, DateKey, DayGroup, FacetCount, FacetSelection, Facets,
+    build_view, day_groups, is_sandbox_cwd, noise_reasons, DateKey, DayGroup, FacetCount, FacetSelection, Facets,
     NoiseCounts, NoiseReasons, Sort, View, MIN_MESSAGES,
 };
 
@@ -210,6 +210,13 @@ impl Catalog {
 /// `paths.index_path`. Pure + blocking: run it on `spawn_blocking`.
 /// A missing dir or index is empty, not an error.
 pub fn load_catalog(paths: &CatalogPaths) -> std::io::Result<Catalog> {
+    load_catalog_with(paths, 8)
+}
+
+/// [`load_catalog`] on at most `threads` header-reading threads; `1` reads
+/// on the calling thread and spawns none (a long-lived process that must
+/// not fan out, like the daemon).
+pub fn load_catalog_with(paths: &CatalogPaths, threads: usize) -> std::io::Result<Catalog> {
     let index = read_index(&paths.index_path);
     let dir = &paths.sessions_dir;
     let entries = crate::core::session_journal::session_dir_entries(dir)?;
@@ -228,7 +235,7 @@ pub fn load_catalog(paths: &CatalogPaths) -> std::io::Result<Catalog> {
         .collect();
     // Header reads are tiny but latency-bound on a cold page cache: a few
     // threads keep the disk queue busy (≈4× faster cold, same warm).
-    let headers = parallel_map(&snapshots, 8, |(file, _)| read_header(dir, &file.name));
+    let headers = parallel_map(&snapshots, threads, |(file, _)| read_header(dir, &file.name));
 
     let mut out = Catalog::default();
     for ((file, stem), h) in snapshots.iter().zip(headers) {

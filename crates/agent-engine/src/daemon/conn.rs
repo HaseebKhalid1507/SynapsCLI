@@ -275,6 +275,20 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             Ok(Read::Frame(ClientFrame::Sessions)) => {
                 let _ = tx.send(DaemonFrame::SessionList { sessions: state.session_metas() }).await;
             }
+            // The catalog load runs off the event loop; racing it against
+            // stop and reload keeps their `Bye` prompt on a slow disk.
+            Ok(Read::Frame(ClientFrame::SavedSessions { named_only, limit })) => {
+                let reply = tokio::select! {
+                    r = super::saved::saved_sessions(&state, named_only, limit) => r,
+                    _ = shutdown.cancelled() => { let _ = tx.send(DaemonFrame::Bye { reason: None }).await; let _ = writer.await; return; }
+                    _ = announce.cancelled() => {
+                        let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
+                        let _ = writer.await;
+                        return;
+                    }
+                };
+                let _ = tx.send(reply).await;
+            }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 tracing::info!(force, "daemon: shutdown requested over the socket");
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
@@ -700,7 +714,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     let mut reloading = false;
     let mut lagged = false;
     let announce = state.announce();
+    let mut listings = tokio::task::JoinSet::new();
     loop {
+        while listings.try_join_next().is_some() {}
         let frame = tokio::select! {
             _ = shutdown.cancelled() => { stopping = true; break; }
             _ = owner_lag.cancelled() => { lagged = true; break; }
@@ -753,6 +769,15 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             Ok(Read::Frame(ClientFrame::Sessions)) => {
                 let _ = tx.send(DaemonFrame::SessionList { sessions: state.session_metas() }).await;
             }
+            // Its own task: commands, stop, reload and the session's end
+            // are still read while the catalog loads. Aborted when the
+            // loop ends, so no reply follows the `Bye`.
+            Ok(Read::Frame(ClientFrame::SavedSessions { named_only, limit })) => {
+                let (state, tx) = (Arc::clone(&state), tx.clone());
+                listings.spawn(async move {
+                    let _ = tx.send(super::saved::saved_sessions(&state, named_only, limit).await).await;
+                });
+            }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 state.request_shutdown(force);
@@ -782,6 +807,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             }
         }
     }
+
+    listings.shutdown().await;
 
     // C3: reload — the session is checkpointed and will be rehydrated by
     // the next image; tell the client to reconnect and stop forwarding.

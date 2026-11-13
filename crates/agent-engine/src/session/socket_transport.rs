@@ -47,6 +47,16 @@ pub const RENAME_TIMEOUT: Duration = Duration::from_secs(
 /// timeouts, around 15 s together). Generous, because giving up early only
 /// hides the answer: the daemon finishes the reload either way.
 pub const RELOAD_EXTENSION_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long `saved_sessions` waits: a cold read of a few thousand session
+/// headers, plus a margin.
+pub const SAVED_SESSIONS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `SavedSessionList`: the rows and whether more matched than the limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedSessions {
+    pub sessions: Vec<SavedSessionInfo>,
+    pub truncated: bool,
+}
 
 /// A connection past `Hello`/`Welcome`, before `Attach`.
 pub struct Connected {
@@ -220,6 +230,31 @@ impl Connected {
         match self.request(ClientFrame::Sessions).await? {
             DaemonFrame::SessionList { sessions } => Ok(sessions),
             other => Err(TransportError::Protocol(format!("expected session list, got {other:?}"))),
+        }
+    }
+
+    /// `SavedSessions{named_only, limit}`: the saved sessions on disk (see
+    /// `ClientFrame::SavedSessions`). A daemon that does not list
+    /// [`FEATURE_SAVED_SESSIONS`] in its `Welcome` is `DaemonTooOld`, and
+    /// the frame is never sent to it.
+    pub async fn saved_sessions(&mut self, named_only: bool, limit: Option<u32>) -> Result<SavedSessions, TransportError> {
+        if !self.welcome.supports(FEATURE_SAVED_SESSIONS) {
+            return Err(TransportError::DaemonTooOld {
+                daemon_version: self.welcome.daemon_version.clone(),
+                request: "saved sessions",
+            });
+        }
+        self.writer
+            .send(ClientFrame::SavedSessions { named_only, limit })
+            .await
+            .map_err(|_| TransportError::Closed)?;
+        let frame = tokio::time::timeout(SAVED_SESSIONS_TIMEOUT, read_frame(&mut self.reader, &mut self.buf))
+            .await
+            .map_err(|_| TransportError::Protocol("saved sessions reply timed out".into()))??;
+        match frame.ok_or(TransportError::Closed)? {
+            DaemonFrame::SavedSessionList { sessions, truncated } => Ok(SavedSessions { sessions, truncated }),
+            DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
+            other => Err(TransportError::Protocol(format!("expected saved session list, got {other:?}"))),
         }
     }
 
@@ -728,6 +763,15 @@ impl SocketTransport {
         let s = c.sessions().await;
         c.bye().await;
         s
+    }
+
+    /// `SavedSessions` on a fresh control connection (see
+    /// [`Connected::saved_sessions`]).
+    pub async fn saved_sessions(path: &Path, named_only: bool, limit: Option<u32>) -> Result<SavedSessions, TransportError> {
+        let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
+        let r = c.saved_sessions(named_only, limit).await;
+        c.bye().await;
+        r
     }
 
     pub async fn shutdown(path: &Path, force: bool) -> Result<(), TransportError> {
@@ -1592,6 +1636,24 @@ mod tests {
         );
         assert!(err.to_string().contains("daemon reload"), "{err}");
         assert_eq!(srv.await.unwrap(), vec!["Bye".to_string()], "no Attach ever reached the daemon");
+    }
+
+    /// A daemon without `saved_sessions` in `Welcome.features` would answer
+    /// "unknown variant": the client never asks it, and says why.
+    #[tokio::test]
+    async fn saved_sessions_against_a_daemon_without_the_feature_is_too_old() {
+        let (_d, path) = sock();
+        let l = Listener::bind(&path).unwrap();
+        let srv = tokio::spawn(owned_fake_daemon(l, vec![FEATURE_OWNED_SESSIONS.into()]));
+        let mut conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        assert!(!conn.welcome.supports(FEATURE_SAVED_SESSIONS));
+        let err = conn.saved_sessions(true, None).await.unwrap_err();
+        assert!(
+            matches!(err, TransportError::DaemonTooOld { request: "saved sessions", ref daemon_version } if daemon_version == "0.0.1-old"),
+            "{err}"
+        );
+        conn.bye().await;
+        assert_eq!(srv.await.unwrap(), vec!["Bye".to_string()], "no SavedSessions ever reached the daemon");
     }
 
     /// A daemon that advertises the feature but grants no owner token: the

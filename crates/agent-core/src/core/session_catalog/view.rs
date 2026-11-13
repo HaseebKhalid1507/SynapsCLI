@@ -36,7 +36,9 @@ pub fn noise_reasons(e: &CatalogEntry) -> NoiseReasons {
     }
 }
 
-fn is_sandbox_cwd(cwd: &Path) -> bool {
+/// cwd under a temp dir (`/tmp`, `/var/tmp`, `$TMPDIR`) or a
+/// `synaps-web-sandbox`; the user's own `$HOME` never counts.
+pub fn is_sandbox_cwd(cwd: &Path) -> bool {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     is_sandbox_cwd_with(cwd, home.as_deref(), &std::env::temp_dir())
 }
