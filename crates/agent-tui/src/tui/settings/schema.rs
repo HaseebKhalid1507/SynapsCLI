@@ -13,7 +13,6 @@ pub(crate) enum Category {
     Budgets,
     ToolLimits,
     Appearance,
-    Memory,
     Plugins,
     Sidecar,
     Startup,
@@ -30,7 +29,6 @@ impl Category {
             Category::Budgets => "Turn Budgets",
             Category::ToolLimits => "Tool Limits",
             Category::Appearance => "Appearance",
-            Category::Memory => "Memory",
             Category::Plugins => "Plugins",
             Category::Sidecar => "Sidecar",
             Category::Startup => "Startup",
@@ -39,7 +37,7 @@ impl Category {
     }
 }
 
-pub(crate) const CATEGORIES: [Category; 12] = [
+pub(crate) const CATEGORIES: [Category; 11] = [
     Category::Model,
     Category::Providers,
     Category::Agent,
@@ -47,7 +45,6 @@ pub(crate) const CATEGORIES: [Category; 12] = [
     Category::Budgets,
     Category::ToolLimits,
     Category::Appearance,
-    Category::Memory,
     Category::Plugins,
     Category::Sidecar,
     Category::Startup,
@@ -115,7 +112,6 @@ mod tests {
         for cat in [
             Category::Context,
             Category::Budgets,
-            Category::Memory,
         ] {
             assert!(CATEGORIES.contains(&cat), "{cat:?} missing from CATEGORIES");
             assert!(
@@ -187,7 +183,7 @@ mod tests {
     fn visible_categories_returns_all_when_no_claims() {
         let v = visible_categories(&[]);
         assert_eq!(v.len(), CATEGORIES.len());
-        assert_eq!(v.len(), 12);
+        assert_eq!(v.len(), 11);
         assert!(v.contains(&Category::Sidecar));
     }
 
@@ -196,7 +192,7 @@ mod tests {
         let claim = mk_claim("sample-sidecar", "capture", Some("capture"));
         let v = visible_categories(&[claim]);
         assert_eq!(v.len(), CATEGORIES.len() - 1);
-        assert_eq!(v.len(), 11);
+        assert_eq!(v.len(), 10);
         assert!(!v.contains(&Category::Sidecar));
         assert_eq!(v[0], Category::Model);
         assert_eq!(*v.last().unwrap(), Category::Daemon);
@@ -206,7 +202,7 @@ mod tests {
     fn visible_categories_keeps_sidecar_when_claim_has_no_settings_category() {
         let claim = mk_claim("p", "ocr", None);
         let v = visible_categories(&[claim]);
-        assert_eq!(v.len(), 12);
+        assert_eq!(v.len(), 11);
         assert!(v.contains(&Category::Sidecar));
     }
 }

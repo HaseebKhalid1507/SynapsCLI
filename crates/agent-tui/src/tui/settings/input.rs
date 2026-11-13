@@ -643,7 +643,7 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
             };
             if on { "on".to_string() } else { "off".to_string() }
         }
-        // Config-file-backed rows (cache_ttl, memory.backend, …).
+        // Config-file-backed rows (cache_ttl, max_fps, …).
         other => super::draw::config_row_display(other).unwrap_or_default(),
     }
 }

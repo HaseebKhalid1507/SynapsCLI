@@ -596,7 +596,7 @@ async fn run_command(
         };
     }
     if synaps_cli::engine::commands::evaluate_engine_command(cmd, arg).is_some()
-        || matches!(cmd, "context" | "trace" | "memory" | "workers" | "confirms" | "auth" | "close")
+        || matches!(cmd, "context" | "trace" | "workers" | "confirms" | "auth" | "close")
     {
         use synaps_cli::engine::commands::persist_to_config;
         let value = match link.engine_command(cmd, arg).await {
@@ -1878,6 +1878,96 @@ mod tests {
             }
             _ => panic!("expected plugin command action"),
         }
+    }
+
+    /// The real builtins plus, when `with_plugin`, a plugin `axel` that
+    /// owns a bare `memory` command.
+    fn memory_registry(with_plugin: bool) -> Arc<CommandRegistry> {
+        let plugins = if with_plugin {
+            vec![synaps_cli::skills::Plugin {
+                name: "axel".to_string(),
+                root: PathBuf::from("/tmp/axel"),
+                marketplace: None,
+                version: None,
+                description: None,
+                extension: None,
+                manifest: Some(synaps_cli::skills::manifest::PluginManifest {
+                    name: "axel".to_string(),
+                    version: None,
+                    description: None,
+                    keybinds: vec![],
+                    compatibility: None,
+                    extension: None,
+                    help_entries: vec![],
+                    provides: None,
+                    settings: None,
+                    commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
+                        ManifestSkillPromptCommand {
+                            name: "memory".to_string(),
+                            description: None,
+                            skill: "axel".to_string(),
+                            prompt: "Memory: ${args}".to_string(),
+                        },
+                    )],
+                }),
+            }]
+        } else {
+            vec![]
+        };
+        Arc::new(CommandRegistry::new_with_plugins(
+            synaps_cli::skills::BUILTIN_COMMANDS,
+            vec![],
+            plugins,
+        ))
+    }
+
+    /// `/memory` is not a builtin: a plugin command named `memory` gets it,
+    /// and completion offers it only through that plugin.
+    #[tokio::test]
+    async fn a_plugin_memory_command_wins_over_the_removed_builtin() {
+        let registry = memory_registry(true);
+        assert!(registry.all_commands().contains(&"memory".to_string()));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        match handle_command("memory", "status", &mut app, &mut link, &system_prompt_path, &registry, &keybinds)
+            .await
+        {
+            CommandAction::PluginCommand { command, arg } => {
+                assert_eq!((command.plugin.as_str(), command.name.as_str()), ("axel", "memory"));
+                assert_eq!(arg, "status");
+            }
+            _ => panic!("expected the plugin's /memory"),
+        }
+        let removed = synaps_cli::engine::commands::memory_removed_line();
+        assert!(
+            !app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if *s == removed)),
+            "no removal line"
+        );
+    }
+
+    /// Without a plugin `memory` command, `/memory` is not offered in
+    /// completion, and typing it still prints the one removal line.
+    #[tokio::test]
+    async fn without_a_plugin_memory_prints_the_removal_line() {
+        let registry = memory_registry(false);
+        assert!(!synaps_cli::skills::BUILTIN_COMMANDS.contains(&"memory"));
+        assert!(!registry.all_commands().contains(&"memory".to_string()));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        let action =
+            handle_command("memory", "on", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(matches!(action, CommandAction::None));
+        let want = synaps_cli::engine::commands::memory_removed_line();
+        assert!(
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if *s == want)),
+            "the removal line is shown"
+        );
     }
 
     /// `/close` is the session's to run (it ends it): the TUI forwards it

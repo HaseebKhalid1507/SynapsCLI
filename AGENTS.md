@@ -28,8 +28,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings  # linting (CI ga
 **Build/test worker ceiling (preference):** always use at most **8 workers**
 for Synaps builds/tests (`CARGO_BUILD_JOBS=8` or `cargo -j 8`, test harness
 `--test-threads=8` maximum; use `1` for PTY/environment-sensitive suites).
-Repository `.cargo/config.toml` supplies these defaults. Apply the same ceiling
-to the independently built Axel sidecar; do not multiply parallel build jobs.
+Repository `.cargo/config.toml` supplies these defaults; do not multiply
+parallel build jobs.
 
 **Minimum Rust:** 1.88 (edition 2021).
 **Platforms:** Linux, macOS and Windows 10/11. CI runs the full suite on Linux; macOS gets `cargo check` and the `git_program` tests; Windows gets clippy in both feature sets (default and `--no-default-features`), the `daemon_*` integration tests and `cargo test -p synaps-tui --lib` — the rest of the suite isn't run there yet. Gate Unix-only code and tests with `#[cfg(unix)]` (or `target_os = "linux"` for procfs/systemd); the Windows CI job is the only build that compiles the `cfg(windows)` code.
@@ -123,7 +123,7 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── multi_edit.rs     — anchored edits across files, all or nothing (docs/multi-edit.md)
 │   ├── powershell.rs     — PowerShell tool (Windows only; shares the bash tool's runner)
 │   ├── subagent/         — reactive lifecycle: start, status, steer, collect, resume, authorize_model, finalize + oneshot
-│   ├── memory/           — memory_store, memory_search, memory_fetch, memory_forget, memory_context tools
+│   ├── memory.rs         — memory_store, memory_search, memory_fetch, memory_forget tools
 │   ├── agent.rs          — (legacy — prefer the subagent tools)
 │   ├── extension.rs      — extension-provided tool wrapper
 │   ├── respond.rs        — event-bus response tool
@@ -225,22 +225,16 @@ Project-scoped persistent memory in `crates/agent-core/src/memory/`:
 - **Store**: JSONL files at `~/.synaps-cli/memory/<project>/`, one record per line.
 - **Index**: Lexical substring index for fast search without external dependencies.
 - **Sensitivity**: Three classes — `normal` (full access), `sensitive` (redacted in exports/logs), `secret` (never returned via tool calls).
-- **Tools**: `memory_store`, `memory_search` (returns descriptors with snippets), `memory_fetch` (full bodies by ID), `memory_forget` (tombstone), `memory_context` (session lifecycle control).
+- **Tools**: `memory_store`, `memory_search` (returns descriptors with snippets), `memory_fetch` (full bodies by ID), `memory_forget` (tombstone).
 
 Records have stable IDs, model provenance, tags, timestamps, and optional TTL. The system is designed for agents to accumulate project knowledge across sessions.
 
-Opt-in `memory.backend = axel` routes short notes, eligible context history,
-consented capture/recall, explicit history import, migration and memory retention
-to `sidecars/axel-memory-service`, independently built at an exact Axel revision.
-Axel uses one shared brain with per-repository scopes: Git worktrees share a
-random durable identity in their common Git directory. Default service is an
-installed sibling; default brain is `~/.synaps-cli/memory/axel/brain.r8`.
-Absolute `memory.axel.executable`/`memory.axel.brain` overrides remain supported.
-Linux/procfs is required. Old path scopes require explicit migration/linking;
-there is no legacy fallback or automatic private-history import. User-wide notes
-require separate `memory.user_scope = true` and explicit tool `scope=user`.
-Selection is restart-bound; `/memory` consent and `/context auto` remain separate
-host decisions. See `docs/specs/shared-axel-repositories.md`.
+Notes and context archives are plain files under the base directory, always:
+there is no memory backend to select. `memory.backend`, `memory.user_scope`,
+`memory.axel.executable` and `memory.axel.brain` are removed keys: a config
+that still has them starts normally with one warning. The `memory_*` tools act
+on the project of the chat's folder and take no `scope` (`scope: "repository"`
+is accepted and ignored, any other value refused). Axel is an extension.
 
 ### Reactive Subagent Lifecycle
 
@@ -488,6 +482,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `disabled_plugins` | comma list | — | Plugins to skip on boot |
 | `disabled_skills` | comma list | — | Skills to skip on boot |
 | `disabled_tools` | comma list | — | Built-in tools to remove from the registry at boot (by runtime name, e.g. `bash, ls`); subagent workers don't get them either |
+| `tools.always_loaded` | comma list | — | With `progressive_tool_disclosure = true`: tool ids (as `activate_tools` takes them, e.g. `ext.axel:search, builtin:subagent`) kept loaded from the first request instead of deferred. Ids not in the catalog are skipped (an extension that registers later joins at the next request); untrusted tools never; malformed ids are a config warning. No effect without disclosure ([docs/request-lifecycle-progressive-disclosure.md](docs/request-lifecycle-progressive-disclosure.md#always-loaded-tools)) |
 | `cache_ttl` | string | auto | Prompt-cache TTL: `auto` (1h on an Anthropic subscription/OAuth login, 5m on an API key), `5m`, `1h` or `hybrid`. Other providers ignore it; workers always use 5m |
 | `cache_keepwarm_tools` | bool | on | Keep the prompt cache warm while a long tool round runs (foreground and workers) |
 | `cache_keepwarm_headless` | bool | off | Let idle keep-warm (`cache_keepwarm`) run for daemon sessions driven only by non-interactive clients |
@@ -798,7 +793,7 @@ The model reports task phases through `context_checkpoint`; short `memory_search
 Unix only for now. Rollover waits for a durable frontend head acknowledgement;
 journal generations prevent stale replay after head replacement. Failed saves
 block inference until recovery; this is not an exactly-once tool-effect guarantee.
-No Axel note migration is implied. See
+See
 [context-continuation spec](docs/specs/context-continuation.md) for bounds and
 the 140k/200k versus 250k–400k/1m policy.
 

@@ -29,6 +29,7 @@
 //! may still be working on the call when the next hook is sent.
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -208,11 +209,13 @@ pub(crate) enum SessionStart {
 
 impl SessionStart {
     /// Join the line. `discovery` bounds the wait for extension discovery;
-    /// the hook is keyed on the session's journal id when it runs.
+    /// the hook is keyed on the session's journal id when it runs and
+    /// reports `cwd`, the session's folder.
     pub(crate) fn queue(
         host: &Arc<EngineHost>,
         bus: Arc<HookBus>,
         journal_id: Arc<arc_swap::ArcSwap<String>>,
+        cwd: Option<PathBuf>,
         discovery: Duration,
     ) -> Self {
         let ticket = StartTicket::new(false);
@@ -222,6 +225,7 @@ impl SessionStart {
             Arc::clone(host),
             bus,
             journal_id,
+            cwd,
             discovery,
             Arc::clone(&ticket),
         ));
@@ -274,6 +278,7 @@ async fn run_queued(
     host: Arc<EngineHost>,
     bus: Arc<HookBus>,
     journal_id: Arc<arc_swap::ArcSwap<String>>,
+    cwd: Option<PathBuf>,
     discovery: Duration,
     ticket: Arc<StartTicket>,
 ) -> bool {
@@ -287,7 +292,7 @@ async fn run_queued(
         );
     }
     call_in_line(host.session_start_gate(), &ticket, || {
-        emit_keyed(&bus, &journal_id, &ticket)
+        emit_keyed(&bus, &journal_id, cwd.as_deref(), &ticket)
     })
     .await
 }
@@ -297,11 +302,16 @@ async fn run_queued(
 /// own end clear (`on_session_end`, after [`StartTicket::end`]) comes after
 /// this set, or this check sees the end, since both go through the bus's
 /// injection lock.
-async fn emit_keyed(bus: &Arc<HookBus>, journal_id: &arc_swap::ArcSwap<String>, ticket: &StartTicket) {
+async fn emit_keyed(
+    bus: &Arc<HookBus>,
+    journal_id: &arc_swap::ArcSwap<String>,
+    cwd: Option<&Path>,
+    ticket: &StartTicket,
+) {
     let id = (**journal_id.load()).clone();
     #[cfg(any(test, feature = "testing"))]
     testing::note_call(&id);
-    crate::extensions::loader::emit_session_start(bus, &id).await;
+    crate::extensions::loader::emit_session_start(bus, &id, cwd).await;
     if ticket.has_ended() {
         bus.clear_session_injection(&id).await;
     }
@@ -325,12 +335,17 @@ where
 
 /// `on_session_start` for a session that waits for it at create: through
 /// the same gate, ahead of background hooks.
-pub(crate) async fn run_at_create(host: &EngineHost, bus: &Arc<HookBus>, session_id: &str) {
+pub(crate) async fn run_at_create(
+    host: &EngineHost,
+    bus: &Arc<HookBus>,
+    session_id: &str,
+    cwd: Option<&Path>,
+) {
     let ticket = StartTicket::new(true);
     let permit = host.session_start_gate().acquire(&ticket).await;
     #[cfg(any(test, feature = "testing"))]
     testing::note_call(session_id);
-    crate::extensions::loader::emit_session_start(bus, session_id).await;
+    crate::extensions::loader::emit_session_start(bus, session_id, cwd).await;
     drop(permit);
 }
 
@@ -614,7 +629,7 @@ mod tests {
         let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(id.to_string()));
         let (gate, b, t) = (Arc::clone(gate), Arc::clone(&bus), Arc::clone(&ticket));
         let task = tokio::spawn(async move {
-            call_in_line(&gate, &t, || emit_keyed(&b, &journal_id, &t)).await
+            call_in_line(&gate, &t, || emit_keyed(&b, &journal_id, None, &t)).await
         });
         (SessionStart::Queued { task, ticket }, bus, Blocking { called, release })
     }
@@ -633,7 +648,7 @@ mod tests {
     /// `on_session_end`, which clears the keyed injection.
     async fn end_session(start: &mut SessionStart, bus: &Arc<HookBus>, id: &str) {
         start.end();
-        crate::extensions::loader::emit_session_end(bus, id, None, Duration::from_secs(1)).await;
+        crate::extensions::loader::emit_session_end(bus, id, None, None, Duration::from_secs(1)).await;
     }
 
     /// Control: a session that does not end keeps what its hook injected.
@@ -673,7 +688,7 @@ mod tests {
         let _ = hook.release.send(());
         gate_free(&gate).await;
         assert_eq!(bus.session_injection_for("during").await, None);
-        crate::extensions::loader::emit_session_end(&bus, "during", None, Duration::from_secs(1)).await;
+        crate::extensions::loader::emit_session_end(&bus, "during", None, None, Duration::from_secs(1)).await;
         assert_eq!(bus.session_injection_for("during").await, None);
     }
 

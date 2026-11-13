@@ -372,7 +372,7 @@ pub async fn restore_one(state: &Arc<DaemonState>, entry: &PinEntry) -> Restored
     state.pins.set(id, |e| e.attempts += 1);
     let cfg = SessionConfig {
         continue_session: Some(Some(id.to_string())),
-        cwd: entry.cwd.clone().filter(|c| c.is_dir()),
+        cwd: super::reload::restorable_folder(entry.cwd.clone(), id),
         compaction_policy: CompactionPolicyWire::LinkedSuccessor,
         await_extensions: false,
         keep_warm: true,

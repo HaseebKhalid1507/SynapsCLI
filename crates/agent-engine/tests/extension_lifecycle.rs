@@ -48,7 +48,7 @@ fn with_deferred(
     m.deferred = Some(DeferredDeclarations {
         tools,
         providers: Vec::new(),
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle,
     });
     m
@@ -76,12 +76,13 @@ fn ctx() -> ToolContext {
             tool_activation: None,
             mcp_leases: None,
             extension_leases: None,
-            memory_context: None,
             cwd: None,
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
             session_id: None,
+            hook_bus: None,
+            continuation: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -129,7 +130,7 @@ fn classification_matrix_is_typed_and_exact() {
     provider_only.deferred = Some(DeferredDeclarations {
         tools: vec![],
         providers: vec![declared_provider("prov")],
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle: None,
     });
     assert_eq!(classify(&provider_only), ExtensionClass::Provider);
@@ -148,7 +149,7 @@ fn classification_matrix_is_typed_and_exact() {
     hooky.deferred = Some(DeferredDeclarations {
         tools: vec![],
         providers: vec![],
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle: None,
     });
     assert_eq!(classify(&hooky), ExtensionClass::HookLifecycle);
@@ -168,7 +169,7 @@ fn classification_matrix_is_typed_and_exact() {
     mixed.deferred = Some(DeferredDeclarations {
         tools: vec![declared("t")],
         providers: vec![],
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle: None,
     });
     assert_eq!(classify(&mixed), ExtensionClass::Mixed);
@@ -342,7 +343,7 @@ fn earliest_trigger_matrix_never_uses_tool_search_alone() {
     mixed.deferred = Some(DeferredDeclarations {
         tools: vec![declared("t")],
         providers: vec![],
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle: None,
     });
     assert_eq!(classify(&mixed), ExtensionClass::Mixed);
@@ -354,7 +355,7 @@ fn earliest_trigger_matrix_never_uses_tool_search_alone() {
     tp.deferred = Some(DeferredDeclarations {
         tools: vec![declared("t")],
         providers: vec![declared_provider("p")],
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle: None,
     });
     assert_eq!(classify(&tp), ExtensionClass::Mixed);
@@ -377,7 +378,7 @@ fn provider_declarations_are_deeply_bounded_and_typed() {
         m.deferred = Some(DeferredDeclarations {
             tools: vec![],
             providers: vec![p],
-            context_providers: vec![],
+            context_providers: serde_json::Value::Null,
             lifecycle: None,
         });
         m.validate("plug")
@@ -389,7 +390,7 @@ fn provider_declarations_are_deeply_bounded_and_typed() {
     m.deferred = Some(DeferredDeclarations {
         tools: vec![],
         providers: vec![declared_provider("dup"), declared_provider("dup")],
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle: None,
     });
     assert!(m.validate("plug").is_err());
@@ -419,7 +420,7 @@ fn user_lifecycle_conflicts_with_active_capabilities_fail_closed() {
     m.deferred = Some(DeferredDeclarations {
         tools: vec![],
         providers: vec![declared_provider("p")],
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle: Some(DeferredLifecycle::User),
     });
     assert!(m.validate("plug").is_err());
@@ -495,7 +496,7 @@ async fn deferred_tools_without_tools_register_permission_fail_before_spawn() {
     m.deferred = Some(DeferredDeclarations {
         tools: vec![declared("search")],
         providers: vec![],
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle: None,
     });
 
@@ -535,7 +536,7 @@ fn deferred_providers_without_providers_register_permission_fail_closed() {
     m.deferred = Some(DeferredDeclarations {
         tools: vec![],
         providers: vec![declared_provider("prov")],
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle: None,
     });
     let err = m.validate("plug").expect_err("must fail closed");
@@ -559,7 +560,7 @@ fn hook_lifecycle_without_hook_subscriptions_fails_closed() {
     m.deferred = Some(DeferredDeclarations {
         tools: vec![],
         providers: vec![],
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle: Some(DeferredLifecycle::Hook),
     });
     let err = m.validate("plug").expect_err("must fail closed");
@@ -576,7 +577,7 @@ fn hook_lifecycle_without_hook_subscriptions_fails_closed() {
     hooked.deferred = Some(DeferredDeclarations {
         tools: vec![],
         providers: vec![],
-        context_providers: vec![],
+        context_providers: serde_json::Value::Null,
         lifecycle: Some(DeferredLifecycle::Hook),
     });
     hooked.validate("plug").unwrap();

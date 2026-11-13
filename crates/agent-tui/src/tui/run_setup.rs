@@ -181,7 +181,6 @@ pub(crate) async fn run_setup(
             client_input: None,
             name: None,
             max_session_cost: None,
-            memory_mode: None,
             restore_parked: false,
             message_clock: None,
             owned: None,

@@ -148,15 +148,22 @@ pub(crate) fn path_arg_never_option(path: std::path::PathBuf) -> std::path::Path
 /// identity, not a filesystem lock. A symlink can be swapped after
 /// resolution; write/edit must retain their own filesystem safety policy
 /// for the actual mutation.
-pub(crate) fn canonical_path_key(raw: &str) -> Option<String> {
+///
+/// A relative `raw` is resolved in `cwd`, the folder of the chat making the
+/// call, by the function write/edit resolve their target with
+/// ([`resolve_path_in`]): the key names the file the call will touch. Under
+/// the daemon the process folder is not that folder, and a key made there
+/// put `notes.md` and `<chat>/notes.md`, one file, in two lanes. `None` is a
+/// call with no folder of its own: the process folder.
+pub(crate) fn canonical_path_key_in(raw: &str, cwd: Option<&std::path::Path>) -> Option<String> {
     if raw.trim().is_empty() {
         return None;
     }
-    let expanded = expand_path(raw);
-    let absolute = if expanded.is_absolute() {
-        expanded
+    let resolved_in = resolve_path_in(raw, cwd);
+    let absolute = if resolved_in.is_absolute() {
+        resolved_in
     } else {
-        std::env::current_dir().ok()?.join(expanded)
+        std::env::current_dir().ok()?.join(resolved_in)
     };
 
     use std::path::Component;
@@ -208,10 +215,48 @@ pub(crate) fn canonical_path_key(raw: &str) -> Option<String> {
     Some(resolved.to_string_lossy().to_string())
 }
 
+/// [`canonical_path_key_in`] for a call with no folder of its own.
+#[cfg(test)]
+pub(crate) fn canonical_path_key(raw: &str) -> Option<String> {
+    canonical_path_key_in(raw, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
+
+    /// A relative path is keyed in the chat's folder, not the process's: it
+    /// has the key of the same file spelled absolutely, two chats' same
+    /// relative path are two keys, and neither is the key of that name in
+    /// the folder the process runs in.
+    #[test]
+    fn canonical_path_key_in_resolves_a_relative_path_in_the_chats_folder() {
+        let (chat_a, chat_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let in_a = canonical_path_key_in("notes.md", Some(chat_a.path()));
+        let in_b = canonical_path_key_in("notes.md", Some(chat_b.path()));
+        let absolute = |dir: &std::path::Path| {
+            canonical_path_key_in(dir.join("notes.md").to_str().unwrap(), None)
+        };
+        assert!(in_a.is_some() && in_b.is_some());
+        assert_eq!(in_a, absolute(chat_a.path()));
+        assert_eq!(in_b, absolute(chat_b.path()));
+        assert_ne!(in_a, in_b);
+        let in_the_process_folder = canonical_path_key_in("notes.md", None);
+        assert_eq!(
+            in_the_process_folder,
+            absolute(&std::env::current_dir().unwrap())
+        );
+        assert_ne!(in_a, in_the_process_folder);
+        // An absolute path is the same key from any folder.
+        assert_eq!(
+            canonical_path_key_in(
+                chat_a.path().join("notes.md").to_str().unwrap(),
+                Some(chat_b.path())
+            ),
+            in_a
+        );
+    }
 
     /// Seeding is monotonic: a reload's floor raises the counter, a lower
     /// seed never lowers it (other tests dispatch concurrently: inequalities).

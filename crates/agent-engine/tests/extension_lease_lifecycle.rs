@@ -142,12 +142,13 @@ fn ctx_with(cap: Option<ExtensionLeaseCapability>) -> ToolContext {
             tool_activation: None,
             mcp_leases: None,
             extension_leases: cap,
-            memory_context: None,
             cwd: None,
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
             session_id: None,
+            hook_bus: None,
+            continuation: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -245,6 +246,31 @@ async fn zero_spawn_during_load_search_and_exact_activation() {
     fx.cleanup();
 }
 
+/// A deferred extension's generic handler serves no tool call, whoever the
+/// call is for: the exact lease call, which pins the declaration, is the
+/// only way in.
+#[tokio::test]
+async fn the_deferred_handler_refuses_a_tool_call_and_starts_nothing() {
+    use agent_engine::extensions::runtime::ExtensionHandler;
+    hermetic_base_dir::pin();
+    let fx = fixture("handler-refuses", "ok", advertised_tools());
+    let (mgr, _registry) = deferred_manager(&fx).await;
+    let runtime = mgr.extension_runtime();
+    let handler =
+        agent_engine::extensions::lease::LazyExtensionHandler::new(PLUGIN, Arc::clone(&runtime));
+
+    for (session_id, cwd) in [(Some("chat-A"), Some(fx.dir.as_path())), (None, None)] {
+        let err = handler
+            .call_tool_for("search", json!({"q": "a"}), session_id, cwd)
+            .await
+            .unwrap_err();
+        assert!(err.contains("is deferred"), "{err}");
+    }
+    assert!(fx.events().is_empty(), "no process was started");
+    assert_eq!(runtime.lease_count(), 0);
+    fx.cleanup();
+}
+
 #[tokio::test]
 async fn exact_execute_starts_once_reuses_and_calls_only_exact_tool() {
     hermetic_base_dir::pin();
@@ -279,6 +305,81 @@ async fn exact_execute_starts_once_reuses_and_calls_only_exact_tool() {
     fx.cleanup();
 }
 
+/// `caller` on the deferred lane. A deferred extension tool's call goes
+/// context -> `DeferredExtensionTool::execute` -> the session lease
+/// (`call_exact_as`) -> the leased process, and the process is sent the
+/// author of the calling run's own binding: each chat's its own, the same
+/// on a later call, and no `caller` key when the context has no binding.
+#[tokio::test]
+async fn a_deferred_tools_call_names_the_calling_runs_own_author() {
+    use agent_core::memory::author::Author;
+    use agent_engine::memory_backend::MemoryBinding;
+
+    hermetic_base_dir::pin();
+    let fx = fixture("caller", "ok", advertised_tools());
+    let (mgr, _registry) = deferred_manager(&fx).await;
+    let runtime = mgr.extension_runtime();
+    let tools = dormant_extension_tools(PLUGIN, &fx.manifest);
+    let search = tools
+        .iter()
+        .find(|t| t.name() == "fixture-plugin:search")
+        .unwrap();
+
+    // Two chats: each a folder, a binding and a lease session of its own.
+    let chat = |name: &str| {
+        let dir = fx.dir.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let binding = MemoryBinding::for_cwd(Some(dir));
+        let session = SessionId::parse(&format!("task20-{name}")).unwrap();
+        (binding, ExtensionLeaseCapability::new(session, Arc::clone(&runtime)), name.to_string())
+    };
+    let (a, b) = (chat("chat-a"), chat("chat-b"));
+    let ctx_of = |(binding, cap, name): &(MemoryBinding, ExtensionLeaseCapability, String)| {
+        let mut ctx = ctx_with(Some(cap.clone()));
+        ctx.capabilities.memory_backend = Some(binding.clone());
+        ctx.capabilities.session_id = Some(name.clone());
+        ctx
+    };
+    for ctx in [ctx_of(&a), ctx_of(&b), ctx_of(&a)] {
+        assert_eq!(search.execute(json!({"q":"x"}), ctx).await.unwrap(), "called:search");
+    }
+    // A context with a lease and no binding: the call is made, for no run.
+    let unbound = ExtensionLeaseCapability::new(sid(), Arc::clone(&runtime));
+    search
+        .execute(json!({"q":"x"}), ctx_with(Some(unbound)))
+        .await
+        .unwrap();
+
+    let mut path = fx.spy.clone().into_os_string();
+    path.push(".callers.jsonl");
+    let calls: Vec<Value> = std::fs::read_to_string(path)
+        .expect("the fixture kept the calls")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("fixture caller JSON"))
+        .filter(|call: &Value| call["name"] == "search")
+        .collect();
+    assert_eq!(calls.len(), 4, "{calls:?}");
+    let author = |call: &Value| {
+        let author: Author = serde_json::from_value(call["caller"].clone())
+            .unwrap_or_else(|e| panic!("no caller on {call}: {e}"));
+        author.validate().expect("a valid author");
+        author
+    };
+    for (call, (binding, _, name)) in calls.iter().zip([&a, &b, &a]) {
+        assert_eq!(call["session_id"], json!(name), "{call}");
+        assert_eq!(&author(call), binding.author(), "{name}: its own binding's author");
+        assert!(author(call).parent.is_none(), "a chat has no parent");
+    }
+    let (of_a, of_b) = (author(&calls[0]), author(&calls[1]));
+    assert_ne!(of_a.actor, of_b.actor);
+    assert_ne!(of_a.group, of_b.group);
+    assert_eq!(calls[3]["has_caller"], json!(false), "no binding, no key: {}", calls[3]);
+    assert_eq!(calls[3]["session_id"], Value::Null);
+
+    runtime.terminate_all();
+    fx.cleanup();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_first_calls_are_single_flight() {
     hermetic_base_dir::pin();
@@ -288,8 +389,8 @@ async fn concurrent_first_calls_are_single_flight() {
     let digest = SchemaDigest::of_schema(&search_schema());
 
     let session = sid();
-    let a = runtime.call_exact(&session, PLUGIN, "search", &digest, json!({"q":"a"}));
-    let b = runtime.call_exact(&session, PLUGIN, "search", &digest, json!({"q":"b"}));
+    let a = runtime.call_exact_no_chat(&session, PLUGIN, "search", &digest, json!({"q":"a"}));
+    let b = runtime.call_exact_no_chat(&session, PLUGIN, "search", &digest, json!({"q":"b"}));
     // Outer timeout guards against a lost-wakeup hang regression.
     let (ra, rb) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(a, b) })
         .await
@@ -583,7 +684,7 @@ async fn session_end_guard_revocation_and_idle_reap_kill_children() {
 
     // 1. RAII session-end guard kills the child on drop.
     runtime
-        .call_exact(&sid(), PLUGIN, "search", &digest, json!({"q":"a"}))
+        .call_exact_no_chat(&sid(), PLUGIN, "search", &digest, json!({"q":"a"}))
         .await
         .unwrap();
     let weak = runtime.lease_liveness_for_tests(&sid(), PLUGIN).unwrap();
@@ -599,7 +700,7 @@ async fn session_end_guard_revocation_and_idle_reap_kill_children() {
     // 2. Re-acquire (idle reap already proved by ZERO idle_max: the
     // manager reaps on acquisition), then exact revocation kills again.
     runtime
-        .call_exact(&sid(), PLUGIN, "search", &digest, json!({"q":"b"}))
+        .call_exact_no_chat(&sid(), PLUGIN, "search", &digest, json!({"q":"b"}))
         .await
         .unwrap();
     assert_eq!(fx.count("spawn"), 2, "second lease respawned");
@@ -612,7 +713,7 @@ async fn session_end_guard_revocation_and_idle_reap_kill_children() {
 
     // 3. No leaked child on runtime-manager drop.
     runtime
-        .call_exact(&sid(), PLUGIN, "search", &digest, json!({"q":"c"}))
+        .call_exact_no_chat(&sid(), PLUGIN, "search", &digest, json!({"q":"c"}))
         .await
         .unwrap();
     assert_eq!(fx.count("spawn"), 3);
@@ -636,7 +737,7 @@ async fn unload_removes_record_dormant_batch_and_live_lease() {
     let digest = SchemaDigest::of_schema(&search_schema());
 
     runtime
-        .call_exact(&sid(), PLUGIN, "search", &digest, json!({"q":"a"}))
+        .call_exact_no_chat(&sid(), PLUGIN, "search", &digest, json!({"q":"a"}))
         .await
         .unwrap();
     let weak = runtime.lease_liveness_for_tests(&sid(), PLUGIN).unwrap();
@@ -745,7 +846,7 @@ async fn durable_shared_scope_survives_turns_and_only_last_owner_terminates() {
     ));
 
     runtime
-        .call_exact(&session, PLUGIN, "search", &digest, json!({"q":"turn1"}))
+        .call_exact_no_chat(&session, PLUGIN, "search", &digest, json!({"q":"turn1"}))
         .await
         .unwrap();
 
@@ -754,7 +855,7 @@ async fn durable_shared_scope_survives_turns_and_only_last_owner_terminates() {
     drop(turn1_hold);
     assert_eq!(runtime.lease_count(), 1, "lease survives a turn ending");
     runtime
-        .call_exact(&session, PLUGIN, "search", &digest, json!({"q":"turn2"}))
+        .call_exact_no_chat(&session, PLUGIN, "search", &digest, json!({"q":"turn2"}))
         .await
         .unwrap();
     assert_eq!(fx.count("spawn"), 1, "turn 2 reuses the retained lease");

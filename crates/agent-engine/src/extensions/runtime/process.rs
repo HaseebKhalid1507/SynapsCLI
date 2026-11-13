@@ -4,7 +4,7 @@
 //! Content-Length framing (LSP-style) over stdin/stdout.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use super::{ExtensionHandler, ExtensionHealth, ExtensionLifecycle, RestartPolicy};
 use crate::extensions::hooks::events::{HookEvent, HookResult};
 use crate::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION;
+use agent_core::memory::author::Author;
 
 #[derive(Serialize)]
 struct JsonRpcRequest {
@@ -231,8 +232,8 @@ pub async fn execute_provider_tool_use(
     // live ToolId, verify the session set snapshot generation + pinned
     // schema digest, require core/exact-grant status, re-check source
     // trust, and only then acquire the implementation — all against the
-    // one consistent registry borrow the caller holds (read-locked for the
-    // whole outer provider call, so the catalog cannot drift inside the
+    // one consistent registry snapshot the caller holds (for the whole
+    // outer provider call, so the catalog cannot drift inside the
     // loop). Denial happens BEFORE input translation, BEFORE hook
     // emission, BEFORE execution, and returns a valid tool_result with
     // typed bounded static content and `is_error: true`.
@@ -255,6 +256,10 @@ pub async fn execute_provider_tool_use(
 
     let runtime_name = authorized.runtime_name().to_string();
     let input = registry.translate_input_for_api_tool(&tool_name, input);
+    // Whose call this is and the folder it runs in, kept for the hook after
+    // `ctx` is spent.
+    let session_id = ctx.capabilities.session_id.clone();
+    let cwd = ctx.capabilities.cwd.clone();
     let decision = crate::runtime::resolve_before_tool_call_decision(
         input.clone(),
         crate::runtime::emit_before_tool_call(
@@ -262,9 +267,10 @@ pub async fn execute_provider_tool_use(
             &tool_name,
             Some(&runtime_name),
             input.clone(),
-            // Extension-originated tool.invoke: no owning conversation on this
-            // path (ToolContext carries none) → `null`, as before.
-            None,
+            // The conversation the extension-provided model answers for
+            // (`null` for a worker, or a context that names none).
+            session_id.as_deref(),
+            cwd.as_deref(),
         )
         .await,
         ctx.capabilities.secret_prompt.as_ref(),
@@ -299,7 +305,8 @@ pub async fn execute_provider_tool_use(
         input_for_hook,
         result,
         max_tool_output,
-        None,
+        session_id.as_deref(),
+        cwd.as_deref(),
     )
     .await;
 
@@ -315,9 +322,9 @@ pub async fn execute_provider_tool_use(
 }
 
 /// Interior extension-provider tool loop. `session_tools` is built ONCE by
-/// the caller (under the same registry read guard passed as `registry`) and
-/// reused for every tool call in every interior round — the registry stays
-/// read-locked for the whole outer provider call, so no catalog drift is
+/// the caller (against the same registry snapshot passed as `registry`) and
+/// reused for every tool call in every interior round — the snapshot does
+/// not change for the whole outer provider call, so no catalog drift is
 /// possible inside this loop and one set snapshot governs all rounds.
 #[allow(clippy::too_many_arguments)] // explicit loop policy inputs; grouping would hide registry/session coupling
 pub async fn complete_provider_with_tools<F>(
@@ -590,7 +597,6 @@ struct Inbox {
     inbound_stdin: Mutex<Option<Arc<Mutex<ChildStdin>>>>,
     /// Extension id, used for namespace policy and diagnostics.
     extension_id: String,
-    exclusive_memory: bool,
 }
 
 impl Inbox {
@@ -604,8 +610,6 @@ impl Inbox {
             next_generation: AtomicU64::new(2),
             permissions: RwLock::new(None),
             inbound_stdin: Mutex::new(None),
-            exclusive_memory: crate::memory_backend::MemoryBinding::configured_current()
-                .exclusive(),
             extension_id,
         }
     }
@@ -769,25 +773,7 @@ impl ProcessExtension {
         args: &[String],
         cwd: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let exclusive = crate::memory_backend::MemoryBinding::configured_current().exclusive();
-        Self::spawn_with_memory_policy(id, command, args, cwd, exclusive).await
-    }
-
-    pub(crate) async fn spawn_with_memory_policy(
-        id: &str,
-        command: &str,
-        args: &[String],
-        cwd: Option<PathBuf>,
-        exclusive: bool,
-    ) -> Result<Self, String> {
-        if exclusive && id == "axel-memory-manager" {
-            return Err(
-                "independent Axel plugin is disabled by the host-selected memory backend".into(),
-            );
-        }
-        let mut inbox = Inbox::new(id.to_string());
-        inbox.exclusive_memory = exclusive;
-        let inbox = Arc::new(inbox);
+        let inbox = Arc::new(Inbox::new(id.to_string()));
         let state = Self::spawn_state(id, command, args, cwd.as_ref(), inbox.clone()).await?;
         Ok(Self {
             id: id.to_string(),
@@ -1265,13 +1251,6 @@ impl ProcessExtension {
         use crate::extensions::permissions::Permission;
         use crate::memory::store::{self, MemoryQuery};
 
-        if inbox.exclusive_memory && matches!(method, "memory.append" | "memory.query") {
-            return Err((
-                -32000,
-                "legacy extension memory is disabled by the host-selected backend".into(),
-            ));
-        }
-
         match method {
             "memory.append" => {
                 Self::require_permission(inbox, Permission::MemoryWrite, "memory.write").await?;
@@ -1303,7 +1282,12 @@ impl ProcessExtension {
                 };
                 let record = store::new_record(namespace, content, tags, meta);
                 let timestamp_ms = record.timestamp_ms;
-                store::append(&record).map_err(|e| (-32000, e.to_string()))?;
+                // On a blocking thread: the append waits for the notes file's
+                // lock (up to 5 seconds, sleeping) and syncs the file.
+                tokio::task::spawn_blocking(move || store::append(&record))
+                    .await
+                    .map_err(|_| (-32000, "memory append worker failed".to_string()))?
+                    .map_err(|e| (-32000, e.to_string()))?;
                 Ok(serde_json::json!({"ok": true, "timestamp_ms": timestamp_ms}))
             }
             "memory.query" => {
@@ -1895,6 +1879,8 @@ impl ProcessExtension {
         name: &str,
         input: Value,
         session_id: Option<&str>,
+        cwd: Option<&Path>,
+        caller: Option<&Author>,
     ) -> Result<Value, String> {
         let fut = async {
             let _call_guard = self.call_lock.lock().await;
@@ -1916,7 +1902,7 @@ impl ProcessExtension {
                 .call_once_locked(
                     &mut state,
                     "tool.call",
-                    tool_call_params(name, input, session_id),
+                    tool_call_params(name, input, session_id, cwd, caller),
                     id,
                 )
                 .await;
@@ -2198,12 +2184,31 @@ impl ProcessExtension {
 /// `tool.call` params. `session_id` is the owning conversation id, `null`
 /// for workers/no conversation and under the `SYNAPS_HOOK_SESSION_ID=0`
 /// kill switch, so plugins can key tool state on the same value the hook
-/// events carry. Always present (`null`, never omitted), like hook fields.
-pub(crate) fn tool_call_params(name: &str, input: Value, session_id: Option<&str>) -> Value {
+/// events carry. `cwd` is the folder the caller runs in, as on hook events
+/// ([`hook_cwd`]): set for workers too, and the kill switch leaves it alone.
+/// Both always present (`null`, never omitted), like hook fields.
+///
+/// `caller` is the author of the run that makes the call: the one its
+/// memory binding holds (an extension's forum records it). Serialised as [`Author`] serialises (`parent` absent for a
+/// chat). Unlike the two above the key is ABSENT when there is none (no
+/// binding in the tool context, the host's own calls) or when it does not
+/// validate: never `null`, never one made up here. The kill switch leaves
+/// it alone. An identity, not a secret and not a proof of who calls.
+///
+/// [`hook_cwd`]: crate::extensions::hooks::events::hook_cwd
+pub(crate) fn tool_call_params(
+    name: &str,
+    input: Value,
+    session_id: Option<&str>,
+    cwd: Option<&Path>,
+    caller: Option<&Author>,
+) -> Value {
     tool_call_params_gated(
         name,
         input,
         session_id,
+        cwd,
+        caller,
         crate::extensions::hooks::events::hook_session_id_enabled(),
     )
 }
@@ -2212,14 +2217,24 @@ fn tool_call_params_gated(
     name: &str,
     input: Value,
     session_id: Option<&str>,
+    cwd: Option<&Path>,
+    caller: Option<&Author>,
     session_id_enabled: bool,
 ) -> Value {
     let session_id = if session_id_enabled { session_id } else { None };
-    serde_json::json!({
+    let mut params = serde_json::json!({
         "name": name,
         "input": input,
         "session_id": session_id,
-    })
+        "cwd": crate::extensions::hooks::events::hook_cwd(cwd),
+    });
+    if let Some(caller) = caller
+        .filter(|author| author.validate().is_ok())
+        .and_then(|author| serde_json::to_value(author).ok())
+    {
+        params["caller"] = caller;
+    }
+    params
 }
 
 #[async_trait]
@@ -2233,18 +2248,29 @@ impl ExtensionHandler for ProcessExtension {
         lifecycle.snapshot(self.total_restarts.load(Ordering::Relaxed) > 0)
     }
 
-    async fn call_tool(&self, name: &str, input: Value) -> Result<Value, String> {
-        self.call_tool_for(name, input, None).await
-    }
-
     async fn call_tool_for(
         &self,
         name: &str,
         input: Value,
         session_id: Option<&str>,
+        cwd: Option<&Path>,
     ) -> Result<Value, String> {
-        self.call("tool.call", tool_call_params(name, input, session_id))
-            .await
+        self.call_tool_as(name, input, session_id, cwd, None).await
+    }
+
+    async fn call_tool_as(
+        &self,
+        name: &str,
+        input: Value,
+        session_id: Option<&str>,
+        cwd: Option<&Path>,
+        caller: Option<&Author>,
+    ) -> Result<Value, String> {
+        self.call(
+            "tool.call",
+            tool_call_params(name, input, session_id, cwd, caller),
+        )
+        .await
     }
 
     async fn provider_complete(
@@ -2575,49 +2601,86 @@ impl ExtensionHandler for ProcessExtension {
 }
 
 #[cfg(test)]
-mod exclusive_memory_tests {
-    use super::*;
-    #[tokio::test]
-    async fn exclusive_inbox_refuses_legacy_memory_without_writes() {
-        let mut inbox = Inbox::new("fixture".into());
-        inbox.exclusive_memory = true;
-        let inbox = Arc::new(inbox);
-        for method in ["memory.append", "memory.query"] {
-            let result = ProcessExtension::handle_inbound_request(
-                &inbox,
-                method,
-                serde_json::json!({"namespace":"fixture","content":"must not persist"}),
-            )
-            .await;
-            assert!(result.unwrap_err().1.contains("disabled"));
-        }
-    }
-}
-
-#[cfg(test)]
 mod tool_call_params_tests {
     use super::*;
     use serde_json::json;
 
+    /// A folder in the host's own path shape; it need not exist.
+    fn chat_dir() -> PathBuf {
+        std::env::temp_dir().join("tool-call-cwd")
+    }
+
     #[test]
-    fn carries_caller_session_id() {
+    fn carries_caller_session_id_and_cwd() {
+        let dir = chat_dir();
         assert_eq!(
-            tool_call_params_gated("echo", json!({"text": "hi"}), Some("sess-A"), true),
-            json!({"name": "echo", "input": {"text": "hi"}, "session_id": "sess-A"})
+            tool_call_params_gated("echo", json!({"text": "hi"}), Some("sess-A"), Some(&dir), None, true),
+            json!({
+                "name": "echo",
+                "input": {"text": "hi"},
+                "session_id": "sess-A",
+                "cwd": dir.to_str().unwrap(),
+            })
         );
     }
 
+    /// A worker has no conversation id but does run in a folder.
     #[test]
-    fn worker_call_has_null_session_id_key() {
-        let params = tool_call_params_gated("echo", json!({}), None, true);
+    fn worker_call_has_null_session_id_key_and_its_cwd() {
+        let dir = chat_dir();
+        let params = tool_call_params_gated("echo", json!({}), None, Some(&dir), None, true);
         assert_eq!(params.get("session_id"), Some(&Value::Null));
+        assert_eq!(params["cwd"], json!(dir.to_str().unwrap()));
     }
 
     #[test]
-    fn kill_switch_forces_null() {
-        let params = tool_call_params_gated("echo", json!({}), Some("sess-A"), false);
+    fn kill_switch_forces_null_session_id_and_leaves_cwd() {
+        let dir = chat_dir();
+        let params = tool_call_params_gated("echo", json!({}), Some("sess-A"), Some(&dir), None, false);
         assert_eq!(params.get("session_id"), Some(&Value::Null));
+        assert_eq!(params["cwd"], json!(dir.to_str().unwrap()));
         assert_eq!(params["name"], json!("echo"));
+    }
+
+    /// No session folder: the process folder, never an absent key.
+    #[test]
+    fn no_session_folder_sends_the_process_folder() {
+        let process = std::env::current_dir().unwrap();
+        let params = tool_call_params_gated("echo", json!({}), None, None, None, true);
+        assert_eq!(params["cwd"], json!(process.to_str().unwrap()));
+    }
+
+    /// The value is the author as its type serialises, and reads back as it.
+    #[test]
+    fn caller_is_the_author_as_it_serialises() {
+        let chat = Author::fresh();
+        let worker = chat.child();
+        for (author, keys) in [(&chat, 2), (&worker, 3)] {
+            // The kill switch is for session_id only.
+            for enabled in [true, false] {
+                let params =
+                    tool_call_params_gated("echo", json!({}), None, None, Some(author), enabled);
+                assert_eq!(params["caller"], serde_json::to_value(author).unwrap());
+                assert_eq!(params["caller"].as_object().unwrap().len(), keys);
+                let read: Author = serde_json::from_value(params["caller"].clone()).unwrap();
+                read.validate().unwrap();
+                assert_eq!(&read, author);
+            }
+        }
+        let params = tool_call_params_gated("echo", json!({}), None, None, Some(&chat), true);
+        assert!(params["caller"].get("parent").is_none(), "a chat has no parent key");
+    }
+
+    /// No author: no key, not `null`. One that does not validate is not sent.
+    #[test]
+    fn no_caller_is_no_key() {
+        let params = tool_call_params_gated("echo", json!({}), Some("s"), None, None, true);
+        assert!(params.as_object().unwrap().get("caller").is_none());
+        assert_eq!(params.as_object().unwrap().len(), 4);
+        let mut bad = Author::fresh();
+        bad.actor = "me".into();
+        let params = tool_call_params_gated("echo", json!({}), None, None, Some(&bad), true);
+        assert!(params.as_object().unwrap().get("caller").is_none());
     }
 }
 

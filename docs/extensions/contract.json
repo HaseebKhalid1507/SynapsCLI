@@ -74,6 +74,26 @@
       "actions": [
         "continue"
       ]
+    },
+    "on_context_archived": {
+      "permission": "privacy.llm_content",
+      "tool_filter": false,
+      "actions": [
+        "continue"
+      ],
+      "delivery": "notify-only: sent after a context rollover has written and synced every archive file of the window, never awaited, result discarded; best effort (dropped on a 5 s timeout, when 64 notify-only deliveries are in flight, or when the host exits), unordered, and one archive_id may be announced more than once; a window sealed as several archives sends one event per archive as one delivery, first part first, and nothing if sealing stopped between two parts; never for subagent workers",
+      "compatibility": "additive hook kind within extension_protocol_version 1 (no version bump): extensions that do not name it are unaffected; an extension that subscribes to it fails to load on a host that predates it (unknown hook kind)",
+      "event_data": "{archive_id: 32 lowercase hex, path: absolute path of the archive file | null, project_key: string, message_count: int, source_message_count: int, window: int (the window that starts after the archive), part: int (1-based), parts: int, first_source_index: int, reduced_messages: int}; a window within the limits of one archive is one event with part = parts = 1, first_source_index = 0 and reduced_messages = 0; a window over them is sealed as several archives, one event each, where the parts are consecutive (first_source_index of a part = first_source_index + source_message_count of the one before), source_message_count is that part's share of the window, and reduced_messages counts its messages stored with an oversized payload left out (marked _archive_reduced in the file); session_id is the chat the window belonged to and is always set"
+    },
+    "on_memory_forgotten": {
+      "permission": "session.lifecycle",
+      "tool_filter": false,
+      "actions": [
+        "continue"
+      ],
+      "delivery": "notify-only: sent after the memory_forget tool has forgotten an archive or a note, never awaited, result discarded; best effort (dropped on a 5 s timeout, when 64 notify-only deliveries are in flight, or when the host exits), unordered, and a forgotten archive may be announced more than once; not sent for a forget that failed, nor for one made by a subagent worker or by `synaps retention`",
+      "compatibility": "additive hook kind within extension_protocol_version 1 (no version bump): extensions that do not name it are unaffected; an extension that subscribes to it fails to load on a host that predates it (unknown hook kind)",
+      "event_data": "{id: string, kind: \"archive\"|\"note\", project_key: string, scope: \"repository\"}; for an archive id is the bare 32 lowercase hex (archive_id of on_context_archived, no ctx- prefix), for a note the id as stored; scope is always repository (it could be user before 0.12.0); session_id is the chat whose tool call it was, null when the call had no chat behind it"
     }
   },
   "permissions": [
@@ -151,9 +171,11 @@
         "params": {
           "name": "the extension's own tool name (not the plugin-id:name runtime name)",
           "input": "the model-supplied arguments object",
-          "session_id": "owning conversation id; null for workers/subagents, the extension-provider tool route, contexts with no conversation, and under SYNAPS_HOOK_SESSION_ID=0. Always present."
+          "session_id": "owning conversation id; null for workers/subagents, for the host's own calls to a memory extension (capture and recall), and under SYNAPS_HOOK_SESSION_ID=0. Always present.",
+          "cwd": "the folder the caller runs in (the chat's; a worker's parent chat's; the chat's for the host's own memory calls), as the client gave it, not canonicalised by Synaps; null only when the path is not valid UTF-8, or when the folder to report is the host process's own and it cannot be read. The same value hook events carry as cwd. Always present.",
+          "caller": "optional object {actor: \"actor-<32 lowercase hex>\", group: \"group-<32 lowercase hex>\", parent?: \"actor-<32 lowercase hex>\"}: the author of the run that makes the call (a chat, or one worker of it), the one an extension's forum records when that run posts. parent is absent for a chat and is the starting run's actor for a worker; workers share their chat's group. The key is absent, never null, when the call has no memory binding behind it and for the host's own memory calls (capture and recall). Written by the host beside input, never from it: a model cannot set it and no run is given another's, so an extension may go by it. Its values are not secret (models can read them in an extension's forum posts), so an extension must never accept an author from tool input. A call with no caller (the host's own calls, an older host) must get no access that depends on who is calling. It identifies one life of a run: after a park and wake, a daemon reload or restart, or --continue, the same chat has a new actor and a new group. session_id is what stays the same for a chat; a worker's call has no session_id, so group ties a worker to its chat only within one life. Not affected by SYNAPS_HOOK_SESSION_ID."
         },
-        "compatibility": "session_id is an additive params key within extension_protocol_version 1; extensions must ignore params keys they do not know"
+        "compatibility": "session_id, cwd and caller are additive params keys within extension_protocol_version 1; extensions must ignore params keys they do not know"
       }
     },
     "providers": {

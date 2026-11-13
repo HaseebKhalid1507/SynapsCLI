@@ -832,9 +832,15 @@ fn classify_stream_outcome(
 /// Extensible — new flags go here instead of adding parameters to 4 signatures.
 #[derive(Debug, Clone, Default)]
 pub struct ApiOptions {
-    /// Immutable host binding for extension-provider interior tool execution.
-    /// `None` is only for internal/test callers without a runtime capability.
-    pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
+    /// What the tool calls of this turn are given, for the tool loop of an
+    /// extension-provided model (`openai::extension_route`): the very
+    /// [`TurnToolContext`](crate::tools::TurnToolContext) the stream loop
+    /// (or `run_single`) makes its own tools' contexts from, so that loop's
+    /// tools run in the chat's folder with the chat's environment, for the
+    /// chat. `None` (keep-warm pings, compaction, tests): a request that
+    /// runs no tool for a chat; a tool that loop runs then gets
+    /// `TurnToolContext::no_chat`.
+    pub tool_context: Option<crate::tools::TurnToolContext>,
     /// Opt into the 1M context window beta header.
     pub use_1m_context: bool,
     /// Configured prompt-cache TTL (spec: cache-ttl). Resolved to a wire
@@ -1282,7 +1288,7 @@ impl ApiMethods {
                     options.codex_request_role,
                     options.tool_session_id.as_ref(),
                     options.session_tool_set.as_ref(),
-                    options.memory_backend.as_ref(),
+                    options.tool_context.as_ref(),
                     &options.trace,
                     options.suppress_stream_deltas,
                 )

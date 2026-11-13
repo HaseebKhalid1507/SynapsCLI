@@ -32,8 +32,7 @@ pub(crate) const TYPED_CYCLERS: &[&str] = &["cache_keepwarm"];
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     // Dead config: parsed by `load_config` but read by nothing (the shell
-    // tool is built from `ShellConfig::default()`; no runtime consumer of
-    // the continuous-memory policy fields). No row until a PR wires the key
+    // tool is built from `ShellConfig::default()`). No row until a PR wires the key
     // up — that PR must move it back to a row in `define_settings!`.
     ("shell.default_cols", NOT_READ_YET),
     ("shell.default_rows", NOT_READ_YET),
@@ -43,19 +42,9 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("shell.readiness_strategy", NOT_READ_YET),
     ("shell.readiness_timeout_ms", NOT_READ_YET),
     ("shell.max_readiness_timeout_ms", NOT_READ_YET),
-    ("memory.capture_user", NOT_READ_YET),
-    ("memory.capture_assistant", NOT_READ_YET),
-    ("memory.capture_tools", NOT_READ_YET),
-    ("memory.recall_max_records", NOT_READ_YET),
-    ("memory.recall_max_tokens", NOT_READ_YET),
-    ("memory.recall_timeout_ms", NOT_READ_YET),
-    ("memory.auto_consolidate", NOT_READ_YET),
-    ("memory.local_embeddings", NOT_READ_YET),
-    ("memory.gliner", NOT_READ_YET),
     ("auth.machine_token", "secret: never echoed in a TUI"),
     ("auth.remote_endpoint", "credential-broker wiring set by deployment, not a preference"),
     ("server.auto_approve_confirms", "security-sensitive: approves every extension confirm unasked"),
-    ("memory.default_mode_confirmed", "operator consent marker: must be set by hand"),
     ("subagent_max_concurrent", "legacy flat alias of subagent.max_concurrent (edit that row)"),
     ("subagent_max_total", "legacy flat alias of subagent.max_total (edit that row)"),
     ("favorite_models", "owned by the model picker (/models favorites)"),
@@ -678,6 +667,10 @@ define_settings! {
         "When the model asks to activate tools: auto allows (default), prompt asks you, deny refuses. Takes effect next launch.",
         |_app, value| config_edit("tools.activation_confirm", value);
 
+    "tools.always_loaded", "Always-loaded tools", ToolLimits, EditorKind::Text { numeric: false },
+        "With progressive tools on: tools kept loaded from the first request, comma-separated ids as activate_tools takes them (e.g. ext.axel:search, builtin:subagent). Ids not installed are skipped. Empty = none. Takes effect next launch.",
+        |_app, value| config_edit("tools.always_loaded", value);
+
     "process_scopes", "Process scopes", ToolLimits, EditorKind::Cycler(&["auto", "off"]),
         "Run the daemon, bash commands and shells in their own systemd scopes so the OOM killer stops one runaway command, not the terminal (Linux; default auto). Applies to commands started afterwards; the daemon's own scope changes next launch. Env SYNAPS_PROCESS_SCOPES overrides.",
         |_app, value| config_edit("process_scopes", value);
@@ -700,28 +693,6 @@ define_settings! {
         "Lines scrolled per mouse-wheel event (1–20, default 3). Takes effect next launch.",
         |_app, value| whole_number("scroll_lines", value);
 
-    // ── Memory ───────────────────────────────────────────────────────────
-
-    "memory.default_mode", "Default memory mode", Memory,
-        EditorKind::Cycler(&["off", "recall_once", "recall_each_prompt", "capture_only", "capture_and_recall"]),
-        "Memory mode every new session starts in (default off). A non-off mode needs memory.default_mode_confirmed = true in the config, added by hand; until then this setting is refused. /memory off still turns it off for that session. Takes effect next launch.",
-        |_app, value| config_edit("memory.default_mode", value);
-
-    "memory.backend", "Memory backend", Memory, EditorKind::Cycler(&["legacy", "axel"]),
-        "Note storage: legacy (default) or axel (needs the Axel executable below). Selecting a backend never enables capture or recall. Restart required.",
-        |_app, value| config_edit("memory.backend", value);
-
-    "memory.user_scope", "User-wide notes", Memory, EditorKind::Cycler(&["true", "false"]),
-        "Allow user-wide notes in addition to project notes (default false). Never grants capture or history consent. Restart required.",
-        |_app, value| config_edit("memory.user_scope", value);
-
-    "memory.axel.executable", "Axel executable", Memory, EditorKind::Text { numeric: false },
-        "Absolute path to the Axel memory service executable (never looked up on PATH). Restart required.",
-        |_app, value| config_edit("memory.axel.executable", value);
-
-    "memory.axel.brain", "Axel brain", Memory, EditorKind::Text { numeric: false },
-        "Absolute path to a shared Axel brain file (unset = the private per-user default). Restart required.",
-        |_app, value| config_edit("memory.axel.brain", value);
 }
 
 #[cfg(test)]
@@ -960,14 +931,7 @@ mod tests {
                 continue;
             };
             for option in options.iter() {
-                // A non-off default mode is valid only alongside the
-                // operator's hand-set consent latch (spec §12).
-                let latch = if def.key == "memory.default_mode" {
-                    "memory.default_mode_confirmed = true\n"
-                } else {
-                    ""
-                };
-                let content = format!("{latch}{} = {option}\n", def.key);
+                let content = format!("{} = {option}\n", def.key);
                 temp.write(&content);
                 let config = synaps_cli::config::load_config();
                 if !config.warnings.is_empty() {
@@ -1305,11 +1269,6 @@ mod tests {
             assert!(is_ok(d("max_fps", "144")));
             assert!(is_err(d("max_fps", "0")));
             assert!(is_err(d("scroll_lines", "21")));
-            let absolute = if cfg!(windows) { r"C:\srv\axel\brain.r8" } else { "/srv/axel/brain.r8" };
-            assert!(is_ok(d("memory.axel.brain", absolute)));
-            assert!(is_err(d("memory.axel.brain", "brain.r8")));
-            assert!(is_err(d("memory.user_scope", "yes")));
-            assert!(is_err(d("memory.backend", "sqlite")));
         }
 
         // Cross-key rules see the rest of the file.
@@ -1320,56 +1279,6 @@ mod tests {
         assert_eq!(
             synaps_cli::config::read_config_value("subagent.max_concurrent"),
             None
-        );
-
-        // A non-off default memory mode needs the hand-set consent latch.
-        temp.write("");
-        assert!(is_ok(apply_setting_dispatch(
-            "memory.default_mode",
-            "off",
-            &mut app
-        )));
-        assert!(is_err(apply_setting_dispatch(
-            "memory.default_mode",
-            "capture_and_recall",
-            &mut app
-        )));
-        assert!(is_err(apply_setting_dispatch(
-            "memory.default_mode",
-            "everything",
-            &mut app
-        )));
-        temp.write("memory.default_mode_confirmed = true\n");
-        assert!(is_ok(apply_setting_dispatch(
-            "memory.default_mode",
-            "capture_and_recall",
-            &mut app
-        )));
-        drop(temp);
-    }
-
-    /// The default-mode row shows the effective mode: off until the
-    /// operator's consent latch is set alongside it.
-    #[test]
-    fn memory_default_mode_display_requires_the_consent_latch() {
-        use super::super::draw::config_row_display;
-        let _lock = config_lock();
-        let temp = TempConfig::new("memory.default_mode = capture_and_recall\n");
-        assert_eq!(
-            config_row_display("memory.default_mode").as_deref(),
-            Some("off")
-        );
-        temp.write(
-            "memory.default_mode = capture_and_recall\nmemory.default_mode_confirmed = true\n",
-        );
-        assert_eq!(
-            config_row_display("memory.default_mode").as_deref(),
-            Some("capture_and_recall")
-        );
-        temp.write("memory.default_mode = bogus\nmemory.default_mode_confirmed = true\n");
-        assert_eq!(
-            config_row_display("memory.default_mode").as_deref(),
-            Some("off")
         );
         drop(temp);
     }

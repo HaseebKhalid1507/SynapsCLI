@@ -350,7 +350,8 @@ impl ToolRoundKeepWarm {
             .unwrap_or(mark.sent);
         let messages = round.messages.to_vec();
         let options = ApiOptions {
-            memory_backend: None,
+            // A ping runs no tool: nothing of the chat's goes with it.
+            tool_context: None,
             trace: settings.trace.clone(),
             request_correlation: None,
             suppress_stream_deltas: true,

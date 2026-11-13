@@ -568,7 +568,11 @@ pub fn parse_anthropic_catalog_models(body: &str) -> Result<Vec<CatalogModel>, s
 /// mode manifest (`anthropic_mode_capabilities`).
 pub fn anthropic_static_capability(model_id: &str) -> Option<ReasoningSupport> {
     match model_id {
-        "claude-opus-5-5" | "claude-opus-4-7" | "claude-fable-5" | "claude-fable-5-1" => {
+        "claude-opus-5-5"
+        | "claude-opus-4-7"
+        | "claude-fable-5"
+        | "claude-fable-5-1"
+        | "claude-fable-5-2" => {
             Some(ReasoningSupport::AnthropicAdaptive { adaptive: true })
         }
         "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-haiku-4-5-20251001" => {

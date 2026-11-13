@@ -613,17 +613,19 @@ impl Runtime {
                 .map_err(RuntimeError::Config)?;
         let (request_messages, _) = round_images.views(&request);
 
-        // Tools: a snapshot of the live registry (the previous turn already
-        // applied its idempotent setup), projected exactly like a stream round
-        // when progressive disclosure is on — read-only: the retained session
+        // Tools: a snapshot of the live registry, as this chat's next turn
+        // will be offered it (`chat_tools::chat_tool_set`: the same tools
+        // withheld), and projected exactly like a stream round when
+        // progressive disclosure is on — read-only: the retained session
         // tool set is never written.
         let tools_snapshot = self.tools.read().await.clone();
         let (request_tools_schema, anthropic_tool_split) = if self.progressive_tool_disclosure {
-            let fresh = super::continuation::context_tool_set(
+            let fresh = super::chat_tools::chat_tool_set(
                 self.host_tool_session.clone(),
                 tools_snapshot.catalog(),
                 true,
                 context_enabled,
+                &self.tools_always_loaded,
             );
             // The SAME selection a turn start makes (`retain_session_tool_set`),
             // through its pure half: nothing is written back.
@@ -670,11 +672,13 @@ impl Runtime {
             });
             (Some(Arc::new(schema)), split)
         } else {
-            (None, None)
+            let withheld = super::chat_tools::withheld_tools(context_enabled);
+            (tools_snapshot.tools_schema_without(&withheld), None)
         };
 
         let options = ApiOptions {
-            memory_backend: None,
+            // A ping runs no tool: nothing of the chat's goes with it.
+            tool_context: None,
             use_1m_context: self.context_window_override == Some(1_000_000),
             cache_ttl: self.cache_ttl,
             // The SESSION's latch: a ping that sees the silent 1h→5m
@@ -1447,8 +1451,7 @@ mod tests {
         let (ping, real) = (&bodies[0], &bodies[1]);
         // The non-deferred tools are the cached prefix. (The deferred list
         // can still differ here: this runtime's first turn applies its
-        // idempotent setup, e.g. hiding the forum tools under the legacy
-        // memory backend; deferred definitions are outside the prefix.)
+        // idempotent setup; deferred definitions are outside the prefix.)
         let loaded = |b: &Value| -> Vec<Value> {
             b["tools"]
                 .as_array()
@@ -1941,6 +1944,118 @@ mod tests {
             matches!(err, PingFailure::Fatal(ref m) if m.contains("keep-warm skipped")),
             "{err:?}"
         );
+    }
+
+    /// An extension's provider that counts the requests it is sent.
+    struct CountingProvider(AtomicUsize);
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for CountingProvider {
+        fn id(&self) -> &str {
+            "plug"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+        async fn provider_complete(
+            &self,
+            _params: crate::extensions::runtime::process::ProviderCompleteParams,
+        ) -> std::result::Result<
+            crate::extensions::runtime::process::ProviderCompleteResult,
+            String,
+        > {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::extensions::runtime::process::ProviderCompleteResult {
+                content: vec![json!({"type": "text", "text": "hi"})],
+                stop_reason: None,
+                usage: None,
+            })
+        }
+    }
+
+    /// A chat with a keep-warm period on a Claude model that is switched to
+    /// a model an extension provides (`/model`): the period's next probe and
+    /// ping are refused before anything is built, and the extension is sent
+    /// nothing. (Its id has no `/`, so it used to count as Anthropic's: the
+    /// probe, documented as "no network I/O", was a full request to the
+    /// extension, with the chat's tools, for no chat.) The same chat on the
+    /// Claude model probes as before, and no request reaches the extension
+    /// then either.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir, extension_routing)]
+    async fn a_chat_switched_to_an_extension_model_sends_the_extension_no_keepwarm_request() {
+        use crate::extensions::manager::ExtensionManager;
+        use crate::extensions::runtime::process::{
+            RegisteredProviderModelSpec, RegisteredProviderSpec,
+        };
+        const EXTENSION_MODEL: &str = "plug:prov:model-x";
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus(CacheTtl::OneHour);
+        let provider = Arc::new(CountingProvider(AtomicUsize::new(0)));
+        let mut manager = ExtensionManager::new_with_tools(rt.hook_bus.clone(), rt.tools.clone());
+        manager
+            .register_provider_handler_for_tests(
+                "plug",
+                RegisteredProviderSpec {
+                    id: "prov".into(),
+                    display_name: "Counting".into(),
+                    description: "counts its requests".into(),
+                    models: vec![RegisteredProviderModelSpec {
+                        id: "model-x".into(),
+                        display_name: None,
+                        capabilities: json!({"streaming": false, "tool_use": true}),
+                        context_window: None,
+                    }],
+                    config_schema: None,
+                },
+                provider.clone(),
+            )
+            .unwrap();
+        crate::runtime::openai::set_extension_manager_for_routing(Arc::new(
+            tokio::sync::RwLock::new(manager),
+        ));
+        let history = vec![
+            user("hello"),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
+        ];
+
+        // On the Claude model: eligible, and a probe sends nothing anywhere.
+        let fingerprint = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+        assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+        assert!(mock.bodies.lock().unwrap().is_empty());
+
+        rt.set_model(EXTENSION_MODEL.to_string());
+        assert_eq!(rt.model(), EXTENSION_MODEL);
+        let ineligible = rt.cache_keepwarm_ineligibility();
+        let probe = rt.cache_keepwarm_probe(&history).await;
+        let tap = PingTap::default();
+        let ping = rt
+            .cache_keepwarm_ping(&history, fingerprint, &CancellationToken::new(), &tap)
+            .await
+            .result;
+        crate::runtime::openai::clear_extension_manager_for_routing();
+
+        assert_eq!(
+            provider.0.load(Ordering::SeqCst),
+            0,
+            "the extension was sent a request for a probe or a ping"
+        );
+        assert!(mock.bodies.lock().unwrap().is_empty(), "nor was Anthropic");
+        assert!(
+            ineligible
+                .as_deref()
+                .is_some_and(|why| why.contains("not on the native Anthropic transport")),
+            "{ineligible:?}"
+        );
+        let refused = probe.expect_err("no probe for an extension's model").to_string();
+        assert!(refused.contains("keep-warm skipped"), "{refused}");
+        assert!(
+            matches!(ping, Err(PingFailure::Fatal(ref m)) if m.contains("keep-warm skipped")),
+            "{ping:?}"
+        );
+        assert!(!tap.was_sent());
     }
 
     #[test]

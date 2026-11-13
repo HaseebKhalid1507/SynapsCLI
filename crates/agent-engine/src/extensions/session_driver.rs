@@ -1380,10 +1380,8 @@ mod tests {
     fn context_auto_backend_failure_preserves_previous_mode() {
         let _env = crate::test_env::BaseDirGuard::new();
         let mut runtime = Runtime::new_headless();
-        runtime.apply_memory_backend_config(&agent_core::config::MemoryBackendConfig {
-            kind: agent_core::config::MemoryBackendKind::Unavailable,
-            ..Default::default()
-        });
+        // A chat with no project: there is nowhere to archive a window.
+        runtime.inherit_memory_binding(&crate::memory_backend::MemoryBinding::for_cwd(None));
         let mut value = start();
         value["session_driver"]["context_mode"] = json!("auto");
         let (grant, _) =
@@ -1391,7 +1389,7 @@ mod tests {
         assert!(grant
             .apply_context_mode(&runtime)
             .unwrap_err()
-            .contains("unavailable"));
+            .contains("host project scope unavailable"));
         assert!(!runtime.context_management_enabled());
     }
 

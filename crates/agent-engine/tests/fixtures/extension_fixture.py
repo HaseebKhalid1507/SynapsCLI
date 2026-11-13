@@ -230,6 +230,26 @@ while True:
     method = request.get("method", "")
     if method == "tool.call":
         called = str(request.get("params", {}).get("name"))
+        # Who the host says the call is for, next to the spy log (the spy
+        # event stream existing tests assert on is unchanged).
+        try:
+            with open(SPY + ".callers.jsonl", "a", encoding="utf-8") as f:
+                params = request.get("params", {})
+                json.dump({
+                    "name": called,
+                    "session_id": params.get("session_id"),
+                    "has_cwd": "cwd" in params,
+                    "cwd": params.get("cwd"),
+                    # The project the host says the call is about (recall and
+                    # capture inputs carry one; other tools' do not).
+                    "project_id": (params.get("input") or {}).get("project_id"),
+                    # The run the host says makes the call (absent key: no run).
+                    "has_caller": "caller" in params,
+                    "caller": params.get("caller"),
+                }, f)
+                f.write("\n")
+        except OSError:
+            pass
         if called == RECALL_TOOL_NAME:
             recall_calls += 1
             log("recall:%d" % recall_calls)

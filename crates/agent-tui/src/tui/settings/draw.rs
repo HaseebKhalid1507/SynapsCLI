@@ -676,7 +676,7 @@ fn u64_config_display(key: &str, default: u64) -> String {
 /// opened on it starts empty, never with this placeholder.
 pub(crate) const NONE_DISPLAY: &str = "(none)";
 /// Shown for an unset key whose default lives elsewhere (role budgets,
-/// identity, Axel paths). A text editor opened on it starts empty.
+/// identity). A text editor opened on it starts empty.
 pub(crate) const DEFAULT_DISPLAY: &str = "(default)";
 
 /// Trimmed, non-empty raw config value.
@@ -877,35 +877,10 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             Some("false" | "0" | "off" | "no") => "off".to_string(),
             _ => "auto".to_string(),
         },
-        "disabled_tools" | "disabled_skills" => list_config_display(key),
+        "disabled_tools" | "disabled_skills" | "tools.always_loaded" => list_config_display(key),
         // Appearance
         "max_fps" => ranged_config_display(key, 1..=1000, 60),
         "scroll_lines" => ranged_config_display(key, 1..=20, 3),
-        // Memory
-        // The effective mode: a non-off value without the hand-set consent
-        // latch reverts to off in the parser, so it displays as off here.
-        "memory.default_mode" => {
-            let confirmed = bool_config_display("memory.default_mode_confirmed", false) == "on";
-            checked_config_display(
-                key,
-                |v| {
-                    confirmed
-                        && matches!(
-                            v,
-                            "recall_once"
-                                | "recall_each_prompt"
-                                | "capture_only"
-                                | "capture_and_recall"
-                        )
-                },
-                "off",
-            )
-        }
-        "memory.backend" => checked_config_display(key, |v| v == "axel", "legacy"),
-        "memory.user_scope" => checked_config_display(key, |v| v == "true", "false"),
-        "memory.axel.executable" | "memory.axel.brain" => {
-            raw_config(key).unwrap_or_else(|| DEFAULT_DISPLAY.to_string())
-        }
         _ => return None,
     };
     Some(v)

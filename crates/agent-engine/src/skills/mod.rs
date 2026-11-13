@@ -240,7 +240,8 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     // Take input from the daemon client that owns it (`--takeover`, in place).
     "takeover",
     "trace",
-    "memory",
+    // Not "memory": `/memory` was removed, and a plugin may own the name.
+    // Without one, the engine still answers it with the removal line.
     "auth",
     "ping",
     "keybinds",

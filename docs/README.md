@@ -29,13 +29,14 @@ Durable references live here at the top level. Working history is filed by kind 
 
 | Directory | Contents |
 |---|---|
+| [upgrading/](upgrading/) | Per-release upgrade notes. |
 | [specs/](specs/) | Design specifications. |
 | [plans/](plans/) | Implementation plans. |
 | [reviews/](reviews/) | Code and architecture review records. |
 | [decisions/](decisions/) | Accepted decision records. |
 | [design/](design/) | Design notes for shipped features (subagent context rollover). |
 | [incidents/](incidents/) | Incident write-ups: timeline, root cause, fixes. |
-| [extensions/](extensions/) | Extension authoring: protocol, hooks, permissions, tutorial. |
+| [extensions/](extensions/) | Extension authoring: protocol, hooks, permissions, tutorial, the context archive file format. |
 | [smoke/](smoke/) | Manual smoke-test procedures. |
 
 New contributors should start with [../AGENTS.md](../AGENTS.md), which is the developer and agent orientation guide for the whole workspace.
