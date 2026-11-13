@@ -305,6 +305,9 @@ struct EventCtx<'t> {
     /// This request sent `diagnostics`: capture the message id (chain) and
     /// the server's verdict from message_start.
     cache_diagnosis: bool,
+    /// The round's keep-warm follows this response as it streams
+    /// (`ApiOptions::round_signal`).
+    round_signal: Option<&'t super::tool_keepwarm::RoundSignal>,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -659,6 +662,15 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                     ctx.saw_1h_honored
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                // The prefix this request read from or wrote to the cache,
+                // known here and not booked until the response ends.
+                if let Some(signal) = ctx.round_signal {
+                    signal.message_started(
+                        usage
+                            .cache_read_input_tokens
+                            .saturating_add(usage.cache_creation_input_tokens),
+                    );
+                }
             }
         }
         AnthropicEvent::MessageStop => {}
@@ -966,6 +978,14 @@ pub struct ApiOptions {
     /// `rollover_window` / `rollover` fields. `None` (default) before any
     /// rollover and on every non-turn request: records stay unchanged.
     pub context_rollover: Option<super::telemetry::RolloverStamp>,
+    /// Live view of this request for its round's keep-warm
+    /// (`runtime::tool_keepwarm`): the native Anthropic transport reports
+    /// the size of the cached prefix as the response starts
+    /// (`message_start`), so a response that outlasts the cache TTL can be
+    /// kept warm before it ends. `None` (default) reports nothing. Set only
+    /// on the stream loop's own round requests, never on a ping (its
+    /// `message_start` is not the round's).
+    pub round_signal: Option<std::sync::Arc<super::tool_keepwarm::RoundSignal>>,
 }
 
 /// What a keep-warm request does once its body is built.
@@ -2359,6 +2379,7 @@ impl ApiMethods {
                 request_has_1h_marker,
                 usage_counters: options.usage_counters.clone(),
                 cache_diagnosis: diagnostics.is_some(),
+                round_signal: options.round_signal.as_deref(),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -2897,6 +2918,7 @@ mod tests {
             request_has_1h_marker: true,
             usage_counters: None,
             cache_diagnosis: false,
+            round_signal: None,
         }
     }
 
@@ -2930,6 +2952,7 @@ mod tests {
             request_has_1h_marker: true,
             usage_counters: None,
             cache_diagnosis: false,
+            round_signal: None,
         }
     }
 
@@ -2955,6 +2978,7 @@ mod tests {
             request_has_1h_marker: true,
             usage_counters: None,
             cache_diagnosis: false,
+            round_signal: None,
         }
     }
 
@@ -3052,6 +3076,60 @@ mod tests {
             state.accumulated_content[1],
             json!({"type":"text","text":"second"})
         );
+    }
+
+    /// The round's keep-warm learns the size of the cached prefix as the
+    /// response starts (`ApiOptions::round_signal`): what `message_start`
+    /// says was read plus what it says was written. The round's own usage
+    /// is not booked until the response ends.
+    #[test]
+    fn message_start_reports_the_cached_prefix_to_the_round_signal() {
+        let (mut state, tx, mut rx) = harness();
+        let signal = crate::runtime::tool_keepwarm::RoundSignal::default();
+        let mut ctx = make_ctx(&tx);
+        ctx.round_signal = Some(&signal);
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":125655,"cache_creation_input_tokens":1974}}}"#,
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(signal.cached_tokens(), 127_629, "read + written");
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))),
+            "reported, not booked: usage is emitted once, when the response ends"
+        );
+        // A retried attempt reports its own.
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_2","usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":127629,"cache_creation_input_tokens":40}}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(signal.cached_tokens(), 127_669);
+    }
+
+    /// A request with no signal (every request but a round's own: pings,
+    /// probes, non-stream calls) reports nothing and parses the same.
+    #[test]
+    fn without_a_round_signal_message_start_parses_the_same() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        assert!(ctx.round_signal.is_none());
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":100,"cache_creation_input_tokens":20}}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(state.msg_start_cache_read, Some(100));
+        assert_eq!(state.msg_start_cache_create, Some(20));
     }
 
     #[test]
@@ -4533,6 +4611,7 @@ mod tests {
             request_has_1h_marker: false,
             usage_counters: None,
             cache_diagnosis: false,
+            round_signal: None,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(

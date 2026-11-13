@@ -406,7 +406,7 @@ define_settings! {
         |_app, value| on_off("cache_keepwarm_headless", value);
 
     "cache_keepwarm_tools", "Keep-warm tool rounds", Context, EditorKind::Cycler(&["on", "off"]),
-        "Keep the prompt cache warm while a long tool call runs (builds, test sweeps, polls): once tools have run for the TTL minus a margin (4.5 min on 5m, 55 min on 1h), resend that round's request asking for a minimal reply so the next request reads the cache instead of rewriting it. Independent of idle keep-warm (default on). Applies to new sessions and workers.",
+        "Keep the prompt cache warm through a long round: a response that streams past the cache TTL (minutes of thinking, one long write) or tools that run past it (builds, test sweeps, polls). Once the round has run for the TTL minus a margin (4.5 min on 5m, 55 min on 1h), resend its request asking for a minimal reply so the next request reads the cache instead of rewriting it. Independent of idle keep-warm (default on). Applies to new sessions and workers.",
         |_app, value| on_off("cache_keepwarm_tools", value);
 
     "context_management.mode", "Context management", Context,

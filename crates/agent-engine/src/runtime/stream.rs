@@ -1372,6 +1372,12 @@ impl StreamMethods {
                     first_request: std::mem::take(&mut first_request_of_window),
                 })
             };
+            // This round's live view for its keep-warm: the transport reports
+            // the cached prefix as the response starts
+            // (`runtime::tool_keepwarm`).
+            let round_signal = tool_keepwarm
+                .as_ref()
+                .map(|_| Arc::new(super::tool_keepwarm::RoundSignal::default()));
             let projected_options;
             let metered_options;
             let round_options: &super::api::ApiOptions = if progressive_tool_disclosure {
@@ -1407,6 +1413,7 @@ impl StreamMethods {
                     request_correlation: request_correlation.clone(),
                     retention_frontier,
                     context_rollover,
+                    round_signal: round_signal.clone(),
                     ..options.clone()
                 };
                 &projected_options
@@ -1426,6 +1433,7 @@ impl StreamMethods {
                     request_correlation: request_correlation.clone(),
                     retention_frontier,
                     context_rollover,
+                    round_signal: round_signal.clone(),
                     ..options.clone()
                 };
                 &metered_options
@@ -1812,7 +1820,41 @@ impl StreamMethods {
                 request_messages
             };
 
+            // Keep this round's prefix warm from the moment its request goes
+            // out (`runtime::tool_keepwarm`): through a response that streams
+            // past the cache TTL, then through its tools. Dropped (stopped,
+            // a ping in flight aborted) on every way out of this round that
+            // does not settle it below.
             let round_mark = super::tool_keepwarm::RoundMark::new(&usage_counters);
+            let mut round_keepwarm = match (&tool_keepwarm, &round_signal) {
+                (Some(settings), Some(signal)) => {
+                    super::tool_keepwarm::ToolRoundKeepWarm::start(
+                        settings,
+                        round_mark,
+                        signal,
+                        super::tool_keepwarm::Round {
+                            auth: &auth,
+                            client: &client,
+                            model: &model,
+                            tools: &tools_snapshot,
+                            system_prompt: &injected_system,
+                            thinking_budget,
+                            reasoning_level,
+                            messages: request_messages,
+                            options: round_options,
+                            telemetry_level,
+                        },
+                        super::tool_keepwarm::Turn {
+                            usage: &usage_counters,
+                            max_cost_usd: budget_meter.budget().max_cost_usd,
+                            tx: &tx,
+                            cancel: &cancel,
+                        },
+                    )
+                    .await
+                }
+                _ => None,
+            };
             let response = match await_provider_call(&cancel, ApiMethods::call_api_stream_inner(
                 &auth,
                 &client,
@@ -1845,39 +1887,21 @@ impl StreamMethods {
             // normal end (`TurnCompletion`).
             let response_cancelled = cancel.is_cancelled();
 
-            // A round that asks for tools: keep its prefix warm while they
-            // run (`runtime::tool_keepwarm`). Stopped once their results are
-            // in; dropped (stopped) on every other way out of this round.
-            let mut round_keepwarm = match &tool_keepwarm {
-                Some(settings)
-                    if !response_cancelled && super::tool_keepwarm::has_tool_use(&response) =>
+            // The response is in. One that asks for tools keeps its prefix
+            // warm while they run (stopped once their results are in);
+            // otherwise nothing in this turn reads the prefix next: the
+            // round's keep-warm ends here, a ping in flight aborted and
+            // booked.
+            if let Some(keepwarm) = round_keepwarm.take() {
+                if !response_cancelled
+                    && super::tool_keepwarm::has_tool_use(&response)
+                    && keepwarm.tools_running(&usage_counters)
                 {
-                    super::tool_keepwarm::ToolRoundKeepWarm::start(
-                        settings,
-                        round_mark,
-                        super::tool_keepwarm::Round {
-                            auth: &auth,
-                            client: &client,
-                            model: &model,
-                            tools: &tools_snapshot,
-                            system_prompt: &injected_system,
-                            thinking_budget,
-                            reasoning_level,
-                            messages: request_messages,
-                            options: round_options,
-                            telemetry_level,
-                        },
-                        super::tool_keepwarm::Turn {
-                            usage: &usage_counters,
-                            max_cost_usd: budget_meter.budget().max_cost_usd,
-                            tx: &tx,
-                            cancel: &cancel,
-                        },
-                    )
-                    .await
+                    round_keepwarm = Some(keepwarm);
+                } else {
+                    keepwarm.abandon().await;
                 }
-                _ => None,
-            };
+            }
 
             // Optional usage dimensions (context tokens / cost), fed by
             // the transport's authoritative Usage emission this round.
@@ -9060,7 +9084,7 @@ mod rich_output_tests {
     /// how fast the machine is (real time only paces the pings).
     mod tool_keepwarm_stream {
         use super::*;
-        use crate::runtime::cache_sim::{self, Script};
+        use crate::runtime::cache_sim::{self, Script, Streamed};
         use crate::runtime::tool_keepwarm::ToolKeepWarm;
         use crate::session::cache_keepwarm::PING_INPUT_ESTIMATE;
         use std::time::{Duration, Instant};
@@ -9340,6 +9364,116 @@ mod rich_output_tests {
             )
             .await;
             assert_eq!(run.requests.len(), 2, "no ping: {:?}", run.pings().len());
+            run.assert_quiet().await;
+        }
+
+        /// A response that outlasted the TTL while it streamed: the pings
+        /// went out WHILE it streamed (the sim let it go on only after its
+        /// third), each the round's request plus the ping text, each
+        /// reading the whole prefix, and the request after the round read
+        /// it too. The tool itself returned at once, so nothing but the
+        /// response outlived the TTL.
+        async fn assert_kept_warm_while_streaming(label: &str, run: &Run) {
+            let pings = cache_sim::assert_round_kept_warm(label, &run.requests);
+            assert!(pings >= 3, "{label}: repeats while the response streams: {pings}");
+            assert_eq!(
+                run.sim.lock().unwrap().stream_released_at,
+                Some(4),
+                "{label}: three pings arrived before the response went on"
+            );
+            let result = run.requests.last().unwrap();
+            assert!(
+                result.vt >= cache_sim::TTL,
+                "{label}: the response outlived the TTL: {:?}",
+                result.vt
+            );
+            // Not before the threshold, as for a tool round.
+            let first = run.pings()[0].at.duration_since(run.started);
+            assert!(first >= INTERVAL, "{label}: not before the threshold: {first:?}");
+            // Every request is booked into the turn, as measured. A ping
+            // sent while the response streams is booked before the round's
+            // own usage (which lands when the response ends): compare as
+            // sets.
+            let (mut booked, mut billed) = (run.usage.clone(), run.billed());
+            booked.sort_unstable();
+            billed.sort_unstable();
+            assert_eq!(booked, billed, "{label}: usage of every request");
+            run.assert_quiet().await;
+        }
+
+        /// What the logs showed: a response thinks for longer than the
+        /// cache TTL and only then makes a short tool call (the sim holds
+        /// it for three pings, 0.6 TTL each, before the call starts). It is
+        /// pinged while it streams, and the request after the round reads
+        /// the whole prefix.
+        #[tokio::test]
+        async fn a_response_that_thinks_past_the_ttl_is_kept_warm() {
+            let run = run(
+                Script::long_response(Streamed::Thinking { pings: 3 }),
+                Opts {
+                    interval: Some(INTERVAL),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_kept_warm_while_streaming("thinking", &run).await;
+        }
+
+        /// The other long response: one tool call whose input takes longer
+        /// than the TTL to arrive (held inside its `tool_use` block).
+        #[tokio::test]
+        async fn a_long_tool_call_is_kept_warm_while_it_streams() {
+            let run = run(
+                Script::long_response(Streamed::ToolCall { pings: 3 }),
+                Opts {
+                    interval: Some(INTERVAL),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_kept_warm_while_streaming("tool call", &run).await;
+        }
+
+        /// A final answer that streams past the interval is pinged like any
+        /// other response (when a ping falls due, nothing says it is the
+        /// last word): each ping is its round's request plus the ping text
+        /// and reads the whole prefix. Once it ends, asking for no tools,
+        /// the round's keep-warm is over: nothing is sent after the turn.
+        #[tokio::test]
+        async fn a_long_final_answer_is_kept_warm_while_it_streams_and_no_longer() {
+            let run = run(
+                Script {
+                    answer_pings: 2,
+                    ..Script::short()
+                },
+                Opts {
+                    interval: Some(INTERVAL),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let at = run
+                .requests
+                .iter()
+                .position(|r| r.has_tool_result())
+                .expect("the request the final answer replies to");
+            let (answer, pings) = (&run.requests[at], &run.requests[at + 1..]);
+            assert!(pings.len() >= 2, "pinged while it streamed: {}", pings.len());
+            assert_eq!(
+                run.sim.lock().unwrap().stream_released_at,
+                Some(at + 3),
+                "two pings arrived before the answer went on"
+            );
+            for ping in pings {
+                assert!(ping.is_ping(), "only pings after the answer's request");
+                assert_eq!(
+                    cache_sim::marker_layout(&ping.body),
+                    cache_sim::marker_layout(&answer.body),
+                    "the breakpoint layout of the answer's request"
+                );
+                assert_eq!(ping.read, answer.cached_prefix(), "reads the whole prefix");
+                assert_eq!(ping.write, 0, "writes nothing");
+            }
             run.assert_quiet().await;
         }
 

@@ -1388,9 +1388,10 @@ pub struct SynapsConfig {
     /// rpc/server clients over the daemon, piped `synaps attach`. Off, only a
     /// session a TUI or interactive `attach` has seen qualifies.
     pub cache_keepwarm_headless: bool,
-    /// Keep the prompt cache warm while a tool round runs
-    /// (`cache_keepwarm_tools`, default `true`): once a round's tools have
-    /// run for the TTL minus a safety margin (4.5 min on 5m, 55 min on 1h),
+    /// Keep the prompt cache warm while a provider round runs
+    /// (`cache_keepwarm_tools`, default `true`): once a round has run for
+    /// the TTL minus a safety margin (4.5 min on 5m, 55 min on 1h) — its
+    /// response still streaming, or its tools still running —
     /// re-send that round's request with a minimal output cap so the next
     /// request reads the prefix instead of rewriting it. Foreground and
     /// workers alike; independent of the idle `cache_keepwarm`.

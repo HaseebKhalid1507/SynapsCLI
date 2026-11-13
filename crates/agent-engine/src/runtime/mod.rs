@@ -3326,6 +3326,8 @@ impl Runtime {
             // `diagnostics.previous_message_id`.
             cache_diagnosis: self.cache_diagnosis(),
             context_rollover: None,
+            // Placeholder: the stream loop installs one per provider round.
+            round_signal: None,
         };
 
         let session = crate::runtime::stream::StreamSession {
