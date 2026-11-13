@@ -2752,12 +2752,6 @@ mod command_tests {
         let rt = crate::Runtime::new_headless();
         rt.continuation.lock().unwrap().durability_blocked = true;
         rt.context_management_command("off").unwrap();
-        assert!(rt
-            .run_single("must not dispatch")
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("unresolved"));
         let mut stream = rt
             .run_stream("must not dispatch".into(), Default::default())
             .await;

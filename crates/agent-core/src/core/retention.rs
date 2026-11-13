@@ -1,6 +1,5 @@
 //! Task 34 — unified retention (spec §9.7): one sweep across sessions
-//! (including compaction parents), memory records, derived memory indexes,
-//! traces, and logs, with max-age and disk budgets and headless
+//! (including compaction parents), memory records, traces, and logs, with max-age and disk budgets and headless
 //! inspect/export/forget operations.
 //!
 //! Invariants:
@@ -13,10 +12,9 @@
 //!   timestamp against their OWN retention class; the policy's global age
 //!   reaches them only with `include_notes`.
 //! - Memory files are compacted by atomic rewrite (expired + tombstoned
-//!   records physically removed) rather than whole-file deletion; their
-//!   derived index directories are dropped alongside (rebuildable state).
+//!   records physically removed) rather than whole-file deletion.
 //! - The disk budget deletes oldest-first across whole-file artifacts
-//!   (sessions/traces/logs/indexes), skipping protected chain heads. It
+//!   (sessions/traces/logs), skipping protected chain heads. It
 //!   evicts notes only with `include_notes`; without it an unmet budget is
 //!   `BudgetUnmet` with every note untouched.
 //! - A budget below what the sweep may not delete (protected chain heads,
@@ -147,9 +145,6 @@ impl RetentionRoots {
     fn memory_dir(&self) -> PathBuf {
         self.base_dir.join("memory")
     }
-    fn index_dir(&self) -> PathBuf {
-        self.memory_dir().join("index")
-    }
     fn spill_dir(&self) -> PathBuf {
         crate::core::tool_spill::spill_root(&self.base_dir)
     }
@@ -161,7 +156,6 @@ impl RetentionRoots {
 pub enum RetentionDomain {
     Sessions,
     Memory,
-    MemoryIndex,
     Traces,
     Logs,
 }
@@ -241,21 +235,6 @@ fn log_files(config_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn dir_bytes(dir: &Path) -> u64 {
-    let mut total = 0;
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                total += dir_bytes(&path);
-            } else if let Ok(meta) = entry.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    total
-}
-
 /// Session ids protected by named chains (heads must never dangle). Any
 /// unreadable or unparseable chain file fails CLOSED (CP-13 fix1 M2): with
 /// an unknown head, no destructive session operation may proceed.
@@ -305,7 +284,6 @@ pub fn inspect(roots: &RetentionRoots) -> io::Result<RetentionReport> {
         .collect();
     let traces = cache_files(&roots.cache_dir);
     let logs = log_files(&roots.config_dir);
-    let index_files = walk_regular_files(&roots.index_dir());
 
     let sum = |files: &[PathBuf]| -> u64 {
         files
@@ -313,7 +291,6 @@ pub fn inspect(roots: &RetentionRoots) -> io::Result<RetentionReport> {
             .filter_map(|p| fs::metadata(p).ok().map(|m| m.len()))
             .sum()
     };
-    let index_bytes = dir_bytes(&roots.index_dir());
 
     let domains = vec![
         DomainReport {
@@ -325,11 +302,6 @@ pub fn inspect(roots: &RetentionRoots) -> io::Result<RetentionReport> {
             domain: RetentionDomain::Memory,
             files: memory.len(),
             bytes: sum(&memory),
-        },
-        DomainReport {
-            domain: RetentionDomain::MemoryIndex,
-            files: index_files.len(),
-            bytes: index_bytes,
         },
         DomainReport {
             domain: RetentionDomain::Traces,
@@ -501,49 +473,20 @@ pub fn sweep_at(
             continue;
         }
         let dropped = compact_memory_file(&path, now_ms, notes_cutoff)?;
-        if dropped > 0 {
-            outcome.memory_records_dropped += dropped;
-            // The derived index for a rewritten namespace is stale by
-            // construction — drop it; it rebuilds from the store.
-            if let Some(ns) = path.file_stem().and_then(|s| s.to_str()) {
-                let index_dir = roots.index_dir().join(ns);
-                if index_dir.exists() {
-                    outcome.freed_bytes += dir_bytes(&index_dir);
-                    fs::remove_dir_all(&index_dir)?;
-                }
-            }
-        }
+        outcome.memory_records_dropped += dropped;
     }
 
     // ── Disk budget (CP-13 fix1 I4): staged eviction until the final
     // total actually fits, or a typed unmet error. Stage order minimizes
-    // data loss: (1) derived index dirs (rebuildable — free win), (2)
-    // whole-file artifacts oldest-first (never protected chain heads),
-    // (3) memory records oldest-first via atomic rewrite, only with
-    // `include_notes`. ──
+    // data loss: (1) whole-file artifacts oldest-first (never protected
+    // chain heads), (2) memory records oldest-first via atomic rewrite,
+    // only with `include_notes`. ──
     if let Some(budget) = policy.max_disk_bytes {
         let total_now = |roots: &RetentionRoots| -> u64 {
             inspect(roots).map(|r| r.total_bytes).unwrap_or(u64::MAX)
         };
 
-        // Stage 1: derived index directories.
-        if total_now(roots) > budget {
-            if let Ok(entries) = fs::read_dir(roots.index_dir()) {
-                for entry in entries.flatten() {
-                    if total_now(roots) <= budget {
-                        break;
-                    }
-                    let dir = entry.path();
-                    if dir.is_dir() {
-                        outcome.freed_bytes += dir_bytes(&dir);
-                        fs::remove_dir_all(&dir).map_err(RetentionError::Io)?;
-                        outcome.deleted_files += 1;
-                    }
-                }
-            }
-        }
-
-        // Stage 2: whole-file artifacts, oldest-first, chain heads immune.
+        // Stage 1: whole-file artifacts, oldest-first, chain heads immune.
         if total_now(roots) > budget {
             let mut candidates: Vec<(u64, PathBuf, bool)> = Vec::new();
             for path in list_files(&roots.sessions_dir()) {
@@ -579,7 +522,7 @@ pub fn sweep_at(
             }
         }
 
-        // Stage 3: memory records, globally oldest-first. Only when asked:
+        // Stage 2: memory records, globally oldest-first. Only when asked:
         // without `include_notes` the budget never deletes a note.
         if policy.include_notes && total_now(roots) > budget {
             let over = total_now(roots) - budget;
@@ -1144,10 +1087,6 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
                 ));
             }
             fs::remove_file(roots.config_dir.join(file))
-        }
-        RetentionDomain::MemoryIndex => {
-            let dir = roots.index_dir().join(sanitize_file_id(id)?);
-            fs::remove_dir_all(dir)
         }
         RetentionDomain::Memory => {
             let (namespace, record_id) = id.split_once(':').ok_or_else(|| {

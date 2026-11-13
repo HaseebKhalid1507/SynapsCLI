@@ -1,4 +1,3 @@
-use crate::core::shell_config::ShellConfig;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -1139,7 +1138,7 @@ fn removed_bridge_warning() -> String {
 }
 
 /// Parse `turn_budget.<role>.<field>` keys. Invalid values warn and keep
-/// the default (parity with shell.* parsing). `Err` carries the stderr
+/// the default. `Err` carries the stderr
 /// diagnostic. `Ok(Some(warning))`: applied, with a deprecation warning for
 /// `config.warnings` (shown at TUI startup and on stderr for headless
 /// hosts).
@@ -1487,7 +1486,6 @@ pub struct SynapsConfig {
     /// Built-in tools to disable by runtime name (e.g. "bash", "ls"). Removed
     /// from the registry at boot so they're never offered to the model.
     pub disabled_tools: Vec<String>,
-    pub shell: ShellConfig,
     pub server: ServerConfig,
     pub auth: AuthConfig,
     pub events: EventsConfig,
@@ -1562,7 +1560,6 @@ impl Default for SynapsConfig {
             tools_always_loaded: Vec::new(),
             session_persistence: crate::core::session_journal::SessionPersistence::default(),
             disabled_tools: Vec::new(),
-            shell: ShellConfig::default(),
             server: ServerConfig::default(),
             auth: AuthConfig::default(),
             events: EventsConfig::default(),
@@ -1694,21 +1691,12 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
 ];
 
 /// Every key accepted by the namespaced family parsers that is NOT in
-/// [`KNOWN_CONFIG_KEYS`] (`shell.*`, `events.*`, `turn_budget.*`,
+/// [`KNOWN_CONFIG_KEYS`] (`events.*`, `turn_budget.*`,
 /// `server.*`, `auth.*`). Open-ended families whose
 /// suffix is user-chosen are listed as `prefix.*`. Keep this in sync when a
 /// parser learns a key: the /settings coverage test requires each entry to
 /// have a settings row or an explicit exclusion.
 pub const FAMILY_CONFIG_KEYS: &[&str] = &[
-    // parse_shell_config_key
-    "shell.max_sessions",
-    "shell.idle_timeout",
-    "shell.readiness_timeout_ms",
-    "shell.max_readiness_timeout_ms",
-    "shell.default_rows",
-    "shell.default_cols",
-    "shell.readiness_strategy",
-    "shell.max_output",
     // parse_events_config_key
     "events.auto_turn",
     "events.auto_turn_cap",
@@ -1800,47 +1788,31 @@ fn write_comma_list_locked(key: &str, values: &[String]) -> std::io::Result<()> 
     write_config_value_locked(key, &values.join(", "))
 }
 
-/// Parse shell.* configuration keys and update the ShellConfig. `Err`
-/// carries the diagnostic the caller prints.
-fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) -> Result<(), String> {
-    let invalid = || format!("Warning: invalid value for {key}: '{val}', using default");
-    match key {
-        "shell.max_sessions" => {
-            shell_config.max_sessions = val.parse::<usize>().map_err(|_| invalid())?;
-        }
-        "shell.idle_timeout" => {
-            let timeout = val.parse::<u64>().map_err(|_| invalid())?;
-            shell_config.idle_timeout = std::time::Duration::from_secs(timeout);
-        }
-        "shell.readiness_timeout_ms" => {
-            shell_config.readiness_timeout_ms = val.parse::<u64>().map_err(|_| invalid())?;
-        }
-        "shell.max_readiness_timeout_ms" => {
-            shell_config.max_readiness_timeout_ms = val.parse::<u64>().map_err(|_| invalid())?;
-        }
-        "shell.default_rows" => {
-            shell_config.default_rows = val.parse::<u16>().map_err(|_| invalid())?;
-        }
-        "shell.default_cols" => {
-            shell_config.default_cols = val.parse::<u16>().map_err(|_| invalid())?;
-        }
-        "shell.readiness_strategy" => {
-            let val_lower = val.to_lowercase();
-            match val_lower.as_str() {
-                "timeout" | "prompt" | "hybrid" => {
-                    shell_config.readiness_strategy = val.to_string();
-                }
-                _ => return Err(invalid()),
-            }
-        }
-        "shell.max_output" => {
-            shell_config.max_output = val.parse::<usize>().map_err(|_| invalid())?;
-        }
-        _ => {
-            // Unknown shell.* keys are preserved (not rejected)
-        }
-    }
-    Ok(())
+/// The `shell.*` keys removed in 0.12.0. They were parsed but read by
+/// nothing (the shell tool always used its defaults). A config that still
+/// sets them loads, ignores them and gets one warning naming the keys set.
+pub const REMOVED_SHELL_KEYS: &[&str] = &[
+    "shell.max_sessions",
+    "shell.idle_timeout",
+    "shell.readiness_timeout_ms",
+    "shell.max_readiness_timeout_ms",
+    "shell.default_rows",
+    "shell.default_cols",
+    "shell.readiness_strategy",
+    "shell.max_output",
+];
+
+/// The one warning for the removed `shell.*` keys a config sets, named in
+/// [`REMOVED_SHELL_KEYS`] order, each once.
+fn removed_shell_keys_warning(set: &[&str]) -> String {
+    format!(
+        "{} no longer {} anything (removed in {}; {} never read): delete {}",
+        set.join(", "),
+        if set.len() == 1 { "does" } else { "do" },
+        crate::REMOVED_IN,
+        if set.len() == 1 { "it was" } else { "they were" },
+        if set.len() == 1 { "this line" } else { "these lines" },
+    )
 }
 
 /// Parse server.* configuration keys and update the ServerConfig.
@@ -1951,7 +1923,7 @@ pub fn load_config_from_str(content: &str) -> SynapsConfig {
 }
 
 /// Every problem the parser reports for `content`: the `warnings` surfaced
-/// at startup plus the stderr-only diagnostics of the `shell.*`, `events.*`,
+/// at startup plus the stderr-only diagnostics of the `events.*`,
 /// `turn_budget.*` and `memory.*` families. Pure — prints nothing and
 /// touches no process state.
 pub fn config_content_problems(content: &str) -> Vec<String> {
@@ -2019,7 +1991,7 @@ pub fn load_config() -> SynapsConfig {
 /// Apply key=value config lines from `content` into `config`.
 /// Shared by `load_config` (file path) and `load_config_from_str` (test helper).
 fn apply_config_content(config: &mut SynapsConfig, content: &str) {
-    // The shell/events/turn_budget families and an unknown `memory.*` key
+    // The events/turn_budget families and an unknown `memory.*` key
     // report to stderr (not `config.warnings`) — unchanged behaviour.
     apply_config_content_with(config, content, &mut |diagnostic: String| eprintln!("{diagnostic}"));
 }
@@ -2036,6 +2008,7 @@ fn apply_config_content_with(
     // The removed memory backend keys: which of their two warnings is due.
     let (mut removed_axel_backend, mut removed_other_backend) = (false, false);
     let mut removed_sidecar_toggle_key = false;
+    let mut removed_shell_keys = [false; REMOVED_SHELL_KEYS.len()];
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2434,13 +2407,15 @@ fn apply_config_content_with(
             "memory.backend" if val != "axel" => removed_other_backend = true,
             "memory.backend" | "memory.user_scope" | "memory.axel.executable"
             | "memory.axel.brain" => removed_axel_backend = true,
+            // Removed in 0.12.0: ignored, reported once after the loop.
+            key if REMOVED_SHELL_KEYS.contains(&key) => {
+                if let Some(i) = REMOVED_SHELL_KEYS.iter().position(|k| *k == key) {
+                    removed_shell_keys[i] = true;
+                }
+            }
             _ => {
                 // Handle namespaced keys
-                if key.starts_with("shell.") {
-                    if let Err(diagnostic) = parse_shell_config_key(&mut config.shell, key, val) {
-                        family_diagnostic(diagnostic);
-                    }
-                } else if key.starts_with("server.") {
+                if key.starts_with("server.") {
                     if let Some(warning) = parse_server_config_key(&mut config.server, key, val) {
                         if !config.warnings.contains(&warning) {
                             config.warnings.push(warning);
@@ -2584,6 +2559,14 @@ fn apply_config_content_with(
     }
     if removed_sidecar_toggle_key {
         config.warnings.push(removed_sidecar_toggle_key_warning());
+    }
+    let set_shell_keys: Vec<&str> = REMOVED_SHELL_KEYS
+        .iter()
+        .zip(removed_shell_keys)
+        .filter_map(|(k, set)| set.then_some(*k))
+        .collect();
+    if !set_shell_keys.is_empty() {
+        config.warnings.push(removed_shell_keys_warning(&set_shell_keys));
     }
 }
 
@@ -4506,10 +4489,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    // Note: test_load_config_nonexistent_file removed — HOME env var mutation
-    // is not thread-safe and races with shell config tests. Coverage provided
-    // by shell::config::tests::test_shell_config_from_file.
-
     #[test]
     fn test_synaps_config_default() {
         let config = SynapsConfig::default();
@@ -4526,8 +4505,6 @@ mod tests {
         assert!(config.disabled_skills.is_empty());
         assert!(!config.progressive_tool_disclosure);
         assert_eq!(config.tools_activation_confirm, ActivationConfirm::Auto);
-        assert_eq!(config.shell.max_sessions, 5);
-        assert_eq!(config.shell.idle_timeout.as_secs(), 600);
         // Server config defaults
         assert!(!config.server.auto_approve_confirms);
     }
@@ -5383,13 +5360,11 @@ api_retries = 5
     }
 
     /// `config_content_problems` sees the stderr-only family diagnostics
-    /// (shell/events/turn_budget/memory) as well as `warnings`, and nothing
+    /// (events/turn_budget/memory) as well as `warnings`, and nothing
     /// for valid values.
     #[test]
     fn config_content_problems_covers_family_diagnostics() {
         for bad in [
-            "shell.max_sessions = lots",
-            "shell.readiness_strategy = eventually",
             "events.auto_turn = maybe",
             "events.auto_turn_cap = many",
             "turn_budget.worker.max_cost_usd = cheap",
@@ -5401,8 +5376,6 @@ api_retries = 5
             assert!(!problems.is_empty(), "{bad} should be reported");
         }
         for good in [
-            "shell.max_sessions = 8",
-            "shell.readiness_strategy = prompt",
             "events.auto_turn = off",
             "events.auto_turn_cap = unlimited",
             "turn_budget.worker.max_cost_usd = 2.5",
@@ -5413,9 +5386,39 @@ api_retries = 5
             assert!(problems.is_empty(), "{good}: {problems:?}");
         }
         // The family values still land exactly as before.
-        let cfg = load_config_from_str("shell.max_sessions = 8\nevents.auto_turn = maybe\n");
-        assert_eq!(cfg.shell.max_sessions, 8);
+        let cfg = load_config_from_str("events.auto_turn = maybe\n");
         assert!(!cfg.events.auto_turn, "unrecognised auto_turn still fails safe to false");
+    }
+
+    /// The `shell.*` keys removed in 0.12.0 load, are ignored and get one
+    /// warning naming each key set, once, in `REMOVED_SHELL_KEYS` order.
+    #[test]
+    fn removed_shell_keys_warn_once() {
+        assert_eq!(REMOVED_SHELL_KEYS.len(), 8);
+        for key in REMOVED_SHELL_KEYS {
+            assert!(!KNOWN_CONFIG_KEYS.contains(key) && !FAMILY_CONFIG_KEYS.contains(key));
+        }
+        let expected = format!(
+            "shell.max_sessions, shell.max_output no longer do anything (removed in {}; they \
+             were never read): delete these lines",
+            crate::REMOVED_IN
+        );
+        // Two keys, one of them twice, out of order: one warning naming both.
+        let content = "shell.max_output = big\nshell.max_sessions = 10\nmodel = m\n\
+             shell.max_output = huge\n";
+        let cfg = load_config_from_str(content);
+        assert_eq!(cfg.warnings, std::slice::from_ref(&expected), "{:?}", cfg.warnings);
+        assert_eq!(cfg.model.as_deref(), Some("m"), "the rest of the file still loads");
+        assert_eq!(config_content_problems(content), [expected]);
+        let one = load_config_from_str("shell.default_rows = 30\n");
+        assert_eq!(
+            one.warnings,
+            [format!(
+                "shell.default_rows no longer does anything (removed in {}; it was never read): \
+                 delete this line",
+                crate::REMOVED_IN
+            )]
+        );
     }
 
     #[test]
@@ -5472,7 +5475,6 @@ api_retries = 5
     fn family_config_keys_are_real_parser_keys() {
         let sample = |key: &str| -> &'static str {
             match key {
-                "shell.readiness_strategy" => "hybrid",
                 "events.auto_turn" => "on",
                 "server.auto_approve_confirms" => "false",
                 "auth.remote_endpoint" | "auth.machine_token" => "x",
@@ -5497,7 +5499,7 @@ api_retries = 5
             assert!(validate_config_edit("cache_ttl", "1h").is_ok());
             assert!(validate_config_edit("cache_ttl", "auto").is_ok());
             assert!(validate_config_edit("cache_ttl", "2h").is_err());
-            assert!(validate_config_edit("shell.max_output", "big").is_err());
+            assert!(validate_config_edit("events.auto_turn_cap", "many").is_err());
             assert!(validate_config_edit("model", "a\nb").is_err());
 
             // Cross-key rules see the rest of the file.

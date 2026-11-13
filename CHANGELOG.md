@@ -346,6 +346,53 @@ All notable changes to this project will be documented in this file.
   summary's "runs setup script on install" now reflects `extension.setup`.
   See `docs/upgrading/0.12.0.md`.
 
+- **The eight `shell.*` config keys.** `shell.max_sessions`,
+  `shell.idle_timeout`, `shell.readiness_timeout_ms`,
+  `shell.max_readiness_timeout_ms`, `shell.default_rows`,
+  `shell.default_cols`, `shell.readiness_strategy` and `shell.max_output`
+  were parsed but never read: interactive shells always ran with the
+  built-in limits, and still do. They are no longer parsed or validated,
+  and `SynapsConfig::shell` is gone (`ShellConfig` moved to
+  `tools::shell::config`). A config that still sets them loads, ignores
+  them and shows one warning per start naming the keys it sets:
+  `shell.max_sessions, … no longer do anything (removed in 0.12.0; they
+  were never read): delete these lines`.
+
+- **The lexical memory index and the `memory-index` retention domain.**
+  `memory::index` (the staged segment index under `<base>/memory/index/`,
+  T33) is deleted with its tests and benchmark: nothing outside its tests
+  ever built or searched it. Retention loses the domain that held it:
+  `synaps retention inspect` has no `memory_index` entry in `domains` (and
+  `total_bytes` no longer counts `<base>/memory/index/`), `synaps retention
+  forget memory-index <id>` is refused as an unknown domain, and a sweep no
+  longer deletes index directories (rewriting a note file, or as the first
+  stage of a disk budget). The session metadata index
+  (`<base>/sessions/index.jsonl`) is a different thing and is unchanged.
+
+- **`Runtime::run_single` and the non-streaming turn call.** The
+  non-streaming single-prompt loop (`Runtime::run_single`) and the
+  `ApiMethods::call_api` request it made are deleted, with the tool-result
+  helpers only that loop used. Nothing in Synaps called them: every turn
+  streams. An embedder that called `run_single` should use `run_stream`.
+  Compaction's non-streaming call (`call_api_simple`) is unchanged.
+
+- **The inline `synaps chat` loop.** The pre-actor chat loop behind the
+  `legacy_inline` Cargo feature and `SYNAPS_CHAT_INLINE=1` is deleted, with
+  the feature itself and the engine stream adapter only it used
+  (`engine::stream::process_stream_event`, `EngineStreamEvent`,
+  `StreamCompletion`, `SubagentTracker`; `repair_history_after_failure`
+  stays) and `engine::reactor::AUTO_TURN_CAP_CONFIG_KEY`. `synaps chat` runs
+  on the session actor exactly as before. A build that passes
+  `--features legacy_inline` now fails: drop the flag.
+
+- **The frozen reference reactor and its differential tests.**
+  `tests/support/reference_reactor{,_ext}.rs`,
+  `tests/session_actor_differential.rs`, `tests/tui_transport_differential.rs`
+  and `scripts/tui-e2e/differential.sh` compared the actor and the TUI with
+  copies of the pre-actor code; their scenarios are now asserted directly
+  (six new actor tests in `tests/session_actor_scenarios.rs`, the rest by
+  existing actor and TUI harness tests).
+
 - **The Axel memory helper's source and its CI jobs.**
   `sidecars/axel-memory-service` (the `synaps-axel-memory-service` process the
   memory backend started, with its copy of the forum contract) is deleted,

@@ -765,20 +765,6 @@ mod transport_tests {
             )
             .await
             .expect("stream");
-            ApiMethods::call_api(
-                &auth(),
-                &reqwest::Client::new(),
-                model,
-                &ToolRegistry::new(),
-                &None,
-                0,
-                agent_core::reasoning::ReasoningLevel::Adaptive,
-                &near,
-                0,
-                &opts,
-            )
-            .await
-            .expect("sync");
             ApiMethods::call_api_simple(
                 &auth(),
                 &reqwest::Client::new(),
@@ -793,7 +779,7 @@ mod transport_tests {
             .await
             .expect("compaction");
             let seen = seen.lock().unwrap();
-            assert_eq!(seen.len(), 3, "{model}");
+            assert_eq!(seen.len(), 2, "{model}");
             for (_, body) in seen.iter() {
                 let max = body["max_tokens"].as_u64().unwrap();
                 assert_eq!(body["thinking"]["budget_tokens"], 16_384, "{model}");
@@ -808,10 +794,10 @@ mod transport_tests {
         }
     }
 
-    /// `thinking_display = omitted` reaches the streaming and the
-    /// non-streaming turn; compaction (an internal summary) stays summarized.
+    /// `thinking_display = omitted` reaches the streaming turn; compaction
+    /// (an internal summary) stays summarized.
     #[tokio::test]
-    async fn thinking_display_reaches_both_turn_transports_not_compaction() {
+    async fn thinking_display_reaches_the_turn_transport_not_compaction() {
         let (url, seen) = server(Server::Accepts).await;
         let opts = ApiOptions {
             thinking_display: crate::config::ThinkingDisplay::Omitted,
@@ -826,12 +812,6 @@ mod transport_tests {
         )
         .await
         .expect("stream");
-        ApiMethods::call_api(
-            &auth(), &reqwest::Client::new(), model, &ToolRegistry::new(), &None, 0, level,
-            &messages(), 0, &opts,
-        )
-        .await
-        .expect("sync");
         ApiMethods::call_api_simple(
             &auth(), &reqwest::Client::new(), model, "summarize", 0, level, &messages(), 0, &opts,
         )
@@ -839,31 +819,12 @@ mod transport_tests {
         .expect("compaction");
         let seen = seen.lock().unwrap();
         let displays: Vec<&Value> = seen.iter().map(|(_, b)| &b["thinking"]["display"]).collect();
-        assert_eq!(displays, [&json!("omitted"), &json!("omitted"), &json!("summarized")]);
+        assert_eq!(displays, [&json!("omitted"), &json!("summarized")]);
     }
 
     #[tokio::test]
-    async fn sync_and_compaction_paths_compress_and_fall_back_too() {
+    async fn compaction_path_compresses_and_falls_back_too() {
         let (url, seen) = server(Server::RefusesGzip).await;
-        let c = RequestCompression::always();
-        let opts = options(&url, c.clone());
-        ApiMethods::call_api(
-            &auth(),
-            &reqwest::Client::new(),
-            "claude-sonnet-4-6",
-            &ToolRegistry::new(),
-            &None,
-            0,
-            agent_core::reasoning::ReasoningLevel::Adaptive,
-            &messages(),
-            0,
-            &opts,
-        )
-        .await
-        .expect("sync call survives the refusal");
-        assert!(c.refused());
-
-        let (url, seen2) = server(Server::RefusesGzip).await;
         let c = RequestCompression::always();
         let text = ApiMethods::call_api_simple(
             &auth(),
@@ -880,8 +841,6 @@ mod transport_tests {
         .expect("compaction survives the refusal");
         assert_eq!(text, "summary");
         assert!(c.refused());
-        for seen in [&seen, &seen2] {
-            assert_eq!(encodings(seen), [Some("gzip".to_string()), None]);
-        }
+        assert_eq!(encodings(&seen), [Some("gzip".to_string()), None]);
     }
 }

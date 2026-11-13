@@ -309,7 +309,7 @@ enum Command {
         action: cmd::trace::TraceAction,
     },
     /// Unified retention: inspect/sweep/export/forget across sessions,
-    /// memory, indexes, traces, and logs (chain-integrity-safe).
+    /// memory, traces and logs (chain-integrity-safe).
     Retention {
         #[command(subcommand)]
         action: cmd::retention::RetentionAction,

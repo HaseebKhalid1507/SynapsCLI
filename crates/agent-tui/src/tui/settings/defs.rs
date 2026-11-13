@@ -31,17 +31,6 @@ pub(crate) const TYPED_CYCLERS: &[&str] = &["cache_keepwarm"];
 /// new config key cannot silently skip the settings UI. Keep this tight.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
-    // Dead config: parsed by `load_config` but read by nothing (the shell
-    // tool is built from `ShellConfig::default()`). No row until a PR wires the key
-    // up — that PR must move it back to a row in `define_settings!`.
-    ("shell.default_cols", NOT_READ_YET),
-    ("shell.default_rows", NOT_READ_YET),
-    ("shell.idle_timeout", NOT_READ_YET),
-    ("shell.max_output", NOT_READ_YET),
-    ("shell.max_sessions", NOT_READ_YET),
-    ("shell.readiness_strategy", NOT_READ_YET),
-    ("shell.readiness_timeout_ms", NOT_READ_YET),
-    ("shell.max_readiness_timeout_ms", NOT_READ_YET),
     ("auth.machine_token", "secret: never echoed in a TUI"),
     ("auth.remote_endpoint", "credential-broker wiring set by deployment, not a preference"),
     ("server.auto_approve_confirms", "security-sensitive: approves every extension confirm unasked"),
@@ -54,11 +43,6 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("provider.*", "owned by the Providers tab (API keys)"),
     ("keybind.*", "keybind family (keybind registry), not a single setting"),
 ];
-
-/// Reason for dead-config exclusions (see `EXCLUDED_CONFIG_KEYS`).
-#[cfg_attr(not(test), allow(dead_code))]
-const NOT_READ_YET: &str =
-    "parsed but not read by the runtime yet (no-op); wiring it up must restore its settings row";
 
 /// Config-only rows: validate with the real config parser over the whole
 /// file as it would look after the write, so /settings can never persist a
