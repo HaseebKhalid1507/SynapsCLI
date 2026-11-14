@@ -3422,7 +3422,7 @@ dependencies = [
 
 [[package]]
 name = "synaps"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3471,7 +3471,7 @@ dependencies = [
 
 [[package]]
 name = "synaps-core"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3505,7 +3505,7 @@ dependencies = [
 
 [[package]]
 name = "synaps-engine"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3561,7 +3561,7 @@ dependencies = [
 
 [[package]]
 name = "synaps-tui"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "arboard",

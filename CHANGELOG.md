@@ -2,7 +2,59 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.12.0] — 2026-11-13
+
+Memory in core is plain files only, and Axel is an extension. The Axel
+memory backend, its helper process, the built-in project forum and built-in
+automatic memory are gone from core; Axel 0.1.0, released with this
+version, brings recall, capture, search and the forum back as an extension,
+through new hooks (`on_context_archived`, `on_memory_forgotten`) and the
+`cwd` and `caller` every hook and tool call now carries. The plugin sidecar
+system, `synaps agent`, `synaps watcher` and `synaps server` are removed.
+`grep` and `find` run in-process on ripgrep's engine, so `a|b` works and
+`.gitignore` is respected on every platform. Daemon sessions can be owned
+by the client that created them, keep-warm covers a response that streams
+past the cache TTL, and Windows, subagent, MCP and image fixes round it out.
+
+Read the Upgrade notes first, above all if your config has
+`memory.backend = axel`: archives and notes in the Axel brain are not read
+any more until you move them with Axel 0.1.0. Full notes:
+[docs/upgrading/0.12.0.md](docs/upgrading/0.12.0.md).
+
+### Upgrade notes
+
+- **Reload the daemon after installing:** `synaps daemon reload`, then
+  restart attached TUIs. A reload stops running subagents (they can be
+  resumed), so let them finish first. Daemon protocol (v3) and extension
+  protocol (1) are unchanged.
+- **`memory.backend = axel`: move your memory first.** 0.12.0 keeps notes
+  and context archives in plain files only and no longer reads the Axel
+  brain. Export with `axel synaps-export` (Axel 0.1.0), import with
+  `synaps memory import-archives` / `import-notes`, then install the Axel
+  extension for recall, capture and the forum. Nothing is deleted, and
+  0.11.1 reads the brain again. Step by step:
+  [docs/upgrading/0.12.0.md](docs/upgrading/0.12.0.md#if-you-used-memorybackend--axel).
+- **Removed commands and tools:** `synaps agent`, `synaps watcher` and
+  `synaps server` print one line and exit 2; `/memory`, `/sidecar`, the
+  `memory_context` and `forum_*` tools and `synaps retention memory-scope`,
+  `upgrade-memory` and `migrate-memory` are gone. The guide has a
+  replacement for each.
+- **Removed config keys load with a warning and do nothing:** the
+  `memory.*` backend and automatic-memory keys, `sidecar_toggle_key`, the
+  eight `shell.*` keys, `turn_budget.autonomous.*`, `bridge.*`,
+  `server.token`, `server.allowed_origins` and `server.max_message_size`.
+- **Plugin sidecars are gone.** A `plugin.json` with `provides.sidecar`
+  still loads with the block ignored; `local-voice` dictation stops working
+  until it is rebuilt on extensions.
+- **`grep` patterns are Rust regex** (escape `(`, `[`, `{` to match them),
+  and `grep` and `find` respect `.gitignore` (`no_ignore: true` for
+  everything). Their schemas changed, so the first request after upgrading
+  rewrites the prompt cache once.
+- **`synaps retention sweep` keeps saved notes** unless `--include-notes`
+  is given.
+- **Going back to 0.11.1:** a chat that rolled over on 0.12.0 counts its
+  windows from 1 again there (and is refused on `memory.backend = axel`).
+  Nothing is lost; see the guide.
 
 ### Added
 
@@ -422,7 +474,7 @@ All notable changes to this project will be documented in this file.
   0.12.0 Synaps keeps context archives and notes in plain files under its base
   directory, always, and Axel is an extension. This session uses plain files.
   Archives and notes saved to the Axel brain are not read any more: move them
-  once with "axel synaps-export" (Axel v2) and "synaps memory import-archives"
+  once with "axel synaps-export" (Axel 0.1.0) and "synaps memory import-archives"
   / "import-notes", install the Axel extension for recall and the forum, then
   remove the memory.backend, memory.user_scope and memory.axel.* lines. See
   https://github.com/HaseebKhalid1507/SynapsCLI/blob/dev/docs/upgrading/0.12.0.md`.
@@ -1289,6 +1341,22 @@ All notable changes to this project will be documented in this file.
   "unknown command". To send text that starts with `/`, start it with
   `//`: `//etc/hosts is wrong` sends `/etc/hosts is wrong`, idle or
   mid-turn, in the TUI and in `synaps attach`.
+- **`--help` and `--version` never start a daemon.** `synaps attach --help`
+  (or `-h`, `--attach --help`, `-V`) started a daemon and left it running
+  before printing help. Those flags now go straight to the help and
+  version output.
+- **An MCP tool that answers `isError: true` is a tool error, not a broken
+  server.** The model saw "MCP transport failure for server '<name>'" for an
+  ordinary refusal and retried or gave up on the server; it now sees "MCP
+  tool error from server '<name>': …". Real transport failures read as
+  before, and neither revokes the tool's activation.
+- **A history image that can't be sent is omitted with a note.** One image
+  that could not be fitted within the image limits (say a 2048×2048 opaque
+  PNG near the byte cap) failed every later request of the chat. It is now
+  replaced by a one-line note asking for a smaller PNG or JPEG; a new
+  attachment of your own is still refused so it can be fixed and resent.
+  Opaque PNGs are re-encoded as RGB, and a PNG still over the cap is sent
+  as JPEG.
 - **`bash` says when it stopped a command.** Output past the 256 KiB
   tool buffer kills the command, but the result only ended
   `[output truncated at N]`, which reads like a display cut of a command
@@ -1302,6 +1370,19 @@ All notable changes to this project will be documented in this file.
   last 256 KiB). Caps, timeouts and kills are unchanged (the process group
   on Unix, only the shell process on Windows); the same messages apply to
   the Windows `powershell` tool.
+
+### Internal
+
+- Benchmarks: memory scaling to 1000 sessions (#375) and the
+  Terminal-Bench 4.1 pass with Opus 5.5, with its harness, per-task data
+  and failure analysis (#381, #382).
+- CI: the Axel helper's two jobs are gone with its crate; the test job runs
+  the file archive store's two ignored heavy tests, and the macOS and
+  Windows jobs run the in-process grep/find tests. The dirty-HOME suite
+  keeps a removed `memory.backend = axel` line, so every test runs under
+  its warning. (#403, #404, #405)
+- A flaky owned-session test waits for the ended actor to be gone, not
+  only its lock. (#391)
 
 ## [0.11.1] — 2026-10-31
 
