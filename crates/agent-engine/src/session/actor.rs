@@ -892,6 +892,7 @@ impl SessionActor {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            subagents_running: 0,
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
@@ -1328,7 +1329,9 @@ impl SessionActor {
     /// clock, and the conversation's title / cost / message count (kept as
     /// last published while Parked). Every transition that moves them —
     /// turn and compaction start/end, attach/detach, `rearm_park`,
-    /// park/unpark — ends in a publish; stream deltas do not.
+    /// park/unpark — ends in a publish; stream deltas do not. The running
+    /// worker count is read fresh here too; the 1 Hz worker tick republishes
+    /// when it changes between transitions (`publish_subagent_rows`).
     pub(crate) fn publish_presence(&self) {
         use super::handle::{Presence, PresenceState};
         self.background
@@ -1386,6 +1389,7 @@ impl SessionActor {
             title,
             cost_usd,
             messages,
+            subagents_running: self.live_worker_count(),
             owning_client: self.owned.as_ref().and_then(|o| o.client),
         }));
     }
@@ -2587,6 +2591,9 @@ impl SessionActor {
         self.parked_tool_activations = self.runtime.carried_tool_activations();
         // Drop order: conv first, then runtime — a panic between them can
         // never leave a Runtime without state to save.
+        // No worker tick on a parked runtime: one pending since a worker
+        // just wound down (a cancelled one holds no park) would read it.
+        self.subagent_tick = None;
         // Last look at the conversation for listings (title/cost/messages).
         self.publish_presence();
         let conv = self.conv.park_take();
@@ -2790,25 +2797,45 @@ impl SessionActor {
         let running = rows
             .iter()
             .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running));
+        let live = count_live_workers(&rows);
         if !rows.is_empty() {
             self.emit(SessionEventWire::SubagentRows(rows));
         }
         if !keep_subagent_tick(self.streaming, running) {
             self.subagent_tick = None;
-            // The last worker finished: a park it held may be due now.
+            // The last worker finished: a park it held may be due now. Its
+            // publish carries the count (0) to listings.
             self.rearm_park();
+        } else if live != self.presence.load().subagents_running {
+            // Listings read the count from presence: a worker that started
+            // or ended since the last publish changes it here, turn or no
+            // turn.
+            self.publish_presence();
         }
     }
 
-    /// Whether any worker in the registry is still running.
-    fn subagents_running(&self) -> bool {
+    /// Whether any worker is still running, cancelled ones winding down
+    /// included: the tick's lifetime. Not `SessionMeta::subagents_running`
+    /// ([`Self::live_worker_count`]), which leaves those out.
+    fn any_worker_running(&self) -> bool {
         self.runtime
             .subagent_registry()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .display_rows()
-            .iter()
-            .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running))
+            .any_running()
+    }
+
+    /// `SessionMeta::subagents_running`: 0 while Parked (no runtime, and a
+    /// running worker holds the park, so 0 is the true count).
+    fn live_worker_count(&self) -> usize {
+        if !self.runtime.is_live() {
+            return 0;
+        }
+        self.runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .live_worker_count()
     }
 
     /// Codex hosted web_search is read from this (engine/daemon) process's
@@ -3031,7 +3058,7 @@ impl SessionActor {
         self.revoked_turn_deadline = None;
         // Background workers outlive the turn: keep publishing their rows
         // until the last one finishes (see `publish_subagent_rows`).
-        if !keep_subagent_tick(false, self.subagents_running()) {
+        if !keep_subagent_tick(false, self.any_worker_running()) {
             self.subagent_tick = None;
         }
         if !self.turn_steered_events.is_empty() && self.conv.is_live() {
@@ -3578,18 +3605,16 @@ impl SessionActor {
                     "turn interrupted: cancelled running workers"
                 );
             }
+            // Still running and staying so: not the ones just cancelled
+            // (they read as running until their next step).
+            let spared = registry.live_worker_count();
+            drop(registry);
+            // `clear_stream` published the count before the cancel: the
+            // listing drops the cancelled workers now, not a tick later.
+            if !cancelled.is_empty() {
+                self.publish_presence();
+            }
             if let WorkerCancelScope::Turn(_) = scope {
-                // Still running and staying so: not the ones just cancelled
-                // (they read as running until their next step).
-                let spared = registry
-                    .display_rows()
-                    .iter()
-                    .filter(|r| {
-                        r.status == crate::runtime::subagent::SubagentStatus::Running
-                            && !r.cancel_requested
-                    })
-                    .count();
-                drop(registry);
                 if spared > 0 {
                     self.emit(SessionEventWire::Stream(StreamEvent::Session(
                         SessionEvent::Notice(format!(
@@ -5664,6 +5689,12 @@ fn keep_subagent_tick(streaming: bool, any_running: bool) -> bool {
     streaming || any_running
 }
 
+/// [`SubagentRegistry::live_worker_count`](crate::runtime::subagent::SubagentRegistry::live_worker_count)
+/// over a rows snapshot the tick already holds.
+fn count_live_workers(rows: &[crate::runtime::subagent::SubagentDisplayRow]) -> usize {
+    rows.iter().filter(|r| r.is_live()).count()
+}
+
 /// Which running workers an interrupted turn cancels. Only the user's own
 /// interrupt of a live session is turn-scoped: Esc stops what that turn
 /// started, not reactive workers inherited from earlier turns (which the
@@ -5972,6 +6003,42 @@ mod live_folder_tests {
         if denied {
             assert_eq!(kept, Some(folder));
         }
+    }
+}
+
+#[cfg(test)]
+mod count_live_workers_tests {
+    use super::count_live_workers;
+    use crate::runtime::subagent::{SubagentDisplayRow, SubagentStatus};
+
+    fn row(status: SubagentStatus, cancel_requested: bool) -> SubagentDisplayRow {
+        SubagentDisplayRow {
+            subagent_id: 1,
+            agent_name: "w".into(),
+            status,
+            cancel_requested,
+            elapsed_secs: 0.0,
+            finished_elapsed: None,
+            step: String::new(),
+            tools: 0,
+            handle_id: "sa_1".into(),
+            model: String::new(),
+        }
+    }
+
+    #[test]
+    fn counts_workers_running_and_not_cancelled() {
+        let rows = [
+            row(SubagentStatus::Running, false),
+            row(SubagentStatus::Running, false),
+            row(SubagentStatus::Running, true),
+            row(SubagentStatus::Completed, false),
+            row(SubagentStatus::Cancelled, true),
+            row(SubagentStatus::TimedOut, false),
+            row(SubagentStatus::Failed("x".into()), false),
+        ];
+        assert_eq!(count_live_workers(&rows), 2);
+        assert_eq!(count_live_workers(&[]), 0);
     }
 }
 

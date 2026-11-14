@@ -786,6 +786,7 @@ mod tests {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            subagents_running: 0,
         }
     }
 

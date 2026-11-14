@@ -489,6 +489,30 @@ pub struct SessionMeta {
     /// API message count, as of the last publish.
     #[serde(default)]
     pub messages: usize,
+    /// This session's background workers (subagents) running and not
+    /// stopping: started and not completed, failed, timed out or cancelled
+    /// (a cancelled worker drops out at the cancel, though its thread reads
+    /// as running until its next step). Independent of `busy`, which is a
+    /// turn or compaction only: a session whose turn ended with workers
+    /// still going is `busy: false` with this above 0. Always 0 while
+    /// Parked (a running worker holds the park). Live in listings
+    /// (`Welcome.sessions`, `SessionList`); the `Attached` snapshot's meta
+    /// is the create-time copy, 0 like its `busy`. An older daemon omits it
+    /// (→ 0); an older client ignores it.
+    #[serde(default)]
+    pub subagents_running: usize,
+}
+
+impl SessionMeta {
+    /// ` · 2 workers` while background workers run, else empty: listings
+    /// append it to the state so idle-with-workers never reads as idle.
+    pub fn workers_tag(&self) -> String {
+        match self.subagents_running {
+            0 => String::new(),
+            1 => " · 1 worker".into(),
+            n => format!(" · {n} workers"),
+        }
+    }
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).

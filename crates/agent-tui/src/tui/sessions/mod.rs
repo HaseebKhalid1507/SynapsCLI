@@ -403,11 +403,13 @@ pub(crate) fn state_text(m: &SessionMeta, now: DateTime<Utc>) -> String {
         })
         .unwrap_or_default()
     };
+    // Background workers still running: never plain idle.
+    let workers = m.workers_tag();
     match RowState::of(m) {
-        RowState::Streaming => format!("streaming{since}"),
-        RowState::Waiting => "waiting on you".to_string(),
-        RowState::Idle if m.pinned => format!("idle{since}"),
-        RowState::Idle => format!("idle{since}{}", until(m.park_due, "parks")),
+        RowState::Streaming => format!("streaming{since}{workers}"),
+        RowState::Waiting => format!("waiting on you{workers}"),
+        RowState::Idle if m.pinned => format!("idle{since}{workers}"),
+        RowState::Idle => format!("idle{since}{workers}{}", until(m.park_due, "parks")),
         RowState::Transient => match m.lifecycle {
             SessionLifecycle::Ending => "ending…".to_string(),
             _ => "parking…".to_string(),

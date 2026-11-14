@@ -142,6 +142,8 @@ impl SessionActor {
             for (id, agent) in &cancelled_by_command(uncancelled, &after) {
                 self.note_in_main_conversation(super::actor::subagent_user_cancel_event(id, agent));
             }
+            // The listing's running count drops at the cancel, not a tick later.
+            self.publish_presence();
         }
         if view_changed {
             self.publish_view().await;

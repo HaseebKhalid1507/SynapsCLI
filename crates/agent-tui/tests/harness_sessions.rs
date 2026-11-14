@@ -33,6 +33,7 @@ fn meta(id: &str, name: Option<&str>) -> SessionMeta {
         title: None,
         cost_usd: 0.0,
         messages: 0,
+        subagents_running: 0,
     }
 }
 
@@ -103,6 +104,26 @@ fn daemon_rows_render_per_state() {
     for want in ["LIVE", "PARKED", "streaming 1m", "idle 4m · parks in 42s", "parked 12m · evicts in 48m", "you"] {
         assert!(frame.contains(want), "missing {want:?}:\n{frame}");
     }
+}
+
+/// A session whose turn ended with background workers still running reads
+/// `idle … · N workers` in the row, not plain idle.
+#[test]
+fn an_idle_row_with_running_workers_says_so() {
+    let mut h = TestHarness::boot_with_size(120, 30);
+    h.open_sessions_with(Some("/nonexistent/daemon.sock".into()));
+    let mut list = daemon_list(&h);
+    let mut busy_bg = meta("20261025-090400-77b2", Some("muse"));
+    busy_bg.state_since = Some(sessions_test_now() - chrono::Duration::minutes(3));
+    busy_bg.subagents_running = 2;
+    list.push(busy_bg);
+    h.sessions_feed_live(Ok(list));
+    let frame = h.snapshot();
+    assert!(frame.contains("idle 3m · 2 workers"), "{frame}");
+    assert!(
+        frame.contains("idle 4m · parks in 42s"),
+        "no workers, no tag:\n{frame}"
+    );
 }
 
 #[test]
