@@ -322,6 +322,29 @@ async fn retry_emits_one_record_per_attempt_with_shared_request_id() {
     }
 }
 
+/// A Cloudflare 520 (seen live, failed for good before) retries like a 5xx
+/// and succeeds on the next attempt, classed as a server error.
+#[tokio::test]
+async fn cloudflare_520_is_retried_and_the_next_attempt_succeeds() {
+    let (url, _bodies, hits) = spawn_stub(vec![520]).await;
+    let h = harness(url);
+
+    drive_stream(&h.options, 2, &CancellationToken::new())
+        .await
+        .expect("a 520 must be retried");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "one 520, then success");
+
+    let records = h.sink.records();
+    assert_eq!(records.len(), 2, "one record per actual attempt");
+    assert_eq!(records[0].outcome.http_status, Some(520));
+    assert_eq!(records[1].outcome.retries.len(), 1);
+    assert_eq!(
+        records[1].outcome.retries[0].class,
+        super::RetryClass::ServerError
+    );
+    assert_eq!(records[1].outcome.terminal, TurnOutcome::Completed);
+}
+
 // ─── Cancellation ───────────────────────────────────────────────────────────
 
 #[tokio::test]
