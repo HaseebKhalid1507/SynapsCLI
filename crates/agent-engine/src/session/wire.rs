@@ -41,7 +41,8 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// Additive `ClientFrame` variants that only a new client sends follow this
 /// rule; `Closed` only ever answers `Close`, so old clients never see it.
 /// `Pin`/`Pinned` (`synaps daemon pin`) follow the same rule, and so does
-/// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it).
+/// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it),
+/// and `SessionMeta.subagents_running` likewise.
 /// `ReloadExtension` and its two replies (`ExtensionReloaded`,
 /// `ExtensionReloadFailed`) follow it too.
 /// Owned sessions (`Attach::Create{owned}`) are additive as well, but an

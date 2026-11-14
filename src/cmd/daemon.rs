@@ -815,8 +815,9 @@ fn owner_field(m: &agent_engine::session::SessionMeta, c: agent_engine::session:
 }
 
 /// `streaming 2m` / `waiting 1m` / `idle 4m · parks in 42s` /
-/// `parked 12m · evicts in 48m` — what `/sessions` shows, for the CLI.
-/// An older daemon sends no `state_since`: the age is left out.
+/// `idle 3m · 2 workers` / `parked 12m · evicts in 48m` — what `/sessions`
+/// shows, for the CLI. An older daemon sends no `state_since`: the age is
+/// left out.
 fn state_phrase(m: &SessionMeta, now: chrono::DateTime<chrono::Utc>) -> String {
     let word = match m.lifecycle {
         SessionLifecycle::Parked => "parked",
@@ -831,6 +832,7 @@ fn state_phrase(m: &SessionMeta, now: chrono::DateTime<chrono::Utc>) -> String {
         s.push(' ');
         s.push_str(&short_dur(now - since));
     }
+    s.push_str(&m.workers_tag());
     if let Some(due) = m.park_due {
         s.push_str(&format!(" · parks in {}", short_dur(due - now)));
     }
@@ -987,6 +989,14 @@ mod state_phrase_tests {
         m.park_due = Some(now + TimeDelta::seconds(42));
         assert_eq!(state_phrase(&m, now), "idle 4m · parks in 42s");
         m.park_due = None;
+        // Idle with background workers still running is not plain idle.
+        m.subagents_running = 2;
+        assert_eq!(state_phrase(&m, now), "idle 4m · 2 workers");
+        m.subagents_running = 1;
+        m.busy = true;
+        assert_eq!(state_phrase(&m, now), "streaming 4m · 1 worker");
+        m.busy = false;
+        m.subagents_running = 0;
         m.lifecycle = SessionLifecycle::Parked;
         m.state_since = Some(now - TimeDelta::minutes(12));
         m.evict_due = Some(now + TimeDelta::minutes(48) + TimeDelta::seconds(5));

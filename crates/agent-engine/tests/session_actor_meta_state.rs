@@ -437,12 +437,84 @@ async fn subagents_running_drops_when_the_worker_is_cancelled() {
     .await;
     assert!(states[0].read().unwrap().cancel_requested);
     // The fake worker's thread never winds down: it still reads as running
-    // in the registry, but it is stopping, so the listing drops it.
-    let (ok, m) = wait_meta(&handle, Duration::from_secs(2), |m| {
-        m.subagents_running == 0
-    })
-    .await;
-    assert!(ok, "a cancelled worker leaves the count: {m:?}");
+    // in the registry, but it is stopping, so the listing drops it. Read
+    // straight after the reply (published before it), not polled: the
+    // worker tick would hide a missing publish a second later.
+    let m = handle.meta_live();
+    assert_eq!(
+        m.subagents_running, 0,
+        "dropped at the cancel, not a tick later: {m:?}"
+    );
     assert!(!m.busy);
     end(&mut a).await;
+}
+
+/// Esc stops the turn and the workers it launched: the listing drops them
+/// with the turn's end, not a worker tick later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn subagents_running_drops_at_an_esc_cancel() {
+    let _h = Home::new();
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = prompt_host().await;
+    let (handle, task) = host.create_session_unspawned(pcfg()).await.unwrap();
+    let registry = task.subagent_registry();
+    tokio::spawn(task.run());
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("go")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let state = register_worker(&registry, "sa_1");
+    let (ok, m) = wait_meta(&handle, Duration::from_secs(3), |m| {
+        m.subagents_running == 1
+    })
+    .await;
+    assert!(ok && m.busy, "the turn's worker shows up: {m:?}");
+
+    a.send(SessionCommand::Cancel).await.unwrap();
+    // `Aborted` follows the cancel's publish; read at once, not polled.
+    until(&mut a, |e| matches!(e, SessionEventWire::Aborted { .. })).await;
+    assert!(
+        state.read().unwrap().cancel_requested,
+        "Esc stops the turn's worker"
+    );
+    let m = handle.meta_live();
+    assert_eq!(
+        (m.busy, m.subagents_running),
+        (false, 0),
+        "dropped with the turn's end, not a tick later: {m:?}"
+    );
+    end(&mut a).await;
+}
+
+/// A worker tick still due when the session parks never reads the parked
+/// runtime. A cancelled worker that just wound down holds no park, so with
+/// a zero grace the park can beat the tick that would notice it is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_worker_tick_due_at_the_park_never_reads_the_parked_runtime() {
+    let _h = Home::new();
+    let _g = grace("0");
+    let (handle, mut a, states, _) = turn_that_leaves_workers_running(&["sa_1"]).await;
+    {
+        let mut s = states[0].write().unwrap();
+        s.cancel_requested = true;
+        s.status = agent_engine::tools::SubagentStatus::Cancelled;
+        s.finished_at = Some(std::time::Instant::now());
+    }
+    detach(&mut a).await;
+    let (ok, m) = wait_meta(&handle, Duration::from_secs(5), |m| {
+        m.lifecycle == SessionLifecycle::Parked
+    })
+    .await;
+    assert!(ok, "parked: {m:?}");
+    assert_eq!(m.subagents_running, 0);
+    // Past the tick that was due: the actor is still there to unpark.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (mut b, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
+        .await
+        .expect("the actor survived its worker tick");
+    end(&mut b).await;
 }

@@ -323,6 +323,19 @@ pub struct SubagentDisplayRow {
     pub model: String,
 }
 
+impl SubagentDisplayRow {
+    /// Running and staying so ([`SubagentRegistry::live_worker_count`]).
+    pub fn is_live(&self) -> bool {
+        is_live_worker(&self.status, self.cancel_requested)
+    }
+}
+
+/// A worker that is running and not stopping: a cancelled one reads as
+/// running until its next step, but it is on its way out.
+fn is_live_worker(status: &SubagentStatus, cancel_requested: bool) -> bool {
+    *status == SubagentStatus::Running && !cancel_requested
+}
+
 // ── SubagentHandle ───────────────────────────────────────────────────────────────
 
 pub struct SubagentHandle {
@@ -980,6 +993,27 @@ impl SubagentRegistry {
         })
     }
 
+    /// Whether any worker is still running, a cancelled one winding down
+    /// included (it still has a step to take).
+    pub fn any_running(&self) -> bool {
+        self.handles
+            .values()
+            .any(|h| h.status() == SubagentStatus::Running)
+    }
+
+    /// Workers running and not stopping (a cancelled one is not counted):
+    /// `SessionMeta::subagents_running` and the Esc notice. Counts in place,
+    /// without building [`Self::display_rows`].
+    pub fn live_worker_count(&self) -> usize {
+        self.handles
+            .values()
+            .filter(|h| {
+                let s = h.state.read().unwrap_or_else(|p| p.into_inner());
+                is_live_worker(&s.public_status(), s.cancel_requested)
+            })
+            .count()
+    }
+
     /// Returns (id, agent_name, status) for every tracked handle.
     pub fn list_active(&self) -> Vec<(String, String, SubagentStatus)> {
         self.handles
@@ -1455,6 +1489,44 @@ mod tests {
             .read()
             .unwrap()
             .cancel_requested
+    }
+
+    /// `live_worker_count` (the listing's count) leaves out finished and
+    /// cancelled workers; `any_running` (the tick's lifetime) keeps a
+    /// cancelled one that still reads as running. Both agree with the rows.
+    #[test]
+    fn live_worker_count_skips_finished_and_cancelled_workers() {
+        let mut registry = SubagentRegistry::new();
+        assert_eq!(
+            (registry.live_worker_count(), registry.any_running()),
+            (0, false)
+        );
+        registry.register(make_handle("sa_1"));
+        registry.register(make_handle("sa_2"));
+        registry.register(make_finished_handle("sa_3"));
+        assert_eq!(
+            (registry.live_worker_count(), registry.any_running()),
+            (2, true)
+        );
+        registry
+            .get("sa_2")
+            .unwrap()
+            .state
+            .write()
+            .unwrap()
+            .cancel_requested = true;
+        assert_eq!(
+            (registry.live_worker_count(), registry.any_running()),
+            (1, true)
+        );
+        let rows = registry.display_rows();
+        assert_eq!(rows.iter().filter(|r| r.is_live()).count(), 1);
+        registry.cancel_running(WorkerCancelScope::All);
+        assert_eq!(
+            (registry.live_worker_count(), registry.any_running()),
+            (0, true),
+            "cancelled workers read as running until their next step"
+        );
     }
 
     /// Esc cancels the interrupted turn's workers, not reactive workers an
