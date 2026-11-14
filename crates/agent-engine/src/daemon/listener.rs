@@ -64,8 +64,9 @@ pub async fn accept_loop(state: Arc<DaemonState>, mut listener: Listener, shutdo
         };
         match accepted {
             Ok(stream) => {
-                // On Windows the pipe's owner-only DACL admits only the
-                // daemon's user (see `crate::ipc`).
+                // On Windows the pipe's DACL and integrity label refuse most
+                // peers at open; `conn::serve` checks the client's token
+                // after `Hello` (`crate::ipc::admit_client`).
                 #[cfg(unix)]
                 // SAFETY: geteuid has no preconditions and cannot fail.
                 if let Err(why) = admit(&stream, unsafe { libc::geteuid() }) {

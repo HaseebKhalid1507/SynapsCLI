@@ -131,6 +131,68 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
     d.wait().await;
 }
 
+/// The Windows `admit` in a running daemon (`conn::serve`, after `Hello`,
+/// before `Welcome`): a client opened at Anonymous level can't be identified,
+/// so its valid `Hello` gets no frame back, only EOF, and the daemon goes on
+/// serving its user. tokio ORs `SECURITY_SQOS_PRESENT` into the flags, and
+/// `SECURITY_ANONYMOUS` is 0.
+#[cfg(windows)]
+#[tokio::test]
+#[serial]
+async fn an_unidentifiable_client_gets_eof_instead_of_welcome() {
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+
+    let anonymous = tokio::net::windows::named_pipe::ClientOptions::new()
+        .security_qos_flags(0)
+        .open(agent_engine::ipc::pipe_name(&sock))
+        .unwrap();
+    let (r, w) = agent_engine::ipc::split_client(anonymous);
+    let mut c = Raw { r: BufReader::new(r), w };
+    c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    assert!(c.recv().await.is_none(), "refused after Hello: EOF, no Welcome, no frame");
+
+    let mut c = Raw::connect(&sock).await;
+    c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::Welcome(_))), "the daemon still serves its user");
+
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
+/// The `admit` comes before every reply, not only the `Welcome`: a client
+/// that can't be identified and writes something that is not a `Hello`
+/// (a malformed line, a frame out of order) gets EOF, not the `Refused` or
+/// `Error` frame the daemon sends a client it has admitted.
+#[cfg(windows)]
+#[tokio::test]
+#[serial]
+async fn an_unidentifiable_client_gets_no_reply_frame_of_any_kind() {
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+
+    for first in ["this is not json", "{\"type\":\"nope\"}"] {
+        let anonymous = tokio::net::windows::named_pipe::ClientOptions::new()
+            .security_qos_flags(0)
+            .open(agent_engine::ipc::pipe_name(&sock))
+            .unwrap();
+        let (r, w) = agent_engine::ipc::split_client(anonymous);
+        let mut c = Raw { r: BufReader::new(r), w };
+        c.send_line(first).await;
+        assert!(c.recv().await.is_none(), "{first:?}: EOF, no Refused or Error frame");
+    }
+
+    // An admitted client still gets the protocol refusal for the same input.
+    let mut c = Raw::connect(&sock).await;
+    c.send_line("this is not json").await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::Refused { .. })), "an admitted client is told why");
+
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
 #[tokio::test]
 #[serial]
 async fn control_fast_path_allocates_no_session() {

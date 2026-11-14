@@ -987,7 +987,8 @@ pub const AUTOSPAWN_IDLE_EXIT: Duration = Duration::from_secs(10);
 
 /// `synaps daemon --foreground` body: gate → boot host (cached MCP
 /// descriptors only) → extension discovery once → start → background MCP
-/// discovery → wait for SIGTERM/SIGINT/Shutdown frame/idle.
+/// discovery → wait for SIGTERM/SIGINT (Windows: Ctrl+C, Ctrl+Break, console
+/// close)/Shutdown frame/idle.
 pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     if !enabled() {
         anyhow::bail!("{DISABLED_NOTICE} (exit {EXIT_REFUSED})");
@@ -1033,6 +1034,16 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
         opts.factory = Some(host_factory(&host));
     }
     let mcp_host = Arc::clone(&host);
+    // Console events end the daemon like SIGTERM; registered before it
+    // accepts (see `win::ConsoleEvents`).
+    #[cfg(windows)]
+    let console = match win::ConsoleEvents::register() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!("daemon: console events not handled: {e}");
+            None
+        }
+    };
     let daemon = Daemon::start(host, opts).await?;
     // Accepting and ready: now discover uncached MCP servers. New servers'
     // tools join the shared registry when it finishes (see
@@ -1050,10 +1061,29 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
                 _ = state.shutdown.cancelled() => return,
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
+            let mut console = console;
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
+                ev = async {
+                    match console.as_mut() {
+                        Some(c) => c.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    tracing::info!("daemon: {ev}");
+                    // Windows ends the process about 5 s after a close,
+                    // logoff or shutdown event, whatever the daemon is still
+                    // doing; the winding-down of the sessions may not finish.
+                    // Take the registry file down first, so a client never
+                    // finds `daemon.json` for a daemon that is gone
+                    // (`Daemon::wait` repeats it: harmless).
+                    let lock = state.lock_fd.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(lock) = lock.as_ref() {
+                        state.meta.cleanup(lock);
+                    }
+                }
                 _ = state.shutdown.cancelled() => return,
             }
         }

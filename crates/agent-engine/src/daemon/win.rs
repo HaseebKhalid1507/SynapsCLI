@@ -548,6 +548,39 @@ pub fn pid_is_alive(pid: u32) -> bool {
     unsafe { WaitForSingleObject(h.0, 0) == WAIT_TIMEOUT }
 }
 
+/// Console control events that end the daemon as SIGTERM does on Unix. A
+/// detached daemon (hidden console, own process group) can still get
+/// Ctrl+Break from a program sharing its console; a foreground one gets
+/// close when its window closes. Logoff and shutdown reach a console
+/// process only if it never loads user32.dll or gdi32.dll (HandlerRoutine
+/// remarks), and a service always; they are registered for both. Register before
+/// the daemon accepts: until then the default handler ends the process
+/// without cleanup.
+pub(crate) struct ConsoleEvents {
+    brk: tokio::signal::windows::CtrlBreak,
+    close: tokio::signal::windows::CtrlClose,
+    logoff: tokio::signal::windows::CtrlLogoff,
+    shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+impl ConsoleEvents {
+    pub(crate) fn register() -> io::Result<Self> {
+        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown};
+        Ok(Self { brk: ctrl_break()?, close: ctrl_close()?, logoff: ctrl_logoff()?, shutdown: ctrl_shutdown()? })
+    }
+
+    /// The next event's name.
+    pub(crate) async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            Some(()) = self.brk.recv() => "ctrl_break",
+            Some(()) = self.close.recv() => "ctrl_close",
+            Some(()) = self.logoff.recv() => "ctrl_logoff",
+            Some(()) = self.shutdown.recv() => "ctrl_shutdown",
+            else => std::future::pending().await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
