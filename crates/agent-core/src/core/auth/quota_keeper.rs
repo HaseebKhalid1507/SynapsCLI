@@ -1323,6 +1323,7 @@ pub fn capacity_view(st: &AccountState) -> Option<AccountCapacity> {
         },
         cooldown_until_ms: None,
         failure: None,
+        plan: None,
     })
 }
 
