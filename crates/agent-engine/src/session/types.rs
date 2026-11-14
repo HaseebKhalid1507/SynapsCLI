@@ -489,6 +489,15 @@ pub struct SessionMeta {
     /// API message count, as of the last publish.
     #[serde(default)]
     pub messages: usize,
+    /// This session's background workers (subagents) running now: started
+    /// and not completed, failed, timed out or cancelled (a cancelled worker
+    /// drops out at the cancel, though its thread reads as running until its
+    /// next step). Independent of `busy`, which is the turn only: a session
+    /// whose turn ended with workers still going is `busy: false` with this
+    /// above 0. Always 0 while Parked (a running worker holds the park). An
+    /// older daemon omits it (→ 0); an older client ignores it.
+    #[serde(default)]
+    pub subagents_running: usize,
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).

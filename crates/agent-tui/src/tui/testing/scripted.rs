@@ -87,6 +87,7 @@ impl ScriptedTransport {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            subagents_running: 0,
         };
         let view = Arc::new(RuntimeView::snapshot(&runtime, 0));
         Self {

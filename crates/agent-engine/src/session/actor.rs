@@ -892,6 +892,7 @@ impl SessionActor {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            subagents_running: 0,
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
@@ -1328,7 +1329,9 @@ impl SessionActor {
     /// clock, and the conversation's title / cost / message count (kept as
     /// last published while Parked). Every transition that moves them —
     /// turn and compaction start/end, attach/detach, `rearm_park`,
-    /// park/unpark — ends in a publish; stream deltas do not.
+    /// park/unpark — ends in a publish; stream deltas do not. The running
+    /// worker count is read fresh here too; the 1 Hz worker tick republishes
+    /// when it changes between transitions (`publish_subagent_rows`).
     pub(crate) fn publish_presence(&self) {
         use super::handle::{Presence, PresenceState};
         self.background
@@ -1386,6 +1389,7 @@ impl SessionActor {
             title,
             cost_usd,
             messages,
+            subagents_running: self.running_worker_count(),
             owning_client: self.owned.as_ref().and_then(|o| o.client),
         }));
     }
@@ -2790,6 +2794,11 @@ impl SessionActor {
         let running = rows
             .iter()
             .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running));
+        // Listings read the count from presence: a worker that started or
+        // ended since the last publish changes it here, turn or no turn.
+        if running_worker_count(&rows) != self.presence.load().subagents_running {
+            self.publish_presence();
+        }
         if !rows.is_empty() {
             self.emit(SessionEventWire::SubagentRows(rows));
         }
@@ -2809,6 +2818,21 @@ impl SessionActor {
             .display_rows()
             .iter()
             .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running))
+    }
+
+    /// `SessionMeta::subagents_running`: 0 while Parked (no runtime, and a
+    /// running worker holds the park, so 0 is the true count).
+    fn running_worker_count(&self) -> usize {
+        if !self.runtime.is_live() {
+            return 0;
+        }
+        let rows = self
+            .runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .display_rows();
+        running_worker_count(&rows)
     }
 
     /// Codex hosted web_search is read from this (engine/daemon) process's
@@ -5664,6 +5688,16 @@ fn keep_subagent_tick(streaming: bool, any_running: bool) -> bool {
     streaming || any_running
 }
 
+/// Workers running and staying so: a cancelled one reads as running until
+/// its next step, but it is stopping (the Esc notice counts the same way).
+fn running_worker_count(rows: &[crate::runtime::subagent::SubagentDisplayRow]) -> usize {
+    rows.iter()
+        .filter(|r| {
+            r.status == crate::runtime::subagent::SubagentStatus::Running && !r.cancel_requested
+        })
+        .count()
+}
+
 /// Which running workers an interrupted turn cancels. Only the user's own
 /// interrupt of a live session is turn-scoped: Esc stops what that turn
 /// started, not reactive workers inherited from earlier turns (which the
@@ -5972,6 +6006,42 @@ mod live_folder_tests {
         if denied {
             assert_eq!(kept, Some(folder));
         }
+    }
+}
+
+#[cfg(test)]
+mod running_worker_count_tests {
+    use super::running_worker_count;
+    use crate::runtime::subagent::{SubagentDisplayRow, SubagentStatus};
+
+    fn row(status: SubagentStatus, cancel_requested: bool) -> SubagentDisplayRow {
+        SubagentDisplayRow {
+            subagent_id: 1,
+            agent_name: "w".into(),
+            status,
+            cancel_requested,
+            elapsed_secs: 0.0,
+            finished_elapsed: None,
+            step: String::new(),
+            tools: 0,
+            handle_id: "sa_1".into(),
+            model: String::new(),
+        }
+    }
+
+    #[test]
+    fn counts_workers_running_and_not_cancelled() {
+        let rows = [
+            row(SubagentStatus::Running, false),
+            row(SubagentStatus::Running, false),
+            row(SubagentStatus::Running, true),
+            row(SubagentStatus::Completed, false),
+            row(SubagentStatus::Cancelled, true),
+            row(SubagentStatus::TimedOut, false),
+            row(SubagentStatus::Failed("x".into()), false),
+        ];
+        assert_eq!(running_worker_count(&rows), 2);
+        assert_eq!(running_worker_count(&[]), 0);
     }
 }
 

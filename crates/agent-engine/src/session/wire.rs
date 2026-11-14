@@ -2198,6 +2198,31 @@ mod tests {
         assert!(back.pinned);
     }
 
+    /// `SessionMeta.subagents_running` is additive: it round-trips, and an
+    /// older daemon's meta (no such key) decodes as 0 workers.
+    #[test]
+    fn session_meta_subagents_running_is_additive() {
+        let mut m = meta();
+        m.subagents_running = 3;
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["subagents_running"], 3);
+        let back: SessionMeta = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.subagents_running, 3);
+
+        let mut old = v;
+        old.as_object_mut().unwrap().remove("subagents_running");
+        let m: SessionMeta = serde_json::from_value(old).unwrap();
+        assert_eq!(m.subagents_running, 0);
+
+        // The shape the oldest daemons sent: only the create-time fields.
+        let m: SessionMeta = serde_json::from_str(
+            r#"{"id":"s1","name":null,"model":"m","cwd":null,"created_at":"2026-01-01T00:00:00Z",
+                "continued":false,"continue_info":null,"host_pid":7,"busy":false}"#,
+        )
+        .unwrap();
+        assert_eq!((m.subagents_running, m.busy), (0, false));
+    }
+
     #[test]
     fn debug_redacts_answer_and_submit_bodies() {
         let secret = "hunter2-very-secret";

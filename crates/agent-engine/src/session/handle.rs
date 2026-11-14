@@ -37,6 +37,8 @@ pub struct Presence {
     pub title: Option<String>,
     pub cost_usd: f64,
     pub messages: usize,
+    /// Running workers (`SessionMeta::subagents_running`); 0 while Parked.
+    pub subagents_running: usize,
     /// Owned sessions: the client bound as the owner (`None` while the
     /// session waits for its owner to bind or re-bind). Always `None` for a
     /// session that is not owned (`SessionHandle::is_owned`).
@@ -223,7 +225,8 @@ impl SessionHandle {
 
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,
     /// awaiting_input, client_input, model, journal_id, name, pinned, and the
-    /// presence's busy/state/deadlines/title/cost/messages) — what listings show.
+    /// presence's busy/state/deadlines/title/cost/messages/running workers)
+    /// — what listings show.
     pub fn meta_live(&self) -> SessionMeta {
         let mut m = (*self.meta).clone();
         let p = self.presence();
@@ -245,6 +248,7 @@ impl SessionHandle {
         m.title = p.title;
         m.cost_usd = p.cost_usd;
         m.messages = p.messages;
+        m.subagents_running = p.subagents_running;
         m
     }
 
@@ -344,6 +348,7 @@ pub mod echo {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            subagents_running: 0,
         }
     }
 
@@ -594,6 +599,7 @@ pub mod locked_placeholder {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            subagents_running: 0,
         };
         let view = crate::session::view::RuntimeView {
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),
