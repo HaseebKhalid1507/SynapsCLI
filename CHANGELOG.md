@@ -1371,12 +1371,6 @@ any more until you move them with Axel 0.1.0. Full notes:
   on Unix, only the shell process on Windows); the same messages apply to
   the Windows `powershell` tool.
 
-### Credits
-
-- **JR Morton**: retrying Anthropic streams that only ping, keeping unknown
-  `/commands` from the model, MCP `isError` as a tool error and omitting
-  history images that can't be sent.
-
 ### Internal
 
 - Benchmarks: memory scaling to 1000 sessions (#375) and the
