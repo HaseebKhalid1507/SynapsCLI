@@ -1,0 +1,1278 @@
+{
+ "benchmark": "terminal-bench@4.1.0",
+ "date": "2026-11-06",
+ "agent": "synaps 0.11.1 (daemon transport)",
+ "model": "anthropic/claude-opus-5-5",
+ "thinking": "xhigh",
+ "trials_per_task": 1,
+ "tasks": {
+  "atrx-vep-crispr": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 13,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 2.31,
+    "prompt_tokens": 2011181,
+    "cached_tokens": 1921137,
+    "completion_tokens": 60157,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.6,
+    "n": 5,
+    "avg_min": 23,
+    "cost_usd": 22.22,
+    "exceptions": [
+     "AgentSafetyRefusalError"
+    ]
+   }
+  },
+  "batched-eval-parity": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 21,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 4.68,
+    "prompt_tokens": 5869693,
+    "cached_tokens": 5705784,
+    "completion_tokens": 111647,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 44,
+    "cost_usd": 45.27,
+    "exceptions": []
+   }
+  },
+  "biped-contact-dynamics": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 134,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 27.39,
+    "prompt_tokens": 87997659,
+    "cached_tokens": 87538806,
+    "completion_tokens": 310471,
+    "job": "-heavy"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.8,
+    "n": 5,
+    "avg_min": 152,
+    "cost_usd": 121.96,
+    "exceptions": []
+   }
+  },
+  "bun-sourcemap-leak": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 14,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 2.25,
+    "prompt_tokens": 2091158,
+    "cached_tokens": 2005542,
+    "completion_tokens": 58317,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 34,
+    "cost_usd": 32.65,
+    "exceptions": []
+   }
+  },
+  "cad-model": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 10,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 1.0,
+    "prompt_tokens": 597631,
+    "cached_tokens": 556663,
+    "completion_tokens": 28040,
+    "job": "-light2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 18,
+    "cost_usd": 13.11,
+    "exceptions": []
+   }
+  },
+  "cargo-flight-dispatch": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 26,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 4.94,
+    "prompt_tokens": 1962885,
+    "cached_tokens": 1785116,
+    "completion_tokens": 158036,
+    "job": "-light2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 38,
+    "cost_usd": 38.15,
+    "exceptions": []
+   }
+  },
+  "coq-block-bound": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 9,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 1.82,
+    "prompt_tokens": 791411,
+    "cached_tokens": 730102,
+    "completion_tokens": 59057,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 17,
+    "cost_usd": 12.37,
+    "exceptions": []
+   }
+  },
+  "ctr-optimization": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 289,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 9.48,
+    "prompt_tokens": 22901223,
+    "cached_tokens": 22679052,
+    "completion_tokens": 158363,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.8,
+    "n": 5,
+    "avg_min": 279,
+    "cost_usd": 124.58,
+    "exceptions": []
+   }
+  },
+  "cumulative-layout-shift": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 239,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 23.21,
+    "prompt_tokens": 65798768,
+    "cached_tokens": 65309424,
+    "completion_tokens": 311506,
+    "job": "-cls"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 186,
+    "cost_usd": 158.98,
+    "exceptions": []
+   }
+  },
+  "data-anonymization": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 95,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 9.67,
+    "prompt_tokens": 15438772,
+    "cached_tokens": 15150368,
+    "completion_tokens": 216732,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.2,
+    "n": 5,
+    "avg_min": 98,
+    "cost_usd": 73.28,
+    "exceptions": []
+   }
+  },
+  "distributed-dedup": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 162,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 18.67,
+    "prompt_tokens": 39339521,
+    "cached_tokens": 38881934,
+    "completion_tokens": 361851,
+    "job": "-rerun"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.4,
+    "n": 5,
+    "avg_min": 270,
+    "cost_usd": 213.79,
+    "exceptions": []
+   }
+  },
+  "embedding-drift-monitor": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 16,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 2.56,
+    "prompt_tokens": 2279681,
+    "cached_tokens": 2192752,
+    "completion_tokens": 71272,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 60,
+    "cost_usd": 42.69,
+    "exceptions": []
+   }
+  },
+  "fin-saccr-rwa": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 14,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 2.88,
+    "prompt_tokens": 1939698,
+    "cached_tokens": 1832629,
+    "completion_tokens": 82634,
+    "job": "-light2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 34,
+    "cost_usd": 30.11,
+    "exceptions": []
+   }
+  },
+  "foodstuff-beta-activity": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 7,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 0.99,
+    "prompt_tokens": 321270,
+    "cached_tokens": 283268,
+    "completion_tokens": 31536,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 40,
+    "cost_usd": 38.39,
+    "exceptions": []
+   }
+  },
+  "formal-crypto": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 0,
+    "refused": true,
+    "exception": "NonZeroAgentExitCodeError",
+    "cost_usd": 0.04,
+    "prompt_tokens": 82458,
+    "cached_tokens": 80024,
+    "completion_tokens": 117,
+    "job": ""
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.6,
+    "n": 5,
+    "avg_min": 72,
+    "cost_usd": 91.18,
+    "exceptions": []
+   }
+  },
+  "freecad-impeller": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 14,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 2.19,
+    "prompt_tokens": 1489094,
+    "cached_tokens": 1416144,
+    "completion_tokens": 66391,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 35,
+    "cost_usd": 28.18,
+    "exceptions": []
+   }
+  },
+  "freecad-platform-drawing": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 4,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 0.58,
+    "prompt_tokens": 343814,
+    "cached_tokens": 318374,
+    "completion_tokens": 15730,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 16,
+    "cost_usd": 13.4,
+    "exceptions": []
+   }
+  },
+  "freecad-spring-clip": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 18,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 3.22,
+    "prompt_tokens": 1799655,
+    "cached_tokens": 1689478,
+    "completion_tokens": 99998,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 26,
+    "cost_usd": 24.89,
+    "exceptions": []
+   }
+  },
+  "freight-dispatch-shift": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 52,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 10.72,
+    "prompt_tokens": 18247651,
+    "cached_tokens": 17952237,
+    "completion_tokens": 238404,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 120,
+    "cost_usd": 114.22,
+    "exceptions": []
+   }
+  },
+  "glycan-ms2-elucidation": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 22,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 4.27,
+    "prompt_tokens": 2160209,
+    "cached_tokens": 2004696,
+    "completion_tokens": 131113,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 30,
+    "cost_usd": 22.95,
+    "exceptions": []
+   }
+  },
+  "gsea-proteomics": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 6,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 1.02,
+    "prompt_tokens": 826345,
+    "cached_tokens": 781900,
+    "completion_tokens": 25429,
+    "job": ""
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 23,
+    "cost_usd": 16.45,
+    "exceptions": []
+   }
+  },
+  "heat-pump-warranty": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 10,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 3.37,
+    "prompt_tokens": 3420012,
+    "cached_tokens": 3240098,
+    "completion_tokens": 64298,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.6,
+    "n": 5,
+    "avg_min": 46,
+    "cost_usd": 54.81,
+    "exceptions": []
+   }
+  },
+  "hof-topology-interpenetration": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 14,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 2.23,
+    "prompt_tokens": 2361258,
+    "cached_tokens": 2270026,
+    "completion_tokens": 52384,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 22,
+    "cost_usd": 14.81,
+    "exceptions": []
+   }
+  },
+  "html-js-filter": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 93,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 10.39,
+    "prompt_tokens": 19324398,
+    "cached_tokens": 19061774,
+    "completion_tokens": 223951,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.6,
+    "n": 5,
+    "avg_min": 74,
+    "cost_usd": 108.19,
+    "exceptions": []
+   }
+  },
+  "interleaved-vigenere": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 35,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 4.44,
+    "prompt_tokens": 6604301,
+    "cached_tokens": 6462441,
+    "completion_tokens": 100816,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 101,
+    "cost_usd": 78.64,
+    "exceptions": []
+   }
+  },
+  "intrastat-meldung": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 13,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 4.08,
+    "prompt_tokens": 8281581,
+    "cached_tokens": 8109729,
+    "completion_tokens": 54312,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.4,
+    "n": 5,
+    "avg_min": 18,
+    "cost_usd": 24.62,
+    "exceptions": []
+   }
+  },
+  "ks-solver-cpp": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 31,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 6.21,
+    "prompt_tokens": 8425743,
+    "cached_tokens": 8225652,
+    "completion_tokens": 148336,
+    "job": "-heavy"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 75,
+    "cost_usd": 58.14,
+    "exceptions": []
+   }
+  },
+  "kv-live-surgery": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 16,
+    "refused": true,
+    "exception": "NonZeroAgentExitCodeError",
+    "cost_usd": 2.36,
+    "prompt_tokens": 1568326,
+    "cached_tokens": 1503001,
+    "completion_tokens": 76870,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.4,
+    "n": 5,
+    "avg_min": 46,
+    "cost_usd": 54.52,
+    "exceptions": [
+     "AgentSafetyRefusalError"
+    ]
+   }
+  },
+  "lake-temp-glm": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 217,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 7.62,
+    "prompt_tokens": 17799931,
+    "cached_tokens": 17598323,
+    "completion_tokens": 124496,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.6,
+    "n": 5,
+    "avg_min": 197,
+    "cost_usd": 132.92,
+    "exceptions": []
+   }
+  },
+  "layout-config-recreation": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 216,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 28.62,
+    "prompt_tokens": 96002013,
+    "cached_tokens": 95555142,
+    "completion_tokens": 296671,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 243,
+    "cost_usd": 224.95,
+    "exceptions": []
+   }
+  },
+  "layout-config-recreation2": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 8,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 1.31,
+    "prompt_tokens": 1750170,
+    "cached_tokens": 1695487,
+    "completion_tokens": 26888,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 21,
+    "cost_usd": 11.41,
+    "exceptions": []
+   }
+  },
+  "legacy-utility-triage": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 20,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 3.56,
+    "prompt_tokens": 8790038,
+    "cached_tokens": 8670880,
+    "completion_tokens": 43599,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 60,
+    "cost_usd": 57.97,
+    "exceptions": []
+   }
+  },
+  "live-database-cutover": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 179,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 38.05,
+    "prompt_tokens": 113247663,
+    "cached_tokens": 112591509,
+    "completion_tokens": 514291,
+    "job": "-heavy"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.6,
+    "n": 5,
+    "avg_min": 129,
+    "cost_usd": 165.43,
+    "exceptions": []
+   }
+  },
+  "medical-claims-processing": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 22,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 6.85,
+    "prompt_tokens": 11549501,
+    "cached_tokens": 11253877,
+    "completion_tokens": 111628,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 36,
+    "cost_usd": 46.42,
+    "exceptions": []
+   }
+  },
+  "mp-checkpoint-consolidation": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 23,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 2.45,
+    "prompt_tokens": 2625960,
+    "cached_tokens": 2526110,
+    "completion_tokens": 57484,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 24,
+    "cost_usd": 16.94,
+    "exceptions": []
+   }
+  },
+  "music-harmony": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 49,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 10.03,
+    "prompt_tokens": 18819380,
+    "cached_tokens": 18515212,
+    "completion_tokens": 194534,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 69,
+    "cost_usd": 74.09,
+    "exceptions": []
+   }
+  },
+  "mvcc-lsm-compaction": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 5,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 0.86,
+    "prompt_tokens": 501377,
+    "cached_tokens": 466855,
+    "completion_tokens": 24690,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 31,
+    "cost_usd": 17.01,
+    "exceptions": []
+   }
+  },
+  "nextjs-performance": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 32,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 5.89,
+    "prompt_tokens": 9779938,
+    "cached_tokens": 9602843,
+    "completion_tokens": 127524,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.6,
+    "n": 5,
+    "avg_min": 76,
+    "cost_usd": 65.78,
+    "exceptions": []
+   }
+  },
+  "ontology-kg-querying": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 26,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 7.84,
+    "prompt_tokens": 14026016,
+    "cached_tokens": 13704961,
+    "completion_tokens": 126510,
+    "job": "-light2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 55,
+    "cost_usd": 87.38,
+    "exceptions": []
+   }
+  },
+  "payments-pipeline-fix": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 185,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 27.16,
+    "prompt_tokens": 75756250,
+    "cached_tokens": 75241731,
+    "completion_tokens": 399817,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 161,
+    "cost_usd": 147.52,
+    "exceptions": [
+     "RewardFileNotFoundError"
+    ]
+   }
+  },
+  "photonic-waveguide-routing": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 38,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 6.08,
+    "prompt_tokens": 3030706,
+    "cached_tokens": 2818263,
+    "completion_tokens": 190969,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.2,
+    "n": 5,
+    "avg_min": 111,
+    "cost_usd": 71.36,
+    "exceptions": [
+     "OutputTokenExceededError"
+    ]
+   }
+  },
+  "pretrain-shard-corruption": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 46,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 3.69,
+    "prompt_tokens": 5652631,
+    "cached_tokens": 5521907,
+    "completion_tokens": 77265,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 36,
+    "cost_usd": 22.25,
+    "exceptions": []
+   }
+  },
+  "production-planning": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 33,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 5.9,
+    "prompt_tokens": 3224111,
+    "cached_tokens": 2996524,
+    "completion_tokens": 174139,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 43,
+    "cost_usd": 36.55,
+    "exceptions": []
+   }
+  },
+  "protein-autointerp-disulfide": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 3,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 0.51,
+    "prompt_tokens": 128687,
+    "cached_tokens": 108780,
+    "completion_tokens": 16567,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 28,
+    "cost_usd": 16.31,
+    "exceptions": []
+   }
+  },
+  "react-lead-form": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 28,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 5.58,
+    "prompt_tokens": 6573264,
+    "cached_tokens": 6362957,
+    "completion_tokens": 142245,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.8,
+    "n": 5,
+    "avg_min": 51,
+    "cost_usd": 61.05,
+    "exceptions": []
+   }
+  },
+  "retro-console-soc": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 54,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 10.12,
+    "prompt_tokens": 17155152,
+    "cached_tokens": 16872124,
+    "completion_tokens": 224114,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 134,
+    "cost_usd": 144.62,
+    "exceptions": []
+   }
+  },
+  "risk-scorer-replay": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 22,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 4.11,
+    "prompt_tokens": 5704761,
+    "cached_tokens": 5561533,
+    "completion_tokens": 92555,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 41,
+    "cost_usd": 38.22,
+    "exceptions": []
+   }
+  },
+  "roy-polymorph-cn": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 3,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 0.41,
+    "prompt_tokens": 176065,
+    "cached_tokens": 159526,
+    "completion_tokens": 12444,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 15,
+    "cost_usd": 9.39,
+    "exceptions": []
+   }
+  },
+  "rs-archive-clone": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 76,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 16.79,
+    "prompt_tokens": 45578802,
+    "cached_tokens": 45231740,
+    "completion_tokens": 248652,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 110,
+    "cost_usd": 120.46,
+    "exceptions": []
+   }
+  },
+  "satb-audio-transcription": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 17,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 3.43,
+    "prompt_tokens": 4867139,
+    "cached_tokens": 4742289,
+    "completion_tokens": 74238,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 25,
+    "cost_usd": 17.14,
+    "exceptions": []
+   }
+  },
+  "session-window-debug": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 18,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 3.45,
+    "prompt_tokens": 2043436,
+    "cached_tokens": 1927245,
+    "completion_tokens": 106742,
+    "job": "-light2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.2,
+    "n": 5,
+    "avg_min": 55,
+    "cost_usd": 43.72,
+    "exceptions": []
+   }
+  },
+  "sglang-qwen-burst": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 110,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 16.25,
+    "prompt_tokens": 47421580,
+    "cached_tokens": 47027692,
+    "completion_tokens": 184708,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.6,
+    "n": 5,
+    "avg_min": 98,
+    "cost_usd": 137.41,
+    "exceptions": []
+   }
+  },
+  "shadow-relay": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 12,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 2.83,
+    "prompt_tokens": 2885244,
+    "cached_tokens": 2786332,
+    "completion_tokens": 73876,
+    "job": "-heavy"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.6,
+    "n": 5,
+    "avg_min": 8,
+    "cost_usd": 5.71,
+    "exceptions": []
+   }
+  },
+  "sound-change-cascade": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 15,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 3.14,
+    "prompt_tokens": 3699571,
+    "cached_tokens": 3571035,
+    "completion_tokens": 69784,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 62,
+    "cost_usd": 32.57,
+    "exceptions": []
+   }
+  },
+  "takens-embedding-lean": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 123,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 35.16,
+    "prompt_tokens": 106754992,
+    "cached_tokens": 106171285,
+    "completion_tokens": 462939,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 61,
+    "cost_usd": 114.13,
+    "exceptions": []
+   }
+  },
+  "telecom-entity-resolution": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 167,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 15.09,
+    "prompt_tokens": 40222935,
+    "cached_tokens": 39840569,
+    "completion_tokens": 203003,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 100,
+    "cost_usd": 83.92,
+    "exceptions": []
+   }
+  },
+  "uefi-bootkit": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 3,
+    "refused": true,
+    "exception": "NonZeroAgentExitCodeError",
+    "cost_usd": 0.16,
+    "prompt_tokens": 175288,
+    "cached_tokens": 171091,
+    "completion_tokens": 4456,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.8,
+    "n": 5,
+    "avg_min": 68,
+    "cost_usd": 72.62,
+    "exceptions": []
+   }
+  },
+  "vba-userform-port": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 40,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 10.74,
+    "prompt_tokens": 18123852,
+    "cached_tokens": 17780057,
+    "completion_tokens": 221959,
+    "job": "-rerun"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 101,
+    "cost_usd": 152.3,
+    "exceptions": []
+   }
+  },
+  "vf2-speedup-networkx": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 76,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 22.23,
+    "prompt_tokens": 51471169,
+    "cached_tokens": 50974724,
+    "completion_tokens": 403348,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 132,
+    "cost_usd": 164.48,
+    "exceptions": []
+   }
+  },
+  "vllm-deepseek-streaming": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 24,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 7.32,
+    "prompt_tokens": 15649502,
+    "cached_tokens": 15412018,
+    "completion_tokens": 117051,
+    "job": "-light"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 77,
+    "cost_usd": 87.38,
+    "exceptions": []
+   }
+  },
+  "vpp-loss-divergence": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 64,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 9.88,
+    "prompt_tokens": 21561166,
+    "cached_tokens": 21249551,
+    "completion_tokens": 156858,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.6,
+    "n": 5,
+    "avg_min": 57,
+    "cost_usd": 61.05,
+    "exceptions": []
+   }
+  },
+  "wal-recovery-ordering": {
+   "synaps": {
+    "reward": 0.0,
+    "agent_min": 14,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 2.36,
+    "prompt_tokens": 1626231,
+    "cached_tokens": 1540327,
+    "completion_tokens": 68286,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 0.0,
+    "n": 5,
+    "avg_min": 46,
+    "cost_usd": 42.19,
+    "exceptions": []
+   }
+  },
+  "wdm-design": {
+   "synaps": {
+    "reward": 1.0,
+    "agent_min": 258,
+    "refused": false,
+    "exception": null,
+    "cost_usd": 7.67,
+    "prompt_tokens": 17990922,
+    "cached_tokens": 17820169,
+    "completion_tokens": 137188,
+    "job": "-rest2"
+   },
+   "claude_code_tb40": {
+    "pass_rate": 1.0,
+    "n": 5,
+    "avg_min": 182,
+    "cost_usd": 82.73,
+    "exceptions": []
+   }
+  }
+ }
+}

@@ -45,6 +45,157 @@ impl From<&str> for SessionId {
 /// Ordered key-value snapshot of a client's environment.
 pub type SessionEnv = Vec<(String, String)>;
 
+/// Secret env vars an OWNED session's creator forwards (`forward_secrets`):
+/// exactly the vars [`capture_client_env`] strips as secrets. Held in the
+/// daemon's memory for the session's lifetime only, applied to its tools'
+/// env and never to `SessionConfig`, the journal, the reload record or any
+/// log. `Debug` prints names only.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretEnv(pub SessionEnv);
+
+impl std::fmt::Debug for SecretEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.0.iter().map(|(k, _)| k.as_str()).collect();
+        write!(f, "SecretEnv({names:?})")
+    }
+}
+
+/// What a session's tools spawn with: the session env snapshot, plus (owned
+/// sessions with `forward_secrets` only) the forwarded secrets, kept apart
+/// so no `Debug` of the runtime, the tool capabilities or a worker's
+/// workspace can print them. Merged into a child's env only at spawn
+/// ([`ToolEnv::spawn_vars`]).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ToolEnv {
+    pub vars: SessionEnv,
+    secrets: Option<std::sync::Arc<SecretEnv>>,
+}
+
+impl ToolEnv {
+    pub fn with_secrets(vars: SessionEnv, secrets: SecretEnv) -> Self {
+        Self { vars, secrets: (!secrets.0.is_empty()).then(|| std::sync::Arc::new(secrets)) }
+    }
+
+    fn secret_vars(&self) -> &[(String, String)] {
+        self.secrets.as_deref().map(|s| s.0.as_slice()).unwrap_or(&[])
+    }
+
+    /// One var as a child would see it.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.secret_vars()
+            .iter()
+            .chain(self.vars.iter())
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The child's env, at spawn only: the session vars, each forwarded
+    /// secret in place of a var of the same name.
+    pub fn spawn_vars(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        let secrets = self.secret_vars();
+        self.vars
+            .iter()
+            .filter(move |(k, _)| !secrets.iter().any(|(s, _)| s == k))
+            .chain(secrets.iter())
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+}
+
+impl From<SessionEnv> for ToolEnv {
+    fn from(vars: SessionEnv) -> Self {
+        Self { vars, secrets: None }
+    }
+}
+
+impl std::fmt::Debug for ToolEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolEnv").field("vars", &self.vars).field("secrets", &self.secrets).finish()
+    }
+}
+
+/// The capability that binds an owned session to its owner: minted by the
+/// daemon at create, returned only to the creating connection, presented
+/// again to re-bind after a daemon reload. `Debug` is redacted.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OwnerToken(pub String);
+
+impl OwnerToken {
+    pub fn mint() -> Self {
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+}
+
+impl std::fmt::Debug for OwnerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnerToken(<redacted>)")
+    }
+}
+
+impl OwnerToken {
+    /// Constant-time: how long a wrong token takes to refuse says nothing
+    /// about how much of it was right.
+    pub fn matches(&self, other: &OwnerToken) -> bool {
+        let (a, b) = (self.0.as_bytes(), other.0.as_bytes());
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+}
+
+/// Daemon-set (`SessionConfig::owned`): the session is owned, bound to the
+/// connection that presents `token`.
+#[derive(Clone, Debug)]
+pub struct OwnedConfig {
+    pub token: OwnerToken,
+    /// Restored by a reload's rehydrate: the session waits, unbound and
+    /// holding its autonomous work, until the host arms the re-bind grace
+    /// (`SessionCommand::ArmOwnerRebind`, once the new image accepts
+    /// connections) and its owner re-binds. A fresh create arms the grace
+    /// at once: its creator is attaching right now.
+    pub restored: bool,
+}
+
+/// Host-side (never wire): an owner claim plus the claiming connection's
+/// liveness. The connection task holds a drop guard on `alive` for as long
+/// as it serves, so the actor learns its owner is gone when the task ends
+/// for ANY reason (EOF, error, panic, an attach that timed out after this
+/// was queued), even if no `Detach` ever arrives.
+pub struct OwnerBind {
+    pub claim: OwnerClaim,
+    pub alive: tokio_util::sync::CancellationToken,
+}
+
+/// A connection's claim to be an owned session's owner: the token, plus the
+/// secrets it forwards (`None` = forward none).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerClaim {
+    pub token: OwnerToken,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_secrets: Option<SecretEnv>,
+}
+
+/// The secrets [`capture_client_env`] strips from this process's env, with
+/// their values: what an owned create with `forward_secrets` sends.
+pub fn capture_client_secrets() -> SecretEnv {
+    client_secret_env(std::env::vars())
+}
+
+/// The pure part of [`capture_client_secrets`]: the vars `strip_client_env`
+/// records as stripped secrets. Client-only `SYNAPS_*` knobs never go, even
+/// with a secret-looking name.
+pub fn client_secret_env(vars: impl IntoIterator<Item = (String, String)>) -> SecretEnv {
+    let mut out: SessionEnv = vars
+        .into_iter()
+        .filter(|(k, v)| {
+            let upper = k.to_ascii_uppercase();
+            let client_only = ENV_STRIP_PREFIXES.iter().any(|p| upper.starts_with(p));
+            !client_only && (is_secret_key(k) || agent_core::core::config::is_secret_env_value(v))
+        })
+        .collect();
+    out.sort_by(|(a, _), (b, _)| a.cmp(b));
+    SecretEnv(out)
+}
+
 /// Prefixes stripped from the client env before it enters the session.
 /// These are client-only or daemon-only knobs — never session identity.
 const ENV_STRIP_PREFIXES: &[&str] = &[
@@ -186,17 +337,6 @@ pub struct SessionConfig {
     /// host-owned circuit breaker for an actor-resident autonomous driver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_session_cost: Option<f64>,
-    /// The session's explicit `/memory` choice, recorded by the actor so a
-    /// rebuilt runtime (unpark, daemon reload) restores it instead of
-    /// re-applying the operator's `memory.default_mode`. `None` = no choice
-    /// yet: the default applies. Host-recorded: the daemon drops a value a
-    /// client sends at create.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "SessionMemoryMode::deserialize_lenient"
-    )]
-    pub memory_mode: Option<SessionMemoryMode>,
     /// Set by a daemon reload for a session it restores Parked (never on
     /// the wire): with `await_extensions=false`, `on_session_start` waits
     /// until the session is unparked instead of running right after create.
@@ -206,60 +346,11 @@ pub struct SessionConfig {
     /// `None` = the wall clock; tests inject a clock to advance time.
     #[serde(skip)]
     pub message_clock: Option<crate::runtime::message_time::MessageClock>,
-}
-
-/// A durable `/memory` mode the user chose for a session
-/// (`SessionConfig::memory_mode`). `/memory once` is a one-shot lease, not
-/// a mode, and is not recorded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionMemoryMode {
-    Off,
-    RecallEachPrompt,
-    CaptureOnly,
-    CaptureAndRecall,
-}
-
-impl SessionMemoryMode {
-    /// `SessionConfig::memory_mode` reader: a value this build does not know
-    /// (a newer image's mode) reads as `Off` — the consent-safe direction —
-    /// rather than an error that would fail the whole reload state and
-    /// rehydrate no session at all. Null (or a missing field) is no choice.
-    fn deserialize_lenient<'de, D>(d: D) -> Result<Option<Self>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let v = serde_json::Value::deserialize(d)?;
-        if v.is_null() {
-            return Ok(None);
-        }
-        Ok(Some(serde_json::from_value(v.clone()).unwrap_or_else(|_| {
-            tracing::warn!(mode = %v, "unknown session memory mode; treating as off");
-            Self::Off
-        })))
-    }
-
-    /// The mode `/memory <arg>` sets, if it sets one.
-    pub fn from_command_arg(arg: &str) -> Option<Self> {
-        match arg.trim() {
-            "off" => Some(Self::Off),
-            "recall" => Some(Self::RecallEachPrompt),
-            "capture" => Some(Self::CaptureOnly),
-            "on" => Some(Self::CaptureAndRecall),
-            _ => None,
-        }
-    }
-
-    /// The lease mode to grant; `None` for `Off`.
-    pub fn lease_mode(self) -> Option<crate::runtime::memory_context::MemoryContextMode> {
-        use crate::runtime::memory_context::MemoryContextMode as M;
-        match self {
-            Self::Off => None,
-            Self::RecallEachPrompt => Some(M::RecallEachPrompt),
-            Self::CaptureOnly => Some(M::CaptureOnly),
-            Self::CaptureAndRecall => Some(M::CaptureAndRecall),
-        }
-    }
+    /// Set by the daemon (never on the wire, never in the reload record's
+    /// config): this session is OWNED, bound to the connection that
+    /// presents its token (see `docs/daemon-mode.md`, "Owned sessions").
+    #[serde(skip)]
+    pub owned: Option<OwnedConfig>,
 }
 
 fn default_true() -> bool {
@@ -303,9 +394,9 @@ impl Default for SessionConfig {
             client_input: None,
             name: None,
             max_session_cost: None,
-            memory_mode: None,
             restore_parked: false,
             message_clock: None,
+            owned: None,
         }
     }
 }
@@ -600,12 +691,16 @@ pub struct ClientCapabilities {
     /// in owner terms (`wire::legacy_shared`).
     #[serde(default)]
     pub owner_reason_input: bool,
+    /// Knows `EndReason::OwnerGone`. Without it, an observer of an owned
+    /// session is told `Ended{ClientQuit}` (`wire::ended_for`).
+    #[serde(default)]
+    pub owner_gone: bool,
 }
 
 impl ClientCapabilities {
     /// What this build decodes.
     pub fn current() -> Self {
-        Self { tool_queue: true, owner_reason_input: true }
+        Self { tool_queue: true, owner_reason_input: true, owner_gone: true }
     }
 
     fn is_none(&self) -> bool {
@@ -890,14 +985,21 @@ pub enum SessionCommand {
     /// Reply = `SessionEventWire::QueryResult { id, value }`.
     Query { id: u64, query: SessionQuery },
     /// Reply = `Attached { client_id, … }` on THIS client's channel only.
-    Attach { client: ClientMeta, mode: AttachMode },
+    Attach {
+        client: ClientMeta,
+        mode: AttachMode,
+        /// Host-set (never wire): the connection claims to own the session
+        /// (an owned create, or a re-bind after a reload).
+        #[serde(skip)]
+        owner: Option<OwnerBind>,
+    },
     Detach { client: ClientId },
     /// Host shutdown of this session: save → on_session_end → leases → Ended.
     End { reason: EndReason },
     /// Resync after Lagged (B, day 3): actor re-sends history + turn_replay.
     Resync { client: ClientId, since_seq: u64 },
     /// Runtime-backed slash command (`engine::commands::handle_engine_command`:
-    /// /model /thinking /context /trace /memory /compact …). Reply =
+    /// /model /thinking /context /trace /compact …). Reply =
     /// `QueryResult { id, value: {"kind": .., "text": ..} }`.
     EngineCommand { id: u64, name: String, arg: String },
     /// (A3) dispatch.rs LoadSkill — pre-built tool_use/tool_result pair
@@ -937,6 +1039,11 @@ pub enum SessionCommand {
     /// against their archives and wakes the parent once per worker.
     #[serde(skip)]
     AdoptWorkers { workers: Vec<crate::runtime::subagent::CarriedWorker> },
+    /// Host-only (never wire): the daemon accepts connections again after a
+    /// reload; a restored owned session that still waits for its owner
+    /// starts the re-bind grace now (a no-op for any other session).
+    #[serde(skip)]
+    ArmOwnerRebind,
     /// Host-only (never wire): reload's rehydrate hands the new image the
     /// exact tool activations the session held in the previous image
     /// (`SessionReloadRecord::tool_activations`). The runtime re-validates
@@ -1079,6 +1186,7 @@ impl std::fmt::Debug for SessionCommand {
             Self::Save => f.write_str("Save"),
             Self::TakeInput => f.write_str("TakeInput"),
             Self::Park => f.write_str("Park"),
+            Self::ArmOwnerRebind => f.write_str("ArmOwnerRebind"),
             Self::AdoptWorkers { workers } => f
                 .debug_struct("AdoptWorkers")
                 .field("workers", &workers.iter().map(|w| w.id.as_str()).collect::<Vec<_>>())
@@ -1095,8 +1203,12 @@ impl std::fmt::Debug for SessionCommand {
             Self::Query { id, query } => {
                 f.debug_struct("Query").field("id", id).field("query", query).finish()
             }
-            Self::Attach { client, mode } => {
-                f.debug_struct("Attach").field("client", client).field("mode", mode).finish()
+            Self::Attach { client, mode, owner } => {
+                f.debug_struct("Attach")
+                    .field("client", client)
+                    .field("mode", mode)
+                    .field("owner_claim", &owner.is_some())
+                    .finish()
             }
             Self::Detach { client } => f.debug_struct("Detach").field("client", client).finish(),
             Self::End { reason } => f.debug_struct("End").field("reason", reason).finish(),
@@ -1238,6 +1350,10 @@ pub enum EndReason {
     /// to journal, so the session cannot park; it ends instead of holding a
     /// Runtime resident forever.
     Idle,
+    /// An owned session's owner went away (detach, EOF, socket error, its
+    /// process killed) or did not re-bind within the grace after a daemon
+    /// reload. Any turn was cancelled as `Cancel` does; the journal stays.
+    OwnerGone,
 }
 
 // ── events + envelope ─────────────────────────────────────────────────────────
@@ -1750,6 +1866,69 @@ mod tests {
             vec!["DATABASE_URL", "GITHUB_PAT", "HTTPS_PROXY", "SENTRY_DSN"],
             "stripped names are recorded"
         );
+    }
+
+    /// `forward_secrets` sends exactly what `Hello.env` strips as secrets
+    /// (names AND credential-shaped values), never the client-only knobs.
+    #[test]
+    fn client_secret_env_is_the_stripped_secrets_with_values() {
+        let vars = vec![
+            ("HOME".to_string(), "/home/u".to_string()),
+            ("GH_TOKEN".to_string(), "ghp_dummy".to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "aws-dummy".to_string()),
+            ("DATABASE_URL".to_string(), "postgres://app:hunter2@db/prod".to_string()),
+            ("SYNAPS_CLIENT_TOKEN".to_string(), "client-only".to_string()),
+        ];
+        let (_, stripped) = strip_client_env(vars.clone());
+        let secrets = client_secret_env(vars);
+        let names: Vec<&str> = secrets.0.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, vec!["AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "GH_TOKEN"]);
+        // Every stripped secret, but not the client-only knob (stripped too).
+        assert!(names.iter().all(|n| stripped.iter().any(|s| s == n)), "{stripped:?}");
+        assert!(stripped.iter().any(|s| s == "SYNAPS_CLIENT_TOKEN"), "{stripped:?}");
+        assert!(secrets.0.contains(&("GH_TOKEN".to_string(), "ghp_dummy".to_string())));
+        // Debug never prints a value; the token never prints at all.
+        let dbg = format!("{secrets:?} {:?}", OwnerClaim { token: OwnerToken("tok-123".into()), forward_secrets: Some(secrets.clone()) });
+        assert!(!dbg.contains("ghp_dummy") && !dbg.contains("hunter2") && !dbg.contains("tok-123"), "{dbg}");
+        assert!(dbg.contains("GH_TOKEN"), "{dbg}");
+    }
+
+    /// Forwarded secrets stay apart in a `ToolEnv`: a child gets them (in
+    /// place of a same-named session var), a `Debug` never prints them.
+    #[test]
+    fn tool_env_merges_secrets_at_spawn_and_never_debugs_them() {
+        let vars = vec![("GH_TOKEN".to_string(), "session-old".to_string()), ("PATH".into(), "/bin".into())];
+        let env = ToolEnv::with_secrets(vars, SecretEnv(vec![("GH_TOKEN".into(), "s3cr3t-value".into())]));
+        let spawn: Vec<(&str, &str)> = env.spawn_vars().collect();
+        assert_eq!(spawn, [("PATH", "/bin"), ("GH_TOKEN", "s3cr3t-value")]);
+        assert_eq!(env.get("GH_TOKEN"), Some("s3cr3t-value"));
+        let dbg = format!("{env:?}");
+        assert!(!dbg.contains("s3cr3t-value") && dbg.contains("GH_TOKEN"), "{dbg}");
+        let plain: ToolEnv = vec![("PATH".to_string(), "/bin".to_string())].into();
+        assert_eq!(plain.spawn_vars().collect::<Vec<_>>(), [("PATH", "/bin")]);
+    }
+
+    #[test]
+    fn owner_tokens_compare_whole() {
+        let t = OwnerToken("abcdef".into());
+        assert!(t.matches(&OwnerToken("abcdef".into())));
+        assert!(!t.matches(&OwnerToken("abcdeg".into())));
+        assert!(!t.matches(&OwnerToken("abcde".into())));
+        assert!(!t.matches(&OwnerToken(String::new())));
+    }
+
+    /// `owned` is daemon-set and never rides the wire or the reload
+    /// record's config.
+    #[test]
+    fn session_config_owned_never_serializes() {
+        let cfg = SessionConfig {
+            owned: Some(OwnedConfig { token: OwnerToken::mint(), restored: false }),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert!(v.get("owned").is_none(), "{v}");
+        let back: SessionConfig = serde_json::from_value(v).unwrap();
+        assert!(back.owned.is_none());
     }
 
     #[test]

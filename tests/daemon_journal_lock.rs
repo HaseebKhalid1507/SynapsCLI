@@ -57,8 +57,8 @@ async fn in_process_continue_of_live_daemon_session_refused() {
         .unwrap();
     let (mut t, snap) = SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(cwd.clone()),
                 env: None,
                 model_override: Some("claude-sonnet-4-5".into()),
@@ -66,8 +66,8 @@ async fn in_process_continue_of_live_daemon_session_refused() {
                 await_extensions: true,
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .expect("daemon attach");

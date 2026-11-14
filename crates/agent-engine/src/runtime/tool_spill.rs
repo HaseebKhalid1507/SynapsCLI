@@ -47,7 +47,7 @@ pub const SPILL_SESSION_CAP_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Builtin tools whose results are output dumps (command output, search
 /// hits, listings, worker reports) and may be spilled. Everything else
-/// builtin (`edit`, `write`, `load_skill`, memory and forum tools, …)
+/// builtin (`edit`, `write`, `load_skill`, memory tools, …)
 /// returns content the model asked for in full, and keeps the legacy cut.
 const SPILL_BUILTINS: &[&str] = &[
     "bash",

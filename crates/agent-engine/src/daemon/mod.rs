@@ -346,6 +346,10 @@ impl DaemonState {
             Ok(real) if real.id == placeholder.id || real.journal_id() == placeholder.id.as_str() => {
                 tracing::info!(session = %placeholder.id, "daemon: locked journal released — placeholder replaced by the real session");
                 self.insert(real.clone());
+                // A restored owned session: the daemon accepts connections.
+                if real.is_owned() {
+                    arm_owner_rebind(&real).await;
+                }
                 real
             }
             Ok(other) => {
@@ -468,6 +472,14 @@ impl Daemon {
         }
 
         let accept = tokio::spawn(listener::accept_loop(Arc::clone(&state), listener, state.shutdown.clone()));
+        // Owned sessions the rehydrate restored start their owner's re-bind
+        // grace now that the owner can actually connect (never during the
+        // restore, which can take longer than the grace).
+        if reload_state.is_some() {
+            for h in state.live_sessions().into_iter().filter(|h| h.is_owned()) {
+                arm_owner_rebind(&h).await;
+            }
+        }
         if let Some(idle) = opts.idle_exit {
             tokio::spawn(idle_monitor(Arc::clone(&state), idle));
         }
@@ -567,6 +579,25 @@ pub async fn daemon_is_idle(state: &DaemonState) -> bool {
         }
     }
     true
+}
+
+/// `ArmOwnerRebind` to a restored owned session, retried while its command
+/// queue is full (as `close` retries). Should it still not arrive, the
+/// session's fallback deadline ends it (`owned::owner_restore_cap`).
+async fn arm_owner_rebind(h: &crate::session::SessionHandle) {
+    let deadline = tokio::time::Instant::now() + close::CLOSE_SEND_RETRY;
+    loop {
+        match h.send(crate::session::SessionCommand::ArmOwnerRebind).await {
+            Err(crate::session::TransportError::Backpressure) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(crate::session::TransportError::Backpressure) => {
+                tracing::warn!(session = %h.id, "daemon: owned session's queue stayed full; its fallback deadline applies");
+                return;
+            }
+            _ => return,
+        }
+    }
 }
 
 async fn idle_monitor(state: Arc<DaemonState>, idle: Duration) {

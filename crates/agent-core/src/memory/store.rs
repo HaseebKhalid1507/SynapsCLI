@@ -13,8 +13,9 @@ pub struct MemoryRecord {
     pub timestamp_ms: u64,
     /// Free-form text content.
     pub content: String,
-    /// Optional tag list (e.g. ["@user", "preference"]).
-    #[serde(default)]
+    /// Optional tag list (e.g. ["@user", "preference"]). Absent and `null`
+    /// both read as no tags.
+    #[serde(default, deserialize_with = "null_as_no_tags")]
     pub tags: Vec<String>,
     /// Optional structured metadata. Validated as JSON on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36,6 +37,11 @@ pub struct MemoryRecord {
     /// Retention class (consumed by the unified retention sweep).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<MemoryRetention>,
+}
+
+/// `"tags": null` says what an absent `tags` says.
+fn null_as_no_tags<'de, D: serde::Deserializer<'de>>(reader: D) -> Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(reader)?.unwrap_or_default())
 }
 
 /// Provenance of a memory record (spec §9.5).
@@ -103,6 +109,37 @@ pub enum MemoryError {
     NotFound(String),
     /// The project root could not be canonicalized.
     InvalidProjectRoot(String),
+    /// The line (a note, or the tombstone of a forget) IS in the file, whole,
+    /// and every reader sees it, but a sync after the write failed, so it is
+    /// not confirmed to be on disk. Not a failed save: doing it again makes
+    /// a second note under a new id, and a second forget answers
+    /// [`MemoryError::NotFound`]. Holds the id of the note saved or
+    /// forgotten, when there is one (a record without an id, or the end of
+    /// an import run, has none), and the sync's error.
+    WrittenUnconfirmed { id: Option<String>, cause: String },
+}
+
+impl MemoryError {
+    /// A sync failure after the write, before the caller knows the id.
+    fn unconfirmed(cause: impl std::fmt::Display) -> Self {
+        MemoryError::WrittenUnconfirmed {
+            id: None,
+            cause: cause.to_string(),
+        }
+    }
+
+    /// This error with `id` as the id of an unconfirmed write.
+    fn with_id(self, id: Option<&str>) -> Self {
+        match self {
+            MemoryError::WrittenUnconfirmed { id: None, cause } => {
+                MemoryError::WrittenUnconfirmed {
+                    id: id.map(str::to_string),
+                    cause,
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 impl std::fmt::Display for MemoryError {
@@ -118,6 +155,19 @@ impl std::fmt::Display for MemoryError {
                 write!(f, "memory record not found in this project scope: {id}")
             }
             MemoryError::InvalidProjectRoot(s) => write!(f, "invalid project root: {s}"),
+            MemoryError::WrittenUnconfirmed { id: None, cause } => write!(
+                f,
+                "written, but not confirmed on disk (the sync failed: {cause}); \
+                 it is in the store now, so look before doing it again"
+            ),
+            MemoryError::WrittenUnconfirmed {
+                id: Some(id),
+                cause,
+            } => write!(
+                f,
+                "written, but not confirmed on disk (the sync failed: {cause}); \
+                 {id} is in the store now, so fetch {id} to check before doing it again"
+            ),
         }
     }
 }
@@ -171,12 +221,20 @@ fn namespace_path(dir: &Path, ns: &str) -> PathBuf {
     dir.join(format!("{ns}.jsonl"))
 }
 
-/// Append one record. Validates namespace, content size. Atomic per-line via O_APPEND.
+/// Append one record. Validates namespace, content size. One line is one
+/// `write` to a file opened for append, and the file is synced before this
+/// returns (see `append_jsonl_line`).
 pub fn append(record: &MemoryRecord) -> Result<(), MemoryError> {
     append_to(&crate::config::base_dir(), record)
 }
 
 pub fn append_to(base: &Path, record: &MemoryRecord) -> Result<(), MemoryError> {
+    append_record(base, record, true)
+}
+
+/// [`append_to`]; with `sync_now` false the sync is left to the caller (an
+/// import, which syncs each file once at the end of its run).
+fn append_record(base: &Path, record: &MemoryRecord, sync_now: bool) -> Result<(), MemoryError> {
     validate_namespace(&record.namespace)?;
     if record.content.len() > MAX_CONTENT_BYTES {
         return Err(MemoryError::ContentTooLarge {
@@ -185,17 +243,53 @@ pub fn append_to(base: &Path, record: &MemoryRecord) -> Result<(), MemoryError> 
         });
     }
     let dir = memory_dir_in(base);
+    let new_dir = !dir.exists();
     crate::core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::from)?;
+    if new_dir {
+        // The name of a `memory/` folder made just now is in its parent, and
+        // no sync below reaches that. Before the line is written, so that a
+        // failure here leaves no note behind an error.
+        if let Some(parent) = dir.parent() {
+            sync_dir(parent)?;
+        }
+    }
     let path = namespace_path(&dir, &record.namespace);
     let line = serde_json::to_string(record)?;
-    append_jsonl_line(&path, &line)
+    append_jsonl_line(&path, &line, sync_now).map_err(|e| e.with_id(record.id.as_deref()))
 }
 
-/// Append one JSONL line with torn-tail healing: if a previous writer
-/// crashed mid-line (file does not end in a newline), a leading newline
-/// isolates the torn fragment on its own line — lenient readers skip the
-/// fragment and every subsequent record stays parseable.
-fn append_jsonl_line(path: &Path, line: &str) -> Result<(), MemoryError> {
+/// Append one JSONL line and make it durable before returning: the line goes
+/// to the file whole ([`write_whole_line`]), the file is synced, and then
+/// its directory, on every save. "The file had bytes" does not say that its
+/// name is on disk: another saver may have created it and not synced the
+/// directory yet, a rewrite may have renamed a new file over it, or an
+/// import that did not finish may have made it.
+///
+/// With `sync_now` false nothing is synced here: the caller is an import
+/// run, which syncs each file and its directory once, at its end
+/// ([`ImportRun::finish`]).
+///
+/// An error means the save is NOT acknowledged. It does not mean nothing was
+/// written. [`MemoryError::WrittenUnconfirmed`] says the whole line is in
+/// the file and a sync after it failed; a caller must not treat that as "try
+/// again". After any other error at most a fragment of the line is in the
+/// file (a short write), which readers skip.
+///
+/// Torn-tail healing: if a previous writer died mid-line (the file does not
+/// end in a newline), a leading newline isolates the torn fragment on its
+/// own line. Lenient readers skip the fragment and every later record stays
+/// parseable. Nothing is ever cut off the file, so healing cannot drop a
+/// line, and a line that only lacked its newline becomes a good line.
+///
+/// The file's lock ([`lock_notes_file`]) is held from the look at the last
+/// byte through the sync, and the notes file is opened only once the lock is
+/// had. So no other appender's line can tear between the look and the write,
+/// and no rewrite (sweep, eviction, `retention forget memory`) can replace
+/// the file between this line going in and this call returning: a rewrite
+/// reads the file either before this line or with it whole. If the lock is
+/// not had within [`NOTES_LOCK_WAIT`] the save fails and nothing is written.
+fn append_jsonl_line(path: &Path, line: &str, sync_now: bool) -> Result<(), MemoryError> {
+    let _lock = lock_notes_file(path)?;
     let needs_heal = match fs::metadata(path) {
         Ok(meta) if meta.len() > 0 => {
             use std::io::{Read, Seek, SeekFrom};
@@ -208,13 +302,217 @@ fn append_jsonl_line(path: &Path, line: &str) -> Result<(), MemoryError> {
         _ => false,
     };
     let mut f = crate::core::private_fs::open_private_append(path).map_err(std::io::Error::from)?;
-    let mut out = String::with_capacity(line.len() + 2);
-    if needs_heal {
-        out.push('\n');
+    write_whole_line(&mut f, line, needs_heal)?;
+    if sync_now {
+        // From here on the line is in the file.
+        let synced = sync_file(&f).and_then(|()| match path.parent() {
+            Some(dir) => sync_dir(dir),
+            None => Ok(()),
+        });
+        synced.map_err(MemoryError::unconfirmed)?;
     }
-    out.push_str(line);
-    out.push('\n');
-    f.write_all(out.as_bytes())?;
+    Ok(())
+}
+
+/// How long a save or a rewrite waits for a notes file's lock: the archive
+/// store's number.
+pub(crate) const NOTES_LOCK_WAIT: std::time::Duration =
+    crate::context_archive::PROCESS_LOCK_WAIT;
+/// How often that wait tries again. A save holds the lock for one write and
+/// one sync, so the next try is soon.
+const NOTES_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The lock file of the notes file at `path`: `<ns>.jsonl.lock` beside it.
+/// Its name does not end in `.jsonl`, so nothing that lists notes files
+/// takes it for one, and it is never renamed or removed: a lock on the notes
+/// file itself would be lost with the inode a rewrite replaces.
+pub(crate) fn notes_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Take the exclusive lock of the notes file at `path`, waiting up to
+/// [`NOTES_LOCK_WAIT`]. Every appender and every rewriter of a notes file
+/// holds it: an append from its look at the last byte through its sync, a
+/// rewrite from its read through its rename. Dropping the guard releases it.
+///
+/// When the wait runs out this is an error (`WouldBlock`), and the caller
+/// must not go on: a save never appends without the lock and a rewrite never
+/// rewrites without it. The lock is a `flock`, so it holds between threads
+/// of one process as well (each call opens the file anew), and it must not
+/// be taken twice on one call path.
+///
+/// A binary older than this lock does not take it. Beside such a binary a
+/// rewrite can still lose a save, as before.
+pub(crate) fn lock_notes_file(
+    path: &Path,
+) -> std::io::Result<crate::core::lock_file::ExclusiveLock> {
+    let lock_path = notes_lock_path(path);
+    let wait = notes_lock_wait();
+    crate::core::lock_file::lock_within(wait, NOTES_LOCK_POLL, || {
+        let file = open_lock_file(&lock_path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot open the notes lock file {}: {e}; nothing was written",
+                    lock_path.display()
+                ),
+            )
+        })?;
+        crate::core::lock_file::try_lock(file)
+    })?
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "notes file {} is locked by another writer (waited {} ms); nothing was written",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                wait.as_millis()
+            ),
+        )
+    })
+}
+
+/// Open (creating it, mode 0600, never through a symlink) a lock file. Read
+/// and write access: Windows locks only a handle that has one of them.
+/// The folder is not created. Public for `synaps memory import-notes`, whose
+/// one lock for a whole run is opened as a notes file's lock is.
+pub fn open_lock_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(crate::core::private_fs::FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A shorter lock wait for this thread's saves and rewrites.
+    static NOTES_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Shorten (or with `None` restore) the lock wait of this thread.
+#[cfg(test)]
+pub(crate) fn set_notes_lock_wait(wait: Option<std::time::Duration>) {
+    NOTES_LOCK_WAIT_OVERRIDE.with(|cell| cell.set(wait));
+}
+
+fn notes_lock_wait() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(wait) = NOTES_LOCK_WAIT_OVERRIDE.with(|cell| cell.get()) {
+        return wait;
+    }
+    NOTES_LOCK_WAIT
+}
+
+/// How many `write` calls one line may take before the append gives up.
+const LINE_WRITE_ATTEMPTS: usize = 3;
+
+/// Write `line` and its newline with ONE `write` call, so that no other
+/// appender's bytes can land inside a line that was acknowledged.
+///
+/// `write_all` is not used: after a short write it sends the REST of the
+/// line in a second call, and whatever another appender wrote in between
+/// would sit in the middle of this line. Here a short write is abandoned
+/// where it is (bytes are never taken back out of the file) and the whole
+/// line is written again, led by a newline that ends the fragment, which a
+/// reader then skips like any torn line. If the fragment was the whole
+/// record short of its newline, the record is in the file twice, same id and
+/// same bytes: a duplicate rather than a line this call cannot vouch for.
+/// A regular file takes a short write when the disk or a quota is full, so
+/// the retry normally fails and the caller gets that error.
+fn write_whole_line<W: Write>(
+    file: &mut W,
+    line: &str,
+    mut lead_newline: bool,
+) -> std::io::Result<()> {
+    let mut attempts = 0;
+    while attempts < LINE_WRITE_ATTEMPTS {
+        let mut out = Vec::with_capacity(line.len() + 2);
+        if lead_newline {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
+        step("write");
+        match file.write(&out) {
+            Ok(n) if n == out.len() => return Ok(()),
+            Ok(n) => {
+                attempts += 1;
+                lead_newline |= n > 0;
+            }
+            // Nothing was written; the same call again.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WriteZero,
+        "a line could not be appended with one write",
+    ))
+}
+
+/// Sync a notes file: its bytes and its length.
+fn sync_file(file: &fs::File) -> std::io::Result<()> {
+    step("sync file");
+    failing("sync file")?;
+    file.sync_all()
+}
+
+/// Sync a directory, so that the name of a file created in it, or renamed
+/// into it, is on disk.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    step("sync dir");
+    failing("sync dir")?;
+    // Every save syncs the directory, so a directory that cannot be synced
+    // at all must not fail every save, each with its line already in the
+    // file. Which errors say that is `private_fs::sync_dir`'s one rule, and
+    // it logs the one it leaves that may cost a new file's name.
+    crate::core::private_fs::sync_dir(dir)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The write and sync calls this thread's appends made, in order.
+    static IO_STEPS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Notes a write or a sync for the tests that check their order.
+#[cfg(test)]
+fn step(name: &'static str) {
+    IO_STEPS.with(|steps| steps.borrow_mut().push(name));
+}
+
+#[cfg(not(test))]
+fn step(_name: &'static str) {}
+
+#[cfg(test)]
+thread_local! {
+    /// The sync step that fails on this thread, for the tests of what a
+    /// caller is told then.
+    static FAILING_STEP: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// An error if a test made this step fail.
+#[cfg(test)]
+fn failing(name: &'static str) -> std::io::Result<()> {
+    if FAILING_STEP.with(|step| step.get()) == Some(name) {
+        return Err(std::io::Error::other(format!("{name} failed (test)")));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn failing(_name: &'static str) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -238,9 +536,14 @@ pub fn query_in(
     let needle = q.content_contains.as_ref().map(|s| s.to_lowercase());
     let mut out: Vec<MemoryRecord> = Vec::new();
     for line in reader.lines() {
+        // The rule of `scan_project_file`: a line that is not UTF-8 is
+        // skipped like one that does not parse; any other read error is
+        // returned. `lines` gives a lasting error again on every call, so
+        // skipping it would never end.
         let line = match line {
             Ok(l) => l,
-            Err(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(e) => return Err(e.into()),
         };
         if line.trim().is_empty() {
             continue;
@@ -343,10 +646,7 @@ impl ProjectScope {
         Ok(Self::for_canonical_root(canonical))
     }
 
-    // Internal seam for historical, already-verified canonical paths retained
-    // in the private repository marker. Unlike for_root this does not re-resolve
-    // an old path that may have moved or been reused by another repository.
-    pub(super) fn for_canonical_root(canonical: PathBuf) -> Self {
+    fn for_canonical_root(canonical: PathBuf) -> Self {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(canonical.as_os_str().as_encoded_bytes());
@@ -363,38 +663,8 @@ impl ProjectScope {
         }
     }
 
-    /// Construct an explicit user-wide scope at a canonical host base path.
-    /// This is the ONLY constructor accepting the reserved all-zero key.
-    /// Never derive this scope from model-authored project arguments.
-    pub fn user_scope(root: &Path) -> Result<Self, MemoryError> {
-        let mut scope = Self::for_root(root)?;
-        scope.require_directory()?;
-        scope.key = "p0000000000000000".into();
-        Ok(scope)
-    }
-
-    /// Restore a host-verified key (e.g. an operator migration manifest).
-    /// Syntax validation is NOT authorization: callers must establish the key's
-    /// trusted provenance, never accept a model-supplied key as a scope grant.
     /// Accepts exactly `p[0-9a-f]{16}`, excluding the user-wide reserved key.
-    pub fn from_key(root: &Path, key: &str) -> Result<Self, MemoryError> {
-        Self::validate_repository_key(key)?;
-        let mut scope = Self::for_root(root)?;
-        scope.require_directory()?;
-        scope.key = key.to_owned();
-        Ok(scope)
-    }
-
-    fn require_directory(&self) -> Result<(), MemoryError> {
-        if !self.root.is_dir() {
-            return Err(MemoryError::InvalidProjectRoot(
-                "host scope root must be a directory".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_repository_key(key: &str) -> Result<(), MemoryError> {
+    fn validate_repository_key(key: &str) -> Result<(), MemoryError> {
         if key.len() != 17
             || !key.starts_with('p')
             || !key.as_bytes()[1..]
@@ -461,8 +731,13 @@ impl ProjectScope {
 
     /// The JSONL namespace holding this project's records.
     pub fn namespace(&self) -> String {
-        format!("project-{}", self.key)
+        project_namespace(&self.key)
     }
+}
+
+/// The JSONL namespace of the project with this key.
+fn project_namespace(key: &str) -> String {
+    format!("project-{key}")
 }
 
 /// Input for [`store_record_in`] — explicit provenance, sensitivity, and
@@ -547,49 +822,72 @@ pub fn store_record_in(
     Ok(record)
 }
 
-/// Load the LIVE (non-tombstoned, scope-matching) records of a project.
-/// Records whose inner `project` key does not match the scope are excluded
-/// — fail closed even if a foreign file was copied into the namespace.
-fn load_live_project_records(
-    base: &Path,
-    scope: &ProjectScope,
-) -> Result<Vec<MemoryRecord>, MemoryError> {
-    let path = namespace_path(&memory_dir_in(base), &scope.namespace());
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let f = fs::File::open(&path)?;
-    let reader = BufReader::new(f);
-    let mut live: Vec<MemoryRecord> = Vec::new();
-    let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for line in reader.lines() {
+/// What the lines of one project's file amount to: the records that carry
+/// the project's key and an id, in file order, and every id a tombstone line
+/// names. A record whose id is tombstoned is not live, wherever in the file
+/// the tombstone stands.
+struct ProjectLines {
+    records: Vec<MemoryRecord>,
+    tombstoned: std::collections::HashSet<String>,
+}
+
+/// Scan `<base>/memory/project-<key>.jsonl` by a bare project key (a
+/// [`ProjectScope`] needs the project's folder to exist; an import has only
+/// the key). No file is an empty project. Records whose inner `project` key
+/// is not `key` are excluded — fail closed even if a foreign file was copied
+/// into the namespace.
+///
+/// A line that does not parse is skipped, and so is one that is not UTF-8 (a
+/// torn tail can end inside a character). Any other read error is returned:
+/// a scan that carried on past it would answer from part of the file.
+fn scan_project_file(base: &Path, key: &str) -> Result<ProjectLines, MemoryError> {
+    let mut lines = ProjectLines {
+        records: Vec::new(),
+        tombstoned: std::collections::HashSet::new(),
+    };
+    let path = namespace_path(&memory_dir_in(base), &project_namespace(key));
+    let f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(lines),
+        Err(e) => return Err(e.into()),
+    };
+    for line in BufReader::new(f).lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(e) => return Err(e.into()),
         };
         if line.trim().is_empty() {
             continue;
         }
         if let Ok(tomb) = serde_json::from_str::<TombstoneLine>(&line) {
-            tombstoned.insert(tomb.tombstone);
+            lines.tombstoned.insert(tomb.tombstone);
             continue;
         }
         let rec: MemoryRecord = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(_) => continue,
         };
-        // Fail closed: only records carrying THIS scope's key participate.
-        if rec.project.as_deref() != Some(scope.key()) || rec.id.is_none() {
+        // Fail closed: only records carrying THIS project's key participate.
+        if rec.project.as_deref() != Some(key) || rec.id.is_none() {
             continue;
         }
-        live.push(rec);
+        lines.records.push(rec);
     }
-    live.retain(|r| {
-        r.id.as_ref()
-            .map(|id| !tombstoned.contains(id))
-            .unwrap_or(false)
-    });
-    Ok(live)
+    Ok(lines)
+}
+
+/// Load the LIVE (non-tombstoned, scope-matching) records of a project.
+fn load_live_project_records(
+    base: &Path,
+    scope: &ProjectScope,
+) -> Result<Vec<MemoryRecord>, MemoryError> {
+    let ProjectLines {
+        mut records,
+        tombstoned,
+    } = scan_project_file(base, scope.key())?;
+    records.retain(|r| r.id.as_ref().is_some_and(|id| !tombstoned.contains(id)));
+    Ok(records)
 }
 
 /// Project-scoped bounded search: descriptors + snippets, most recent
@@ -693,14 +991,25 @@ pub fn forget_in(base: &Path, scope: &ProjectScope, id: &str) -> Result<(), Memo
     if !live.iter().any(|r| r.id.as_deref() == Some(id)) {
         return Err(MemoryError::NotFound(id.to_string()));
     }
-    let dir = memory_dir_in(base);
-    crate::core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::from)?;
-    let path = namespace_path(&dir, &scope.namespace());
-    let line = serde_json::to_string(&TombstoneLine {
+    let tombstone = TombstoneLine {
         tombstone: id.to_string(),
         timestamp_ms: now_ms(),
-    })?;
-    append_jsonl_line(&path, &line)
+    };
+    append_tombstone(base, &scope.namespace(), &tombstone, true)
+}
+
+/// Append a tombstone line to a project namespace's file.
+fn append_tombstone(
+    base: &Path,
+    namespace: &str,
+    tombstone: &TombstoneLine,
+    sync_now: bool,
+) -> Result<(), MemoryError> {
+    let dir = memory_dir_in(base);
+    crate::core::private_fs::ensure_private_dir(&dir).map_err(std::io::Error::from)?;
+    let path = namespace_path(&dir, namespace);
+    let line = serde_json::to_string(tombstone)?;
+    append_jsonl_line(&path, &line, sync_now).map_err(|e| e.with_id(Some(&tombstone.tombstone)))
 }
 
 /// Path of a project namespace's JSONL store file (index-module seam).
@@ -708,10 +1017,612 @@ pub(crate) fn namespace_file(base: &Path, namespace: &str) -> PathBuf {
     namespace_path(&memory_dir_in(base), namespace)
 }
 
+/// The notes file of the project with this key under `base`: where a save,
+/// a forget and an import of that project's notes write. Only the path:
+/// nothing is created, and the key is not checked.
+pub fn project_notes_file(base: &Path, key: &str) -> PathBuf {
+    namespace_file(base, &project_namespace(key))
+}
+
+// ─── Import from another store ──────────────────────────────────────────────
+
+/// The reserved key of user-wide notes, which have no project file to go to.
+const USER_WIDE_KEY: &str = "p0000000000000000";
+
+/// The fields a note line may have: those of [`MemoryRecord`].
+const RECORD_FIELDS: [&str; 10] = [
+    "namespace",
+    "timestamp_ms",
+    "content",
+    "tags",
+    "meta",
+    "id",
+    "project",
+    "provenance",
+    "sensitivity",
+    "retention",
+];
+
+/// Where [`import_line_in`] files a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportTarget<'a> {
+    /// Under the project the line names in its own `project`. Nothing in the
+    /// line changes. A tombstone line names no project and is refused.
+    AsRecorded,
+    /// Under this project key (`p` + 16 hex, not the user-wide key). A
+    /// note's `project` and `namespace` are set to it.
+    Project(&'a str),
+}
+
+/// What [`import_line_in`] did with one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportOutcome {
+    /// Appended: a note, or a tombstone, whose id the file did not have.
+    Stored,
+    /// Nothing written: the note is live in the file as given, or (for a
+    /// tombstone line) the id is already tombstoned there.
+    AlreadyPresent,
+    /// Nothing written: a note whose id is tombstoned in the file. An import
+    /// does not undo a forget.
+    KeptForgotten,
+    /// A tombstone appended for an id that was live.
+    Forgotten,
+    /// Nothing written. The reason names fields and positions and never
+    /// quotes a value of the line.
+    Refused(String),
+}
+
+impl ImportOutcome {
+    /// The outcome's name in an import report.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Stored => "stored",
+            Self::AlreadyPresent => "already_present",
+            Self::KeptForgotten => "kept_forgotten",
+            Self::Forgotten => "forgotten",
+            Self::Refused(_) => "refused",
+        }
+    }
+}
+
+/// [`import_line_in`]'s answer for one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedLine {
+    pub outcome: ImportOutcome,
+    /// The line's id, if the line was read far enough to have one.
+    pub id: Option<String>,
+    /// The key of the project whose file the line was judged against, if it
+    /// got that far. For a tombstone line as recorded that was applied to
+    /// more than one project, the first of them by key.
+    pub project: Option<String>,
+    /// Whether the line is a tombstone line rather than a note.
+    pub tombstone: bool,
+}
+
+/// What one import run knows: each notes file it has touched, read from disk
+/// once and kept in step with what the run has stored since, in a dry run
+/// too. That is what makes the lines of one run be judged against each
+/// other, and a dry run report what the real run then does.
+///
+/// A run is a dry run or a real one from [`ImportRun::new`] to its end, so
+/// what a dry run remembers as stored can never be taken for stored by a
+/// real one: a preview and the import after it are two runs.
+///
+/// End a run with [`ImportRun::finish`], on an early stop too: nothing a
+/// real run stored is durable before it returns `Ok`. The compiler cannot
+/// tell a run that was dropped on an early return from one that was
+/// finished (`#[must_use]` only catches a run that is never bound). So a
+/// real run that is dropped unfinished syncs what it appended as it goes,
+/// and logs it if that fails; only the caller's chance to see the error is
+/// lost.
+#[derive(Debug)]
+#[must_use = "end an import run with `finish()`: nothing it stored is durable before that"]
+pub struct ImportRun {
+    dry_run: bool,
+    files: std::collections::HashMap<PathBuf, ImportFile>,
+    /// Ids of tombstone lines this run refused because no project could be
+    /// found for them. A note with such an id is refused for the rest of
+    /// the run: storing it would bring a forgotten note back.
+    unfiled_tombstones: std::collections::HashSet<String>,
+    /// Whether the run has read every project's notes file under the base
+    /// (it does once, the first time a tombstone line has no project).
+    read_every_project: bool,
+    finished: bool,
+}
+
+#[derive(Debug)]
+struct ImportFile {
+    /// The key of the project whose file this is.
+    key: String,
+    /// The file's records by id, by the reader's rule. A file can hold an id
+    /// more than once.
+    notes: std::collections::HashMap<String, Vec<MemoryRecord>>,
+    tombstoned: std::collections::HashSet<String>,
+    /// Whether this run appended to the file.
+    appended: bool,
+}
+
+impl ImportRun {
+    /// A run that writes (`dry_run` false), or one that writes, creates and
+    /// syncs nothing and gives the outcomes the real run would give from the
+    /// same files.
+    pub fn new(dry_run: bool) -> Self {
+        Self {
+            dry_run,
+            files: std::collections::HashMap::new(),
+            unfiled_tombstones: std::collections::HashSet::new(),
+            read_every_project: false,
+            finished: false,
+        }
+    }
+
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    /// The file of project `key`, read the first time the run needs it.
+    fn file(&mut self, base: &Path, key: &str) -> Result<&mut ImportFile, MemoryError> {
+        use std::collections::hash_map::Entry;
+        match self
+            .files
+            .entry(namespace_file(base, &project_namespace(key)))
+        {
+            Entry::Occupied(known) => Ok(known.into_mut()),
+            Entry::Vacant(vacant) => {
+                let lines = scan_project_file(base, key)?;
+                let mut notes: std::collections::HashMap<String, Vec<MemoryRecord>> =
+                    std::collections::HashMap::new();
+                for record in lines.records {
+                    if let Some(id) = record.id.clone() {
+                        notes.entry(id).or_default().push(record);
+                    }
+                }
+                Ok(vacant.insert(ImportFile {
+                    key: key.to_string(),
+                    notes,
+                    tombstoned: lines.tombstoned,
+                    appended: false,
+                }))
+            }
+        }
+    }
+
+    /// Read every `project-<key>.jsonl` under `<base>/memory` that the run
+    /// has not read yet. Once in a run: a file made later is one the run
+    /// made, and it has that already. Reads only; no memory folder is no
+    /// file. An error is a file or a folder that could not be read: the run
+    /// cannot say that no project holds an id, and must stop.
+    fn read_every_project(&mut self, base: &Path) -> Result<(), MemoryError> {
+        if self.read_every_project {
+            return Ok(());
+        }
+        let entries = match fs::read_dir(memory_dir_in(base)) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries.into_iter().flatten() {
+            let name = entry?.file_name();
+            let key = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("project-"))
+                .and_then(|name| name.strip_suffix(".jsonl"));
+            if let Some(key) = key.filter(|key| ProjectScope::validate_repository_key(key).is_ok())
+            {
+                self.file(base, key)?;
+            }
+        }
+        self.read_every_project = true;
+        Ok(())
+    }
+
+    /// The projects in whose files this run has seen `id`, as a note or as a
+    /// tombstone, sorted. Only files the run has read: those a line of the
+    /// run was filed in or judged against, and all of them after
+    /// [`Self::read_every_project`].
+    fn projects_holding(&self, id: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .files
+            .values()
+            .filter(|file| file.notes.contains_key(id) || file.tombstoned.contains(id))
+            .map(|file| file.key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// End the run: sync every file it appended to, then the directory of
+    /// each. An import's appends are not synced one by one, so nothing the
+    /// run stored is durable until this returns `Ok`; call it when the run
+    /// stops early too. Returns the files synced, sorted. A dry run has
+    /// none.
+    ///
+    /// Every file and every directory is tried, also after one failed.
+    /// An error is [`MemoryError::WrittenUnconfirmed`] for the first sync
+    /// that failed, naming its file: the lines the run reported as stored
+    /// are in their files, and that sync failed.
+    #[must_use = "an import is not durable unless `finish` returned Ok"]
+    pub fn finish(mut self) -> Result<Vec<PathBuf>, MemoryError> {
+        // Whatever the sync says, it was tried and the caller is told.
+        self.finished = true;
+        self.sync()
+            .map_err(|(path, e)| MemoryError::unconfirmed(format!("{}: {e}", path.display())))
+    }
+
+    /// Sync every appended file, then every directory of one, trying all of
+    /// them. The first failure, with the path that failed.
+    fn sync(&self) -> Result<Vec<PathBuf>, (PathBuf, std::io::Error)> {
+        let mut synced: Vec<PathBuf> = self
+            .files
+            .iter()
+            .filter(|(_, file)| file.appended)
+            .map(|(path, _)| path.clone())
+            .collect();
+        synced.sort();
+        let mut first_error: Option<(PathBuf, std::io::Error)> = None;
+        let mut dirs: std::collections::BTreeSet<&Path> = std::collections::BTreeSet::new();
+        for path in &synced {
+            // Opened for append, not for reading: Windows flushes only a
+            // handle that may write.
+            let result = fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .and_then(|file| sync_file(&file));
+            if let Err(e) = result {
+                first_error.get_or_insert((path.clone(), e));
+            }
+            dirs.extend(path.parent());
+        }
+        for dir in dirs {
+            if let Err(e) = sync_dir(dir) {
+                first_error.get_or_insert((dir.to_path_buf(), e));
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(synced),
+        }
+    }
+}
+
+impl Drop for ImportRun {
+    /// The net under a run that was not finished (an early return, a `?`):
+    /// what it appended is synced all the same.
+    fn drop(&mut self) {
+        if self.finished || !self.files.values().any(|file| file.appended) {
+            return;
+        }
+        if let Err((path, error)) = self.sync() {
+            tracing::warn!(
+                "an import run was dropped unfinished and its sync of {} failed: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Import one JSONL line of another store's notes into the plain-file store
+/// under `base`: a note (a [`MemoryRecord`] line) or a tombstone line
+/// (`{"tombstone":"<id>","timestamp_ms":…}`).
+///
+/// A note must be a JSON object with no field but [`MemoryRecord`]'s, an
+/// `id` of 1 to 128 bytes without whitespace or control characters, a
+/// `project` that is a project key, `namespace == "project-" + project`, a
+/// `timestamp_ms`, and at most [`MAX_CONTENT_BYTES`] of content. It is
+/// stored as given, except that [`ImportTarget::Project`] sets `project` and
+/// `namespace`. No field is dropped and no time is made up: a line that
+/// could only be stored without something it says is refused.
+///
+/// Against the target file: a note whose id is tombstoned there is
+/// [`ImportOutcome::KeptForgotten`]; whose id is live there with the same
+/// content, tags, time, provenance, sensitivity, retention and meta is
+/// [`ImportOutcome::AlreadyPresent`], and with anything different is
+/// refused; otherwise it is appended. A tombstone line is appended unless
+/// the id is already tombstoned: [`ImportOutcome::Forgotten`] if the id was
+/// live, [`ImportOutcome::Stored`] if the file did not have it (a later
+/// import of that note then stays forgotten).
+///
+/// A tombstone line names no project. Under [`ImportTarget::AsRecorded`] it
+/// is applied to the project in whose file this run has seen its id (to
+/// each, if the run has seen the id in more than one). When the run has seen
+/// it in none, every project's notes file under the base is read for the id,
+/// and the line is refused only when none holds it. A note with the id of a tombstone line that was
+/// refused that way is then refused too, for the rest of the run, whatever
+/// its target: a forgotten note never comes out of an import live.
+///
+/// In a dry run ([`ImportRun::new`]) nothing is written, created or synced,
+/// and the outcomes are the ones the real run gives from the same files.
+/// `run` is the state of one run; end the run with [`ImportRun::finish`].
+///
+/// `Err` is for what is not the line's fault and should stop the run: an
+/// I/O error, or a target that is not a project key (the user-wide key is
+/// not one).
+pub fn import_line_in(
+    base: &Path,
+    line: &str,
+    target: ImportTarget<'_>,
+    run: &mut ImportRun,
+) -> Result<ImportedLine, MemoryError> {
+    if let ImportTarget::Project(key) = target {
+        ProjectScope::validate_repository_key(key)?;
+    }
+    let mut about = ImportedLine {
+        outcome: ImportOutcome::Refused(String::new()),
+        id: None,
+        project: None,
+        tombstone: false,
+    };
+    let outcome = match parse_import_line(line) {
+        Err(reason) => ImportOutcome::Refused(reason),
+        Ok(ImportLine::Tombstone(tombstone)) => {
+            about.tombstone = true;
+            import_tombstone(base, tombstone, target, run, &mut about)?
+        }
+        Ok(ImportLine::Note(note)) => import_note(base, *note, target, run, &mut about)?,
+    };
+    about.outcome = outcome;
+    Ok(about)
+}
+
+/// Why a note is refused after its tombstone line was.
+const UNFILED_TOMBSTONE: &str = "its tombstone in this run could not be filed";
+
+/// Why a tombstone line is refused as recorded.
+const UNPLACED_TOMBSTONE: &str = "a tombstone line names no project and no project's notes hold \
+                                  its id; pass --cwd or --project-key";
+
+fn refused(reason: &str) -> Result<ImportOutcome, MemoryError> {
+    Ok(ImportOutcome::Refused(reason.to_string()))
+}
+
+fn import_note(
+    base: &Path,
+    mut note: MemoryRecord,
+    target: ImportTarget<'_>,
+    run: &mut ImportRun,
+    about: &mut ImportedLine,
+) -> Result<ImportOutcome, MemoryError> {
+    let Some(id) = note.id.clone() else {
+        return refused("missing field id");
+    };
+    if !valid_import_id(&id) {
+        return refused("invalid id");
+    }
+    about.id = Some(id.clone());
+    if run.unfiled_tombstones.contains(&id) {
+        return refused(UNFILED_TOMBSTONE);
+    }
+    let Some(recorded) = note.project.clone() else {
+        return refused("missing field project");
+    };
+    if recorded != USER_WIDE_KEY && ProjectScope::validate_repository_key(&recorded).is_err() {
+        return refused("invalid project");
+    }
+    if note.namespace != project_namespace(&recorded) {
+        return refused("namespace is not project-<project>");
+    }
+    if note.content.len() > MAX_CONTENT_BYTES {
+        return refused(&format!("content is over {MAX_CONTENT_BYTES} bytes"));
+    }
+    let key = match target {
+        ImportTarget::Project(key) => {
+            note.project = Some(key.to_string());
+            note.namespace = project_namespace(key);
+            key.to_string()
+        }
+        ImportTarget::AsRecorded if recorded == USER_WIDE_KEY => {
+            return refused("user-wide note; pass --cwd to file it under a project");
+        }
+        ImportTarget::AsRecorded => recorded,
+    };
+    about.project = Some(key.clone());
+    let dry_run = run.dry_run;
+    let file = run.file(base, &key)?;
+    if file.tombstoned.contains(&id) {
+        return Ok(ImportOutcome::KeptForgotten);
+    }
+    if let Some(held) = file.notes.get(&id) {
+        if held.iter().any(|other| same_note(other, &note)) {
+            return Ok(ImportOutcome::AlreadyPresent);
+        }
+        return refused("id already holds a different note");
+    }
+    if !dry_run {
+        append_record(base, &note, false)?;
+        file.appended = true;
+    }
+    file.notes.insert(id, vec![note]);
+    Ok(ImportOutcome::Stored)
+}
+
+fn import_tombstone(
+    base: &Path,
+    tombstone: TombstoneLine,
+    target: ImportTarget<'_>,
+    run: &mut ImportRun,
+    about: &mut ImportedLine,
+) -> Result<ImportOutcome, MemoryError> {
+    if !valid_import_id(&tombstone.tombstone) {
+        return refused("invalid id");
+    }
+    about.id = Some(tombstone.tombstone.clone());
+    let keys = match target {
+        ImportTarget::Project(key) => vec![key.to_string()],
+        ImportTarget::AsRecorded => {
+            let mut keys = run.projects_holding(&tombstone.tombstone);
+            if keys.is_empty() {
+                // Not in a file this run has opened. The note may be in the
+                // file of a project no line of this run has named yet (an
+                // earlier run stored it): look in every project's file
+                // before saying that there is none.
+                run.read_every_project(base)?;
+                keys = run.projects_holding(&tombstone.tombstone);
+            }
+            keys
+        }
+    };
+    if keys.is_empty() {
+        run.unfiled_tombstones.insert(tombstone.tombstone);
+        return refused(UNPLACED_TOMBSTONE);
+    }
+    about.project = keys.first().cloned();
+    let dry_run = run.dry_run;
+    let (mut forgot, mut stored) = (false, false);
+    for key in &keys {
+        let file = run.file(base, key)?;
+        if file.tombstoned.contains(&tombstone.tombstone) {
+            continue;
+        }
+        if !dry_run {
+            append_tombstone(base, &project_namespace(key), &tombstone, false)?;
+            file.appended = true;
+        }
+        if file.notes.contains_key(&tombstone.tombstone) {
+            forgot = true;
+        } else {
+            stored = true;
+        }
+        file.tombstoned.insert(tombstone.tombstone.clone());
+    }
+    Ok(if forgot {
+        ImportOutcome::Forgotten
+    } else if stored {
+        ImportOutcome::Stored
+    } else {
+        ImportOutcome::AlreadyPresent
+    })
+}
+
+/// The store's check of a record id that did not come from the store itself
+/// (an imported line, `retention forget memory`): 1 to 128 bytes, no
+/// whitespace, no control characters. An id the store makes is `mem-` and a
+/// UUID; an imported one need not look like that.
+pub(crate) fn valid_import_id(id: &str) -> bool {
+    (1..=128).contains(&id.len()) && !id.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Whether two notes under one id are the same note: every field but the id
+/// and the project they are filed under.
+fn same_note(a: &MemoryRecord, b: &MemoryRecord) -> bool {
+    a.content == b.content
+        && a.tags == b.tags
+        && a.timestamp_ms == b.timestamp_ms
+        && a.provenance == b.provenance
+        && a.sensitivity == b.sensitivity
+        && a.retention == b.retention
+        && a.meta == b.meta
+}
+
+enum ImportLine {
+    Note(Box<MemoryRecord>),
+    Tombstone(TombstoneLine),
+}
+
+/// Read one line as a note or a tombstone line, or say why it is neither.
+fn parse_import_line(line: &str) -> Result<ImportLine, String> {
+    let object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(line).map_err(|e| match e.classify() {
+            serde_json::error::Category::Data => "not a JSON object".to_string(),
+            _ => format!("not JSON at column {}", e.column()),
+        })?;
+    if object.contains_key("tombstone") {
+        if let Some(extra) = object
+            .keys()
+            .find(|name| !["tombstone", "timestamp_ms"].contains(&name.as_str()))
+        {
+            return Err(unknown_field(extra));
+        }
+        return serde_json::from_str(line)
+            .map(ImportLine::Tombstone)
+            .map_err(|e| unread("tombstone line", &e));
+    }
+    if let Some(extra) = object
+        .keys()
+        .find(|name| !RECORD_FIELDS.contains(&name.as_str()))
+    {
+        return Err(unknown_field(extra));
+    }
+    // From the text, not from `object`: the record's own reader refuses a
+    // field given twice, where a JSON map keeps the last and says nothing.
+    let note: MemoryRecord = serde_json::from_str(line).map_err(|e| unread("note", &e))?;
+    // Nothing the line says may be missing from what would be written. This
+    // is what catches a field inside `provenance` that the record has no
+    // place for. A `null` says nothing and may go.
+    let kept = serde_json::to_value(&note)
+        .map(|kept| without_nulls(&kept))
+        .map_err(|_| "not a note".to_string())?;
+    for (name, value) in &object {
+        if !value.is_null() && kept.get(name) != Some(&without_nulls(value)) {
+            return Err(format!("{name} holds something a note cannot keep"));
+        }
+    }
+    Ok(ImportLine::Note(Box::new(note)))
+}
+
+/// The reason for a top-level key a line may not have. A key's name is text
+/// from the line like any value, so it is shown only when it looks like a
+/// field name (`[a-z_]{1,32}`), and not at all otherwise.
+fn unknown_field(name: &str) -> String {
+    let plain = (1..=32).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    if plain {
+        format!("unknown field {name}")
+    } else {
+        "unknown field".to_string()
+    }
+}
+
+/// Why serde did not read a line, without quoting the line. Its "missing
+/// field" and "duplicate field" messages name a field of the record and
+/// nothing else. Any other message can quote a value, so only the place is
+/// passed on.
+fn unread(what: &str, e: &serde_json::Error) -> String {
+    let message = e.to_string();
+    for kind in ["missing field", "duplicate field"] {
+        let name = message
+            .strip_prefix(kind)
+            .and_then(|rest| rest.split('`').nth(1));
+        if let Some(name) = name {
+            return format!("{kind} {name}");
+        }
+    }
+    format!("not a {what}: wrong value at column {}", e.column())
+}
+
+/// `value` without the object members that are `null`, at any depth.
+fn without_nulls(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .filter(|(_, member)| !member.is_null())
+                .map(|(name, member)| (name.clone(), without_nulls(member)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_nulls).collect()),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A folder's project key is the first 8 bytes of SHA-256 of its canonical path, as
+    /// hex after `p`. Notes files and archive folders on disk are named by it, so it
+    /// must never change: these are fixed values, not recomputed here.
+    #[test]
+    fn a_folder_maps_to_the_same_project_key_forever() {
+        for (path, key) in [
+            ("/fixed/project/root", "p6e2cb4c61e23315c"),
+            ("/home/haseeb", "pa465e6cee4a607a1"),
+        ] {
+            let scope = ProjectScope::for_canonical_root(PathBuf::from(path));
+            assert_eq!(scope.key(), key, "{path}");
+        }
+    }
 
     fn rec(ns: &str, ts: u64, content: &str, tags: Vec<&str>) -> MemoryRecord {
         MemoryRecord {
@@ -846,6 +1757,33 @@ mod tests {
         assert_eq!(got.len(), 2);
     }
 
+    /// A line that is not UTF-8 is skipped like one that does not parse. A
+    /// read error that will not go away ends the query with that error:
+    /// `lines` returns it again on every call, so a loop that skipped it
+    /// never ended.
+    #[test]
+    fn query_skips_a_line_that_is_not_utf8_and_stops_on_a_lasting_read_error() {
+        let tmp = TempDir::new().unwrap();
+        append_to(tmp.path(), &rec("ns", 1, "one", vec![])).unwrap();
+        let path = memory_dir_in(tmp.path()).join("ns.jsonl");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"content\":\"caf\xc3\n");
+        fs::write(&path, bytes).unwrap();
+        append_to(tmp.path(), &rec("ns", 2, "two", vec![])).unwrap();
+        let found = query_in(tmp.path(), "ns", &MemoryQuery::default()).unwrap();
+        let contents: Vec<&str> = found.iter().map(|r| r.content.as_str()).collect();
+        assert_eq!(contents, ["two", "one"]);
+
+        // A directory where the file should be opens, and every read of it
+        // fails the same way.
+        #[cfg(unix)]
+        {
+            fs::create_dir(memory_dir_in(tmp.path()).join("dir.jsonl")).unwrap();
+            let error = query_in(tmp.path(), "dir", &MemoryQuery::default()).unwrap_err();
+            assert!(matches!(error, MemoryError::Io(_)), "{error}");
+        }
+    }
+
     #[test]
     fn append_rejects_oversized_content() {
         let tmp = TempDir::new().unwrap();
@@ -902,6 +1840,1215 @@ mod tests {
         assert!(got.is_empty());
     }
 
+    // ─── Durable, whole-line appends ────────────────────────────────────────
+
+    fn project_scope(tmp: &TempDir) -> ProjectScope {
+        let root = tmp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        ProjectScope::for_root(&root).unwrap()
+    }
+
+    fn note(content: &str) -> NewMemoryRecord {
+        NewMemoryRecord {
+            content: content.to_string(),
+            tags: vec!["t".into()],
+            provenance: MemoryProvenance {
+                source: "model".into(),
+                session: None,
+            },
+            sensitivity: MemorySensitivity::Normal,
+            retention: MemoryRetention::Standard,
+        }
+    }
+
+    /// The write and sync calls this thread's appends made since the last
+    /// call, in order.
+    fn take_steps() -> Vec<&'static str> {
+        IO_STEPS.with(|steps| std::mem::take(&mut *steps.borrow_mut()))
+    }
+
+    /// What this shows: the ORDER of the calls a save makes. One write of the
+    /// line, then a sync of the file, then a sync of its directory (before
+    /// all of them, once, a sync of the folder `memory/` was just made in),
+    /// all before the call returns, and the same for
+    /// the line a forget appends. What it cannot show: that the bytes are on
+    /// the platter. A test cannot cut the power, and whether a sync reaches
+    /// the medium is up to the system and the disk.
+    #[test]
+    fn a_save_and_a_forget_are_synced_before_they_return() {
+        let tmp = TempDir::new().unwrap();
+        let scope = project_scope(&tmp);
+        take_steps();
+
+        let first = store_record_in(tmp.path(), &scope, note("first")).unwrap();
+        assert_eq!(
+            take_steps(),
+            ["sync dir", "write", "sync file", "sync dir"],
+            "the first save makes `memory/` and syncs the folder it is in; \
+             then the line, the file, and the file's directory"
+        );
+
+        store_record_in(tmp.path(), &scope, note("second")).unwrap();
+        assert_eq!(
+            take_steps(),
+            ["write", "sync file", "sync dir"],
+            "every save syncs the directory: that the file has bytes does not \
+             say its name is on disk"
+        );
+
+        forget_in(tmp.path(), &scope, first.id.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            take_steps(),
+            ["write", "sync file", "sync dir"],
+            "a tombstone line is synced like a note"
+        );
+
+        // The plain namespace path (the extension `memory.append` call).
+        append_to(tmp.path(), &rec("ns", 1, "x", vec![])).unwrap();
+        assert_eq!(take_steps(), ["write", "sync file", "sync dir"]);
+
+        // A file that is there but empty.
+        fs::write(memory_dir_in(tmp.path()).join("empty.jsonl"), "").unwrap();
+        append_to(tmp.path(), &rec("empty", 1, "x", vec![])).unwrap();
+        assert_eq!(take_steps(), ["write", "sync file", "sync dir"]);
+    }
+
+    /// When a sync fails after the line went in, the caller is told exactly
+    /// that, not "the save failed": the note (or the forget) is in the file
+    /// and every reader sees it. An error from before the write is not this
+    /// one.
+    #[test]
+    fn a_sync_that_fails_after_the_write_is_written_unconfirmed() {
+        struct Failing;
+        impl Failing {
+            fn step(name: &'static str) -> Self {
+                FAILING_STEP.with(|step| step.set(Some(name)));
+                Failing
+            }
+        }
+        impl Drop for Failing {
+            fn drop(&mut self) {
+                FAILING_STEP.with(|step| step.set(None));
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let scope = project_scope(&tmp);
+        let kept = store_record_in(base, &scope, note("kept")).unwrap();
+        let contents = || -> Vec<String> {
+            let live = load_live_project_records(base, &scope).unwrap();
+            live.into_iter().map(|record| record.content).collect()
+        };
+
+        for step in ["sync file", "sync dir"] {
+            let failing = Failing::step(step);
+            let error = store_record_in(base, &scope, note(step)).unwrap_err();
+            drop(failing);
+            // The error carries the id the note has in the file.
+            let live = load_live_project_records(base, &scope).unwrap();
+            let saved = live.iter().find(|r| r.content == step).unwrap();
+            let saved_id = saved.id.clone().unwrap();
+            assert!(
+                matches!(&error, MemoryError::WrittenUnconfirmed { id: Some(id), .. } if *id == saved_id),
+                "{error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.starts_with("written, but not confirmed on disk"), "{message}");
+            assert!(message.contains(&format!("{step} failed")), "{message}");
+            assert!(message.contains(&format!("fetch {saved_id} to check")), "{message}");
+        }
+        assert_eq!(contents(), ["kept", "sync file", "sync dir"], "both notes are there");
+
+        // A forget: the tombstone is in the file, and a second forget says
+        // not found, which is why the caller must be told.
+        let id = kept.id.as_deref().unwrap();
+        let failing = Failing::step("sync file");
+        let error = forget_in(base, &scope, id).unwrap_err();
+        drop(failing);
+        assert!(
+            matches!(&error, MemoryError::WrittenUnconfirmed { id: Some(got), .. } if got == id),
+            "{error:?}"
+        );
+        assert_eq!(contents(), ["sync file", "sync dir"]);
+        assert!(matches!(forget_in(base, &scope, id), Err(MemoryError::NotFound(_))));
+
+        // The plain namespace path (an extension's `memory.append`).
+        let failing = Failing::step("sync dir");
+        let error = append_to(base, &rec("ns", 1, "x", vec![])).unwrap_err();
+        drop(failing);
+        // A record without an id: there is none to name.
+        assert!(
+            matches!(error, MemoryError::WrittenUnconfirmed { id: None, .. }),
+            "{error}"
+        );
+        assert_eq!(query_in(base, "ns", &MemoryQuery::default()).unwrap().len(), 1);
+
+        // An import: its lines are written, and `finish` is where the sync
+        // fails.
+        let mut run = ImportRun::new(false);
+        let line = exported("mem-i", scope.key(), 1, "imported");
+        import(base, &line, ImportTarget::AsRecorded, &mut run);
+        let failing = Failing::step("sync file");
+        let error = run.finish().unwrap_err();
+        drop(failing);
+        assert!(
+            matches!(error, MemoryError::WrittenUnconfirmed { id: None, .. }),
+            "{error}"
+        );
+        assert_eq!(contents(), ["sync file", "sync dir", "imported"]);
+
+        // Before the write: the sync of the folder a new `memory/` is in,
+        // and a lock that is not had. Nothing was written, and the error
+        // does not say otherwise.
+        let fresh = TempDir::new().unwrap();
+        let failing = Failing::step("sync dir");
+        let error = append_to(fresh.path(), &rec("ns", 1, "x", vec![])).unwrap_err();
+        drop(failing);
+        assert!(matches!(error, MemoryError::Io(_)), "{error}");
+        assert!(!namespace_file(fresh.path(), "ns").exists());
+    }
+
+    /// `finish` tries every file and every directory even after a sync has
+    /// failed, and the error names the file whose sync failed first.
+    #[test]
+    fn finish_syncs_every_file_and_names_the_one_that_failed() {
+        let tmp = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let base = tmp.path();
+        let keys = [
+            project_scope(&tmp).key().to_string(),
+            project_scope(&other).key().to_string(),
+        ];
+        let mut run = ImportRun::new(false);
+        for (n, key) in keys.iter().enumerate() {
+            let line = exported(&format!("mem-{n}"), key, 1, "imported");
+            let imported = import(base, &line, ImportTarget::AsRecorded, &mut run);
+            assert_eq!(imported.outcome, ImportOutcome::Stored);
+        }
+        let mut paths: Vec<PathBuf> = keys
+            .iter()
+            .map(|key| namespace_file(base, &project_namespace(key)))
+            .collect();
+        paths.sort();
+
+        take_steps();
+        FAILING_STEP.with(|step| step.set(Some("sync file")));
+        let error = run.finish().unwrap_err();
+        FAILING_STEP.with(|step| step.set(None));
+        let syncs: Vec<&str> = take_steps()
+            .into_iter()
+            .filter(|step| step.starts_with("sync"))
+            .collect();
+        assert_eq!(syncs, ["sync file", "sync file", "sync dir"], "all tried");
+        assert!(
+            matches!(error, MemoryError::WrittenUnconfirmed { id: None, .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&paths[0].display().to_string()), "{message}");
+        assert!(!message.contains(&paths[1].display().to_string()), "{message}");
+    }
+
+    /// A save that cannot get the file's lock in time fails and writes
+    /// nothing: it never appends without the lock.
+    #[test]
+    fn a_save_that_cannot_get_the_lock_fails_and_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let scope = project_scope(&tmp);
+        store_record_in(tmp.path(), &scope, note("first")).unwrap();
+        let path = namespace_file(tmp.path(), &project_namespace(scope.key()));
+        let before = fs::read(&path).unwrap();
+
+        let held = lock_notes_file(&path).unwrap();
+        set_notes_lock_wait(Some(std::time::Duration::from_millis(60)));
+        let started = std::time::Instant::now();
+        let refused = store_record_in(tmp.path(), &scope, note("second")).unwrap_err();
+        // A file that is not there yet is not created either.
+        let other = append_to(tmp.path(), &rec("other", 1, "x", vec![]));
+        let _other_lock = lock_notes_file(&namespace_file(tmp.path(), "held")).unwrap();
+        let unborn = append_to(tmp.path(), &rec("held", 1, "x", vec![])).unwrap_err();
+        set_notes_lock_wait(None);
+
+        assert!(started.elapsed() >= std::time::Duration::from_millis(60));
+        let message = refused.to_string();
+        assert!(message.contains("is locked by another writer"), "{message}");
+        assert!(message.contains("nothing was written"), "{message}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        other.expect("another file's lock is free");
+        assert!(unborn.to_string().contains("held.jsonl is locked"));
+        assert!(!namespace_file(tmp.path(), "held").exists());
+
+        drop(held);
+        store_record_in(tmp.path(), &scope, note("second")).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+    }
+
+    /// A file opened for append that another writer shares, as far as a
+    /// writer can tell: every `write` lands at the end, whole. It takes at
+    /// most the scripted number of bytes per call, and after its first short
+    /// write the other writer appends `interloper`.
+    struct SharedAppendFile {
+        bytes: Vec<u8>,
+        accept: std::collections::VecDeque<usize>,
+        interloper: Option<String>,
+        calls: Vec<Vec<u8>>,
+    }
+
+    impl SharedAppendFile {
+        fn taking(accept: &[usize], interloper: Option<String>) -> Self {
+            Self {
+                bytes: Vec::new(),
+                accept: accept.iter().copied().collect(),
+                interloper,
+                calls: Vec::new(),
+            }
+        }
+
+        fn lines(&self) -> Vec<&str> {
+            std::str::from_utf8(&self.bytes).unwrap().lines().collect()
+        }
+    }
+
+    impl Write for SharedAppendFile {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = self.accept.pop_front().unwrap_or(buf.len()).min(buf.len());
+            self.calls.push(buf.to_vec());
+            self.bytes.extend_from_slice(&buf[..n]);
+            if n < buf.len() {
+                if let Some(other) = self.interloper.take() {
+                    self.bytes.extend_from_slice(other.as_bytes());
+                }
+            }
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const LINE: &str = r#"{"namespace":"ns","timestamp_ms":1,"content":"mine","tags":[]}"#;
+    const OTHER: &str = r#"{"namespace":"ns","timestamp_ms":2,"content":"theirs","tags":[]}"#;
+
+    #[test]
+    fn a_line_is_one_write_call() {
+        let mut file = SharedAppendFile::taking(&[], None);
+        write_whole_line(&mut file, LINE, false).unwrap();
+        assert_eq!(file.calls, [format!("{LINE}\n").into_bytes()]);
+
+        // The newline that ends a torn tail goes in the same call.
+        let mut file = SharedAppendFile::taking(&[], None);
+        write_whole_line(&mut file, LINE, true).unwrap();
+        assert_eq!(file.calls, [format!("\n{LINE}\n").into_bytes()]);
+    }
+
+    /// What this shows: after a short write the rest of the line is never
+    /// sent as a second call, so a line another writer appends in between
+    /// cannot end up inside this one. The writer is a script, not a file: a
+    /// real file gives a short write only when the disk or a quota is full,
+    /// which a hermetic test cannot arrange. What it cannot show: how a given
+    /// file system behaves at that point.
+    #[test]
+    fn a_short_write_is_abandoned_and_the_whole_line_written_again() {
+        // The other writer saw the torn tail and led with a newline.
+        let mut file = SharedAppendFile::taking(&[20], Some(format!("\n{OTHER}\n")));
+        write_whole_line(&mut file, LINE, false).unwrap();
+        assert_eq!(file.lines(), [&LINE[..20], OTHER, "", LINE]);
+        assert_eq!(
+            file.calls,
+            [format!("{LINE}\n").into_bytes(), format!("\n{LINE}\n").into_bytes()],
+            "each call carries the whole line; none carries a remainder"
+        );
+
+        // The other writer looked before the fragment was there and did not
+        // lead with a newline. Its line is lost on the fragment, which no
+        // writer can prevent without a lock; this writer's line is whole.
+        let mut file = SharedAppendFile::taking(&[20], Some(format!("{OTHER}\n")));
+        write_whole_line(&mut file, LINE, false).unwrap();
+        let merged = format!("{}{OTHER}", &LINE[..20]);
+        assert_eq!(file.lines(), [merged.as_str(), "", LINE]);
+
+        // Every reader keeps the good lines and skips the fragment.
+        for line in file.lines() {
+            let parsed = serde_json::from_str::<MemoryRecord>(line);
+            assert_eq!(parsed.is_ok(), line == LINE, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_that_cannot_go_in_one_write_is_an_error_not_a_split_line() {
+        // Every call is short: the save fails; it is never reported as done.
+        let mut file = SharedAppendFile::taking(&[5, 5, 5, 5, 5, 5], None);
+        let err = write_whole_line(&mut file, LINE, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(file.calls.len(), LINE_WRITE_ATTEMPTS);
+        assert!(
+            file.lines().iter().all(|line| line.len() <= 5),
+            "only fragments, each on a line of its own: {:?}",
+            file.lines()
+        );
+
+        // A writer that takes nothing fails the same way.
+        let mut file = SharedAppendFile::taking(&[0, 0, 0, 0], None);
+        assert!(write_whole_line(&mut file, LINE, false).is_err());
+        assert!(file.bytes.is_empty());
+    }
+
+    /// What this shows: on the machine and file system the test runs on,
+    /// writers that each open the file for append and start together do not
+    /// tear or lose each other's lines, for lines from a few bytes to several
+    /// pages. Threads with a handle each stand in for processes: the kernel
+    /// orders appends by file, not by who holds the handle. What it cannot
+    /// show: the same for every file system (a network one may not keep
+    /// append writes whole), or what happens when a write is short; the
+    /// scripted-writer tests above cover that.
+    #[test]
+    fn concurrent_appends_keep_every_line_whole_and_lose_none() {
+        const WRITERS: usize = 8;
+        const ROUNDS: usize = 24;
+        let tmp = TempDir::new().unwrap();
+        let scope = project_scope(&tmp);
+        let start = std::sync::Barrier::new(WRITERS);
+        let mut forgotten: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        std::thread::scope(|threads| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|writer| {
+                    let (base, scope, start) = (tmp.path(), &scope, &start);
+                    threads.spawn(move || {
+                        let (mut ids, mut errors) = (Vec::new(), Vec::new());
+                        for round in 0..ROUNDS {
+                            // 9 bytes to about 15 KiB, so some lines span
+                            // several pages.
+                            let pad = "x".repeat((round % 6) * 3_000);
+                            let content = format!("w{writer}-r{round}-{pad}");
+                            // Every writer comes to every round and none
+                            // panics in between: one that stopped early would
+                            // leave the others waiting here for good, and a
+                            // torn line would hang the test, not fail it.
+                            start.wait();
+                            let stored = match store_record_in(base, scope, note(&content)) {
+                                Ok(stored) => stored,
+                                Err(e) => {
+                                    errors.push(format!("save w{writer}-r{round}: {e}"));
+                                    continue;
+                                }
+                            };
+                            if round % 8 == 7 {
+                                let id = stored.id.unwrap_or_default();
+                                match forget_in(base, scope, &id) {
+                                    Ok(()) => ids.push(id),
+                                    Err(e) => errors.push(format!("forget w{writer}-r{round}: {e}")),
+                                }
+                            }
+                        }
+                        (ids, errors)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let (ids, errors) = handle.join().unwrap();
+                forgotten.extend(ids);
+                failures.extend(errors);
+            }
+        });
+        assert!(
+            failures.is_empty(),
+            "a save or a forget failed among concurrent writers: {failures:?}"
+        );
+
+        let raw = fs::read_to_string(namespace_file(tmp.path(), &scope.namespace())).unwrap();
+        assert!(raw.ends_with('\n'));
+        let mut contents = std::collections::HashSet::new();
+        let mut tombstones = std::collections::HashSet::new();
+        for line in raw.lines().filter(|line| !line.is_empty()) {
+            if let Ok(tomb) = serde_json::from_str::<TombstoneLine>(line) {
+                assert!(tombstones.insert(tomb.tombstone), "a tombstone twice");
+                continue;
+            }
+            let record: MemoryRecord = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("a line does not parse ({e}): {:.80}", line));
+            let head: String = record.content.chars().take(12).collect();
+            assert!(contents.insert(record.content), "a note twice: {head}");
+        }
+        assert_eq!(contents.len(), WRITERS * ROUNDS, "no note is lost");
+        for writer in 0..WRITERS {
+            for round in 0..ROUNDS {
+                let pad = "x".repeat((round % 6) * 3_000);
+                assert!(contents.contains(&format!("w{writer}-r{round}-{pad}")));
+            }
+        }
+        assert_eq!(forgotten.len(), WRITERS * ROUNDS / 8);
+        assert_eq!(
+            tombstones,
+            forgotten.iter().cloned().collect(),
+            "no tombstone is lost"
+        );
+        let live = load_live_project_records(tmp.path(), &scope).unwrap();
+        assert_eq!(live.len(), WRITERS * ROUNDS - forgotten.len());
+    }
+
+    // ─── The torn last line ─────────────────────────────────────────────────
+
+    /// What this shows: what the next append does with a last line that a
+    /// dead writer left unfinished, cut inside a multi-byte character. No
+    /// byte before the tear changes, the fragment ends up alone on a line
+    /// every reader skips, and the new note is whole. The tear is made by
+    /// writing the file, not by killing a process mid-write.
+    #[test]
+    fn a_torn_last_line_is_fenced_off_and_no_good_line_is_touched() {
+        let tmp = TempDir::new().unwrap();
+        let scope = project_scope(&tmp);
+        let kept = store_record_in(tmp.path(), &scope, note("kept")).unwrap();
+        let path = namespace_file(tmp.path(), &scope.namespace());
+        let before = fs::read(&path).unwrap();
+
+        let mut whole = MemoryRecord {
+            content: "caf\u{e9}".into(),
+            ..kept.clone()
+        };
+        whole.id = Some("mem-torn".into());
+        let torn_line = serde_json::to_string(&whole).unwrap();
+        let cut = torn_line.find('\u{e9}').unwrap() + 1;
+        let fragment = &torn_line.as_bytes()[..cut];
+        assert!(std::str::from_utf8(fragment).is_err(), "cut inside a character");
+        let mut torn = before.clone();
+        torn.extend_from_slice(fragment);
+        fs::write(&path, &torn).unwrap();
+
+        let after = store_record_in(tmp.path(), &scope, note("after the tear")).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&torn), "nothing before the append changed");
+        let mut expected = torn.clone();
+        expected.push(b'\n');
+        expected.extend_from_slice(serde_json::to_string(&after).unwrap().as_bytes());
+        expected.push(b'\n');
+        assert_eq!(bytes, expected, "fragment, newline, the new line, newline");
+
+        let live = load_live_project_records(tmp.path(), &scope).unwrap();
+        assert_eq!(live, [kept.clone(), after.clone()]);
+        let ids = [kept.id.as_deref().unwrap(), after.id.as_deref().unwrap()];
+        assert_eq!(fetch_exact_in(tmp.path(), &scope, &ids).unwrap().len(), 2);
+        assert_eq!(
+            query_in(tmp.path(), &scope.namespace(), &MemoryQuery::default())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// A last line that is complete but for its newline is a good line. The
+    /// next append ends it; it is neither dropped nor run into the new one.
+    #[test]
+    fn a_last_line_missing_only_its_newline_is_kept() {
+        let tmp = TempDir::new().unwrap();
+        let scope = project_scope(&tmp);
+        let first = store_record_in(tmp.path(), &scope, note("first")).unwrap();
+        let path = namespace_file(tmp.path(), &scope.namespace());
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&path, bytes).unwrap();
+
+        let second = store_record_in(tmp.path(), &scope, note("second")).unwrap();
+
+        let live = load_live_project_records(tmp.path(), &scope).unwrap();
+        assert_eq!(live, [first, second]);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 2, "no empty line, nothing merged");
+    }
+
+    // ─── Import from another store (cut-spec A3) ───────────────────────────────────
+
+    /// A note line as another store exports it, with all ten fields.
+    fn exported(id: &str, project: &str, timestamp_ms: u64, content: &str) -> String {
+        serde_json::json!({
+            "namespace": format!("project-{project}"),
+            "timestamp_ms": timestamp_ms,
+            "content": content,
+            "tags": ["imported", "@user"],
+            "meta": {"_synaps_repository": {"source_worktree_root": "/elsewhere"}, "blank": null},
+            "id": id,
+            "project": project,
+            "provenance": {"source": "model", "session": "sess-old"},
+            "sensitivity": "sensitive",
+            "retention": {"max_age_days": 30},
+        })
+        .to_string()
+    }
+
+    fn import(
+        base: &Path,
+        line: &str,
+        target: ImportTarget<'_>,
+        run: &mut ImportRun,
+    ) -> ImportedLine {
+        import_line_in(base, line, target, run).unwrap()
+    }
+
+    fn refusal(imported: &ImportedLine) -> &str {
+        match &imported.outcome {
+            ImportOutcome::Refused(reason) => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// cut-spec T-A10.
+    #[test]
+    fn import_notes_t_a10() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let scope = project_scope(&tmp);
+        let key = scope.key().to_string();
+        let here = ImportTarget::Project(&key);
+        let path = namespace_file(base, &scope.namespace());
+
+        // A file with 3 notes; import 8 more.
+        let old: Vec<String> = (0..3)
+            .map(|i| {
+                let stored = store_record_in(base, &scope, note(&format!("old note {i}")));
+                stored.unwrap().id.unwrap()
+            })
+            .collect();
+        let lines: Vec<String> = (0..8u64)
+            .map(|i| exported(&format!("mem-new-{i}"), &key, 1_000 + i, &format!("new note {i}")))
+            .collect();
+        let mut run = ImportRun::new(false);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(
+                import(base, line, ImportTarget::AsRecorded, &mut run),
+                ImportedLine {
+                    outcome: ImportOutcome::Stored,
+                    id: Some(format!("mem-new-{i}")),
+                    project: Some(key.clone()),
+                    tombstone: false,
+                }
+            );
+        }
+        assert_eq!(run.finish().unwrap(), std::slice::from_ref(&path));
+
+        // 11 live; search and fetch find old and new.
+        assert_eq!(load_live_project_records(base, &scope).unwrap().len(), 11);
+        let search = |needle: &str| {
+            let query = ProjectMemoryQuery {
+                content_contains: Some(needle.into()),
+                limit: Some(MAX_SEARCH_LIMIT),
+                ..Default::default()
+            };
+            search_project_in(base, &scope, &query).unwrap().len()
+        };
+        assert_eq!(
+            (search("note"), search("old note"), search("new note")),
+            (11, 3, 8)
+        );
+        let mut ids = old.clone();
+        ids.extend((0..8).map(|i| format!("mem-new-{i}")));
+        let wanted: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let fetched = fetch_exact_in(base, &scope, &wanted).unwrap();
+        assert_eq!(fetched.len(), 11);
+        // An imported note is its line: every field, and the time it came with.
+        for (line, stored) in lines.iter().zip(&fetched[3..]) {
+            assert_eq!(
+                serde_json::to_value(stored).unwrap(),
+                serde_json::from_str::<serde_json::Value>(line).unwrap()
+            );
+        }
+
+        // Import again: 8 already_present, file bytes unchanged.
+        let before = fs::read(&path).unwrap();
+        let mut again = ImportRun::new(false);
+        for line in &lines {
+            assert_eq!(
+                import(base, line, ImportTarget::AsRecorded, &mut again).outcome,
+                ImportOutcome::AlreadyPresent
+            );
+        }
+        // A line with a known id and other content is refused.
+        let changed = exported("mem-new-3", &key, 1_003, "another text");
+        assert_eq!(
+            refusal(&import(base, &changed, here, &mut again)),
+            "id already holds a different note"
+        );
+        assert!(again.finish().unwrap().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        // A tombstoned id is kept_forgotten.
+        forget_in(base, &scope, "mem-new-5").unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut run = ImportRun::new(false);
+        assert_eq!(
+            import(base, &lines[5], here, &mut run).outcome,
+            ImportOutcome::KeptForgotten
+        );
+
+        // A line with an extra field is refused.
+        let extra = lines[0].replacen('{', r#"{"colour":"red","#, 1);
+        assert_eq!(
+            refusal(&import(base, &extra, here, &mut run)),
+            "unknown field colour"
+        );
+
+        // The user-wide key is refused: as a line's own project, and as the
+        // project to file under.
+        let user_wide = exported("mem-user", USER_WIDE_KEY, 3_000, "a user-wide note");
+        assert_eq!(
+            refusal(&import(base, &user_wide, ImportTarget::AsRecorded, &mut run)),
+            "user-wide note; pass --cwd to file it under a project"
+        );
+        let to_user_wide = ImportTarget::Project(USER_WIDE_KEY);
+        let err = import_line_in(base, &lines[0], to_user_wide, &mut run).unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidProjectRoot(_)), "{err}");
+
+        assert!(run.finish().unwrap().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), before, "none of these wrote");
+        assert_eq!(list_namespaces_in(base).unwrap(), [scope.namespace()]);
+        let mut run = ImportRun::new(false);
+
+        // A tombstone line before its note keeps the note out.
+        let tombstone = r#"{"tombstone":"mem-late","timestamp_ms":77}"#;
+        let late = exported("mem-late", &key, 2_000, "forgotten before it came");
+        let first = import(base, tombstone, here, &mut run);
+        assert_eq!(
+            (first.outcome, first.tombstone),
+            (ImportOutcome::Stored, true)
+        );
+        assert_eq!(
+            import(base, &late, here, &mut run).outcome,
+            ImportOutcome::KeptForgotten
+        );
+        run.finish().unwrap();
+        let mut run = ImportRun::new(false);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().lines().last(),
+            Some(tombstone),
+            "the tombstone is stored with the time it came with"
+        );
+        assert!(matches!(
+            fetch_exact_in(base, &scope, &["mem-late"]),
+            Err(MemoryError::NotFound(_))
+        ));
+        // In a later run too.
+        assert_eq!(
+            import(base, &late, here, &mut ImportRun::new(false)).outcome,
+            ImportOutcome::KeptForgotten
+        );
+
+        // Re-homing rewrites `project` and `namespace`, and nothing else.
+        let elsewhere = "pc4d9f8d15dc3bd8f";
+        let moved = exported("mem-moved", elsewhere, 4_000, "from another project");
+        let imported = import(base, &moved, here, &mut run);
+        assert_eq!(
+            (imported.outcome, imported.project),
+            (ImportOutcome::Stored, Some(key.clone()))
+        );
+        let stored = fetch_exact_in(base, &scope, &["mem-moved"]).unwrap().remove(0);
+        let mut expected: MemoryRecord = serde_json::from_str(&moved).unwrap();
+        expected.project = Some(key.clone());
+        expected.namespace = scope.namespace();
+        assert_eq!(stored, expected);
+        assert!(!namespace_file(base, &project_namespace(elsewhere)).exists());
+
+        // A user-wide note is filed under a project when one is named.
+        assert_eq!(
+            import(base, &user_wide, here, &mut run).outcome,
+            ImportOutcome::Stored
+        );
+        let filed = fetch_exact_in(base, &scope, &["mem-user"]).unwrap().remove(0);
+        assert_eq!(filed.project.as_deref(), Some(key.as_str()));
+        assert_eq!(filed.namespace, scope.namespace());
+        run.finish().unwrap();
+    }
+
+    /// What this shows: with `dry_run` no byte of the store changes and no
+    /// file or directory appears, and the outcomes are, line for line, those
+    /// of the real run made next from the same files. It cannot show the
+    /// same for a store that another process changes between the two runs.
+    #[test]
+    fn a_dry_run_changes_no_byte_and_says_what_the_real_run_then_does() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let scope = project_scope(&tmp);
+        let key = scope.key().to_string();
+        let here = ImportTarget::Project(&key);
+        let path = namespace_file(base, &scope.namespace());
+
+        // In the file: a live note and a forgotten one.
+        let mut setup = ImportRun::new(false);
+        for id in ["mem-live", "mem-gone"] {
+            import(base, &exported(id, &key, 10, "there before"), here, &mut setup);
+        }
+        setup.finish().unwrap();
+        forget_in(base, &scope, "mem-gone").unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let lines = [
+            exported("mem-a", &key, 20, "new"),
+            exported("mem-a", &key, 20, "new"),
+            exported("mem-a", &key, 20, "not the same"),
+            exported("mem-live", &key, 10, "there before"),
+            exported("mem-gone", &key, 10, "there before"),
+            r#"{"tombstone":"mem-live","timestamp_ms":30}"#.to_string(),
+            r#"{"tombstone":"mem-live","timestamp_ms":31}"#.to_string(),
+            exported("mem-live", &key, 10, "there before"),
+            r#"{"tombstone":"mem-never","timestamp_ms":32}"#.to_string(),
+            exported("mem-never", &key, 40, "comes after its tombstone"),
+            "not json".to_string(),
+        ];
+        let expected = [
+            "stored",
+            "already_present",
+            "refused",
+            "already_present",
+            "kept_forgotten",
+            "forgotten",
+            "already_present",
+            "kept_forgotten",
+            "stored",
+            "kept_forgotten",
+            "refused",
+        ];
+        let run_all = |dry_run: bool| -> Vec<ImportedLine> {
+            let mut run = ImportRun::new(dry_run);
+            assert_eq!(run.is_dry_run(), dry_run);
+            let all: Vec<ImportedLine> = lines
+                .iter()
+                .map(|line| import_line_in(base, line, here, &mut run).unwrap())
+                .collect();
+            assert_eq!(run.finish().unwrap().is_empty(), dry_run);
+            all
+        };
+
+        take_steps();
+        let dry = run_all(true);
+        assert!(take_steps().is_empty(), "a dry run writes and syncs nothing");
+        assert_eq!(fs::read(&path).unwrap(), before, "byte for byte");
+        assert_eq!(list_namespaces_in(base).unwrap(), [scope.namespace()]);
+        let names: Vec<&str> = dry.iter().map(|line| line.outcome.name()).collect();
+        assert_eq!(names, expected);
+
+        let real = run_all(false);
+        assert_eq!(real, dry, "the real run does what the dry run said");
+        let live = load_live_project_records(base, &scope).unwrap();
+        let ids: Vec<&str> = live.iter().filter_map(|r| r.id.as_deref()).collect();
+        assert_eq!(ids, ["mem-a"], "and the file agrees");
+
+        // Where there is no store yet, a dry run makes none.
+        let empty = TempDir::new().unwrap();
+        let mut run = ImportRun::new(true);
+        let imported = import_line_in(empty.path(), &lines[0], here, &mut run).unwrap();
+        assert_eq!(imported.outcome, ImportOutcome::Stored);
+        assert!(run.finish().unwrap().is_empty());
+        assert_eq!(fs::read_dir(empty.path()).unwrap().count(), 0);
+    }
+
+    /// A run cannot be a preview and then an import: the mode is fixed when
+    /// the run is made, so the import after a preview is a new run, reads
+    /// the files again and stores what the preview only said it would.
+    #[test]
+    fn a_preview_and_the_import_after_it_are_two_runs() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let key = "p1111111111111111";
+        let line = exported("mem-a", key, 1, "x");
+        for dry_run in [true, true, false] {
+            let mut run = ImportRun::new(dry_run);
+            let first = import(base, &line, ImportTarget::AsRecorded, &mut run);
+            assert_eq!(first.outcome, ImportOutcome::Stored, "dry_run {dry_run}");
+            // Within one run the line is known, in a dry run too.
+            let again = import(base, &line, ImportTarget::AsRecorded, &mut run);
+            assert_eq!(again.outcome, ImportOutcome::AlreadyPresent);
+            assert_eq!(run.finish().unwrap().len(), usize::from(!dry_run));
+        }
+        let text = fs::read_to_string(namespace_file(base, &project_namespace(key))).unwrap();
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    /// A real run that is dropped without `finish` (an early return) still
+    /// syncs what it appended; a dry run and a run that stored nothing sync
+    /// nothing.
+    #[test]
+    fn a_run_dropped_unfinished_still_syncs_what_it_appended() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let key = "p1111111111111111";
+        take_steps();
+        {
+            let mut run = ImportRun::new(false);
+            import(base, &exported("mem-a", key, 1, "x"), ImportTarget::AsRecorded, &mut run);
+            assert_eq!(take_steps(), ["sync dir", "write"]);
+        }
+        assert_eq!(take_steps(), ["sync file", "sync dir"], "synced on drop");
+        {
+            let mut run = ImportRun::new(false);
+            import(base, &exported("mem-a", key, 1, "x"), ImportTarget::AsRecorded, &mut run);
+            let mut dry = ImportRun::new(true);
+            import(base, &exported("mem-b", key, 1, "x"), ImportTarget::AsRecorded, &mut dry);
+        }
+        assert!(take_steps().is_empty(), "nothing appended, nothing synced");
+        // A finished run is not synced a second time when it goes.
+        let mut run = ImportRun::new(false);
+        import(base, &exported("mem-c", key, 1, "x"), ImportTarget::AsRecorded, &mut run);
+        run.finish().unwrap();
+        assert_eq!(take_steps(), ["write", "sync file", "sync dir"]);
+    }
+
+    /// What this shows: the order of calls. An import's lines are written
+    /// without a sync each, and `ImportRun::sync` then syncs every file the
+    /// run appended to, once, and their directory after them. As for a save,
+    /// it cannot show that the bytes reached the disk.
+    #[test]
+    fn an_import_syncs_each_file_once_at_the_end_of_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let (a, b) = ("p1111111111111111", "p2222222222222222");
+        let mut run = ImportRun::new(false);
+        take_steps();
+        for (i, project) in [a, a, b, a].into_iter().enumerate() {
+            let line = exported(&format!("mem-{i}"), project, i as u64, "x");
+            assert_eq!(
+                import(base, &line, ImportTarget::AsRecorded, &mut run).outcome,
+                ImportOutcome::Stored
+            );
+        }
+        let tombstone = r#"{"tombstone":"mem-0","timestamp_ms":9}"#;
+        assert_eq!(
+            import(base, tombstone, ImportTarget::Project(a), &mut run).outcome,
+            ImportOutcome::Forgotten
+        );
+        assert_eq!(
+            take_steps(),
+            ["sync dir", "write", "write", "write", "write", "write"],
+            "the folder the new `memory/` is in, then five lines and no sync yet"
+        );
+
+        let files = [a, b].map(|key| namespace_file(base, &project_namespace(key)));
+        assert_eq!(run.finish().unwrap(), files);
+        assert_eq!(take_steps(), ["sync file", "sync file", "sync dir"]);
+    }
+
+    #[test]
+    fn a_line_that_could_not_be_kept_whole_is_refused_and_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let key = "p1111111111111111";
+        let good = exported("mem-x", key, 5, "secret words");
+        let with = |from: &str, to: &str| {
+            assert!(good.contains(from), "{from}");
+            good.replacen(from, to, 1)
+        };
+        let long_id = format!(r#""id":"{}""#, "i".repeat(129));
+        let big = format!(r#""content":"{}""#, "c".repeat(MAX_CONTENT_BYTES + 1));
+        let long_key = format!(r#"{{"{}":1,"content""#, "secret".repeat(6));
+        let wrong_value = "not a note: wrong value at column ";
+        let cases: Vec<(String, &str)> = vec![
+            // A time is never made up.
+            (with(r#","timestamp_ms":5"#, ""), "missing field timestamp_ms"),
+            (with(r#""timestamp_ms":5"#, r#""timestamp_ms":"5""#), wrong_value),
+            // Nothing is dropped: not a field, not a part of one, not a
+            // second copy of one.
+            (with(r#"{"content""#, r#"{"extra":1,"content""#), "unknown field extra"),
+            // A key is text from the line too: one that does not look like a
+            // field name is not shown.
+            (with(r#"{"content""#, r#"{"secret words":1,"content""#), "unknown field"),
+            (with(r#"{"content""#, r#"{"Secret":1,"content""#), "unknown field"),
+            (with(r#"{"content""#, r#"{"secret-token-1234":1,"content""#), "unknown field"),
+            (with(r#"{"content""#, &long_key), "unknown field"),
+            (with(r#"{"content""#, r#"{"":1,"content""#), "unknown field"),
+            (
+                r#"{"tombstone":"mem-x","timestamp_ms":1,"secret words":2}"#.to_string(),
+                "unknown field",
+            ),
+            (
+                with(r#""source":"model""#, r#""source":"model","host":"x""#),
+                "provenance holds something a note cannot keep",
+            ),
+            (
+                with(r#"{"content""#, r#"{"content":"first","content""#),
+                "duplicate field content",
+            ),
+            (with(r#""retention":{"max_age_days":30}"#, r#""retention":"forever""#), wrong_value),
+            (with(r#""id":"mem-x","#, ""), "missing field id"),
+            (with(r#""id":"mem-x""#, r#""id":"mem x""#), "invalid id"),
+            (with(r#""id":"mem-x""#, r#""id":"""#), "invalid id"),
+            (with(r#""id":"mem-x""#, &long_id), "invalid id"),
+            (with(r#""project":"p1111111111111111","#, ""), "missing field project"),
+            (
+                with(r#""project":"p1111111111111111""#, r#""project":"P1111111111111111""#),
+                "invalid project",
+            ),
+            (
+                with(r#""namespace":"project-p1111111111111111""#, r#""namespace":"notes""#),
+                "namespace is not project-<project>",
+            ),
+            (with(r#""content":"secret words""#, &big), "content is over 16384 bytes"),
+            (r#"{"content":"secret words""#.to_string(), "not JSON at column "),
+            (r#"["secret words"]"#.to_string(), "not a JSON object"),
+            (r#""secret words""#.to_string(), "not a JSON object"),
+            // Tombstone lines.
+            (
+                r#"{"tombstone":"mem-x","timestamp_ms":1,"content":"secret words"}"#.to_string(),
+                "unknown field content",
+            ),
+            (r#"{"tombstone":"mem-x"}"#.to_string(), "missing field timestamp_ms"),
+            (
+                r#"{"tombstone":"mem-gone","timestamp_ms":1}"#.to_string(),
+                "a tombstone line names no project and no project's notes hold its id; \
+                 pass --cwd or --project-key",
+            ),
+        ];
+        let mut run = ImportRun::new(false);
+        for (line, expected) in &cases {
+            let imported = import(base, line, ImportTarget::AsRecorded, &mut run);
+            let reason = refusal(&imported);
+            assert_eq!(
+                reason.trim_end_matches(|c: char| c.is_ascii_digit()),
+                *expected,
+                "{line:.70}"
+            );
+            let quoted = reason.to_lowercase().contains("secret");
+            assert!(!quoted, "a reason quotes nothing: {reason}");
+        }
+        assert!(!memory_dir_in(base).exists(), "a refused line writes nothing");
+
+        // The line they were all made from is a good one.
+        assert_eq!(
+            import(base, &good, ImportTarget::AsRecorded, &mut run).outcome,
+            ImportOutcome::Stored
+        );
+        assert_eq!(run.finish().unwrap().len(), 1);
+    }
+
+    /// A tombstone line as recorded whose note an earlier run stored, in a
+    /// file no line of this run has named: every project's file is read for
+    /// the id before the line is refused (core-a5-review, finding 1).
+    #[test]
+    fn a_tombstone_as_recorded_finds_its_note_in_a_file_the_run_has_not_opened() {
+        let (a, b) = ("p1111111111111111", "p2222222222222222");
+        let as_recorded = ImportTarget::AsRecorded;
+        let tombstone = |id: &str| format!(r#"{{"tombstone":"{id}","timestamp_ms":9}}"#);
+        let file = |base: &Path, key: &str| namespace_file(base, &project_namespace(key));
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let mut run = ImportRun::new(false);
+        for (id, key) in [("mem-1", a), ("mem-5", b)] {
+            let stored = import(base, &exported(id, key, 1, "x"), as_recorded, &mut run);
+            assert_eq!(stored.outcome, ImportOutcome::Stored);
+        }
+        let _ = run.finish().unwrap();
+        // Not notes files of a project: none of these is read for an id.
+        let memory = memory_dir_in(base);
+        fs::write(memory.join("project-p0000000000000000.jsonl"), exported("mem-u", a, 1, "x"))
+            .unwrap();
+        fs::write(memory.join("session-notes.jsonl"), "not a note\n").unwrap();
+        fs::write(memory.join(".import.lock"), "").unwrap();
+
+        // The dry run says what the real run says and writes nothing.
+        for dry_run in [true, false] {
+            let before = fs::read_to_string(file(base, a)).unwrap();
+            let mut run = ImportRun::new(dry_run);
+            let late = import(base, &tombstone("mem-1"), as_recorded, &mut run);
+            assert_eq!(
+                (late.outcome, late.project.as_deref()),
+                (ImportOutcome::Forgotten, Some(a)),
+                "dry run {dry_run}"
+            );
+            // An id that no project's file holds is still refused, and so is
+            // one that only a file of no project holds.
+            for id in ["mem-nowhere", "mem-u"] {
+                let nowhere = import(base, &tombstone(id), as_recorded, &mut run);
+                assert_eq!(refusal(&nowhere), UNPLACED_TOMBSTONE, "{id}");
+            }
+            let files = run.finish().unwrap();
+            let text = fs::read_to_string(file(base, a)).unwrap();
+            if dry_run {
+                assert!(files.is_empty());
+                assert_eq!(text, before);
+            } else {
+                assert_eq!(files, [file(base, a)]);
+                assert_eq!(text.lines().last(), Some(tombstone("mem-1").as_str()));
+                assert!(!fs::read_to_string(file(base, b)).unwrap().contains("tombstone"));
+            }
+        }
+        // Again: it is there.
+        let mut run = ImportRun::new(false);
+        assert_eq!(
+            import(base, &tombstone("mem-1"), as_recorded, &mut run).outcome,
+            ImportOutcome::AlreadyPresent
+        );
+        assert!(run.finish().unwrap().is_empty());
+    }
+
+    /// A tombstone line as recorded, in both orders, and the refused case
+    /// (cut-spec A3, "The one change to the built code").
+    #[test]
+    fn a_tombstone_as_recorded_is_filed_where_the_run_saw_its_id_or_keeps_its_note_out() {
+        let (a, b) = ("p1111111111111111", "p2222222222222222");
+        let as_recorded = ImportTarget::AsRecorded;
+        let tombstone = |id: &str| format!(r#"{{"tombstone":"{id}","timestamp_ms":9}}"#);
+        let file = |base: &Path, key: &str| namespace_file(base, &project_namespace(key));
+        let live = |base: &Path, key: &str| -> Vec<String> {
+            let scanned = scan_project_file(base, key).unwrap();
+            let mut ids: Vec<String> = scanned
+                .records
+                .iter()
+                .filter_map(|record| record.id.clone())
+                .filter(|id| !scanned.tombstoned.contains(id))
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        for dry_run in [true, false] {
+            // Note before tombstone: the run has seen the id in project a's
+            // file, so the tombstone is filed there.
+            let tmp = TempDir::new().unwrap();
+            let base = tmp.path();
+            let mut run = ImportRun::new(dry_run);
+            for (id, key) in [("mem-1", a), ("mem-2", a), ("mem-3", b)] {
+                import(base, &exported(id, key, 1, "x"), as_recorded, &mut run);
+            }
+            let forgotten = import(base, &tombstone("mem-1"), as_recorded, &mut run);
+            assert_eq!(
+                forgotten,
+                ImportedLine {
+                    outcome: ImportOutcome::Forgotten,
+                    id: Some("mem-1".into()),
+                    project: Some(a.into()),
+                    tombstone: true,
+                }
+            );
+            // The same tombstone again, and the note again.
+            assert_eq!(
+                import(base, &tombstone("mem-1"), as_recorded, &mut run).outcome,
+                ImportOutcome::AlreadyPresent
+            );
+            assert_eq!(
+                import(base, &exported("mem-1", a, 1, "x"), as_recorded, &mut run).outcome,
+                ImportOutcome::KeptForgotten
+            );
+
+            // Tombstone before note: the run has not seen the id, so there
+            // is no project to file it under. Both lines are refused.
+            let refused = import(base, &tombstone("mem-9"), as_recorded, &mut run);
+            assert_eq!(
+                refusal(&refused),
+                "a tombstone line names no project and no project's notes hold its id; \
+                 pass --cwd or --project-key"
+            );
+            assert_eq!((refused.id.as_deref(), refused.project), (Some("mem-9"), None));
+            let late = import(base, &exported("mem-9", a, 1, "x"), as_recorded, &mut run);
+            assert_eq!(refusal(&late), "its tombstone in this run could not be filed");
+            // Under a named project too: the run cannot tell that this is
+            // not the note the tombstone forgot.
+            let late = import(base, &exported("mem-9", a, 1, "x"), ImportTarget::Project(b), &mut run);
+            assert_eq!(refusal(&late), "its tombstone in this run could not be filed");
+            // Other notes go on as before.
+            assert_eq!(
+                import(base, &exported("mem-4", b, 1, "x"), as_recorded, &mut run).outcome,
+                ImportOutcome::Stored
+            );
+
+            let files = run.finish().unwrap();
+            if dry_run {
+                assert!(files.is_empty());
+                assert!(!memory_dir_in(base).exists(), "a dry run writes nothing");
+                continue;
+            }
+            assert_eq!(files, [file(base, a), file(base, b)]);
+            assert_eq!(live(base, a), ["mem-2"]);
+            assert_eq!(live(base, b), ["mem-3", "mem-4"]);
+            let text = fs::read_to_string(file(base, a)).unwrap();
+            assert_eq!(text.lines().last(), Some(tombstone("mem-1").as_str()));
+            assert_eq!(text.matches("tombstone").count(), 1);
+            assert!(!text.contains("mem-9"));
+            assert!(!fs::read_to_string(file(base, b)).unwrap().contains("mem-9"));
+        }
+
+        // Tombstone then note, as recorded, in a store with nothing in it:
+        // both refused, nothing written (the spec's one test).
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let mut run = ImportRun::new(false);
+        let first = import(base, &tombstone("mem-1"), as_recorded, &mut run);
+        let second = import(base, &exported("mem-1", a, 1, "x"), as_recorded, &mut run);
+        assert_eq!(first.outcome.name(), "refused");
+        assert_eq!(refusal(&second), "its tombstone in this run could not be filed");
+        assert!(run.finish().unwrap().is_empty());
+        assert!(!memory_dir_in(base).exists());
+        // The refusal belongs to the run: a new run stores the note.
+        let mut run = ImportRun::new(false);
+        assert_eq!(
+            import(base, &exported("mem-1", a, 1, "x"), as_recorded, &mut run).outcome,
+            ImportOutcome::Stored
+        );
+
+        // An id the run has seen in two projects' files (a note filed twice)
+        // is forgotten in both.
+        let again = exported("mem-1", a, 1, "x");
+        assert_eq!(
+            import(base, &again, ImportTarget::Project(b), &mut run).outcome,
+            ImportOutcome::Stored
+        );
+        let both = import(base, &tombstone("mem-1"), as_recorded, &mut run);
+        assert_eq!(
+            (both.outcome, both.project.as_deref()),
+            (ImportOutcome::Forgotten, Some(a))
+        );
+        run.finish().unwrap();
+        assert!(live(base, a).is_empty() && live(base, b).is_empty());
+
+        // A note that is in a file from an earlier run is seen once a line
+        // of this run is judged against that file.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let mut earlier = ImportRun::new(false);
+        import(base, &exported("mem-1", a, 1, "x"), as_recorded, &mut earlier);
+        earlier.finish().unwrap();
+        let mut run = ImportRun::new(false);
+        assert_eq!(
+            import(base, &exported("mem-1", a, 1, "x"), as_recorded, &mut run).outcome,
+            ImportOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            import(base, &tombstone("mem-1"), as_recorded, &mut run).outcome,
+            ImportOutcome::Forgotten
+        );
+        run.finish().unwrap();
+        assert!(live(base, a).is_empty());
+    }
+
+    /// A `null` and an absent field say the same, and absent `tags` are no
+    /// tags: such a line is kept, as the record the store's reader makes of
+    /// it.
+    #[test]
+    fn a_null_field_and_absent_tags_are_not_a_loss() {
+        let tmp = TempDir::new().unwrap();
+        let scope = project_scope(&tmp);
+        let key = scope.key();
+        let line = format!(
+            r#"{{"namespace":"project-{key}","timestamp_ms":7,"content":"c","id":"mem-n","project":"{key}","tags":null,"meta":null,"provenance":{{"source":"model","session":null}}}}"#
+        );
+        let mut run = ImportRun::new(false);
+        assert_eq!(
+            import(tmp.path(), &line, ImportTarget::AsRecorded, &mut run).outcome,
+            ImportOutcome::Stored
+        );
+        let stored = fetch_exact_in(tmp.path(), &scope, &["mem-n"]).unwrap().remove(0);
+        assert_eq!(stored, serde_json::from_str::<MemoryRecord>(&line).unwrap());
+        assert_eq!(stored.timestamp_ms, 7);
+        assert!(stored.tags.is_empty(), "`\"tags\": null` is no tags");
+        // Absent tags as well, and tags that are not a list are still refused.
+        let absent = line.replace(r#""tags":null,"#, "").replace("mem-n", "mem-o");
+        assert_eq!(
+            import(tmp.path(), &absent, ImportTarget::AsRecorded, &mut run).outcome,
+            ImportOutcome::Stored
+        );
+        let wrong = line.replace(r#""tags":null"#, r#""tags":"one""#).replace("mem-n", "mem-p");
+        assert!(refusal(&import(tmp.path(), &wrong, ImportTarget::AsRecorded, &mut run))
+            .starts_with("not a note: wrong value at column "));
+        run.finish().unwrap();
+    }
+
     /// Private-mode tests (spec §5.4). Umask isolation: see
     /// `private_fs::test_support::UmaskGuard` — `#[serial(umask)]` serializes
     /// every umask-mutating test in the crate, and the guard restores the old
@@ -947,6 +3094,29 @@ mod tests {
                 "",
                 "no bytes may be written through the planted symlink"
             );
+        }
+
+        /// A lock file that cannot be opened (here a symlink, refused by
+        /// `O_NOFOLLOW`) fails the save, the error names the lock file, and
+        /// nothing is written.
+        #[test]
+        fn a_lock_file_that_cannot_be_opened_is_named_in_the_error() {
+            let tmp = TempDir::new().unwrap();
+            let dir = memory_dir_in(tmp.path());
+            fs::create_dir_all(&dir).unwrap();
+            let victim = tmp.path().join("victim.txt");
+            fs::write(&victim, "").unwrap();
+            let lock = dir.join("ns.jsonl.lock");
+            std::os::unix::fs::symlink(&victim, &lock).unwrap();
+            let error = append_to(tmp.path(), &rec("ns", 1, "x", vec![])).unwrap_err();
+            assert!(matches!(error, MemoryError::Io(_)), "{error}");
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("cannot open the notes lock file {}", lock.display())),
+                "{message}"
+            );
+            assert!(!dir.join("ns.jsonl").exists());
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "");
         }
 
         #[test]

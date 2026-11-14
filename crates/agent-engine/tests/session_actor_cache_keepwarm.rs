@@ -253,6 +253,8 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::ReloadAborted
         // Re-arms the park timer, which an active period already defers.
         | SessionCommand::ArmPark
+        // Starts an owned session's re-bind grace; owned sessions never pin.
+        | SessionCommand::ArmOwnerRebind
         | SessionCommand::HostEvent(_) => Effect::Untouched,
         SessionCommand::DriverStart { .. } => Effect::DriverOwned,
         SessionCommand::End { .. } => Effect::SessionEnd,

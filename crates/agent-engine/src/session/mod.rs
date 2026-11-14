@@ -14,6 +14,7 @@ pub mod client_args;
 pub mod display;
 pub mod driver;
 pub mod handle;
+pub(crate) mod owned;
 mod persister;
 pub(crate) mod session_start;
 /// Test-only controls of `on_session_start` scheduling (`cfg(test)` / the

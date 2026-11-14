@@ -39,7 +39,7 @@ On Windows:
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.ps1 | iex"
 ```
 
-This installs `synaps.exe` in `%USERPROFILE%\.cargo\bin` (`%CARGO_HOME%\bin` if set). On Windows the agent also gets a built-in `powershell` tool, and the default system prompt tells it to prefer it. The `bash` tool uses Git Bash, or WSL's `bash.exe`, when it finds one; with neither, bash calls fail with a not-found error, so install [Git for Windows](https://git-scm.com/download/win) if you want bash.
+This installs `synaps.exe` in `%USERPROFILE%\.cargo\bin` (`%CARGO_HOME%\bin` if set). On Windows the agent also gets a built-in `powershell` tool, and the default system prompt tells it to prefer it. Install [Git for Windows](https://git-scm.com/download/win) for the rest: the `bash` tool uses its Git Bash (or WSL's `bash.exe`), and `ls` runs its GNU `ls` from `usr\bin`. Without it those tools fail with a message pointing at `powershell`. `grep` and `find` need nothing: they search in-process.
 
 <details>
 <summary>Other ways: cargo, AUR, .deb, .zip, source</summary>
@@ -108,7 +108,7 @@ Local models: Synaps targets Ollama's default `http://localhost:11434/v1`. LM St
 - **Long sessions stay cheap.** The prompt cache lasts an hour on a Claude subscription, large tool output waits on disk behind a short preview, re-reads of unchanged files are deduplicated, and workers roll their context over instead of filling the window.
 - **Memory that survives.** Project memory, `/compact` checkpoints, sessions that chain across days.
 - **Sees what you see.** The model reads images, and `/attach` adds images, PDFs and text to a turn. [More](docs/multimodal.md)
-- **Build on it.** Extensions in any language, MCP servers, and the engine over [JSON-RPC](docs/rpc-protocol.md) or WebSocket.
+- **Build on it.** Extensions in any language, MCP servers, and the engine over [JSON-RPC](docs/rpc-protocol.md) or the [daemon socket](docs/daemon-mode.md).
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/9f907e06-46ff-46b3-87d5-36f53783e795" alt="Two terminals attached to one live session: one asks, the other steers mid-turn" width="100%" />
@@ -135,6 +135,8 @@ Memory is total PSS (plus swapped-out pages) across each tool's whole process tr
 
 ![weekly prompt-cache hit rate](benchmarks/prompt-cache/charts/1-weekly-hit-rate.png)
 
+**Terminal-Bench 4.1, with Claude Opus 5.5:** 39 of 63 tasks (61.9%), one trial per task. The public TB 4.0 Claude Code entry labeled Opus 5.5 would be expected to pass 40.0 of those task names, but some of its traces switch models. Synaps's median task time was 23 minutes versus the board's 55-minute median of per-task means. This is not a controlled ranking: benchmark revisions, effort, host conditions, model lineage, and trial counts differ. [Full results](benchmarks/terminal-bench/README.md) · [24 failure case studies](benchmarks/terminal-bench/failures/README.md) · [whole-run audit and regression-controlled improvement plan](benchmarks/terminal-bench/analysis/README.md)
+
 Method, tool versions, latency numbers, caveats and how to reproduce: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Why Synaps
@@ -160,7 +162,6 @@ Method, tool versions, latency numbers, caveats and how to reproduce: [BENCHMARK
 | `synaps send` | Send a message to a running session from a script |
 | `synaps chat` | The same engine on stdin/stdout, for pipes, scripts and CI |
 | `synaps rpc` | JSON-RPC over stdio, to embed the engine in other software |
-| `synaps server` | WebSocket API with token auth and streaming |
 | `synaps login` · `auth` · `status` | Sign in, manage several accounts per provider, see usage and reset windows |
 
 ## Configuration

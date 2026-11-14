@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Registers one tool, `whoami`, that answers with the `tool.call` params'
-`session_id`, so tests can check the caller identity a daemon-shared
-plugin receives. The reply is JSON text:
-{"has_key": <bool>, "session_id": <str|null>, "input": <object>}.
+`session_id` and `cwd`, so tests can check the caller identity and folder a
+daemon-shared plugin receives. The reply is JSON text:
+{"has_key": <bool>, "session_id": <str|null>, "has_cwd": <bool>,
+ "cwd": <str|null>, "input": <object>}.
 """
 import json
 import sys
@@ -54,6 +55,8 @@ while True:
             write_message(request, {"content": json.dumps({
                 "has_key": "session_id" in params,
                 "session_id": params.get("session_id"),
+                "has_cwd": "cwd" in params,
+                "cwd": params.get("cwd"),
                 "input": params.get("input"),
             })})
         else:

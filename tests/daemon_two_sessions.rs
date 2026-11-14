@@ -64,16 +64,16 @@ async fn two_sessions_one_daemon_isolated() {
         let conn = SocketTransport::connect(&sock, Hello::new(ClientKind::Test)).await.unwrap();
         let (t, snap) = SocketTransport::attach(
             conn,
-            Attach::Create {
-                config: SessionConfig {
+            Attach::create(
+                SessionConfig {
                     cwd: Some(cwd.clone()),
                     env: None,
                     model_override: Some("claude-sonnet-4-5".into()),
                     persist: false,
                     ..Default::default()
                 },
-                mode: AttachMode::Mirror,
-            },
+                AttachMode::Mirror,
+            ),
         )
         .await
         .expect("attach create");
@@ -184,16 +184,16 @@ async fn continue_of_live_journal_attaches_instead_of_second_actor() {
     let conn = SocketTransport::connect(&sock, Hello::new(ClientKind::Test)).await.unwrap();
     let (mut a, snap_a) = SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(cwd.clone()),
                 env: None,
                 model_override: Some("claude-sonnet-4-5".into()),
                 name: Some("ambient".into()),
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .expect("attach create");
@@ -207,15 +207,15 @@ async fn continue_of_live_journal_attaches_instead_of_second_actor() {
         let conn = SocketTransport::connect(&sock, Hello::new(ClientKind::Test)).await.unwrap();
         let (mut b, snap_b) = SocketTransport::attach(
             conn,
-            Attach::Create {
-                config: SessionConfig {
+            Attach::create(
+                SessionConfig {
                     continue_session: Some(Some(query.to_string())),
                     cwd: Some(cwd.clone()),
                     env: None,
                     ..Default::default()
                 },
-                mode: AttachMode::Mirror,
-            },
+                AttachMode::Mirror,
+            ),
         )
         .await
         .expect("attach continue");

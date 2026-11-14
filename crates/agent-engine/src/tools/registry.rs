@@ -57,11 +57,6 @@ impl ToolRegistry {
             Arc::new(crate::tools::subagent::steer::SubagentSteerTool),
             Arc::new(crate::tools::subagent::collect::SubagentCollectTool),
             Arc::new(crate::tools::subagent::resume::SubagentResumeTool),
-            // Task A4 continuous-memory control tool (spec §7.2). Like the
-            // authorization gateways above, primary-registry only: recursive
-            // subagent registries exclude it so a delegated model can never
-            // steer the session's memory-context leases.
-            Arc::new(crate::tools::memory_context::MemoryContextTool),
             // Task 17 discovery/authorization gateways (spec §7.2). Present
             // in the primary runtime registry only; subagent registries
             // (`without_subagent*`) deliberately exclude them so recursive
@@ -75,11 +70,14 @@ impl ToolRegistry {
             Arc::new(crate::tools::memory::MemoryFetchTool),
             Arc::new(crate::tools::memory::MemoryStoreTool),
             Arc::new(crate::tools::memory::MemoryForgetTool),
-            // Explicit project forum tools remain deferred in the foreground;
-            // workers receive this narrow surface without authorization tools.
-            Arc::new(crate::tools::forum::ForumPostTool),
-            Arc::new(crate::tools::forum::ForumReadTool),
-            Arc::new(crate::tools::forum::ForumForgetTool),
+            // Automatic context management's phase report. Registered here,
+            // once, and stateless: it writes to the calling chat's rollover
+            // state, which the call's context carries. A chat without
+            // context management is not offered it (its session tool set
+            // withholds it); it is never registered or removed per chat,
+            // because every chat on the host shares this registry. Primary
+            // registry only: a worker has no rollover state of this kind.
+            Arc::new(crate::tools::context_checkpoint::ContextCheckpointTool {}),
         ];
         // Arbitrary command-execution tools are only present when the
         // `command-exec` feature is enabled (default). A `--no-default-features`
@@ -154,9 +152,6 @@ impl ToolRegistry {
             Arc::new(crate::tools::grep::GrepTool),
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
-            Arc::new(crate::tools::forum::ForumPostTool),
-            Arc::new(crate::tools::forum::ForumReadTool),
-            Arc::new(crate::tools::forum::ForumForgetTool),
         ];
         #[cfg(feature = "command-exec")]
         {
@@ -248,12 +243,6 @@ impl ToolRegistry {
 
     fn api_safe_name(name: &str, used: &HashSet<String>) -> String {
         Self::api_safe_identifier(name, used, 128, false)
-    }
-
-    /// The wire name `runtime_name` is exposed under when nothing else
-    /// claims it first (no collision suffix).
-    pub(crate) fn unclaimed_wire_name(runtime_name: &str) -> String {
-        Self::api_safe_name(runtime_name, &HashSet::new())
     }
 
     fn api_safe_property_name(name: &str, used: &HashSet<String>) -> String {
@@ -605,6 +594,32 @@ impl ToolRegistry {
         Arc::clone(&self.cached_schema)
     }
 
+    /// The exposed schema without the tools a session is not offered
+    /// ([`crate::tools::activation::SessionToolSet::withholding`]): what a
+    /// request of that session carries when it sends the whole registry
+    /// (progressive disclosure off): the cached entries, in cached order
+    /// and under their cached API-safe names, minus those tools. `None`
+    /// when none of them is registered: the caller keeps
+    /// [`Self::tools_schema`]'s cached Arc.
+    pub fn tools_schema_without<'a>(
+        &self,
+        withheld: impl IntoIterator<Item = &'a crate::tools::catalog::ToolId>,
+    ) -> Option<Arc<Vec<Value>>> {
+        let withheld: HashSet<&crate::tools::catalog::ToolId> = withheld.into_iter().collect();
+        if !withheld.iter().any(|id| self.catalog.get(id).is_some()) {
+            return None;
+        }
+        let offered = |entry: &&Value| {
+            let tool = entry["name"]
+                .as_str()
+                .and_then(|api_name| self.tools.get(self.runtime_name_for_api(api_name)));
+            !tool.is_some_and(|tool| withheld.contains(&tool_id_for(tool.as_ref())))
+        };
+        Some(Arc::new(
+            self.cached_schema.iter().filter(offered).cloned().collect(),
+        ))
+    }
+
     /// Deterministic session schema projection (Task 17, spec §7.7): select
     /// from the EXISTING cached exposed schema exactly the entries whose
     /// capability identity is core or exactly-activated in `session`,
@@ -665,10 +680,11 @@ impl ToolRegistry {
                 } else {
                     split.deferred.push(deferred_entry(entry));
                 }
-            } else if self
-                .catalog
-                .get(&id)
-                .is_some_and(crate::tools::activation::is_activatable_record)
+            } else if !session.is_withheld(&id)
+                && self
+                    .catalog
+                    .get(&id)
+                    .is_some_and(crate::tools::activation::is_activatable_record)
             {
                 split.deferred.push(deferred_entry(entry));
             } else {
@@ -832,10 +848,6 @@ fn is_recursive_subagent_tool_name(name: &str) -> bool {
             | "subagent_resume"
             | "subagent_model_authorize"
             | "subagent_models"
-            // Task A4: the continuous-memory control tool follows the exact
-            // subagent_model_authorize precedent — recursive subagents must
-            // never see it (nor an extension tool squatting on its name).
-            | "memory_context"
     )
 }
 /// Result of [`ToolRegistry::deferred_tool_split`].
@@ -1096,15 +1108,16 @@ mod tests {
     fn test_tool_registry_new() {
         let registry = ToolRegistry::new();
 
-        // Includes model discovery/authorization, project memory primitives,
-        // memory-context control, and the three explicit forum tools. Forum
-        // tools remain outside the progressive essential foreground core.
+        // Includes model discovery/authorization, project memory primitives
+        // and `context_checkpoint`. The built-in forum is gone (the Axel
+        // extension serves one).
         assert_eq!(
             registry.tools_schema().len(),
-            29 + usize::from(cfg!(windows))
+            26 + usize::from(cfg!(windows))
         );
+        assert!(registry.get("context_checkpoint").is_some());
         for name in ["forum_post", "forum_read", "forum_forget"] {
-            assert!(registry.get(name).is_some(), "missing {name}");
+            assert!(registry.get(name).is_none(), "{name} is no longer built in");
         }
 
         // Should find bash tool
@@ -1161,13 +1174,13 @@ mod tests {
     fn test_tool_registry_without_subagent() {
         let registry = ToolRegistry::without_subagent();
 
-        // 8 base + 3 shell + 3 forum tools (plus PowerShell on Windows).
+        // 8 base + 3 shell tools (plus PowerShell on Windows).
         assert_eq!(
             registry.tools_schema().len(),
-            14 + usize::from(cfg!(windows))
+            11 + usize::from(cfg!(windows))
         );
         for name in ["forum_post", "forum_read", "forum_forget"] {
-            assert!(registry.get(name).is_some(), "missing {name}");
+            assert!(registry.get(name).is_none(), "{name} is no longer built in");
         }
         // Should not have subagent tool
         assert!(registry.get("subagent").is_none());
@@ -1197,9 +1210,12 @@ mod tests {
         assert!(registry.get("shell_start").is_none());
         assert!(registry.get("shell_send").is_none());
         assert!(registry.get("shell_end").is_none());
-        // Non-exec built-ins are still present.
+        // Non-exec built-ins are still present; grep and find search
+        // in-process.
         assert!(registry.get("read").is_some());
         assert!(registry.get("ls").is_some());
+        assert!(registry.get("grep").is_some());
+        assert!(registry.get("find").is_some());
         assert!(registry.get("subagent").is_some());
 
         let without_sub = ToolRegistry::without_subagent();
@@ -1330,26 +1346,26 @@ mod tests {
     }
 
     /// `disabled_tools` on a worker: every listed built-in goes (`bash`,
-    /// `ls`, the forum tools alike), an extension tool keeps its place even
+    /// `ls` alike), an extension tool keeps its place even
     /// when listed (the foreground's boot pass runs before extensions
     /// register, so it keeps it too), and the schema matches the tool set.
     #[test]
     fn worker_set_disables_the_listed_built_ins_before_the_extension_merge() {
         let mut shared = ToolRegistry::empty();
         shared.register(Arc::new(OwnedTool("alpha:do_thing", Some("alpha"))));
-        let disabled: Vec<String> = ["bash", "shell_start", "ls", "forum_read", "alpha:do_thing"]
+        let disabled: Vec<String> = ["bash", "shell_start", "ls", "alpha:do_thing"]
             .map(String::from)
             .to_vec();
 
         let all = ToolRegistry::worker_set(&shared, &[]);
-        assert!(all.get("ls").is_some() && all.get("forum_read").is_some());
+        assert!(all.get("ls").is_some());
         let worker = ToolRegistry::worker_set(&shared, &disabled);
         let names: Vec<String> = worker
             .tools_schema()
             .iter()
             .filter_map(|t| t["name"].as_str().map(String::from))
             .collect();
-        for name in ["bash", "shell_start", "ls", "forum_read"] {
+        for name in ["bash", "shell_start", "ls"] {
             assert!(worker.get(name).is_none(), "{name} kept");
             assert!(!names.iter().any(|n| n == name), "{name} advertised: {names:?}");
         }
@@ -1386,35 +1402,12 @@ mod tests {
 
     #[cfg(feature = "command-exec")]
     #[test]
-    fn forum_membership_preserves_worker_bounds_and_foreground_disclosure() {
-        use crate::tools::activation::{SessionId, SessionToolSet};
-        use crate::tools::catalog::{ToolEffect, ToolId};
-        let main = ToolRegistry::new();
+    fn worker_registries_keep_their_bounds_with_extensions_merged() {
         let mut extensions = ToolRegistry::empty();
         extensions.register(Arc::new(OwnedTool("peer:probe", Some("peer"))));
         let merged = ToolRegistry::without_subagent_with_extensions(&extensions);
-        assert_eq!(merged.tools_schema().len(), 15 + usize::from(cfg!(windows)));
+        assert_eq!(merged.tools_schema().len(), 12 + usize::from(cfg!(windows)));
         assert!(merged.get("peer:probe").is_some());
-        for registry in [&main, &ToolRegistry::without_subagent(), &merged] {
-            for (name, effect) in [
-                ("forum_post", ToolEffect::NonIdempotent),
-                ("forum_read", ToolEffect::ReadOnly),
-                ("forum_forget", ToolEffect::NonIdempotent),
-            ] {
-                let tool = registry.get(name).unwrap();
-                assert_eq!(tool.origin(), crate::tools::ToolOrigin::Builtin);
-                assert_eq!(tool.effect(), effect);
-                assert!(registry.catalog().get(&ToolId::builtin(name)).is_some());
-                assert_eq!(
-                    registry
-                        .tools_schema()
-                        .iter()
-                        .filter(|schema| schema["name"] == name)
-                        .count(),
-                    1
-                );
-            }
-        }
         for registry in [ToolRegistry::without_subagent(), merged] {
             for name in [
                 "subagent",
@@ -1427,7 +1420,6 @@ mod tests {
                 "subagent_models",
                 "search_tools",
                 "activate_tools",
-                "memory_context",
                 "memory_store",
                 "memory_search",
                 "memory_fetch",
@@ -1438,18 +1430,6 @@ mod tests {
             for name in ["bash", "write", "edit", "multi_edit"] {
                 assert!(registry.get(name).is_some(), "worker must retain {name}");
             }
-        }
-        let session = SessionToolSet::progressive_core_for_catalog(
-            SessionId::parse("forum-foreground-test").unwrap(),
-            main.catalog(),
-        );
-        let projection = main.session_tools_schema(&session);
-        for name in ["forum_post", "forum_read", "forum_forget"] {
-            assert!(!session.is_core(&ToolId::builtin(name)));
-            assert!(!projection
-                .schema
-                .iter()
-                .any(|schema| schema["name"] == name));
         }
     }
 
@@ -1483,7 +1463,6 @@ mod tests {
             "subagent_resume",
             "subagent_model_authorize",
             "subagent_models",
-            "memory_context",
         ] {
             other.register(Arc::new(OwnedTool(name, Some("malicious-extension"))));
         }
@@ -1498,7 +1477,6 @@ mod tests {
             "subagent_resume",
             "subagent_model_authorize",
             "subagent_models",
-            "memory_context",
         ] {
             assert!(merged.get(name).is_none(), "{name} must stay unavailable");
         }
@@ -1515,7 +1493,6 @@ mod tests {
             "subagent:resume",
             "subagent:model:authorize",
             "subagent:models",
-            "memory:context",
         ] {
             other.register(Arc::new(OwnedTool(runtime_name, Some("subagent"))));
         }
@@ -1529,30 +1506,12 @@ mod tests {
             "subagent_resume",
             "subagent_model_authorize",
             "subagent_models",
-            "memory_context",
         ] {
             assert!(
                 merged.get(api_name).is_none(),
                 "API-safe recursive name {api_name} must stay unavailable"
             );
         }
-    }
-
-    /// Task A4: `memory_context` mirrors the `subagent_model_authorize`
-    /// precedent — present in the primary registry, absent from every
-    /// recursive subagent registry.
-    #[test]
-    fn memory_context_present_in_primary_registry_absent_in_recursive_ones() {
-        assert!(ToolRegistry::new().get("memory_context").is_some());
-        assert!(ToolRegistry::without_subagent()
-            .get("memory_context")
-            .is_none());
-
-        let merged = ToolRegistry::without_subagent_with_extensions(&ToolRegistry::new());
-        assert!(
-            merged.get("memory_context").is_none(),
-            "recursive registries must never expose memory_context"
-        );
     }
 
     #[test]

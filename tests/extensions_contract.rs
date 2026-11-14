@@ -166,6 +166,76 @@ fn after_tool_call_truncates_utf8_safely() {
     );
 }
 
+/// What the two pages tell an extension author about `tool.call`'s `caller`:
+/// that the host writes it and it may be gone by, that its values are not
+/// secret, that a call without one gets nothing by identity, and that it
+/// names one life of a run. They once said not to grant access by it.
+#[test]
+fn caller_is_documented_as_host_written_not_secret_and_one_life_of_a_run() {
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let contract = extension_contract();
+    let entry = one_line(
+        contract["registered_capabilities"]["tools"]["call"]["params"]["caller"]
+            .as_str()
+            .expect("registered_capabilities.tools.call.params.caller"),
+    );
+    let page = one_line(include_str!("../docs/extensions/protocol.md"));
+    for (name, text) in [("contract.json", &entry), ("protocol.md", &page)] {
+        for said in [
+            "never from it",
+            "cannot set it",
+            "may go by it",
+            "not secret",
+            "never accept an author from tool",
+            "must get no access that depends on who is calling",
+            "one life of a run",
+            "the same chat has a new",
+            "what stays the same for a chat",
+            "only within one life",
+        ] {
+            let said = said.replace('`', "");
+            assert!(text.replace('`', "").contains(&said), "{name} does not say {said:?}");
+        }
+        for gone in ["Do not grant access", "not a proof"] {
+            assert!(!text.contains(gone), "{name} still says {gone:?}");
+        }
+    }
+}
+
+/// A hook is documented as notify-only exactly when the engine sends it
+/// without waiting, and each such hook says what naming it costs on an
+/// older host.
+#[test]
+fn notify_only_hooks_are_documented_as_such_and_as_additive() {
+    let contract = extension_contract();
+    for &hook in ALL_HOOK_KINDS {
+        let entry = &contract["hooks"][hook.as_str()];
+        let delivery = entry["delivery"].as_str();
+        assert_eq!(
+            delivery.is_some_and(|text| text.starts_with("notify-only")),
+            hook.is_notification(),
+            "{}: delivery = {delivery:?}",
+            hook.as_str()
+        );
+        if hook.is_notification() {
+            assert_eq!(hook.allowed_action_names(), ["continue"]);
+            let compatibility = entry["compatibility"].as_str().unwrap_or_default();
+            assert!(
+                compatibility.contains("no version bump")
+                    && compatibility.contains("fails to load on a host that predates it"),
+                "{}: {compatibility}",
+                hook.as_str()
+            );
+            assert!(entry["event_data"].is_string(), "{}", hook.as_str());
+        }
+    }
+    assert_eq!(
+        contract["extension_protocol_version"],
+        serde_json::json!(1),
+        "new hook kinds are additive: no protocol bump"
+    );
+}
+
 /// `context_phase` is an additive optional result within protocol version 1:
 /// it is advertised only on `on_message_complete`, documented in the
 /// contract, and the protocol version is not bumped for it.

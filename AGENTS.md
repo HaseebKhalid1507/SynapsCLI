@@ -5,7 +5,7 @@ This is the onboarding doc for any agent (Cursor, Aider, or SynapsCLI itself) to
 SynapsCLI is a terminal-native AI agent runtime written in Rust. ~210K LOC across the workspace (counts drift — verify with `find src crates -name '*.rs' -not -path '*/target/*' | xargs wc -l`). **Cargo workspace** with three library crates + a root binary crate:
 
 - `synaps-core` (`crates/agent-core/`) — config, session, auth, credential broker, models, memory, orchestration policy, prompt manifests, pricing, protocol primitives
-- `synaps-engine` (`crates/agent-engine/`) — runtime, provider catalogs, credential routing, tools, memory tools, reactive subagent lifecycle, MCP, skills, events, extensions, sidecar, watcher
+- `synaps-engine` (`crates/agent-engine/`) — runtime, provider catalogs, credential routing, tools, memory tools, reactive subagent lifecycle, MCP, skills, events, extensions, daemon
 - `synaps-tui` (`crates/agent-tui/`) — the ratatui TUI
 - `synaps` (`src/main.rs`) — the binary; CLI dispatch
 
@@ -28,8 +28,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings  # linting (CI ga
 **Build/test worker ceiling (preference):** always use at most **8 workers**
 for Synaps builds/tests (`CARGO_BUILD_JOBS=8` or `cargo -j 8`, test harness
 `--test-threads=8` maximum; use `1` for PTY/environment-sensitive suites).
-Repository `.cargo/config.toml` supplies these defaults. Apply the same ceiling
-to the independently built Axel sidecar; do not multiply parallel build jobs.
+Repository `.cargo/config.toml` supplies these defaults; do not multiply
+parallel build jobs.
 
 **Minimum Rust:** 1.88 (edition 2021).
 **Platforms:** Linux, macOS and Windows 10/11. CI runs the full suite on Linux; macOS gets `cargo check` and the `git_program` tests; Windows gets clippy in both feature sets (default and `--no-default-features`), the `daemon_*` integration tests and `cargo test -p synaps-tui --lib` — the rest of the suite isn't run there yet. Gate Unix-only code and tests with `#[cfg(unix)]` (or `target_os = "linux"` for procfs/systemd); the Windows CI job is the only build that compiles the `cfg(windows)` code.
@@ -40,10 +40,7 @@ to the independently built Axel sidecar; do not multiply parallel build jobs.
 - `synaps --continue [NAME_OR_ID]` — resume last session, or resolve a chain bookmark / session alias / partial session ID via `resolve_session()` (chain name → session name → partial ID)
 - `synaps --no-extensions` — disable the extension system (skips plugin hook registration)
 - `synaps chat` — fully-featured headless mode (MCP, extensions, skills, sessions, compaction, event bus)
-- `synaps agent` — headless worker managed by the watcher
-- `synaps watcher` — supervisor daemon
 - `synaps login` — OAuth flow
-- `synaps server` — WebSocket API server
 - `synaps send` — push events into a running session
 - `synaps status` — check account usage
 - `synaps auth-broker` — credential broker daemon for multi-machine shared auth
@@ -60,7 +57,7 @@ to the independently built Axel sidecar; do not multiply parallel build jobs.
 ```
 src/
 ├── main.rs               — CLI entry point, subcommand dispatch, --profile pinning
-└── cmd/                  — subcommand handlers (chat, server, agent, login, watcher, send, status, rpc, daemon, attach, auth-broker, …)
+└── cmd/                  — subcommand handlers (chat, login, send, status, rpc, daemon, attach, auth-broker, …)
     ├── auth_accounts.rs  — `synaps auth list|use|remove|identify|plan`
     ├── quota_keeper.rs   — `synaps quota-keeper` (reset-window watcher, opt-in Codex activation)
     └── status.rs         — `synaps status` (per-account usage, --provider/--account/--all/--json)
@@ -80,10 +77,8 @@ crates/agent-core/src/    (crate: synaps-core)
 │   │   ├── auto_selection.rs — `auto` choice + its secret-free explanation (soonest reset)
 │   │   ├── quota_keeper.rs   — quota keeper engine (reset windows, activation ledger)
 │   │   └── muse.rs           — Meta Muse device-flow login + Model API key mint
-│   ├── protocol.rs       — WebSocket wire format (server/client)
 │   ├── error.rs          — SynapsError type
-│   ├── logging.rs        — tracing subscriber setup
-│   └── watcher_types.rs  — shared types for watcher IPC
+│   └── logging.rs        — tracing subscriber setup
 ├── memory/               — session memory store (mod.rs, store.rs)
 ├── orchestration.rs      — worker authorization policy, completion gates, model/role/scope validation
 ├── prompt/               — YAML prompt manifests, module composition, path confinement
@@ -124,15 +119,15 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── mod.rs            — Tool trait, ToolContext
 │   ├── registry.rs       — ToolRegistry::new() registers all built-ins
 │   ├── {bash,read,write,edit,grep,find,ls}.rs  — core filesystem/shell tools
+│   ├── search/           — grep's and find's in-process engine (ripgrep's `ignore`, `globset`, `grep-searcher`): walk, regex, name glob, output
 │   ├── multi_edit.rs     — anchored edits across files, all or nothing (docs/multi-edit.md)
 │   ├── powershell.rs     — PowerShell tool (Windows only; shares the bash tool's runner)
 │   ├── subagent/         — reactive lifecycle: start, status, steer, collect, resume, authorize_model, finalize + oneshot
-│   ├── memory/           — memory_store, memory_search, memory_fetch, memory_forget, memory_context tools
+│   ├── memory.rs         — memory_store, memory_search, memory_fetch, memory_forget tools
 │   ├── agent.rs          — (legacy — prefer the subagent tools)
 │   ├── extension.rs      — extension-provided tool wrapper
 │   ├── respond.rs        — event-bus response tool
 │   ├── send_channel.rs   — channel send tool
-│   ├── watcher_exit.rs   — graceful-exit tool (watcher agents only)
 │   ├── secret_prompt.rs  — masked secret / confirm prompt plumbing (TUI queue, handle)
 │   ├── sudo_askpass/     — bash tool's sudo password path: `synaps-sudo-askpass` helper + per-call broker (Linux)
 │   ├── shell/            — stateful PTY shell (start/send/end) — session manager
@@ -149,18 +144,12 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── manifest.rs       — ExtensionManifest from plugin.json
 │   ├── manager.rs        — ExtensionManager lifecycle
 │   └── runtime/process.rs — JSON-RPC over stdio ProcessExtension
-├── sidecar/              — sidecar process support
 ├── skills/               — skill discovery + command registry
 │   ├── loader.rs         — walks .synaps-cli/{plugins,skills} roots
 │   ├── manifest.rs       — plugin.json / marketplace.json parsers
 │   ├── registry.rs       — CommandRegistry: built-ins + skill names → tab-complete
 │   ├── marketplace.rs    — plugin install from marketplace
 │   └── tool.rs           — load_skill Tool impl
-└── watcher/              — supervisor daemon
-    ├── mod.rs            — subsystem entry (invoked by `synaps watcher`)
-    ├── supervisor.rs     — per-agent lifecycle, limits, retries
-    ├── ipc.rs            — Unix socket protocol (deploy, status, stop)
-    └── display.rs        — `watcher status` renderer
 
 crates/agent-tui/src/     (crate: synaps-tui)
 └── tui/                  — the TUI (module, entered via default `synaps` subcommand)
@@ -235,22 +224,16 @@ Project-scoped persistent memory in `crates/agent-core/src/memory/`:
 - **Store**: JSONL files at `~/.synaps-cli/memory/<project>/`, one record per line.
 - **Index**: Lexical substring index for fast search without external dependencies.
 - **Sensitivity**: Three classes — `normal` (full access), `sensitive` (redacted in exports/logs), `secret` (never returned via tool calls).
-- **Tools**: `memory_store`, `memory_search` (returns descriptors with snippets), `memory_fetch` (full bodies by ID), `memory_forget` (tombstone), `memory_context` (session lifecycle control).
+- **Tools**: `memory_store`, `memory_search` (returns descriptors with snippets), `memory_fetch` (full bodies by ID), `memory_forget` (tombstone).
 
 Records have stable IDs, model provenance, tags, timestamps, and optional TTL. The system is designed for agents to accumulate project knowledge across sessions.
 
-Opt-in `memory.backend = axel` routes short notes, eligible context history,
-consented capture/recall, explicit history import, migration and memory retention
-to `sidecars/axel-memory-service`, independently built at an exact Axel revision.
-Axel uses one shared brain with per-repository scopes: Git worktrees share a
-random durable identity in their common Git directory. Default service is an
-installed sibling; default brain is `~/.synaps-cli/memory/axel/brain.r8`.
-Absolute `memory.axel.executable`/`memory.axel.brain` overrides remain supported.
-Linux/procfs is required. Old path scopes require explicit migration/linking;
-there is no legacy fallback or automatic private-history import. User-wide notes
-require separate `memory.user_scope = true` and explicit tool `scope=user`.
-Selection is restart-bound; `/memory` consent and `/context auto` remain separate
-host decisions. See `docs/specs/shared-axel-repositories.md`.
+Notes and context archives are plain files under the base directory, always:
+there is no memory backend to select. `memory.backend`, `memory.user_scope`,
+`memory.axel.executable` and `memory.axel.brain` are removed keys: a config
+that still has them starts normally with one warning. The `memory_*` tools act
+on the project of the chat's folder and take no `scope` (`scope: "repository"`
+is accepted and ignored, any other value refused). Axel is an extension.
 
 ### Reactive Subagent Lifecycle
 
@@ -278,7 +261,7 @@ Implementation split across `crates/agent-engine/src/tools/subagent/` (tools) an
 2. Re-export in `crates/agent-engine/src/tools/mod.rs` (`pub use my_tool::MyTool;`).
 3. Register in `crates/agent-engine/src/tools/registry.rs::ToolRegistry::new()` — add to the `vec![]`.
 4. If it streams output, use `ctx.tx_delta` (UnboundedSender<String>) to push deltas.
-5. If it's restricted (e.g. watcher-only), gate on `ctx.watcher_exit_path.is_some()` or similar.
+5. If subagents must not get it, leave it out of the restricted registry in `crates/agent-engine/src/tools/registry.rs`.
 
 The tool's `parameters()` JSON schema is what the model sees. Be precise — bad schemas lead to malformed tool calls.
 
@@ -287,7 +270,7 @@ The tool's `parameters()` JSON schema is what the model sees. Be precise — bad
 The old "5-site sync" pain point was solved by the `define_settings!` macro. Now it's 2–3 sites:
 
 1. **`crates/agent-tui/src/tui/settings/defs.rs`** — add an entry to the `define_settings!` invocation: key, label, category, `EditorKind` (`Cycler(&[...])`, `Text { numeric }`, `ModelPicker`, or `ThemePicker`), help text, and the apply closure (`|runtime, app, value| { ... }`). The macro generates both `ALL_SETTINGS` (schema) and `apply_setting_dispatch()` — they cannot drift.
-2. **`crates/agent-core/src/core/config.rs::load_config()`** — add a branch to parse the key from the config file, plus the field on `SynapsConfig` and its default. List the key in `KNOWN_CONFIG_KEYS` (or `FAMILY_CONFIG_KEYS` for `shell.*`/`memory.*`/… family keys); the coverage test in `settings/defs.rs` then fails until the key has a settings row or an `EXCLUDED_CONFIG_KEYS` entry with a reason.
+2. **`crates/agent-core/src/core/config.rs::load_config()`** — add a branch to parse the key from the config file, plus the field on `SynapsConfig` and its default. List the key in `KNOWN_CONFIG_KEYS` (or `FAMILY_CONFIG_KEYS` for `events.*`/`turn_budget.*`/… family keys); the coverage test in `settings/defs.rs` then fails until the key has a settings row or an `EXCLUDED_CONFIG_KEYS` entry with a reason.
 3. **`crates/agent-engine/src/skills/mod.rs::BUILTIN_COMMANDS`** — only if it also gets a slash command (e.g. `/foo`); then handle it in `tui/commands.rs::handle_command()` too.
 
 `apply_setting()` itself lives in `crates/agent-tui/src/tui/helpers.rs` and delegates to the generated dispatch — you should rarely need to touch it. Step 2 is the un-tested one: forget the `load_config()` branch and the setting silently won't persist across restarts.
@@ -498,8 +481,9 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `disabled_plugins` | comma list | — | Plugins to skip on boot |
 | `disabled_skills` | comma list | — | Skills to skip on boot |
 | `disabled_tools` | comma list | — | Built-in tools to remove from the registry at boot (by runtime name, e.g. `bash, ls`); subagent workers don't get them either |
+| `tools.always_loaded` | comma list | — | With `progressive_tool_disclosure = true`: tool ids (as `activate_tools` takes them, e.g. `ext.axel:search, builtin:subagent`) kept loaded from the first request instead of deferred. Ids not in the catalog are skipped (an extension that registers later joins at the next request); untrusted tools never; malformed ids are a config warning. No effect without disclosure ([docs/request-lifecycle-progressive-disclosure.md](docs/request-lifecycle-progressive-disclosure.md#always-loaded-tools)) |
 | `cache_ttl` | string | auto | Prompt-cache TTL: `auto` (1h on an Anthropic subscription/OAuth login, 5m on an API key), `5m`, `1h` or `hybrid`. Other providers ignore it; workers always use 5m |
-| `cache_keepwarm_tools` | bool | on | Keep the prompt cache warm while a long tool round runs (foreground and workers) |
+| `cache_keepwarm_tools` | bool | on | Keep the prompt cache warm while a long round runs: a response that streams past the cache TTL, or tools that run past it (foreground and workers) |
 | `cache_keepwarm_headless` | bool | off | Let idle keep-warm (`cache_keepwarm`) run for daemon sessions driven only by non-interactive clients |
 | `request_compression` | string | auto | gzip Anthropic request bodies: `auto` (16 KiB+ bodies sent straight to api.anthropic.com), `on`, `off`. `SYNAPS_GZIP_REQUEST_BODIES=0` turns it off |
 | `request_compression_level` | int | 1 | gzip level, 1–9 |
@@ -512,7 +496,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `telemetry` | string | off | Per-request API telemetry: `off`, `basic` (Anthropic streaming calls: turns, keep-warm, workers; timing incl. `ttft_ms`, usage, `cost_usd` estimated at API list prices, the persisted conversation `session_id` plus the request-trace `runtime_session_id`/`turn_id`/`trace_request_id`, worker identity on subagent records, plus the `cache_diag` verdict when `cache_diagnostics` is on), `full` (adds rate-limit headers). JSONL at `~/.cache/synaps/api-log.jsonl` (0600, O_NOFOLLOW); `basic`/`full` also write the metadata-only `~/.cache/synaps/request-trace.jsonl` ([docs/trace-schema.md](docs/trace-schema.md)) |
 | `telemetry_log_generations` | int | 1 | Rotated generations kept for `api-log.jsonl` and `request-trace.jsonl` (each rotates at 50 MB): `<log>.1` (newest) .. `<log>.N` (oldest), 1–100. `1` is the historical single `<log>.1`. Read when the session's telemetry writer starts |
 | `cache_diagnostics` | bool | false | Anthropic cache diagnostics: each turn sends `diagnostics.previous_message_id` and records the server's reason: how this request diverges from the previous request in the chain, not what the cache did (it can appear on a full cache hit — read it with `cache_read_input_tokens`). An unknown or nonexistent previous id returns 200 with `previous_message_not_found`. Written to `cache_diag` in `api-log.jsonl` (telemetry `basic`+) and `cache.server_diagnosis` in the request trace. Beta header `cache-diagnosis-2026-04-07` on API-key auth only; a rejection turns it off for the session and the request is re-sent without it |
-| `shell.*` / `server.*` / `bridge.*` | — | — | Namespaced config families parsed by `parse_shell_config_key` / `parse_server_config_key` / `parse_bridge_config_key` in `crates/agent-core/src/core/config.rs` — see those functions for the full key list |
+| `shell.*` / `server.*` | — | — | `shell.*`: the eight keys were removed in 0.12.0; a config that sets them loads, ignores them and gets one warning naming them (`REMOVED_SHELL_KEYS` in `crates/agent-core/src/core/config.rs`). `server.*`: parsed by `parse_server_config_key` in the same file; it is only `server.auto_approve_confirms` now: the other keys of the removed `synaps server` (and the removed watcher's `bridge.*` keys) load with one deprecation warning and are ignored |
 
 ---
 
@@ -524,10 +508,10 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 4. **`cargo test -p <crate>` skips integration tests.** The `tests/` suite (extensions e2e, provider tests) only runs with `cargo test --workspace`. "Single-crate green" can still mean broken.
 5. **Binary swap requires process restart.** `cargo build` replaces `target/release/synaps` on disk but the running process keeps the old binary mmap'd. Must exit + relaunch to pick up changes.
 6. **New StreamEvents need TWO consumers.** `crates/agent-tui/src/tui/stream_handler.rs` AND `crates/agent-engine/src/engine/stream.rs` — update only the TUI one and headless mode silently drops the event.
-7. **Subagent has NO subagent.** No recursion. Subagents also lack `connect_mcp_server`, `load_skill`, `watcher_exit`. Enforced via the restricted registry in `crates/agent-engine/src/tools/registry.rs` (see the second tool list).
+7. **Subagent has NO subagent.** No recursion. Subagents also lack `connect_mcp_server`, `load_skill`. Enforced via the restricted registry in `crates/agent-engine/src/tools/registry.rs` (see the second tool list).
 8. **Theme changes apply live.** `/theme` and the `/settings` theme row apply at once with a cross-fade, no restart. Any path that changes the persisted theme must also call `App::sync_myx_live` (see `apply_theme_from_settings`), or the live `myx` subscriber leaks.
 9. **MCP servers are lazy-spawned.** First `connect_mcp_server` pays the spawn cost. Tools are registered dynamically via `ToolContext::tool_register_tx` — this channel breaks the `Arc<ToolRegistry>` circularity.
-10. **OAuth tokens are file-locked** via `fs4`. Concurrent TUI + watcher instances are safe, but a crashed process holding the lock will block others until its file is cleaned up.
+10. **OAuth tokens are file-locked** via `fs4`. Concurrent TUI + daemon instances are safe, but a crashed process holding the lock will block others until its file is cleaned up.
 11. **Provider model IDs contain slashes.** `nvidia/meta/llama-3.3-70b-instruct` — the first slash separates provider from model. `resolve_shorthand` uses `split_once('/')`. Nested slashes in model IDs (NVIDIA, DeepInfra) are preserved correctly.
 12. **Anthropic auth is optional.** `get_auth_token()` returns `auth_type: "none"` if no credentials found. The app boots fine. Anthropic API calls fail lazily with a clear message pointing to `synaps login` or `/model groq/...`.
 13. **`/compact` doesn't route through providers** — uses the Anthropic-only sync path (`runtime/api_sync.rs`). Known issue (see `docs/open-provider-issues.md`).
@@ -548,10 +532,10 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 - **`serde_json`** — everything JSON (messages, tool schemas, API bodies).
 - **`syntect` 5** — syntax highlighting. `default-themes + default-syntaxes + regex-onig`.
 - **`portable-pty` 0.9** — PTY for stateful shell tool.
-- **`notify` 6.1 + `globset` 0.4** — file-watching for watcher mode.
-- **`axum` 0.7 + `tokio-tungstenite`** — WS server/client (auxiliary).
+- **`notify` 6.1** — file-watching (event inbox, extension config).
+- **`ignore` 0.4 + `grep-regex`/`grep-searcher` 0.1 + `globset` 0.4** — ripgrep's walk and search, in-process, for the `grep` and `find` tools (`tools/search/`); `globset` builds the `find` tool's name glob.
+- **`axum` 0.7 + `axum-server`** — the `synaps auth-broker` HTTP(S) server.
 - **`fs4` 0.13** — advisory file locks for auth.json.
-- **`toml` 0.8** — watcher per-agent config (note: global config uses plain `key = value`, NOT TOML).
 
 Release profile: `lto = true, codegen-units = 1, strip = true, panic = "abort"`. Slow compile, small binary.
 
@@ -587,7 +571,6 @@ Located in `crates/agent-engine/src/runtime/mod.rs`. The single source of truth 
 Owns: `model`, `thinking_budget`, `system_prompt`, `ToolRegistry` (behind `Arc<RwLock>`), HTTP client, telemetry level, limits (`max_tool_output`, `bash_timeout`, `bash_max_timeout`, `subagent_timeout`, `api_retries`).
 
 Key entry points:
-- `run_single(&self, prompt)` → `Result<String>` — one-shot, no streaming. Used by headless paths.
 - `run_stream(&self, prompt, cancel)` → stream of `StreamEvent` — fire-and-forget (synthesizes messages).
 - `run_stream_with_messages(...)` → stream with caller-supplied message history. **Used by TUI.**
 
@@ -603,33 +586,15 @@ Things an agent should know about, but not necessarily fix in-passing:
 
 - **`crates/agent-engine/src/tools/agent.rs`** is legacy, superseded by the `subagent` tools. Kept for compatibility with older agent definitions. Remove after deprecation window.
 - **Theme changes require restart.** `Theme` is captured by long-lived render state; refactor to use `Rc<RefCell<Theme>>` or similar if live-swap becomes important.
-- **Watcher subsystem** (`crates/agent-engine/src/watcher/`, `crates/agent-engine/src/cmd/agent.rs`) is being evaluated for removal from the main repo. Don't invest in deep refactors there without checking with project owner first.
 - **`run_script` keybind action is a stub** (`crates/agent-tui/src/tui/input.rs` — TODO). Needs path validation before implementation.
 - **Sliding-4 cache strategy is over-engineered** — bench data shows `single-last` is equivalent (see Prompt Caching Strategy). Simplification pending.
 - **`gamba.rs`** — easter egg. Yes, really. Leave it alone.
 
 ---
 
-## Watcher Subsystem (brief)
-
-The watcher daemon (`target/release/synaps (watcher subcommand)`) supervises headless `synaps agent` processes. Each agent lives at `~/.synaps-cli/watcher/{name}/` with `config.toml`, `soul.md` (system prompt), `handoff.json` (state from last session), `stats.json`, `heartbeat` (timestamp file), and `logs/`.
-
-Trigger modes:
-- `manual` — runs only when deployed via `watcher deploy`
-- `always` — auto-restart with cooldown
-- `watch` — triggered by file changes (via `notify` crate)
-
-Limits (per-agent, in `config.toml`): `max_session_tokens`, `max_session_duration_mins`, `max_session_cost_usd`, `max_daily_cost_usd`, `max_tool_calls`, `cooldown_secs`, `max_retries`.
-
-When a limit is hit, the agent is prompted to call the `watcher_exit` tool to write a handoff. See `crates/agent-engine/src/tools/watcher_exit.rs` and `crates/agent-engine/src/watcher/supervisor.rs`.
-
-IPC is over a Unix socket (`src/watcher/ipc.rs`). Commands: `deploy`, `status`, `stop`, `logs`.
-
----
-
 ## Tool Reference (for agents running INSIDE SynapsCLI)
 
-This is the runtime tool surface. An LLM agent running in the TUI, synaps agent, or as a subagent sees these tools.
+This is the runtime tool surface. An LLM agent running in the TUI, a daemon session, `synaps chat`, or as a subagent sees these tools.
 
 ### `bash`
 Execute shell commands via `bash -c`.
@@ -639,7 +604,12 @@ Execute shell commands via `bash -c`.
 | `command` | string | ✓ | — | |
 | `timeout` | integer | | 30 | Seconds, max 300 |
 
-ANSI stripped. Output truncated at 30KB. `kill_on_drop` on timeout. Combined stdout+stderr.
+ANSI stripped. Combined stdout+stderr.
+
+- **Output cap:** output past the 256 KiB tool buffer (`max_tool_buffer`) stops the command: its process group is killed (Unix; on Windows only the shell process is, and a child holding the pipe keeps running) and the result (still a success, not an error) ends `[output truncated at N bytes: the command was stopped at this limit before it finished, so its exit status is unknown. …]`, with advice to redirect large output to a file. The live stream shows at most the first 16 KiB of output (`MAX_STREAMED_DELTA_BYTES`), never bytes the result drops, then the same notice; so stream and result match only for output under 16 KiB.
+- **Timeout:** the command is killed the same way (process group on Unix, shell process on Windows), and the error starts `Command timed out after Ns and was stopped` (with `(Ms was requested; the maximum is Ns)` when the model passed `timeout` and `bash_max_timeout` cut it). Then comes `Output before the timeout:` and what the command printed, redacted like any result: at most the last `max_tool_buffer` bytes, marked `(last K of M bytes)` when cut. If nothing was captured, it says so.
+- A command that exits by itself leaves what it started in the background (`server &`) running.
+- After the tool returns, the result goes through the usual `max_tool_output` cut or the spill preview (`tool_output_spill_bytes`).
 
 ### `read`
 Read file with line numbers.
@@ -673,27 +643,36 @@ Run a PowerShell command (`pwsh` if installed, else Windows PowerShell). Same ru
 | `command` (string, req) | `timeout` (integer) |
 
 ### `grep`
-Recursive regex search.
+Recursive regex search, run in-process with ripgrep's crates (`tools/search/`): no `grep` binary, so it works the same on Linux, macOS and Windows (no Git for Windows) and in the hardened build.
 
 | Parameter | Type | Req | Default | Notes |
 |---|---|---|---|---|
-| `pattern` | string | ✓ | — | |
-| `path` | string | | `.` | |
-| `include` | string | | — | Glob filter |
-| `context` | integer | | — | Lines before/after |
+| `pattern` | string | ✓ | — | Rust regex (ripgrep syntax, see Dialect). Invalid → tool error with a hint |
+| `path` | string | | `.` | File or directory (session cwd for relative paths) |
+| `include` | string | | — | File-name glob (`*.rs`, `*.{ts,tsx}`), like `grep --include` |
+| `context` | integer | | — | Lines before/after; turns on `--` group separators |
+| `no_ignore` | boolean | | `false` | Also search what `.gitignore`/`.ignore`/git excludes, `node_modules` and `target` skip |
 
-Excludes `.git`, `node_modules`, `target`. 15s timeout. Output truncated at `max_tool_output` (default 30KB, shared limit).
+- **Dialect:** Rust regex, as in ripgrep: `a|b`, `+`, `?`, `{n}`, `( )`, `\d`, `\b` and `(?i)` work as written. `\|` is a literal `|`, not alternation. No lookaround or backreferences. Escape `(` `)` `[` `{` and the other metacharacters with a backslash to match them literally: `fn main() {` is an invalid pattern; write `fn main\(\) \{`.
+- **Result:** `grep -rn`'s format: `path:line:text`, `path-line-text` for context, `--` between groups, no path for a file argument, sorted by path. Exactly `No matches found.` when nothing matched. An invalid pattern is a tool error (`invalid regex: …` and a `Hint:` line), as is a missing path (`Path not found: …`) or a search that could read nothing. Matches that come with errors (an unreadable file) are kept, with a note giving the error count and the first error. Binary files (a NUL byte) are skipped and the matching ones listed in a note (`[binary file matches, lines not shown: …]`).
+- **Walk:** respects `.gitignore` (in a git repo), `.ignore`, `.git/info/exclude` and global git excludes; always skips `node_modules` and `target` unless `no_ignore`; never enters `.git`, `.svn`, `.hg`, `.bzr`, `.jj`, `.sl`. Hidden files are searched; links inside the tree are not followed; only regular files are read (no FIFOs or devices).
+- **Size:** lines over 500 chars are cut. Output stops at `max_tool_buffer` (256 KiB) on a whole line, with `... (output truncated, more than N total bytes)` appended. The result then goes through tool output spill (`tool_output_spill_bytes`) like any other; with spill off, the `max_tool_output` cut applies.
+- **Time:** 15s deadline. Matches found by then come back with a note that more may be missing (also on cancel); with none, a tool error. A timed-out or cancelled search stops.
 
 ### `find`
-Glob-based file search.
+File-name search, run in-process on grep's walker (`tools/search/files.rs`): no `find` binary, so it works the same on Linux, macOS and Windows (no Git for Windows) and in the hardened build.
 
 | Parameter | Type | Req | Default | Notes |
 |---|---|---|---|---|
-| `pattern` | string | ✓ | — | |
-| `path` | string | | `.` | |
-| `type` | string | | — | `"f"` or `"d"` |
+| `pattern` | string | ✓ | — | Glob on the file name (`*.rs`, `Cargo.*`, `*.{rs,toml}`), case-sensitive. Invalid → tool error with the parse error. A path separator in it is a tool error too: names hold none, so put the directory in `path` |
+| `path` | string | | `.` | Directory or file (session cwd for relative paths) |
+| `type` | string | | — | `"f"`, `"d"` or `"l"` (symlink, never followed); anything else → tool error |
+| `no_ignore` | boolean | | `false` | Also list what `.gitignore`/`.ignore`/git excludes, `node_modules` and `target` skip |
 
-Same excludes as grep. 10s timeout.
+- **Result:** one path per line, as `find PATH` printed it: the path joined with the entry below it (`<cwd>/./src/a.rs` for `.`; the TUI card shortens it), native separators. Sorted by name, a directory before its entries. The path itself comes first when its name matches (as `-name` takes it: `.` for the default path). Exactly `No files found.` when nothing matched. A missing path is a tool error (`Path not found: …`), as is a path that could not be read at all. Results that come with errors (an unreadable directory) are kept, with a note giving the error count and the first error.
+- **Walk:** grep's: respects `.gitignore` (in a git repo), `.ignore`, `.git/info/exclude` and global git excludes; `node_modules` and `target` are neither listed nor walked unless `no_ignore`; `.git`, `.svn`, `.hg`, `.bzr`, `.jj`, `.sl` are never listed or entered. Hidden entries are listed. An explicit `path` is always walked, even inside `node_modules`; a linked `path` is followed, links inside the tree are not. Nothing is opened, so a FIFO is listed like any entry.
+- **Size:** output stops at `max_tool_buffer` (256 KiB) on a whole line, with grep's truncation footer; then tool output spill as for grep.
+- **Time:** 10s deadline. Paths found by then come back with a note that more may be missing (also on cancel); with none, a tool error. A timed-out or cancelled walk stops.
 
 ### `ls`
 `ls -lah` output.
@@ -731,16 +710,6 @@ Load behavioral guidelines. Discovery roots: `.synaps-cli/plugins/`, `.synaps-cl
 ### `shell_start` / `shell_send` / `shell_end`
 Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shell_send` to interact and `shell_end` to clean up. For interactive programs (REPLs, SSH, etc.). See `crates/agent-engine/src/tools/shell/` for the full state machine.
 
-### `watcher_exit`
-**Watcher agents only.** Writes `handoff.json`, triggers shutdown.
-
-| Parameter | Type | Req | Default |
-|---|---|---|---|
-| `reason` | string | ✓ | — |
-| `summary` | string | ✓ | — |
-| `pending` | array[string] | | `[]` |
-| `context` | object | | `{}` |
-
 ---
 
 ## Quick-Reference Summary
@@ -753,8 +722,8 @@ Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shel
 | `edit` | path, old_string, new_string | — | Surgical editing |
 | `multi_edit` | edits | placeholders | Anchored multi-file edits, all or nothing |
 | `powershell`† | command | timeout | PowerShell execution |
-| `grep` | pattern | path, include, context | Regex search |
-| `find` | pattern | path, type | File discovery |
+| `grep` | pattern | path, include, context, no_ignore | Regex search (in-process) |
+| `find` | pattern | path, type, no_ignore | File discovery (in-process) |
 | `ls` | — | path | Directory listing |
 | `subagent` | task | agent, system_prompt, model, timeout, thinking | Agent dispatch |
 | `connect_mcp_server` | server | — | MCP server connection |
@@ -767,9 +736,8 @@ Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shel
 | `subagent_steer` | handle_id, message | — | Inject guidance mid-run |
 | `subagent_collect` | handle_id | — | Collect result (non-blocking poll) |
 | `subagent_resume` | handle_id, instructions | archive_path, timeout, thinking | Continue a finished/timed-out/failed worker from its own archived conversation |
-| `watcher_exit`* | reason, summary | pending, context | Watcher handoff |
 
-*Watcher agents only. Subagents cannot use `subagent`, `connect_mcp_server`, `load_skill`, `watcher_exit`. †Windows only.
+Subagents cannot use `subagent`, `connect_mcp_server`, `load_skill`. †Windows only.
 
 ---
 
@@ -823,11 +791,11 @@ The model reports task phases through `context_checkpoint`; short `memory_search
 Unix only for now. Rollover waits for a durable frontend head acknowledgement;
 journal generations prevent stale replay after head replacement. Failed saves
 block inference until recovery; this is not an exactly-once tool-effect guarantee.
-No Axel note migration is implied. See
+See
 [context-continuation spec](docs/specs/context-continuation.md) for bounds and
 the 140k/200k versus 250k–400k/1m policy.
 
-Resolution (`crates/agent-core/src/core/session.rs::resolve_session()`) tries **chain name → session name → partial ID** in that order. Used by `synaps --continue <NAME_OR_ID>`, `/resume`, and server `--continue`. The resolution path is surfaced to the user via a system message (e.g. `↳ resolved via chain 'foo'`).
+Resolution (`crates/agent-core/src/core/session.rs::resolve_session()`) tries **chain name → session name → partial ID** in that order. Used by `synaps --continue <NAME_OR_ID>`, `/resume`, and `synaps rpc --continue`. The resolution path is surfaced to the user via a system message (e.g. `↳ resolved via chain 'foo'`).
 
 ---
 
@@ -858,7 +826,6 @@ For agents touching this code — what's protected, what isn't, and what to neve
 - **`bash` is unsandboxed.** Full user privileges, no path restrictions. The model can run anything.
 - **The `read` tool can read `~/.synaps-cli/config` and the auth store** — a prompt-injected agent can exfiltrate API keys into context, session logs, or subagent logs (`~/.synaps-cli/logs/subagents/`). There is no denylist.
 - **Event bus has no sender authentication.** Filesystem perms (0600/0700) stop other *users*, but any same-UID process can drop JSON into the inbox or hit the session socket and trigger an unattended model turn. Events are untrusted input — prompt injection by design. Treat event content accordingly.
-- **Watcher IPC** (`src/watcher/ipc.rs`): socket chmod'd `0600` after bind (small race window); no command-level auth on deploy/stop beyond filesystem perms.
 - **Marketplace installs are TOFU** (trust-on-first-use, per `github.com/<owner>` host key — `crates/agent-engine/src/skills/marketplace.rs`). No signature verification — a compromised upstream repo ships straight to users on update.
 - **`run_script` keybind is an unimplemented stub** — when implementing, validate the path stays inside the plugin dir.
 - **`inject_prompt` keybinds** let plugins submit text as the user. Audit third-party plugin manifests before install.

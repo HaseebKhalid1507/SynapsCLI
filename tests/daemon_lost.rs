@@ -68,15 +68,15 @@ async fn daemon_sigkill_line_client_exits_nonzero() {
         .unwrap();
     let (t, _snap) = SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(guard.home.path().to_path_buf()),
                 env: None,
                 model_override: Some("claude-sonnet-4-5".into()),
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .unwrap();
@@ -168,14 +168,14 @@ async fn daemon_sigkill_socket_transport_reports_crash() {
         .unwrap();
     let (mut t, _snap) = SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(guard.home.path().to_path_buf()),
                 env: None,
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .unwrap();

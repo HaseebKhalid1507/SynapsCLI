@@ -115,14 +115,21 @@ impl AuthMethods {
     }
 }
 
-/// True if `model` routes to the Anthropic path (not OpenAI/codex/local). Used
-/// to skip the Anthropic pre-stream refresh for non-Anthropic models — they
-/// resolve their own provider auth (incl. via the broker), so fetching an
-/// Anthropic token first is wasteful and would FAIL on a codex-only Remote
-/// broker. (#158 C4/#7)
+/// True if `model` routes to the Anthropic path (not OpenAI/codex/local, and
+/// not a model an extension provides). Used to skip the Anthropic pre-stream
+/// refresh for non-Anthropic models — they resolve their own provider auth
+/// (incl. via the broker), so fetching an Anthropic token first is wasteful
+/// and would FAIL on a codex-only Remote broker (#158 C4/#7) — and to keep
+/// cache keep-warm requests off every other transport.
+///
+/// `plugin:provider:model` is asked about first, as routing does
+/// (`openai::try_route_with_memory_backend`): it has no `/`, and
+/// `resolve_route` sends every id without one to Anthropic.
 pub(super) fn model_is_anthropic(model: &str) -> bool {
-    crate::runtime::openai::resolve_route(model)
-        .is_some_and(|route| route.wire == crate::runtime::openai::WireProtocol::AnthropicMessages)
+    crate::extensions::providers::ProviderRegistry::parse_model_id(model).is_none()
+        && crate::runtime::openai::resolve_route(model).is_some_and(|route| {
+            route.wire == crate::runtime::openai::WireProtocol::AnthropicMessages
+        })
 }
 
 /// The model key handed to the broker's capacity selector for an Anthropic
@@ -1095,6 +1102,70 @@ fn auth_file_changed(recorded: Option<std::time::SystemTime>) -> bool {
 mod tests {
     use super::*;
     use crate::auth::TokenCache;
+
+    /// What routing sends to the Anthropic transport is Anthropic's, and
+    /// nothing else: a model an extension provides has no `/` either, and
+    /// routing hands it to the extension before it looks for a route.
+    #[test]
+    fn an_extension_provided_model_is_not_anthropic() {
+        for anthropic in ["claude-opus-4-7", "claude-sonnet-4-6", "anthropic/claude-opus-4-7"] {
+            assert!(model_is_anthropic(anthropic), "{anthropic}");
+        }
+        for other in [
+            "plug:prov:model-x",
+            "my-plugin:local:claude-opus-4-7",
+            "groq/llama-3.3-70b-versatile",
+        ] {
+            assert!(!model_is_anthropic(other), "{other}");
+        }
+    }
+
+    /// A turn asks for an Anthropic token only for a model the Anthropic
+    /// transport serves. A chat on a model an extension provides asks the
+    /// broker for nothing, at turn start and for a keep-warm ping; it used
+    /// to count as Anthropic's, so its turn failed when no Anthropic
+    /// credential could be had, though the extension needs none.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_turn_on_an_extension_model_asks_for_no_anthropic_token() {
+        use axum::{http::StatusCode, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _config = crate::test_env::BaseDirGuard::new();
+        // A broker with no Anthropic seat to vend: it counts and refuses.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let app = Router::new().fallback(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { (StatusCode::FORBIDDEN, "no Anthropic account") }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut rt = crate::Runtime::new_headless();
+        rt.credential_source = CredentialSource::Remote {
+            endpoint: format!("http://{addr}"),
+            machine_token: "m".into(),
+        };
+        rt.set_model("claude-sonnet-4-6".to_string());
+        assert!(rt.refresh_if_needed().await.is_err(), "a Claude model needs the token");
+        let for_claude = asked.load(Ordering::SeqCst);
+        assert!(for_claude > 0, "the broker was asked");
+
+        rt.set_model("plug:prov:model-x".to_string());
+        assert_eq!(rt.model(), "plug:prov:model-x");
+        rt.refresh_if_needed()
+            .await
+            .expect("an extension's model needs no Anthropic token");
+        rt.refresh_for_keepwarm().await.expect("nor does a ping it never gets");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            for_claude,
+            "the broker was asked for an Anthropic token for an extension's model"
+        );
+    }
 
     /// Tiny in-test broker that always returns `token_json` at GET /token.
     async fn spawn_broker(token_json: &'static str) -> String {

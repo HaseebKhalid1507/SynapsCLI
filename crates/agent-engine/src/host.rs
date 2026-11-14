@@ -33,6 +33,8 @@ pub struct HostParts {
     /// `<base>/spill` (tool output virtualisation), bound once at boot.
     pub spill_root: std::path::PathBuf,
     pub progressive_tool_disclosure: bool,
+    /// `tools.always_loaded` (joined to the progressive session core).
+    pub tools_always_loaded: Arc<[crate::tools::catalog::ToolId]>,
 }
 
 pub struct HostOpts {
@@ -194,10 +196,6 @@ impl EngineHost {
             Arc::clone(&hook_bus),
             Arc::clone(&tools),
         );
-        // Per-process: tell the extension manager whether memory is exclusive
-        // (Axel) so extensions spawned later inherit the right policy.
-        let mem_binding = crate::memory_backend::MemoryBinding::from_config(&config.memory_backend);
-        ext_mgr.bind_memory_backend(mem_binding.exclusive());
         ext_mgr.set_progressive_deferral(config.progressive_tool_disclosure);
         let extension_runtime = if config.progressive_tool_disclosure {
             Some(ext_mgr.extension_runtime())
@@ -217,6 +215,7 @@ impl EngineHost {
             capture_dir,
             spill_root,
             progressive_tool_disclosure: config.progressive_tool_disclosure,
+            tools_always_loaded: Arc::from(config.tools_always_loaded.as_slice()),
         };
 
         Ok(Arc::new(Self {
@@ -378,32 +377,14 @@ impl EngineHost {
 
     /// `foreground_runtime()` for a session whose cwd is not the process cwd
     /// (daemon-hosted sessions). The cwd is set BEFORE `apply_config` so the
-    /// memory binding (`apply_memory_backend_config`, one-shot) scopes to the
+    /// memory binding (`bind_memory`, one-shot) scopes to the
     /// session's project, not the daemon's — A-engine-merge §4. `None` =
     /// process cwd, byte-identical to `foreground_runtime()`.
     pub async fn foreground_runtime_for(&self, cwd: Option<std::path::PathBuf>) -> Result<Runtime> {
-        self.foreground_runtime_with(cwd, true).await
-    }
-
-    /// `foreground_runtime_for`, applying the operator's `memory.default_mode`
-    /// only when `memory_default` — a session runtime rebuilt for a session
-    /// that made its own `/memory` choice passes `false` and restores that
-    /// choice instead (`SessionConfig::memory_mode`).
-    pub(crate) async fn foreground_runtime_with(
-        &self,
-        cwd: Option<std::path::PathBuf>,
-        memory_default: bool,
-    ) -> Result<Runtime> {
         let mut runtime = Runtime::from_parts(RuntimeParts::with_reaper(self.parts.clone()));
         runtime.set_cwd(cwd);
         let config = self.config();
         runtime.apply_config_keep_tools(&config);
-        // Every interactive session starts in the operator's confirmed
-        // `memory.default_mode` (after the backend binding above). A failed
-        // grant is logged and leaves memory off; it never fails the session.
-        if memory_default {
-            let _ = runtime.apply_memory_default_mode(&config.memory);
-        }
         Ok(runtime)
     }
 
@@ -455,8 +436,7 @@ impl EngineHost {
     /// The worker's built-ins are built from scratch, so the boot-time
     /// disable on the shared registry does not carry over: `worker_set`
     /// re-applies the whole `disabled_tools` list (before, a worker of a
-    /// host with `disabled_tools = bash` still had `bash`; only the forum
-    /// names were re-applied). The template is a pure function of the shared
+    /// host with `disabled_tools = bash` still had `bash`). The template is a pure function of the shared
     /// registry's tool set (a pure function of its catalog generation) and
     /// the list, so caching by both returns exactly what a rebuild would,
     /// and a `reload_config` that changes the list rebuilds it.

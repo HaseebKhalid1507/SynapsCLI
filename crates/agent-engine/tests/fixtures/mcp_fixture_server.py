@@ -9,7 +9,11 @@ assumptions, no sockets, no network. Behavior is driven by env:
   MCP_FIXTURE_MODE       ok (default) | huge (oversized init line) |
                          error (hostile provider error message on init) |
                          hang (log spawn and requests, never reply; exit on
-                         stdin EOF)
+                         stdin EOF) | call_error (tools/call answers
+                         isError with MCP_FIXTURE_CALL_TEXT, default "nope") |
+                         call_rpc_error (tools/call answers a JSON-RPC
+                         error) | call_eof (exit on tools/call, closing
+                         stdout)
   MCP_FIXTURE_MODE_FILE  optional file whose stripped content overrides
                          MCP_FIXTURE_MODE (switch behaviour without changing
                          the launch config fingerprint)
@@ -92,6 +96,18 @@ for line in sys.stdin:
         reply({"jsonrpc": "2.0", "id": rid, "result": {"tools": tools}})
     elif method == "tools/call":
         params = msg.get("params", {})
+        if mode == "call_error":
+            reply({"jsonrpc": "2.0", "id": rid,
+                   "result": {"content": [{"type": "text",
+                                           "text": os.environ.get("MCP_FIXTURE_CALL_TEXT", "nope")}],
+                              "isError": True}})
+            continue
+        if mode == "call_rpc_error":
+            reply({"jsonrpc": "2.0", "id": rid,
+                   "error": {"code": -32603, "message": "call broke"}})
+            continue
+        if mode == "call_eof":
+            break
         reply({"jsonrpc": "2.0", "id": rid,
                "result": {"content": [{"type": "text",
                                        "text": "called:" + str(params.get("name"))}]}})

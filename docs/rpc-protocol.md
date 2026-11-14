@@ -9,7 +9,7 @@ child process per Slack thread and communicates with it over the child's
 `stdin` / `stdout` pipes.
 
 **One process = one synaps session.**  The child reuses the same `Runtime`,
-`Session`, and streaming engine that `synaps server` uses, so tool execution,
+`Session`, and streaming engine as the TUI and the daemon, so tool execution,
 MCP, skills, and session persistence all work identically.
 
 ---

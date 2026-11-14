@@ -180,16 +180,16 @@ async fn session_env_differential_in_process_vs_daemon() {
         .unwrap();
     let (mut transport, _snap) = SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(test_cwd.clone()),
                 env: Some(env.clone()),
                 model_override: Some("claude-sonnet-4-5".into()),
                 persist: false,
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .expect("attach create");
@@ -343,16 +343,16 @@ async fn attach_existing_does_not_change_env() {
         .unwrap();
     let (mut t1, snap1) = SocketTransport::attach(
         conn1,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(test_cwd.clone()),
                 env: Some(env.clone()),
                 model_override: Some("claude-sonnet-4-5".into()),
                 persist: false,
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .expect("attach create");

@@ -13,11 +13,18 @@ hooks.
 | `on_compaction`       | new session id      | unchanged                                  |
 | `on_session_start`    | session id          | unchanged                                  |
 | `on_session_end`      | session id          | unchanged                                  |
+| `on_context_archived` | (new hook)          | `"<conversation id>"` of the chat whose window was archived; always set |
+| `on_memory_forgotten` | (new hook)          | `"<conversation id>"` of the chat whose `memory_forget` call it was; `null` when the call had no chat behind it |
 | `tool.call` request   | absent              | `params.session_id`: the conversation that invoked the extension's tool (`null` for workers) |
 
 The field already existed as `Option<String>` in the JSON schema
 (`docs/extensions/contract.json`), so the change is **additive**: an
 extension that ignores `session_id` sees the same shape it always did.
+
+`session_id` says which chat; it does not say which project. For that, every
+hook event and `tool.call` also carries `cwd`, the chat's working folder
+(set for workers too, and not affected by `SYNAPS_HOOK_SESSION_ID`). See
+`hooks.md`, "`cwd`: the chat's working folder".
 
 ## When it is still `null`
 
@@ -28,14 +35,23 @@ extension that ignores `session_id` sees the same shape it always did.
   `hooks.md`, "Subagent workers"), and it arrives with `session_id: null`;
   `SYNAPS_HOOK_SESSION_ID=0` changes nothing for it. Plugins must not assume
   every tool call belongs to a session.
-- **Extension-originated `tool.invoke`.** A tool invoked by a sidecar via the
-  extension protocol runs outside a conversation turn; `null`.
-- **`tool.call` outside a conversation.** The extension-provider tool route,
-  skill commands and host-originated lease calls (memory capture/recall)
-  send `params.session_id: null`.
+- **The host's own `tool.call`s.** The calls the host makes to a memory
+  extension for a chat (capture and recall) send `params.session_id: null`:
+  the host makes them, not the chat's model. Their `params.cwd` is the
+  chat's folder.
 - **Kill-switch `SYNAPS_HOOK_SESSION_ID=0`** (also `false`/`off`): forces
   `null` on the four tool/message hooks and on `tool.call` `params.session_id`. Use it if a plugin misbehaves on the
   new value. Session-lifecycle hooks are unaffected.
+
+Two kinds of call used to send `null` and now carry the chat's id, on their
+hook events and in `tool.call`: the tool calls of a model an extension
+provides (the host runs them in a loop of their own), and an extension tool
+run by a plugin slash command. No worker runs on a model an extension
+provides: a worker's model is an exact `provider/model` id that the chat's
+worker policy authorizes (`subagent`, `subagent_start` and `subagent_resume`
+all go through `OrchestrationRuntime::resolve_and_authorize`), and a
+`plugin:provider:model` id has no `/`, so it is refused there;
+`subagent_model_authorize` accepts only ids of the built-in catalogs.
 
 ## Why: one sidecar, many sessions
 
@@ -50,8 +66,9 @@ two sessions interleave their hooks on the same stdin. Key per-session state
 on `params.session_id`, and treat `null` as "no session (worker)".
 
 The in-tree helper is `HookEvent::with_session(Option<&str>)`; the runtime
-emitters `emit_before_tool_call` / `emit_after_tool_call` take a trailing
-`session_id: Option<&str>`.
+emitters `emit_before_tool_call` / `emit_after_tool_call` take
+`session_id: Option<&str>` followed by `cwd: Option<&Path>`
+(`HookEvent::with_cwd`).
 
 ## Plugin contract (daemon-mode phase 3, C2)
 

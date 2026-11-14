@@ -1185,7 +1185,6 @@ fn gemini_report_keeps_shared_internal_tool_rule() {
     let tools = vec![
         json!({"name": "respond", "input_schema": {"type": "object"}}),
         json!({"name": "send_channel", "input_schema": {"type": "object"}}),
-        json!({"name": "watcher_exit", "input_schema": {"type": "object"}}),
     ];
     let losses = losses_for(&[], &tools);
     let ids: Vec<_> = losses
@@ -1193,5 +1192,5 @@ fn gemini_report_keeps_shared_internal_tool_rule() {
         .filter(|l| l.action == TranslationAction::Dropped && l.element == TranslationElement::Tool)
         .map(|l| l.element_id.as_ref().unwrap().to_string())
         .collect();
-    assert_eq!(ids, ["respond", "send_channel", "watcher_exit"]);
+    assert_eq!(ids, ["respond", "send_channel"]);
 }

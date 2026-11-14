@@ -92,6 +92,7 @@ fn continue_attach(journal_id: &str, cwd: Option<PathBuf>, mode: AttachMode) -> 
             ..Default::default()
         },
         mode,
+        owned: None,
     }
 }
 

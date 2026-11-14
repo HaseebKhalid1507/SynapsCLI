@@ -19,7 +19,7 @@ Any other approaches you've thought about.
 Which part of the agent runtime does this relate to?
 - [ ] Interactive mode (chatui)
 - [ ] Orchestration (subagents)
-- [ ] Autonomous agents (Watcher)
+- [ ] Daemon sessions (synaps daemon, --attach)
 - [ ] Tool system
 - [ ] MCP integration
 - [ ] Other
