@@ -1260,7 +1260,7 @@ fn removed_axel_backend_warning() -> String {
          longer supported: since {v} Synaps keeps context archives and notes in plain files under \
          its base directory, always, and Axel is an extension. This session uses plain files. \
          Archives and notes saved to the Axel brain are not read any more: move them once with \
-         \"axel synaps-export\" (Axel v2) and \"synaps memory import-archives\" / \
+         \"axel synaps-export\" (Axel 0.1.0) and \"synaps memory import-archives\" / \
          \"import-notes\", install the Axel extension for recall and the forum, then remove the \
          memory.backend, memory.user_scope and memory.axel.* lines. See \
          https://github.com/HaseebKhalid1507/SynapsCLI/blob/dev/docs/upgrading/{v}.md",
@@ -3785,7 +3785,7 @@ mod tests {
              memory.axel.*) is no longer supported: since {v} Synaps keeps context archives and \
              notes in plain files under its base directory, always, and Axel is an extension. \
              This session uses plain files. Archives and notes saved to the Axel brain are not \
-             read any more: move them once with \"axel synaps-export\" (Axel v2) and \
+             read any more: move them once with \"axel synaps-export\" (Axel 0.1.0) and \
              \"synaps memory import-archives\" / \"import-notes\", install the Axel extension \
              for recall and the forum, then remove the memory.backend, memory.user_scope and \
              memory.axel.* lines. See \
