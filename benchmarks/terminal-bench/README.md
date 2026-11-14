@@ -129,6 +129,19 @@ plan](analysis/README.md#6-ranked-changes-and-exact-regression-guards).
   "If any part of the task is not yet complete and verified, continue now and
   finish it… If it is complete and verified, reply with a one-line summary and
   stop." Both are verbatim in `synaps_agent.py`.
+- **Completion mode:** the published run used `completion=confirm`, the
+  default (the fixed message above). `--ak completion=closeout` is an opt-in
+  alternative, not yet run on any task: the driver reads how the turn ended
+  (the daemon's `done`/`error` event and the last api-log `stop_reason`) and
+  sends at most two continuations after an output-limit stop, then one
+  close-out (check each requirement against evidence, fix only demonstrated
+  violations) after a voluntary end. After a refusal it sends nothing, or one
+  factual note with `--ak refusal_note=true`. After an error, a cancellation,
+  the deadline or unclear signals it sends nothing.
+  `--ak agent_timeout_sec=<s>` adds elapsed/remaining minutes (Harbor doesn't
+  pass the timeout to agents). Decisions go to `agent/completion.jsonl`; the
+  mode is recorded in the trajectory (`agent.extra.completion`) and the
+  result's agent metadata.
 - **Host:** one 24-core, 30 GB workstation running Docker, with up to ~17
   trials at once. Load average reached 85 with heavy swapping during the run.
 
@@ -254,4 +267,6 @@ SYNAPS_BINARY=/path/to/synaps-x86_64-unknown-linux-musl/synaps PYTHONPATH=. \
 ```
 
 See the docstring at the top of `synaps_agent.py` for the environment
-variables. Keep `-n` low enough for your Docker address pools and RAM.
+variables. Keep `-n` low enough for your Docker address pools and RAM. The
+harness tests need no Docker or model:
+`.venv/bin/python -m unittest discover -s tests`.

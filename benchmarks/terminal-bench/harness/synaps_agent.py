@@ -16,7 +16,9 @@ Per trial:
     day (synaps-run.sh starts `synaps daemon`, attaches over its socket via
     the static uds-relay and creates a session with the TUI's settings): the
     instruction, then one fixed CONFIRM message (same text for every task),
-    then /close (saved) and daemon stop,
+    then /close (saved) and daemon stop. `--ak completion=closeout` (opt-in,
+    not the published run) replaces CONFIRM with follow-ups chosen by how the
+    turn ended (see CLOSEOUT and synaps-run.sh),
   * converts the daemon event log to an ATIF trajectory (trajectory.json),
     which the leaderboard requires for every passing trial.
 
@@ -41,9 +43,9 @@ import shlex
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, override
+from typing import Any, Literal, Self, override
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from harbor.agents.capabilities import AgentCapabilities
 from harbor.agents.installed.base import BaseInstalledAgent, with_prompt_template
@@ -72,6 +74,7 @@ INSTALL_DIR = "/installed-agent"  # created as root by BaseInstalledAgent.setup
 LOG_DIR = "/logs/agent"
 EVENTS_LOG = "daemon-events.jsonl"
 API_LOG = "api-log.jsonl"
+COMPLETION_LOG = "completion.jsonl"  # closeout only: one line per decision
 
 # synaps 0.11.1's built-in default system prompt (non-Windows), verbatim.
 # A system.md replaces it, so the run keeps it and appends AUTONOMY.
@@ -115,6 +118,40 @@ CONFIRM = (
     "If it is complete and verified, reply with a one-line summary and stop."
 )
 
+# completion=closeout (opt-in): no CONFIRM. After each turn synaps-run.sh reads
+# how it ended (daemon done/error event, last api-log stop_reason) and sends at
+# most: 2 x CONTINUE after an output-limit stop, then one CLOSEOUT after a
+# voluntary end; after a refusal nothing, or one REFUSAL_NOTE if enabled. The
+# driver fills @E@/@T@/@R@ (elapsed/limit/remaining minutes).
+CLOSEOUT_TIME = " Elapsed: @E@ of @T@ minutes (@R@ remaining)."
+CLOSEOUT = (
+    "Automated close-out (no human is present).{time} Before you stop, check your "
+    "work against the task once:\n"
+    "1. List each explicit requirement and the evidence you have that it is met, "
+    "measured the way the task states it. If a cheap, safe check is missing, run it.\n"
+    "2. List any caveat, assumption or risk you raised. For each: if the evidence "
+    "shows a requirement is violated, or something contradicts your result (a failing "
+    "check, a labelled example, the source the task names as authoritative), fix it "
+    "with the smallest justified change, or undo a change you can't justify. "
+    "Otherwise leave it and say why it doesn't violate the task. Don't make "
+    "speculative changes just to remove a caveat.\n"
+    "3. Don't repeat irreversible actions, don't experiment on a live system the task "
+    "depends on, and don't weaken a check to make it pass.\n"
+    "Then end with a one-line summary."
+)
+CONTINUE = (
+    "Automated message (no human is present): your last response was cut off at the "
+    "output limit. Continue from where it stopped. Do long work through tools, and "
+    "keep each response shorter."
+)
+REFUSAL_NOTE = (
+    "Automated note (no human is present): your previous response was stopped by the "
+    "API's safety classifier. This is not a tool or API error. Its content was withheld "
+    "and any tool calls in it did not run. Do not produce that content again, even "
+    "reworded. Continue with any other parts of the task that are fine, then end with a "
+    "one-line summary."
+)
+
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
 
@@ -122,6 +159,40 @@ class SynapsOptions(InstalledAgentOptions):
     reasoning_effort: Effort | None = Field(
         default=None, description="synaps `thinking` level (default: xhigh)."
     )
+    completion: Literal["confirm", "closeout"] = Field(
+        default="confirm",
+        description="After the first turn: confirm = the fixed CONFIRM (published run); "
+        "closeout = state-aware continuation/close-out (opt-in).",
+    )
+    refusal_note: bool = Field(
+        default=False,
+        description="closeout only: after a refusal send one factual note instead of nothing.",
+    )
+    agent_timeout_sec: float | None = Field(
+        default=None, gt=0,
+        description="closeout only: the trial's agent timeout (Harbor doesn't pass it to "
+        "agents). Adds elapsed/remaining minutes to the close-out; nothing is sent with "
+        "under 60 s left.",
+    )
+
+    @model_validator(mode="after")
+    def _closeout_flags(self) -> Self:
+        if self.completion != "closeout" and (self.refusal_note or self.agent_timeout_sec):
+            raise ValueError("refusal_note and agent_timeout_sec need completion=closeout")
+        return self
+
+
+def completion_env(options: SynapsOptions) -> str:
+    """completion.env for synaps-run.sh (closeout): shell assignments, messages as
+    JSON strings, empty = off/unknown."""
+    timeout = options.agent_timeout_sec
+    values = {
+        "SX_TIMEOUT_S": str(int(timeout)) if timeout else "",
+        "SX_CLOSEOUT": json.dumps(CLOSEOUT.format(time=CLOSEOUT_TIME if timeout else "")),
+        "SX_CONTINUE": json.dumps(CONTINUE),
+        "SX_REFUSAL_NOTE": json.dumps(REFUSAL_NOTE) if options.refusal_note else "",
+    }
+    return "".join(f"{k}={shlex.quote(v)}\n" for k, v in values.items())
 
 
 def _now_iso(ms: int | None = None) -> str:
@@ -386,23 +457,46 @@ class SynapsAgent(BaseInstalledAgent):
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
     ) -> None:
+        closeout = self.options.completion == "closeout"
         # One JSON string per line; synaps-run.sh embeds each as a Submit's text.
         await self._upload_text(
             environment,
-            "".join(json.dumps(p) + "\n" for p in (instruction, CONFIRM)),
+            "".join(json.dumps(p) + "\n" for p in ((instruction,) if closeout else (instruction, CONFIRM))),
             f"{INSTALL_DIR}/prompts.jsonl",
             0o644,
         )
-        await self.exec_as_agent(
-            environment,
-            command=f"bash {INSTALL_DIR}/sx-driver {INSTALL_DIR}/prompts.jsonl {LOG_DIR}",
-        )
+        command = f"bash {INSTALL_DIR}/sx-driver {INSTALL_DIR}/prompts.jsonl {LOG_DIR}"
+        if closeout:
+            await self._upload_text(environment, completion_env(self.options),
+                                    f"{INSTALL_DIR}/completion.env", 0o644)
+            command += f" {INSTALL_DIR}/completion.env"
+        await self.exec_as_agent(environment, command=command)
+
+    def _completion_meta(self) -> dict[str, Any]:
+        """Mode, flags and (closeout) the driver's decisions, so trials from
+        different completion modes can't be pooled unnoticed."""
+        o = self.options
+        if o.completion != "closeout":
+            return {"mode": o.completion}
+        decisions = []
+        log = self.logs_dir / COMPLETION_LOG
+        if log.exists():
+            for line in log.read_text(errors="replace").splitlines():
+                try:
+                    decisions.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return {"mode": "closeout", "refusal_note": o.refusal_note,
+                "agent_timeout_sec": o.agent_timeout_sec, "decisions": decisions}
 
     @override
     def populate_context_post_run(self, context: AgentContext) -> None:
+        completion = self._completion_meta()
+        context.metadata = {**(context.metadata or {}), "completion": completion}
         traj = self.convert_trajectory(self.logs_dir)
         if traj is None:
             return
+        traj.agent.extra = {**(traj.agent.extra or {}), "completion": completion}
         (self.logs_dir / "trajectory.json").write_text(format_trajectory_json(traj.to_json_dict()))
         # Task totals: every api-log row once, subagents included (see convert_trajectory).
         fm = traj.final_metrics
