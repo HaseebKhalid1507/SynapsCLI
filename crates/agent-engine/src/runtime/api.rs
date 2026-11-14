@@ -128,6 +128,14 @@ struct ParseState {
     server_diagnosis: Option<crate::runtime::trace::ServerCacheDiagnosis>,
 }
 
+/// HTTP statuses from the Anthropic API that a backoff retry can clear: 408
+/// request timeout, 429 rate limit, 500/502/503/504 server and gateway
+/// errors, Cloudflare's 520-524 edge errors, and 529 overloaded. The one
+/// retry set for the streaming and compaction paths and the keepwarm ping.
+pub(crate) fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 520..=524 | 529)
+}
+
 /// A failure surfaced as an in-stream Anthropic `error` event under a 200
 /// response. `retryable` follows Anthropic's error taxonomy: transient classes
 /// (`overloaded_error`, `api_error`, `rate_limit_error`) are retried with
@@ -148,7 +156,8 @@ struct StreamError {
 
 impl StreamError {
     /// Anthropic error `type`s that a retry can plausibly clear. Mirrors the
-    /// HTTP-status retry set (429 rate_limit, 500 api_error, 529 overloaded).
+    /// HTTP-status retry set in [`is_retryable_status`] (429 rate_limit,
+    /// 500 api_error, 529 overloaded).
     fn is_retryable_type(error_type: &str) -> bool {
         matches!(
             error_type,
@@ -1865,8 +1874,7 @@ impl ApiMethods {
                             }
 
                             let is_429 = status.as_u16() == 429;
-                            let is_retryable =
-                                matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                            let is_retryable = is_retryable_status(status.as_u16());
 
                             // Capture headers before consuming the body.
                             let (delay, from_hdr) =
@@ -2860,6 +2868,16 @@ where
 mod tests {
     use super::*;
     use crate::runtime::telemetry::TelemetryLevel;
+
+    #[test]
+    fn retryable_statuses_are_the_transient_set() {
+        for status in [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529] {
+            assert!(is_retryable_status(status), "HTTP {status} must retry");
+        }
+        for status in [200, 400, 401, 403, 404, 413, 422, 501, 519, 525] {
+            assert!(!is_retryable_status(status), "HTTP {status} must not retry");
+        }
+    }
 
     #[tokio::test]
     async fn non_anthropic_usage_is_booked_into_the_turn_counters() {

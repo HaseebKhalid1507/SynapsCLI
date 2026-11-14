@@ -378,8 +378,7 @@ impl ApiMethods {
                             let trace_rid =
                                 super::api::provider_request_id_from_headers(resp.headers());
                             let is_429 = status.as_u16() == 429;
-                            let is_retryable =
-                                matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                            let is_retryable = super::api::is_retryable_status(status.as_u16());
                             let (delay, from_hdr) = super::telemetry::retry_delay_from_headers(
                                 resp.headers(),
                                 attempt + 1,
