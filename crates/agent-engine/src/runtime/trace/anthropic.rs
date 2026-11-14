@@ -19,7 +19,7 @@ pub fn retry_class_for_status(status: u16) -> RetryClass {
     match status {
         429 => RetryClass::RateLimited,
         529 => RetryClass::Overloaded,
-        500 | 502 | 503 => RetryClass::ServerError,
+        500 | 502 | 503 | 504 | 520..=524 => RetryClass::ServerError,
         401 | 403 => RetryClass::Auth,
         408 => RetryClass::Timeout,
         _ => RetryClass::Other,
@@ -250,6 +250,19 @@ fn cache_meta(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn retry_class_covers_every_retried_status() {
+        for status in [500, 502, 503, 504, 520, 521, 522, 523, 524] {
+            assert_eq!(retry_class_for_status(status), RetryClass::ServerError, "{status}");
+        }
+        assert_eq!(retry_class_for_status(408), RetryClass::Timeout);
+        assert_eq!(retry_class_for_status(429), RetryClass::RateLimited);
+        assert_eq!(retry_class_for_status(529), RetryClass::Overloaded);
+        for status in [400, 413, 501, 525] {
+            assert_eq!(retry_class_for_status(status), RetryClass::Other, "{status}");
+        }
+    }
 
     fn message_boundaries(messages: &[crate::SharedMessage]) -> Vec<CacheBoundaryMeta> {
         cache_meta(messages, 0, None, false, false).boundaries
