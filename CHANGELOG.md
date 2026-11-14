@@ -626,6 +626,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Anthropic: 504, 408 and Cloudflare's 520-524 are retried.** A request
+  that got one of them failed at once (`not retried`), though like a 500 or
+  529 they are transient: a live request was lost to a single 520. They now
+  back off and retry under the same attempt cap and delays, in the chat and
+  compaction paths alike, the trace records 504 and 52x as server errors,
+  and a keepwarm ping that ends on a 408 backs off instead of stopping. The
+  OpenAI path already retried them.
 - **Extensions: the `on_message_complete` pages say what `has_tool_use: false`
   means.** It marks an assistant message that asked for no tools, not the end
   of a turn: steering or the Muse nudge can continue a turn after one, and a

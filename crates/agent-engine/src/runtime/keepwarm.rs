@@ -325,7 +325,7 @@ pub(crate) fn classify_failure(err: &RuntimeError, status: u16) -> PingFailure {
     if matches!(err, RuntimeError::Canceled) {
         return PingFailure::Canceled;
     }
-    if (400..500).contains(&status) && status != 429 {
+    if (400..500).contains(&status) && !super::api::is_retryable_status(status) {
         return PingFailure::Fatal(format!("HTTP {status}"));
     }
     match err {
@@ -1862,6 +1862,13 @@ mod tests {
             classify_failure(&api(), 529),
             PingFailure::Transient(_)
         ));
+        // A request timeout and Cloudflare edge errors back off, too.
+        for status in [408, 504, 520, 524] {
+            assert!(
+                matches!(classify_failure(&api(), status), PingFailure::Transient(_)),
+                "HTTP {status}"
+            );
+        }
         assert!(matches!(
             classify_failure(&api(), 0),
             PingFailure::Transient(_)
