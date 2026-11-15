@@ -13,11 +13,18 @@ All notable changes to this project will be documented in this file.
   Now a 429 that only rejects a per-model limit (the account-wide 5-hour and
   weekly limits reported and not rejected) cools just that model on that
   account; other models keep using it, and a later answer for another model
-  does not clear it. A missing header still cools the whole account. The
-  usage reading also reads Anthropic's new `limits` list, so the per-model
-  limit is seen before the first 429. `synaps status` shows it (e.g.
-  `Fable weekly 100%`) and marks the limit that is blocking, and `synaps auth
-  state` shows a model's cooldown with its model.
+  does not clear it. A missing header, or a rejected limit not known to
+  cover one model, still cools the whole account. The usage reading also
+  reads Anthropic's new `limits` list, so the per-model limit is seen
+  before the first 429. `synaps status` shows it by name and
+  marks a limit that is used up as blocking (e.g. `Fable 7d: 100% used ·
+  resets in 13h 48m · EXHAUSTED · BLOCKING`), and `synaps auth state` shows
+  a model's cooldown with its model.
+
+  Upgrade a credential broker and its clients together (e.g. a machine that
+  uses another machine's `synaps auth-broker`): an older client reports a
+  429 on one model's limit as the whole account's, and an older broker
+  ignores the model in a newer client's report and cools the whole account.
 
 ## [0.12.0] — 2026-11-14
 

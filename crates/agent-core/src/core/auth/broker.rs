@@ -5496,6 +5496,10 @@ pub fn global_broker() -> Arc<dyn CredentialBroker> {
 
 /// Legacy signature bridge: resolve an access token via the appropriate
 /// broker for `source`. Kept for CLI paths (`synaps status`).
+///
+/// Catalog / usage reads only: it asks with no model, so a limit or
+/// cooldown on one model does not apply to it. Inference must vend with
+/// its model (`access_token_pinned_for`).
 pub async fn broker_access_token(
     provider: OAuthProviderId,
     source: &super::CredentialSource,
