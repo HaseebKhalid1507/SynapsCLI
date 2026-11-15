@@ -354,20 +354,15 @@ fn limit_name(w: &UsageWindow) -> Option<&str> {
     w.limit_status.as_ref().and_then(|s| s.name.as_deref())
 }
 
-/// `EXHAUSTED` for a used-up window, `BLOCKING` for the one stopping
-/// requests (at or over its limit; the provider's severity / `is_active`
-/// are shown as its own words in `--verbose`, never as BLOCKING).
+/// `EXHAUSTED` for a used-up window: the limit stopping requests. The
+/// provider's severity / `is_active` are shown as its own words in
+/// `--verbose`, never as EXHAUSTED.
 fn window_flags(w: &UsageWindow, sep: &str) -> String {
-    let mut flags = String::new();
     if w.is_exhausted() {
-        flags.push_str(sep);
-        flags.push_str("EXHAUSTED");
+        format!("{sep}EXHAUSTED")
+    } else {
+        String::new()
     }
-    if w.is_blocking() {
-        flags.push_str(sep);
-        flags.push_str("BLOCKING");
-    }
-    flags
 }
 
 fn window_title(w: &UsageWindow) -> String {
@@ -1253,25 +1248,25 @@ mod usage_tests {
             .lines()
             .find(|l| l.trim_start().starts_with("Fable 7d: 100% used"))
             .unwrap_or_else(|| panic!("no Fable row:\n{text}"));
-        assert!(fable.ends_with(" · EXHAUSTED · BLOCKING"), "{fable}");
+        assert!(fable.ends_with(" · EXHAUSTED"), "{fable}");
         let weekly = text
             .lines()
             .find(|l| l.trim_start().starts_with("7d: 82% used"))
             .unwrap_or_else(|| panic!("no weekly row:\n{text}"));
-        assert!(!weekly.contains("BLOCKING"), "{weekly}");
+        assert!(!weekly.contains("EXHAUSTED"), "{weekly}");
         let verbose = render_verbose(&report, at);
         assert!(
             verbose.contains("Fable 7d limit · limits.weekly_scoped.fable (7d) · model fable"),
             "{verbose}"
         );
-        assert!(verbose.contains("100%  EXHAUSTED  BLOCKING"), "{verbose}");
+        assert!(verbose.contains("100%  EXHAUSTED"), "{verbose}");
         assert!(verbose.contains("provider: severity critical, active"), "{verbose}");
         let json = serde_json::to_value(&report).unwrap();
         let windows = json["accounts"][0]["snapshot"]["windows"].as_array().unwrap();
         let fable = windows.iter().find(|w| w["id"] == "limits.weekly_scoped.fable").unwrap();
         assert_eq!(fable["limit_status"]["severity"], "critical", "{fable}");
         assert_eq!(fable["scope"], serde_json::json!({"kind": "model", "model": "fable"}));
-        // Under 100 % but reported critical and active: not blocking. The
+        // Under 100 % but reported critical and active: not exhausted. The
         // provider's words stay in the verbose view.
         if let AccountUsageOutcome::Ok { snapshot } = &mut report.accounts[0].outcome {
             let w = snapshot
@@ -1283,9 +1278,9 @@ mod usage_tests {
         }
         let text = render_text(&report, at);
         assert!(text.contains("Fable 7d: 95% used · resets in 13h 48m\n"), "{text}");
-        assert!(!text.contains("BLOCKING"), "{text}");
+        assert!(!text.contains("EXHAUSTED"), "{text}");
         let verbose = render_verbose(&report, at);
-        assert!(!verbose.contains("BLOCKING"), "{verbose}");
+        assert!(!verbose.contains("EXHAUSTED"), "{verbose}");
         assert!(verbose.contains("provider: severity critical, active"), "{verbose}");
     }
 

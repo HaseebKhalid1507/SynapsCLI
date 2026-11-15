@@ -94,10 +94,10 @@ A window may also carry `limit_status` (Anthropic `limits[]` only):
 `{"name": "Fable", "severity": "critical", "active": true}` — the provider's
 name for what the limit covers, its severity and `is_active`. It is display
 only; capacity comes from the numbers. The text view names such a limit
-(`Fable 7d: 100% used · … · EXHAUSTED · BLOCKING`) and marks `BLOCKING` on a
-window that is at or over its limit: the limit that is stopping requests.
-The provider's severity and `is_active` (the limit that binds, at any level)
-never make a window `BLOCKING`; `--verbose` shows them as
+(`Fable 7d: 100% used · … · EXHAUSTED`); `EXHAUSTED` marks a window that is
+at or over its limit, the limit stopping requests. The provider's severity
+and `is_active` (the limit that binds, at any level) never make a window
+`EXHAUSTED`; `--verbose` shows them as
 `provider: severity critical, active`.
 
 `used_percent` is never a bare number. `Valid` requires a finite value in

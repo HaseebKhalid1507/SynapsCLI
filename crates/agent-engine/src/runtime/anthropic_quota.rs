@@ -312,12 +312,14 @@ pub(crate) fn classify_anthropic_429(
     Anthropic429::RateLimited
 }
 
-/// Unified claims known to cover one model's own limit: `7d_oi` (today's
-/// real one; its usage counterpart is the `weekly_scoped` limit of a single
-/// model) and the per-model weekly windows. Any other rejected claim
+/// Unified claims known to cover one model's own limit: `7d_oi`, the only
+/// one seen live (2026-11-15; its usage counterpart is the `weekly_scoped`
+/// limit of a single model). Per-model names such as `7d_opus` are not
+/// listed: they are unconfirmed, and the classifier cannot check that the
+/// claim's model is the requested one. Any other rejected claim
 /// (`seven_day_oauth_apps`, `seven_day_cowork`, … or one not yet seen)
 /// is treated as covering the account.
-const MODEL_CLAIMS: &[&str] = &["7d_oi", "7d_opus", "7d_sonnet"];
+const MODEL_CLAIMS: &[&str] = &["7d_oi"];
 
 /// The `anthropic-ratelimit-unified-<claim>-status: rejected` headers other
 /// than the account-wide `5h` / `7d` windows and `overage` (paid extra
@@ -1160,7 +1162,13 @@ mod tests {
     /// account, even beside allowed account windows and a known model claim.
     #[test]
     fn an_unknown_rejected_claim_cools_the_whole_account() {
-        for claim in ["7d_oauth_apps", "7d_cowork", "something_new"] {
+        for claim in [
+            "7d_oauth_apps",
+            "7d_cowork",
+            "7d_opus",
+            "7d_sonnet",
+            "something_new",
+        ] {
             let name = format!("anthropic-ratelimit-unified-{claim}-status");
             let unknown = headers(&[
                 ("anthropic-ratelimit-unified-status", "rejected"),
@@ -1177,15 +1185,12 @@ mod tests {
             ]);
             assert!(!model_scoped(&beside_known), "{claim} beside 7d_oi");
         }
-        for claim in ["7d_oi", "7d_opus", "7d_sonnet"] {
-            let name = format!("anthropic-ratelimit-unified-{claim}-status");
-            let known = headers(&[
-                ("anthropic-ratelimit-unified-status", "rejected"),
-                ("anthropic-ratelimit-unified-7d-status", "allowed"),
-                (name.as_str(), "rejected"),
-            ]);
-            assert!(model_scoped(&known), "{claim}");
-        }
+        let known = headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+        ]);
+        assert!(model_scoped(&known), "7d_oi");
     }
 
     #[test]

@@ -414,14 +414,6 @@ impl UsageWindow {
     pub fn is_exhausted(&self) -> bool {
         self.limit_reached == Some(true) || self.used_percent.valid().is_some_and(|p| p >= 100.0)
     }
-
-    /// The limit that is stopping requests: it is at or over its limit.
-    /// The provider's `severity` / `is_active` are not used: `is_active`
-    /// marks the limit that binds, at any level. Display only
-    /// (`synaps status`); selection reads the numbers.
-    pub fn is_blocking(&self) -> bool {
-        self.is_exhausted()
-    }
 }
 
 /// Three-state model availability derived from model-scoped windows.
@@ -2135,7 +2127,7 @@ mod tests {
                 active: Some(true),
             })
         );
-        assert!(fable.is_blocking());
+        assert!(fable.is_exhausted());
         let account: Vec<_> = s.account_windows().map(|w| w.id.as_str()).collect();
         assert_eq!(account, ["seven_day"], "weekly_all is not a second account window");
         let weekly = s.window("seven_day").unwrap();
@@ -2145,12 +2137,12 @@ mod tests {
             weekly.limit_status.as_ref().and_then(|l| l.severity.as_deref()),
             Some("warning")
         );
-        assert!(!weekly.is_blocking(), "82 %, warning, not active");
+        assert!(!weekly.is_exhausted(), "82 %, warning, not active");
         // `is_active` marks the limit that binds, at any level: under its
         // limit it is not blocking, whatever the provider's words.
         let mut binding = fable.clone();
         binding.used_percent = UsedPercent::from_f64(30.0);
-        assert!(!binding.is_blocking(), "30 %, critical, active");
+        assert!(!binding.is_exhausted(), "30 %, critical, active");
         assert_eq!(s.windows.len(), 2, "{:?}", s.windows);
         let entry = s.model_availability_for("claude-fable-5").expect("fable entry");
         assert_eq!(entry.availability, Availability::Exhausted);

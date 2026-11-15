@@ -1044,10 +1044,13 @@ async fn accounts_cooldown(
     let reason = report.reason.as_deref().unwrap_or("client_report");
     // The id the runtime matches on (`quota_model_key`): a client that
     // sent the routed `anthropic/<id>` still names `<id>`.
-    let model = report
-        .model
-        .as_deref()
-        .map(|m| m.trim().strip_prefix("anthropic/").unwrap_or(m.trim()));
+    let model = report.model.as_deref().map(|m| {
+        let m = m.trim();
+        match m.get(..10) {
+            Some(p) if p.eq_ignore_ascii_case("anthropic/") => &m[10..],
+            _ => m,
+        }
+    });
     if model.is_some_and(|m| !valid_cooldown_model(m)) {
         return (
             StatusCode::BAD_REQUEST,

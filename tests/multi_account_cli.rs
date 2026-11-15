@@ -670,10 +670,12 @@ async fn empty_account_usage_probe_is_a_json_400_that_reads_no_credential() {
 }
 
 /// The bella path end to end, through the real binary's router: a client
-/// reports a 429 on Fable's own limit (`model`, as sent with its routed
-/// `anthropic/` prefix); then an automatic token request for Fable is
+/// reports a 429 on Fable's own limit (`model`, with a routed
+/// `Anthropic/` prefix in any case); then an automatic token request for Fable is
 /// refused that account, while one for Opus, and one that names no model,
-/// is served from it.
+/// is served from it. Debug builds only: the usage-endpoint seam
+/// (`SYNAPS_TEST_BROKER_USAGE_URL`) is compiled out of release builds.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn a_reported_model_cooldown_refuses_only_that_model_over_http() {
     let sandbox = Sandbox::new();
@@ -755,7 +757,7 @@ async fn a_reported_model_cooldown_refuses_only_that_model_over_http() {
         .post(format!("{base}/accounts/cooldown"))
         .bearer_auth("synthetic-machine-auth")
         .json(&json!({"provider": "anthropic", "account": "claude1", "until_ms": until,
-            "reason": "anthropic_quota_exhausted", "model": "anthropic/claude-fable-5"}))
+            "reason": "anthropic_quota_exhausted", "model": "Anthropic/claude-fable-5"}))
         .send()
         .await
         .unwrap();

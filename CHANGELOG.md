@@ -16,9 +16,8 @@ All notable changes to this project will be documented in this file.
   does not clear it. A missing header, or a rejected limit not known to
   cover one model, still cools the whole account. The usage reading also
   reads Anthropic's new `limits` list, so the per-model limit is seen
-  before the first 429. `synaps status` shows it by name and
-  marks a limit that is used up as blocking (e.g. `Fable 7d: 100% used ·
-  resets in 13h 48m · EXHAUSTED · BLOCKING`), and `synaps auth state` shows
+  before the first 429. `synaps status` shows it by name (e.g. `Fable 7d:
+  100% used · resets in 13h 48m · EXHAUSTED`), and `synaps auth state` shows
   a model's cooldown with its model.
 
   Upgrade a credential broker and its clients together (e.g. a machine that
