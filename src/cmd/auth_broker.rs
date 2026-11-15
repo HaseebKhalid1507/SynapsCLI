@@ -453,6 +453,17 @@ struct CooldownReport {
     model: Option<String>,
 }
 
+/// Debug builds only: `SYNAPS_TEST_BROKER_USAGE_URL` points the broker's
+/// usage reads at a fake server, so an end-to-end test of the real binary
+/// can run automatic selection without the network. Release builds ignore it.
+fn test_usage_endpoint(local: auth::LocalBroker) -> auth::LocalBroker {
+    #[cfg(debug_assertions)]
+    if let Ok(url) = std::env::var("SYNAPS_TEST_BROKER_USAGE_URL") {
+        return local.with_usage_endpoint_override(url);
+    }
+    local
+}
+
 /// Longest model id a cooldown report may name.
 const MAX_COOLDOWN_MODEL_LEN: usize = 128;
 
@@ -601,7 +612,7 @@ pub async fn run(
             .is_loopback()
             .then(|| Arc::from(loopback_allowed_hostnames(addr.ip()))),
         token_source,
-        local: Arc::new(auth::LocalBroker::new(client.clone())),
+        local: Arc::new(test_usage_endpoint(auth::LocalBroker::new(client.clone()))),
     };
 
     // Proactive refresh of EVERY stored OAuth slot, SUPERVISED. Each slot
@@ -1031,7 +1042,12 @@ async fn accounts_cooldown(
     };
     let cred = auth::CredentialRef::new(provider_id, account);
     let reason = report.reason.as_deref().unwrap_or("client_report");
-    let model = report.model.as_deref().map(str::trim);
+    // The id the runtime matches on (`quota_model_key`): a client that
+    // sent the routed `anthropic/<id>` still names `<id>`.
+    let model = report
+        .model
+        .as_deref()
+        .map(|m| m.trim().strip_prefix("anthropic/").unwrap_or(m.trim()));
     if model.is_some_and(|m| !valid_cooldown_model(m)) {
         return (
             StatusCode::BAD_REQUEST,

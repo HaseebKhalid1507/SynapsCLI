@@ -5527,6 +5527,9 @@ mod anthropic_failover_tests {
         Rejected429 { reset_in_secs: u64 },
         /// Ordinary 429: `retry-after` only, no exhaustion signal.
         Plain429 { retry_after: u64 },
+        /// 2026-11-15's real 429: unified status rejected by one model's own
+        /// weekly limit (`7d_oi`), the account's 7d window still allowed.
+        ModelRejected429 { reset_in_secs: u64 },
         SseOk,
         SsePartialThenOverloaded,
     }
@@ -5592,6 +5595,27 @@ mod anthropic_failover_tests {
                                 (
                                     "anthropic-ratelimit-unified-reset",
                                     (now_secs + reset_in_secs).to_string(),
+                                ),
+                            ],
+                            body_429,
+                        )
+                            .into_response(),
+                        Reply::ModelRejected429 { reset_in_secs } => (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [
+                                ("content-type", "application/json".to_string()),
+                                ("anthropic-ratelimit-unified-status", "rejected".to_string()),
+                                (
+                                    "anthropic-ratelimit-unified-reset",
+                                    (now_secs + reset_in_secs).to_string(),
+                                ),
+                                (
+                                    "anthropic-ratelimit-unified-7d-status",
+                                    "allowed_warning".to_string(),
+                                ),
+                                (
+                                    "anthropic-ratelimit-unified-7d_oi-status",
+                                    "rejected".to_string(),
                                 ),
                             ],
                             body_429,
@@ -5756,6 +5780,18 @@ mod anthropic_failover_tests {
         max_retries: u32,
         base: ApiOptions,
     ) -> Outcome {
+        drive_model(upstream, auth, router, max_retries, base, "claude-haiku-4-5").await
+    }
+
+    /// [`drive_with`] for `model`.
+    async fn drive_model(
+        upstream: &MockUpstream,
+        auth: Arc<RwLock<AuthState>>,
+        router: &dyn AnthropicAccountRouter,
+        max_retries: u32,
+        base: ApiOptions,
+        model: &str,
+    ) -> Outcome {
         let options = ApiOptions {
             anthropic_base_url: Some(upstream.base_url.clone()),
             credential_source: CredentialSource::Local,
@@ -5770,7 +5806,7 @@ mod anthropic_failover_tests {
         let result = ApiMethods::anthropic_stream_with_router(
             &auth,
             &client,
-            "claude-haiku-4-5",
+            model,
             tools.tools_schema(),
             &None,
             0,
@@ -5971,6 +6007,40 @@ mod anthropic_failover_tests {
                     "{labels:?}: the turn stays on a"
                 );
             }
+        }
+
+        /// The real 429 path: a request for `anthropic/claude-fable-5` meets
+        /// Fable's own weekly limit on a. The broker holds a cooldown for the
+        /// requested model id with the prefix stripped (`claude-fable-5`), on
+        /// a only; a still serves Opus, and the request moves to b.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, anthropic_429_log_capture)]
+        async fn a_model_limit_429_cools_the_requested_model_on_that_account_only() {
+            let base = crate::test_env::BaseDirGuard::new();
+            let broker = auto_broker(base.path(), &["a", "b"]).await;
+            let router = BrokerAnthropicRouter::new(broker.clone());
+            let upstream = spawn_upstream(vec![
+                Reply::ModelRejected429 { reset_in_secs: 20 * 3600 },
+                Reply::SseOk,
+            ])
+            .await;
+            let auth = oauth_auth_pinned_to("a");
+            let out = drive_model(
+                &upstream,
+                Arc::clone(&auth),
+                &router,
+                2,
+                ApiOptions::default(),
+                "anthropic/claude-fable-5",
+            )
+            .await;
+            out.result.expect("b serves the request");
+            assert_eq!(upstream.auth_seen(), vec!["Bearer tok-a", "Bearer tok-b"]);
+            let a = seat("a");
+            assert!(broker.active_cooldown_for(&a, Some("claude-fable-5")).is_some());
+            assert_eq!(broker.active_cooldown_for(&a, Some("claude-opus-4-7")), None);
+            assert_eq!(broker.active_cooldown(&a), None, "the account is not cooling");
+            assert_eq!(broker.active_cooldown_for(&seat("b"), Some("claude-fable-5")), None);
         }
 
         /// Review fix 1 (belt and braces): a is cooling down and is the only
