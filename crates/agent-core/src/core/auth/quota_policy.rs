@@ -138,13 +138,18 @@ pub fn model_matches(entry: &str, requested: &str) -> bool {
 }
 
 impl WindowLimit {
-    /// Whether this window constrains `model` (`None` = any model).
+    /// Whether this window constrains `model` (`None` = no model named).
+    ///
+    /// A model-scoped window constrains only a request that names its
+    /// model. A caller that names none (a usage read, `auth plan` without
+    /// `--model`, an old broker client) is not refused an account because
+    /// ONE model's limit is used up: the account still serves the others
+    /// (2026-11-15: Fable's weekly limit at 100 % refused Opus and Sonnet).
+    /// Account-wide windows always apply.
     pub fn applies_to(&self, model: Option<&str>) -> bool {
         match (&self.models, model) {
             (None, _) => true,
-            // A model-scoped window cannot be matched without a model; treat
-            // it as applicable so an unknown model never bypasses a limit.
-            (Some(_), None) => true,
+            (Some(_), None) => false,
             (Some(list), Some(m)) => list.iter().any(|x| model_matches(x, m)),
         }
     }
@@ -493,7 +498,8 @@ pub enum Strategy {
 #[derive(Debug, Clone)]
 pub struct SelectionRequest<'a> {
     pub provider: OAuthProviderId,
-    /// Model the request is for; `None` = any (model-scoped windows still apply).
+    /// Model the request is for; `None` = none named (only account-wide
+    /// windows apply, see [`WindowLimit::applies_to`]).
     pub model: Option<&'a str>,
     pub now_ms: u64,
     /// Observations older than this are stale (not capacity).
@@ -1905,10 +1911,11 @@ mod tests {
             Selection::Selected { utilization, .. } => assert_eq!(utilization, Some(99.0)),
             other => panic!("unexpected {other:?}"),
         }
-        // no model given: scoped windows still apply (never bypass a limit)
+        // no model given: one model's used-up window does not refuse the
+        // account, which still serves every other model
         assert!(select(&req(), std::slice::from_ref(&acct))
             .selected()
-            .is_none());
+            .is_some());
         // model listed as unavailable
         let mut unavailable = acct;
         if let QuotaObservation::Ok { models, .. } = &mut unavailable.observation {
@@ -2117,8 +2124,11 @@ mod tests {
         };
         assert!(w.applies_to(Some("claude-sonnet-4-6")));
         assert!(!w.applies_to(Some("claude-opus-4-6")));
-        assert!(w.applies_to(None));
+        // No model named: one model's used-up window does not refuse the
+        // account (it still serves the others).
+        assert!(!w.applies_to(None));
         let acct = ok("a", vec![win("seven_day", 7 * DAY, 1.0, NOW + DAY), w]);
+        assert!(select(&req(), std::slice::from_ref(&acct)).selected().is_some());
         let r = SelectionRequest {
             model: Some("claude-sonnet-4-6"),
             ..req()
