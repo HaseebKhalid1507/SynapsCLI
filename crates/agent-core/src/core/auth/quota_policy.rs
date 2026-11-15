@@ -124,9 +124,12 @@ pub enum WindowVerdict {
 /// Whether a provider availability/window entry (`sonnet`, `opus-4-7`,
 /// `gpt-6-astra`) names the requested model id (`claude-sonnet-4-6`).
 /// Exact (case-insensitive) match, or the entry's `-`/`_`/`/`/`:`/`.`
-/// separated tokens are a contiguous run of the request's tokens
-/// (`opus-4-7` names `claude-opus-4-7`, not `claude-opus-4-6`). A
-/// single-token entry thus equals one token of the request.
+/// separated tokens are a contiguous run of the request's tokens that
+/// ends the request or is followed only by a date (`opus-4-7` names
+/// `claude-opus-4-7` and `claude-opus-4-7-20261101`, not
+/// `claude-opus-4-6`; `gpt-5` does not name `gpt-5.5` or `gpt-5-mini`, and
+/// `gpt-6-astra` does not name `gpt-6-astra-mini`). A single-token entry
+/// equals any one token of the request, as before.
 pub fn model_matches(entry: &str, requested: &str) -> bool {
     const SEPS: [char; 5] = ['-', '_', '/', ':', '.'];
     let entry = entry.trim().to_ascii_lowercase();
@@ -139,7 +142,16 @@ pub fn model_matches(entry: &str, requested: &str) -> bool {
     }
     let want: Vec<&str> = entry.split(SEPS).collect();
     let have: Vec<&str> = req.split(SEPS).collect();
-    have.windows(want.len()).any(|run| run == want.as_slice())
+    if want.len() == 1 {
+        return have.contains(&want[0]);
+    }
+    let is_date = |t: &str| t.len() == 8 && t.bytes().all(|b| b.is_ascii_digit());
+    have.windows(want.len()).enumerate().any(|(i, run)| {
+        run == want.as_slice() && {
+            let rest = &have[i + want.len()..];
+            rest.is_empty() || (rest.len() == 1 && is_date(rest[0]))
+        }
+    })
 }
 
 impl WindowLimit {
@@ -2173,7 +2185,8 @@ mod tests {
 
     /// A multi-token entry (a display name such as `Opus 4.7`, normalised
     /// to `opus-4-7`) names a request whose tokens contain it as a
-    /// contiguous run; single-token entries behave as before.
+    /// contiguous run that ends the request (or is followed by a date only);
+    /// single-token entries behave as before.
     #[test]
     fn a_multi_token_entry_matches_a_contiguous_run_of_the_request() {
         assert!(model_matches("opus-4-7", "claude-opus-4-7"));
@@ -2184,6 +2197,12 @@ mod tests {
         assert!(model_matches("fable", "claude-fable-5"));
         assert!(!model_matches("fab", "claude-fable-5"));
         assert!(model_matches("4", "claude-opus-4-7"), "single token: as before");
+        // A run followed by more than a date names another model.
+        assert!(!model_matches("gpt-5", "gpt-5.5"));
+        assert!(!model_matches("gpt-5", "gpt-5-mini"));
+        assert!(!model_matches("gpt-6-astra", "gpt-6-astra-mini"));
+        assert!(!model_matches("opus-4", "claude-opus-4-7"));
+        assert!(model_matches("gpt-5", "openai/gpt-5"));
     }
 
     #[test]
