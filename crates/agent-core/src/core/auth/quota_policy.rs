@@ -121,11 +121,14 @@ pub enum WindowVerdict {
     Unknown,
 }
 
-/// Whether a provider availability/window entry (`sonnet`, `gpt-6-astra`)
-/// names the requested model id (`claude-sonnet-4-6`). Exact
-/// (case-insensitive) match, or the entry equals one `-`/`_`/`/`/`:`/`.`
-/// separated token of the request — the same rule the usage adapter uses.
+/// Whether a provider availability/window entry (`sonnet`, `opus-4-7`,
+/// `gpt-6-astra`) names the requested model id (`claude-sonnet-4-6`).
+/// Exact (case-insensitive) match, or the entry's `-`/`_`/`/`/`:`/`.`
+/// separated tokens are a contiguous run of the request's tokens
+/// (`opus-4-7` names `claude-opus-4-7`, not `claude-opus-4-6`). A
+/// single-token entry thus equals one token of the request.
 pub fn model_matches(entry: &str, requested: &str) -> bool {
+    const SEPS: [char; 5] = ['-', '_', '/', ':', '.'];
     let entry = entry.trim().to_ascii_lowercase();
     let req = requested.trim().to_ascii_lowercase();
     if entry.is_empty() || req.is_empty() {
@@ -134,7 +137,9 @@ pub fn model_matches(entry: &str, requested: &str) -> bool {
     if entry == req {
         return true;
     }
-    req.split(['-', '_', '/', ':', '.']).any(|tok| tok == entry)
+    let want: Vec<&str> = entry.split(SEPS).collect();
+    let have: Vec<&str> = req.split(SEPS).collect();
+    have.windows(want.len()).any(|run| run == want.as_slice())
 }
 
 impl WindowLimit {
@@ -2164,6 +2169,21 @@ mod tests {
             ..req()
         };
         assert!(select(&r, std::slice::from_ref(&acct)).selected().is_some());
+    }
+
+    /// A multi-token entry (a display name such as `Opus 4.7`, normalised
+    /// to `opus-4-7`) names a request whose tokens contain it as a
+    /// contiguous run; single-token entries behave as before.
+    #[test]
+    fn a_multi_token_entry_matches_a_contiguous_run_of_the_request() {
+        assert!(model_matches("opus-4-7", "claude-opus-4-7"));
+        assert!(model_matches("opus-4-7", "claude-opus-4-7-20261101"));
+        assert!(!model_matches("opus-4-7", "claude-opus-4-6"));
+        assert!(!model_matches("opus-4-7", "claude-4-7-opus"));
+        assert!(!model_matches("opus-4", "claude-opus"));
+        assert!(model_matches("fable", "claude-fable-5"));
+        assert!(!model_matches("fab", "claude-fable-5"));
+        assert!(model_matches("4", "claude-opus-4-7"), "single token: as before");
     }
 
     #[test]

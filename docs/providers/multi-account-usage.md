@@ -95,8 +95,10 @@ A window may also carry `limit_status` (Anthropic `limits[]` only):
 name for what the limit covers, its severity and `is_active`. It is display
 only; capacity comes from the numbers. The text view names such a limit
 (`Fable 7d: 100% used · … · EXHAUSTED · BLOCKING`) and marks `BLOCKING` on a
-window that is used up or reported `critical` or active: the limit that is
-stopping requests.
+window that is at or over its limit: the limit that is stopping requests.
+The provider's severity and `is_active` (the limit that binds, at any level)
+never make a window `BLOCKING`; `--verbose` shows them as
+`provider: severity critical, active`.
 
 `used_percent` is never a bare number. `Valid` requires a finite value in
 `0..=100`; everything else is `{"state":"unknown","reason":…}` with reasons
@@ -121,7 +123,7 @@ never appears here.
 
 | Provider | Endpoint | Extra headers | Schema provenance |
 | --- | --- | --- | --- |
-| Anthropic | `https://api.anthropic.com/api/oauth/usage` | `anthropic-beta: oauth-2025-04-20` | shipped `synaps status` reader; every object with `utilization`/`resets_at` is a window, `seven_day_<model>` → model scope; each `limits[]` entry is a window too: `weekly_scoped` with `scope.model` → that model (`id`, else `display_name` lowercased, e.g. `fable`), `weekly_all` merges into the `seven_day` window it repeats, other kinds/scopes are shown but never gate |
+| Anthropic | `https://api.anthropic.com/api/oauth/usage` | `anthropic-beta: oauth-2025-04-20` | shipped `synaps status` reader; every object with `utilization`/`resets_at` is a window, `seven_day_<model>` → model scope; each `limits[]` entry is a window too: `weekly_scoped` with `scope.model` → that model (`id` lowercased, else `display_name` as lowercased `-`-joined tokens, e.g. `fable`, `Opus 4.7` → `opus-4-7`, matched when its tokens are a contiguous run of the request id's), `weekly_all` merges into the `seven_day` window it repeats, other kinds/scopes are shown but never gate |
 | Codex | `https://chatgpt.com/backend-api/wham/usage` (+ optional `…/wham/rate-limit-reset-credits`) | `chatgpt-account-id` derived from **the same** token's JWT claim | rate-limit fields verified against the official `codex` binary string table; `model_usage` from a prior live response |
 | Kimi Code | `https://api.kimi.com/coding/v1/usages` | none (the official CLI's usage fetch sends bearer + Accept only; no device-identity headers, no device-id state touched) | official `kimi` CLI bundle `managed-usage.ts` |
 | Grok | `https://cli-chat-proxy.grok.com/v1/billing?format=credits` | `x-xai-token-auth: xai-grok-cli` | **unverified live**; QuotaKit-documented shape |

@@ -355,7 +355,8 @@ fn limit_name(w: &UsageWindow) -> Option<&str> {
 }
 
 /// `EXHAUSTED` for a used-up window, `BLOCKING` for the one stopping
-/// requests (used up, or reported `critical` / active).
+/// requests (at or over its limit; the provider's severity / `is_active`
+/// are shown as its own words in `--verbose`, never as BLOCKING).
 fn window_flags(w: &UsageWindow, sep: &str) -> String {
     let mut flags = String::new();
     if w.is_exhausted() {
@@ -1270,7 +1271,8 @@ mod usage_tests {
         let fable = windows.iter().find(|w| w["id"] == "limits.weekly_scoped.fable").unwrap();
         assert_eq!(fable["limit_status"]["severity"], "critical", "{fable}");
         assert_eq!(fable["scope"], serde_json::json!({"kind": "model", "model": "fable"}));
-        // Under 100 % but reported critical and active: still the one blocking.
+        // Under 100 % but reported critical and active: not blocking. The
+        // provider's words stay in the verbose view.
         if let AccountUsageOutcome::Ok { snapshot } = &mut report.accounts[0].outcome {
             let w = snapshot
                 .windows
@@ -1280,7 +1282,11 @@ mod usage_tests {
             w.used_percent = UsedPercent::from_f64(95.0);
         }
         let text = render_text(&report, at);
-        assert!(text.contains("Fable 7d: 95% used · resets in 13h 48m · BLOCKING\n"), "{text}");
+        assert!(text.contains("Fable 7d: 95% used · resets in 13h 48m\n"), "{text}");
+        assert!(!text.contains("BLOCKING"), "{text}");
+        let verbose = render_verbose(&report, at);
+        assert!(!verbose.contains("BLOCKING"), "{verbose}");
+        assert!(verbose.contains("provider: severity critical, active"), "{verbose}");
     }
 
     /// An account without extra usage enabled shows no extra_usage

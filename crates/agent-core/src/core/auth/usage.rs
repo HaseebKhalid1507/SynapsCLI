@@ -403,7 +403,8 @@ pub struct LimitStatus {
     /// `normal`, `warning`, `critical` (provider vocabulary, lowercased).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<String>,
-    /// The provider's `is_active`: this limit is the one in force.
+    /// The provider's `is_active`: this limit is the one that binds (at
+    /// any level; not a sign it is used up).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<bool>,
 }
@@ -414,14 +415,12 @@ impl UsageWindow {
         self.limit_reached == Some(true) || self.used_percent.valid().is_some_and(|p| p >= 100.0)
     }
 
-    /// The limit that is stopping requests, as far as the reading says: it
-    /// is used up, or the provider calls it `critical` or active. Display
-    /// only (`synaps status`); selection reads the numbers.
+    /// The limit that is stopping requests: it is at or over its limit.
+    /// The provider's `severity` / `is_active` are not used: `is_active`
+    /// marks the limit that binds, at any level. Display only
+    /// (`synaps status`); selection reads the numbers.
     pub fn is_blocking(&self) -> bool {
         self.is_exhausted()
-            || self.limit_status.as_ref().is_some_and(|s| {
-                s.severity.as_deref() == Some("critical") || s.active == Some(true)
-            })
     }
 }
 
@@ -460,18 +459,11 @@ pub struct ModelAvailability {
 
 impl ModelAvailability {
     /// Case-insensitive match of an availability entry against a requested
-    /// model id. Exact match, or the entry names a family token contained in
-    /// the id (`sonnet` ⊂ `claude-sonnet-4-5`, `gpt-6-astra` == `gpt-6-astra`).
+    /// model id: [`super::quota_policy::model_matches`] (exact, or the
+    /// entry's tokens are a contiguous run of the id's: `sonnet` ⊂
+    /// `claude-sonnet-4-5`, `opus-4-7` ⊂ `claude-opus-4-7`).
     pub fn matches_model(&self, requested: &str) -> bool {
-        let entry = self.model.to_ascii_lowercase();
-        let req = requested.trim().to_ascii_lowercase();
-        if entry.is_empty() || req.is_empty() {
-            return false;
-        }
-        if entry == req {
-            return true;
-        }
-        req.split(['-', '_', '/', ':', '.']).any(|tok| tok == entry)
+        super::quota_policy::model_matches(&self.model, requested)
     }
 }
 
@@ -945,12 +937,22 @@ fn extra_usage_shown(val: &Value) -> bool {
         && val.get("utilization").is_some_and(Value::is_number)
 }
 
-/// The model a `limits[].scope.model` names: its `id`, else its
-/// `display_name`, lowercased (`{"id":null,"display_name":"Fable"}` →
-/// `fable`, matched against `claude-fable-5` by family token).
+/// The model a `limits[].scope.model` names: its `id` lowercased, else its
+/// `display_name` as lowercased `-`-joined alphanumeric tokens
+/// (`{"id":null,"display_name":"Fable"}` → `fable`, `"Opus 4.7"` →
+/// `opus-4-7`), matched against a request id by its tokens
+/// ([`super::quota_policy::model_matches`]).
 fn anthropic_limit_model(model: &Value) -> Option<String> {
-    let pick = |key: &str| string_from_value(model.get(key)).map(|s| s.to_ascii_lowercase());
-    pick("id").or_else(|| pick("display_name"))
+    if let Some(id) = string_from_value(model.get("id")) {
+        return Some(id.to_ascii_lowercase());
+    }
+    let name = string_from_value(model.get("display_name"))?;
+    let tokens: Vec<String> = name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    (!tokens.is_empty()).then(|| tokens.join("-"))
 }
 
 /// What one `limits[]` entry applies to. `None`: a scope this build does
@@ -2089,6 +2091,27 @@ mod tests {
         epoch_ms_from_rfc3339(LIMITS_AT).unwrap()
     }
 
+    /// A `display_name` with spaces or dots (`Opus 4.7`) becomes `-`-joined
+    /// tokens (`opus-4-7`): it gates `claude-opus-4-7` and nothing else.
+    #[test]
+    fn anthropic_limits_normalise_a_display_name_to_tokens() {
+        let now = limits_at();
+        let body = r#"{"seven_day":{"utilization":10,"resets_at":"2026-11-20T00:00:00Z"},
+            "limits":[{"kind":"weekly_scoped","group":"weekly","percent":100,
+            "severity":"critical","resets_at":"2026-11-20T00:00:00Z",
+            "scope":{"model":{"id":null,"display_name":" Opus 4.7 "}},"is_active":true}]}"#;
+        let s = parse_anthropic_usage(body, "default", now).unwrap();
+        let w = s
+            .windows
+            .iter()
+            .find(|w| matches!(&w.scope, WindowScope::Model { .. }))
+            .expect("the Opus 4.7 limit is a window");
+        assert_eq!(w.scope, WindowScope::Model { model: "opus-4-7".into() });
+        assert!(!s.has_proven_capacity_for_model("claude-opus-4-7", now, 60_000));
+        assert!(s.has_proven_capacity_for_model("claude-opus-4-6", now, 60_000));
+        assert!(s.has_proven_capacity_for_model("claude-sonnet-4-6", now, 60_000));
+    }
+
     /// The Fable limit in `limits` is a window scoped to `fable`: a Fable
     /// request has no capacity on the account, Opus and Sonnet do, and the
     /// `weekly_all` entry is the `seven_day` window already read (one
@@ -2123,6 +2146,11 @@ mod tests {
             Some("warning")
         );
         assert!(!weekly.is_blocking(), "82 %, warning, not active");
+        // `is_active` marks the limit that binds, at any level: under its
+        // limit it is not blocking, whatever the provider's words.
+        let mut binding = fable.clone();
+        binding.used_percent = UsedPercent::from_f64(30.0);
+        assert!(!binding.is_blocking(), "30 %, critical, active");
         assert_eq!(s.windows.len(), 2, "{:?}", s.windows);
         let entry = s.model_availability_for("claude-fable-5").expect("fable entry");
         assert_eq!(entry.availability, Availability::Exhausted);
