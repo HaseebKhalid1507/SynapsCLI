@@ -113,7 +113,7 @@ never appears here.
 
 | Provider | Endpoint | Extra headers | Schema provenance |
 | --- | --- | --- | --- |
-| Anthropic | `https://api.anthropic.com/api/oauth/usage` | `anthropic-beta: oauth-2025-04-20` | shipped `synaps status` reader; every object with `utilization`/`resets_at` is a window, `seven_day_<model>` → model scope |
+| Anthropic | `https://api.anthropic.com/api/oauth/usage` | `anthropic-beta: oauth-2025-04-20` | shipped `synaps status` reader; every object with `utilization`/`resets_at` is a window, `seven_day_<model>` → model scope; each `limits[]` entry is a window too: `weekly_scoped` with `scope.model` → that model (`id`, else `display_name` lowercased, e.g. `fable`), `weekly_all` merges into the `seven_day` window it repeats, other kinds/scopes are shown but never gate |
 | Codex | `https://chatgpt.com/backend-api/wham/usage` (+ optional `…/wham/rate-limit-reset-credits`) | `chatgpt-account-id` derived from **the same** token's JWT claim | rate-limit fields verified against the official `codex` binary string table; `model_usage` from a prior live response |
 | Kimi Code | `https://api.kimi.com/coding/v1/usages` | none (the official CLI's usage fetch sends bearer + Accept only; no device-identity headers, no device-id state touched) | official `kimi` CLI bundle `managed-usage.ts` |
 | Grok | `https://cli-chat-proxy.grok.com/v1/billing?format=credits` | `x-xai-token-auth: xai-grok-cli` | **unverified live**; QuotaKit-documented shape |

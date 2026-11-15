@@ -46,7 +46,8 @@
 //!                                            pin a slot as `provider@label`; keys never vended)
 //!   GET  /usage                           -> legacy raw Anthropic usage JSON (machine-auth)
 //!   GET  /usage/snapshot?provider&account -> normalized UsageSnapshot (machine-auth)
-//!   POST /accounts/cooldown               -> { provider, account, until_ms?, reason } (machine-auth)
+//!   POST /accounts/cooldown               -> { provider, account, until_ms?, reason, model? }
+//!                                            (machine-auth; `model`: the limit covers that model only)
 //!   GET  /capabilities                    -> provider status list incl. account rows (no secrets)
 
 use std::net::SocketAddr;
@@ -445,6 +446,22 @@ struct CooldownReport {
     until_ms: Option<u64>,
     #[serde(default)]
     reason: Option<String>,
+    /// The limit covers this model only (the requested id); absent: the
+    /// whole account. Older clients never send it. Unknown fields are
+    /// allowed, so a daemon older than this field cools the account.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Longest model id a cooldown report may name.
+const MAX_COOLDOWN_MODEL_LEN: usize = 128;
+
+/// A model id a cooldown report may carry: non-empty after trimming, at
+/// most [`MAX_COOLDOWN_MODEL_LEN`] bytes, printable ASCII without spaces.
+fn valid_cooldown_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= MAX_COOLDOWN_MODEL_LEN
+        && model.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// Constant-time byte comparison — avoids a timing oracle on the machine token.
@@ -1014,7 +1031,23 @@ async fn accounts_cooldown(
     };
     let cred = auth::CredentialRef::new(provider_id, account);
     let reason = report.reason.as_deref().unwrap_or("client_report");
-    match st.local.report_cooldown(&cred, report.until_ms, reason).await {
+    let model = report.model.as_deref().map(str::trim);
+    if model.is_some_and(|m| !valid_cooldown_model(m)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid model" })),
+        )
+            .into_response();
+    }
+    let reported = match model {
+        Some(model) => {
+            st.local
+                .report_model_cooldown(&cred, model, report.until_ms, reason)
+                .await
+        }
+        None => st.local.report_cooldown(&cred, report.until_ms, reason).await,
+    };
+    match reported {
         Ok(()) => (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response(),
         Err(e) => broker_error_response(e),
     }

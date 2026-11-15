@@ -535,6 +535,19 @@ async fn broker_token_account_mapping_and_metadata_endpoints_on_real_router() {
         .await
         .unwrap();
     assert_eq!(cool.status().as_u16(), 200);
+    // A limit that covers one model: accepted, and the account itself is
+    // not cooling. A model id the route can't store is refused.
+    let model_cool = |model: &str| {
+        client
+            .post(format!("{base}/accounts/cooldown"))
+            .bearer_auth("synthetic-machine-auth")
+            .json(&json!({"provider": "openai-codex", "account": "default", "until_ms": until,
+                "reason": "test", "model": model}))
+            .send()
+    };
+    assert_eq!(model_cool("gpt-6-astra").await.unwrap().status().as_u16(), 200);
+    assert_eq!(model_cool("bad model").await.unwrap().status().as_u16(), 400);
+    assert_eq!(model_cool("  ").await.unwrap().status().as_u16(), 400);
     let caps: Value = client
         .get(format!("{base}/capabilities"))
         .bearer_auth("synthetic-machine-auth")
@@ -553,6 +566,15 @@ async fn broker_token_account_mapping_and_metadata_endpoints_on_real_router() {
         .find(|a| a["provider"] == "openai-codex" && a["label"] == "second")
         .expect("second slot listed");
     assert!(second["cooldown_until"].as_u64().is_some(), "{second}");
+    let default = caps
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["accounts"].as_array())
+        .flatten()
+        .find(|a| a["provider"] == "openai-codex" && a["label"] == "default")
+        .expect("default slot listed");
+    assert!(default["cooldown_until"].is_null(), "a model's cooldown is not the account's: {default}");
     let snap = client
         .get(format!("{base}/usage/snapshot"))
         .query(&[("provider", "openai-codex"), ("account", "Bad Label")])

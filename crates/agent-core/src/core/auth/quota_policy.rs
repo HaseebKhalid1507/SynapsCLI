@@ -250,6 +250,10 @@ pub struct AccountCapacity {
     /// Client-side cooldown (e.g. after a provider limit response). Epoch ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_until_ms: Option<u64>,
+    /// The model that cooldown covers, when it covers the requested model
+    /// only (the account still serves other models); `None`: the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_model: Option<String>,
     /// Why there is no reading, when the read itself failed (a usage 429,
     /// a refresh timeout, …). Never capacity; carried into the rejection
     /// so the failure can be named instead of a bare "quota unknown".
@@ -265,6 +269,7 @@ impl AccountCapacity {
             observed_at_ms: None,
             observation: QuotaObservation::Unknown,
             cooldown_until_ms: None,
+            cooldown_model: None,
             failure: None,
         }
     }
@@ -594,6 +599,9 @@ pub enum RejectReason {
     AuthError,
     CoolingDown {
         until_ms: u64,
+        /// The model the cooldown covers; `None`: the whole account.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Exhausted {
         window: String,
@@ -639,7 +647,11 @@ impl std::fmt::Display for RejectReason {
             Self::Unknown => write!(f, "quota unknown"),
             Self::Unsupported => write!(f, "usage unsupported"),
             Self::AuthError => write!(f, "auth error"),
-            Self::CoolingDown { until_ms } => write!(f, "cooling down until {until_ms}"),
+            Self::CoolingDown {
+                until_ms,
+                model: Some(model),
+            } => write!(f, "cooling down for {model} until {until_ms}"),
+            Self::CoolingDown { until_ms, .. } => write!(f, "cooling down until {until_ms}"),
             Self::Exhausted {
                 window,
                 resets_at_ms: Some(r),
@@ -704,6 +716,10 @@ pub struct AccountFailure {
     /// `kind` says about its last observation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cooling_down: bool,
+    /// The model the cooldown covers when it covers one model only (the
+    /// account still serves the others).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_model: Option<String>,
 }
 
 impl AccountFailure {
@@ -720,6 +736,10 @@ impl AccountFailure {
             retry_after_s: None,
             until_ms: rejection.usable_after_ms,
             cooling_down: matches!(rejection.reason, RejectReason::CoolingDown { .. }),
+            cooldown_model: match &rejection.reason {
+                RejectReason::CoolingDown { model, .. } => model.clone(),
+                _ => None,
+            },
         };
         if let RejectReason::Outranked { .. } = rejection.reason {
             return None;
@@ -1053,7 +1073,10 @@ pub fn evaluate(
     // same either way.
     if let Some(until) = cap.cooldown_until_ms {
         if until > req.now_ms {
-            return Err(RejectReason::CoolingDown { until_ms: until });
+            return Err(RejectReason::CoolingDown {
+                until_ms: until,
+                model: cap.cooldown_model.clone(),
+            });
         }
     }
     if req
@@ -1177,6 +1200,7 @@ fn evaluate_graced(
     };
     let reading = AccountCapacity {
         cooldown_until_ms: cap.cooldown_until_ms,
+        cooldown_model: cap.cooldown_model.clone(),
         ..good.clone()
     };
     evaluate(&graced_req, &reading)
@@ -1581,6 +1605,7 @@ mod tests {
                 models: None,
             },
             cooldown_until_ms: None,
+            cooldown_model: None,
             failure: None,
         }
     }

@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **A limit on one model no longer blocks the whole Anthropic account.**
+  When Fable's own weekly limit ran out, the 429 put the account in a
+  cooldown for every model until the reset, so Opus and Sonnet requests
+  failed without being sent while the account still had weekly usage left.
+  Now a 429 that only rejects a per-model limit (the account-wide 5-hour and
+  weekly limits reported and not rejected) cools just that model on that
+  account; other models keep using it, and a later answer for another model
+  does not clear it. A missing header still cools the whole account. The
+  usage reading also reads Anthropic's new `limits` list, so the per-model
+  limit is seen before the first 429. `synaps status` shows it (e.g.
+  `Fable weekly 100%`) and marks the limit that is blocking, and `synaps auth
+  state` shows a model's cooldown with its model.
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel

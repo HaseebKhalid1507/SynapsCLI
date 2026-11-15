@@ -1793,7 +1793,7 @@ impl ApiMethods {
                                     {
                                         await_or_cancel(
                                             cancel,
-                                            router.report_served(&seat, sent_at_ms),
+                                            router.report_served(&seat, model, sent_at_ms),
                                         )
                                         .await?;
                                         anthropic_cooled.retain(|c| c != &seat);
@@ -1957,7 +1957,10 @@ impl ApiMethods {
                                     // AutoRepin selects away from this seat.
                                     match seat.as_ref() {
                                         Some(seat) => {
-                                            await_or_cancel(cancel, router.report_exhausted(seat, &evidence))
+                                            await_or_cancel(
+                                                cancel,
+                                                router.report_exhausted(seat, model, &evidence),
+                                            )
                                                 .await?;
                                             if !anthropic_cooled.contains(seat) {
                                                 anthropic_cooled.push(seat.clone());
@@ -5687,6 +5690,7 @@ mod anthropic_failover_tests {
         async fn report_exhausted(
             &self,
             failed: &CredentialRef,
+            _model: &str,
             evidence: &AnthropicQuotaEvidence,
         ) {
             self.reports
@@ -5694,7 +5698,7 @@ mod anthropic_failover_tests {
                 .unwrap()
                 .push((failed.clone(), *evidence));
         }
-        async fn report_served(&self, seat: &CredentialRef, _sent_at_ms: u64) {
+        async fn report_served(&self, seat: &CredentialRef, _model: &str, _sent_at_ms: u64) {
             self.served.lock().unwrap().push(seat.clone());
         }
         async fn failover(
