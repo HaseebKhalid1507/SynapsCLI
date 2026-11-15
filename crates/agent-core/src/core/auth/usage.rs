@@ -388,12 +388,40 @@ pub struct UsageWindow {
     pub reset_kind: ResetKind,
     /// Per-window exhaustion flag if the provider gives one.
     pub limit_reached: Option<bool>,
+    /// What the provider says about this limit beside its numbers
+    /// (Anthropic `limits[]`). Display only: never capacity evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_status: Option<LimitStatus>,
+}
+
+/// A provider's own words about one limit (Anthropic `limits[]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitStatus {
+    /// The provider's name for what the limit covers (`Fable`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `normal`, `warning`, `critical` (provider vocabulary, lowercased).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    /// The provider's `is_active`: this limit is the one in force.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
 }
 
 impl UsageWindow {
     /// Exhausted iff the provider says so or the valid percent is ≥ 100.
     pub fn is_exhausted(&self) -> bool {
         self.limit_reached == Some(true) || self.used_percent.valid().is_some_and(|p| p >= 100.0)
+    }
+
+    /// The limit that is stopping requests, as far as the reading says: it
+    /// is used up, or the provider calls it `critical` or active. Display
+    /// only (`synaps status`); selection reads the numbers.
+    pub fn is_blocking(&self) -> bool {
+        self.is_exhausted()
+            || self.limit_status.as_ref().is_some_and(|s| {
+                s.severity.as_deref() == Some("critical") || s.active == Some(true)
+            })
     }
 }
 
@@ -974,6 +1002,14 @@ fn anthropic_limits(snap: &mut UsageSnapshot, limits: &[Value]) -> usize {
             },
         };
         let used_percent = UsedPercent::from_json(entry.get("percent"));
+        let status = LimitStatus {
+            name: entry
+                .get("scope")
+                .and_then(|scope| scope.get("model"))
+                .and_then(|model| string_from_value(model.get("display_name"))),
+            severity: string_from_value(entry.get("severity")).map(|s| s.to_ascii_lowercase()),
+            active: bool_from_value(entry.get("is_active")),
+        };
         let reset_at = match entry.get("resets_at") {
             None | Some(Value::Null) => None,
             Some(v) => {
@@ -995,6 +1031,9 @@ fn anthropic_limits(snap: &mut UsageSnapshot, limits: &[Value]) -> usize {
             }
             if same.reset_at.is_none() {
                 same.reset_at = reset_at;
+            }
+            if same.limit_status.is_none() {
+                same.limit_status = Some(status);
             }
             continue;
         }
@@ -1024,6 +1063,7 @@ fn anthropic_limits(snap: &mut UsageSnapshot, limits: &[Value]) -> usize {
             reset_at,
             reset_kind: ResetKind::QuotaWindow,
             limit_reached: None,
+            limit_status: Some(status),
         });
     }
     unrecognized
@@ -1082,6 +1122,7 @@ pub fn parse_anthropic_usage(
                     reset_at,
                     reset_kind: ResetKind::QuotaWindow,
                     limit_reached: None,
+                    limit_status: None,
                 });
             }
             Value::Null => skipped_null += 1,
@@ -1148,6 +1189,7 @@ fn codex_window(
         reset_at,
         reset_kind: ResetKind::QuotaWindow,
         limit_reached: None,
+        limit_status: None,
     })
 }
 
@@ -1345,6 +1387,7 @@ pub fn parse_codex_usage(
                         reset_at: resets_at,
                         reset_kind: ResetKind::BillingRenewal,
                         limit_reached: bool_from_value(limit.get("reached")),
+                        limit_status: None,
                     });
                 }
             }
@@ -1444,6 +1487,7 @@ fn kimi_row(
         reset_at,
         reset_kind: ResetKind::QuotaWindow,
         limit_reached: None,
+        limit_status: None,
     })
 }
 
@@ -1610,6 +1654,7 @@ pub fn parse_grok_billing(
             reset_at,
             reset_kind: ResetKind::BillingRenewal,
             limit_reached: None,
+            limit_status: None,
         });
         if used.is_some() || cap.is_some() {
             snap.credits = Some(CreditBalance {
@@ -2059,9 +2104,25 @@ mod tests {
         assert_eq!(fable.used_percent.valid(), Some(100.0));
         assert_eq!(fable.reset_at, epoch_ms_from_rfc3339("2026-11-16T05:59:59.895787+00:00"));
         assert!(fable.is_exhausted());
+        assert_eq!(
+            fable.limit_status,
+            Some(LimitStatus {
+                name: Some("Fable".into()),
+                severity: Some("critical".into()),
+                active: Some(true),
+            })
+        );
+        assert!(fable.is_blocking());
         let account: Vec<_> = s.account_windows().map(|w| w.id.as_str()).collect();
         assert_eq!(account, ["seven_day"], "weekly_all is not a second account window");
-        assert_eq!(s.window("seven_day").unwrap().used_percent.valid(), Some(82.0));
+        let weekly = s.window("seven_day").unwrap();
+        assert_eq!(weekly.used_percent.valid(), Some(82.0));
+        // weekly_all's own words land on the window it repeats.
+        assert_eq!(
+            weekly.limit_status.as_ref().and_then(|l| l.severity.as_deref()),
+            Some("warning")
+        );
+        assert!(!weekly.is_blocking(), "82 %, warning, not active");
         assert_eq!(s.windows.len(), 2, "{:?}", s.windows);
         let entry = s.model_availability_for("claude-fable-5").expect("fable entry");
         assert_eq!(entry.availability, Availability::Exhausted);

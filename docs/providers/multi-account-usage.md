@@ -90,6 +90,14 @@ Rules:
 }
 ```
 
+A window may also carry `limit_status` (Anthropic `limits[]` only):
+`{"name": "Fable", "severity": "critical", "active": true}` — the provider's
+name for what the limit covers, its severity and `is_active`. It is display
+only; capacity comes from the numbers. The text view names such a limit
+(`Fable 7d: 100% used · … · EXHAUSTED · BLOCKING`) and marks `BLOCKING` on a
+window that is used up or reported `critical` or active: the limit that is
+stopping requests.
+
 `used_percent` is never a bare number. `Valid` requires a finite value in
 `0..=100`; everything else is `{"state":"unknown","reason":…}` with reasons
 `missing`, `null`, `not a number`, `out of range`, `limit is zero`. Unknown is
