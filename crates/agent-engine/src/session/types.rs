@@ -491,8 +491,10 @@ pub struct SessionMeta {
     pub messages: usize,
     /// The workers that hold this session's park. Empty when none, when
     /// parked, and from a daemon without `session_workers`
-    /// (`wire::FEATURE_SESSION_WORKERS`). `busy` stays the turn only:
-    /// clients combine the two.
+    /// (`wire::FEATURE_SESSION_WORKERS`). Filled in listings (`meta_live`:
+    /// `Welcome.sessions`, `SessionList`); `Attached.meta` is the create-time
+    /// record, empty here like the other state fields. `busy` stays the turn
+    /// only: clients combine the two.
     #[serde(default, skip_serializing_if = "SessionWorkers::is_empty")]
     pub workers: SessionWorkers,
 }

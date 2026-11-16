@@ -746,9 +746,10 @@ C: bye | socket close = Detach (turn keeps running)
   `owner_gone` only to clients that declare the `owner_gone` capability and tells the others
   `client_quit` (`ended_for`). `Bye` gains `owner_lagged`, sent only to an owner (a client that
   knows the feature).
-- Session workers are additive the same way. `Welcome.features` lists `session_workers` when every
-  `SessionMeta` (in `Welcome.sessions`, `session_list` and `attached.meta`) carries its `workers`
-  block (see "Workers in the session list"). The block is omitted while empty, so a session without
+- Session workers are additive the same way. `Welcome.features` lists `session_workers` when the
+  listings (`Welcome.sessions`, `session_list`) carry each session's `workers` block (see "Workers
+  in the session list"); `attached.meta` is the create-time record and carries none, like the
+  other state fields. The block is omitted while empty, so a session without
   workers encodes exactly as before. `Welcome.boot_id` (16 hex characters) is minted at a cold start
   and carried across `daemon reload` (`ReloadState.boot_id`): a new value means worker handle ids
   (`sa_N`) started over. `SessionLifecycle` decodes a lifecycle this build does not know as
