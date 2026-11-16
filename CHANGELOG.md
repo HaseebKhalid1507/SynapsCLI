@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **Daemon: a session's `created_at` is when its conversation began.** It
+  was when the session was created. It now holds across a compaction (the
+  start of the chain) and a reload, and moves with `/clear` and an in-session
+  `/resume`. `SessionMeta.journal_id`, not `id`, names the conversation: they
+  also differ after `/clear`, `/resume`, and on a session that took a fresh
+  id because another live session had its journal's id.
+- **`synaps --attach --continue` with no argument right after `/clear`**
+  continues the conversation from before the `/clear` in a second session.
+  The cleared session no longer counts as holding it, and its new
+  conversation has nothing on disk until its first turn.
+
+### Fixed
+
+- **Daemon: `/clear` and an in-session `/resume` update the session list at
+  once.** The list showed the old conversation's name, title, cost and
+  message count until the next turn.
+- **Daemon: resuming a conversation after `/clear` resumes it.** Resuming
+  `A` (by id or by its old name) attached to the session that had cleared
+  `A` and now holds a new conversation. It now starts a second session on
+  `A`, and either one can end without taking the other out of the list.
+- **Daemon: a reload that finds a cleared session's journal locked brings
+  the right conversation back.** Once the lock was free, the next attach
+  loaded the conversation from before the `/clear` instead of the one the
+  session held.
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel

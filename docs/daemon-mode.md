@@ -1042,6 +1042,12 @@ that conversation began.
   format instead. Both are listed; ending either leaves the other.
 - **Removal is by identity:** an actor that ends removes its own map entry only, never a session adopted
   under the same id meanwhile.
+- **A lock-held placeholder** (a reload that found the journal locked elsewhere) holds the conversation
+  its reload record continues: after `/clear` that is `N` under the id `A`. Once the lock is free, the
+  next attach builds `N` (under the id `N`, with the reload alias `A → N`), never the pre-clear `A`.
+- **`--continue` with no argument right after `/clear`** continues the latest saved conversation, which is
+  the pre-clear `A` (`N` has no journal until its first turn, and the cleared actor no longer holds `A`):
+  it opens a second actor on `A` rather than reattaching to the cleared one.
 - **Known residual:** after `/clear` → resume `A` → `daemon reload`, both actors come back under their
   journal ids (`N` and `A`). A client of the cleared actor that reconnects with `Attach::Existing{A}` gets
   conversation `A`, not `N` (the live `A` is found before the reload alias). It should reconnect by the

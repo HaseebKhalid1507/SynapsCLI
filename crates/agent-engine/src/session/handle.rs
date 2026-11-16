@@ -4,7 +4,7 @@
 //! `ClientTransport` is built on it. `echo_for_test` ships a stand-in actor
 //! so package B can build the wire before the real `SessionActor` exists.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc};
@@ -94,7 +94,9 @@ impl JournalCell {
 
     /// The cell after a move to `new_id`. A compaction keeps `created_at`
     /// and appends the old id (unless it is the same journal: an in-place
-    /// compaction); a clear or resume starts over at `created_at`.
+    /// compaction); a clear or resume starts over at `created_at`, unless
+    /// it lands on the journal already held (`/resume` of the current
+    /// session reloads it from disk: the same conversation, cell kept).
     pub fn moved(
         &self,
         new_id: String,
@@ -116,6 +118,7 @@ impl JournalCell {
                     created_at: self.created_at,
                 }
             }
+            JournalMove::Clear | JournalMove::Resume if new_id == self.journal_id => self.clone(),
             JournalMove::Clear | JournalMove::Resume => Self::new(new_id, created_at),
         }
     }
@@ -171,10 +174,12 @@ pub struct SessionHandle {
     /// F23: only on a lock-held placeholder — the config to retry the real
     /// `create` with on the next attach. `None` for real actors.
     placeholder_config: Option<Arc<SessionConfig>>,
-    /// F23: a placeholder whose real `create` is running. It stays listed
-    /// (no flicker) but is not a resume target nor an id holder until the
-    /// real session replaces it in place.
-    retrying: Arc<AtomicBool>,
+    /// F23: how many real `create`s of this placeholder are running
+    /// ([`RetryGuard`]). While any is, it stays listed (no flicker) but is
+    /// not a resume target nor an id holder until the real session
+    /// replaces it. A count, not a flag: one retry ending never clears
+    /// another's.
+    retrying: Arc<AtomicUsize>,
     /// Owned sessions only: the owner token, fixed at create. Here so a
     /// reload whose checkpoint did not confirm still records the session
     /// as owned (it would otherwise come back unowned and never end).
@@ -187,6 +192,15 @@ impl std::fmt::Debug for SessionHandle {
             .field("id", &self.id)
             .field("model", &self.meta.model)
             .finish()
+    }
+}
+
+/// One running retry of a placeholder ([`SessionHandle::retry_guard`]).
+pub struct RetryGuard(Arc<AtomicUsize>);
+
+impl Drop for RetryGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -245,7 +259,7 @@ impl SessionHandle {
             keep_warm: Arc::clone(&keep_warm),
             cache_keepwarm: Arc::clone(&cache_keepwarm),
             placeholder_config: None,
-            retrying: Arc::new(AtomicBool::new(false)),
+            retrying: Arc::new(AtomicUsize::new(0)),
             owner_token: None,
         };
         (
@@ -330,11 +344,14 @@ impl SessionHandle {
 
     /// F23: a placeholder whose real `create` is running.
     pub fn retrying(&self) -> bool {
-        self.retrying.load(Ordering::Acquire)
+        self.retrying.load(Ordering::Acquire) > 0
     }
 
-    pub(crate) fn set_retrying(&self, on: bool) {
-        self.retrying.store(on, Ordering::Release);
+    /// F23: mark one real `create` of this placeholder as running until the
+    /// guard drops (also when the retrying future is dropped mid-await).
+    pub fn retry_guard(&self) -> RetryGuard {
+        self.retrying.fetch_add(1, Ordering::AcqRel);
+        RetryGuard(Arc::clone(&self.retrying))
     }
 
     /// Test seam: write the conversation cell as an actor would.
@@ -712,17 +729,33 @@ pub mod locked_placeholder {
     /// by `holder_desc` (e.g. `"pid 1234 (tui)"`). The handle starts
     /// Parked; Attach emits `AttachRefused` naming the holder. The caller
     /// registers it in the session map under the SAME id — no alias.
+    ///
+    /// It holds the conversation `config` continues, which after a `/clear`
+    /// is not `id`, with what the reload record knew of it
+    /// (`restore_conversation`: what it superseded, its start).
     pub fn spawn(
         id: SessionId,
         config: SessionConfig,
         holder_desc: String,
     ) -> (SessionHandle, tokio::task::JoinHandle<()>) {
+        let journal_id = match &config.continue_session {
+            Some(Some(j)) => j.clone(),
+            _ => id.0.clone(),
+        };
+        let cell = match &config.restore_conversation {
+            Some(r) if r.journal_id == journal_id => JournalCell {
+                journal_id: journal_id.clone(),
+                supersedes: r.supersedes.clone(),
+                created_at: r.created_at,
+            },
+            _ => JournalCell::new(journal_id.clone(), chrono::Utc::now()),
+        };
         let meta = SessionMeta {
             id: id.clone(),
             name: config.name.clone(),
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),
             cwd: config.cwd.clone(),
-            created_at: chrono::Utc::now(),
+            created_at: cell.created_at,
             continued: true,
             continue_info: None,
             host_pid: std::process::id(),
@@ -732,7 +765,7 @@ pub mod locked_placeholder {
             awaiting_input: 0,
             roster: Vec::new(),
             client_input: None,
-            journal_id: id.0.clone(),
+            journal_id,
             locked_by: Some(holder_desc.clone()),
             pinned: false,
             busy: false,
@@ -765,6 +798,7 @@ pub mod locked_placeholder {
         let handle = handle
             .with_placeholder_config(config.clone())
             .with_owner_token(config.owned.as_ref().map(|o| o.token.clone()));
+        ep.journal.store(Arc::new(cell));
         // Start as Parked.
         ep.lifecycle.store(SessionLifecycle::Parked as u8, Ordering::Release);
         let task = tokio::spawn(run(id, ep, config, holder_desc));
@@ -870,6 +904,20 @@ mod tests {
             .await
             .expect("timely")
             .expect("open")
+    }
+
+    /// Overlapping retries of one placeholder: the first to end does not
+    /// end the other's.
+    #[tokio::test]
+    async fn a_retry_ends_only_itself() {
+        let (handle, _task) = SessionHandle::echo_for_test(SessionId::from("p"));
+        assert!(!handle.retrying());
+        let first = handle.retry_guard();
+        let second = handle.clone().retry_guard();
+        drop(first);
+        assert!(handle.retrying(), "the second retry still runs");
+        drop(second);
+        assert!(!handle.retrying());
     }
 
     #[tokio::test]
@@ -1015,6 +1063,24 @@ mod journal_cell_tests {
                 "{why:?}"
             );
             assert!(!n.holds("A") && !n.holds("B"));
+        }
+    }
+
+    /// `/resume` of the journal already held reloads it: the same
+    /// conversation, so the cell (start, supersedes) is kept.
+    #[test]
+    fn a_resume_of_the_held_journal_keeps_the_cell() {
+        let b = JournalCell::new("A".into(), at("2026-11-01T10:00:00Z")).moved(
+            "B".into(),
+            JournalMove::Compaction,
+            at("2026-11-02T10:00:00Z"),
+        );
+        for why in [JournalMove::Clear, JournalMove::Resume] {
+            assert_eq!(
+                b.moved("B".into(), why, at("2026-11-02T10:00:00Z")),
+                b,
+                "{why:?}"
+            );
         }
     }
 

@@ -359,6 +359,14 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
     let meta = handle.meta();
     let journal = handle.journal();
     let journal_id = journal.journal_id.clone();
+    // A lock-held placeholder knows the conversation's start and what it
+    // superseded only from the record it was restored from; without that,
+    // its cell's start is its own spawn time, which must not ride on.
+    let known = handle.placeholder_config().is_none_or(|c| {
+        c.restore_conversation
+            .as_ref()
+            .is_some_and(|r| r.journal_id == journal_id)
+    });
     if rec.is_none() {
         tracing::warn!(
             session = %handle.id,
@@ -420,8 +428,12 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         workers,
         tool_activations,
         owner_token: handle.owner_token().cloned(),
-        supersedes: journal.supersedes.clone(),
-        created_at: Some(journal.created_at),
+        supersedes: if known {
+            journal.supersedes.clone()
+        } else {
+            Vec::new()
+        },
+        created_at: known.then_some(journal.created_at),
     }
 }
 
@@ -1431,6 +1443,46 @@ mod tests {
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("off"));
         *ep.cache_keepwarm.lock().unwrap() = Some(CacheKeepWarm::Hours(6));
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("6h"));
+    }
+
+    /// A lock-held placeholder holds the conversation its config continues
+    /// (after `/clear`, not its actor id), and its record carries a start
+    /// and what it superseded only when it was restored with them: never
+    /// its own spawn time.
+    #[tokio::test]
+    async fn a_placeholder_record_carries_its_conversation_not_its_spawn_time() {
+        use crate::session::handle::locked_placeholder;
+        let id = crate::session::SessionId::from("A");
+        let cfg = SessionConfig {
+            continue_session: Some(Some("N".into())),
+            ..SessionConfig::default()
+        };
+        let (bare, _t) = locked_placeholder::spawn(id.clone(), cfg.clone(), "pid 1 (tui)".into());
+        assert_eq!(bare.meta_live().journal_id, "N");
+        assert!(bare.holds("N") && !bare.holds("A"));
+        let r = record(&bare, None);
+        assert_eq!((r.id.as_str(), r.journal_id.as_str()), ("A", "N"));
+        assert_eq!(r.config.continue_session, Some(Some("N".into())));
+        assert_eq!(r.created_at, None, "no start known");
+        assert!(r.supersedes.is_empty());
+
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let restored = SessionConfig {
+            restore_conversation: Some(crate::session::RestoredConversation {
+                journal_id: "N".into(),
+                supersedes: vec!["P".into()],
+                created_at: at,
+            }),
+            ..cfg
+        };
+        let (known, _t) = locked_placeholder::spawn(id, restored, "pid 1 (tui)".into());
+        assert!(known.holds("P"));
+        assert_eq!(known.meta_live().created_at, at, "listed from its start");
+        let r = record(&known, None);
+        assert_eq!(r.created_at, Some(at));
+        assert_eq!(r.supersedes, ["P"]);
     }
 
     /// Likewise the pin: an unconfirmed checkpoint must not unpin a

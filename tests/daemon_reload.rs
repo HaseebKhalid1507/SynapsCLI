@@ -1094,6 +1094,17 @@ async fn supersedes_and_the_start_survive_a_reload() {
     assert_eq!(v["compacted_into"], serde_json::json!(b));
     v.as_object_mut().unwrap().remove("compacted_into");
     std::fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+    // Precondition: the cut holds as the daemon reads it (a journal's meta
+    // overlay would put the link back, and the resume below would pass on
+    // the disk chain alone).
+    let chain = agent_engine::core::session::follow_compaction_chain(
+        agent_engine::core::session::resolve_session(&a).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        chain.session.id, a,
+        "the disk chain ends at the predecessor"
+    );
 
     assert_eq!(
         SocketTransport::reload(&d.paths.sock, true, None, None)

@@ -215,6 +215,114 @@ async fn resuming_a_cleared_conversation_is_a_second_actor() {
     end(&mut t2).await;
 }
 
+/// An in-session `/resume X` begins conversation `X`, as `/clear` begins a
+/// new one: the listing follows at once (`X`'s name, messages and start),
+/// the old conversation is let go, and resuming it builds a second actor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn resume_in_session_lists_the_resumed_conversation_and_lets_the_old_one_go() {
+    let _h = Home::new();
+    let host = boot().await;
+    // `X`: on disk, its own name, one turn.
+    let x = host
+        .create_session(SessionConfig {
+            name: Some("xeno".into()),
+            ..pcfg()
+        })
+        .await
+        .unwrap();
+    let journal_x = x.journal_id();
+    let mut tx = attach(&x).await;
+    turn(&mut tx, "conversation X").await;
+    end(&mut tx).await;
+    wait_gone(&host, &x.id).await;
+    let x_start = agent_engine::core::session::Session::load(&journal_x)
+        .unwrap()
+        .created_at;
+
+    let a = host
+        .create_session(SessionConfig {
+            name: Some("axel".into()),
+            ..pcfg()
+        })
+        .await
+        .unwrap();
+    let journal_a = a.journal_id();
+    let mut t = attach(&a).await;
+    turn(&mut t, "first").await;
+    turn(&mut t, "second").await;
+    let before = host.sessions().into_iter().find(|m| m.id == a.id).unwrap();
+    assert_eq!((before.name.as_deref(), before.messages), (Some("axel"), 4));
+
+    t.send(SessionCommand::Resume {
+        id: 7,
+        query: journal_x.clone(),
+    })
+    .await
+    .unwrap();
+    until(&mut t, |e| matches!(e, SessionEventWire::Resumed { .. })).await;
+    let m = host.sessions().into_iter().find(|m| m.id == a.id).unwrap();
+    assert_eq!(m.journal_id, journal_x);
+    assert_eq!(
+        m.name.as_deref(),
+        Some("xeno"),
+        "the resumed conversation's name"
+    );
+    assert_eq!(m.messages, 2, "its messages");
+    assert_eq!(m.created_at, x_start, "its start");
+    assert!(a.holds(&journal_x));
+    assert!(!a.holds(&journal_a), "the old conversation is let go");
+
+    // Resuming the old conversation: a second actor; `a` is untouched.
+    let r = host.create_session(resume(&journal_a)).await.unwrap();
+    assert_ne!(r.id, a.id, "a minted actor id");
+    assert_eq!(r.journal_id(), journal_a);
+    assert_eq!(a.journal_id(), journal_x);
+    assert_eq!(host.sessions().len(), 2);
+    let mut tr = attach(&r).await;
+    end(&mut tr).await;
+    end(&mut t).await;
+}
+
+/// `/resume` of the journal already held (a compacted actor on `B` resuming
+/// `B`) reloads the same conversation: what it superseded and its start
+/// are kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn resuming_the_held_journal_keeps_the_conversation() {
+    let _h = Home::new();
+    let host = boot().await;
+    let a = host
+        .create_session(SessionConfig {
+            compaction_policy: CompactionPolicyWire::LinkedSuccessor,
+            ..pcfg()
+        })
+        .await
+        .unwrap();
+    let mut t = attach(&a).await;
+    turn(&mut t, "hello 0").await;
+    turn(&mut t, "hello 1").await;
+    t.send(SessionCommand::Compact { instructions: None })
+        .await
+        .unwrap();
+    until(&mut t, |e| matches!(e, SessionEventWire::Idle)).await;
+    let cell = a.journal();
+    let b = cell.journal_id.clone();
+    assert_eq!(cell.supersedes, vec![a.id.0.clone()]);
+
+    t.send(SessionCommand::Resume {
+        id: 7,
+        query: b.clone(),
+    })
+    .await
+    .unwrap();
+    until(&mut t, |e| matches!(e, SessionEventWire::Resumed { .. })).await;
+    assert_eq!(*a.journal(), *cell, "the same conversation");
+    let m = host.sessions().into_iter().find(|m| m.id == a.id).unwrap();
+    assert_eq!((m.journal_id, m.created_at), (b, cell.created_at));
+    end(&mut t).await;
+}
+
 /// After a linked-successor compaction `A → B` the actor still holds `A`:
 /// resuming `A` attaches to it even when the disk chain does not lead to
 /// `B` (the successor's link not written yet), not by its actor id.

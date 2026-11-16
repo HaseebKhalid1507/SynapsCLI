@@ -534,7 +534,7 @@ impl EngineHost {
 
     /// Every registered handle (B4: THE session map; `DaemonState`
     /// delegates here). Dead handles are dropped defensively: the actor
-    /// task drops `cmd_rx` when `run()` returns and `remove_session` runs
+    /// task drops `cmd_rx` when `run()` returns and `remove_session_if` runs
     /// *after* — a listing in that window sees `is_alive() == false`. That
     /// is an ordering window, not an invariant violation, so it is logged
     /// at debug, never asserted.
@@ -704,7 +704,9 @@ impl EngineHost {
         }
     }
 
-    /// Release all driver grants held by `session` (called from `remove_session`).
+    /// Release all driver grants held by `session` (called from
+    /// `remove_session_if`, only once that session's entry is removed: grants
+    /// are keyed by id, and a newcomer adopted under the same id keeps its own).
     fn release_all_driver_grants(&self, session: &SessionId) {
         let mut grants = self.driver_grants.lock().unwrap_or_else(|e| e.into_inner());
         grants.retain(|_, s| s != session);

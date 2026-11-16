@@ -334,25 +334,35 @@ impl DaemonState {
     }
 
     /// F23: a lock-held placeholder (`meta.locked_by.is_some()`) is retried on
-    /// every attach: re-run the real `create` from the journal. The
-    /// placeholder stays listed meanwhile, flagged `retrying` so the host's
-    /// attach-if-live short-circuit does not hand it straight back and its
-    /// id is free for the real session. Success replaces the placeholder in
-    /// place under the same id; still-held clears the flag and the caller
-    /// attaches to it (→ `AttachRefused` naming the holder).
+    /// every attach: re-run the real `create` of the conversation it holds
+    /// (its config's `continue_session`: after a `/clear` that is not its
+    /// actor id). The placeholder stays listed meanwhile, flagged
+    /// `retrying` so the host's attach-if-live short-circuit does not hand
+    /// it straight back and its id is free for the real session. Success
+    /// replaces the placeholder: in place under the same id, or under the
+    /// journal id with the reload alias `id → journal id` a reload would
+    /// have set; still-held ends the retry and the caller attaches to it
+    /// (→ `AttachRefused` naming the holder).
     pub async fn retry_locked_placeholder(&self, placeholder: SessionHandle) -> SessionHandle {
-        let cfg = SessionConfig {
-            continue_session: Some(Some(placeholder.id.as_str().to_string())),
-            ..placeholder.placeholder_config().cloned().unwrap_or_default()
+        let journal = placeholder.journal_id();
+        let mut cfg = placeholder
+            .placeholder_config()
+            .cloned()
+            .unwrap_or_default();
+        cfg.continue_session = Some(Some(journal.clone()));
+        let created = {
+            let _retrying = placeholder.retry_guard();
+            (self.factory)(cfg).await
         };
-        placeholder.set_retrying(true);
-        let created = (self.factory)(cfg).await;
-        placeholder.set_retrying(false);
         match created {
-            Ok(real) if real.id == placeholder.id || real.journal_id() == placeholder.id.as_str() => {
-                tracing::info!(session = %placeholder.id, "daemon: locked journal released — placeholder replaced by the real session");
+            Ok(real) if real.id == placeholder.id || real.holds(&journal) => {
+                tracing::info!(session = %placeholder.id, journal, "daemon: locked journal released — placeholder replaced by the real session");
                 if real.id != placeholder.id {
                     self.remove(&placeholder);
+                    self.reload_aliases
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(placeholder.id.0.clone(), real.id.0.clone());
                 }
                 self.insert(real.clone());
                 // A restored owned session: the daemon accepts connections.
