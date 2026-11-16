@@ -168,6 +168,13 @@ async fn reload_keeps_pid_sessions_and_reconnects_clients() {
 
     let (mut t, snap) = attach_create(&d.paths, guard.home.path()).await;
     assert_eq!(t.welcome.generation, 1);
+    // A cold start mints a boot id; the reload below keeps it. The daemon
+    // lists its workers per session.
+    let boot_id = t.welcome.boot_id.clone();
+    assert_eq!(boot_id.len(), 16, "{boot_id:?}");
+    assert!(t
+        .welcome
+        .supports(agent_engine::session::wire::FEATURE_SESSION_WORKERS));
     // The real daemon reports the build id the root build script baked in
     // (`main` hands it to the engine), and a client of the same build sees
     // no version-skew notice.
@@ -217,6 +224,7 @@ async fn reload_keeps_pid_sessions_and_reconnects_clients() {
         .expect("reconnected");
     assert_eq!(t.welcome.generation, 2);
     assert_reload_pid(t.welcome.pid, pid_before);
+    assert_eq!(t.welcome.boot_id, boot_id, "a reload is not a cold start");
     assert_eq!(t.session_id(), &sid, "session id survives (same journal)");
     assert_eq!(
         serde_json::to_string(&snap.conversation.api_messages).unwrap(),
@@ -241,6 +249,22 @@ async fn reload_keeps_pid_sessions_and_reconnects_clients() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(!registry::is_alive(&d.paths));
+
+    // A cold start: a new boot id (worker handle ids start over).
+    let d2 = spawn_daemon(&guard, &url).await;
+    let conn = SocketTransport::connect(&d2.paths.sock, Hello::new(ClientKind::Test))
+        .await
+        .unwrap();
+    assert_eq!(conn.welcome.generation, 1);
+    assert_eq!(conn.welcome.boot_id.len(), 16);
+    assert_ne!(
+        conn.welcome.boot_id, boot_id,
+        "a cold start mints a new boot id"
+    );
+    drop(conn);
+    SocketTransport::shutdown(&d2.paths.sock, false)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

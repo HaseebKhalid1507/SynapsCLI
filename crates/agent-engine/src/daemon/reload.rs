@@ -174,6 +174,10 @@ pub struct ReloadState {
     /// carried workers only.
     #[serde(default)]
     pub next_subagent_id: u64,
+    /// `Welcome.boot_id`, kept by the next image. Empty from an older image
+    /// (the next image mints one).
+    #[serde(default)]
+    pub boot_id: String,
 }
 
 impl ReloadState {
@@ -483,6 +487,7 @@ pub async fn prepare(
         expected_clients: state.connections.load(Ordering::SeqCst),
         // After every checkpoint: no session can launch a worker any more.
         next_subagent_id: crate::tools::peek_next_subagent_id(),
+        boot_id: state.boot_id.clone(),
     };
     let rs_path = reload_state_path(paths);
     // If either write fails we early-return WITHOUT reaching exec() (which is the
@@ -1138,6 +1143,7 @@ mod tests {
             sessions: vec![session(vec![worker("sa_288"), worker("sa_286")]), session(vec![])],
             expected_clients: 0,
             next_subagent_id: 0,
+            boot_id: String::new(),
         };
         assert_eq!(rs.subagent_id_floor(), 289);
         rs.next_subagent_id = 300;

@@ -101,6 +101,9 @@ pub struct SubagentState {
     pub conversation_state: Vec<Value>,
     /// Stamped once by finalize_subagent at thread exit.
     pub finished_at: Option<std::time::Instant>,
+    /// Wall clock of `finished_at`, stamped with it (`stamp_finished`): the
+    /// listing's `WorkerRow::finished_at`, stable across reads.
+    pub finished_at_wall: Option<chrono::DateTime<chrono::Utc>>,
     /// Set by cancel() before the shutdown signal is sent.
     /// Read by finalize_subagent to label the terminal status correctly.
     pub cancel_requested: bool,
@@ -191,6 +194,7 @@ impl SubagentState {
             tool_log: Vec::new(),
             conversation_state: Vec::new(),
             finished_at: None,
+            finished_at_wall: None,
             cancel_requested: false,
             stopped_by_reload: false,
             completion_settled: false,
@@ -211,6 +215,13 @@ impl SubagentState {
             archive_error: None,
             watch: Default::default(),
         }
+    }
+
+    /// The run ended now: stamp `finished_at` and its wall clock together
+    /// (the finalizer, once per run).
+    pub fn stamp_finished(&mut self) {
+        self.finished_at = Some(std::time::Instant::now());
+        self.finished_at_wall = Some(chrono::Utc::now());
     }
 
     /// Record the worker's latest progress line and tool count.
@@ -323,6 +334,31 @@ pub struct SubagentDisplayRow {
     pub model: String,
 }
 
+impl SubagentDisplayRow {
+    /// Running and staying so ([`SubagentRegistry::live_worker_count`]).
+    pub fn is_live(&self) -> bool {
+        is_live_worker(&self.status, self.cancel_requested)
+    }
+}
+
+/// A worker that is running and not stopping: a cancelled one reads as
+/// running until its next step, but it is on its way out.
+fn is_live_worker(status: &SubagentStatus, cancel_requested: bool) -> bool {
+    *status == SubagentStatus::Running && !cancel_requested
+}
+
+/// Whether parking now would cost this worker: running (a cancelled one
+/// winding down included), or finished on its own within `ttl` with a
+/// result the parent has not collected. The one predicate for
+/// [`SubagentRegistry::holds_park`] and [`SubagentRegistry::worker_rows`].
+fn holds_park(s: &SubagentState, collected: bool, ttl: std::time::Duration) -> bool {
+    if s.public_status() == SubagentStatus::Running {
+        return true;
+    }
+    let fresh = s.finished_at.is_none_or(|t| t.elapsed() < ttl);
+    fresh && !collected && !s.cancel_requested
+}
+
 // ── SubagentHandle ───────────────────────────────────────────────────────────────
 
 pub struct SubagentHandle {
@@ -335,6 +371,8 @@ pub struct SubagentHandle {
     pub model: String,
     pub system_prompt: String,
     pub started_at: std::time::Instant,
+    /// Wall clock of `started_at` (the listing's `WorkerRow::started_at`).
+    pub started_at_wall: chrono::DateTime<chrono::Utc>,
     pub timeout_secs: u64,
     pub authorization: Option<AuthorizationDiagnostic>,
 
@@ -395,6 +433,7 @@ impl SubagentHandle {
             model,
             system_prompt,
             started_at: std::time::Instant::now(),
+            started_at_wall: chrono::Utc::now(),
             timeout_secs,
             authorization: None,
             state,
@@ -688,10 +727,35 @@ impl Drop for SubagentHandle {
 
 /// Finished-but-uncollected handles are retained this long before GC.
 pub const FINISHED_HANDLE_TTL: std::time::Duration = std::time::Duration::from_secs(900); // 15 min
+
+/// [`FINISHED_HANDLE_TTL`] as the park and the listing apply it (a test
+/// build can shorten it: [`set_finished_handle_ttl_for_test`]).
+pub fn finished_handle_ttl() -> std::time::Duration {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        let ms = FINISHED_TTL_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    FINISHED_HANDLE_TTL
+}
+
+#[cfg(any(test, feature = "testing"))]
+static FINISHED_TTL_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test seam: [`finished_handle_ttl`] returns `ttl` (`None`: the default)
+/// for the whole process.
+#[cfg(any(test, feature = "testing"))]
+pub fn set_finished_handle_ttl_for_test(ttl: Option<std::time::Duration>) {
+    let ms = ttl.map_or(0, |t| (t.as_millis() as u64).max(1));
+    FINISHED_TTL_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
 /// Maximum terminal text retained by a transport-free tombstone.
 pub const TOMBSTONE_OUTPUT_MAX_BYTES: usize = 32 * 1024;
 
-/// `WatchPage::status` for a worker status.
+/// `WatchPage::status` (and `WorkerRow::status`) for a worker status.
 fn watch_status_label(status: &SubagentStatus) -> &'static str {
     match status {
         SubagentStatus::Running => "running",
@@ -970,14 +1034,105 @@ impl SubagentRegistry {
     /// result the parent has not collected yet. A cancelled worker owes no
     /// result.
     pub fn holds_park(&self) -> bool {
+        let ttl = finished_handle_ttl();
         self.handles.values().any(|h| {
-            if h.status() == SubagentStatus::Running {
-                return true;
-            }
             let s = h.state.read().unwrap_or_else(|p| p.into_inner());
-            let fresh = s.finished_at.is_none_or(|t| t.elapsed() < FINISHED_HANDLE_TTL);
-            fresh && !h.collected && !s.cancel_requested
+            holds_park(&s, h.collected, ttl)
         })
+    }
+
+    /// The workers that hold the park ([`Self::holds_park`]'s predicate), as
+    /// the listing shows them (`SessionMeta::workers`): running first,
+    /// oldest first, then finished, newest first; at most
+    /// [`SESSION_WORKER_ROWS`](crate::session::SESSION_WORKER_ROWS), `more`
+    /// counting the rest. No step text: rows only change when a worker
+    /// starts, stops, finishes or is collected, or its result expires.
+    pub fn worker_rows(&self) -> crate::session::SessionWorkers {
+        use crate::session::{SessionWorkers, WorkerRow, SESSION_WORKER_ROWS};
+        let ttl = finished_handle_ttl();
+        let mut running = 0u32;
+        let mut rows: Vec<(bool, WorkerRow)> = Vec::new();
+        for h in self.handles.values() {
+            let s = h.state.read().unwrap_or_else(|p| p.into_inner());
+            if !holds_park(&s, h.collected, ttl) {
+                continue;
+            }
+            let status = s.public_status();
+            let is_running = status == SubagentStatus::Running;
+            if is_live_worker(&status, s.cancel_requested) {
+                running += 1;
+            }
+            rows.push((
+                is_running,
+                WorkerRow {
+                    handle_id: h.id.clone(),
+                    subagent_id: h.subagent_id,
+                    agent_name: h.agent_name.clone(),
+                    model: h.model.clone(),
+                    status: watch_status_label(&status).to_string(),
+                    cancel_requested: s.cancel_requested,
+                    started_at: h.started_at_wall,
+                    finished_at: if is_running { None } else { s.finished_at_wall },
+                    step: String::new(),
+                    tools: 0,
+                },
+            ));
+        }
+        rows.sort_by(|(ra, a), (rb, b)| {
+            rb.cmp(ra).then_with(|| {
+                if *ra {
+                    (a.started_at, a.subagent_id).cmp(&(b.started_at, b.subagent_id))
+                } else {
+                    (b.finished_at, b.subagent_id).cmp(&(a.finished_at, a.subagent_id))
+                }
+            })
+        });
+        let more = rows.len().saturating_sub(SESSION_WORKER_ROWS) as u32;
+        rows.truncate(SESSION_WORKER_ROWS);
+        SessionWorkers {
+            running,
+            rows: rows.into_iter().map(|(_, r)| r).collect(),
+            more,
+        }
+    }
+
+    /// When the earliest finished worker that holds the park stops holding
+    /// it: its result expires ([`finished_handle_ttl`] after it finished).
+    /// `None` while no finished worker holds it.
+    pub fn next_worker_expiry(&self) -> Option<std::time::Instant> {
+        let ttl = finished_handle_ttl();
+        self.handles
+            .values()
+            .filter_map(|h| {
+                let s = h.state.read().unwrap_or_else(|p| p.into_inner());
+                let finished = s.public_status() != SubagentStatus::Running;
+                (finished && holds_park(&s, h.collected, ttl))
+                    .then_some(s.finished_at)
+                    .flatten()
+                    .map(|t| t + ttl)
+            })
+            .min()
+    }
+
+    /// Whether any worker is still running, a cancelled one winding down
+    /// included (it still has a step to take).
+    pub fn any_running(&self) -> bool {
+        self.handles
+            .values()
+            .any(|h| h.status() == SubagentStatus::Running)
+    }
+
+    /// Workers running and not stopping (a cancelled one is not counted):
+    /// the Esc notice; `SessionWorkers::running` counts the same. Counts in
+    /// place, without building [`Self::display_rows`].
+    pub fn live_worker_count(&self) -> usize {
+        self.handles
+            .values()
+            .filter(|h| {
+                let s = h.state.read().unwrap_or_else(|p| p.into_inner());
+                is_live_worker(&s.public_status(), s.cancel_requested)
+            })
+            .count()
     }
 
     /// Returns (id, agent_name, status) for every tracked handle.
@@ -1455,6 +1610,216 @@ mod tests {
             .read()
             .unwrap()
             .cancel_requested
+    }
+
+    /// `live_worker_count` (the Esc notice) leaves out finished and
+    /// cancelled workers; `any_running` (the tick's lifetime) keeps a
+    /// cancelled one that still reads as running. Both agree with the rows.
+    #[test]
+    fn live_worker_count_skips_finished_and_cancelled_workers() {
+        let mut registry = SubagentRegistry::new();
+        assert_eq!(
+            (registry.live_worker_count(), registry.any_running()),
+            (0, false)
+        );
+        registry.register(make_handle("sa_1"));
+        registry.register(make_handle("sa_2"));
+        registry.register(make_finished_handle("sa_3"));
+        assert_eq!(
+            (registry.live_worker_count(), registry.any_running()),
+            (2, true)
+        );
+        registry
+            .get("sa_2")
+            .unwrap()
+            .state
+            .write()
+            .unwrap()
+            .cancel_requested = true;
+        assert_eq!(
+            (registry.live_worker_count(), registry.any_running()),
+            (1, true)
+        );
+        let rows = registry.display_rows();
+        assert_eq!(rows.iter().filter(|r| r.is_live()).count(), 1);
+    }
+
+    fn finish_at(h: &SubagentHandle, status: SubagentStatus, ago: std::time::Duration) {
+        let mut s = h.state.write().unwrap();
+        s.status = status;
+        s.finished_at = Some(std::time::Instant::now() - ago);
+        s.finished_at_wall = Some(chrono::Utc::now() - chrono::Duration::from_std(ago).unwrap());
+    }
+
+    fn listed(registry: &SubagentRegistry) -> Vec<String> {
+        registry
+            .worker_rows()
+            .rows
+            .into_iter()
+            .map(|r| r.handle_id)
+            .collect()
+    }
+
+    /// The listing's workers are exactly the ones that hold the park: a
+    /// running one (cancelled and winding down included), a finished one
+    /// with its result uncollected within the TTL. Not a collected, a
+    /// cancelled-and-finished or an expired one. `running` leaves out the
+    /// cancelled one.
+    #[test]
+    fn worker_rows_are_the_workers_that_hold_the_park() {
+        let mut registry = SubagentRegistry::new();
+        assert!(registry.worker_rows().is_empty());
+        assert!(!registry.holds_park());
+        let ttl = FINISHED_HANDLE_TTL;
+        let mut kinds: Vec<(&str, bool)> = Vec::new();
+        for (id, setup, holds) in [
+            ("sa_1", 0, true),  // running
+            ("sa_2", 1, true),  // running, cancel requested (winding down)
+            ("sa_3", 2, true),  // completed, uncollected, fresh
+            ("sa_4", 3, false), // completed, collected
+            ("sa_5", 4, false), // cancelled, finished
+            ("sa_6", 5, false), // completed, uncollected, expired
+            ("sa_7", 6, true),  // failed, uncollected, fresh
+        ] {
+            let mut h = make_handle(id);
+            match setup {
+                1 => h.state.write().unwrap().cancel_requested = true,
+                2 => finish_at(
+                    &h,
+                    SubagentStatus::Completed,
+                    std::time::Duration::from_secs(1),
+                ),
+                3 => {
+                    finish_at(
+                        &h,
+                        SubagentStatus::Completed,
+                        std::time::Duration::from_secs(1),
+                    );
+                    h.mark_collected();
+                }
+                4 => {
+                    finish_at(
+                        &h,
+                        SubagentStatus::Cancelled,
+                        std::time::Duration::from_secs(1),
+                    );
+                    h.state.write().unwrap().cancel_requested = true;
+                }
+                5 => finish_at(
+                    &h,
+                    SubagentStatus::Completed,
+                    ttl + std::time::Duration::from_secs(1),
+                ),
+                6 => finish_at(
+                    &h,
+                    SubagentStatus::Failed("x".into()),
+                    std::time::Duration::from_secs(2),
+                ),
+                _ => {}
+            }
+            // One at a time: the park holds iff this worker's kind does.
+            let mut alone = SubagentRegistry::new();
+            alone.register(h);
+            assert_eq!(alone.holds_park(), holds, "{id}");
+            assert_eq!(alone.worker_rows().rows.len(), usize::from(holds), "{id}");
+            kinds.push((id, holds));
+            let h = alone.remove(id).unwrap();
+            registry.register(h);
+        }
+        let want: Vec<&str> = kinds
+            .iter()
+            .filter(|(_, h)| *h)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut got = listed(&registry);
+        got.sort();
+        assert_eq!(got, want);
+        let w = registry.worker_rows();
+        assert_eq!(w.running, 1, "the cancelled one is not counted");
+        assert_eq!(w.running as usize, registry.live_worker_count());
+        let row = |id: &str| w.rows.iter().find(|r| r.handle_id == id).unwrap().clone();
+        assert!(row("sa_2").cancel_requested && row("sa_2").status == "running");
+        assert_eq!(row("sa_7").status, "failed");
+        assert!(row("sa_3").finished_at.is_some() && row("sa_1").finished_at.is_none());
+        assert!(
+            w.rows.iter().all(|r| r.step.is_empty() && r.tools == 0),
+            "no step text"
+        );
+    }
+
+    /// Running first, oldest first; then finished, newest first. Eight rows,
+    /// `more` counts the rest. The same registry gives the same block on
+    /// every read (wall-clock stamps, no elapsed values).
+    #[test]
+    fn worker_rows_order_cap_and_stable_stamps() {
+        let mut registry = SubagentRegistry::new();
+        let t0 = chrono::Utc::now();
+        for i in 1..=6u64 {
+            let mut h = make_handle(&format!("sa_{i}"));
+            h.started_at_wall = t0 + chrono::Duration::seconds(10 - i as i64);
+            if i > 3 {
+                finish_at(
+                    &h,
+                    SubagentStatus::Completed,
+                    std::time::Duration::from_secs(i),
+                );
+            }
+            registry.register(h);
+        }
+        // sa_3 started first; among the finished, sa_4 finished last.
+        assert_eq!(
+            listed(&registry),
+            ["sa_3", "sa_2", "sa_1", "sa_4", "sa_5", "sa_6"]
+        );
+        assert_eq!(registry.worker_rows().more, 0);
+        let first = registry.worker_rows();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(registry.worker_rows(), first, "stable across reads");
+
+        for i in 7..=12u64 {
+            let mut h = make_handle(&format!("sa_{i}"));
+            h.started_at_wall = t0 + chrono::Duration::seconds(10 + i as i64);
+            registry.register(h);
+        }
+        let w = registry.worker_rows();
+        assert_eq!(w.rows.len(), crate::session::SESSION_WORKER_ROWS);
+        assert_eq!(w.more, 4);
+        assert_eq!(w.running, 9);
+        let ids: Vec<&str> = w.rows.iter().map(|r| r.handle_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["sa_3", "sa_2", "sa_1", "sa_7", "sa_8", "sa_9", "sa_10", "sa_11"]
+        );
+    }
+
+    /// The expiry one-shot's deadline: the earliest listed finished
+    /// worker's `finished_at + TTL`; none while only running ones, or
+    /// collected ones, are left.
+    #[test]
+    fn next_worker_expiry_is_the_earliest_listed_result() {
+        let mut registry = SubagentRegistry::new();
+        registry.register(make_handle("sa_1"));
+        assert_eq!(registry.next_worker_expiry(), None, "running: no expiry");
+        let older = make_handle("sa_2");
+        finish_at(
+            &older,
+            SubagentStatus::Completed,
+            std::time::Duration::from_secs(60),
+        );
+        let at = older.state.read().unwrap().finished_at.unwrap() + FINISHED_HANDLE_TTL;
+        let newer = make_handle("sa_3");
+        finish_at(
+            &newer,
+            SubagentStatus::Completed,
+            std::time::Duration::from_secs(5),
+        );
+        registry.register(older);
+        registry.register(newer);
+        assert_eq!(registry.next_worker_expiry(), Some(at));
+        registry.get_mut("sa_2").unwrap().mark_collected();
+        assert!(registry.next_worker_expiry().is_some_and(|t| t > at));
+        registry.get_mut("sa_3").unwrap().mark_collected();
+        assert_eq!(registry.next_worker_expiry(), None);
     }
 
     /// Esc cancels the interrupted turn's workers, not reactive workers an

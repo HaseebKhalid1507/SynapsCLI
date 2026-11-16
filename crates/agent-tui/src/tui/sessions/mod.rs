@@ -71,7 +71,10 @@ impl RowState {
     pub(crate) fn of(m: &SessionMeta) -> Self {
         match m.lifecycle {
             SessionLifecycle::Parked => Self::Parked,
-            SessionLifecycle::Parking | SessionLifecycle::Ending => Self::Transient,
+            // A lifecycle from a newer daemon: listed with the transient ones.
+            SessionLifecycle::Parking | SessionLifecycle::Ending | SessionLifecycle::Unknown => {
+                Self::Transient
+            }
             SessionLifecycle::Live if m.awaiting_input > 0 => Self::Waiting,
             SessionLifecycle::Live if m.busy => Self::Streaming,
             SessionLifecycle::Live => Self::Idle,
@@ -403,14 +406,17 @@ pub(crate) fn state_text(m: &SessionMeta, now: DateTime<Utc>) -> String {
         })
         .unwrap_or_default()
     };
+    // Background workers still running: never plain idle.
+    let workers = m.workers_tag();
     match RowState::of(m) {
-        RowState::Streaming => format!("streaming{since}"),
-        RowState::Waiting => "waiting on you".to_string(),
-        RowState::Idle if m.pinned => format!("idle{since}"),
-        RowState::Idle => format!("idle{since}{}", until(m.park_due, "parks")),
+        RowState::Streaming => format!("streaming{since}{workers}"),
+        RowState::Waiting => format!("waiting on you{workers}"),
+        RowState::Idle if m.pinned => format!("idle{since}{workers}"),
+        RowState::Idle => format!("idle{since}{workers}{}", until(m.park_due, "parks")),
         RowState::Transient => match m.lifecycle {
             SessionLifecycle::Ending => "ending…".to_string(),
-            _ => "parking…".to_string(),
+            SessionLifecycle::Parking => "parking…".to_string(),
+            _ => "unknown".to_string(),
         },
         RowState::Parked => format!("parked{since}{}", until(m.evict_due, "evicts")),
     }

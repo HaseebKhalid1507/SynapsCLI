@@ -1138,6 +1138,7 @@ mod tests {
                         generation: 1,
                         daemon_build: String::new(),
                         features: Vec::new(),
+                        boot_id: String::new(),
                     })
                 }
                 ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
@@ -1504,6 +1505,7 @@ mod tests {
                 generation: 1,
                 daemon_build: String::new(),
                 features: Vec::new(),
+                boot_id: String::new(),
             });
             w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
             line.clear();
@@ -1539,6 +1541,7 @@ mod tests {
             generation: 1,
             daemon_build: String::new(),
             features,
+            boot_id: String::new(),
         });
         w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
         let mut sent = Vec::new();

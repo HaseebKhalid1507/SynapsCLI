@@ -81,6 +81,10 @@ pub struct SessionHandle {
     journal_id: Arc<arc_swap::ArcSwap<String>>,
     /// Clients / input owner / pending prompts, written by the actor.
     presence: Arc<arc_swap::ArcSwap<Presence>>,
+    /// The workers that hold the park (`SessionMeta::workers`), written by
+    /// the actor's `publish_workers` only when the block changes. Its own
+    /// cell: a worker change does not rebuild the presence.
+    workers: Arc<arc_swap::ArcSwap<super::types::SessionWorkers>>,
     /// Session name — `--name` at create / `/cmd saveas` later. Written by
     /// the actor so listings and `--continue <name>` see renames live.
     name: Arc<arc_swap::ArcSwap<Option<String>>>,
@@ -117,6 +121,7 @@ pub struct SessionEndpoints {
     pub lifecycle: Arc<AtomicU8>,
     pub journal_id: Arc<arc_swap::ArcSwap<String>>,
     pub presence: Arc<arc_swap::ArcSwap<Presence>>,
+    pub workers: Arc<arc_swap::ArcSwap<super::types::SessionWorkers>>,
     pub name: Arc<arc_swap::ArcSwap<Option<String>>>,
     pub keep_warm: Arc<AtomicBool>,
     pub cache_keepwarm: super::cache_keepwarm::OverrideSlot,
@@ -132,6 +137,9 @@ impl SessionHandle {
         let lifecycle = Arc::new(AtomicU8::new(SessionLifecycle::Live as u8));
         let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(meta.id.0.clone()));
         let presence = Arc::new(arc_swap::ArcSwap::from_pointee(Presence::default()));
+        let workers = Arc::new(arc_swap::ArcSwap::from_pointee(
+            super::types::SessionWorkers::default(),
+        ));
         let name = Arc::new(arc_swap::ArcSwap::from_pointee(meta.name.clone()));
         let keep_warm = Arc::new(AtomicBool::new(meta.pinned));
         let cache_keepwarm = super::cache_keepwarm::OverrideSlot::default();
@@ -144,6 +152,7 @@ impl SessionHandle {
             lifecycle: Arc::clone(&lifecycle),
             journal_id: Arc::clone(&journal_id),
             presence: Arc::clone(&presence),
+            workers: Arc::clone(&workers),
             name: Arc::clone(&name),
             keep_warm: Arc::clone(&keep_warm),
             cache_keepwarm: Arc::clone(&cache_keepwarm),
@@ -159,6 +168,7 @@ impl SessionHandle {
                 lifecycle,
                 journal_id,
                 presence,
+                workers,
                 name,
                 keep_warm,
                 cache_keepwarm,
@@ -207,6 +217,13 @@ impl SessionHandle {
         (**self.name.load()).clone()
     }
 
+    /// Test seam: the workers cell as stored (its `Arc` changes only when
+    /// the actor publishes a different block).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn workers_cell_for_test(&self) -> Arc<super::types::SessionWorkers> {
+        self.workers.load_full()
+    }
+
     /// Whether the session is pinned (`KeepWarm{on}`), as last written by
     /// the actor.
     pub fn pinned(&self) -> bool {
@@ -222,8 +239,9 @@ impl SessionHandle {
     }
 
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,
-    /// awaiting_input, client_input, model, journal_id, name, pinned, and the
-    /// presence's busy/state/deadlines/title/cost/messages) — what listings show.
+    /// awaiting_input, client_input, model, journal_id, name, pinned, the
+    /// presence's busy/state/deadlines/title/cost/messages, and the
+    /// workers) — what listings show.
     pub fn meta_live(&self) -> SessionMeta {
         let mut m = (*self.meta).clone();
         let p = self.presence();
@@ -245,6 +263,7 @@ impl SessionHandle {
         m.title = p.title;
         m.cost_usd = p.cost_usd;
         m.messages = p.messages;
+        m.workers = (**self.workers.load()).clone();
         m
     }
 
@@ -344,6 +363,7 @@ pub mod echo {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            workers: Default::default(),
         }
     }
 
@@ -594,6 +614,7 @@ pub mod locked_placeholder {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            workers: Default::default(),
         };
         let view = crate::session::view::RuntimeView {
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),

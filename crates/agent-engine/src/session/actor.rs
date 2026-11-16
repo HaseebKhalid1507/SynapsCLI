@@ -641,6 +641,13 @@ pub struct SessionActor {
     pub(crate) turn_awaiting_start: Option<TurnStart>,
     /// 1 Hz `SubagentRows` cadence while a turn runs (`None` when idle).
     pub(crate) subagent_tick: Option<tokio::time::Interval>,
+    /// Mirrors `handle.meta_live().workers` (`publish_workers`).
+    pub(crate) workers_cell: Arc<arc_swap::ArcSwap<super::types::SessionWorkers>>,
+    /// When the earliest listed finished worker's result expires
+    /// (`finished_at + FINISHED_HANDLE_TTL`): its row leaves the listing
+    /// then, and the park it held is re-armed. `None` while no finished
+    /// worker is listed, so an idle session holds no timer.
+    pub(crate) worker_expiry: Option<tokio::time::Instant>,
     /// Worker-registry generation of the current/last turn: a user
     /// interrupt cancels only the workers this turn launched.
     pub(crate) turn_worker_generation: u64,
@@ -892,6 +899,7 @@ impl SessionActor {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            workers: Default::default(),
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
@@ -923,6 +931,7 @@ impl SessionActor {
                 lifecycle,
                 journal_id,
                 presence,
+                workers: workers_cell,
                 name,
                 keep_warm: keep_warm_cell,
                 cache_keepwarm,
@@ -1012,6 +1021,8 @@ impl SessionActor {
             session_start,
             turn_awaiting_start: None,
             subagent_tick: None,
+            workers_cell,
+            worker_expiry: None,
             turn_worker_generation: 0,
             lifecycle,
             journal_id,
@@ -1328,8 +1339,11 @@ impl SessionActor {
     /// clock, and the conversation's title / cost / message count (kept as
     /// last published while Parked). Every transition that moves them —
     /// turn and compaction start/end, attach/detach, `rearm_park`,
-    /// park/unpark — ends in a publish; stream deltas do not.
-    pub(crate) fn publish_presence(&self) {
+    /// park/unpark — ends in a publish; stream deltas do not. The deadlines
+    /// are whole seconds, so republishing the same deadline compares equal.
+    /// The worker block is published with it (`publish_workers`): a parked
+    /// session lists none.
+    pub(crate) fn publish_presence(&mut self) {
         use super::handle::{Presence, PresenceState};
         self.background
             .set_inbox_accepting(self.input_owner.is_some());
@@ -1349,10 +1363,12 @@ impl SessionActor {
             _ => Some(now),
         };
         let wall = |at: tokio::time::Instant| {
+            use chrono::SubsecRound;
             let left = at.saturating_duration_since(tokio::time::Instant::now());
             chrono::Duration::from_std(left)
                 .ok()
                 .and_then(|d| now.checked_add_signed(d))
+                .map(|t| t.trunc_subsecs(0))
         };
         // A worker re-check is not a park (it only looks again), nor is a
         // grace that workers now hold: its firing would only re-check. The
@@ -1388,6 +1404,36 @@ impl SessionActor {
             messages,
             owning_client: self.owned.as_ref().and_then(|o| o.client),
         }));
+        self.publish_workers();
+    }
+
+    /// Publish the workers that hold the park (`SubagentRegistry::
+    /// worker_rows`) to the listing, only when the block changed, and arm
+    /// the one-shot at the earliest listed result's expiry. Parked: none.
+    /// Callers hold no registry guard (it locks the registry).
+    pub(crate) fn publish_workers(&mut self) {
+        let (block, expiry) = if self.runtime.is_live() {
+            let registry = self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            (registry.worker_rows(), registry.next_worker_expiry())
+        } else {
+            Default::default()
+        };
+        self.worker_expiry = expiry.map(tokio::time::Instant::from_std);
+        if **self.workers_cell.load() != block {
+            self.workers_cell.store(Arc::new(block));
+        }
+    }
+
+    /// A listed worker result just expired: drop its row and re-arm the park
+    /// it held (the park re-check only runs detached and unpinned).
+    fn on_worker_expiry(&mut self) {
+        self.worker_expiry = None;
+        self.publish_workers();
+        self.rearm_park();
     }
 
     /// Every attached client, by id.
@@ -2587,8 +2633,12 @@ impl SessionActor {
         self.parked_tool_activations = self.runtime.carried_tool_activations();
         // Drop order: conv first, then runtime — a panic between them can
         // never leave a Runtime without state to save.
+        // No worker tick or expiry on a parked runtime: one pending since a
+        // worker just wound down (a cancelled one holds no park) would read it.
+        self.subagent_tick = None;
         // Last look at the conversation for listings (title/cost/messages).
         self.publish_presence();
+        self.worker_expiry = None;
         let conv = self.conv.park_take();
         drop(conv);
         let runtime = self.runtime.park_take();
@@ -2795,20 +2845,26 @@ impl SessionActor {
         }
         if !keep_subagent_tick(self.streaming, running) {
             self.subagent_tick = None;
-            // The last worker finished: a park it held may be due now.
+            // The last worker finished: a park it held may be due now. Its
+            // publish carries the worker block to listings.
             self.rearm_park();
+        } else {
+            // Listings read the workers from their own cell: one that
+            // started or ended since the last publish shows here, turn or
+            // no turn.
+            self.publish_workers();
         }
     }
 
-    /// Whether any worker in the registry is still running.
-    fn subagents_running(&self) -> bool {
+    /// Whether any worker is still running, cancelled ones winding down
+    /// included: the tick's lifetime. `SessionWorkers::running` leaves
+    /// those out.
+    fn any_worker_running(&self) -> bool {
         self.runtime
             .subagent_registry()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .display_rows()
-            .iter()
-            .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running))
+            .any_running()
     }
 
     /// Codex hosted web_search is read from this (engine/daemon) process's
@@ -3031,7 +3087,7 @@ impl SessionActor {
         self.revoked_turn_deadline = None;
         // Background workers outlive the turn: keep publishing their rows
         // until the last one finishes (see `publish_subagent_rows`).
-        if !keep_subagent_tick(false, self.subagents_running()) {
+        if !keep_subagent_tick(false, self.any_worker_running()) {
             self.subagent_tick = None;
         }
         if !self.turn_steered_events.is_empty() && self.conv.is_live() {
@@ -3578,18 +3634,16 @@ impl SessionActor {
                     "turn interrupted: cancelled running workers"
                 );
             }
+            // Still running and staying so: not the ones just cancelled
+            // (they read as running until their next step).
+            let spared = registry.live_worker_count();
+            drop(registry);
+            // The listing shows the cancelled workers stopping now, not a
+            // tick later.
+            if !cancelled.is_empty() {
+                self.publish_workers();
+            }
             if let WorkerCancelScope::Turn(_) = scope {
-                // Still running and staying so: not the ones just cancelled
-                // (they read as running until their next step).
-                let spared = registry
-                    .display_rows()
-                    .iter()
-                    .filter(|r| {
-                        r.status == crate::runtime::subagent::SubagentStatus::Running
-                            && !r.cancel_requested
-                    })
-                    .count();
-                drop(registry);
                 if spared > 0 {
                     self.emit(SessionEventWire::Stream(StreamEvent::Session(
                         SessionEvent::Notice(format!(
@@ -5816,6 +5870,7 @@ impl SessionTask {
                     actor.publish_subagent_rows();
                     actor.flush_turn_draft();
                 }
+                _ = park_timer(actor.worker_expiry) => actor.on_worker_expiry(),
                 _ = park_timer(actor.park_deadline), if !actor.holds(WorkSource::ParkTimer) => {
                     if let std::ops::ControlFlow::Break(reason) = actor.park().await {
                         break reason;
