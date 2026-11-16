@@ -351,6 +351,20 @@ pub struct SessionConfig {
     /// presents its token (see `docs/daemon-mode.md`, "Owned sessions").
     #[serde(skip)]
     pub owned: Option<OwnedConfig>,
+    /// Set by a daemon reload (never on the wire; the reload record carries
+    /// it beside the config): what the old image's actor held besides its
+    /// journal, restored into the new actor's conversation cell.
+    #[serde(skip)]
+    pub restore_conversation: Option<RestoredConversation>,
+}
+
+/// A reloaded actor's conversation cell (`SessionConfig::restore_conversation`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoredConversation {
+    /// Applied only when the new actor continues this journal.
+    pub journal_id: String,
+    pub supersedes: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn default_true() -> bool {
@@ -397,6 +411,7 @@ impl Default for SessionConfig {
             restore_parked: false,
             message_clock: None,
             owned: None,
+            restore_conversation: None,
         }
     }
 }

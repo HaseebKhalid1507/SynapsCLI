@@ -320,8 +320,11 @@ impl DaemonState {
         self.host.adopt_session(handle);
     }
 
-    pub fn remove(&self, id: &SessionId) {
-        self.host.remove_session(id);
+    /// Drop `handle`'s session from the map, only if the entry under its
+    /// id is that session (`EngineHost::remove_session_if`).
+    pub fn remove(&self, handle: &SessionHandle) {
+        self.host
+            .remove_session_if(&handle.id, &handle.session_ref());
     }
 
     pub async fn create(&self, cfg: SessionConfig) -> Result<SessionHandle, String> {
@@ -331,20 +334,26 @@ impl DaemonState {
     }
 
     /// F23: a lock-held placeholder (`meta.locked_by.is_some()`) is retried on
-    /// every attach. Pull it out of the map first — otherwise the host's
-    /// attach-if-live short-circuit hands the placeholder straight back —
-    /// and re-run the real `create` from the journal. Success replaces the
-    /// placeholder under the same id; still-held puts it back and the caller
+    /// every attach: re-run the real `create` from the journal. The
+    /// placeholder stays listed meanwhile, flagged `retrying` so the host's
+    /// attach-if-live short-circuit does not hand it straight back and its
+    /// id is free for the real session. Success replaces the placeholder in
+    /// place under the same id; still-held clears the flag and the caller
     /// attaches to it (→ `AttachRefused` naming the holder).
     pub async fn retry_locked_placeholder(&self, placeholder: SessionHandle) -> SessionHandle {
         let cfg = SessionConfig {
             continue_session: Some(Some(placeholder.id.as_str().to_string())),
             ..placeholder.placeholder_config().cloned().unwrap_or_default()
         };
-        self.remove(&placeholder.id);
-        match (self.factory)(cfg).await {
+        placeholder.set_retrying(true);
+        let created = (self.factory)(cfg).await;
+        placeholder.set_retrying(false);
+        match created {
             Ok(real) if real.id == placeholder.id || real.journal_id() == placeholder.id.as_str() => {
                 tracing::info!(session = %placeholder.id, "daemon: locked journal released — placeholder replaced by the real session");
+                if real.id != placeholder.id {
+                    self.remove(&placeholder);
+                }
                 self.insert(real.clone());
                 // A restored owned session: the daemon accepts connections.
                 if real.is_owned() {
@@ -355,12 +364,12 @@ impl DaemonState {
             Ok(other) => {
                 // Journal resolved somewhere else (e.g. compacted_into follow): keep it, drop the placeholder.
                 tracing::warn!(session = %placeholder.id, resolved = %other.id, "daemon: placeholder retry resolved to a different id");
+                self.remove(&placeholder);
                 self.insert(other.clone());
                 other
             }
             Err(e) => {
                 tracing::debug!(session = %placeholder.id, error = %e, "daemon: journal still locked; keeping placeholder");
-                self.insert(placeholder.clone());
                 placeholder
             }
         }

@@ -159,6 +159,14 @@ pub struct ReloadSession {
     /// owner sends them again when it re-binds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_token: Option<crate::session::OwnerToken>,
+    /// The journal ids the actor compacted away from (`JournalCell`): the
+    /// next image's actor still holds them. Empty from an older image.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
+    /// When the conversation began (kept across compactions). Absent from
+    /// an older image: the journal's own `created_at` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// `registry_dir()/daemon[-P].reload.json` body.
@@ -349,7 +357,8 @@ async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
 /// current model from the published view, the `/keepwarm` override).
 fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSession {
     let meta = handle.meta();
-    let journal_id = handle.journal_id();
+    let journal = handle.journal();
+    let journal_id = journal.journal_id.clone();
     if rec.is_none() {
         tracing::warn!(
             session = %handle.id,
@@ -411,6 +420,8 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         workers,
         tool_activations,
         owner_token: handle.owner_token().cloned(),
+        supersedes: journal.supersedes.clone(),
+        created_at: Some(journal.created_at),
     }
 }
 
@@ -950,8 +961,27 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
         // Owned: restored unbound, its grace armed only once this image
         // accepts connections (`Daemon::start`), its autonomous work held
         // until the owner re-binds.
-        let owned = s.owner_token.clone().map(|token| crate::session::OwnedConfig { token, restored: true });
-        let config = SessionConfig { owned, ..restore_config(&s.config, s.lifecycle, &s.id) };
+        let owned = s
+            .owner_token
+            .clone()
+            .map(|token| crate::session::OwnedConfig {
+                token,
+                restored: true,
+            });
+        // What the actor held besides its journal; applied only if the new
+        // actor continues that journal (not a fresh fallback).
+        let restore_conversation =
+            s.created_at
+                .map(|created_at| crate::session::RestoredConversation {
+                    journal_id: s.journal_id.clone(),
+                    supersedes: s.supersedes.clone(),
+                    created_at,
+                });
+        let config = SessionConfig {
+            owned,
+            restore_conversation,
+            ..restore_config(&s.config, s.lifecycle, &s.id)
+        };
         let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
@@ -1075,6 +1105,8 @@ mod tests {
             workers: Vec::new(),
             tool_activations: carried.clone(),
             owner_token: None,
+            supersedes: Vec::new(),
+            created_at: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         let back: ReloadSession = serde_json::from_value(v.clone()).unwrap();
@@ -1086,6 +1118,44 @@ mod tests {
         older.as_object_mut().unwrap().remove("tool_activations");
         let back: ReloadSession = serde_json::from_value(older).unwrap();
         assert!(back.tool_activations.is_empty());
+    }
+
+    /// The conversation cell rides the record beside the config, never in
+    /// the config's wire form; an older image's record has neither field.
+    #[test]
+    fn reload_session_carries_the_conversation_cell() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let s = ReloadSession {
+            id: "a".into(),
+            journal_id: "b".into(),
+            config: SessionConfig::default(),
+            keep_warm: false,
+            lifecycle: SessionLifecycle::Live,
+            settings_replay: Vec::new(),
+            cache_keepwarm: None,
+            input_owner_kind: None,
+            workers: Vec::new(),
+            tool_activations: Vec::new(),
+            owner_token: None,
+            supersedes: vec!["a".into()],
+            created_at: Some(at),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["supersedes"], serde_json::json!(["a"]));
+        assert!(v["config"].get("restore_conversation").is_none());
+        let back: ReloadSession = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(
+            (back.supersedes, back.created_at),
+            (vec!["a".to_string()], Some(at))
+        );
+
+        let mut older = v;
+        older.as_object_mut().unwrap().remove("supersedes");
+        older.as_object_mut().unwrap().remove("created_at");
+        let back: ReloadSession = serde_json::from_value(older).unwrap();
+        assert!(back.supersedes.is_empty() && back.created_at.is_none());
     }
 
     /// Reload-state written by an older image (no workers, no counter)
@@ -1131,6 +1201,8 @@ mod tests {
             workers,
             tool_activations: Vec::new(),
             owner_token: None,
+            supersedes: Vec::new(),
+            created_at: None,
         };
         let mut rs = ReloadState {
             generation: 10,

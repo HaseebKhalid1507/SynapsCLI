@@ -187,14 +187,21 @@ impl Session {
     }
 }
 
+/// A fresh session id at `now`: `YYYYMMDD-HHMMSS-xxxx` (4 random hex).
+/// Journals take it in [`Session::new`]; a daemon actor whose journal id is
+/// already some other live actor's id takes one too.
+pub fn mint_session_id(now: DateTime<Utc>) -> String {
+    format!(
+        "{}-{}",
+        now.format("%Y%m%d-%H%M%S"),
+        &uuid::Uuid::new_v4().to_string()[..4]
+    )
+}
+
 impl Session {
     pub fn new(model: &str, thinking_level: &str, system_prompt: Option<&str>) -> Self {
         let now = Utc::now();
-        let id = format!(
-            "{}-{}",
-            now.format("%Y%m%d-%H%M%S"),
-            &uuid::Uuid::new_v4().to_string()[..4]
-        );
+        let id = mint_session_id(now);
         Session {
             id,
             title: String::new(),
