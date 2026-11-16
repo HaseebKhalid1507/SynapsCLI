@@ -335,7 +335,10 @@ pub struct SubagentDisplayRow {
 }
 
 impl SubagentDisplayRow {
-    /// Running and staying so ([`SubagentRegistry::live_worker_count`]).
+    /// Running and staying so: the one test for "this worker is running"
+    /// on a row (`/close`'s blockers), as
+    /// [`SubagentRegistry::live_worker_count`] and `SessionWorkers::running`
+    /// count it.
     pub fn is_live(&self) -> bool {
         is_live_worker(&self.status, self.cancel_requested)
     }
@@ -350,7 +353,7 @@ fn is_live_worker(status: &SubagentStatus, cancel_requested: bool) -> bool {
 /// Whether parking now would cost this worker: running (a cancelled one
 /// winding down included), or finished on its own within `ttl` with a
 /// result the parent has not collected. The one predicate for
-/// [`SubagentRegistry::holds_park`] and [`SubagentRegistry::worker_rows`].
+/// [`SubagentRegistry::holds_park`] and [`SubagentRegistry::listing`].
 fn holds_park(s: &SubagentState, collected: bool, ttl: std::time::Duration) -> bool {
     if s.public_status() == SubagentStatus::Running {
         return true;
@@ -1041,16 +1044,20 @@ impl SubagentRegistry {
         })
     }
 
-    /// The workers that hold the park ([`Self::holds_park`]'s predicate), as
-    /// the listing shows them (`SessionMeta::workers`): running first,
-    /// oldest first, then finished, newest first; at most
+    /// In one pass: the workers that hold the park ([`Self::holds_park`]'s
+    /// predicate) as the listing shows them (`SessionMeta::workers`), and
+    /// when the earliest finished one among them stops holding it (its
+    /// result expires, [`finished_handle_ttl`] after it finished; `None`
+    /// while none is finished). Rows: running first, oldest first, then
+    /// finished, newest first; at most
     /// [`SESSION_WORKER_ROWS`](crate::session::SESSION_WORKER_ROWS), `more`
     /// counting the rest. No step text: rows only change when a worker
     /// starts, stops, finishes or is collected, or its result expires.
-    pub fn worker_rows(&self) -> crate::session::SessionWorkers {
+    pub fn listing(&self) -> (crate::session::SessionWorkers, Option<std::time::Instant>) {
         use crate::session::{SessionWorkers, WorkerRow, SESSION_WORKER_ROWS};
         let ttl = finished_handle_ttl();
         let mut running = 0u32;
+        let mut expiry: Option<std::time::Instant> = None;
         let mut rows: Vec<(bool, WorkerRow)> = Vec::new();
         for h in self.handles.values() {
             let s = h.state.read().unwrap_or_else(|p| p.into_inner());
@@ -1061,6 +1068,9 @@ impl SubagentRegistry {
             let is_running = status == SubagentStatus::Running;
             if is_live_worker(&status, s.cancel_requested) {
                 running += 1;
+            }
+            if let Some(at) = s.finished_at.filter(|_| !is_running).map(|t| t + ttl) {
+                expiry = Some(expiry.map_or(at, |e| e.min(at)));
             }
             rows.push((
                 is_running,
@@ -1089,29 +1099,12 @@ impl SubagentRegistry {
         });
         let more = rows.len().saturating_sub(SESSION_WORKER_ROWS) as u32;
         rows.truncate(SESSION_WORKER_ROWS);
-        SessionWorkers {
+        let workers = SessionWorkers {
             running,
             rows: rows.into_iter().map(|(_, r)| r).collect(),
             more,
-        }
-    }
-
-    /// When the earliest finished worker that holds the park stops holding
-    /// it: its result expires ([`finished_handle_ttl`] after it finished).
-    /// `None` while no finished worker holds it.
-    pub fn next_worker_expiry(&self) -> Option<std::time::Instant> {
-        let ttl = finished_handle_ttl();
-        self.handles
-            .values()
-            .filter_map(|h| {
-                let s = h.state.read().unwrap_or_else(|p| p.into_inner());
-                let finished = s.public_status() != SubagentStatus::Running;
-                (finished && holds_park(&s, h.collected, ttl))
-                    .then_some(s.finished_at)
-                    .flatten()
-                    .map(|t| t + ttl)
-            })
-            .min()
+        };
+        (workers, expiry)
     }
 
     /// Whether any worker is still running, a cancelled one winding down
@@ -1653,7 +1646,8 @@ mod tests {
 
     fn listed(registry: &SubagentRegistry) -> Vec<String> {
         registry
-            .worker_rows()
+            .listing()
+            .0
             .rows
             .into_iter()
             .map(|r| r.handle_id)
@@ -1666,9 +1660,9 @@ mod tests {
     /// cancelled-and-finished or an expired one. `running` leaves out the
     /// cancelled one.
     #[test]
-    fn worker_rows_are_the_workers_that_hold_the_park() {
+    fn listed_workers_are_the_ones_that_hold_the_park() {
         let mut registry = SubagentRegistry::new();
-        assert!(registry.worker_rows().is_empty());
+        assert!(registry.listing().0.is_empty());
         assert!(!registry.holds_park());
         let ttl = FINISHED_HANDLE_TTL;
         let mut kinds: Vec<(&str, bool)> = Vec::new();
@@ -1721,7 +1715,7 @@ mod tests {
             let mut alone = SubagentRegistry::new();
             alone.register(h);
             assert_eq!(alone.holds_park(), holds, "{id}");
-            assert_eq!(alone.worker_rows().rows.len(), usize::from(holds), "{id}");
+            assert_eq!(alone.listing().0.rows.len(), usize::from(holds), "{id}");
             kinds.push((id, holds));
             let h = alone.remove(id).unwrap();
             registry.register(h);
@@ -1734,7 +1728,7 @@ mod tests {
         let mut got = listed(&registry);
         got.sort();
         assert_eq!(got, want);
-        let w = registry.worker_rows();
+        let w = registry.listing().0;
         assert_eq!(w.running, 1, "the cancelled one is not counted");
         assert_eq!(w.running as usize, registry.live_worker_count());
         let row = |id: &str| w.rows.iter().find(|r| r.handle_id == id).unwrap().clone();
@@ -1751,7 +1745,7 @@ mod tests {
     /// `more` counts the rest. The same registry gives the same block on
     /// every read (wall-clock stamps, no elapsed values).
     #[test]
-    fn worker_rows_order_cap_and_stable_stamps() {
+    fn listing_order_cap_and_stable_stamps() {
         let mut registry = SubagentRegistry::new();
         let t0 = chrono::Utc::now();
         for i in 1..=6u64 {
@@ -1771,17 +1765,17 @@ mod tests {
             listed(&registry),
             ["sa_3", "sa_2", "sa_1", "sa_4", "sa_5", "sa_6"]
         );
-        assert_eq!(registry.worker_rows().more, 0);
-        let first = registry.worker_rows();
+        assert_eq!(registry.listing().0.more, 0);
+        let first = registry.listing().0;
         std::thread::sleep(std::time::Duration::from_millis(20));
-        assert_eq!(registry.worker_rows(), first, "stable across reads");
+        assert_eq!(registry.listing().0, first, "stable across reads");
 
         for i in 7..=12u64 {
             let mut h = make_handle(&format!("sa_{i}"));
             h.started_at_wall = t0 + chrono::Duration::seconds(10 + i as i64);
             registry.register(h);
         }
-        let w = registry.worker_rows();
+        let w = registry.listing().0;
         assert_eq!(w.rows.len(), crate::session::SESSION_WORKER_ROWS);
         assert_eq!(w.more, 4);
         assert_eq!(w.running, 9);
@@ -1796,10 +1790,10 @@ mod tests {
     /// worker's `finished_at + TTL`; none while only running ones, or
     /// collected ones, are left.
     #[test]
-    fn next_worker_expiry_is_the_earliest_listed_result() {
+    fn listing_expiry_is_the_earliest_listed_result() {
         let mut registry = SubagentRegistry::new();
         registry.register(make_handle("sa_1"));
-        assert_eq!(registry.next_worker_expiry(), None, "running: no expiry");
+        assert_eq!(registry.listing().1, None, "running: no expiry");
         let older = make_handle("sa_2");
         finish_at(
             &older,
@@ -1815,11 +1809,11 @@ mod tests {
         );
         registry.register(older);
         registry.register(newer);
-        assert_eq!(registry.next_worker_expiry(), Some(at));
+        assert_eq!(registry.listing().1, Some(at));
         registry.get_mut("sa_2").unwrap().mark_collected();
-        assert!(registry.next_worker_expiry().is_some_and(|t| t > at));
+        assert!(registry.listing().1.is_some_and(|t| t > at));
         registry.get_mut("sa_3").unwrap().mark_collected();
-        assert_eq!(registry.next_worker_expiry(), None);
+        assert_eq!(registry.listing().1, None);
     }
 
     /// Esc cancels the interrupted turn's workers, not reactive workers an

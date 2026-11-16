@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_engine::session::{
-    ClientKind, ClientMeta, ClientTransport, EndReason, LocalTransport, SessionCommand,
-    SessionConfig, SessionEventWire, SessionHandle, SessionLifecycle, SessionMeta,
+    AttachMode, ClientKind, ClientMeta, ClientTransport, EndReason, Envelope, LocalTransport,
+    SessionCommand, SessionConfig, SessionEventWire, SessionHandle, SessionLifecycle, SessionMeta,
 };
 use chrono::Utc;
 use serial_test::serial;
@@ -663,4 +663,137 @@ async fn a_worker_step_alone_never_republishes() {
     );
     assert!(after.rows.iter().all(|r| r.step.is_empty() && r.tools == 0));
     end(&mut a).await;
+}
+
+/// `/close force` stops the running workers and ends the session. From the
+/// moment it starts to end it lists no workers: no `running` rows for
+/// workers that are being torn down with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_closing_session_lists_no_workers() {
+    let _h = Home::new();
+    let (handle, mut a, _registry, states, _) =
+        turn_that_leaves_workers_running(pcfg(), &["sa_1"]).await;
+    a.send_from_self(SessionCommand::EngineCommand {
+        id: 9,
+        name: "close".into(),
+        arg: "force".into(),
+    })
+    .await
+    .unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Ended { .. })).await;
+    assert!(
+        states[0].read().unwrap().cancel_requested,
+        "force stops the worker"
+    );
+    let m = handle.meta_live();
+    assert!(m.workers.is_empty(), "an ending session lists none: {m:?}");
+}
+
+/// The 1 Hz worker tick stops once no worker runs and no turn does:
+/// nothing more arrives after the last worker finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_worker_tick_stops_once_nothing_runs() {
+    let _h = Home::new();
+    let (handle, mut a, _registry, states, _) =
+        turn_that_leaves_workers_running(pcfg(), &["sa_1"]).await;
+    let is_rows = |e: &Envelope| matches!(e.event, SessionEventWire::SubagentRows(_));
+    let ticking = drain_for(&mut a, Duration::from_millis(1500)).await;
+    assert!(
+        ticking.iter().any(is_rows),
+        "the tick runs while the worker does"
+    );
+    finish(&states[0]);
+    let (ok, m) = wait_meta(&handle, Duration::from_secs(3), |m| m.workers.running == 0).await;
+    assert!(ok, "{m:?}");
+    // The stopping tick's last rows were sent before that publish.
+    drain_for(&mut a, Duration::from_millis(100)).await;
+    let after = drain_for(&mut a, Duration::from_millis(1500)).await;
+    assert!(!after.iter().any(is_rows), "the tick stopped: {after:?}");
+    end(&mut a).await;
+}
+
+/// Over the socket: `SessionList` and `Welcome.sessions` carry the worker
+/// block (keys at their default left out), and `Attached.meta` never does
+/// (design Q14: workers come from the listing, not the attach).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn workers_cross_the_socket_in_listings_never_in_attached() {
+    use agent_engine::session::socket_transport::SocketTransport;
+    use agent_engine::session::wire::{Attach, Hello};
+    let home = Home::new();
+    let host = host().await;
+    let d = agent_engine::daemon::Daemon::start(
+        Arc::clone(&host),
+        agent_engine::daemon::DaemonOpts {
+            runtime_dir: Some(home.dir.path().join("run")),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+    let sock = d.paths.sock.clone();
+    let (handle, task) = host.create_session_unspawned(pcfg()).await.unwrap();
+    let registry = task.subagent_registry();
+    tokio::spawn(task.run());
+    let _worker = register_worker(&registry, "sa_1");
+    // An attach is a transition: its publish carries the block.
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let (ok, m) = wait_meta(&handle, Duration::from_secs(3), |m| m.workers.running == 1).await;
+    assert!(ok, "{m:?}");
+
+    let listed = SocketTransport::sessions(&sock).await.unwrap();
+    let m = listed.iter().find(|m| m.id == handle.id).expect("listed");
+    assert_eq!(m.workers.running, 1);
+    assert_eq!(rows(m), [row("sa_1", "running", false)]);
+    let raw = SocketTransport::sessions_raw(&sock).await.unwrap();
+    let w = &raw
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == handle.id.as_str())
+        .expect("listed")["workers"];
+    assert_eq!(w["running"], 1, "{w}");
+    assert_eq!(
+        (&w["rows"][0]["handle_id"], &w["rows"][0]["status"]),
+        (&serde_json::json!("sa_1"), &serde_json::json!("running"))
+    );
+    assert!(
+        w.get("more").is_none() && w["rows"][0].get("cancel_requested").is_none(),
+        "defaults are left out: {w}"
+    );
+
+    let conn = SocketTransport::connect(&sock, Hello::new(ClientKind::Test))
+        .await
+        .unwrap();
+    let welcomed = conn
+        .welcome
+        .sessions
+        .iter()
+        .find(|m| m.id == handle.id)
+        .expect("welcomed");
+    assert_eq!(welcomed.workers.running, 1);
+    let (_t, snap) = SocketTransport::attach(
+        conn,
+        Attach::Existing {
+            session_id: handle.id.clone(),
+            mode: AttachMode::Mirror,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        snap.meta.workers.is_empty(),
+        "Attached.meta is the create-time record: {:?}",
+        snap.meta.workers
+    );
+
+    end(&mut a).await;
+    SocketTransport::shutdown(&sock, true).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), d.wait())
+        .await
+        .expect("daemon wait");
 }

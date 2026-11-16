@@ -877,11 +877,18 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
         }
         anyhow::bail!("daemon not running");
     }
+    if json {
+        // As the daemon sent them: a newer daemon's fields and values pass
+        // through rather than being decoded away.
+        let raw = SocketTransport::sessions_raw(&paths.sock)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("{}", serde_json::to_string_pretty(&raw)?);
+        return Ok(());
+    }
     let list = SocketTransport::sessions(&paths.sock).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let offline = pins::offline(book.load(), &list);
-    if json {
-        println!("{}", serde_json::to_string_pretty(&list)?);
-    } else if list.is_empty() && offline.is_empty() {
+    if list.is_empty() && offline.is_empty() {
         println!("no sessions");
     } else {
         let now = chrono::Utc::now();
@@ -910,10 +917,8 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
             );
         }
     }
-    if !json {
-        for e in &offline {
-            println!("{}", offline_line(e));
-        }
+    for e in &offline {
+        println!("{}", offline_line(e));
     }
     Ok(())
 }

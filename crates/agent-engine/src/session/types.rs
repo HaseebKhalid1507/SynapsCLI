@@ -490,11 +490,12 @@ pub struct SessionMeta {
     #[serde(default)]
     pub messages: usize,
     /// The workers that hold this session's park. Empty when none, when
-    /// parked, and from a daemon without `session_workers`
+    /// parked or ending, and from a daemon without `session_workers`
     /// (`wire::FEATURE_SESSION_WORKERS`). Filled in listings (`meta_live`:
-    /// `Welcome.sessions`, `SessionList`); `Attached.meta` is the create-time
-    /// record, empty here like the other state fields. `busy` stays the turn
-    /// only: clients combine the two.
+    /// `Welcome.sessions`, `SessionList`) only. `Attached.meta` is the
+    /// create-time record and never carries them, like the presence fields
+    /// (design Q14): a client keeps workers from the listing, never from an
+    /// attach. `busy` stays a turn or a compaction: clients combine the two.
     #[serde(default, skip_serializing_if = "SessionWorkers::is_empty")]
     pub workers: SessionWorkers,
 }
@@ -545,6 +546,11 @@ fn is_zero(n: &u32) -> bool {
 /// One worker in [`SessionWorkers`]. Field names match `SubagentDisplayRow`
 /// and the status labels `WatchPage::status`, so a client keys both by
 /// `handle_id`. Times are wall clock, stamped once.
+///
+/// Append-only: fields are only ever added, with `#[serde(default)]`; an
+/// existing one is never removed, renamed or retyped. Rust clients (TUI,
+/// `synaps daemon sessions`) decode a whole `SessionList` / `Welcome` as one
+/// frame, so one row they cannot read would fail the entire listing.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkerRow {
     /// `sa_12`: what `SessionQuery::SubagentWatch` and `subagent_*` take.
@@ -591,6 +597,7 @@ impl SessionLifecycle {
             1 => Self::Parking,
             2 => Self::Parked,
             3 => Self::Ending,
+            255 => Self::Unknown,
             _ => Self::Live,
         }
     }
@@ -2186,7 +2193,13 @@ mod tests {
 
     #[test]
     fn session_lifecycle_u8_round_trip() {
-        for l in [SessionLifecycle::Live, SessionLifecycle::Parking, SessionLifecycle::Parked, SessionLifecycle::Ending] {
+        for l in [
+            SessionLifecycle::Live,
+            SessionLifecycle::Parking,
+            SessionLifecycle::Parked,
+            SessionLifecycle::Ending,
+            SessionLifecycle::Unknown,
+        ] {
             assert_eq!(SessionLifecycle::from_u8(l as u8), l);
         }
         assert_eq!(serde_json::to_string(&SessionLifecycle::Parked).unwrap(), r#""parked""#);

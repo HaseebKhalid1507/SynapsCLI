@@ -43,7 +43,9 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// `Pin`/`Pinned` (`synaps daemon pin`) follow the same rule, and so does
 /// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it),
 /// `SessionMeta.workers` (gated on [`FEATURE_SESSION_WORKERS`]) and
-/// `Welcome.boot_id`.
+/// `Welcome.boot_id`. `WorkerRow` is append-only: fields are only ever
+/// added, with `#[serde(default)]`, and an existing one never changes
+/// name or type (one unreadable row fails a Rust client's whole listing).
 /// `ReloadExtension` and its two replies (`ExtensionReloaded`,
 /// `ExtensionReloadFailed`) follow it too.
 /// Owned sessions (`Attach::Create{owned}`) are additive as well, but an

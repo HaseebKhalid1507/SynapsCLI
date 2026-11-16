@@ -148,13 +148,13 @@ pub fn echo_factory() -> SessionFactory {
     })
 }
 
-/// The default factory for a booted host: `EngineHost::create_session` (A1) —
-/// the real `SessionActor` owning one `Runtime` + `ConversationState`.
 /// A fresh `Welcome.boot_id`: 16 hex characters.
 pub fn mint_boot_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
 }
 
+/// The default factory for a booted host: `EngineHost::create_session` (A1) —
+/// the real `SessionActor` owning one `Runtime` + `ConversationState`.
 pub fn host_factory(host: &Arc<EngineHost>) -> SessionFactory {
     let host = Arc::clone(host);
     Arc::new(move |cfg: SessionConfig| {

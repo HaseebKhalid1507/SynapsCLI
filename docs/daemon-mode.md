@@ -571,9 +571,9 @@ nothing until the first real turn. The restore holds the daemon's idle exit.
 so a client sees a session whose turn has ended while its workers still run:
 
 ```json
-"workers": {"running": 1, "more": 0, "rows": [
+"workers": {"running": 1, "rows": [
   {"handle_id": "sa_12", "subagent_id": 12, "agent_name": "shady", "status": "running",
-   "cancel_requested": false, "started_at": "2026-11-16T06:41:10Z"},
+   "started_at": "2026-11-16T06:41:10Z"},
   {"handle_id": "sa_11", "subagent_id": 11, "agent_name": "shady", "status": "completed",
    "started_at": "2026-11-16T06:38:02Z", "finished_at": "2026-11-16T06:40:30Z"}]}
 ```
@@ -589,13 +589,24 @@ so a client sees a session whose turn has ended while its workers still run:
   the rest. Times are wall clock, stamped once (`started_at` at registration, `finished_at` when the
   run ends), so an unchanged worker gives an identical row. `status` is a string (`running`,
   `completed`, `cancelled`, `timed_out`, `failed`); a client must accept new values. `step` and
-  `tools` are reserved: always empty for now.
+  `tools` are reserved: always empty for now. Keys at their default are left out (`more: 0`,
+  `cancel_requested: false`, an empty `model`, `finished_at` on a running worker, and the whole
+  `workers` key when there are none).
+- **Row fields are append-only**: a later daemon only adds fields (with a default), never removes,
+  renames or retypes one. A Rust client decodes a whole `session_list` / `welcome` as one frame, so
+  one unreadable row would fail its entire listing. `synaps daemon sessions --json` prints the rows
+  exactly as the daemon sent them, fields this build does not know included.
 - **Freshness**: the actor publishes the block to the handle's own cell (`publish_workers`), only
   when it changed: with every presence publish; from the 1 Hz worker tick, which outlives the turn
   while a worker runs (a start or finish shows within a second); at once on a cancel (`/workers
-  cancel`, Esc, the cost cap, a driver revoke); and from a one-shot at the earliest listed result's
-  expiry, which also re-arms the park. An idle session with no finished rows holds no timer.
+  cancel`, Esc, the cost cap, a driver revoke, `/close force`); and from a one-shot at the earliest
+  listed result's expiry, which also re-arms the park. An idle session with no finished rows holds
+  no timer.
 - **Parked**: no runtime, so no workers (and a session with listed workers does not park).
+- **Ending**: none either. From the moment a session starts to end (`/close`, `daemon close`,
+  eviction, its owner gone) until it leaves the list, its workers are being stopped with it.
+- **Attach**: `Attached.meta` is the create-time record and never carries workers (nor the other
+  presence fields). Keep a session's workers from the listing, never from an attach.
 - **Handle ids**: never reused within a boot or across `daemon reload`; after a cold start they
   begin again at `sa_1` and `Welcome.boot_id` changes, so a client keys worker state by
   `(boot_id, handle_id)`.

@@ -1340,9 +1340,10 @@ impl SessionActor {
     /// last published while Parked). Every transition that moves them —
     /// turn and compaction start/end, attach/detach, `rearm_park`,
     /// park/unpark — ends in a publish; stream deltas do not. The deadlines
-    /// are whole seconds, so republishing the same deadline compares equal.
-    /// The worker block is published with it (`publish_workers`): a parked
-    /// session lists none.
+    /// are whole seconds, so republishing an unchanged deadline usually
+    /// compares equal (wall and monotonic clocks are read apart: one on a
+    /// second boundary can move by a second). The worker block is published
+    /// with it (`publish_workers`): a parked or ending session lists none.
     pub(crate) fn publish_presence(&mut self) {
         use super::handle::{Presence, PresenceState};
         self.background
@@ -1407,18 +1408,19 @@ impl SessionActor {
         self.publish_workers();
     }
 
-    /// Publish the workers that hold the park (`SubagentRegistry::
-    /// worker_rows`) to the listing, only when the block changed, and arm
-    /// the one-shot at the earliest listed result's expiry. Parked: none.
-    /// Callers hold no registry guard (it locks the registry).
+    /// Publish the workers that hold the park (`SubagentRegistry::listing`,
+    /// one pass) to the listing, only when the block changed, and arm the
+    /// one-shot at the earliest listed result's expiry. Parked: none. An
+    /// ending session lists none either: its workers are being stopped with
+    /// it, and none of them will be collected here. Callers hold no registry
+    /// guard (it locks the registry).
     pub(crate) fn publish_workers(&mut self) {
-        let (block, expiry) = if self.runtime.is_live() {
-            let registry = self
-                .runtime
+        let (block, expiry) = if self.runtime.is_live() && !self.is_ending() {
+            self.runtime
                 .subagent_registry()
                 .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            (registry.worker_rows(), registry.next_worker_expiry())
+                .unwrap_or_else(|p| p.into_inner())
+                .listing()
         } else {
             Default::default()
         };
@@ -1429,11 +1431,16 @@ impl SessionActor {
     }
 
     /// A listed worker result just expired: drop its row and re-arm the park
-    /// it held (the park re-check only runs detached and unpinned).
+    /// it held (the park re-check only runs detached and unpinned). One
+    /// publish: `rearm_park`'s carries the worker block.
     fn on_worker_expiry(&mut self) {
         self.worker_expiry = None;
-        self.publish_workers();
         self.rearm_park();
+    }
+
+    /// `finish` has begun: the session is on its way out.
+    fn is_ending(&self) -> bool {
+        self.lifecycle.load(std::sync::atomic::Ordering::Acquire) == SessionLifecycle::Ending as u8
     }
 
     /// Every attached client, by id.
@@ -2831,15 +2838,14 @@ impl SessionActor {
     /// up. The tick stops once no worker is running after the turn, having
     /// published the terminal rows.
     pub(crate) fn publish_subagent_rows(&mut self) {
-        let rows = self
-            .runtime
-            .subagent_registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .display_rows();
-        let running = rows
-            .iter()
-            .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running));
+        let (rows, running) = {
+            let registry = self
+                .runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            (registry.display_rows(), registry.any_running())
+        };
         if !rows.is_empty() {
             self.emit(SessionEventWire::SubagentRows(rows));
         }
@@ -3614,9 +3620,7 @@ impl SessionActor {
         // teardown, cost cap, host checkpoint, driver revocation — stops all.
         {
             use crate::runtime::subagent::WorkerCancelScope;
-            let ending = self.lifecycle.load(std::sync::atomic::Ordering::Acquire)
-                == SessionLifecycle::Ending as u8;
-            let scope = worker_cancel_scope(reason, ending, self.turn_worker_generation);
+            let scope = worker_cancel_scope(reason, self.is_ending(), self.turn_worker_generation);
             let mut registry = match self.runtime.subagent_registry().lock() {
                 Ok(g) => g,
                 Err(poisoned) => {
@@ -5581,6 +5585,10 @@ impl SessionActor {
             SessionLifecycle::Ending as u8,
             std::sync::atomic::Ordering::Release,
         );
+        // An ending session lists no workers (`publish_workers`): every
+        // listing from here on, until it leaves the map, shows none, whatever
+        // ends it (`/close force`, `daemon close`, eviction, its owner gone).
+        self.publish_workers();
         // Quitting the client mid-turn is the user's interruption (so is
         // an owned session's owner going away: `Cancel`'s marker); every
         // other end reason is the host's.

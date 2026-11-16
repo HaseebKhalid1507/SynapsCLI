@@ -1,6 +1,6 @@
 //! `SessionActor` — command bodies that belong to the TUI port (A3):
 //! `engine_command` (structured reply), `submit_prepared`, `plugin_command`,
-//! `resume`, `session_name`, `emit_subagent_rows`. Kept apart from
+//! `resume`, `session_name`. Kept apart from
 //! `actor.rs` so the turn machine (B) and the command surface (A) never
 //! touch the same file.
 
@@ -216,10 +216,7 @@ impl SessionActor {
                 .unwrap_or_else(|p| p.into_inner())
                 .display_rows()
                 .into_iter()
-                .filter(|r| {
-                    r.status == crate::runtime::subagent::SubagentStatus::Running
-                        && !r.cancel_requested
-                })
+                .filter(|r| r.is_live())
                 .map(|r| (r.handle_id, r.agent_name))
                 .collect();
             running.sort();
@@ -267,6 +264,8 @@ impl SessionActor {
             for (handle_id, agent) in workers.iter().filter(|(h, _)| cancelled.contains(h)) {
                 self.note_in_main_conversation(super::actor::subagent_close_cancel_event(handle_id, agent));
             }
+            // At once on a cancel, like every other cancel site.
+            self.publish_workers();
         }
         let session = (**self.journal_id.load()).clone();
         // No history, no journal: there is nothing to continue (a parked
@@ -507,31 +506,6 @@ impl SessionActor {
             clamp_notice,
         });
         self.emit_conversation();
-    }
-
-    /// `runtime.subagent_registry().display_rows()` → `SubagentRows`
-    /// (called at Done/Error and from the 1 Hz arm B adds).
-    #[allow(dead_code)]
-    pub(crate) fn emit_subagent_rows(&mut self) {
-        let rows = self
-            .runtime
-            .subagent_registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .display_rows();
-        self.emit(SessionEventWire::SubagentRows(rows));
-    }
-
-    /// Any non-terminal subagent row (drives the 1 Hz arm).
-    #[allow(dead_code)]
-    pub(crate) fn has_live_subagents(&self) -> bool {
-        self.runtime
-            .subagent_registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .display_rows()
-            .iter()
-            .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running))
     }
 }
 
