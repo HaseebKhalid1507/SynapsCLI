@@ -830,6 +830,37 @@ mod tests {
     }
 
     #[test]
+    fn every_invisible_or_reordering_character_is_a_bad_character() {
+        for c in [
+            '\u{0}', '\u{1b}', '\u{7f}', '\u{85}', '\u{061C}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}',
+            '\u{2028}', '\u{2029}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2060}', '\u{2066}',
+            '\u{2067}', '\u{2068}', '\u{2069}', '\u{FEFF}',
+        ] {
+            assert!(is_bad_char(c), "{:?} must be a bad character", c);
+            assert_eq!(
+                screen_provider_entry(Path::new(&format!("/data/a{c}b"))).as_deref(),
+                Some(REASON_BAD_CHARS),
+                "{c:?} in a path"
+            );
+        }
+        for c in ['a', '/', ' ', 'é', '日'] {
+            assert!(!is_bad_char(c), "{c:?} is an ordinary character");
+        }
+    }
+
+    #[test]
+    fn every_parent_of_the_base_dir_is_dropped_even_outside_the_home() {
+        let e = env("/srv/engine/.synaps-cli", "/home/u");
+        let p = Protected::new(&e);
+        for parent in ["/srv/engine", "/srv", "/"] {
+            let reason = p.drop_reason(Path::new(parent)).unwrap_or_else(|| panic!("{parent} must drop"));
+            assert!(reason.contains("a parent of the engine base directory"), "{parent}: {reason}");
+        }
+        assert_eq!(p.drop_reason(Path::new("/srv/other")), None);
+        assert_eq!(p.drop_reason(Path::new("/srv/engine/work")), None);
+    }
+
+    #[test]
     fn drops_entries_equal_under_or_above_a_protected_path() {
         let e = env("/home/u/.synaps-cli", "/home/u");
         let p = Protected::new(&e);
@@ -975,6 +1006,36 @@ mod tests {
         for rel in [".ssh", ".gnupg", ".aws", ".kube", ".docker", ".password-store", ".netrc", ".git-credentials"] {
             assert!(!c.bare.covers(&c.home.join(rel)), "{rel} is covered without its class");
         }
+    }
+
+    /// The fixed name lists, spelled out: a name added or dropped is a
+    /// decision someone has to make on purpose (and the by-name pins above
+    /// would otherwise be satisfied by a parent such as `~/.config`).
+    #[test]
+    fn the_protected_name_lists_are_exactly_the_documented_ones() {
+        assert_eq!(
+            HOME_CREDENTIALS,
+            [
+                ".ssh",
+                ".gnupg",
+                ".aws",
+                ".config/gcloud",
+                ".kube",
+                ".docker",
+                ".local/share/keyrings",
+                ".password-store",
+                ".netrc",
+                ".git-credentials",
+            ]
+        );
+        assert_eq!(HOME_AUTOSTART, [".config/systemd", ".local/share/systemd", ".config/autostart"]);
+        assert_eq!(HOME_DATA, [".config", ".local", ".cargo", ".rustup"]);
+        assert_eq!(
+            HOME_SHELL_ENV,
+            [".bashrc.d", ".oh-my-zsh", ".vim", ".vscode", "go/bin", ".deno", ".bun", ".thunderbird", ".claude"]
+        );
+        assert_eq!(HOME_RC_FILES, [".bashrc", ".profile", ".bash_profile", ".zshrc", ".zprofile"]);
+        assert_eq!(HOME_PREFIX_PROTECTED, ".vscode");
     }
 
     #[test]
