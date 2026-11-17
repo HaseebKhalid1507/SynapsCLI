@@ -1459,6 +1459,15 @@ pub struct SynapsConfig {
     pub agent_name: Option<String>,
     pub identity: Option<String>,
     pub disabled_plugins: Vec<String>,
+    /// `required_guards`: plugin ids (comma list) of the guards this engine
+    /// must have loaded. While one of them is not loaded, for any reason (no
+    /// folder, disabled, a skip-renamed folder, a bad manifest, a failed
+    /// start, its process gone), every tool call is refused with the guard
+    /// and the cause named. Owner-set in the config file only: no in-product
+    /// write path sets it ([`OWNER_SET_CONFIG_KEYS`]) and it is not a
+    /// `/settings` row. Absent or empty: no gate (the behaviour before the
+    /// key existed). Last line wins.
+    pub required_guards: Vec<String>,
     pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
     /// Opt-in progressive tool disclosure (Task 18). When false, providers
@@ -1560,6 +1569,7 @@ impl Default for SynapsConfig {
             agent_name: None,
             identity: None,
             disabled_plugins: Vec::new(),
+            required_guards: Vec::new(),
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
             progressive_tool_disclosure: false,
@@ -1689,6 +1699,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "agent_name",
     "identity",
     "disabled_plugins",
+    "required_guards",
     "favorite_models",
     "disabled_skills",
     "disabled_tools",
@@ -1952,6 +1963,12 @@ pub fn config_content_problems(content: &str) -> Vec<String> {
 /// concurrency vs total. A removed key is refused with its removal warning.
 /// Problems already present before the edit are not blamed on it.
 pub fn validate_config_edit(key: &str, value: &str) -> Result<(), String> {
+    if is_owner_set_config_key(key) {
+        return Err(format!(
+            "{} is set by editing the config file, not by the product",
+            key.trim()
+        ));
+    }
     if key.contains(['=', '\n', '\r'])
         || value.contains(['\n', '\r'])
     {
@@ -1969,6 +1986,31 @@ pub fn validate_config_edit(key: &str, value: &str) -> Result<(), String> {
     } else {
         Err(introduced.join("; "))
     }
+}
+
+/// The `required_guards` of the active config file, read fresh now and
+/// parsed without any diagnostics output; the caller's own config snapshot is
+/// untouched. A missing or unreadable file reads as empty, exactly like
+/// [`load_config`]: no required guards.
+pub fn read_required_guards() -> Vec<String> {
+    let content = std::fs::read_to_string(resolve_read_path("config")).unwrap_or_default();
+    let mut config = SynapsConfig::default();
+    apply_config_content_with(&mut config, &content, &mut |_diagnostic: String| {});
+    config.required_guards
+}
+
+/// Config keys only the owner sets, by editing the config file. Nothing in
+/// the product writes them: [`write_config_value`] and
+/// [`validate_config_edit`] refuse them, and no `/settings` row exists for
+/// them. A guard list an agent or a settings dialog could rewrite would let
+/// the thing it guards against switch the guard off.
+pub const OWNER_SET_CONFIG_KEYS: &[&str] = &["required_guards"];
+
+/// Whether `key` is one of [`OWNER_SET_CONFIG_KEYS`] (surrounding spaces and
+/// case ignored).
+pub fn is_owner_set_config_key(key: &str) -> bool {
+    let key = key.trim();
+    OWNER_SET_CONFIG_KEYS.iter().any(|owned| owned.eq_ignore_ascii_case(key))
 }
 
 /// Parse the config file at ~/.synaps-cli/config (or profile variant).
@@ -2368,6 +2410,9 @@ fn apply_config_content_with(
             "disabled_plugins" => {
                 config.disabled_plugins = parse_comma_list(val);
             }
+            "required_guards" => {
+                config.required_guards = parse_comma_list(val);
+            }
             "favorite_models" => {
                 config.favorite_models = parse_comma_list(val);
             }
@@ -2650,6 +2695,12 @@ pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
 
 /// The RMW body; caller holds [`ConfigLock`].
 fn write_config_value_locked(key: &str, value: &str) -> std::io::Result<()> {
+    if is_owner_set_config_key(key) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is set by editing the config file, not by the product", key.trim()),
+        ));
+    }
     let path = resolve_write_path("config");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let out = replace_config_line(&existing, key, value);
@@ -4897,6 +4948,62 @@ context_window = 200k\n\
 
         let contents = std::fs::read_to_string(&cfg).unwrap();
         assert!(contents.contains("custom_thing = 42"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// No `required_guards` line is no gate, an empty list, exactly as before
+    /// the key existed. Set, it is a trimmed comma list (empties dropped,
+    /// last line wins), a known key (no warning), and read fresh and
+    /// silently.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn required_guards_absent_is_empty_and_set_is_read_fresh() {
+        assert!(SynapsConfig::default().required_guards.is_empty());
+        assert!(load_config_from_str("disabled_plugins = a\n").required_guards.is_empty());
+        let config = load_config_from_str(
+            "required_guards = example-guard, ,other\nrequired_guards = example-guard ,  b\n",
+        );
+        assert_eq!(config.required_guards, ["example-guard", "b"]);
+        assert!(config_content_problems("required_guards = example-guard\n").is_empty());
+        let home = make_test_home("required-guards");
+        with_home(&home, || {
+            assert!(read_required_guards().is_empty());
+            std::fs::write(home.join(".synaps-cli/config"), "model = m\n").unwrap();
+            assert!(read_required_guards().is_empty());
+            std::fs::write(home.join(".synaps-cli/config"), "required_guards = example-guard\n")
+                .unwrap();
+            assert_eq!(read_required_guards(), ["example-guard"]);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `required_guards` is owner-set in the file only: the config writer and
+    /// the settings validator refuse it (and clearing it), whatever the
+    /// spelling, and a refused write leaves the file untouched.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn required_guards_is_never_written_by_the_product() {
+        assert!(KNOWN_CONFIG_KEYS.contains(&"required_guards"));
+        assert!(OWNER_SET_CONFIG_KEYS.contains(&"required_guards"));
+        let home = make_test_home("required-guards-write");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "required_guards = example-guard\nmodel = m\n").unwrap();
+        with_home(&home, || {
+            for key in ["required_guards", " required_guards ", "Required_Guards"] {
+                for value in ["other", "", " "] {
+                    let err = write_config_value(key, value).expect_err("refused");
+                    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{key:?}");
+                    assert!(validate_config_edit(key, value).is_err(), "{key:?} {value:?}");
+                }
+            }
+            // Other keys still write, and the guard list is untouched.
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+            assert_eq!(read_required_guards(), ["example-guard"]);
+        });
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert_eq!(contents, "required_guards = example-guard\nmodel = claude-sonnet-4-6\n");
         let _ = std::fs::remove_dir_all(&home);
     }
 
