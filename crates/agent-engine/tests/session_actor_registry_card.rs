@@ -191,21 +191,7 @@ async fn a_fresh_session_that_draws_a_live_sessions_id_draws_another() {
             serde_json::from_str(&std::fs::read_to_string(run.join(format!("{id}.json"))).unwrap())
                 .unwrap();
         assert_eq!(card.name.as_deref(), Some(name), "card {id}");
-        let lock = agent_engine::core::session_lock::SessionLock::try_acquire(
-            &sessions,
-            id,
-            agent_engine::core::session_lock::LockHolder {
-                pid: std::process::id(),
-                kind: "test".into(),
-            },
-        );
-        assert!(
-            matches!(
-                lock,
-                Err(agent_engine::core::session_lock::SessionLockError::Held { .. })
-            ),
-            "{id} runs without its journal lock: {lock:?}"
-        );
+        assert_locked(id);
     }
 
     // An id whose journal is on disk but unlocked (its session ended) is
@@ -223,6 +209,7 @@ async fn a_fresh_session_that_draws_a_live_sessions_id_draws_another() {
         "a fresh session took an ended session's id"
     );
     assert_eq!(std::fs::read_to_string(&ended_journal).unwrap(), "{}");
+    assert_no_stray_lock(&[&taken, &other, third.id.as_str()]);
 
     for h in [first, second, third] {
         h.send(SessionCommand::End {
@@ -231,5 +218,98 @@ async fn a_fresh_session_that_draws_a_live_sessions_id_draws_another() {
         .await
         .unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), h.closed()).await;
+    }
+}
+
+/// Two unnamed fresh sessions that draw the same id, as two sessions opened
+/// in the same second do. The first has nothing on disk before its first
+/// turn, so only its journal lock says the id is taken: the second used to
+/// log the held lock and run on the id without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_fresh_session_that_draws_an_unjournaled_live_id_draws_another() {
+    let _h = Home::new();
+    let host = host().await;
+    let taken = "20261117-015328-a11d".to_string();
+    agent_engine::session::fresh_id_testing::force_fresh_session_ids([
+        taken.clone(),
+        taken.clone(),
+    ]);
+    let first = host.create_session(pcfg()).await;
+    let second = host.create_session(pcfg()).await;
+    agent_engine::session::fresh_id_testing::force_fresh_session_ids([]);
+    let (first, second) = (first.unwrap(), second.unwrap());
+
+    let sessions = agent_engine::core::session_lock::sessions_dir();
+    for ext in ["json", "journal", "turn"] {
+        let file = sessions.join(format!("{taken}.{ext}"));
+        assert!(!file.exists(), "the first session wrote {}", file.display());
+    }
+    assert_eq!(first.id.as_str(), taken);
+    let other = second.id.as_str().to_string();
+    assert_ne!(other, taken, "the second session runs on the first's id");
+    assert!(
+        agent_engine::core::session_catalog::is_session_id(&other),
+        "{other}"
+    );
+    assert_eq!(second.journal_id(), other, "its journal is its new id");
+    let mut listed: Vec<String> = host
+        .session_handles()
+        .iter()
+        .map(|h| h.id.as_str().to_string())
+        .collect();
+    listed.sort();
+    let mut both = vec![taken.clone(), other.clone()];
+    both.sort();
+    assert_eq!(listed, both, "both sessions are listed");
+    assert_locked(&taken);
+    assert_locked(&other);
+    assert_no_stray_lock(&[&taken, &other]);
+
+    for h in [first, second] {
+        h.send(SessionCommand::End {
+            reason: EndReason::HostShutdown,
+        })
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), h.closed()).await;
+    }
+}
+
+/// A live session holds `id`'s journal lock.
+fn assert_locked(id: &str) {
+    let lock = agent_engine::core::session_lock::SessionLock::try_acquire(
+        &agent_engine::core::session_lock::sessions_dir(),
+        id,
+        agent_engine::core::session_lock::LockHolder {
+            pid: std::process::id(),
+            kind: "test".into(),
+        },
+    );
+    assert!(
+        matches!(
+            lock,
+            Err(agent_engine::core::session_lock::SessionLockError::Held { .. })
+        ),
+        "{id} runs without its journal lock: {lock:?}"
+    );
+}
+
+/// Every lock file in the sessions dir is a live session's or sits beside a
+/// journal: a fresh session's failed draws leave none of their own.
+fn assert_no_stray_lock(live: &[&str]) {
+    let dir = agent_engine::core::session_lock::sessions_dir();
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_suffix(".lock") else {
+            continue;
+        };
+        let journaled = ["json", "journal", "turn"]
+            .iter()
+            .any(|ext| dir.join(format!("{id}.{ext}")).exists());
+        assert!(
+            live.contains(&id) || journaled,
+            "stray lock file {name} (live: {live:?})"
+        );
     }
 }

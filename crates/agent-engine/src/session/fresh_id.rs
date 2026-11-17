@@ -19,9 +19,19 @@ use crate::engine::setup::SessionBootResult;
 const FRESH_ID_DRAWS: usize = 8;
 
 /// Take the journal lock for the fresh session in `sb`, giving it a new id
-/// while the one it holds is taken: its lock is held, or a journal with
-/// that id (`.json` or `.journal`) is already on disk. Runs before anything publishes or writes the
-/// id (the `--name` save, the registry card and socket, the START record).
+/// while the one it holds is taken: its lock is held, it was compacted
+/// into a successor, or a journal with that id (`.json`, `.journal` or a
+/// `.turn` draft) is already on disk. Runs before anything publishes or
+/// writes the id (the `--name` save, the registry card and socket, the
+/// START record).
+///
+/// The lock comes first and the disk check second: every cooperating writer
+/// of a journal holds its lock, so no journal can appear between the two.
+/// A draw that fails leaves no lock file of its own: a held lock's file is
+/// its holder's, a compacted id is refused before its file is opened, and
+/// over a journal on disk the file stays where that journal's own sessions
+/// keep theirs (unlinking one that another process may be opening would
+/// reopen the unlink race).
 ///
 /// `Ok(None)` is the old best-effort case only: the lock could not be taken
 /// for another reason (an unwritable sessions dir), which is logged.
@@ -38,21 +48,20 @@ pub(crate) fn lock_fresh_session(
     let mut draws = 1;
     loop {
         let id = sb.session.id.clone();
-        let on_disk = ["json", "journal"]
-            .iter()
-            .any(|ext| dir.join(format!("{id}.{ext}")).exists());
-        let taken = if on_disk {
-            "a journal with this id is on disk".to_string()
-        } else {
-            match SessionLock::try_acquire(&dir, &id, holder.clone()) {
-                Ok(lock) => return Ok(Some(lock)),
-                Err(
-                    e @ (SessionLockError::Held { .. } | SessionLockError::CompactedInto { .. }),
-                ) => e.to_string(),
-                Err(e) => {
-                    tracing::warn!(session = %id, "session lock: {e}");
-                    return Ok(None);
+        let taken = match SessionLock::try_acquire(&dir, &id, holder.clone()) {
+            Ok(lock) => match journal_on_disk(&dir, &id) {
+                None => return Ok(Some(lock)),
+                Some(file) => {
+                    drop(lock);
+                    format!("{file} is on disk")
                 }
+            },
+            Err(e @ (SessionLockError::Held { .. } | SessionLockError::CompactedInto { .. })) => {
+                taken_reason(&e)
+            }
+            Err(e) => {
+                tracing::warn!(session = %id, "session lock: {e}");
+                return Ok(None);
             }
         };
         if draws == FRESH_ID_DRAWS {
@@ -67,6 +76,31 @@ pub(crate) fn lock_fresh_session(
             agent_core::session::mint_session_id(chrono::Utc::now()),
         );
         tracing::warn!(taken = %id, session = %sb.session.id, "fresh session id taken ({taken}); drew another");
+    }
+}
+
+/// The journal file already under `id`, if any.
+fn journal_on_disk(dir: &std::path::Path, id: &str) -> Option<String> {
+    ["json", "journal", "turn"]
+        .iter()
+        .map(|ext| format!("{id}.{ext}"))
+        .find(|file| dir.join(file).exists())
+}
+
+/// Why a fresh session cannot have the id it drew. Not the lock error's own
+/// text: that tells the user to attach to the session, a stranger's here.
+fn taken_reason(e: &SessionLockError) -> String {
+    match e {
+        SessionLockError::Held {
+            holder: Some(h), ..
+        } => {
+            format!("its lock is held by pid {} ({})", h.pid, h.kind)
+        }
+        SessionLockError::Held { holder: None, .. } => "its lock is held".to_string(),
+        SessionLockError::CompactedInto { successor_id, .. } => {
+            format!("it was compacted into {successor_id}")
+        }
+        SessionLockError::Io(e, _) => format!("lock I/O error: {e}"),
     }
 }
 
@@ -97,5 +131,51 @@ pub mod testing {
 
     pub(super) fn take_forced_id() -> Option<String> {
         FORCED.lock().unwrap_or_else(|p| p.into_inner()).pop_front()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{journal_on_disk, taken_reason};
+    use agent_core::session_lock::{LockHolder, SessionLockError};
+
+    #[test]
+    fn a_taken_reason_never_points_at_the_strangers_session() {
+        let held = SessionLockError::Held {
+            session_id: "20261117-015328-de08".into(),
+            holder: Some(LockHolder {
+                pid: 42,
+                kind: "daemon".into(),
+            }),
+        };
+        assert_eq!(taken_reason(&held), "its lock is held by pid 42 (daemon)");
+        let anon = SessionLockError::Held {
+            session_id: "20261117-015328-de08".into(),
+            holder: None,
+        };
+        let compacted = SessionLockError::CompactedInto {
+            session_id: "20261117-015328-de08".into(),
+            successor_id: "20261117-015329-0e0d".into(),
+        };
+        for e in [&held, &anon, &compacted] {
+            let r = taken_reason(e);
+            assert!(!r.contains("attach") && !r.contains("de08"), "{r}");
+        }
+    }
+
+    #[test]
+    fn any_journal_file_takes_an_id() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(journal_on_disk(dir.path(), "a"), None);
+        std::fs::write(dir.path().join("a.lock"), "").unwrap();
+        assert_eq!(
+            journal_on_disk(dir.path(), "a"),
+            None,
+            "a lock is not a journal"
+        );
+        for ext in ["turn", "journal", "json"] {
+            std::fs::write(dir.path().join(format!("a.{ext}")), "").unwrap();
+            assert_eq!(journal_on_disk(dir.path(), "a"), Some(format!("a.{ext}")));
+        }
     }
 }

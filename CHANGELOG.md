@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **New session ids end in 8 random hex characters, not 4**
+  (`20261117-015328-1f2e3d4c`). They still start with the time they were
+  made and sort by it. Ids from before, with 4, stay valid everywhere.
+
+### Fixed
+
+- **Two sessions that drew the same id no longer share a journal.** Two
+  sessions started in the same second could draw the same id. The second
+  then ran on the first's journal without its lock, and in the daemon the
+  first dropped out of the session list while it kept running. A new
+  session whose id is taken now draws another one.
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel
