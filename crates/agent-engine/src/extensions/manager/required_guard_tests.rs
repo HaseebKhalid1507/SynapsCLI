@@ -464,11 +464,10 @@ async fn the_refusal_names_the_guard_and_the_cause_exactly() {
 }
 
 /// A required guard unloaded, or stopped with every extension, refuses every
-/// tool call; a guard whose manifest subscribes no `before_tool_call` hook
-/// does not count as loaded.
+/// tool call.
 #[tokio::test]
 #[serial_test::serial(synaps_base_dir)]
-async fn an_unloaded_or_hookless_required_guard_refuses() {
+async fn an_unloaded_required_guard_refuses() {
     let base = BaseDirGuard::new();
     let _no_project = EnvVarGuard::set("SYNAPS_DISABLE_PROJECT_PLUGINS", "1");
     let dir = tempfile::tempdir().unwrap();
@@ -484,7 +483,17 @@ async fn an_unloaded_or_hookless_required_guard_refuses() {
     assert_eq!(bus.emit(&call()).await, guard_says_no());
     mgr.shutdown_all().await;
     assert_eq!(bus.emit(&call()).await, refused("unloaded: it was unloaded"));
+}
 
+/// A required guard whose manifest subscribes no `before_tool_call` hook
+/// does not count as loaded.
+#[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
+async fn a_required_guard_with_no_before_tool_call_hook_is_not_loaded() {
+    let base = BaseDirGuard::new();
+    let _no_project = EnvVarGuard::set("SYNAPS_DISABLE_PROJECT_PLUGINS", "1");
+    write_config(base.path(), "required_guards = example-guard\n");
+    let (bus, _) = booted();
     let args = json!(["-c", GUARD, "guard", NO, "", init()]);
     let hookless = guard_json("/bin/sh", args, &[json!({"hook": "after_tool_call"})]);
     let hookless: ExtensionManifest = serde_json::from_value(hookless).unwrap();

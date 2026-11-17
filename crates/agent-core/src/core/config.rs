@@ -5024,13 +5024,13 @@ context_window = 200k\n\
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// `required_guards` is owner-set in the file only: the config writer and
-    /// the settings validator refuse it (and clearing it), whatever the
-    /// spelling, and a refused write leaves the file untouched.
+    /// `required_guards` is owner-set in the file only: the config writer
+    /// refuses it (and clearing it), whatever the spelling, and a refused
+    /// write leaves the file untouched.
     #[test]
     #[serial]
     #[cfg(unix)]
-    fn required_guards_is_never_written_by_the_product() {
+    fn the_config_writer_refuses_required_guards() {
         assert!(KNOWN_CONFIG_KEYS.contains(&"required_guards"));
         assert!(OWNER_SET_CONFIG_KEYS.contains(&"required_guards"));
         let home = make_test_home("required-guards-write");
@@ -5041,7 +5041,6 @@ context_window = 200k\n\
                 for value in ["other", "", " "] {
                     let err = write_config_value(key, value).expect_err("refused");
                     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{key:?}");
-                    assert!(validate_config_edit(key, value).is_err(), "{key:?} {value:?}");
                 }
             }
             // Other keys still write, and the guard list is untouched.
@@ -5050,6 +5049,26 @@ context_window = 200k\n\
         });
         let contents = std::fs::read_to_string(&cfg).unwrap();
         assert_eq!(contents, "required_guards = example-guard\nmodel = claude-sonnet-4-6\n");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The settings dialog's check refuses `required_guards` too (and
+    /// clearing it), whatever the spelling.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn the_settings_validator_refuses_required_guards() {
+        let home = make_test_home("required-guards-validate");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "required_guards = example-guard\nmodel = m\n").unwrap();
+        with_home(&home, || {
+            for key in ["required_guards", " required_guards ", "Required_Guards"] {
+                for value in ["other", "", " "] {
+                    assert!(validate_config_edit(key, value).is_err(), "{key:?} {value:?}");
+                }
+            }
+            assert!(validate_config_edit("model", "claude-sonnet-4-6").is_ok());
+        });
         let _ = std::fs::remove_dir_all(&home);
     }
 
