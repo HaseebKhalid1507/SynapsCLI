@@ -349,24 +349,44 @@ impl PolicyEnv {
     }
 
     pub fn from_process() -> Self {
-        let base_dir = agent_core::config::base_dir();
-        let runtime_dir = std::env::var_os("SYNAPS_RUNTIME_DIR")
+        Self::from_vars(
+            &|name| std::env::var_os(name),
+            agent_core::config::base_dir(),
+            passwd_home(),
+            std::env::current_dir().ok(),
+        )
+    }
+
+    /// The environment as the given variables, base dir, password-database
+    /// home and working folder say. A relative base or socket dir is made
+    /// absolute against `cwd` (the engine resolves it there), so it is
+    /// protected where it really is. Only absolute `$PATH` entries and
+    /// `$HOME`/`$XDG_*` values count: a relative one names no fixed place.
+    pub fn from_vars(
+        var: &dyn Fn(&str) -> Option<OsString>,
+        base_dir: PathBuf,
+        passwd: Option<PathBuf>,
+        cwd: Option<PathBuf>,
+    ) -> Self {
+        let make_absolute = |path: PathBuf| match &cwd {
+            Some(cwd) if !path.is_absolute() => cwd.join(path),
+            _ => path,
+        };
+        let absolute = |name: &str| var(name).map(PathBuf::from).filter(|d| d.is_absolute());
+        let base_dir = make_absolute(base_dir);
+        let runtime_dir = var("SYNAPS_RUNTIME_DIR")
             .map(PathBuf::from)
+            .map(make_absolute)
             .unwrap_or_else(|| base_dir.join("run"));
-        let home = passwd_home();
-        let env_home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|h| h.is_absolute() && Some(h) != home.as_ref());
-        let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|d| d.is_absolute());
-        let path_dirs = std::env::var_os("PATH")
+        let home = passwd;
+        let env_home = absolute("HOME").filter(|h| Some(h) != home.as_ref());
+        let xdg_runtime_dir = absolute("XDG_RUNTIME_DIR");
+        let path_dirs = var("PATH")
             .map(|p| std::env::split_paths(&p).filter(|d| d.is_absolute()).collect())
             .unwrap_or_default();
         let xdg_dirs = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"]
             .iter()
-            .filter_map(|name| std::env::var_os(name).map(PathBuf::from))
-            .filter(|d| d.is_absolute())
+            .filter_map(|name| absolute(name))
             .collect();
         PolicyEnv { home, env_home, base_dir, runtime_dir, xdg_runtime_dir, path_dirs, xdg_dirs }
     }
@@ -1115,6 +1135,81 @@ mod tests {
         assert!(p.drop_reason(Path::new("/srv/fakehome")).is_some());
         assert!(p.drop_reason(Path::new("/srv/fakehome/.aws/x")).is_some());
         assert!(p.drop_reason(Path::new("/srv/fakehome/proj")).is_none());
+    }
+
+    fn vars(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
+        let pairs: Vec<(&'static str, &'static str)> = pairs.to_vec();
+        move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| OsString::from(*v))
+    }
+
+    #[test]
+    fn the_process_environment_is_read_into_the_protected_set() {
+        let v = vars(&[
+            ("HOME", "/srv/fakehome"),
+            ("PATH", "/opt/tool/bin:relative/bin::.:/usr/local/bin"),
+            ("XDG_CONFIG_HOME", "/xdg/config"),
+            ("XDG_DATA_HOME", "/xdg/data"),
+            ("XDG_STATE_HOME", "/xdg/state"),
+            ("XDG_RUNTIME_DIR", "/run/user/7"),
+            ("SYNAPS_RUNTIME_DIR", "/var/run/synaps"),
+        ]);
+        let e = PolicyEnv::from_vars(
+            &v,
+            PathBuf::from("/home/u/.synaps-cli"),
+            Some(PathBuf::from("/home/u")),
+            Some(PathBuf::from("/work")),
+        );
+        assert_eq!(e.home, Some(PathBuf::from("/home/u")), "the home is the password database's");
+        assert_eq!(e.env_home, Some(PathBuf::from("/srv/fakehome")), "a $HOME that differs is kept");
+        assert_eq!(e.path_dirs, vec![PathBuf::from("/opt/tool/bin"), PathBuf::from("/usr/local/bin")]);
+        assert_eq!(
+            e.xdg_dirs,
+            vec![PathBuf::from("/xdg/config"), PathBuf::from("/xdg/data"), PathBuf::from("/xdg/state")]
+        );
+        assert_eq!(e.xdg_runtime_dir, Some(PathBuf::from("/run/user/7")));
+        assert_eq!(e.runtime_dir, PathBuf::from("/var/run/synaps"));
+        assert_eq!(e.base_dir, PathBuf::from("/home/u/.synaps-cli"));
+        let p = Protected::new(&e);
+        for covered in [
+            "/opt/tool/bin/x",
+            "/usr/local/bin/x",
+            "/xdg/config/app",
+            "/xdg/data/app",
+            "/xdg/state/app",
+            "/run/user/7/askpass",
+            "/var/run/synaps/s.sock",
+            "/srv/fakehome/.ssh/id",
+        ] {
+            assert!(p.covers(Path::new(covered)), "{covered} must be protected");
+        }
+        // A relative $PATH entry names no fixed place and is not protected.
+        assert!(!p.covers(Path::new("/work/relative/bin/x")));
+    }
+
+    #[test]
+    fn the_home_from_the_password_database_wins_and_a_matching_or_relative_home_adds_nothing() {
+        let same = PolicyEnv::from_vars(&vars(&[("HOME", "/home/u")]), "/home/u/.synaps-cli".into(), Some("/home/u".into()), None);
+        assert_eq!(same.env_home, None);
+        let relative = PolicyEnv::from_vars(&vars(&[("HOME", "home/u"), ("XDG_DATA_HOME", "rel")]), "/b".into(), None, None);
+        assert_eq!(relative.env_home, None);
+        assert!(relative.xdg_dirs.is_empty());
+        // With no password entry the environment's home is all there is.
+        let only_env = PolicyEnv::from_vars(&vars(&[("HOME", "/srv/h")]), "/b".into(), None, None);
+        assert_eq!(only_env.home, None);
+        assert_eq!(only_env.env_home, Some(PathBuf::from("/srv/h")));
+        assert!(Protected::new(&only_env).drop_reason(Path::new("/srv/h")).is_some());
+    }
+
+    #[test]
+    fn a_relative_base_or_socket_dir_is_protected_where_it_really_is() {
+        let v = vars(&[("SYNAPS_RUNTIME_DIR", "sockets")]);
+        let e = PolicyEnv::from_vars(&v, PathBuf::from(".synaps-cli"), Some("/home/u".into()), Some("/work/dir".into()));
+        assert_eq!(e.base_dir, PathBuf::from("/work/dir/.synaps-cli"));
+        assert_eq!(e.runtime_dir, PathBuf::from("/work/dir/sockets"));
+        let p = Protected::new(&e);
+        assert!(p.covers(Path::new("/work/dir/.synaps-cli/config")));
+        assert!(p.covers(Path::new("/work/dir/sockets/a.sock")));
+        assert!(!p.covers(Path::new("/work/dir/src/main.rs")));
     }
 
     #[test]

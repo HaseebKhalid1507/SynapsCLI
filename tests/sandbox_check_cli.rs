@@ -88,18 +88,34 @@ impl Rig {
     }
 
     fn check(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_synaps"))
+        self.check_with(&[], args)
+    }
+
+    /// `check` with more environment variables; a `PATH` given here comes
+    /// before the test's own.
+    fn check_with(&self, env: &[(&str, &std::ffi::OsStr)], args: &[&str]) -> Output {
+        let mut path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_synaps"));
+        command
             .env_clear()
             .env("HOME", &self.home)
             .env("SYNAPS_BASE_DIR", &self.base)
-            .env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()))
             .env("TERM", "dumb")
             .current_dir(&self.ws)
             .stdin(Stdio::null())
             .args(["sandbox", "check"])
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        for (name, value) in env {
+            if *name == "PATH" {
+                let mut joined = std::ffi::OsString::from(value);
+                joined.push(":");
+                joined.push(&path);
+                path = joined;
+            } else {
+                command.env(name, value);
+            }
+        }
+        command.env("PATH", &path).output().unwrap()
     }
 
     /// Everything under the root but the provider's own `seen` file: name,
@@ -358,4 +374,68 @@ fn a_provider_that_never_answers_times_out() {
     let v = one_object(&out);
     assert_eq!(v["provider_state"], "timeout");
     assert_eq!(v["refusal"], "provider-timeout");
+}
+
+/// The process environment decides part of the protected set: each `$PATH`
+/// entry, the `$XDG_*` bases, the password-database home (not `$HOME`) and
+/// a `$HOME` that differs. The binary reads them itself, so a provider that
+/// offers each of them gets every one dropped, with its reason.
+#[test]
+fn the_environment_the_binary_runs_in_decides_what_is_protected() {
+    if !kernel_usable() {
+        eprintln!("SKIPPED the_environment_the_binary_runs_in_decides_what_is_protected: no usable Landlock");
+        return;
+    }
+    let rig = Rig::new();
+    rig.config("sandbox.confine = enforce\nsandbox.policy_provider = guard\n");
+    let path_dir = rig.root.join("toolbin");
+    let (xdg_config, xdg_data, xdg_state) = (rig.root.join("xdgc"), rig.root.join("xdgd"), rig.root.join("xdgs"));
+    let fake_home = rig.root.join("fakehome");
+    let ordinary = rig.root.join("ordinary");
+    let mut offered: Vec<PathBuf> = vec![
+        path_dir.clone(),
+        xdg_config.join("app"),
+        xdg_data.clone(),
+        xdg_state.clone(),
+        fake_home.join(".ssh"),
+        ordinary.clone(),
+    ];
+    // The real home, from the password database: the test's own $HOME can be
+    // anything, and the binary below is given another.
+    let passwd_home = agent_engine::sandbox::policy::passwd_home();
+    if let Some(home) = &passwd_home {
+        offered.push(home.clone());
+    }
+    rig.provider("guard", &["sandbox.policy"], json!({"mode": "ok", "write": offered}));
+    let env: [(&str, &std::ffi::OsStr); 5] = [
+        ("PATH", path_dir.as_os_str()),
+        ("XDG_CONFIG_HOME", xdg_config.as_os_str()),
+        ("XDG_DATA_HOME", xdg_data.as_os_str()),
+        ("XDG_STATE_HOME", xdg_state.as_os_str()),
+        ("HOME", fake_home.as_os_str()),
+    ];
+    let out = rig.check_with(&env, &["--json"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let v = one_object(&out);
+    let write = strings(&v["write"]);
+    let dropped = dropped_paths(&v);
+    let reason_of = |p: &Path| dropped.iter().find(|(d, _)| Path::new(d) == p).map(|(_, r)| r.clone());
+    let expect = [
+        (&path_dir, "a $PATH entry"),
+        (&xdg_config.join("app"), "an XDG base directory"),
+        (&xdg_data, "an XDG base directory"),
+        (&xdg_state, "an XDG base directory"),
+        (&fake_home.join(".ssh"), "~/.ssh"),
+    ];
+    for (path, why) in expect {
+        let reason = reason_of(path).unwrap_or_else(|| panic!("{} is not dropped: {dropped:?}", path.display()));
+        assert!(reason.contains(why), "{}: {reason}", path.display());
+        assert!(!write.iter().any(|w| Path::new(w) == path.as_path()), "{} is writable", path.display());
+    }
+    if let Some(home) = &passwd_home {
+        let reason = reason_of(home).unwrap_or_else(|| panic!("{} is not dropped: {dropped:?}", home.display()));
+        assert!(reason.contains("the home directory"), "{reason}");
+    }
+    // Control: an entry no class holds is granted.
+    assert!(write.iter().any(|w| Path::new(w) == ordinary.as_path()), "{write:?}");
 }

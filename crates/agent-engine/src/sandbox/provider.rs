@@ -152,10 +152,22 @@ pub async fn establish(
     parent_session_id: Option<&str>,
     cwd: Option<&Path>,
 ) -> Result<SessionSandbox, SandboxRefused> {
+    establish_with_abi(super::kernel_abi(), bus, settings, session_id, parent_session_id, cwd).await
+}
+
+/// [`establish`] with the kernel's ABI given, so a test need not have Landlock.
+pub async fn establish_with_abi(
+    abi: Result<u32, ()>,
+    bus: &HookBus,
+    settings: &SandboxSettings,
+    session_id: &str,
+    parent_session_id: Option<&str>,
+    cwd: Option<&Path>,
+) -> Result<SessionSandbox, SandboxRefused> {
     if settings.confine == SandboxConfine::Off {
         return Ok(SessionSandbox::Off);
     }
-    let (resolution, env) = evaluate(bus, settings, session_id, parent_session_id, cwd).await;
+    let (resolution, env) = evaluate_with_abi(abi, bus, settings, session_id, parent_session_id, cwd).await;
     if let Some(refusal) = &resolution.refusal {
         return Err(SandboxRefused { cause: refusal.session_cause.clone() });
     }
@@ -508,6 +520,35 @@ mod tests {
             .await
             .expect_err("must refuse");
         assert_eq!(refused.cause, "abi-too-old");
+    }
+
+    /// A workspace with a protected path inside it that can't be split around
+    /// (too many entries to grant one by one) refuses the session at its
+    /// start, naming the path, for a top-level session and for a worker; the
+    /// same workspace with a few entries is confined.
+    #[tokio::test]
+    async fn a_grant_that_cannot_be_split_refuses_the_session_with_the_inner_path() {
+        let tmp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let ws = canon_lossy(tmp.path()).join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let settings = SandboxSettings { confine: SandboxConfine::Enforce, policy_provider: Some("guard".into()) };
+        let bus = bus_with(Fake::new("guard", Ok(json!({"write": []}))), &["sandbox.policy"]).await;
+        let parent = parent_for(&ws, &[]);
+        // Control: few entries, split around `<ws>/.synaps/plugins`, confined.
+        let ok = establish_with_abi(Ok(7), &bus, &settings, "s1", None, Some(&ws)).await.expect("splittable");
+        assert!(ok.confinement().is_some());
+        establish_worker_with_abi(Ok(7), &bus, &parent, "sa_1", Some("s1"), Some(&ws)).await.expect("splittable");
+        for i in 0..=super::super::confinement::MAX_SPLIT_ENTRIES {
+            std::fs::write(ws.join(format!("f{i}")), "").unwrap();
+        }
+        let inner = ws.join(".synaps").join("plugins");
+        let want = format!("protected-inside-grant: {}", inner.display());
+        let refused = establish_with_abi(Ok(7), &bus, &settings, "s1", None, Some(&ws)).await.expect_err("must refuse");
+        assert_eq!(refused.cause, want);
+        let refused = establish_worker_with_abi(Ok(7), &bus, &parent, "sa_1", Some("s1"), Some(&ws))
+            .await
+            .expect_err("must refuse");
+        assert_eq!(refused.cause, want);
     }
 
     #[tokio::test]
