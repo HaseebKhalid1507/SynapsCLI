@@ -450,3 +450,37 @@ impl McpConnection {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod sandbox_pins {
+    use super::*;
+    use crate::sandbox::testkit::{appears, Tree};
+    use crate::sandbox::SessionSandbox;
+
+    /// A confined session whose ruleset cannot be built starts no MCP
+    /// server (no Landlock needed: the refusal comes first). The undo is the
+    /// same server with confinement off, which starts and runs its script
+    /// (and then fails the handshake, being no server).
+    #[tokio::test]
+    async fn a_server_is_not_started_when_the_sessions_ruleset_cannot_be_built() {
+        let t = Tree::new();
+        let marker = t.root.join("mcp-ran");
+        let run = t.script("mcp.sh", &format!("touch '{}'\n", marker.display()));
+        let config = crate::mcp::McpServerConfig {
+            command: "sh".to_string(),
+            args: vec![run.display().to_string()],
+            env: Default::default(),
+            shared: false,
+        };
+
+        let session = t.session_that_cannot_spawn();
+        let Err(why) = McpConnection::start("example", &config, &session).await else {
+            panic!("the server started in a session that cannot spawn");
+        };
+        assert!(why.contains("sandbox"), "{why}");
+        assert!(!marker.exists(), "the server ran anyway");
+
+        let _ = McpConnection::start("example", &config, &SessionSandbox::Off).await;
+        assert!(appears(&marker).await, "control: the server ran when confinement is off");
+    }
+}

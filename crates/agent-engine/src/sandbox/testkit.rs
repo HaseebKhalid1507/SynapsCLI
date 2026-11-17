@@ -64,6 +64,41 @@ impl Tree {
     pub fn session(&self, path_dirs: Vec<PathBuf>, extra_write: Vec<String>) -> SessionSandbox {
         SessionSandbox::Confined(Arc::new(self.confinement(path_dirs, extra_write)))
     }
+
+    /// A confined session whose ruleset can no longer be built: its
+    /// workspace is gone, so it cannot be split around the project's plugin
+    /// folder. Every spawn for it must be refused; none may run loose. The
+    /// fixture checks that it does refuse. (Needs no Landlock kernel: the
+    /// refusal comes before any kernel call.)
+    pub fn session_that_cannot_spawn(&self) -> SessionSandbox {
+        let session = self.session(vec![], vec![]);
+        std::fs::remove_dir_all(&self.ws).expect("remove the workspace");
+        assert!(
+            matches!(session.for_spawn(), super::SpawnSandbox::Refuse(_)),
+            "the fixture must refuse every spawn"
+        );
+        session
+    }
+
+    /// A script file beside the workspace (outside every grant, readable),
+    /// for a spawn site that only takes a program and arguments.
+    pub fn script(&self, name: &str, body: &str) -> PathBuf {
+        let path = self.root.join(name);
+        std::fs::write(&path, body).expect("write the script");
+        path
+    }
+}
+
+/// Wait up to five seconds for `path` to appear.
+pub(crate) async fn appears(path: &std::path::Path) -> bool {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < end {
+        if path.exists() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    path.exists()
 }
 
 /// Whether this kernel can confine a child (Landlock ABI at or above the

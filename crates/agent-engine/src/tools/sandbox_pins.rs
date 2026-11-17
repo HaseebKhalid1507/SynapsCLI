@@ -16,8 +16,8 @@ use super::multi_edit::MultiEditTool;
 use super::test_helpers::create_tool_context;
 use super::write::WriteTool;
 use super::{Tool, ToolContext};
-use crate::sandbox::testkit::{kernel_ok, Tree};
-use crate::sandbox::SessionSandbox;
+use crate::sandbox::testkit::{appears, kernel_ok, Tree};
+use crate::sandbox::{SessionSandbox, SpawnSandbox};
 
 fn ctx(sandbox: SessionSandbox, cwd: &Path) -> ToolContext {
     let mut ctx = create_tool_context();
@@ -162,4 +162,106 @@ async fn a_confined_bash_command_writes_inside_and_not_outside() {
     ] {
         assert!(!path.exists(), "{what}: a confined command wrote {}", path.display());
     }
+}
+
+// Every other place the engine starts a command for a session goes through
+// the same sandbox decision. Each pin below uses a confined session whose
+// ruleset cannot be built (`session_that_cannot_spawn`): the spawn must be
+// refused before anything runs, on any Linux (no Landlock needed). Its undo
+// is the same call with confinement off, which does run.
+
+/// The shell tool and `ls`.
+#[tokio::test]
+async fn bash_and_ls_are_refused_when_the_sessions_ruleset_cannot_be_built() {
+    let t = Tree::new();
+    let marker = t.root.join("bash-ran");
+    let command = json!({"command": format!("touch '{}'", s(&marker))});
+    let session = t.session_that_cannot_spawn();
+
+    let why = refusal(&BashTool, command.clone(), ctx(session.clone(), &t.root)).await;
+    assert!(why.contains("sandbox"), "bash: {why}");
+    assert!(!marker.exists(), "bash: the command ran anyway");
+    let why = refusal(&LsTool, json!({"path": s(&t.root)}), ctx(session, &t.root)).await;
+    assert!(why.contains("sandbox"), "ls: {why}");
+
+    // Undo: with confinement off the same calls run.
+    BashTool.execute(command, ctx(SessionSandbox::Off, &t.root)).await.unwrap();
+    assert!(marker.exists(), "control: the command runs when confinement is off");
+    LsTool.execute(json!({"path": s(&t.root)}), ctx(SessionSandbox::Off, &t.root)).await.unwrap();
+}
+
+/// A session's extension process.
+#[tokio::test]
+async fn an_extension_process_is_not_started_when_the_sessions_ruleset_cannot_be_built() {
+    use crate::extensions::runtime::process::ProcessExtension;
+    let t = Tree::new();
+    let marker = t.root.join("extension-ran");
+    let run = t.script("extension.sh", &format!("touch '{}'\n", s(&marker)));
+    let args = vec![s(&run)];
+
+    let session = t.session_that_cannot_spawn();
+    let Err(why) = ProcessExtension::spawn_confined("example", "sh", &args, Some(t.root.clone()), session).await else {
+        panic!("the extension process started in a session that cannot spawn");
+    };
+    assert!(why.contains("sandbox"), "{why}");
+    assert!(!marker.exists(), "the extension ran anyway");
+
+    // Undo: with confinement off it starts and runs.
+    let started = ProcessExtension::spawn_confined("example", "sh", &args, Some(t.root.clone()), SessionSandbox::Off).await;
+    assert!(started.is_ok(), "control: the extension starts when confinement is off");
+    assert!(appears(&marker).await, "control: the extension ran");
+}
+
+fn spawn_pty(t: &Tree, script: &Path, sandbox: SpawnSandbox) -> crate::Result<super::shell::pty::PtyHandle> {
+    let prepared = (std::env::vars_os().collect(), Some(t.root.clone()), None);
+    super::shell::pty::PtyHandle::spawn_prepared(
+        &format!("sh {}", script.display()),
+        t.root.to_str(),
+        24,
+        80,
+        prepared,
+        sandbox,
+    )
+}
+
+/// A shell session's PTY.
+#[tokio::test]
+async fn a_pty_shell_is_not_started_when_the_sessions_ruleset_cannot_be_built() {
+    let t = Tree::new();
+    let marker = t.root.join("pty-ran");
+    let run = t.script("pty.sh", &format!("touch '{}'\n", s(&marker)));
+
+    let session = t.session_that_cannot_spawn();
+    assert!(spawn_pty(&t, &run, session.for_spawn()).is_err(), "the PTY started in a session that cannot spawn");
+    assert!(!marker.exists(), "the shell ran anyway");
+
+    // Undo: with confinement off it starts and runs.
+    let handle = spawn_pty(&t, &run, SessionSandbox::Off.for_spawn());
+    assert!(handle.is_ok(), "control: the PTY starts when confinement is off");
+    assert!(appears(&marker).await, "control: the shell ran");
+}
+
+/// A shell session's PTY child really starts under Landlock (its spawn runs
+/// on a confined thread, not through `pre_exec`). Needs a kernel with
+/// Landlock; skips loudly without.
+#[tokio::test]
+async fn a_confined_pty_shell_writes_inside_and_not_outside() {
+    if !kernel_ok("a_confined_pty_shell_writes_inside_and_not_outside") {
+        return;
+    }
+    let t = Tree::new();
+    let outside = t.home.join("pty-out.txt");
+    let inside = t.ws.join("src/pty-in.txt");
+    let run = t.script("pty.sh", &format!("echo no > '{}'\necho ok > '{}'\n", s(&outside), s(&inside)));
+
+    let confined = spawn_pty(&t, &run, t.session(vec![], vec![]).for_spawn());
+    assert!(confined.is_ok(), "the confined PTY must start");
+    assert!(appears(&inside).await, "the workspace is writable");
+    assert!(!outside.exists(), "a confined PTY shell wrote outside the workspace");
+    drop(confined);
+
+    // Undo: the same script with confinement off writes the outside file.
+    let loose = spawn_pty(&t, &run, SessionSandbox::Off.for_spawn());
+    assert!(loose.is_ok());
+    assert!(appears(&outside).await, "control: the script writes there when confinement is off");
 }

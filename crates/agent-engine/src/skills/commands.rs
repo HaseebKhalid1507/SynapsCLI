@@ -269,6 +269,27 @@ mod tests {
         assert_eq!(output.stdout, "cwd=. arg=extra");
     }
 
+    /// A confined chat's plugin command is refused when the session's
+    /// ruleset cannot be built (no Landlock needed: the refusal comes first);
+    /// the same command with confinement off runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_confined_chats_plugin_command_is_refused_when_its_ruleset_cannot_be_built() {
+        let t = crate::sandbox::testkit::Tree::new();
+        let marker = t.root.join("plugin-ran");
+        let command = cmd("touch", vec![marker.to_str().unwrap()], t.root.clone());
+        let session = t.session_that_cannot_spawn();
+
+        let result = execute_plugin_command(&command, "", None, &session).await;
+        let why = result.expect_err("a session that cannot spawn must refuse").to_string();
+        assert!(why.contains("sandbox"), "{why}");
+        assert!(!marker.exists(), "the plugin command ran anyway");
+
+        let output = execute_plugin_command(&command, "", None, &crate::sandbox::SessionSandbox::Off).await.unwrap();
+        assert_eq!(output.status, Some(0));
+        assert!(marker.exists(), "control: the command runs when confinement is off");
+    }
+
     #[tokio::test]
     async fn execute_plugin_command_rejects_parent_dir_command_path() {
         let root = tempdir();

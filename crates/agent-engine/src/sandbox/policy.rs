@@ -934,6 +934,42 @@ mod tests {
     class_pin!(class_rc_file_zshrc, c => c.home.join(".zshrc"));
     class_pin!(class_rc_file_zprofile, c => c.home.join(".zprofile"));
 
+    /// The credential stores and autostart folders, spelled out one by one
+    /// (not read back from the constants), each protected whole and each
+    /// writable in a set built without them.
+    #[test]
+    fn every_credential_store_and_autostart_folder_is_protected_by_name() {
+        let c = classes();
+        for rel in [
+            ".ssh",
+            ".gnupg",
+            ".aws",
+            ".config/gcloud",
+            ".kube",
+            ".docker",
+            ".local/share/keyrings",
+            ".password-store",
+            ".netrc",
+            ".git-credentials",
+            ".config/systemd",
+            ".local/share/systemd",
+            ".config/autostart",
+        ] {
+            let top = c.home.join(rel);
+            let inner = top.join("inner/file");
+            for path in [&top, &inner] {
+                assert!(c.protected.covers(path), "{} is not protected", path.display());
+                assert!(c.protected.drop_reason(path).is_some(), "{} is not dropped", path.display());
+            }
+        }
+        // `~/.config` and `~/.local` are protected whole, so a store beneath
+        // them is covered by its parent as well; the stores directly under
+        // the home directory have no such parent and show the name list holds.
+        for rel in [".ssh", ".gnupg", ".aws", ".kube", ".docker", ".password-store", ".netrc", ".git-credentials"] {
+            assert!(!c.bare.covers(&c.home.join(rel)), "{rel} is covered without its class");
+        }
+    }
+
     #[test]
     fn paths_outside_every_class_stay_writable() {
         let c = classes();
