@@ -108,7 +108,7 @@ Local models: Synaps targets Ollama's default `http://localhost:11434/v1`. LM St
 - **Long sessions stay cheap.** The prompt cache lasts an hour on a Claude subscription, large tool output waits on disk behind a short preview, re-reads of unchanged files are deduplicated, and workers roll their context over instead of filling the window.
 - **Memory that survives.** Project memory, `/compact` checkpoints, sessions that chain across days.
 - **Sees what you see.** The model reads images, and `/attach` adds images, PDFs and text to a turn. [More](docs/multimodal.md)
-- **Build on it.** Extensions in any language, MCP servers, and the engine over [JSON-RPC](docs/rpc-protocol.md) or the [daemon socket](docs/daemon-mode.md).
+- **Build on it.** Extensions in any language, MCP servers, and the engine over [JSON-RPC](docs/rpc-protocol.md) or the [daemon socket](docs/daemon-mode.md). [Capri](https://github.com/HaseebKhalid1507/capri-syn), a desktop companion, is a client built on the daemon socket.
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/9f907e06-46ff-46b3-87d5-36f53783e795" alt="Two terminals attached to one live session: one asks, the other steers mid-turn" width="100%" />
@@ -215,6 +215,12 @@ Each extension is its own crash-isolated process, with a permissions manifest th
 - **Not a sandbox.** Tools run as you. Building with `--no-default-features` compiles out `bash` and the `shell_*` tools, but an agent can still start processes indirectly: by editing shell rc files or MCP config, or through extensions. Use a container or VM for untrusted work.
 
 Found a vulnerability? Report it privately: [SECURITY.md](SECURITY.md).
+
+## Meet Capri
+
+<p align="center"><img src="https://raw.githubusercontent.com/HaseebKhalid1507/capri-syn/main/docs/media/tour-summon.webp" width="640" alt="Capri, a desktop companion, comes over when her Synaps session needs you"></p>
+
+Synaps is a daemon, so a client doesn't have to be a terminal. [Capri](https://github.com/HaseebKhalid1507/capri-syn) is a desktop companion with a session of her own: she perches on your windows, takes a message by key or by voice, and comes over when her session needs you. Already running Synaps? She installs in one line and finds your daemon.
 
 ## Docs and help
 
