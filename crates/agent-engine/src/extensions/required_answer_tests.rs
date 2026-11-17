@@ -74,6 +74,8 @@ enum Mode {
     Answer(HookResult),
     /// `handle_required` reports this; `handle` answers `Continue`.
     Fail(NoAnswer),
+    /// Blocks a call whose input holds this text, else `Continue`.
+    Refuse(&'static str),
 }
 
 /// A live handler (`guard_down` is `None`) answering per its [`Mode`],
@@ -82,11 +84,22 @@ struct Fake {
     id: &'static str,
     mode: Mode,
     calls: AtomicUsize,
+    /// The `command` of each call's input it was asked about.
+    seen: std::sync::Mutex<Vec<String>>,
 }
 
 impl Fake {
     fn new(id: &'static str, mode: Mode) -> Arc<Self> {
-        Arc::new(Self { id, mode, calls: AtomicUsize::new(0) })
+        Arc::new(Self {
+            id,
+            mode,
+            calls: AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
     }
 
     fn calls(&self) -> usize {
@@ -104,12 +117,16 @@ impl ExtensionHandler for Fake {
         None
     }
 
-    async fn handle(&self, _event: &HookEvent) -> HookResult {
+    async fn handle(&self, event: &HookEvent) -> HookResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let command = event.tool_input.as_ref().and_then(|input| input["command"].as_str());
+        self.seen.lock().unwrap().push(command.unwrap_or_default().to_string());
         match &self.mode {
             Mode::Hang => std::future::pending().await,
             Mode::Answer(result) => result.clone(),
             Mode::Fail(_) => HookResult::Continue,
+            Mode::Refuse(text) if command.is_some_and(|c| c.contains(text)) => said_no(),
+            Mode::Refuse(_) => HookResult::Continue,
         }
     }
 
@@ -132,7 +149,9 @@ impl ExtensionHandler for Fake {
 
 /// A bus gated on `example-guard`, with `guards` subscribed in order (each with its
 /// `on_failure`; `example-guard` marked loaded and live), then a `later` handler
-/// that answers `Continue`.
+/// that answers `Continue`. The required guard runs after every other
+/// handler whatever the order: `later` is asked first, the guard's block
+/// ends the chain.
 async fn gated(guards: &[(Arc<Fake>, HookFailurePolicy)]) -> (HookBus, Arc<Fake>) {
     let gate = Arc::new(RequiredGuards::new(&["example-guard".to_string()]));
     let bus = HookBus::new().with_required_guards(Arc::clone(&gate));
@@ -176,7 +195,7 @@ async fn a_hung_required_guard_blocks_at_the_hook_timeout_whatever_its_on_failur
             "at the hook timeout: {waited:?}"
         );
         assert_eq!(required.calls(), 1);
-        assert_eq!(later.calls(), 0, "a block ends the chain");
+        assert_eq!(later.calls(), 1, "the guard runs last; its block ends the chain");
     }
 }
 
@@ -197,7 +216,7 @@ async fn a_required_guards_answer_it_may_not_give_before_a_call_blocks() {
             "bad-answer: its answer is not a usable hook result: '{action}' is not an answer to a before_tool_call"
         );
         assert_eq!(bus.emit(&call()).await, no_answer(&cause));
-        assert_eq!(later.calls(), 0);
+        assert_eq!(later.calls(), 1, "asked before the guard, which runs last");
     }
 }
 
@@ -234,7 +253,7 @@ async fn the_bus_names_the_guard_and_each_cause_exactly() {
         let (bus, later) = gated(&[(required.clone(), HookFailurePolicy::Continue)]).await;
         assert_eq!(bus.emit(&call()).await, no_answer(&cause));
         assert_eq!(required.calls(), 1);
-        assert_eq!(later.calls(), 0);
+        assert_eq!(later.calls(), 1, "asked before the guard, which runs last");
     }
 }
 
@@ -301,7 +320,8 @@ async fn a_required_guards_modify_after_a_confirm_blocks() {
     ])
     .await;
     assert_eq!(bus.emit(&call()).await, no_answer(MODIFY_AFTER_CONFIRM));
-    assert_eq!((asker.calls(), required.calls(), later.calls()), (1, 1, 0));
+    // `later` is asked before the guard, which runs last.
+    assert_eq!((asker.calls(), required.calls(), later.calls()), (1, 1, 1));
 
     // Unchanged: no earlier Confirm, so the guard's rewrite applies.
     let required = Fake::new("example-guard", Mode::Answer(rewrite()));
@@ -667,4 +687,99 @@ async fn the_post_chain_check_keeps_a_chain_block_and_an_unchanged_guards_allow(
     let (bus, later) = gated(&[(guard.clone(), HookFailurePolicy::Continue)]).await;
     assert_eq!(bus.emit(&call()).await, HookResult::Continue);
     assert_eq!((guard.calls(), later.calls()), (1, 1));
+}
+
+// ---- required guards run last: a later modify cannot slip past them ----
+
+/// A call whose input the rewriter changes into the one the guard refuses.
+fn harmless() -> HookEvent {
+    HookEvent::before_tool_call("bash", json!({"command": "ls"}))
+}
+
+fn rewritten_to(command: &str) -> HookResult {
+    HookResult::Modify { input: json!({"command": command}) }
+}
+
+/// A bus gated on `example-guard` and `second-guard` (both loaded and
+/// live), with `chain` subscribed in this order.
+async fn two_guards(chain: &[Arc<Fake>]) -> HookBus {
+    let names = ["example-guard".to_string(), "second-guard".to_string()];
+    let gate = Arc::new(RequiredGuards::new(&names));
+    let bus = HookBus::new().with_required_guards(Arc::clone(&gate));
+    for fake in chain {
+        let handler: Arc<dyn ExtensionHandler> = fake.clone();
+        gate.mark_loaded(fake.id, Arc::clone(&handler));
+        bus.subscribe(HookKind::BeforeToolCall, handler, None, None, intercept())
+            .await
+            .unwrap();
+    }
+    bus
+}
+
+/// Pin (a later modify): the guard is subscribed BEFORE an extension that
+/// rewrites the call into one the guard refuses. Registration order would
+/// let the guard approve the harmless input and the rewrite run; required
+/// guards run last, so the guard sees the rewritten input and refuses it.
+/// Unchanged: a rewrite the guard accepts applies, and a guard that is not
+/// required still runs in registration order.
+#[tokio::test]
+async fn a_later_extensions_modify_cannot_pass_an_input_the_guard_refuses() {
+    let guard = Fake::new("example-guard", Mode::Refuse("rm -rf"));
+    let rewriter = Fake::new("rewriter", Mode::Answer(rewritten_to("rm -rf /")));
+    let (bus, later) = gated(&[
+        (guard.clone(), HookFailurePolicy::Continue),
+        (rewriter.clone(), HookFailurePolicy::Continue),
+    ])
+    .await;
+    assert_eq!(bus.emit(&harmless()).await, said_no());
+    assert_eq!(guard.seen(), ["rm -rf /"], "the guard vetted the final input");
+    assert_eq!((rewriter.calls(), later.calls()), (1, 1));
+
+    // The same rewrite to an input the guard accepts applies.
+    let guard = Fake::new("example-guard", Mode::Refuse("rm -rf"));
+    let rewriter = Fake::new("rewriter", Mode::Answer(rewritten_to("ls -l")));
+    let (bus, _) = gated(&[
+        (guard.clone(), HookFailurePolicy::Continue),
+        (rewriter, HookFailurePolicy::Continue),
+    ])
+    .await;
+    assert_eq!(bus.emit(&harmless()).await, rewritten_to("ls -l"));
+    assert_eq!(guard.seen(), ["ls -l"]);
+
+    // A rewrite chained through two extensions reaches the guard only in
+    // its final form; the extensions keep their registration order.
+    let guard = Fake::new("example-guard", Mode::Refuse("rm -rf"));
+    let first = Fake::new("first", Mode::Answer(rewritten_to("echo hi")));
+    let second = Fake::new("second", Mode::Answer(rewritten_to("rm -rf /")));
+    let (bus, _) = gated(&[
+        (guard.clone(), HookFailurePolicy::Continue),
+        (first.clone(), HookFailurePolicy::Continue),
+        (second.clone(), HookFailurePolicy::Continue),
+    ])
+    .await;
+    assert_eq!(bus.emit(&harmless()).await, said_no());
+    assert_eq!(guard.seen(), ["rm -rf /"]);
+    assert_eq!(first.seen(), ["ls"]);
+    assert_eq!(second.seen(), ["echo hi"]);
+}
+
+const MODIFY_AFTER_A_GUARD: &str = "Refused: required guard 'second-guard' gave no usable answer (bad-answer: its answer is not a usable hook result: 'modify' cannot apply here: required guard 'example-guard' had already vetted the input as it was). No tool call runs without a required guard's answer, whatever its on_failure says.";
+
+/// Pin (two guards): a required guard's rewrite after another required
+/// guard has answered would run an input that guard never saw, so it
+/// blocks, naming the rewriting guard. The other order is fine: the
+/// rewriting guard first, then the one that vets its output.
+#[tokio::test]
+async fn a_required_guards_modify_after_another_guard_answered_blocks() {
+    let vetting = Fake::new("example-guard", Mode::Refuse("rm -rf"));
+    let rewriting = Fake::new("second-guard", Mode::Answer(rewritten_to("rm -rf /")));
+    let bus = two_guards(&[vetting.clone(), rewriting.clone()]).await;
+    assert_eq!(bus.emit(&harmless()).await, HookResult::block(MODIFY_AFTER_A_GUARD));
+    assert_eq!(vetting.seen(), ["ls"]);
+
+    let vetting = Fake::new("example-guard", Mode::Refuse("rm -rf"));
+    let rewriting = Fake::new("second-guard", Mode::Answer(rewritten_to("rm -rf /")));
+    let bus = two_guards(&[rewriting, vetting.clone()]).await;
+    assert_eq!(bus.emit(&harmless()).await, said_no());
+    assert_eq!(vetting.seen(), ["rm -rf /"], "the later guard vets the rewrite");
 }

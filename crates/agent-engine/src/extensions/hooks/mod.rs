@@ -542,6 +542,12 @@ impl HookBus {
     /// read as an allow). No allow fallback: the refusal is a `Block` on
     /// every bus, a worker's included.
     ///
+    /// A `before_tool_call` chain runs the required guards last, in
+    /// registration order among themselves, so a guard vets the input as
+    /// every other extension's `modify` left it. A required guard's `modify`
+    /// after another required guard has answered blocks the call: that
+    /// guard would never see the input it ran.
+    ///
     /// In the chain, a required guard's own handler is called with
     /// [`ExtensionHandler::handle_required`](crate::extensions::runtime::ExtensionHandler::handle_required)
     /// whatever its manifest's `on_failure` says, and no usable answer
@@ -610,6 +616,14 @@ impl HookBus {
                 }
             }
         }; // lock dropped here
+        let mut registrations = registrations;
+        // Required guards run last, so each vets the input as every other
+        // extension left it: an extension later in the chain could rewrite
+        // what a guard had already approved. (Stable: registration order
+        // holds among the guards, and among everything else.)
+        if event.kind == HookKind::BeforeToolCall {
+            registrations.sort_by_key(|reg| self.required.is_required(reg.handler.id()));
+        }
 
         // Collect injections from all handlers rather than returning on first
         let mut injections = Injections::default();
@@ -627,6 +641,8 @@ impl HookBus {
         let mut modified_event: Option<HookEvent> = None;
         // Who rewrote it (chain order, de-duplicated).
         let mut modified_by: Vec<String> = Vec::new();
+        // The first required guard that has answered in this chain.
+        let mut guard_answered: Option<String> = None;
 
         for reg in &registrations {
             let ev: &HookEvent = modified_event.as_ref().unwrap_or(event);
@@ -673,6 +689,10 @@ impl HookBus {
                 }
             };
             let result = tokio::time::timeout(HANDLER_TIMEOUT, call).await;
+            let answered_before = guard_answered.clone();
+            if required && result.is_ok() {
+                guard_answered.get_or_insert_with(|| reg.handler.id().to_string());
+            }
 
             if trace_enabled {
                 let health = reg.handler.health().await;
@@ -752,6 +772,21 @@ impl HookBus {
                     );
                     // Accumulate — don't early-return. Multiple extensions can inject.
                     injections.push(reg.handler.id(), &result);
+                }
+                Ok(HookResult::Modify { .. }) if required && answered_before.is_some() => {
+                    // Another required guard has already vetted the input
+                    // as it stood: this rewrite would run an input that
+                    // guard never saw.
+                    let why = NoAnswer::BadAnswer(format!(
+                        "'modify' cannot apply here: required guard '{}' had already vetted the input as it was",
+                        answered_before.unwrap_or_default()
+                    ));
+                    tracing::warn!(
+                        hook = %ev.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        "Required guard's Modify comes after another guard vetted the input — blocking the call"
+                    );
+                    return HookResult::block(no_answer_text(reg.handler.id(), &why));
                 }
                 Ok(HookResult::Modify { .. }) if required && !confirms.is_empty() => {
                     // A required guard's rewrite the bus may not apply
