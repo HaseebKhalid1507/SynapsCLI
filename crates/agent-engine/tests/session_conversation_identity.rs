@@ -557,16 +557,18 @@ fn record(id: &str, journal: &str) -> agent_engine::daemon::reload::ReloadSessio
     }
 }
 
+/// Through serde, as the new image reads it: a field another change adds
+/// to the record (`#[serde(default)]`) needs no edit here.
 fn reload_state(
     sessions: Vec<agent_engine::daemon::reload::ReloadSession>,
 ) -> agent_engine::daemon::reload::ReloadState {
-    agent_engine::daemon::reload::ReloadState {
-        generation: 2,
-        written_at: chrono::Utc::now(),
-        sessions,
-        expected_clients: 0,
-        next_subagent_id: 0,
-    }
+    serde_json::from_value(serde_json::json!({
+        "generation": 2,
+        "written_at": chrono::Utc::now(),
+        "sessions": sessions,
+        "expected_clients": 0,
+    }))
+    .unwrap()
 }
 
 /// `/clear` (actor `A` → `N`), resume `A` (minted actor `M`), then a reload
