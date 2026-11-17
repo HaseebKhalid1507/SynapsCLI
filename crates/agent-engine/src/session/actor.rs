@@ -2838,14 +2838,20 @@ impl SessionActor {
     /// up. The tick stops once no worker is running after the turn, having
     /// published the terminal rows.
     pub(crate) fn publish_subagent_rows(&mut self) {
-        let (rows, running) = {
-            let registry = self
-                .runtime
-                .subagent_registry()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            (registry.display_rows(), registry.any_running())
-        };
+        let rows = self
+            .runtime
+            .subagent_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .display_rows();
+        #[cfg(any(test, feature = "testing"))]
+        crate::runtime::subagent::after_tick_rows_for_test();
+        // From the rows just read, never a second walk: a worker finishing
+        // in between would stop the tick on rows that still show it
+        // running, and those would be the last rows clients get.
+        let running = rows
+            .iter()
+            .any(|r| r.status == crate::runtime::subagent::SubagentStatus::Running);
         if !rows.is_empty() {
             self.emit(SessionEventWire::SubagentRows(rows));
         }

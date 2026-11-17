@@ -755,6 +755,32 @@ pub fn set_finished_handle_ttl_for_test(ttl: Option<std::time::Duration>) {
     let ms = ttl.map_or(0, |t| (t.as_millis() as u64).max(1));
     FINISHED_TTL_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
 }
+
+#[cfg(any(test, feature = "testing"))]
+type TickRowsHook = Box<dyn FnMut() + Send>;
+
+#[cfg(any(test, feature = "testing"))]
+static AFTER_TICK_ROWS: std::sync::Mutex<Option<TickRowsHook>> = std::sync::Mutex::new(None);
+
+/// Test seam: `hook` runs each time a session's worker tick has read its
+/// rows, before it decides whether to keep ticking (`None` removes it), for
+/// the whole process.
+#[cfg(any(test, feature = "testing"))]
+pub fn set_after_tick_rows_for_test(hook: Option<Box<dyn FnMut() + Send>>) {
+    *AFTER_TICK_ROWS.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+}
+
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn after_tick_rows_for_test() {
+    if let Some(hook) = AFTER_TICK_ROWS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        hook();
+    }
+}
+
 /// Maximum terminal text retained by a transport-free tombstone.
 pub const TOMBSTONE_OUTPUT_MAX_BYTES: usize = 32 * 1024;
 

@@ -714,6 +714,55 @@ async fn the_worker_tick_stops_once_nothing_runs() {
     end(&mut a).await;
 }
 
+/// A worker that finishes right after the tick read its rows (the test seam
+/// runs there) keeps the tick one more beat, which sends it finished.
+/// Deciding from a second registry walk would stop the tick on rows that
+/// show it running, and clients would keep that ghost row (after a
+/// `/workers cancel`, whose wake is withheld, until the next turn).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_tick_never_stops_on_rows_that_show_a_worker_running() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _h = Home::new();
+    let (handle, mut a, _registry, states, _) =
+        turn_that_leaves_workers_running(pcfg(), &["sa_1"]).await;
+    drain_for(&mut a, Duration::from_millis(100)).await;
+    let armed = Arc::new(AtomicBool::new(true));
+    {
+        let (state, armed) = (Arc::clone(&states[0]), Arc::clone(&armed));
+        agent_engine::runtime::subagent::set_after_tick_rows_for_test(Some(Box::new(move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                finish(&state);
+            }
+        })));
+    }
+    let events = drain_for(&mut a, Duration::from_millis(3500)).await;
+    agent_engine::runtime::subagent::set_after_tick_rows_for_test(None);
+    assert!(!armed.load(Ordering::SeqCst), "a tick ran the seam");
+    assert_eq!(handle.meta_live().workers.running, 0);
+    let last = events
+        .iter()
+        .rev()
+        .find_map(|e| match &e.event {
+            SessionEventWire::SubagentRows(rows) => Some(rows.clone()),
+            _ => None,
+        })
+        .expect("the tick sent rows");
+    assert!(
+        last.iter()
+            .all(|r| r.status != agent_engine::runtime::subagent::SubagentStatus::Running),
+        "the last rows clients get show no worker running: {last:?}"
+    );
+    let after = drain_for(&mut a, Duration::from_millis(1500)).await;
+    assert!(
+        !after
+            .iter()
+            .any(|e| matches!(e.event, SessionEventWire::SubagentRows(_))),
+        "and the tick stopped: {after:?}"
+    );
+    end(&mut a).await;
+}
+
 /// Over the socket: `SessionList` and `Welcome.sessions` carry the worker
 /// block (keys at their default left out), and `Attached.meta` never does
 /// (design Q14: workers come from the listing, not the attach).

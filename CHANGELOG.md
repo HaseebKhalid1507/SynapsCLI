@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **`synaps daemon sessions --json` prints each session as the daemon sent
+  it**, with its keys in alphabetical order. Fields a newer daemon adds are
+  kept, and an older daemon's missing fields are left out, not defaulted.
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel
