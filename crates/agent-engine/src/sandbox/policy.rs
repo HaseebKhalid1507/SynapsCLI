@@ -906,6 +906,13 @@ mod tests {
     class_pin!(class_engine_base_dir, c => c.home.join(".synaps-cli/profiles/x"));
     class_pin!(class_engine_plugins, c => c.home.join(".synaps-cli/plugins/guard"));
     class_pin!(class_engine_sandbox_dir, c => c.home.join(".synaps-cli/sandbox/policy"));
+    // The config file that holds the owner's settings (and so any guard
+    // list), the same file under a profile, the plugin folder itself (a new
+    // plugin folder is a new guard or the loss of one) and one plugin's folder.
+    class_pin!(class_engine_config_file, c => c.home.join(".synaps-cli/config"));
+    class_pin!(class_engine_profile_config, c => c.home.join(".synaps-cli/work/config"));
+    class_pin!(class_engine_plugins_dir_itself, c => c.home.join(".synaps-cli/plugins"));
+    class_pin!(class_engine_plugin_manifest, c => c.home.join(".synaps-cli/plugins/example-guard/.synaps-plugin/plugin.json"));
     class_pin!(class_socket_dir, c => c.dir.path().join("sockets/s.sock"));
     class_pin!(class_runtime_dir, c => c.dir.path().join("xdg-run/askpass"));
     class_pin!(class_credential_store, c => c.home.join(".gnupg/pubring.kbx"));

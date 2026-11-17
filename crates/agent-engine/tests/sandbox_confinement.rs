@@ -236,12 +236,24 @@ fn the_engines_sandbox_dir_and_whole_base_dir_cannot_be_written() {
     assert!(!confined_ok(&c, &t.ws, &write_script(&t.base.join("sandbox/policy.json"))));
     assert!(!confined_ok(&c, &t.ws, &write_script(&t.base.join("config"))));
     assert!(!confined_ok(&c, &t.ws, &write_script(&t.base.join("plugins-new"))));
+    // A guard plugin's own folder: its manifest can't be rewritten and a
+    // sibling folder can't be added (the guard list lives in the config file
+    // above and the folders here).
+    std::fs::create_dir_all(t.base.join("plugins/example-guard/.synaps-plugin")).unwrap();
+    let manifest = t.base.join("plugins/example-guard/.synaps-plugin/plugin.json");
+    std::fs::write(&manifest, "{}\n").unwrap();
+    assert!(!confined_ok(&c, &t.ws, &write_script(&manifest)));
+    assert!(!confined_ok(&c, &t.ws, &format!("mkdir '{}'", t.base.join("plugins/other").display())));
+    assert!(!t.base.join("plugins/other").exists());
+    assert_eq!(std::fs::read_to_string(&manifest).unwrap(), "{}\n");
     assert!(!t.base.join("sandbox/policy.json").exists());
     let sandbox = SessionSandbox::Confined(Arc::clone(&c));
     assert!(sandbox.guard_write(&t.base.join("sandbox/policy.json"), true).is_err());
     assert!(confined_ok(&c, &t.ws, &write_script(&t.ws.join("src/ok.txt"))));
 
-    // Undo: granted whole, the sandbox dir is writable.
+    // Undo: granted whole, the sandbox dir and a guard's manifest are writable.
+    assert!(whole_tree_ok(&t.base.join("plugins"), &t.ws, &write_script(&manifest)));
+    std::fs::write(&manifest, "{}\n").unwrap();
     assert!(whole_tree_ok(&t.base.join("sandbox"), &t.ws, &write_script(&t.base.join("sandbox/policy.json"))));
 }
 
