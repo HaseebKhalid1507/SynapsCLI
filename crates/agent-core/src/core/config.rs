@@ -308,6 +308,61 @@ fn parse_context_management_config_key(
     Ok(())
 }
 
+/// Whether the write sandbox is on (`sandbox.confine`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxConfine {
+    /// No confinement: today's behaviour. The default.
+    #[default]
+    Off,
+    /// Every session's shell commands and file writes are confined, and a
+    /// session that cannot be confined refuses to run commands or write.
+    Enforce,
+}
+
+/// The owner-set write sandbox settings (`sandbox.*` keys). They are read
+/// from the config file by hand-editing only: see [`OWNER_SET_CONFIG_KEYS`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SandboxSettings {
+    /// `sandbox.confine = off | enforce`. A value that is neither counts as
+    /// `enforce` (a typo must not switch confinement off).
+    pub confine: SandboxConfine,
+    /// `sandbox.policy_provider = <plugin name>`: the plugin whose
+    /// `sandbox_policy` hook says which directories a session may write.
+    pub policy_provider: Option<String>,
+}
+
+/// Parse `sandbox.*` keys. Unknown keys return an error (caller warns).
+fn parse_sandbox_config_key(
+    config: &mut SandboxSettings,
+    key: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    match key {
+        "sandbox.confine" => {
+            config.confine = match value.trim() {
+                "off" => SandboxConfine::Off,
+                "enforce" => SandboxConfine::Enforce,
+                _ => {
+                    config.confine = SandboxConfine::Enforce;
+                    return Err("expected off or enforce; confinement stays on");
+                }
+            };
+        }
+        "sandbox.policy_provider" => {
+            let name = value.trim();
+            let valid = !name.is_empty()
+                && name.len() <= 64
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+            config.policy_provider = valid.then(|| name.to_string());
+            if !valid && !name.is_empty() {
+                return Err("expected a plugin name (letters, digits, . _ -)");
+            }
+        }
+        _ => return Err("unknown sandbox key"),
+    }
+    Ok(())
+}
+
 /// Startup / first-turn behaviour (`startup.*` keys). Boot-time only — these
 /// take effect at the next launch, never mid-session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1312,6 +1367,8 @@ pub struct SynapsConfig {
     pub context_management: ContextManagementConfig,
     /// First-turn / cold-start behaviour (`startup.*`).
     pub startup: StartupConfig,
+    /// The owner-set write sandbox (`sandbox.*`).
+    pub sandbox: SandboxSettings,
     /// Daemon lifetime knobs (`daemon.*`); env vars still win.
     pub daemon: DaemonConfig,
     /// Subagent fan-out limits (`subagent.*`).
@@ -1540,6 +1597,7 @@ impl Default for SynapsConfig {
             context_window: None,
             context_management: ContextManagementConfig::default(),
             startup: StartupConfig::default(),
+            sandbox: SandboxSettings::default(),
             daemon: DaemonConfig::default(),
             subagent: SubagentLimits::default(),
             compaction_model: None,
@@ -1667,6 +1725,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "context_management.target_tokens",
     "startup.quick_start",
     "startup.extensions_ready_timeout_secs",
+    "sandbox.confine",
+    "sandbox.policy_provider",
     "daemon.idle_exit_secs",
     "daemon.prompt_abandon_secs",
     "daemon.parked_evict_secs",
@@ -2051,12 +2111,36 @@ fn required_guards_in(base: &std::path::Path, profile: Option<&str>) -> Vec<Stri
     names
 }
 
+/// The `sandbox.*` settings of the active config file, read fresh now and
+/// parsed without any diagnostics output. A missing file reads as the
+/// default (confinement off); a file that exists but can't be read counts as
+/// `enforce`, because a setting that can't be read must not switch
+/// confinement off. Unlike a cached snapshot, this is what a session start
+/// and `synaps sandbox check` use, so a hand edit applies to the next
+/// session.
+pub fn read_sandbox_settings() -> SandboxSettings {
+    match std::fs::read_to_string(resolve_read_path("config")) {
+        Ok(content) => sandbox_settings_from_str(&content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SandboxSettings::default(),
+        Err(_) => SandboxSettings { confine: SandboxConfine::Enforce, policy_provider: None },
+    }
+}
+
+/// [`read_sandbox_settings`] over given file content.
+pub fn sandbox_settings_from_str(content: &str) -> SandboxSettings {
+    let mut config = SynapsConfig::default();
+    apply_config_content_with(&mut config, content, &mut |_diagnostic: String| {});
+    config.sandbox
+}
+
 /// Config keys only the owner sets, by editing the config file. Nothing in
 /// the product writes them: [`write_config_value`] and
 /// [`validate_config_edit`] refuse them, and no `/settings` row exists for
-/// them. A guard list an agent or a settings dialog could rewrite would let
-/// the thing it guards against switch the guard off.
-pub const OWNER_SET_CONFIG_KEYS: &[&str] = &["required_guards"];
+/// them. A guard list or a sandbox setting an agent or a settings dialog
+/// could rewrite would let the thing it guards against or confines switch
+/// the guard or the confinement off.
+pub const OWNER_SET_CONFIG_KEYS: &[&str] =
+    &["required_guards", "sandbox.confine", "sandbox.policy_provider"];
 
 /// Whether `key` is one of [`OWNER_SET_CONFIG_KEYS`] (surrounding spaces and
 /// case ignored).
@@ -2587,6 +2671,12 @@ fn apply_config_content_with(
                 } else if key.starts_with("startup.") {
                     if let Err(reason) =
                         parse_startup_config_key(&mut config.startup, key, val)
+                    {
+                        config.warnings.push(format!("{key} — {reason}"));
+                    }
+                } else if key.starts_with("sandbox.") {
+                    if let Err(reason) =
+                        parse_sandbox_config_key(&mut config.sandbox, key, val)
                     {
                         config.warnings.push(format!("{key} — {reason}"));
                     }
@@ -4905,6 +4995,93 @@ context_window = 200k\n\
         let contents = std::fs::read_to_string(&cfg).unwrap();
         assert!(contents.contains("model = claude-sonnet-4-6"));
         assert!(contents.contains("thinking = low"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_sandbox_keys_parse_and_a_bad_value_never_switches_confinement_off() {
+        assert_eq!(sandbox_settings_from_str(""), SandboxSettings::default());
+        assert_eq!(SandboxSettings::default().confine, SandboxConfine::Off);
+
+        let s = sandbox_settings_from_str("sandbox.confine = enforce\nsandbox.policy_provider = my-guard.v2\n");
+        assert_eq!(s.confine, SandboxConfine::Enforce);
+        assert_eq!(s.policy_provider.as_deref(), Some("my-guard.v2"));
+        assert_eq!(sandbox_settings_from_str("sandbox.confine = off\n").confine, SandboxConfine::Off);
+
+        // A typo, a different case and a stray value all mean "on".
+        for bad in ["of", "Off", "false", "0", "enforced", ""] {
+            let s = sandbox_settings_from_str(&format!("sandbox.confine = {bad}\n"));
+            assert_eq!(s.confine, SandboxConfine::Enforce, "`{bad}` must not switch confinement off");
+        }
+        // A later bad line after a good `enforce` does not undo it either.
+        let s = sandbox_settings_from_str("sandbox.confine = enforce\nsandbox.confine = nope\n");
+        assert_eq!(s.confine, SandboxConfine::Enforce);
+
+        // A provider name is a plugin name: nothing path-like or oversized.
+        let too_long = "p".repeat(65);
+        for bad in ["../evil", "a b", "x/y", too_long.as_str()] {
+            let s = sandbox_settings_from_str(&format!("sandbox.policy_provider = {bad}\n"));
+            assert_eq!(s.policy_provider, None, "`{bad}` is not a plugin name");
+        }
+    }
+
+    #[test]
+    fn the_sandbox_keys_are_owner_set_only() {
+        for key in OWNER_SET_CONFIG_KEYS {
+            assert!(is_owner_set_config_key(key));
+            assert!(is_owner_set_config_key(&format!("  {}  ", key.to_uppercase())), "case and spaces are ignored");
+            assert!(KNOWN_CONFIG_KEYS.contains(key), "{key} must stay a known key so a hand edit is not warned about");
+        }
+        assert!(!is_owner_set_config_key("model"));
+        assert_eq!(OWNER_SET_CONFIG_KEYS, &["required_guards", "sandbox.confine", "sandbox.policy_provider"]);
+    }
+
+    #[test]
+    #[serial]
+    fn the_product_never_writes_a_sandbox_key() {
+        let home = make_test_home("sandbox-owner");
+        let cfg = home.join(".synaps-cli/config");
+        let before = "sandbox.confine = enforce\nmodel = claude-opus-4-6\n";
+        std::fs::write(&cfg, before).unwrap();
+
+        with_home(&home, || {
+            for key in OWNER_SET_CONFIG_KEYS {
+                for spelled in [key.to_string(), format!(" {} ", key.to_uppercase())] {
+                    let err = write_config_value(&spelled, "off").unwrap_err();
+                    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{spelled}");
+                    assert!(validate_config_edit(&spelled, "off").is_err(), "{spelled}");
+                }
+            }
+            // The refusal is specific to the sandbox keys.
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(after.contains("sandbox.confine = enforce"), "the switch is untouched: {after}");
+        assert!(!after.contains("sandbox.confine = off"));
+        assert!(after.contains("model = claude-sonnet-4-6"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn a_config_that_cannot_be_read_counts_as_enforce_and_a_missing_one_as_off() {
+        let home = make_test_home("sandbox-read");
+        let cfg = home.join(".synaps-cli/config");
+
+        with_home(&home, || {
+            assert_eq!(read_sandbox_settings().confine, SandboxConfine::Off, "no file: the default");
+
+            std::fs::write(&cfg, "sandbox.confine = enforce\nsandbox.policy_provider = g\n").unwrap();
+            let s = read_sandbox_settings();
+            assert_eq!((s.confine, s.policy_provider.as_deref()), (SandboxConfine::Enforce, Some("g")));
+
+            // A path that exists but can't be read as a file: the switch
+            // can't be read, so confinement stays on.
+            std::fs::remove_file(&cfg).unwrap();
+            std::fs::create_dir(&cfg).unwrap();
+            assert_eq!(read_sandbox_settings().confine, SandboxConfine::Enforce);
+        });
         let _ = std::fs::remove_dir_all(&home);
     }
 
