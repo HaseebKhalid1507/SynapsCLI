@@ -21,6 +21,20 @@ The `tool` filter is supported only for `before_tool_call` and
 `after_tool_call`. It matches either the API-safe tool name or the runtime tool
 name.
 
+A `before_tool_call` hook may also say what a call does when its extension
+gives no answer (see [Required guards](#required-guards)):
+
+```json
+{ "hook": "before_tool_call", "on_failure": "block" }
+```
+
+`on_failure` is `"continue"` (the default, and what every hook did before the
+field existed: a crashed, timed-out or malformed handler is skipped and the call
+proceeds) or `"block"` (the call is refused, naming the extension and the
+cause). It is accepted only on `before_tool_call`; any other hook with
+`on_failure: "block"`, or a value other than those two, fails manifest
+validation.
+
 A filter matches one tool name exactly, with one exception: a
 `before_tool_call` filter for `edit` or `write` also matches `multi_edit`,
 which changes files the same way, so a guard written for those tools still
@@ -113,6 +127,54 @@ id, and `data` includes `old_session_id`, `new_session_id`, `message_count`, and
 registration order. Put high-priority security policy extensions earlier in plugin
 load order, and avoid granting trust to plugins that can modify tool inputs unless
 you accept this ordering behavior.
+
+## Required guards
+
+A guard is an extension whose `before_tool_call` hook blocks calls it does not
+like. Left alone, a guard that is missing, switched off, crashed or silent
+leaves every call unguarded: the chain skips a handler that is not there.
+`required_guards` in the config file turns that around:
+
+```
+required_guards = example-guard, other-guard
+```
+
+The value is a comma list of plugin ids. Only the owner sets it, by editing
+the config file: nothing in the product writes it, and it is not a `/settings`
+row, because a list that an agent or a dialog could rewrite would let the
+thing it guards against switch the guard off. Absent or empty, nothing
+changes: no gate, as before the key existed. The last `required_guards` line
+wins. The list is read when the engine starts (a daemon picks up a change at
+its next reload or restart) and only grows within a running process.
+
+With guards required:
+
+- **A guard that is not loaded refuses every tool call.** The refusal names
+  the guard and the cause: no extension host in this process, extensions
+  started off, discovery not finished, no folder of that name, a
+  `disabled_plugins` entry, a folder whose name discovery skips
+  (`example-guard.disabled`, `.bak`), a folder under a project's
+  `.synaps/plugins/` that would override the base one (a required guard loads
+  only from the base directory's `plugins/`), a bad manifest, a failed start,
+  a manifest that subscribes no `before_tool_call`, an unload, or an exited
+  process. A required guard always starts when extensions load, even where
+  other extensions start on first use, so there is always a process to check.
+- **The check is made twice,** before the handler chain and again after it,
+  so a guard unloaded or reloaded while a call was in the chain does not let
+  that call through on a stale answer.
+- **A guard that is loaded but gives no usable answer blocks the call.** No
+  answer within the 5 s hook timeout, a JSON-RPC error, a failed call, or an
+  answer that is not a result `before_tool_call` accepts: for a required
+  guard the call is refused, naming the guard and the cause, whatever the
+  manifest's `on_failure` says. A guard that is not required keeps its
+  manifest's `on_failure` (default `"continue"`).
+- **Subagent workers are covered** (see [Subagent workers](#subagent-workers)).
+- **Restoring the guard clears it.** Put the folder back, fix the manifest or
+  remove the `disabled_plugins` entry, then `synaps daemon reload-extension
+  <id>` or reload the daemon.
+
+`synaps daemon status` shows whether the daemon requires any guard and, for
+each, whether it is loaded (see [daemon-mode.md](../daemon-mode.md)).
 
 ## Notify-only hooks
 
@@ -457,4 +519,31 @@ notify-only hooks.
   passes through; a reloaded or newly loaded extension applies to running
   workers from their next tool call.
 - **Opt-out:** `subagent_transform_hooks = off` (default on; a /settings
-  row) runs no hooks at all for workers, as before.
+  row) runs no hooks at all for workers, as before, unless a guard is
+  required (below).
+
+### With required guards
+
+While the config's [`required_guards`](#required-guards) is not empty, a
+worker's `before_tool_call` is no longer skipped: it runs the chain of the chat
+that started the worker.
+
+- The caller's `before_tool_call` handlers run for each of the worker's tool
+  calls, on the caller's runtime, so a guard's process is started and
+  restarted there and not on the worker's short-lived one. The result,
+  including a `block`, is the caller's.
+- The event carries the caller's `session_id` (the worker has none of its
+  own) and a `subagent_id` (`sa_N`, the worker's id as its caller sees it);
+  `subagent_id` is absent on events from the main session. A guard can tell a
+  worker's call from its caller's, and key its state on either.
+- A `confirm` is answered the way the caller's own would be: its prompt, its
+  auto-approve setting, and its "Allow all" latch.
+- The required-guard gate applies on the worker's bus too, so a guard that is
+  not loaded refuses the worker's calls as it refuses the main session's.
+- `subagent_transform_hooks = off` does not get a worker out of this: it
+  turns off the worker's output transforms, never its guards.
+- A worker's own subagents run the same chain: the route is to the original
+  caller, not to the (empty) hook list of an intermediate worker.
+- Output transforms (`after_tool_call`) are unchanged.
+
+With nothing required, workers behave as described above.
