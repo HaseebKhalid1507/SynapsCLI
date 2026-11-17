@@ -87,15 +87,19 @@ All notable changes to this project will be documented in this file.
   [docs/daemon-mode.md](docs/daemon-mode.md#saved-sessions-catalog_page)
 
 - **Required guards.** `required_guards` in the config file (a comma list of
-  plugin ids, owner-set: no `/settings` row, nothing in the product writes it)
-  names the guard extensions an engine must have loaded. While one is not
+  plugin ids, owner-set: no `/settings` row, no product path writes it)
+  names the guard extensions an engine must have loaded (with a profile
+  active, the default file's list and the profile's together). While one is not
   loaded, for any cause (no extension host, extensions off, no folder,
   `disabled_plugins`, a skip-renamed folder, a project plugin that would
   shadow it, a bad manifest, a failed start, no `before_tool_call` hook, an
   unload, an exited process), every tool call is refused, naming the guard and
   the cause, before and again after the hook chain. A loaded guard that gives
   no usable answer (timeout, error, a result it may not give) blocks the call
-  too. Empty or absent: no change from before.
+  too. In a `before_tool_call` chain the required guards run last, so a later
+  extension's `modify` cannot slip an input past a guard. A daemon logs a
+  warning at every start when none is required. Empty or absent: no change
+  from before.
 - **`on_failure` on a `before_tool_call` hook** in an extension's manifest:
   `"continue"` (default, unchanged) or `"block"`, what the call does when
   the extension gives no answer.
@@ -243,6 +247,10 @@ All notable changes to this project will be documented in this file.
   limit that still holds meets the ping with a 429, at most one per
   keep-warm period, which ends keep-warm and bills no tokens. Under `auto` a
   cooling account still stops the ping (the next request leaves it).
+- **Config writes are one line.** The config writer refuses a key or value
+  with a line break and a key with an `=`, whoever calls it (only the settings
+  dialog checked before): a value such as `x\nrequired_guards =` wrote a second
+  line that cleared the guard list. A `=` in a value is still part of the value.
 - **Subagent workers and guards.** While a guard is required, a worker's
   `before_tool_call` runs the chain of the chat that started it (with that
   chat's `session_id` and a new `subagent_id` on the event), and the required

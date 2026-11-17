@@ -194,6 +194,13 @@ or mistyped shows `no`, never an empty-looking success. A listed guard shows
 with the cause (the same cause a refused tool call names), and the daemon is
 refusing every tool call until the guard is back.
 
+A daemon that starts with `required_guards` absent or empty (a reload's new
+image included) also logs a warning, so the log of a daemon nobody asks says it
+too: `daemon: no required guards configured (required_guards is absent or empty
+in the config); no tool call waits on a guard being loaded`. With a profile
+active the list is the default config file's and the profile's together, so a
+profile's own file can add a guard and never drops the default file's.
+
 `synaps daemon status --json` adds `required_guards_configured` (`true`/`false`,
 `null` when the daemon did not answer) and, when the daemon reports rows,
 `required_guards`: `[{"name", "loaded", "cause"?}]`. The `Pong` carries both

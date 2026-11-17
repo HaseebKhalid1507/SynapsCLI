@@ -139,13 +139,24 @@ leaves every call unguarded: the chain skips a handler that is not there.
 required_guards = example-guard, other-guard
 ```
 
-The value is a comma list of plugin ids. Only the owner sets it, by editing
-the config file: nothing in the product writes it, and it is not a `/settings`
-row, because a list that an agent or a dialog could rewrite would let the
-thing it guards against switch the guard off. Absent or empty, nothing
-changes: no gate, as before the key existed. The last `required_guards` line
-wins. The list is read when the engine starts (a daemon picks up a change at
-its next reload or restart) and only grows within a running process.
+The value is a comma list of plugin ids. It is the owner's to set, by editing
+the config file: no product path writes it (the config writer and the
+`/settings` dialog both refuse the key) and it is not a `/settings` row,
+because a list the product could rewrite would let the thing it guards
+against switch the guard off. That is all the engine does, though: it does not
+write-protect the config file, the guard's folder or `synaps daemon reload`,
+so until tool calls are confined the guard must refuse those itself (see
+[Not covered](#not-covered)). Absent or empty, nothing changes: no gate, as
+before the key existed, and a daemon says so in its log at every start
+(`daemon: no required guards configured ...`, a warning) as well as in
+`synaps daemon status`. The last `required_guards` line in a file wins. With a
+profile active, the list is the default config file's and the profile's
+together (the default file's names first, once each): a profile's config can
+add a guard and never removes one the default file names, and the first
+setting the product writes under a profile, which creates that profile's file
+with that one key, does not drop the default file's list. The list is read
+when the engine starts (a daemon picks up a change at its next reload or
+restart) and only grows within a running process.
 
 With guards required:
 
@@ -168,6 +179,19 @@ With guards required:
   guard the call is refused, naming the guard and the cause, whatever the
   manifest's `on_failure` says. A guard that is not required keeps its
   manifest's `on_failure` (default `"continue"`).
+- **Guards run last.** In a `before_tool_call` chain the required guards run
+  after every other extension's hook (in registration order among
+  themselves; everything else keeps its order), so a `modify` from another
+  extension reaches a guard before it answers, and the guard vets the input
+  the tool would run. The other hooks are asked first, so they see a call
+  that a guard then refuses. A required guard's own `modify` after another
+  required guard has answered blocks the call: that guard would never see the
+  input it ran.
+- **A guard subscribes with no filter.** A required guard's
+  `before_tool_call` subscription should have no `tool` or `match` filter.
+  The load check counts any `before_tool_call` subscription as loaded, a
+  filtered one included, and a call the filter does not match never reaches
+  the guard, so a filtered guard is loaded and silent for every other tool.
 - **Subagent workers are covered** (see [Subagent workers](#subagent-workers)).
 - **Restoring the guard clears it.** Put the folder back, fix the manifest or
   remove the `disabled_plugins` entry, then `synaps daemon reload-extension
@@ -175,6 +199,36 @@ With guards required:
 
 `synaps daemon status` shows whether the daemon requires any guard and, for
 each, whether it is loaded (see [daemon-mode.md](../daemon-mode.md)).
+
+### Not covered
+
+What required guards do not do:
+
+- unconfined, an agent can edit or remove a guard's files; only confining its tool calls (a sandbox) makes them unwritable.
+  The same goes for the config file and
+  for `synaps daemon reload`: the engine write-protects none of them, so a
+  guard has to refuse a call that edits its own folder or the config file, or
+  that reloads the daemon, itself.
+- An agent rewriting a guard into an allow-all guard that still loads.
+- A subagent started where the calling chat's scope is not set (the stream
+  sets it around each tool call it runs; one test pins that scope, none pins
+  that every stream lane sets it) falls back to the same chat's hook bus with
+  auto-approve off: stricter, and still guarded.
+- The check made before the chain has no timeout. A guard whose state cannot
+  be read makes the call hang; it never lets it through.
+- `server.auto_approve_confirms` is the owner's setting and predates required
+  guards. When it is on, every `confirm` any extension answers is approved
+  unasked, a guard's included.
+- Commands the owner types (slash commands and shell commands) are not tool
+  calls and do not pass through `before_tool_call`; nor do plugin slash
+  commands that an extension tool backs.
+- Windows: the daemon reload there starts a new process (see the Windows
+  section of [daemon-mode.md](../daemon-mode.md)); this was built and tested
+  on Linux only.
+- On a case-insensitive file system a folder that differs from a guard's id
+  only in case is not read as that guard's folder when a refusal names its
+  cause, so the cause text may say the guard's folder is absent. The call is
+  refused all the same.
 
 ## Notify-only hooks
 
