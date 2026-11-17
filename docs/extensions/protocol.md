@@ -326,6 +326,13 @@ Called when a registered hook fires.
 
 You must respond with the same `id` that was sent in the request.
 
+One kind is a question rather than an event: `sandbox_policy` (permission
+`sandbox.policy`). Its `params` are the `HookEvent` with `kind` set to
+`"sandbox_policy"` plus `workspace` and `parent_session_id`, and its `result`
+is the answer itself (`{"write": [...], "read": [...]}` or
+`{"refuse": "..."}`), which the host reads strictly; anything else refuses
+the session. See [hooks.md](hooks.md#sandbox_policy).
+
 ---
 
 ### `shutdown`
@@ -1083,6 +1090,7 @@ Relative command paths and local argument paths are resolved from the plugin dir
 | `tools.intercept`    | Allows subscription to `before_tool_call` and `after_tool_call`.                           |
 | `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`, and to `on_context_archived` (its path leads to conversation content). |
 | `session.lifecycle`  | Enables receipt of `on_session_start`, `on_session_end` and `on_memory_forgotten` events; also the second key for the advisory `context_phase` result on `on_message_complete`. |
+| `sandbox.policy`    | Declare the `sandbox_policy` hook, a request/answer hook asked once per confined session of the plugin the owner names in `sandbox.policy_provider`. Its `hook.handle` result is the answer (`{"write": [...], "read": [...]}` or `{"refuse": "..."}`), not a `HookResult`. See [hooks.md](hooks.md#sandbox_policy). |
 | `tools.register`    | Register extension-provided tools during initialization.                                    |
 | `providers.register`| Register extension-provided provider metadata during initialization. Chat routing is not wired yet. |
 

@@ -102,6 +102,7 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 | `on_session_end`    | A session is being torn down                             | ❌          | ❌            | ❌           |
 | `on_context_archived` | A context window has been sealed into an archive file (notify-only) | ❌  | ❌            | ❌           |
 | `on_memory_forgotten` | `memory_forget` has forgotten an archive or a note (notify-only) | ❌     | ❌            | ❌           |
+| `sandbox_policy`    | A session is starting under write confinement; the answer is the policy (request/answer, Linux) | ❌ | ❌ | ❌ |
 
 **Notes:**
 
@@ -168,6 +169,7 @@ Extensions must declare the permissions they require. SynapsCLI rejects unknown 
 | `tools.transform_output` | Rewrite tool output via `after_tool_call` → `replace` (required in addition to `tools.intercept`) |
 | `privacy.llm_content`| Access to message content for `before_message`                                 |
 | `session.lifecycle`  | Receipt of `on_session_start`, `on_session_end` and `on_memory_forgotten` events |
+| `sandbox.policy`    | Declare the `sandbox_policy` hook (the owner must also name the plugin in `sandbox.policy_provider`) |
 | `tools.register`    | Register extension-provided tools during initialization                         |
 | `providers.register`| Register extension-provided provider metadata during initialization; chat routing is not wired yet |
 

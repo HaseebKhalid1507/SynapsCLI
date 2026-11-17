@@ -212,7 +212,8 @@ Each extension is its own crash-isolated process, with a permissions manifest th
 - **Credentials live in a broker.** Agents get short-lived, scoped tokens, so a compromised agent can't leak what it never held. Thin clients strip secrets from your shell's environment before connecting.
 - **Extensions are fenced.** Each runs as its own process under a permissions manifest, and a tool-call confirm names the extension that asked ([details](docs/confirm-prompts.md)).
 - **The daemon is yours alone.** Its socket (a named pipe on Windows) is owner-only and refuses other users.
-- **Not a sandbox.** Tools run as you. Building with `--no-default-features` compiles out `bash` and the `shell_*` tools, but an agent can still start processes indirectly: by editing shell rc files or MCP config, or through extensions. Use a container or VM for untrusted work.
+- **Write confinement is opt-in, Linux only.** Set `sandbox.confine = enforce` by hand in the config file and a session's shell commands and file-writing tools can write only to its workspace, a small baseline and what a policy plugin adds; the engine's own data, credential stores and shell start-up files stay protected. A session that can't be confined is refused, never run loose. Reads, the network and macOS are not confined ([details](docs/sandbox.md)).
+- **Otherwise not a sandbox.** Tools run as you. Building with `--no-default-features` compiles out `bash` and the `shell_*` tools, but an agent can still start processes indirectly: by editing shell rc files or MCP config, or through extensions. Use a container or VM for untrusted work.
 
 Found a vulnerability? Report it privately: [SECURITY.md](SECURITY.md).
 

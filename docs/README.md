@@ -20,6 +20,7 @@ Durable references live here at the top level. Working history is filed by kind 
 | [subagent-watch.md](subagent-watch.md) | Watching and steering a subagent in its own TUI view. |
 | [subagent-thinking.md](subagent-thinking.md) | Worker thinking effort: the per-call `thinking` argument and the `subagent_thinking` default. |
 | [multi-edit.md](multi-edit.md) | The `multi_edit` tool: anchored edits across files in one call, all or nothing. |
+| [sandbox.md](sandbox.md) | Opt-in write confinement for sessions (Linux): what a session may write, the protected set, the policy plugin hook, refusals, `synaps sandbox check`, limits. |
 | [sudo-askpass.md](sudo-askpass.md) | How the bash tool asks for a sudo password (Linux). |
 | [confirm-prompts.md](confirm-prompts.md) | Extension tool-call Confirm prompts, "Allow all", `/confirms`. |
 | [providers/](providers/) | Provider guides: Meta Muse, multi-account broker and usage, quota keeper, Codex. |
