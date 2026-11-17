@@ -97,7 +97,7 @@ async fn a_turn_submitted_before_the_session_start_hook_waits_for_it() {
     let (mut t, _snap) = LocalTransport::attach(handle, ClientMeta::new(ClientKind::Test))
         .await
         .expect("attach");
-    t.send(SessionCommand::Submit { text: "first".into(), attachments: vec![] })
+    t.send(SessionCommand::Submit { text: "first".into(), attachments: vec![], origin: None })
         .await
         .unwrap();
     loop {

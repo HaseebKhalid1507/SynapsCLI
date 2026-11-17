@@ -280,11 +280,13 @@ fn text_command(text: &str, streaming: bool) -> Result<SessionCommand, &str> {
     Ok(if streaming {
         SessionCommand::Steer {
             text: text.to_string(),
+            origin: None,
         }
     } else {
         SessionCommand::Submit {
             text: text.to_string(),
             attachments: vec![],
+            origin: None,
         }
     })
 }
@@ -613,8 +615,8 @@ mod tests {
     fn unknown_slash_lines_are_never_sent() {
         for streaming in [false, true] {
             let sent = |line: &str| match text_command(line, streaming) {
-                Ok(SessionCommand::Steer { text }) if streaming => text,
-                Ok(SessionCommand::Submit { text, attachments })
+                Ok(SessionCommand::Steer { text, .. }) if streaming => text,
+                Ok(SessionCommand::Submit { text, attachments, .. })
                     if !streaming && attachments.is_empty() =>
                 {
                     text

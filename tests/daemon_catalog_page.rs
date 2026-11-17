@@ -152,7 +152,7 @@ async fn next_event(t: &mut SocketTransport) -> SessionEventWire {
 }
 
 async fn run_turn(t: &mut SocketTransport, text: &str) {
-    t.send_from_self(SessionCommand::Submit { text: text.into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(SessionCommand::Submit { text: text.into(), attachments: vec![], origin: None }).await.unwrap();
     loop {
         match next_event(t).await {
             SessionEventWire::Idle => return,

@@ -53,6 +53,9 @@ pub mod telemetry;
 mod read_dedupe;
 pub mod tool_spill;
 pub mod trace;
+pub mod turn_origin;
+#[cfg(test)]
+mod turn_origin_entry_tests;
 pub mod worker_context;
 pub(crate) mod transport;
 mod types;
@@ -3252,6 +3255,29 @@ impl Runtime {
         messages: Vec<crate::SharedMessage>,
         cancel: CancellationToken,
         steering_rx: Option<mpsc::UnboundedReceiver<String>>,
+        secret_prompt: Option<crate::tools::SecretPromptHandle>,
+        auto_approve_confirms: bool,
+        completion: TurnCompletion,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+        self.run_stream_steered(
+            messages,
+            cancel,
+            steering_rx.map(turn_origin::SteeringRx::Plain),
+            secret_prompt,
+            auto_approve_confirms,
+            completion,
+        )
+        .await
+    }
+
+    /// [`Runtime::run_stream_tracked`] with the steering channel as the
+    /// stream reads it: plain text, or the session actor's typed steers
+    /// (the only ones that can carry a turn origin).
+    pub(crate) async fn run_stream_steered(
+        &self,
+        messages: Vec<crate::SharedMessage>,
+        cancel: CancellationToken,
+        steering_rx: Option<turn_origin::SteeringRx>,
         secret_prompt: Option<crate::tools::SecretPromptHandle>,
         auto_approve_confirms: bool,
         completion: TurnCompletion,

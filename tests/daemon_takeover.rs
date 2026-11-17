@@ -64,7 +64,7 @@ async fn mirror_is_read_only_takeover_steals_owner_may_end() {
     // Second mirror: read-only.
     let (mut b, snap_b) = attach(&paths, ClientKind::Attach, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await;
     assert_eq!(snap_b.input_owner, Some(a.client_id()));
-    b.send_from_self(SessionCommand::Submit { text: "from b".into(), attachments: vec![] }).await.unwrap();
+    b.send_from_self(SessionCommand::Submit { text: "from b".into(), attachments: vec![], origin: None }).await.unwrap();
     let r = until(&mut b, |e| matches!(e, SessionEventWire::Refused { .. })).await;
     let SessionEventWire::Refused { client, command, reason } = r else { unreachable!() };
     assert_eq!(client, b.client_id());
@@ -74,7 +74,7 @@ async fn mirror_is_read_only_takeover_steals_owner_may_end() {
     // Observer: never owns, refused too.
     let (mut o, snap_o) = attach(&paths, ClientKind::Attach, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Observe }).await;
     assert_eq!(snap_o.input_owner, Some(a.client_id()));
-    o.send_from_self(SessionCommand::Steer { text: "x".into() }).await.unwrap();
+    o.send_from_self(SessionCommand::Steer { text: "x".into(), origin: None }).await.unwrap();
     until(&mut o, |e| matches!(e, SessionEventWire::Refused { .. })).await;
 
     // Takeover: c steals; a is told; a's next Submit is refused; c's works.
@@ -86,9 +86,9 @@ async fn mirror_is_read_only_takeover_steals_owner_may_end() {
     assert_eq!(to, Some(c.client_id()));
     assert_eq!(reason, OwnerChangeReason::Takeover);
     assert_eq!(a.input_owner(), Some(c.client_id()));
-    a.send_from_self(SessionCommand::Submit { text: "from a".into(), attachments: vec![] }).await.unwrap();
+    a.send_from_self(SessionCommand::Submit { text: "from a".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut a, |e| matches!(e, SessionEventWire::Refused { .. })).await;
-    c.send_from_self(SessionCommand::Submit { text: "from c".into(), attachments: vec![] }).await.unwrap();
+    c.send_from_self(SessionCommand::Submit { text: "from c".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut c, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
     until(&mut c, |e| matches!(e, SessionEventWire::Idle)).await;
 
@@ -176,7 +176,7 @@ async fn clients_are_named_in_the_roster_listing_and_refusals() {
     assert_eq!(a.roster().label(b.client_id()), format!("Terminal-2 (#{})", b.client_id().0));
 
     // A non-owner's refusal names the owner (and keeps its id).
-    b.send_from_self(SessionCommand::Submit { text: "from b".into(), attachments: vec![] }).await.unwrap();
+    b.send_from_self(SessionCommand::Submit { text: "from b".into(), attachments: vec![], origin: None }).await.unwrap();
     let r = until(&mut b, |e| matches!(e, SessionEventWire::Refused { .. })).await;
     let SessionEventWire::Refused { reason, .. } = r else { unreachable!() };
     assert_eq!(reason, format!("input owned by terminal (#{})", a.client_id().0));
@@ -236,7 +236,7 @@ async fn shared_input_over_the_wire_and_older_clients_are_presented_owners() {
     assert_eq!(snap_b.input_owner, Some(a_id), "a current client sees the real active client");
     assert_eq!(snap_b.input_owned_elsewhere(b.client_id()), None);
 
-    b.send_from_self(SessionCommand::Submit { text: "from b".into(), attachments: vec![] }).await.unwrap();
+    b.send_from_self(SessionCommand::Submit { text: "from b".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut b, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
     until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
     let b_id = b.client_id();
@@ -251,7 +251,7 @@ async fn shared_input_over_the_wire_and_older_clients_are_presented_owners() {
     let old_id = old.client_id();
     let mut owner_changes = 0;
     owner_changes += owner_changes_through_a_turn(&mut old, old_id).await;
-    old.send_from_self(SessionCommand::Submit { text: "from old".into(), attachments: vec![] }).await.unwrap();
+    old.send_from_self(SessionCommand::Submit { text: "from old".into(), attachments: vec![], origin: None }).await.unwrap();
     owner_changes += owner_changes_through_a_turn(&mut old, old_id).await;
     assert_eq!(owner_changes, 0, "an older client on a shared session never sees an owner change");
     assert_eq!(old.input_owner(), Some(old_id));

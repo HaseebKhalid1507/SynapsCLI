@@ -82,7 +82,7 @@ async fn streamed_then_failed_tool_reports_exit_status_and_notice_to_model() {
     let (mut t, _snap) = LocalTransport::attach(handle, ClientMeta::new(ClientKind::Test))
         .await
         .expect("attach");
-    t.send(SessionCommand::Submit { text: "go".into(), attachments: vec![] })
+    t.send(SessionCommand::Submit { text: "go".into(), attachments: vec![], origin: None })
         .await
         .unwrap();
     loop {

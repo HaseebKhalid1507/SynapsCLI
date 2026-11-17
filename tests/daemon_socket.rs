@@ -92,7 +92,7 @@ async fn socket_roundtrip_real_uds() {
     let joined = next(&mut t).await;
     assert!(matches!(joined.event, SessionEventWire::ClientJoined { .. }));
 
-    t.send(SessionCommand::Submit { text: "hi".into(), attachments: vec![] }).await.unwrap();
+    t.send(SessionCommand::Submit { text: "hi".into(), attachments: vec![], origin: None }).await.unwrap();
     let mut seen = Vec::new();
     loop {
         let e = next(&mut t).await;
@@ -182,7 +182,7 @@ async fn attach_to_session_with_history_over_1mib() {
 
     // echo: user + assistant both carry the text → history ≈ 2 × 700 KiB > 1 MiB
     let big = "z".repeat(700 * 1024);
-    t.send(SessionCommand::Submit { text: big.clone(), attachments: vec![] }).await.unwrap();
+    t.send(SessionCommand::Submit { text: big.clone(), attachments: vec![], origin: None }).await.unwrap();
     let conv;
     let mut saw_history = false;
     loop {
@@ -281,7 +281,7 @@ async fn client_commands_are_whitelisted() {
         }
     }
     // whitelisted command from b reaches the actor and fans out to both
-    b.send(SessionCommand::Steer { text: "ok".into() }).await.unwrap();
+    b.send(SessionCommand::Steer { text: "ok".into(), origin: None }).await.unwrap();
     assert!(matches!(next(&mut a).await.event, SessionEventWire::Steered { .. }));
     assert!(matches!(next(&mut b).await.event, SessionEventWire::Steered { .. }));
     // Detach{own} is allowed and only b leaves
@@ -450,7 +450,7 @@ async fn digest_client_never_receives_message_history() {
     assert!(matches!(next(&mut full).await.event, SessionEventWire::ClientJoined { .. }));
     assert!(matches!(next(&mut digest).await.event, SessionEventWire::ClientJoined { .. }));
 
-    full.send(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    full.send(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
 
     let mut full_saw_history = false;
     loop {
@@ -511,7 +511,7 @@ async fn digest_attach_over_20mib_frame_is_small() {
 
     // echo: user + assistant both carry the text → history ≈ 20 MiB
     let big = "z".repeat(10 * 1024 * 1024);
-    full.send(SessionCommand::Submit { text: big.clone(), attachments: vec![] }).await.unwrap();
+    full.send(SessionCommand::Submit { text: big.clone(), attachments: vec![], origin: None }).await.unwrap();
     loop {
         let e = tokio::time::timeout(Duration::from_secs(30), full.next_event()).await.expect("timely").expect("open");
         if matches!(e.event, SessionEventWire::Conversation(_)) {
@@ -568,7 +568,7 @@ async fn digest_attach_over_20mib_frame_is_small() {
     for _ in 0..2 {
         let _ = next(&mut d1).await; // ClientJoined ×2 (d1, full2)
     }
-    full.send(SessionCommand::Submit { text: "small".into(), attachments: vec![] }).await.unwrap();
+    full.send(SessionCommand::Submit { text: "small".into(), attachments: vec![], origin: None }).await.unwrap();
     let mut saw = Vec::new();
     loop {
         let e = next(&mut d1).await;

@@ -47,6 +47,12 @@ pub const MESSAGE_TURN_KEY: &str = "_synaps_turn";
 /// the snapshot), never inside it, for the same rollback reason.
 pub const MESSAGE_AT_KEY: &str = "_synaps_at";
 
+/// Message key carrying the turn origin (`{"origin": <label>, "part": N}`,
+/// see `agent_engine::runtime::turn_origin`) in memory. Persisted beside the
+/// message like [`MESSAGE_TURN_KEY`] (`o` on journal `msg` records,
+/// `_message_origins` in the snapshot), never inside it.
+pub const MESSAGE_ORIGIN_KEY: &str = "_synaps_origin";
+
 /// The recorded time of a message, if it has one.
 pub fn message_time(message: &serde_json::Value) -> Option<&str> {
     message.get(MESSAGE_AT_KEY)?.as_str()
@@ -397,10 +403,13 @@ enum JournalRecord {
         /// message must leave unchanged. Absent = no amend (snapshot).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_hash: Option<String>,
+        /// [`origins_hash`] of the same prefix; absent = no turn origins.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origins_hash: Option<String>,
     },
-    /// Message at ABSOLUTE history index `i`; `t` is its turn id and `at`
-    /// its recorded time, both kept beside the message (see
-    /// [`MESSAGE_TURN_KEY`], [`MESSAGE_AT_KEY`]).
+    /// Message at ABSOLUTE history index `i`; `t` is its turn id, `at` its
+    /// recorded time and `o` its turn origin, all kept beside the message
+    /// (see [`MESSAGE_TURN_KEY`], [`MESSAGE_AT_KEY`], [`MESSAGE_ORIGIN_KEY`]).
     #[serde(rename = "msg")]
     Msg {
         v: u8,
@@ -425,6 +434,9 @@ enum JournalRecord {
         /// their copy: they lose the amendment, never the history after it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         amend: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Any JSON on read: a malformed origin is dropped, never fatal.
+        o: Option<serde_json::Value>,
     },
     /// Full session metadata (the `Session` object minus `api_messages`).
     #[serde(rename = "meta")]
@@ -441,6 +453,8 @@ enum JournalRecord {
         hooked_hash: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origins_hash: Option<String>,
     },
 }
 
@@ -454,7 +468,7 @@ fn message_turn_id(message: &serde_json::Value) -> Option<&str> {
 use crate::core::extension_context::HOOKED_KEY;
 
 /// In-memory host keys that are persisted beside a message, never inside.
-const SIBLING_KEYS: [&str; 3] = [MESSAGE_TURN_KEY, MESSAGE_AT_KEY, HOOKED_KEY];
+const SIBLING_KEYS: [&str; 4] = [MESSAGE_TURN_KEY, MESSAGE_AT_KEY, HOOKED_KEY, MESSAGE_ORIGIN_KEY];
 
 fn has_sibling_key(object: &serde_json::Map<String, serde_json::Value>) -> bool {
     SIBLING_KEYS.iter().any(|k| object.contains_key(*k))
@@ -594,6 +608,55 @@ fn journal_hooked(h: Option<serde_json::Value>) -> Option<usize> {
         tracing::warn!("malformed journal before_message count dropped");
     }
     n
+}
+
+/// A turn origin is kept only as `{"origin": <string>, "part": <u64>}`;
+/// whether the origin is a label the engine accepts is checked at render.
+fn valid_origin(origin: &serde_json::Value) -> bool {
+    origin.as_object().is_some_and(|o| o.len() == 2)
+        && origin.get("origin").is_some_and(serde_json::Value::is_string)
+        && origin.get("part").is_some_and(serde_json::Value::is_u64)
+}
+
+fn message_origin(message: &serde_json::Value) -> Option<&serde_json::Value> {
+    message.get(MESSAGE_ORIGIN_KEY).filter(|o| valid_origin(o))
+}
+
+/// `(index, origin)` of every originated message, in order.
+fn message_origins(messages: &[SharedMessage]) -> Vec<(usize, &serde_json::Value)> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| message_origin(m).map(|o| (i, o)))
+        .collect()
+}
+
+/// Like [`times_hash`], for turn origins. `None` = no origins.
+fn origins_hash(messages: &[SharedMessage]) -> std::io::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let origins = message_origins(messages);
+    if origins.is_empty() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(&origins).map_err(std::io::Error::other)?;
+    Ok(Some(format!("{:x}", Sha256::digest(&bytes))))
+}
+
+/// Stored messages never carry the origin inline: only the sibling is
+/// trusted, so a key inside a stored message is dropped on load.
+fn strip_inline_origin(message: &mut SharedMessage) {
+    if message.get(MESSAGE_ORIGIN_KEY).is_some() {
+        tracing::warn!("stored message carried an inline turn origin; dropped");
+        if let Some(object) = std::sync::Arc::make_mut(message).as_object_mut() {
+            object.remove(MESSAGE_ORIGIN_KEY);
+        }
+    }
+}
+
+fn set_message_origin(message: &mut serde_json::Value, origin: serde_json::Value) {
+    if let Some(object) = message.as_object_mut() {
+        object.insert(MESSAGE_ORIGIN_KEY.into(), origin);
+    }
 }
 
 fn set_message_time(message: &mut serde_json::Value, ts: String) {
@@ -737,6 +800,43 @@ struct SnapshotBinding {
     /// (`session_catalog::body`). Lenient: [`stored_hooked`].
     #[serde(default, rename = "_hooked")]
     hooked: serde_json::Value,
+    /// Same placement and leniency ([`stored_message_origins`]).
+    #[serde(default, rename = "_message_origins")]
+    message_origins: serde_json::Value,
+}
+
+/// Well-formed `[index, origin]` entries of a snapshot's
+/// `_message_origins`. Anything else is dropped with a warning: the message
+/// then simply has no origin (it renders unwrapped).
+fn stored_message_origins(value: serde_json::Value) -> Vec<(usize, serde_json::Value)> {
+    let entries = match value {
+        serde_json::Value::Null => return Vec::new(),
+        serde_json::Value::Array(entries) => entries,
+        _ => {
+            tracing::warn!("session snapshot has a malformed _message_origins; origins dropped");
+            return Vec::new();
+        }
+    };
+    let total = entries.len();
+    let origins: Vec<(usize, serde_json::Value)> = entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value::<(usize, serde_json::Value)>(entry).ok())
+        .filter(|(_, origin)| valid_origin(origin))
+        .collect();
+    if origins.len() != total {
+        tracing::warn!(dropped = total - origins.len(), "malformed _message_origins entries dropped");
+    }
+    origins
+}
+
+/// A journal `o`: kept only when well-formed.
+fn journal_origin(o: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let origin = o?;
+    if valid_origin(&origin) {
+        return Some(origin);
+    }
+    tracing::warn!("malformed journal turn origin dropped");
+    None
 }
 
 /// Well-formed `[index, RFC 3339 time]` entries of a snapshot's
@@ -869,9 +969,9 @@ fn history_hashes(messages: &[SharedMessage]) -> std::io::Result<(Option<String>
 }
 
 /// Everything persisted about `messages` but their last one (stored bytes,
-/// turn ids, times, `before_message` counts), as one digest; `head` is
-/// `history_hashes(messages).0`. A save may amend the last saved message
-/// only while this is unchanged. `None` for an empty history.
+/// turn ids, times, `before_message` counts, turn origins), as one digest;
+/// `head` is `history_hashes(messages).0`. A save may amend the last saved
+/// message only while this is unchanged. `None` for an empty history.
 fn head_hash(messages: &[SharedMessage], head: Option<String>) -> std::io::Result<Option<String>> {
     use sha2::{Digest, Sha256};
     let Some(head) = head else {
@@ -883,6 +983,7 @@ fn head_hash(messages: &[SharedMessage], head: Option<String>) -> std::io::Resul
         turns_hash(prefix)?,
         times_hash(prefix)?,
         hooked_hash(prefix)?,
+        origins_hash(prefix)?,
     ))
     .map_err(std::io::Error::other)?;
     Ok(Some(format!("{:x}", Sha256::digest(&digest))))
@@ -897,6 +998,7 @@ struct JournalState {
     times_hash: Option<String>,
     hooked_hash: Option<String>,
     head_hash: Option<String>,
+    origins_hash: Option<String>,
     bytes: u64,
 }
 
@@ -931,6 +1033,7 @@ fn read_journal_state(
         times_hash: mut times,
         hooked_hash: mut hooked,
         head_hash: mut head,
+        origins_hash: mut origins,
         ..
     } = open
     else {
@@ -960,6 +1063,7 @@ fn read_journal_state(
                 times_hash: next_times,
                 hooked_hash: next_hooked,
                 head_hash: next_head,
+                origins_hash: next_origins,
             }) if v == JOURNAL_SCHEMA_VERSION
                 && meta.id == id
                 && meta.message_count == Some(durable_len) =>
@@ -969,6 +1073,7 @@ fn read_journal_state(
                 times = next_times;
                 hooked = next_hooked;
                 head = next_head;
+                origins = next_origins;
                 amended = false;
                 hashed_len = durable_len;
             }
@@ -985,6 +1090,7 @@ fn read_journal_state(
         times_hash: times,
         hooked_hash: hooked,
         head_hash: head,
+        origins_hash: origins,
         bytes: raw.len() as u64,
     }))
 }
@@ -1069,7 +1175,8 @@ fn save_journal_mode(
     let unchanged = saved_hash == state.history_hash
         && turns_hash(saved)? == state.turns_hash
         && times_hash(saved)? == state.times_hash
-        && hooked_hash(saved)? == state.hooked_hash;
+        && hooked_hash(saved)? == state.hooked_hash
+        && origins_hash(saved)? == state.origins_hash;
     // The `before_message` hook's edit of a prompt the frontend saved
     // before the turn (#414): only the last saved message changed and it is
     // now a hooked user message. Amend it (O(message)); any other edit
@@ -1100,6 +1207,7 @@ fn save_journal_mode(
             at: message_time(msg).map(serde_json::Value::from),
             h: crate::core::extension_context::hooked(msg).map(serde_json::Value::from),
             amend: i < state.durable_len,
+            o: message_origin(msg).cloned(),
         };
         serde_json::to_writer(&mut buf, &record).map_err(std::io::Error::other)?;
         buf.push(b'\n');
@@ -1113,6 +1221,7 @@ fn save_journal_mode(
         times_hash: times_hash(&session.api_messages)?,
         hooked_hash: hooked_hash(&session.api_messages)?,
         head_hash: head_hash(&session.api_messages, head)?,
+        origins_hash: origins_hash(&session.api_messages)?,
     };
     serde_json::to_writer(&mut buf, &meta).map_err(std::io::Error::other)?;
     buf.push(b'\n');
@@ -1205,6 +1314,9 @@ struct SessionSnapshotRef<'a> {
     /// Storage-only too: each message's recorded time, beside it.
     #[serde(rename = "_message_times", skip_serializing_if = "Vec::is_empty")]
     message_times: Vec<(usize, &'a str)>,
+    /// Storage-only too: each message's turn origin, beside it.
+    #[serde(rename = "_message_origins", skip_serializing_if = "Vec::is_empty")]
+    message_origins: Vec<(usize, &'a serde_json::Value)>,
 }
 
 impl<'a> SessionSnapshotRef<'a> {
@@ -1238,6 +1350,7 @@ impl<'a> SessionSnapshotRef<'a> {
             compaction: &s.compaction,
             turn_ids: turn_ids(&s.api_messages),
             message_times: message_times(&s.api_messages),
+            message_origins: message_origins(&s.api_messages),
         }
     }
 }
@@ -1293,6 +1406,7 @@ fn publish_snapshot(
             times_hash: times_hash(&session.api_messages)?,
             hooked_hash: hooked_hash(&session.api_messages)?,
             head_hash: head_hash(&session.api_messages, head)?,
+            origins_hash: origins_hash(&session.api_messages)?,
         };
         serde_json::to_writer(&mut journal, &open).map_err(std::io::Error::other)?;
         journal.push(b'\n');
@@ -1365,6 +1479,12 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
         serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
     let mut session: Session = serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
     session.clamp_keepwarm_to_totals();
+    session.api_messages.iter_mut().for_each(strip_inline_origin);
+    for (i, origin) in stored_message_origins(binding.message_origins) {
+        if let Some(message) = session.api_messages.get_mut(i) {
+            set_message_origin(std::sync::Arc::make_mut(message), origin);
+        }
+    }
     for (i, id) in stored_turn_ids(binding.turn_ids) {
         if let Some(message) = session.api_messages.get_mut(i) {
             set_turn_id(std::sync::Arc::make_mut(message), id);
@@ -1409,12 +1529,21 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
                 at,
                 h,
                 amend: true,
+                o,
                 ..
             }) => {
                 // Only the last message so far can be amended; anything
                 // else is not a journal this build wrote: stop there.
                 if i.checked_add(1) != Some(session.api_messages.len()) {
                     break;
+                }
+                if let Some(object) = m.as_object_mut() {
+                    if object.remove(MESSAGE_ORIGIN_KEY).is_some() {
+                        tracing::warn!("journal message carried an inline turn origin; dropped");
+                    }
+                }
+                if let Some(origin) = journal_origin(o) {
+                    set_message_origin(&mut m, origin);
                 }
                 if let Some(serde_json::Value::String(id)) = t {
                     set_turn_id(&mut m, id);
@@ -1427,8 +1556,24 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
                 }
                 session.api_messages[i] = std::sync::Arc::new(m);
             }
-            Ok(JournalRecord::Msg { i, mut m, t, at, h, .. }) => {
+            Ok(JournalRecord::Msg {
+                i,
+                mut m,
+                t,
+                at,
+                h,
+                o,
+                ..
+            }) => {
                 if i == session.api_messages.len() {
+                    if let Some(object) = m.as_object_mut() {
+                        if object.remove(MESSAGE_ORIGIN_KEY).is_some() {
+                            tracing::warn!("journal message carried an inline turn origin; dropped");
+                        }
+                    }
+                    if let Some(origin) = journal_origin(o) {
+                        set_message_origin(&mut m, origin);
+                    }
                     if let Some(serde_json::Value::String(id)) = t {
                         set_turn_id(&mut m, id);
                     }
@@ -1855,6 +2000,7 @@ mod tests {
             times_hash: None,
             hooked_hash: None,
             head_hash: None,
+            origins_hash: None,
         }];
         for i in 1..5 {
             push_message(&mut s, "legacy delta");
@@ -1866,6 +2012,7 @@ mod tests {
                 at: None,
                 h: None,
                 amend: false,
+                o: None,
             });
         }
         s.title = "legacy title".into();
@@ -1878,6 +2025,7 @@ mod tests {
             times_hash: None,
             hooked_hash: None,
             head_hash: None,
+            origins_hash: None,
         });
         let mut bytes = Vec::new();
         for record in legacy {
@@ -3098,5 +3246,246 @@ mod snapshot_only_fields {
             s.api_messages[0]["content"],
             "without the count every block is the user's"
         );
+    }
+
+    // ── turn origins stay out of persisted message objects ────────────────
+
+    fn origin_mark(part: u64) -> serde_json::Value {
+        serde_json::json!({"origin": "test-app", "part": part})
+    }
+
+    fn originated(text: &str) -> SharedMessage {
+        std::sync::Arc::new(serde_json::json!({
+            "role": "user", "content": text, MESSAGE_ORIGIN_KEY: origin_mark(0)
+        }))
+    }
+
+    fn origins(s: &Session) -> Vec<Option<serde_json::Value>> {
+        s.api_messages.iter().map(|m| m.get(MESSAGE_ORIGIN_KEY).cloned()).collect()
+    }
+
+    #[test]
+    fn turn_origins_round_trip_beside_messages_not_inside_them() {
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            let mut s = Session::new("m", "medium", None);
+            s.api_messages.push(originated("first"));
+            push_message(&mut s, "reply, no origin");
+            save_session_in_dir(&dir, &s, mode).unwrap();
+            s.api_messages.push(originated("second"));
+            let receipt = save_session_in_dir(&dir, &s, mode).unwrap();
+            let snap = std::fs::read_to_string(dir.join(format!("{}.json", s.id))).unwrap();
+            let journal = std::fs::read_to_string(journal_path(&dir, &s.id)).unwrap_or_default();
+            if mode == SessionPersistence::Journal {
+                assert!(matches!(receipt.mode, SaveMode::Append { messages: 1 }));
+                assert!(journal.contains(r#""o":{"origin":"test-app","part":0}"#), "{journal}");
+            } else {
+                assert!(
+                    snap.contains(r#""_message_origins":[[0,{"origin":"test-app","part":0}],[2,{"origin":"test-app","part":0}]]"#),
+                    "{snap}"
+                );
+            }
+            // The sibling field only: never the key inside a stored message.
+            for raw in [&snap, &journal] {
+                assert!(!raw.contains(MESSAGE_ORIGIN_KEY), "{raw}");
+            }
+            // A reader that knows nothing of origins keeps every message,
+            // sees no host key and agrees on the history hash.
+            let (old, hash) = old_reader_view(&dir, &s.id);
+            assert_eq!(old.len(), 3, "{mode:?}");
+            for m in &old {
+                assert_no_host_keys(m, &format!("{mode:?}"));
+            }
+            if mode == SessionPersistence::Journal {
+                let old: Vec<SharedMessage> = old.into_iter().map(std::sync::Arc::new).collect();
+                assert_eq!(hash, Some(history_hash(&old).unwrap()), "{mode:?}");
+            }
+            let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(&loaded.api_messages).unwrap(),
+                serde_json::to_value(&s.api_messages).unwrap(),
+                "{mode:?}"
+            );
+            assert_eq!(
+                origins(&loaded),
+                vec![Some(origin_mark(0)), None, Some(origin_mark(0))],
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marking_an_already_saved_message_forces_a_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = with_messages(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let mut late = (*s.api_messages[0]).clone();
+        late[MESSAGE_ORIGIN_KEY] = origin_mark(0);
+        s.api_messages[0] = std::sync::Arc::new(late);
+        let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        assert!(matches!(receipt.mode, SaveMode::FullSnapshot), "{:?}", receipt.mode);
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(origins(&loaded)[0], Some(origin_mark(0)));
+        // Unchanged origins keep appending.
+        let mut s = loaded;
+        s.api_messages.push(originated("next"));
+        let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        assert!(matches!(receipt.mode, SaveMode::Append { messages: 1 }), "{:?}", receipt.mode);
+    }
+
+    #[test]
+    fn a_session_saved_without_origins_writes_nothing_new() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = with_messages(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        push_message(&mut s, "delta");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let snap = std::fs::read_to_string(dir.join(format!("{}.json", s.id))).unwrap();
+        let journal = std::fs::read_to_string(journal_path(&dir, &s.id)).unwrap();
+        assert!(!snap.contains("_message_origins") && !journal.contains("origins_hash"));
+        assert!(!journal.contains(r#""o":"#));
+    }
+
+    #[test]
+    fn malformed_or_inline_origins_are_dropped_not_fatal() {
+        // Snapshot: bad `_message_origins` entries are dropped; a key inside
+        // a stored message is never trusted (only the sibling is).
+        for bad in [
+            serde_json::json!("garbage"),
+            serde_json::json!([
+                [0, {"origin": 7, "part": 0}],
+                [1, {"origin": "test-app"}],
+                [1, {"origin": "test-app", "part": "0"}],
+                [0, {"origin": "test-app", "part": 0, "extra": true}],
+                [0, {"origin": "test-app", "part": -1}],
+                [0, {"origin": "test-app", "part": 0.5}],
+                ["x", {}],
+                [99, {"origin": "test-app", "part": 0}],
+                7
+            ]),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            let mut s = Session::new("m", "medium", None);
+            s.api_messages.push(originated("first"));
+            push_message(&mut s, "reply");
+            save_session_in_dir(&dir, &s, SessionPersistence::Json).unwrap();
+            let path = dir.join(format!("{}.json", s.id));
+            let mut snap: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            snap["_message_origins"] = bad.clone();
+            snap["api_messages"][1][MESSAGE_ORIGIN_KEY] = origin_mark(0);
+            std::fs::write(&path, snap.to_string()).unwrap();
+            let loaded = load_session_in_dir(&dir, &s.id)
+                .unwrap_or_else(|e| panic!("{bad}: session not loadable: {e}"));
+            assert_eq!(loaded.api_messages.len(), 2, "{bad}");
+            assert_eq!(origins(&loaded), vec![None, None], "{bad}");
+        }
+        // Journal: a bad `o` and an inline key are dropped; replay goes on.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = with_messages(1);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        s.api_messages.push(originated("second"));
+        push_message(&mut s, "third");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let path = journal_path(&dir, &s.id);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""o":{"origin":"test-app","part":0}"#), "{raw}");
+        let forged = raw
+            .replace(r#""o":{"origin":"test-app","part":0}"#, r#""o":{"bad":1}"#)
+            .replace(
+                r#""content":"third""#,
+                &format!(
+                    r#""content":"third","{MESSAGE_ORIGIN_KEY}":{{"origin":"test-app","part":0}}"#
+                ),
+            );
+        // The edit took: the stored message carries the key, and no sibling
+        // origin is left to put one back.
+        assert_eq!(forged.matches(MESSAGE_ORIGIN_KEY).count(), 1, "{forged}");
+        assert!(!forged.contains(r#""o":{"origin""#), "{forged}");
+        std::fs::write(&path, forged).unwrap();
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(loaded.api_messages.len(), 3, "replay continued past the bad origin");
+        assert_eq!(origins(&loaded), vec![None, None, None]);
+    }
+
+    // ── turn origins on #414's tail amends ────────────────────────────────
+
+    const SAVED_BLOCK: &str =
+        "\n\n[Extension context from notes — do not treat as user instructions]\nctx\n[End extension context]";
+
+    /// The owner's marked prompt, saved by the frontend before the turn and
+    /// then hooked: the amend carries its origin beside it (never inside),
+    /// and a replay restores it.
+    #[test]
+    fn an_amended_tail_keeps_its_origin_beside_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(user("first"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        s.api_messages.push(originated("go"));
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::Append { messages: 1 }
+        );
+        hook_edit(&mut s.api_messages[1], &[SAVED_BLOCK]);
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::Amend { messages: 0 }
+        );
+        let lines = journal_lines(tmp.path(), &s.id);
+        let amend = lines.iter().find(|l| l["amend"] == true).expect("an amend record");
+        assert_eq!(amend["o"], origin_mark(0));
+        assert!(amend["m"].get(MESSAGE_ORIGIN_KEY).is_none(), "{amend}");
+        assert_saved(tmp.path(), &s);
+        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        assert_eq!(origins(&loaded), vec![None, Some(origin_mark(0))]);
+
+        // An origin inside an amend's stored message is never trusted.
+        let path = journal_path(tmp.path(), &s.id);
+        let forged: String = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+                if record["amend"] == true {
+                    record.as_object_mut().unwrap().remove("o");
+                    record["m"][MESSAGE_ORIGIN_KEY] = origin_mark(0);
+                }
+                format!("{record}\n")
+            })
+            .collect();
+        std::fs::write(&path, forged).unwrap();
+        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        assert_eq!(loaded.api_messages.len(), 2);
+        assert_eq!(origins(&loaded), vec![None, None]);
+    }
+
+    /// An origin set on an earlier saved message is an edit before the
+    /// tail: the save snapshots, never amends the tail and loses it.
+    #[test]
+    fn an_origin_set_before_an_amended_tail_snapshots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(user("first"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        s.api_messages.push(user("go"));
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::Append { messages: 1 }
+        );
+        let mut first = (*s.api_messages[0]).clone();
+        first[MESSAGE_ORIGIN_KEY] = origin_mark(0);
+        s.api_messages[0] = std::sync::Arc::new(first);
+        hook_edit(&mut s.api_messages[1], &[SAVED_BLOCK]);
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::FullSnapshot
+        );
+        assert_saved(tmp.path(), &s);
     }
 }

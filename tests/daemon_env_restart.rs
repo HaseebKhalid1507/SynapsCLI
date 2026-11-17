@@ -126,6 +126,7 @@ async fn one_turn(t: &mut SocketTransport, text: &str) {
     t.send_from_self(SessionCommand::Submit {
         text: text.into(),
         attachments: vec![],
+        origin: None,
     })
     .await
     .unwrap();

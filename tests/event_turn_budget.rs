@@ -178,6 +178,7 @@ async fn a_typed_turn_is_not_bound_by_the_event_budget() {
     t.send(SessionCommand::Submit {
         text: "do thirty things".into(),
         attachments: vec![],
+        origin: None,
     })
     .await
     .unwrap();
@@ -292,6 +293,7 @@ async fn an_event_turn_waiting_for_on_session_start_runs_under_the_event_budget_
     t.send(SessionCommand::Submit {
         text: "do thirty things".into(),
         attachments: vec![],
+        origin: None,
     })
     .await
     .unwrap();
@@ -318,6 +320,7 @@ async fn a_typed_turn_waiting_for_on_session_start_is_not_bound_by_the_event_bud
     t.send(SessionCommand::Submit {
         text: "do thirty things".into(),
         attachments: vec![],
+        origin: None,
     })
     .await
     .unwrap();
@@ -466,6 +469,7 @@ async fn an_owner_steer_moves_an_event_turn_to_the_session_budget() {
     pump_until_hits(&mut t, &hits, 1).await.expect("first round");
     t.send(SessionCommand::Steer {
         text: "keep going, I'm here".into(),
+        origin: None,
     })
     .await
     .unwrap();

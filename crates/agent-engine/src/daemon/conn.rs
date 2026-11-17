@@ -232,6 +232,13 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         let _ = writer.await;
         return;
     }
+    // A declared turn-origin label is checked the same way: the daemon never
+    // keeps one it would not write into the model's wrapper tag.
+    if let Some(Err(message)) = hello.client.turn_origin.as_deref().map(crate::session::validate_turn_origin_label) {
+        let _ = tx.send(DaemonFrame::Refused { reason: RefuseReason::Protocol, message }).await;
+        let _ = writer.await;
+        return;
+    }
     let daemon_version = binary_version();
     if hello.client_version != daemon_version {
         tracing::info!(client = %hello.client_version, daemon = %daemon_version, "daemon: client binary version differs (same protocol; allowed)");
@@ -1127,11 +1134,11 @@ mod tests {
     /// leaves what the turn being drained still needs.
     #[test]
     fn the_drain_gate_keeps_steering_the_running_turn() {
-        let submit = SessionCommand::Submit { text: "x".into(), attachments: vec![] };
+        let submit = SessionCommand::Submit { text: "x".into(), attachments: vec![], origin: None };
         assert!(refused_while_draining(&submit));
         assert!(refused_while_draining(&SessionCommand::NewSession));
         assert!(refused_while_draining(&SessionCommand::Resume { id: 1, query: "q".into() }));
-        assert!(!refused_while_draining(&SessionCommand::Steer { text: "x".into() }));
+        assert!(!refused_while_draining(&SessionCommand::Steer { text: "x".into(), origin: None }));
         assert!(!refused_while_draining(&SessionCommand::Cancel));
     }
 }

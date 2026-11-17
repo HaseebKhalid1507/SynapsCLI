@@ -86,7 +86,7 @@ async fn create(sock: &Path, cwd: &Path) -> (SocketTransport, SessionId) {
 }
 
 async fn run_turn(t: &mut SocketTransport) {
-    t.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
     until(t, |e| matches!(e, SessionEventWire::Idle)).await;
 }
 

@@ -77,7 +77,7 @@ async fn spawn_daemon(guard: &HomeGuard, url: &str) -> DaemonProc {
 /// the `Conversation` digest's `messages_len` and whether `MessageHistory`
 /// ever showed up.
 async fn one_turn(t: &mut SocketTransport, text: &str) -> (usize, bool) {
-    t.send_from_self(SessionCommand::Submit { text: text.into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(SessionCommand::Submit { text: text.into(), attachments: vec![], origin: None }).await.unwrap();
     let mut len = None;
     let mut saw_history = false;
     loop {

@@ -323,7 +323,7 @@ async fn reload_stops_running_workers_resumably_and_never_reuses_their_ids() {
 
     // Turn 1: the parent starts the worker and ends its turn (it now waits
     // for the worker's completion wake, like any orchestrating session).
-    t.send_from_self(SessionCommand::Submit { text: "start the worker".into(), attachments: vec![] })
+    t.send_from_self(SessionCommand::Submit { text: "start the worker".into(), attachments: vec![], origin: None })
         .await
         .unwrap();
     loop {
@@ -415,7 +415,7 @@ async fn reload_stops_running_workers_resumably_and_never_reuses_their_ids() {
         .await
         .expect("reconnect budget")
         .expect("reconnected");
-    t.send_from_self(SessionCommand::Submit { text: "ping".into(), attachments: vec![] })
+    t.send_from_self(SessionCommand::Submit { text: "ping".into(), attachments: vec![], origin: None })
         .await
         .unwrap();
     let pinged = |bodies: &[Value]| {

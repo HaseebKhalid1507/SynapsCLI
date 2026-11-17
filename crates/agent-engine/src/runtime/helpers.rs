@@ -134,7 +134,7 @@ impl HelperMethods {
     /// Drain all pending steering messages from the channel and inject them
     /// into the conversation as user messages. Returns true if any were injected.
     pub(super) fn drain_steering(
-        steering_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
+        steering_rx: &mut Option<super::turn_origin::SteeringRx>,
         messages: &mut Vec<SharedMessage>,
         tx: &mpsc::UnboundedSender<StreamEvent>,
     ) -> bool {
@@ -144,14 +144,15 @@ impl HelperMethods {
         };
 
         let mut injected = false;
-        while let Ok(msg) = rx.try_recv() {
+        while let Some(steer) = rx.try_recv() {
             // Metadata only — steering messages are user content and must not
             // reach log sinks (request-lifecycle hardening T1).
-            tracing::info!(len = msg.len(), "Steering message injected");
+            tracing::info!(len = steer.text.len(), "Steering message injected");
             let _ = tx.send(StreamEvent::Agent(AgentEvent::SteeringDelivered {
-                message: msg.clone(),
+                message: steer.text.clone(),
             }));
-            messages.push(Arc::new(json!({"role": "user", "content": msg})));
+            // A marked steer (the owner's own input) keeps its mark.
+            messages.push(Arc::new(steer.into_message()));
             injected = true;
         }
         injected

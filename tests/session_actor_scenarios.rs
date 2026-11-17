@@ -171,6 +171,7 @@ impl Run {
             .send(SessionCommand::Submit {
                 text: text.into(),
                 attachments: vec![],
+                origin: None,
             })
             .await
             .unwrap();
@@ -490,6 +491,7 @@ async fn steer_mid_stream_is_delivered_into_the_running_turn() {
     a.until(is_text).await;
     a.t.send(SessionCommand::Steer {
         text: "redirect".into(),
+        origin: None,
     })
     .await
     .unwrap();
@@ -688,6 +690,7 @@ async fn a_cancelled_turn_saves_at_most_the_prompt_checkpoint_and_the_abort() {
     a.until(is_text).await;
     a.t.send(SessionCommand::Steer {
         text: "queued-then-dropped".into(),
+        origin: None,
     })
     .await
     .unwrap();

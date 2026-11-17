@@ -106,6 +106,11 @@ impl ApiMethods {
         max_retries: u32,
         options: &ApiOptions,
     ) -> Result<String> {
+        // As `call_api_stream_inner`: neutralize, render, vouch, once per request.
+        let view = super::turn_origin::request_view(messages);
+        let messages = view.messages.as_deref().unwrap_or(messages);
+        let vouched = super::turn_origin::request_system(Some(system_prompt), &view);
+        let system_prompt = vouched.as_deref().unwrap_or(system_prompt);
         // Host-only message metadata never reaches any provider, whatever
         // history the caller passes in; strip before routing/serializing.
         let wire_messages = super::continuation::wire_messages(messages);

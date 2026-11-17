@@ -87,12 +87,20 @@ pub struct CatalogCursor {
     pub id: String,
 }
 
+/// `Welcome.features` entry: this daemon honours the `origin` field of
+/// `Submit`/`Steer` and the `turn_origin` label a chat client declares in
+/// its hello (`ClientMeta::turn_origin`). An older daemon ignores both, so
+/// a client that marks turns checks for this entry before it relies on the
+/// mark.
+pub const FEATURE_TURN_ORIGIN: &str = "turn_origin";
+
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
     vec![
         FEATURE_OWNED_SESSIONS.to_string(),
         FEATURE_SESSION_WORKERS.to_string(),
         FEATURE_SESSION_PAGE.to_string(),
+        FEATURE_TURN_ORIGIN.to_string(),
     ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
@@ -385,6 +393,13 @@ impl Hello {
     /// Ask to be called `name` in the session ([`ClientMeta::name`]).
     pub fn with_name(mut self, name: Option<String>) -> Self {
         self.client.name = name;
+        self
+    }
+
+    /// Declare the label this chat client marks the owner's turns with
+    /// ([`ClientMeta::turn_origin`]).
+    pub fn with_turn_origin(mut self, label: Option<String>) -> Self {
+        self.client.turn_origin = label;
         self
     }
 
@@ -1874,6 +1889,48 @@ mod tests {
         assert_eq!(old.kind, ClientKind::Tui);
     }
 
+    /// Turn origins are additive on the wire: a `Hello` without a label and
+    /// a `Submit`/`Steer` without an origin encode exactly as before (older
+    /// daemons see the old bytes), the old bytes still decode, and with one
+    /// the field names are `turn_origin` (hello) and `origin` (commands).
+    #[test]
+    fn turn_origin_is_additive_on_the_wire() {
+        let hello = encode_line(&ClientFrame::Hello(Hello::new(ClientKind::Chat))).unwrap();
+        assert!(!hello.contains("turn_origin"), "{hello}");
+        let hello = encode_line(&ClientFrame::Hello(
+            Hello::new(ClientKind::Chat).with_turn_origin(Some("test-app".into())),
+        ))
+        .unwrap();
+        assert!(hello.contains(r#""turn_origin":"test-app""#), "{hello}");
+        match decode_line::<ClientFrame>(hello.trim_end()).unwrap() {
+            ClientFrame::Hello(h) => assert_eq!(h.client.turn_origin.as_deref(), Some("test-app")),
+            other => panic!("{other:?}"),
+        }
+
+        let plain = encode_line(&ClientFrame::Cmd {
+            session_id: "s".into(),
+            cmd: SessionCommand::Submit { text: "hi".into(), attachments: vec![], origin: None },
+        })
+        .unwrap();
+        assert!(!plain.contains("origin"), "{plain}");
+        let marked = encode_line(&ClientFrame::Cmd {
+            session_id: "s".into(),
+            cmd: SessionCommand::Steer { text: "hi".into(), origin: Some("test-app".into()) },
+        })
+        .unwrap();
+        assert!(marked.contains(r#""origin":"test-app""#), "{marked}");
+        match decode_line::<ClientFrame>(marked.trim_end()).unwrap() {
+            ClientFrame::Cmd { cmd: SessionCommand::Steer { origin, .. }, .. } => {
+                assert_eq!(origin.as_deref(), Some("test-app"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match decode_line::<ClientFrame>(plain.trim_end()).unwrap() {
+            ClientFrame::Cmd { cmd: SessionCommand::Submit { origin, .. }, .. } => assert_eq!(origin, None),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// Client names, both directions: an older daemon's `ClientJoined` (no
     /// name, no mode) decodes as the kind's name in `Mirror`; a `Hello`
     /// without a name sends no `name` key (older daemons see the old
@@ -2086,7 +2143,7 @@ mod tests {
             ClientFrame::Shutdown { force: true },
             ClientFrame::Attach(Attach::Existing { session_id: "s".into(), mode: AttachMode::Mirror }),
             ClientFrame::Attach(Attach::create(SessionConfig::default(), AttachMode::Takeover)),
-            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Submit { text: "hi".into(), attachments: vec![] } },
+            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Submit { text: "hi".into(), attachments: vec![], origin: None } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Answer { prompt_id: 1, value: Some("pw".into()) } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::EngineCommand { id: 4, name: "model".into(), arg: "x".into() } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Query { id: 5, query: SessionQuery::Status } },
@@ -2512,11 +2569,11 @@ mod tests {
         assert!(d.contains("redacted"));
         let f = ClientFrame::Cmd {
             session_id: "s".into(),
-            cmd: SessionCommand::Submit { text: "my private prompt".into(), attachments: vec![] },
+            cmd: SessionCommand::Submit { text: "my private prompt".into(), attachments: vec![], origin: None },
         };
         let d = format!("{f:?}");
         assert!(!d.contains("private"), "{d}");
-        let f = ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Steer { text: "steer me".into() } };
+        let f = ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Steer { text: "steer me".into(), origin: None } };
         let d = format!("{f:?}");
         assert!(!d.contains("steer me"));
         // No lengths either: a char count is a side channel.
@@ -2632,9 +2689,12 @@ mod tests {
         };
         let old: Welcome = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
         assert!(!old.supports(FEATURE_OWNED_SESSIONS));
+        assert!(!old.supports(FEATURE_TURN_ORIGIN));
         w.features = daemon_features();
         let new: Welcome = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
         assert!(new.supports(FEATURE_OWNED_SESSIONS));
+        assert!(new.supports(FEATURE_TURN_ORIGIN));
+        assert!(daemon_features().iter().any(|f| f == "turn_origin"));
     }
 }
 

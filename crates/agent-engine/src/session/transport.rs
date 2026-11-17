@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use super::handle::SessionHandle;
 use super::types::{
-    AttachMode, AttachSnapshot, ClientId, ClientInput, ClientMeta, Envelope, Roster, SessionCommand,
+    AttachMode, AttachSnapshot, ClientId, ClientInput, ClientMeta, Envelope, OwnerBind, Roster, SessionCommand,
     SessionEventWire, SessionId, SessionMeta,
 };
 use super::view::RuntimeView;
@@ -226,6 +226,18 @@ impl LocalTransport {
         meta: ClientMeta,
         mode: AttachMode,
     ) -> Result<(Self, AttachSnapshot), TransportError> {
+        Self::attach_with_owner(handle, meta, mode, None).await
+    }
+
+    /// [`Self::attach_with`], with an owner claim: the client binds as the
+    /// owned session's owner when the claim's token matches (else it
+    /// attaches as a plain client, see `SessionActor::bind_owner`).
+    pub async fn attach_with_owner(
+        handle: SessionHandle,
+        meta: ClientMeta,
+        mode: AttachMode,
+        owner: Option<OwnerBind>,
+    ) -> Result<(Self, AttachSnapshot), TransportError> {
         // Subscribe BEFORE sending so the Attached reply cannot be missed.
         // `Attached` is broadcast; with one attach in flight per handle at a
         // time (every host today) the first one seen is ours.
@@ -234,7 +246,7 @@ impl LocalTransport {
             .send(SessionCommand::Attach {
                 client: meta,
                 mode,
-                owner: None,
+                owner,
             })
             .await?;
 
@@ -495,6 +507,7 @@ mod tests {
         t.send(SessionCommand::Submit {
             text: "ping".into(),
             attachments: vec![],
+            origin: None,
         })
         .await
         .unwrap();
@@ -574,6 +587,7 @@ mod tests {
         a.send(SessionCommand::Submit {
             text: "x".into(),
             attachments: vec![],
+            origin: None,
         })
         .await
         .unwrap();

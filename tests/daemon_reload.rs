@@ -115,7 +115,7 @@ async fn attach_create(paths: &registry::DaemonPaths, cwd: &Path) -> (SocketTran
 }
 
 async fn one_turn(t: &mut SocketTransport, text: &str) -> Vec<agent_engine::SharedMessage> {
-    t.send_from_self(SessionCommand::Submit { text: text.into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(SessionCommand::Submit { text: text.into(), attachments: vec![], origin: None }).await.unwrap();
     let mut msgs = None;
     loop {
         let env = tokio::time::timeout(Duration::from_secs(20), t.next_event()).await.expect("turn hung").expect("alive");
@@ -277,7 +277,7 @@ async fn reload_with_turn_in_flight_checkpoints_and_keeps_the_partial_turn() {
 
     let (mut t, _snap) = attach_create(&d.paths, guard.home.path()).await;
     let sid = t.session_id().clone();
-    t.send_from_self(SessionCommand::Submit { text: "never finishes".into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(SessionCommand::Submit { text: "never finishes".into(), attachments: vec![], origin: None }).await.unwrap();
     // Wait for the partial text so the checkpoint has partial work to keep.
     loop {
         let env = tokio::time::timeout(Duration::from_secs(20), t.next_event()).await.unwrap().unwrap();
@@ -861,7 +861,7 @@ async fn the_session_start_wait_yields_to_cancel_and_end() {
     // End while the first turn waits: the session ends at once.
     let (end_id, cancel_id) = (ids[1].clone(), ids[2].clone());
     let mut y = attach(end_id.clone()).await;
-    y.send_from_self(SessionCommand::Submit { text: "end me".into(), attachments: vec![] }).await.unwrap();
+    y.send_from_self(SessionCommand::Submit { text: "end me".into(), attachments: vec![], origin: None }).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let asked = std::time::Instant::now();
     y.send_from_self(SessionCommand::End { reason: EndReason::ClientQuit }).await.unwrap();
@@ -882,7 +882,7 @@ async fn the_session_start_wait_yields_to_cancel_and_end() {
 
     // Cancel while the first turn waits: that turn ends at once, aborted.
     let mut x = attach(cancel_id.clone()).await;
-    x.send_from_self(SessionCommand::Submit { text: "cancel me".into(), attachments: vec![] }).await.unwrap();
+    x.send_from_self(SessionCommand::Submit { text: "cancel me".into(), attachments: vec![], origin: None }).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let asked = std::time::Instant::now();
     x.send_from_self(SessionCommand::Cancel).await.unwrap();

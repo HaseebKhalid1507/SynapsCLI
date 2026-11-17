@@ -1238,6 +1238,16 @@ impl ApiMethods {
                 "cache keep-warm ping requires the native Anthropic transport".into(),
             ));
         }
+        // Every model-readable text neutralized and each owner-marked part
+        // wrapped, once per request, on every transport; history keeps the
+        // plain text and the mark. Callers pass history, never this view.
+        let view = super::turn_origin::request_view(messages);
+        let messages = view.messages.as_deref().unwrap_or(messages);
+        // A request that renders a wrapper also says what it proves, at the
+        // end of its system text (after any extension context), on every
+        // transport below. Nothing is stored.
+        let vouched = super::turn_origin::request_system(system_prompt.as_deref(), &view).map(Some);
+        let system_prompt = vouched.as_ref().unwrap_or(system_prompt);
         super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
         // Host `_synaps_*` keys never reach a provider. The native Anthropic
         // body drops them while serializing (`WireMessages`, no history

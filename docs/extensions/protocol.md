@@ -829,7 +829,12 @@ Which messages are hooked:
   | `[` + text without `[`, `]` or a line break + ` context was shown here for one turn and not kept]` | `\[… context was shown here for one turn and not kept]` |
 
   Line breaks are `\r`, `\n`, U+0085, U+2028 and U+2029. A `[` that
-  already follows a backslash is left alone. Nothing else changes, and
+  already follows a backslash is left alone. Before this escape the
+  content goes through the turn-origin neutralizer
+  ([turn-origin.md](../turn-origin.md#neutralizing)): a host notice opener
+  at the start of a line (`[Extension context` and `[End ` among them) has
+  its `[` replaced with `&#91;`, and anything that reads as the turn-origin
+  tag has its opener replaced with `&lt;`. Nothing else changes, and
   escaping is stable: the same content always frames to the same bytes.
 
 The marker and the saved fence differ from the turn-only fence: saved

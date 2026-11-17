@@ -10,6 +10,7 @@
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::events::{format_event_for_agent, EventQueue};
+use crate::runtime::turn_origin::Steer;
 use crate::SharedMessage;
 
 // Re-export the shared wire payload so callers can use `engine::reactor::EventPayload`.
@@ -100,6 +101,45 @@ pub fn drain_event_queue(
     busy: bool,
     steer_tx: Option<&UnboundedSender<String>>,
 ) -> Vec<DrainedEvent> {
+    drain_events(queue, messages, pending_events, busy, steer_tx)
+}
+
+/// A live steering channel a drained event can be steered into.
+trait SteerSink {
+    fn steer(&self, text: String) -> bool;
+}
+
+impl SteerSink for UnboundedSender<String> {
+    fn steer(&self, text: String) -> bool {
+        self.send(text).is_ok()
+    }
+}
+
+/// The session actor's typed channel: an event never carries a turn origin.
+impl SteerSink for UnboundedSender<Steer> {
+    fn steer(&self, text: String) -> bool {
+        self.send(Steer::from(text)).is_ok()
+    }
+}
+
+/// [`drain_event_queue`] into the session actor's typed steering channel.
+pub fn drain_event_queue_typed(
+    queue: &EventQueue,
+    messages: &mut Vec<SharedMessage>,
+    pending_events: &mut Vec<String>,
+    busy: bool,
+    steer_tx: Option<&UnboundedSender<Steer>>,
+) -> Vec<DrainedEvent> {
+    drain_events(queue, messages, pending_events, busy, steer_tx)
+}
+
+fn drain_events(
+    queue: &EventQueue,
+    messages: &mut Vec<SharedMessage>,
+    pending_events: &mut Vec<String>,
+    busy: bool,
+    steer_tx: Option<&impl SteerSink>,
+) -> Vec<DrainedEvent> {
     let mut drained = Vec::new();
 
     while let Some(event) = queue.pop() {
@@ -121,7 +161,7 @@ pub fn drain_event_queue(
         let disposition = if busy {
             // Steer into active stream if the channel is live.
             let steered = steer_tx
-                .map(|tx| tx.send(formatted.clone()).is_ok())
+                .map(|tx| tx.steer(formatted.clone()))
                 .unwrap_or(false);
             if steered {
                 EventDisposition::Steered

@@ -170,6 +170,7 @@ fn submit(text: &str) -> SessionCommand {
     SessionCommand::Submit {
         text: text.into(),
         attachments: vec![],
+        origin: None,
     }
 }
 
@@ -1337,7 +1338,7 @@ async fn submit_with_image_is_refused_on_text_model_and_accepted_on_image_model(
     let before = snap.conversation.api_messages.len();
     // Client-addressed (what the TUI does) — a host-originated `send` has
     // no client to refuse to and gets a `SystemNotice` instead.
-    a.send_from_self(SessionCommand::Submit { text: "what is this".into(), attachments: vec![image.clone()] })
+    a.send_from_self(SessionCommand::Submit { text: "what is this".into(), attachments: vec![image.clone()], origin: None })
         .await
         .unwrap();
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::Refused { .. })).await;
@@ -1377,7 +1378,7 @@ async fn submit_with_image_is_refused_on_text_model_and_accepted_on_image_model(
     let (mut b, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
         .await
         .unwrap();
-    b.send_from_self(SessionCommand::Submit { text: "what is this".into(), attachments: vec![image.clone()] })
+    b.send_from_self(SessionCommand::Submit { text: "what is this".into(), attachments: vec![image.clone()], origin: None })
         .await
         .unwrap();
     let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;

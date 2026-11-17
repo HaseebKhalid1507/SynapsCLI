@@ -263,7 +263,36 @@ pub fn submit(text: &str) -> SessionCommand {
     SessionCommand::Submit {
         text: text.into(),
         attachments: vec![],
+        origin: None,
     }
+}
+
+/// The turn-origin label the test chat client declares at hello.
+pub const COMPOSER: &str = "test-app";
+
+/// A Submit the owner typed in the declaring chat client's composer.
+pub fn marked_submit(text: &str) -> SessionCommand {
+    SessionCommand::Submit {
+        text: text.into(),
+        attachments: vec![],
+        origin: Some(COMPOSER.into()),
+    }
+}
+
+/// `text` inside the owner's wrapper, as the model reads it (`\x3C` is the
+/// opener; no line here spells the tag).
+pub fn wrapped(text: &str) -> String {
+    format!("\x3Csynaps-turn origin=\"test-app\">\n{text}\n\x3C/synaps-turn>")
+}
+
+/// Every string inside a request body's `messages`, joined, holds
+/// `(openers, closers)` of the wrapper.
+pub fn wrapper_tags(body: &serde_json::Value) -> (usize, usize) {
+    let text = body["messages"].to_string();
+    (
+        text.matches("\\u003csynaps-turn").count() + text.matches("\x3Csynaps-turn").count(),
+        text.matches("\\u003c/synaps-turn").count() + text.matches("\x3C/synaps-turn").count(),
+    )
 }
 
 pub fn last_conversation(seen: &[Envelope]) -> agent_engine::session::ConversationSnapshot {

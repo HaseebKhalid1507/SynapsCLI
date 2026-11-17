@@ -199,6 +199,7 @@ async fn session_env_differential_in_process_vs_daemon() {
         .send(SessionCommand::Submit {
             text: "dump env".into(),
             attachments: vec![],
+            origin: None,
         })
         .await
         .unwrap();
@@ -244,6 +245,7 @@ async fn session_env_differential_in_process_vs_daemon() {
         .send(SessionCommand::Submit {
             text: "dump env".into(),
             attachments: vec![],
+            origin: None,
         })
         .await
         .unwrap();
@@ -363,6 +365,7 @@ async fn attach_existing_does_not_change_env() {
     t1.send(SessionCommand::Submit {
         text: "dump env".into(),
         attachments: vec![],
+        origin: None,
     })
     .await
     .unwrap();
@@ -388,6 +391,7 @@ async fn attach_existing_does_not_change_env() {
     t1.send(SessionCommand::Submit {
         text: "dump env again".into(),
         attachments: vec![],
+        origin: None,
     })
     .await
     .unwrap();

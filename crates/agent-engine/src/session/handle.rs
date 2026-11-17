@@ -668,7 +668,7 @@ pub mod echo {
                     let snap = self.conv_snapshot();
                     self.emit(SessionEventWire::Conversation(snap));
                 }
-                SessionCommand::Steer { text } => {
+                SessionCommand::Steer { text, .. } => {
                     self.conv.queued_message = Some(text.clone());
                     self.emit(SessionEventWire::Steered {
                         text,
@@ -956,6 +956,7 @@ mod tests {
             .send(SessionCommand::Submit {
                 text: "hello".into(),
                 attachments: vec![],
+                origin: None,
             })
             .await
             .unwrap();

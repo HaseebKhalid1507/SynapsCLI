@@ -345,7 +345,19 @@ impl SessionActor {
             ));
             return;
         }
-        self.conv.api_messages.extend(messages);
+        // Only the host sets a host key (`_synaps_*`): a turn origin only
+        // an admitted Submit or Steer, a host notice or a context marker only
+        // the host's own text. A prepared message that arrives carrying one
+        // loses every one.
+        let host = |key: &String| key.starts_with(crate::runtime::continuation::HOST_KEY_PREFIX);
+        self.conv.api_messages.extend(messages.into_iter().map(|mut message| {
+            if message.as_object().is_some_and(|object| object.keys().any(host)) {
+                if let Some(object) = Arc::make_mut(&mut message).as_object_mut() {
+                    object.retain(|key, _| !host(key));
+                }
+            }
+            message
+        }));
         if let Some(text) = user_text {
             self.conv
                 .api_messages

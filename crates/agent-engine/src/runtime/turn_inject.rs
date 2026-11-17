@@ -15,7 +15,13 @@
 //!   same moment as the saved parts, so no durable byte changes later.
 //! - A saved part over [`SAVED_PART_CAP`] is handled as forget (warn log).
 //!
-//! Framing and detectors: `agent_core::core::extension_context`.
+//! Framing and detectors: `agent_core::core::extension_context`. The
+//! content is the extension's, saved or turn-only: it is neutralized before
+//! it is framed (`turn_origin::neutralize_supplied`), so it can neither
+//! spell the turn-origin tag nor open a host notice at a line's start. A
+//! saved block is then a host notice on every request
+//! (`turn_origin::request_view`): its fence lines reach the model as the
+//! host wrote them.
 
 use std::sync::Arc;
 
@@ -75,7 +81,11 @@ impl TurnInjection {
                 self.forget.push(part.content);
                 forgot = true;
             } else {
-                saved.push(ec::saved_block_text(source, &part.content));
+                let content = super::turn_origin::neutralize_supplied(
+                    &part.content,
+                    crate::events::format::NoticeScope::LineStart,
+                );
+                saved.push(ec::saved_block_text(source, &content));
             }
         }
         let blocks: Vec<String> = saved
@@ -85,7 +95,8 @@ impl TurnInjection {
         let added = if blocks.is_empty() { 0 } else { append_text_blocks(message, blocks) };
         ec::set_hooked(Arc::make_mut(message), added);
         if forgot {
-            self.tail = Some(ec::guard_turn(&self.forget.join("\n\n")));
+            // Framed, and neutralized first, as `on_session_start`'s is.
+            self.tail = Some(super::stream::guard_extension_context(&self.forget.join("\n\n")));
         }
     }
 }

@@ -119,7 +119,7 @@ async fn saveas(t: &mut SocketTransport, id: u64, name: &str) -> serde_json::Val
 }
 
 async fn run_turn(t: &mut SocketTransport) {
-    t.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
     until(t, |e| matches!(e, SessionEventWire::Idle)).await;
 }
 
@@ -500,7 +500,7 @@ async fn a_rename_during_a_streaming_turn_survives_the_turn_end_save() {
     let sock = d.paths.sock.clone();
     let (mut t, sid) = create(&sock, guard.home.path()).await;
     run_turn(&mut t).await;
-    t.send_from_self(SessionCommand::Submit { text: "second".into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(SessionCommand::Submit { text: "second".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut t, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
 
     let got = tokio::time::timeout(
