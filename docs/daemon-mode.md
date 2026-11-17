@@ -992,8 +992,8 @@ marker kept), pending prompts (`None`), PTY/background shells (closed, announced
 `turn_replay`, input ownership (re-established by reconnect order + `was_owner`), running reactive
 workers (stopped resumably, see below).
 **Preserved** — each session's `Checkpoint{Reload}` reply carries a `SessionReloadRecord` that the new
-image rehydrates from: the journal and session id (same journal continued; `reload_aliases` only after a
-LinkedSuccessor compaction), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
+image rehydrates from: the journal and session id (same journal continued; `reload_aliases` when the
+session comes back under another id, see step 6), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
 compaction policy, auto-compact, persist), the keep-warm pin, the lifecycle (**a Parked session comes
 back Parked** — rehydrate creates it then sends the host-only `Park`), the non-persisted runtime knobs
 (`settings_replay`: `/context`, compaction model, API retries, subagent/bash timeouts, tool-output cap,
@@ -1003,10 +1003,11 @@ activations** (`activate_tools` grants under progressive disclosure; see
 [Tool activations across a reload](#tool-activations-across-a-reload-or-a-park)). A session that never ran a turn has no
 journal (`save` skips an empty conversation): it is recreated fresh under a new id and aliased.
 A session whose journal lock is held by another process (e.g. an in-process `synaps --continue X`) is
-NOT recreated — it is registered as a **Parked placeholder** under the same id with `locked_by` set
-in its metadata. Attach is refused with a message naming the lock holder's pid and kind (F23).
+NOT recreated — it is registered as a **Parked placeholder** with `locked_by` set in its metadata,
+under the id a real session on that journal would take (the journal id, or a minted one if a session
+restored earlier has it), never replacing a session already registered; the old id is aliased to it. Attach is refused with a message naming the lock holder's pid and kind (F23).
 `daemon sessions` shows it as Parked with the `locked_by` marker. Every attach retries the real create;
-the placeholder stays listed while it runs and the real session replaces it in place under the same id
+the placeholder stays listed while it runs and the real session replaces it in place under its id
 (it never leaves the list).
 
 Tested against a **real** `synaps daemon --foreground` process (`tests/daemon_reload.rs`): same pid before
@@ -1043,8 +1044,10 @@ that conversation began.
 - **Removal is by identity:** an actor that ends removes its own map entry only, never a session adopted
   under the same id meanwhile.
 - **A lock-held placeholder** (a reload that found the journal locked elsewhere) holds the conversation
-  its reload record continues: after `/clear` that is `N` under the id `A`. Once the lock is free, the
-  next attach builds `N` (under the id `N`, with the reload alias `A → N`), never the pre-clear `A`.
+  its reload record continues: after `/clear` that is `N`, not the actor id `A`. It is registered under
+  `N`'s id (the reload alias `A → N` covers the old one), so it never evicts a session restored before
+  it, such as the resumed conversation `A` that took the id `A`. Once the lock is free, the next attach
+  builds `N` in its place, never the pre-clear `A`.
 - **`--continue` with no argument right after `/clear`** continues the latest saved conversation, which is
   the pre-clear `A` (`N` has no journal until its first turn, and the cleared actor no longer holds `A`):
   it opens a second actor on `A` rather than reattaching to the cleared one.

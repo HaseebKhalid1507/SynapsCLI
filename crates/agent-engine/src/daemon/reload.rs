@@ -831,7 +831,7 @@ pub fn adopt_from_env(_paths: &DaemonPaths) -> anyhow::Result<Option<Adopted>> {
 /// F23: detect "is live in another process" in the error string — this is
 /// the `SessionLockError::Held` case, where an in-process runtime holds
 /// the journal lock. Instead of aliasing to an empty impostor, register a
-/// Parked placeholder under the SAME id.
+/// Parked placeholder for that journal (`rehydrate`).
 pub(crate) fn is_lock_held_error(e: &str) -> bool {
     e.contains("is live in another process")
 }
@@ -997,21 +997,41 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
         let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
-            // placeholder under the SAME id. No alias, no fresh session.
+            // placeholder for that journal, no fresh session. Under the id a
+            // real session on it would take, as the success path does, never
+            // blindly under the old one: after `/clear` and a resume, a
+            // session rehydrated earlier in this loop can have that id (the
+            // resumed conversation), and must not be replaced. The old id
+            // reaches the placeholder by alias.
             Err(e) if is_lock_held_error(&e) => {
                 let holder = parse_holder_from_error(&e);
                 tracing::warn!(
                     session = %s.id, holder = %holder,
                     "daemon: journal locked by another process; registering Parked placeholder"
                 );
-                let sid = crate::session::SessionId::from(s.id.as_str());
+                let journal = match &config.continue_session {
+                    Some(Some(j)) => j.clone(),
+                    _ => s.journal_id.clone(),
+                };
                 // `config`, not `s.config`: an owned session stays owned.
-                let (handle, _task) = crate::session::handle::locked_placeholder::spawn(
-                    sid,
-                    config.clone(),
-                    holder,
-                );
-                state.insert(handle);
+                let handle = state
+                    .host
+                    .adopt_for_journal(&journal, |sid| {
+                        crate::session::handle::locked_placeholder::spawn(
+                            sid,
+                            config.clone(),
+                            holder,
+                        )
+                        .0
+                    })
+                    .await;
+                if handle.id.as_str() != s.id {
+                    state
+                        .reload_aliases
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(s.id.clone(), handle.id.0.clone());
+                }
                 continue;
             }
             Err(e) if s.config.continue_session.is_some() => {

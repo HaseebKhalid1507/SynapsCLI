@@ -538,3 +538,190 @@ async fn a_released_journal_replaces_its_placeholder_through_the_host() {
     assert!(rows[0].locked_by.is_none());
     stop(d).await;
 }
+
+fn record(id: &str, journal: &str) -> agent_engine::daemon::reload::ReloadSession {
+    agent_engine::daemon::reload::ReloadSession {
+        id: id.into(),
+        journal_id: journal.into(),
+        config: resume(journal),
+        keep_warm: false,
+        lifecycle: SessionLifecycle::Live,
+        settings_replay: Vec::new(),
+        cache_keepwarm: None,
+        input_owner_kind: None,
+        workers: Vec::new(),
+        tool_activations: Vec::new(),
+        owner_token: None,
+        supersedes: Vec::new(),
+        created_at: None,
+    }
+}
+
+fn reload_state(
+    sessions: Vec<agent_engine::daemon::reload::ReloadSession>,
+) -> agent_engine::daemon::reload::ReloadState {
+    agent_engine::daemon::reload::ReloadState {
+        generation: 2,
+        written_at: chrono::Utc::now(),
+        sessions,
+        expected_clients: 0,
+        next_subagent_id: 0,
+    }
+}
+
+/// `/clear` (actor `A` → `N`), resume `A` (minted actor `M`), then a reload
+/// that finds `N` locked elsewhere. The records come back in map order;
+/// here `M`'s goes first, and its actor takes the id `A` (free by then).
+/// `N`'s placeholder must not replace it: it takes `N`'s id, and the old
+/// id `A` would reach it by alias only if nothing else had it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_lock_held_placeholder_never_replaces_a_session_rehydrated_before_it() {
+    use agent_engine::core::session_lock::{sessions_dir, LockHolder, SessionLock};
+    let home = Home::new();
+    let host = boot().await;
+    let (a, mut t, journal_a, n) = cleared(&host).await;
+    turn(&mut t, "conversation N").await;
+    end(&mut t).await;
+    wait_gone(&host, &a.id).await;
+    let held = SessionLock::try_acquire(
+        &sessions_dir(),
+        &n,
+        LockHolder {
+            pid: std::process::id(),
+            kind: "tui".into(),
+        },
+    )
+    .expect("N's lock is free");
+
+    let d = start_daemon(Arc::clone(&host), &home, None).await;
+    let m = SessionId::from("20261101-000000-m1n7");
+    agent_engine::daemon::reload::rehydrate(
+        &d.state,
+        &reload_state(vec![record(m.as_str(), &journal_a), record(&journal_a, &n)]),
+    )
+    .await;
+
+    let on_a = d.state.attach(&a.id).expect("the session on A");
+    assert!(
+        on_a.meta().locked_by.is_none(),
+        "not replaced by the placeholder"
+    );
+    assert_eq!(on_a.journal_id(), journal_a);
+    assert!(
+        d.state
+            .attach(&m)
+            .expect("M, by alias")
+            .is_session(&on_a.session_ref()),
+        "M's clients reach their conversation"
+    );
+    let metas = d.state.session_metas();
+    assert_eq!(metas.len(), 2, "{metas:?}");
+    let listed = metas
+        .iter()
+        .find(|m| m.journal_id == n)
+        .expect("N's placeholder is listed");
+    assert!(listed.locked_by.is_some(), "{listed:?}");
+    assert_eq!(listed.id.as_str(), n, "under the id N's real session takes");
+
+    // Once the lock is free, N comes back in the placeholder's place.
+    drop(held);
+    let placeholder = d.state.attach(&SessionId::from(n.as_str())).unwrap();
+    let real = d.state.retry_locked_placeholder(placeholder).await;
+    assert!(real.meta().locked_by.is_none());
+    assert_eq!(
+        (real.id.as_str(), real.journal_id()),
+        (n.as_str(), n.clone())
+    );
+    assert!(d
+        .state
+        .attach(&a.id)
+        .unwrap()
+        .is_session(&on_a.session_ref()));
+    assert_eq!(d.state.session_metas().len(), 2);
+    stop(d).await;
+}
+
+/// A placeholder whose journal turns out to have been compacted into a
+/// successor elsewhere is replaced by that successor's session, which does
+/// not hold the placeholder's journal: every id that reached the
+/// placeholder (its own, and the old id aliased to it) reaches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_placeholder_replaced_by_a_successor_keeps_every_id_that_reached_it() {
+    let home = Home::new();
+    let host = boot().await;
+    let s = host
+        .create_session(SessionConfig {
+            compaction_policy: CompactionPolicyWire::LinkedSuccessor,
+            ..pcfg()
+        })
+        .await
+        .unwrap();
+    let n = s.journal_id();
+    let mut t = attach(&s).await;
+    turn(&mut t, "hello 0").await;
+    turn(&mut t, "hello 1").await;
+    t.send(SessionCommand::Compact { instructions: None })
+        .await
+        .unwrap();
+    until(&mut t, |e| matches!(e, SessionEventWire::Idle)).await;
+    let n2 = s.journal_id();
+    assert_ne!(n2, n, "compacted into a successor");
+    end(&mut t).await;
+    wait_gone(&host, &s.id).await;
+
+    let d = start_daemon(Arc::clone(&host), &home, None).await;
+    let sock = d.paths.sock.clone();
+    let old = "20261101-000000-01d0";
+    d.state
+        .insert(placeholder(&SessionId::from(n.as_str()), resume(&n)));
+    d.state
+        .reload_aliases
+        .lock()
+        .unwrap()
+        .insert(old.into(), n.clone());
+
+    let snap = attach_existing(sock.clone(), SessionId::from(old))
+        .await
+        .expect("attached");
+    assert_eq!(snap.meta.journal_id, n2, "the successor");
+    let successor = snap.meta.id.clone();
+    for id in [n.as_str(), old] {
+        let again = attach_existing(sock.clone(), SessionId::from(id))
+            .await
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert_eq!(again.meta.id, successor, "{id}");
+    }
+    stop(d).await;
+}
+
+/// A reload record whose journal cannot be continued comes back as a fresh
+/// session. The conversation the record carried (its journal, what it
+/// superseded, its start) is not that session's: grafted on, `--continue`
+/// of the old journal would attach to an empty session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_fresh_fallback_never_holds_the_conversation_it_replaced() {
+    let home = Home::new();
+    let host = boot().await;
+    let d = start_daemon(Arc::clone(&host), &home, None).await;
+    let gone = "20261101-000000-g0ne";
+    let start = chrono::DateTime::parse_from_rfc3339("2026-11-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut rec = record(gone, gone);
+    rec.supersedes = vec!["20261031-000000-p4st".into()];
+    rec.created_at = Some(start);
+    agent_engine::daemon::reload::rehydrate(&d.state, &reload_state(vec![rec])).await;
+
+    let fresh = d
+        .state
+        .attach(&SessionId::from(gone))
+        .expect("recreated fresh, reached by alias");
+    assert_ne!(fresh.id.as_str(), gone);
+    let cell = fresh.journal();
+    assert!(!fresh.holds(gone) && cell.supersedes.is_empty(), "{cell:?}");
+    assert_ne!(cell.created_at, start, "its own start");
+    stop(d).await;
+}

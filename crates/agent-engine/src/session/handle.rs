@@ -196,7 +196,8 @@ impl std::fmt::Debug for SessionHandle {
 }
 
 /// One running retry of a placeholder ([`SessionHandle::retry_guard`]).
-pub struct RetryGuard(Arc<AtomicUsize>);
+#[must_use = "the retry ends when the guard drops"]
+pub(crate) struct RetryGuard(Arc<AtomicUsize>);
 
 impl Drop for RetryGuard {
     fn drop(&mut self) {
@@ -349,7 +350,7 @@ impl SessionHandle {
 
     /// F23: mark one real `create` of this placeholder as running until the
     /// guard drops (also when the retrying future is dropped mid-await).
-    pub fn retry_guard(&self) -> RetryGuard {
+    pub(crate) fn retry_guard(&self) -> RetryGuard {
         self.retrying.fetch_add(1, Ordering::AcqRel);
         RetryGuard(Arc::clone(&self.retrying))
     }
@@ -728,10 +729,11 @@ pub mod locked_placeholder {
     /// Spawn a placeholder actor for session `id` whose journal is locked
     /// by `holder_desc` (e.g. `"pid 1234 (tui)"`). The handle starts
     /// Parked; Attach emits `AttachRefused` naming the holder. The caller
-    /// registers it in the session map under the SAME id — no alias.
+    /// registers it under the id a real session on its journal would take
+    /// (`EngineHost::adopt_for_journal`), aliasing the old id to it.
     ///
     /// It holds the conversation `config` continues, which after a `/clear`
-    /// is not `id`, with what the reload record knew of it
+    /// is not the old actor id, with what the reload record knew of it
     /// (`restore_conversation`: what it superseded, its start).
     pub fn spawn(
         id: SessionId,

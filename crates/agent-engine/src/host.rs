@@ -607,14 +607,15 @@ impl EngineHost {
     /// The actor id a new session on `journal` takes: the journal id,
     /// unless an alive session already has that id — after `/clear` the
     /// cleared actor keeps its id while its old conversation is resumed —
-    /// then a minted one. A placeholder being retried does not count: the
-    /// real session replaces it under its id. Called under `create_lock`.
+    /// then a minted one. A placeholder being retried for `journal` does
+    /// not count: its real session replaces it under its id
+    /// ([`keeps_id`]). Called under `create_lock`.
     pub(crate) fn actor_id_for(&self, journal: &str) -> SessionId {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let taken = |id: &str| {
             sessions
                 .get(&SessionId::from(id))
-                .is_some_and(|h| h.is_alive() && !h.retrying())
+                .is_some_and(|h| keeps_id(h, journal))
         };
         if !taken(journal) {
             return SessionId::from(journal);
@@ -626,6 +627,21 @@ impl EngineHost {
                 return SessionId::from(id);
             }
         }
+    }
+
+    /// Register a session built outside [`Self::create_session`] (a reload's
+    /// lock-held placeholder) under the id a real session on `journal`
+    /// would take ([`Self::actor_id_for`]), under the create lock: it never
+    /// replaces a session already registered, whatever id that one took.
+    pub(crate) async fn adopt_for_journal(
+        &self,
+        journal: &str,
+        build: impl FnOnce(SessionId) -> SessionHandle,
+    ) -> SessionHandle {
+        let _serial = self.create_lock.lock().await;
+        let handle = build(self.actor_id_for(journal));
+        self.adopt_session(handle.clone());
+        handle
     }
 
     /// Handle for a live session, if any.
@@ -850,6 +866,14 @@ fn holder(handles: &[SessionHandle], c: &str) -> Option<SessionHandle> {
     handles.iter().find(|h| h.holds(c)).cloned()
 }
 
+/// Whether `h` keeps the id it is registered under from a new actor on
+/// `journal`: it is alive, unless it is a placeholder being retried for
+/// that very conversation (its real session replaces it under its id).
+/// A retrying placeholder still keeps its id from any other conversation.
+fn keeps_id(h: &SessionHandle, journal: &str) -> bool {
+    h.is_alive() && !(h.retrying() && h.holds(journal))
+}
+
 #[cfg(test)]
 mod driver_grant_tests {
     use super::*;
@@ -952,6 +976,33 @@ mod driver_grant_tests {
         release_all(&grants, &a);
         assert_eq!(grants.lock().unwrap().len(), 1);
         assert!(grants.lock().unwrap().contains_key("plugin2"));
+    }
+}
+
+#[cfg(test)]
+mod keeps_id_tests {
+    use super::keeps_id;
+    use crate::session::{SessionConfig, SessionId};
+
+    /// A placeholder for `N` registered under `A`, being retried: its id is
+    /// free for `N`'s real session only, never for a create of `A`.
+    #[tokio::test]
+    async fn a_retrying_placeholder_frees_its_id_for_its_own_conversation_only() {
+        let (placeholder, _task) = crate::session::handle::locked_placeholder::spawn(
+            SessionId::from("A"),
+            SessionConfig {
+                continue_session: Some(Some("N".into())),
+                ..SessionConfig::default()
+            },
+            "pid 1 (tui)".into(),
+        );
+        assert!(keeps_id(&placeholder, "A") && keeps_id(&placeholder, "N"));
+        let _retrying = placeholder.retry_guard();
+        assert!(
+            !keeps_id(&placeholder, "N"),
+            "its real session takes the id"
+        );
+        assert!(keeps_id(&placeholder, "A"), "another conversation does not");
     }
 }
 

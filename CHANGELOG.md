@@ -29,7 +29,9 @@ All notable changes to this project will be documented in this file.
 - **Daemon: a reload that finds a cleared session's journal locked brings
   the right conversation back.** Once the lock was free, the next attach
   loaded the conversation from before the `/clear` instead of the one the
-  session held.
+  session held. The waiting session no longer replaces a session restored
+  before it under the same id (the old conversation, resumed after the
+  `/clear`), which dropped that session from the list.
 
 ## [0.12.0] — 2026-11-14
 

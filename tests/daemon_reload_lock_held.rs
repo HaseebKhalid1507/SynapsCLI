@@ -274,10 +274,10 @@ async fn reload_lock_held_keeps_same_id_parked_and_refuses_attach() {
 }
 
 /// After `/clear` the actor's id (`A`) is not its conversation (`N`). A
-/// reload that finds `N` locked registers the placeholder under `A`
-/// holding `N`, and the attach once the lock is free gets `N` back, never
-/// the pre-clear conversation `A`. A later reconnect by `A` reaches it too
-/// (the alias a reload would have set).
+/// reload that finds `N` locked registers the placeholder holding `N`
+/// under `N`'s id, with the alias `A → N`. An attach by `A` once the lock
+/// is free gets `N` back, never the pre-clear conversation `A`, and so
+/// does a later reconnect by `A`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn reload_lock_held_after_clear_retries_the_cleared_conversation() {
@@ -347,10 +347,10 @@ async fn reload_lock_held_after_clear_retries_the_cleared_conversation() {
         .expect("sessions");
     let row = metas
         .iter()
-        .find(|m| m.id == a)
-        .expect("the placeholder, under the actor id");
+        .find(|m| m.journal_id == n)
+        .expect("the placeholder holds the cleared conversation");
     assert!(row.locked_by.is_some(), "{row:?}");
-    assert_eq!(row.journal_id, n, "it holds the cleared conversation");
+    assert_eq!(row.id.as_str(), n, "under the id its real session takes");
     assert!(
         metas.iter().all(|m| m.journal_id != a.as_str()),
         "nothing holds the pre-clear conversation: {metas:?}"

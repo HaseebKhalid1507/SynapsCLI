@@ -215,8 +215,11 @@ pub struct DaemonState {
     /// The flock, held here (not on `Daemon`) so `reload` can hand its fd
     /// to the next image.
     pub lock_fd: Mutex<Option<DaemonLock>>,
-    /// `old id → new id` for one generation (ids differ only if a
-    /// LinkedSuccessor compaction happened since boot).
+    /// `old id → new id` for one generation: a session restored under
+    /// another id than it had (its journal id after a LinkedSuccessor
+    /// compaction or a `/clear`/`/resume`, or a minted one; a lock-held
+    /// placeholder's id), and a placeholder replaced by its real session
+    /// under another id. Consulted only when no live session has the id.
     pub reload_aliases: Mutex<HashMap<String, String>>,
     /// The `daemon.json` record this image wrote, and its writes. A Ping
     /// that finds the file missing or naming another pid puts it back
@@ -299,9 +302,9 @@ impl DaemonState {
     }
 
     /// Live handle by id; falls back to the C3 reload alias
-    /// (`old id → new id`, set when a LinkedSuccessor compaction happened
-    /// since boot) so clients reconnecting after `daemon reload` find
-    /// their session under the id they last saw.
+    /// (`old id → new id`, [`Self::reload_aliases`]) so clients
+    /// reconnecting after `daemon reload` find their session under the id
+    /// they last saw.
     pub fn attach(&self, id: &SessionId) -> Option<SessionHandle> {
         self.host.attach(id).filter(|h| h.is_alive()).or_else(|| {
             let alias = self
@@ -338,10 +341,11 @@ impl DaemonState {
     /// (its config's `continue_session`: after a `/clear` that is not its
     /// actor id). The placeholder stays listed meanwhile, flagged
     /// `retrying` so the host's attach-if-live short-circuit does not hand
-    /// it straight back and its id is free for the real session. Success
-    /// replaces the placeholder: in place under the same id, or under the
-    /// journal id with the reload alias `id → journal id` a reload would
-    /// have set; still-held ends the retry and the caller attaches to it
+    /// it straight back and its id is free for its real session. Success
+    /// replaces the placeholder: in place (rehydrate registered it under
+    /// the id the real session takes), or, when the journal resolved to its
+    /// successor, under that one's id with the alias `old id → new id`.
+    /// Still held: the retry ends and the caller attaches to the placeholder
     /// (→ `AttachRefused` naming the holder).
     pub async fn retry_locked_placeholder(&self, placeholder: SessionHandle) -> SessionHandle {
         let journal = placeholder.journal_id();
@@ -350,39 +354,47 @@ impl DaemonState {
             .cloned()
             .unwrap_or_default();
         cfg.continue_session = Some(Some(journal.clone()));
-        let created = {
-            let _retrying = placeholder.retry_guard();
-            (self.factory)(cfg).await
-        };
-        match created {
-            Ok(real) if real.id == placeholder.id || real.holds(&journal) => {
-                tracing::info!(session = %placeholder.id, journal, "daemon: locked journal released — placeholder replaced by the real session");
-                if real.id != placeholder.id {
-                    self.remove(&placeholder);
-                    self.reload_aliases
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(placeholder.id.0.clone(), real.id.0.clone());
-                }
-                self.insert(real.clone());
-                // A restored owned session: the daemon accepts connections.
-                if real.is_owned() {
-                    arm_owner_rebind(&real).await;
-                }
-                real
-            }
-            Ok(other) => {
-                // Journal resolved somewhere else (e.g. compacted_into follow): keep it, drop the placeholder.
-                tracing::warn!(session = %placeholder.id, resolved = %other.id, "daemon: placeholder retry resolved to a different id");
-                self.remove(&placeholder);
-                self.insert(other.clone());
-                other
-            }
+        // Held until the placeholder is replaced, not just across the
+        // create: until then the real session and the placeholder are both
+        // listed, and only the mark keeps resolvers off the placeholder.
+        let _retrying = placeholder.retry_guard();
+        let real = match (self.factory)(cfg).await {
+            Ok(real) => real,
             Err(e) => {
                 tracing::debug!(session = %placeholder.id, error = %e, "daemon: journal still locked; keeping placeholder");
-                placeholder
+                return placeholder;
             }
+        };
+        // The real session holds the journal (replaced in place, its id
+        // being the one the placeholder took), or the journal resolved to
+        // its on-disk successor (`compacted_into`), a session that does not
+        // hold it. Either way it replaces the placeholder, and the old id
+        // reaches it by alias.
+        let same = real.holds(&journal);
+        if same {
+            tracing::info!(session = %placeholder.id, journal, "daemon: locked journal released — placeholder replaced by the real session");
+        } else {
+            tracing::warn!(session = %placeholder.id, resolved = %real.id, "daemon: placeholder retry resolved to another conversation");
         }
+        if real.id != placeholder.id {
+            self.remove(&placeholder);
+            // Every id that reached the placeholder reaches its successor:
+            // its own, and the old ids aliased to it at rehydrate.
+            let mut aliases = self
+                .reload_aliases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for to in aliases.values_mut().filter(|to| **to == placeholder.id.0) {
+                *to = real.id.0.clone();
+            }
+            aliases.insert(placeholder.id.0.clone(), real.id.0.clone());
+        }
+        self.insert(real.clone());
+        // A restored owned session: the daemon accepts connections.
+        if same && real.is_owned() {
+            arm_owner_rebind(&real).await;
+        }
+        real
     }
 
     pub fn request_shutdown(&self, force: bool) {
