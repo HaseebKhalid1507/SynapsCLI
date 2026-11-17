@@ -306,6 +306,22 @@ impl DaemonState {
         self.host.session_handles()
     }
 
+    /// The `Pong` reply (`Ping`, `Purge`): pid, uptime, live sessions, and
+    /// one row per required guard, its process checked live (none when the
+    /// config requires none).
+    pub async fn pong(&self) -> crate::session::wire::DaemonFrame {
+        let gate = std::sync::Arc::clone(self.host.parts().hook_bus.required_guards());
+        let required_guards = gate.health().await;
+        let required_guards_configured = gate.configured();
+        crate::session::wire::DaemonFrame::Pong {
+            pid: std::process::id(),
+            uptime_s: self.uptime_s(),
+            sessions: self.live_sessions().len(),
+            required_guards,
+            required_guards_configured,
+        }
+    }
+
     /// Listing metas with lifecycle / clients / input_owner / journal_id
     /// (B4: `EngineHost::sessions()` fills the handle cells).
     pub fn session_metas(&self) -> Vec<SessionMeta> {

@@ -281,9 +281,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             Ok(Read::Frame(ClientFrame::Ping)) => {
                 // `daemon status` and `daemon reload` read daemon.json after a Ping.
                 state.heal_daemon_json();
-                let _ = tx
-                    .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
-                    .await;
+                let _ = tx.send(state.pong().await).await;
             }
             Ok(Read::Frame(ClientFrame::Sessions)) => {
                 let _ = tx.send(DaemonFrame::SessionList { sessions: state.session_metas() }).await;
@@ -371,9 +369,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             // C2: jemalloc purge in the daemon (bench hygiene); reply Pong.
             Ok(Read::Frame(ClientFrame::Purge)) => {
                 agent_core::core::memstat::purge_arenas();
-                let _ = tx
-                    .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
-                    .await;
+                let _ = tx.send(state.pong().await).await;
             }
             // `synaps auth state`: the host broker's in-memory account state.
             Ok(Read::Frame(ClientFrame::AuthState(query))) => {
@@ -784,9 +780,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             Ok(Read::Frame(ClientFrame::Ping)) => {
                 // `daemon status` and `daemon reload` read daemon.json after a Ping.
                 state.heal_daemon_json();
-                let _ = tx
-                    .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
-                    .await;
+                let _ = tx.send(state.pong().await).await;
             }
             Ok(Read::Frame(ClientFrame::Sessions)) => {
                 let _ = tx.send(DaemonFrame::SessionList { sessions: state.session_metas() }).await;

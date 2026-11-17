@@ -122,6 +122,8 @@ impl Tool for SubagentTool {
 
         let label = super::subagent_label(agent_name.as_deref(), params["name"].as_str());
         let telemetry = telemetry.map(|t| t.for_worker(&label, &orchestration_id));
+        // Captured here, in the calling tool call's task, for the worker thread.
+        let worker_hooks = super::WorkerHooks::of(&ctx.capabilities, &orchestration_id);
         let task_preview: String = task.chars().take(80).collect();
 
         tracing::info!(
@@ -185,6 +187,8 @@ impl Tool for SubagentTool {
                     // write premium (~2× input price) on them is unrecoverable waste
                     // (~$0.23 per 10-spawn fan-out). (#110)
                     super::apply_subagent_runtime_policy(&mut runtime, &config, memory_backend.as_ref(), session_allow_all.as_ref(), telemetry.as_ref(), &workspace);
+                    // Required guards see this worker's tool calls too.
+                    worker_hooks.apply(&mut runtime, &config);
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
                     runtime.set_model(model);
                     super::fit_subagent_context_window(&mut runtime);

@@ -12,6 +12,9 @@ pub mod start;
 pub mod status;
 pub mod steer;
 
+#[cfg(test)]
+mod worker_hooks_tests;
+
 pub use authorize_model::SubagentModelAuthorizeTool;
 pub use collect::SubagentCollectTool;
 pub use models::SubagentModelsTool;
@@ -230,6 +233,119 @@ pub(crate) fn apply_subagent_runtime_policy(
     // The model is not chosen yet: `fit_subagent_context_window` drops a
     // window the worker's model cannot open once it is.
     runtime.set_context_window(config.context_window);
+}
+
+/// What a subagent-starting tool call learns of the chat that made it: the
+/// chat's hook bus and its confirm policy. The stream scopes it
+/// ([`CALLER_HOOKS`]) around each tool call it runs, so the tool can route
+/// its worker's `before_tool_call` hooks to that chat's chain
+/// ([`WorkerHooks`]).
+#[derive(Clone)]
+pub(crate) struct CallerHooks {
+    /// The calling chat's hook bus (the host's, in a daemon).
+    pub(crate) bus: std::sync::Arc<crate::extensions::hooks::HookBus>,
+    /// The `auto_approve_confirms` of the calling chat's turn.
+    pub(crate) auto_approve: bool,
+}
+
+tokio::task_local! {
+    /// The calling chat's hooks for the tool call running in this task.
+    pub(crate) static CALLER_HOOKS: CallerHooks;
+}
+
+/// Where a worker's `before_tool_call` hooks go while required guards are
+/// configured: its caller's hook chain, run on the caller's runtime, with
+/// the caller's conversation id and the worker's id on each event; and a
+/// `Confirm` is answered by the caller's confirm step (its prompt, its
+/// auto-approve policy, its "Allow all" latch, which the worker already
+/// shares). So a worker's call gets the answer its caller would get for
+/// the same call, and a required guard sees every tool call a subagent
+/// makes.
+///
+/// Captured from the caller's tool call (the stream's [`CALLER_HOOKS`]
+/// scope, else the tool context's own hook bus) before the worker thread
+/// starts, and applied to the worker's runtime before its stream, on all
+/// three spawn paths, after [`apply_subagent_runtime_policy`].
+///
+/// With no required guard configured nothing is applied: a worker keeps
+/// its output-transform view of the host's hooks, as ever. With one
+/// configured and no route captured, the worker's bus stays one that holds
+/// no guard, and refuses every tool call ([`HookBus::emit`]'s check that a
+/// bus holds each required guard): a worker never runs without them.
+///
+/// [`HookBus::emit`]: crate::extensions::hooks::HookBus::emit
+#[derive(Clone)]
+pub(crate) struct WorkerHooks {
+    route: Option<(CallerHooks, tokio::runtime::Handle)>,
+    session_id: Option<String>,
+    prompt: Option<crate::tools::SecretPromptHandle>,
+    subagent_id: String,
+}
+
+impl WorkerHooks {
+    /// Capture the route of the calling tool call; `subagent_id` is the
+    /// worker's id as its caller sees it (`sa_N`). Must run in the calling
+    /// tool call's task (where [`CALLER_HOOKS`] is in scope), not on the
+    /// worker's thread.
+    pub(crate) fn of(caller: &crate::tools::ToolCapabilities, subagent_id: &str) -> Self {
+        let route = CALLER_HOOKS
+            .try_with(Clone::clone)
+            .ok()
+            .or_else(|| {
+                // A tool context made outside the stream's scoped dispatch
+                // (an extension model's tool loop): the chat's bus, and no
+                // auto-approve (a `Confirm` then needs the chat's prompt).
+                caller.hook_bus.clone().map(|bus| CallerHooks {
+                    bus,
+                    auto_approve: false,
+                })
+            })
+            .zip(tokio::runtime::Handle::try_current().ok());
+        Self {
+            route,
+            session_id: caller.session_id.clone(),
+            prompt: caller.secret_prompt.clone(),
+            subagent_id: subagent_id.to_string(),
+        }
+    }
+
+    /// Route `runtime`'s `before_tool_call` hooks to the caller while
+    /// required guards are configured (the caller's gate, the worker's, or
+    /// the config's `required_guards`).
+    ///
+    /// `subagent_transform_hooks = false` (an empty bus on the runtime)
+    /// does not get a worker out of it: the route replaces that bus and
+    /// keeps only what the transform view held, which is nothing then. Must
+    /// run after [`apply_subagent_runtime_policy`].
+    pub(crate) fn apply(&self, runtime: &mut crate::Runtime, config: &crate::config::SynapsConfig) {
+        let Some((caller, host)) = &self.route else {
+            return;
+        };
+        let guarded = !config.required_guards.is_empty()
+            || caller.bus.required_guards().configured()
+            || runtime.hook_bus().required_guards().configured();
+        if !guarded {
+            return;
+        }
+        // `bind_worker_hooks` replaces the bus wholesale, so keep the host's
+        // output-transform view already on the runtime (the spawn path's
+        // `worker_hook_bus`, or the empty bus `subagent_transform_hooks =
+        // false` left): it only ever narrows.
+        let route = crate::extensions::hooks::HookBus::worker_route(
+            std::sync::Arc::clone(&caller.bus),
+            host.clone(),
+            self.session_id.clone(),
+            self.subagent_id.clone(),
+        )
+        .with_worker_transforms_of(runtime.hook_bus());
+        runtime.bind_worker_hooks(
+            std::sync::Arc::new(route),
+            crate::runtime::WorkerConfirm {
+                prompt: self.prompt.clone(),
+                auto_approve: caller.auto_approve,
+            },
+        );
+    }
 }
 
 /// The window a worker on `model` runs with, given the configured

@@ -13,6 +13,7 @@ use super::info::PluginInfo;
 use super::manifest::{ExtensionConfigEntry, ExtensionManifest};
 use super::providers::{ProviderRegistry, RegisteredProvider, RegisteredProviderSummary};
 use super::permissions::{Permission, PermissionSet};
+use super::required_guards::NotLoaded;
 use super::runtime::process::ProcessExtension;
 use super::runtime::{ExtensionHandler, ExtensionHealth};
 use serde_json::{Map, Value};
@@ -67,13 +68,63 @@ fn installed_plugin_setup_failure_in(
     }
 }
 
+/// A required guard loads only from the base dir's `plugins/` (the first of
+/// [`plugin_roots`]). Any later root (a project's `.synaps/plugins/`, which
+/// would override it) holding an entry of its name, of any kind, is a
+/// shadow: the guard is not loaded ([`NotLoaded::Shadowed`]) and neither
+/// copy runs. The shadow's path, if any.
+fn guard_shadow(name: &str) -> Option<PathBuf> {
+    if !crate::extensions::required_guards::valid_guard_name(name) {
+        return None;
+    }
+    plugin_roots()
+        .into_iter()
+        .skip(1)
+        .map(|root| root.join(name))
+        .find(|dir| std::fs::symlink_metadata(dir).is_ok())
+}
+
+/// Why required guard `name` has no plugin folder discovery loads: only a
+/// folder with a name discovery skips holds it (`name.disabled`,
+/// `name.backup.<ts>`, ... in any root), or no root has it at all.
+fn missing_guard_cause(name: &str) -> NotLoaded {
+    let prefix = format!("{name}.");
+    for root in plugin_roots() {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut skipped: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(&prefix) && is_inert_plugin_dir_name(n))
+            .collect();
+        skipped.sort();
+        if let Some(folder) = skipped.into_iter().next() {
+            return NotLoaded::SkipRenamed(folder);
+        }
+    }
+    let roots: Vec<String> = plugin_roots().iter().map(|r| r.display().to_string()).collect();
+    NotLoaded::Absent(roots.join(", "))
+}
+
+/// The cause for required guard `id` whose `plugin.json` gave no
+/// `extension` block (`read_extension_manifest` returned `Ok(None)`).
+fn no_extension_cause(plugin_dir: &std::path::Path) -> NotLoaded {
+    let manifest = plugin_dir.join(".synaps-plugin").join("plugin.json");
+    NotLoaded::BadManifest(if manifest.is_file() {
+        format!("{} has no `extension` block", manifest.display())
+    } else {
+        format!("there is no {}", manifest.display())
+    })
+}
+
 /// The directories discovery walks, in override order: the user's
 /// `plugins/`, then the project's `.synaps/plugins/` (unless disabled). A
 /// plugin directory in a later root replaces one of the same name earlier.
 fn plugin_roots() -> Vec<PathBuf> {
     let mut roots = vec![crate::config::base_dir().join("plugins")];
     if !project_plugins_disabled() {
-        if let Ok(cwd) = std::env::current_dir() {
+        if let Some(cwd) = project_dir() {
             let project_plugins = cwd.join(".synaps").join("plugins");
             if project_plugins != roots[0] {
                 roots.push(project_plugins);
@@ -81,6 +132,26 @@ fn plugin_roots() -> Vec<PathBuf> {
         }
     }
     roots
+}
+
+/// Tests: the directory standing in for the process's cwd as the project
+/// root of [`plugin_roots`] (`None`: the real cwd). Set only by a test
+/// holding `serial(synaps_base_dir)` (changing the real cwd would race every
+/// test that reads a relative path).
+#[cfg(test)]
+static PROJECT_DIR_FOR_TESTS: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// The project root [`plugin_roots`] looks in: the process's cwd.
+fn project_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = PROJECT_DIR_FOR_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return Some(dir);
+    }
+    std::env::current_dir().ok()
 }
 
 /// The registry entries (name, current tool) of `names` that exist.
@@ -469,6 +540,62 @@ impl ExtensionManager {
         manifest: &ExtensionManifest,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
+        if self.is_loaded(id) {
+            return Err(format!("Extension '{}' is already loaded", id));
+        }
+        let loaded = self.load_with_cwd_unmarked(id, manifest, cwd).await;
+        self.mark_required_load(id, manifest, &loaded);
+        loaded
+    }
+
+    /// Record a load of `id`, when it is a required guard: loaded (its live
+    /// handler, which the gate checks at every call) only when it runs as a
+    /// process and subscribes a `before_tool_call` hook; otherwise not
+    /// loaded, with the cause.
+    fn mark_required_load(&self, id: &str, manifest: &ExtensionManifest, loaded: &Result<(), String>) {
+        let gate = self.hook_bus.required_guards();
+        if !gate.is_required(id) {
+            return;
+        }
+        let validated = manifest.validate(id);
+        let cause = match (loaded, &validated) {
+            (Err(_), Err(invalid)) => NotLoaded::BadManifest(invalid.clone()),
+            (Err(error), Ok(_)) => NotLoaded::FailedStart(error.clone()),
+            (Ok(()), Err(invalid)) => NotLoaded::BadManifest(invalid.clone()),
+            (Ok(()), Ok(validated)) => {
+                let guards = validated
+                    .subscriptions
+                    .iter()
+                    .any(|(kind, ..)| *kind == super::hooks::events::HookKind::BeforeToolCall);
+                match self.extensions.get(id) {
+                    Some(handler) if guards => {
+                        tracing::info!(guard = %id, "required guard loaded");
+                        gate.mark_loaded(id, Arc::clone(handler));
+                        return;
+                    }
+                    Some(_) => NotLoaded::NoGuardHook,
+                    None => NotLoaded::FailedStart("it loaded without a running process".into()),
+                }
+            }
+        };
+        gate.mark_not_loaded(id, cause);
+    }
+
+    /// A refused [`Self::reload_from_disk`] of required guard `id` that is
+    /// not loaded now names the refusal's cause (a loaded one is still
+    /// running and keeps its state).
+    fn mark_required_refusal(&self, id: &str, cause: NotLoaded) {
+        if !self.is_loaded(id) {
+            self.hook_bus.required_guards().mark_not_loaded(id, cause);
+        }
+    }
+
+    async fn load_with_cwd_unmarked(
+        &mut self,
+        id: &str,
+        manifest: &ExtensionManifest,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<(), String> {
         let deferred: Vec<String> = self
             .deferred_records()
             .lock()
@@ -661,9 +788,12 @@ impl ExtensionManager {
         //    never does).
         // Legacy manifests (no `deferred` block) and flag-off stay on the
         // documented eager path byte-for-byte.
+        // A required guard always starts eagerly: a deferred one has no
+        // process to check live, and its first start could fail open.
         let class = crate::extensions::lifecycle::classify(manifest);
         if self.progressive_deferral
             && class != crate::extensions::lifecycle::ExtensionClass::LegacyEager
+            && !self.hook_bus.required_guards().is_required(id)
         {
             let declared_tool_names: Vec<String> = manifest
                 .deferred
@@ -783,11 +913,18 @@ impl ExtensionManager {
             }
             // Permission-validated hook subscriptions with the lazy
             // handler: the first AUTHORIZED matching event acquires.
-            for (kind, tool_filter, matcher) in subscriptions {
+            for (kind, tool_filter, matcher, on_failure) in subscriptions {
                 let handler = lazy.clone().expect("subscriptions imply a lazy handler");
                 if let Err(error) = self
                     .hook_bus
-                    .subscribe(kind, handler, tool_filter, matcher, permissions.clone())
+                    .subscribe_with_failure_policy(
+                        kind,
+                        handler,
+                        tool_filter,
+                        matcher,
+                        permissions.clone(),
+                        on_failure,
+                    )
                     .await
                 {
                     unwind_deferred!();
@@ -954,14 +1091,15 @@ impl ExtensionManager {
         };
 
         // Register hook subscriptions
-        for (kind, tool_filter, matcher) in subscriptions {
+        for (kind, tool_filter, matcher, on_failure) in subscriptions {
             self.hook_bus
-                .subscribe(
+                .subscribe_with_failure_policy(
                     kind,
                     handler.clone(),
                     tool_filter,
                     matcher,
                     permissions.clone(),
+                    on_failure,
                 )
                 .await?;
         }
@@ -1310,6 +1448,9 @@ impl ExtensionManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(id);
         if let Some(record) = deferred {
+            self.hook_bus
+                .required_guards()
+                .mark_not_loaded(id, NotLoaded::Unloaded);
             // Record removed FIRST: any concurrent lease acquisition now
             // fails closed (NotDeferred) regardless of the steps below.
             if let Some(runtime) = self.extension_runtime.get() {
@@ -1357,6 +1498,11 @@ impl ExtensionManager {
             .extensions
             .remove(id)
             .ok_or_else(|| format!("Extension '{}' not found", id))?;
+        // A required guard is not loaded from here (unload, reload, stop
+        // all) until a load marks it again.
+        self.hook_bus
+            .required_guards()
+            .mark_not_loaded(id, NotLoaded::Unloaded);
 
         self.hook_bus.unsubscribe_all(id).await;
         self.providers.unregister_plugin(id);
@@ -1497,7 +1643,24 @@ impl ExtensionManager {
             ));
         }
         let was_loaded = self.is_loaded(id);
+        // A required guard never loads from a root other than the base dir's;
+        // a shadow refuses the reload and refuses every tool call, a running
+        // instance or not (it is the shadow that is wrong).
+        if self.hook_bus.required_guards().is_required(id) {
+            if let Some(shadow) = guard_shadow(id) {
+                let cause = NotLoaded::Shadowed(shadow.display().to_string());
+                self.hook_bus.required_guards().mark_not_loaded(id, cause);
+                return Err(refuse(
+                    format!(
+                        "'{id}' is a required guard, and {} would override its folder in the base dir's plugins/",
+                        shadow.display()
+                    ),
+                    "Remove the other plugin folder, then reload it",
+                ));
+            }
+        }
         let Some(plugin_dir) = locate_plugin_dir(id) else {
+            self.mark_required_refusal(id, missing_guard_cause(id));
             let roots = plugin_roots()
                 .iter()
                 .map(|r| r.display().to_string())
@@ -1513,6 +1676,7 @@ impl ExtensionManager {
             .iter()
             .any(|d| d == id)
         {
+            self.mark_required_refusal(id, NotLoaded::Disabled);
             return Err(refuse(
                 format!("'{id}' is disabled (disabled_plugins in config)"),
                 "Remove it from disabled_plugins first",
@@ -1523,14 +1687,20 @@ impl ExtensionManager {
             crate::skills::state::PluginsState::load_from(&state_path).unwrap_or_default()
         };
         if let Some(message) = installed_plugin_setup_failure_in(&plugins_state, id) {
+            let cause = NotLoaded::FailedStart(format!("post-install setup failed: {message}"));
+            self.mark_required_refusal(id, cause);
             return Err(refuse(
                 format!("Post-install setup failed: {message}"),
                 "Open /plugins, reinstall or update the plugin after fixing setup",
             ));
         }
-        let (resolved, manifest_path, json) = match read_extension_manifest(id, &plugin_dir)? {
+        let read = read_extension_manifest(id, &plugin_dir).inspect_err(|failure| {
+            self.mark_required_refusal(id, NotLoaded::BadManifest(failure.reason.clone()));
+        });
+        let (resolved, manifest_path, json) = match read? {
             Some(read) => read,
             None => {
+                self.mark_required_refusal(id, no_extension_cause(&plugin_dir));
                 return Err(ExtensionLoadFailure::new(
                     id,
                     Some(plugin_dir.join(".synaps-plugin").join("plugin.json")),
@@ -1540,6 +1710,7 @@ impl ExtensionManager {
             }
         };
         if let Err(e) = resolved.validate(id) {
+            self.mark_required_refusal(id, NotLoaded::BadManifest(e.clone()));
             return Err(ExtensionLoadFailure::new(
                 id,
                 Some(manifest_path),
@@ -2185,6 +2356,27 @@ impl ExtensionManager {
             }
         }
 
+        // A required guard discovery cannot find is not loaded: only a
+        // skip-renamed folder holds it, or there is none. One another root
+        // shadows is not loaded either, from any root.
+        let required = Arc::clone(self.hook_bus.required_guards());
+        for name in required.names() {
+            if let Some(shadow) = guard_shadow(&name) {
+                plugin_dirs.remove(&name);
+                let shown = shadow.display().to_string();
+                tracing::warn!(guard = %name, shadow = %shown, "a required guard is shadowed by another plugin root; neither copy loads");
+                required.mark_not_loaded(&name, NotLoaded::Shadowed(shown.clone()));
+                failed.push(ExtensionLoadFailure::new(
+                    name.clone(),
+                    Some(shadow),
+                    format!("'{name}' is a required guard, and {shown} would override its folder in the base dir's plugins/"),
+                    "Remove the other plugin folder, then reload it",
+                ));
+            } else if !plugin_dirs.contains_key(&name) {
+                required.mark_not_loaded(&name, missing_guard_cause(&name));
+            }
+        }
+
         let mut plugin_dirs: Vec<(String, PathBuf)> = plugin_dirs.into_iter().collect();
         plugin_dirs.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -2199,10 +2391,13 @@ impl ExtensionManager {
         for (plugin_name, plugin_dir) in plugin_dirs {
             if disabled_plugins.iter().any(|d| d == &plugin_name) {
                 tracing::debug!(plugin = %plugin_name, "Extension disabled via disabled_plugins config");
+                required.mark_not_loaded(&plugin_name, NotLoaded::Disabled);
                 continue;
             }
             if let Some(message) = installed_plugin_setup_failure_in(&plugins_state, &plugin_name) {
                 tracing::warn!(plugin = %plugin_name, error = %message, "Skipping extension with failed post-install setup");
+                let cause = NotLoaded::FailedStart(format!("post-install setup failed: {message}"));
+                required.mark_not_loaded(&plugin_name, cause);
                 failed.push(ExtensionLoadFailure::new(
                     plugin_name,
                     None,
@@ -2214,8 +2409,13 @@ impl ExtensionManager {
             let (resolved, manifest_path, json) =
                 match read_extension_manifest(&plugin_name, &plugin_dir) {
                     Ok(Some(read)) => read,
-                    Ok(None) => continue,
+                    Ok(None) => {
+                        required.mark_not_loaded(&plugin_name, no_extension_cause(&plugin_dir));
+                        continue;
+                    }
                     Err(failure) => {
+                        let cause = NotLoaded::BadManifest(failure.reason.clone());
+                        required.mark_not_loaded(&plugin_name, cause);
                         failed.push(failure);
                         continue;
                     }
@@ -2253,6 +2453,9 @@ impl ExtensionManager {
         (loaded, failed)
     }
 }
+
+#[cfg(test)]
+mod required_guard_tests;
 
 #[cfg(test)]
 mod invoke_command_collected_tests {
@@ -2446,6 +2649,7 @@ mod tests {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
                 matcher: None,
+                on_failure: None,
             }],
             config: vec![],
         };
@@ -2488,6 +2692,7 @@ mod tests {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
                 matcher: None,
+                on_failure: None,
             }],
             config: vec![],
         };
@@ -2573,6 +2778,7 @@ mod tests {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
                 matcher: None,
+                on_failure: None,
             }],
             config: vec![],
         };
@@ -2609,6 +2815,7 @@ mod tests {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
                 matcher: None,
+                on_failure: None,
             }],
             config: vec![],
         };
@@ -2750,6 +2957,7 @@ mod tests {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
                 matcher: None,
+                on_failure: None,
             }],
             config: vec![crate::extensions::manifest::ExtensionConfigEntry {
                 key: "region".to_string(),

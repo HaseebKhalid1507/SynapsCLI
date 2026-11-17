@@ -213,6 +213,13 @@ pub(super) struct StreamSession {
     pub(super) env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
+    /// The prompt and auto-approve policy that answer a `before_tool_call`
+    /// `Confirm`: `secret_prompt` / `auto_approve_confirms`, except on a
+    /// worker with routed hooks, where they are its caller's (see
+    /// [`crate::runtime::WorkerConfirm`]). Used only at the two hook
+    /// resolve sites; the tools' capabilities keep `secret_prompt`.
+    pub(super) hook_confirm_prompt: Option<crate::tools::SecretPromptHandle>,
+    pub(super) hook_auto_approve: bool,
     /// Session "Allow all" latch shared with the owning [`Runtime`].
     pub(super) session_allow_all: Arc<crate::tools::SessionConfirmLatch>,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
@@ -780,6 +787,8 @@ impl StreamMethods {
             env_warned,
             secret_prompt,
             auto_approve_confirms,
+            hook_confirm_prompt,
+            hook_auto_approve,
             session_allow_all,
             telemetry_level,
             orchestration,
@@ -2360,8 +2369,8 @@ impl StreamMethods {
                                         cwd.as_deref(),
                                     )
                                     .await,
-                                    secret_prompt.as_ref(),
-                                    auto_approve_confirms,
+                                    hook_confirm_prompt.as_ref(),
+                                    hook_auto_approve,
                                     Some(&session_allow_all),
                                 )
                                 .await;
@@ -2387,7 +2396,11 @@ impl StreamMethods {
                                         &input,
                                         cwd.as_deref(),
                                     );
-                                    match await_tool_call(&cancel, tool.execute_rich(input, dispatch_tools.for_call(Some(tx_d)))).await {
+                                    // The tool may start a subagent: its worker's
+                                    // `before_tool_call` runs THIS chain (see
+                                    // `tools::CallerHooks`).
+                                    let caller_hooks = crate::tools::CallerHooks { bus: hook_bus.clone(), auto_approve: hook_auto_approve };
+                                    match await_tool_call(&cancel, crate::tools::CALLER_HOOKS.scope(caller_hooks, tool.execute_rich(input, dispatch_tools.for_call(Some(tx_d))))).await {
                                         (Some(res), _) => {
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks) = match res {
@@ -2733,12 +2746,12 @@ impl StreamMethods {
                         let turn_completion_inner = turn_completion.clone();
                         let dispatch_tools_inner = dispatch_tools.clone();
                         let hook_bus_inner = hook_bus.clone();
-                        let prompt_inner = secret_prompt.clone();
+                        let prompt_inner = hook_confirm_prompt.clone();
                         let model_inner = model.clone();
                         let cwd_inner = cwd.clone();
                         let session_id_inner = session_id.clone();
                         let tool_spill_inner = tool_spill.clone();
-                        let auto_approve_inner = auto_approve_confirms;
+                        let auto_approve_inner = hook_auto_approve;
                         let session_allow_all_inner = session_allow_all.clone();
 
                         join_set.spawn(async move {
@@ -2832,7 +2845,8 @@ impl StreamMethods {
                                     );
                                     let tx_d = delta_channel.sender;
 
-                                    match await_tool_call(&cancel_token, t.execute_rich(input, dispatch_tools_inner.for_call(Some(tx_d)))).await {
+                                    let caller_hooks = crate::tools::CallerHooks { bus: hook_bus_inner.clone(), auto_approve: auto_approve_inner };
+                                    match await_tool_call(&cancel_token, crate::tools::CALLER_HOOKS.scope(caller_hooks, t.execute_rich(input, dispatch_tools_inner.for_call(Some(tx_d))))).await {
                                         (Some(res), _) => {
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks, errored) = match res {
@@ -4537,6 +4551,8 @@ mod rich_output_tests {
             env_warned: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
+            hook_confirm_prompt: None,
+            hook_auto_approve: true,
             session_allow_all: Arc::new(crate::tools::SessionConfirmLatch::new()),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
@@ -6606,6 +6622,8 @@ mod rich_output_tests {
             env_warned: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
+            hook_confirm_prompt: None,
+            hook_auto_approve: true,
             session_allow_all: Arc::new(crate::tools::SessionConfirmLatch::new()),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
@@ -9100,6 +9118,7 @@ mod rich_output_tests {
                     s.hook_bus = bus;
                     s.cwd = Some(cwd_path);
                     s.auto_approve_confirms = false;
+                    s.hook_auto_approve = false;
                 })
                 .await;
                 assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep\n", "{filter}");
