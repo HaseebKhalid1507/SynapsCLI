@@ -57,6 +57,9 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// session, so they are gated on [`FEATURE_OWNED_SESSIONS`] in
 /// `Welcome.features` instead: the client refuses to ask a daemon that
 /// does not list it.
+/// The capture-scrub announcement ([`FEATURE_CAPTURE_SCRUB`]) is additive
+/// too: an older daemon lists nothing, and a client reads that as "not
+/// announced".
 pub const PROTOCOL_VERSION: u32 = 3;
 
 /// `Welcome.features` entry: this daemon honours `Attach::Create{owned}`,
@@ -104,15 +107,34 @@ pub const FEATURE_TURN_ORIGIN: &str = "turn_origin";
 /// `owner_claim {owner_bound: false, reason: "unsupported"}`.
 pub const FEATURE_TURN_ORIGIN_OWNER: &str = "turn_origin_owner";
 
+/// `Welcome.features` entry: every capture-class hook payload this daemon
+/// hands an extension is screened first, and withheld when it cannot be
+/// (`extensions::hooks::capture_scrub`). Listed only while the screen works
+/// ([`capture_scrub::is_active`]), so a client that keys on it never reads
+/// it from a daemon whose screen is missing. The exact string is the
+/// contract; `synaps daemon status --json` reports it as `capture_scrub`.
+///
+/// [`capture_scrub::is_active`]: crate::extensions::hooks::capture_scrub::is_active
+pub const FEATURE_CAPTURE_SCRUB: &str = "capture_scrub_v1";
+
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
-    vec![
+    features_with(crate::extensions::hooks::capture_scrub::is_active())
+}
+
+/// [`daemon_features`] for a screen that works (`capture_scrub_active`) or not.
+fn features_with(capture_scrub_active: bool) -> Vec<String> {
+    let mut features = vec![
         FEATURE_OWNED_SESSIONS.to_string(),
         FEATURE_SESSION_WORKERS.to_string(),
         FEATURE_SESSION_PAGE.to_string(),
         FEATURE_TURN_ORIGIN.to_string(),
         FEATURE_TURN_ORIGIN_OWNER.to_string(),
-    ]
+    ];
+    if capture_scrub_active {
+        features.push(FEATURE_CAPTURE_SCRUB.to_string());
+    }
+    features
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
@@ -2876,6 +2898,38 @@ mod tests {
         assert!(new.supports(FEATURE_TURN_ORIGIN_OWNER));
         assert_eq!(FEATURE_TURN_ORIGIN_OWNER, "turn_origin_owner");
         assert_eq!(daemon_features().iter().filter(|f| *f == "turn_origin_owner").count(), 1);
+    }
+
+    /// The announcement is a contract with clients: the exact string, listed
+    /// by a daemon whose screen works, absent from an older daemon's
+    /// `Welcome`, and with no change to the protocol version.
+    #[test]
+    fn capture_scrub_is_announced_as_the_exact_pinned_string() {
+        assert_eq!(FEATURE_CAPTURE_SCRUB, "capture_scrub_v1");
+        assert_eq!(PROTOCOL_VERSION, 3, "an additive feature, not a protocol change");
+        let features = daemon_features();
+        assert_eq!(features.iter().filter(|f| *f == "capture_scrub_v1").count(), 1, "{features:?}");
+        assert!(features.iter().any(|f| f == FEATURE_OWNED_SESSIONS), "{features:?}");
+        let inactive = features_with(false);
+        assert!(!inactive.iter().any(|f| f == FEATURE_CAPTURE_SCRUB), "{inactive:?}");
+        assert!(inactive.iter().any(|f| f == FEATURE_OWNED_SESSIONS), "{inactive:?}");
+        let mut w = Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "v".into(),
+            pid: 1,
+            profile: None,
+            sessions: vec![],
+            progressive_tool_disclosure: false,
+            generation: 1,
+            daemon_build: String::new(),
+            features: Vec::new(),
+            boot_id: String::new(),
+        };
+        let json = |w: &Welcome| serde_json::from_str::<Welcome>(&serde_json::to_string(w).unwrap()).unwrap();
+        assert!(!json(&w).supports(FEATURE_CAPTURE_SCRUB), "an older daemon lists nothing");
+        w.features = features;
+        assert!(json(&w).supports("capture_scrub_v1"));
+        assert!(!json(&w).supports("capture_scrub"), "the feature is matched exactly");
     }
 }
 

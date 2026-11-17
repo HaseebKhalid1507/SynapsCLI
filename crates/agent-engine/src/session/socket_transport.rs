@@ -92,6 +92,9 @@ pub struct Pong {
     /// Whether the daemon requires any guard at all (`false` from an older
     /// daemon, which does not report it).
     pub required_guards_configured: bool,
+    /// The daemon announced [`FEATURE_CAPTURE_SCRUB`] in its `Welcome`.
+    /// `false` for a daemon that did not (an older one).
+    pub capture_scrub: bool,
 }
 
 /// What `synaps auth state` got from the daemon.
@@ -250,6 +253,25 @@ impl Connected {
             .ok_or(TransportError::Closed)
     }
 
+    /// A `Pong` with what this connection's `Welcome` announced.
+    fn pong(
+        &self,
+        pid: u32,
+        uptime_s: u64,
+        sessions: usize,
+        required_guards: Vec<crate::session::wire::RequiredGuardHealth>,
+        required_guards_configured: bool,
+    ) -> Pong {
+        Pong {
+            pid,
+            uptime_s,
+            sessions,
+            required_guards,
+            required_guards_configured,
+            capture_scrub: self.welcome.supports(FEATURE_CAPTURE_SCRUB),
+        }
+    }
+
     pub async fn ping(&mut self) -> Result<Pong, TransportError> {
         match self.request(ClientFrame::Ping).await? {
             DaemonFrame::Pong {
@@ -258,7 +280,7 @@ impl Connected {
                 sessions,
                 required_guards,
                 required_guards_configured,
-            } => Ok(Pong { pid, uptime_s, sessions, required_guards, required_guards_configured }),
+            } => Ok(self.pong(pid, uptime_s, sessions, required_guards, required_guards_configured)),
             other => Err(TransportError::Protocol(format!("expected pong, got {other:?}"))),
         }
     }
@@ -302,7 +324,7 @@ impl Connected {
                 sessions,
                 required_guards,
                 required_guards_configured,
-            } => Ok(Pong { pid, uptime_s, sessions, required_guards, required_guards_configured }),
+            } => Ok(self.pong(pid, uptime_s, sessions, required_guards, required_guards_configured)),
             DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
             other => Err(TransportError::Protocol(format!("expected pong, got {other:?}"))),
         }

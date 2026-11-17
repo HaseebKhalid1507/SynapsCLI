@@ -247,6 +247,12 @@ session gives them: it is bound to the connection that created it.
 - **Capability**: a daemon that honours it lists `"owned_sessions"` in
   `Welcome.features` (absent on older daemons → empty). `PROTOCOL_VERSION` stays
   exact-match and is not bumped, so older TUIs still reconnect after a reload.
+- **Capture screen**: a daemon whose hook screen is compiled in and works lists
+  the exact string `"capture_scrub_v1"` in `Welcome.features`, and
+  `synaps daemon status --json` has `"capture_scrub": true` (`false` when the
+  daemon does not answer or is older). Nothing else changes on the wire; a
+  client that sends chat text only to a screened daemon keys on the feature
+  (see [the capture screen](extensions/hooks.md#the-capture-screen)).
   A client asking for an owned session checks the feature **before** sending
   the attach and fails with `DaemonTooOld` ("… predates owned sessions; run
   `synaps daemon reload`") instead of getting an unowned session. It also
@@ -781,7 +787,7 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page"], boot_id?}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page","capture_scrub_v1"], boot_id?}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions,required_guards?,required_guards_configured?} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error

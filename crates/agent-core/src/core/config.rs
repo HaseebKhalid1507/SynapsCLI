@@ -1481,6 +1481,10 @@ pub struct SynapsConfig {
     /// [`load_config`] holds the default file's list and the profile's
     /// together ([`read_required_guards`]).
     pub required_guards: Vec<String>,
+    /// Extra credential prefixes (`capture_scrub_prefixes`, comma-separated)
+    /// the capture scrub withholds on top of its built-in rules. Add-only:
+    /// nothing in config can switch a built-in rule off.
+    pub capture_scrub_prefixes: Vec<String>,
     pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
     /// Opt-in progressive tool disclosure (Task 18). When false, providers
@@ -1583,6 +1587,7 @@ impl Default for SynapsConfig {
             identity: None,
             disabled_plugins: Vec::new(),
             required_guards: Vec::new(),
+            capture_scrub_prefixes: Vec::new(),
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
             progressive_tool_disclosure: false,
@@ -1714,6 +1719,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "identity",
     "disabled_plugins",
     "required_guards",
+    "capture_scrub_prefixes",
     "favorite_models",
     "disabled_skills",
     "disabled_tools",
@@ -2461,6 +2467,9 @@ fn apply_config_content_with(
             }
             "required_guards" => {
                 config.required_guards = parse_comma_list(val);
+            }
+            "capture_scrub_prefixes" => {
+                config.capture_scrub_prefixes = parse_comma_list(val);
             }
             "favorite_models" => {
                 config.favorite_models = parse_comma_list(val);
@@ -5214,6 +5223,19 @@ context_window = 200k\n\
         let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-theme");
 
         assert_eq!(config.theme.as_deref(), Some("dracula"));
+    }
+
+    /// `capture_scrub_prefixes` is a comma list, empty by default, and a
+    /// later line replaces an earlier one like every other list key.
+    #[test]
+    fn capture_scrub_prefixes_parse_as_a_comma_list() {
+        assert!(load_config_from_str("model = x\n").capture_scrub_prefixes.is_empty());
+        assert_eq!(
+            load_config_from_str("capture_scrub_prefixes = acme_, corp-key- ,\n")
+                .capture_scrub_prefixes,
+            vec!["acme_".to_string(), "corp-key-".to_string()]
+        );
+        assert!(config_content_problems("capture_scrub_prefixes = acme_\n").is_empty());
     }
 
     #[test]

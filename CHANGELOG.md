@@ -259,6 +259,30 @@ All notable changes to this project will be documented in this file.
   required, workers behave as before. See
   [docs/extensions/hooks.md](docs/extensions/hooks.md#required-guards).
 
+### Security
+
+- **Capture screen for extension hooks.** The hook bus now screens the text of
+  `after_tool_call`, `before_message`, `on_message_complete`, `on_compaction`,
+  `on_session_end`, `on_context_archived` and `on_memory_forgotten` before any
+  extension sees it, on every delivery route. A message or tool output that holds
+  a credential (a known key shape, a private-key block, a JWT, a credential-named
+  value, a URL with credentials, an opaque high-entropy token) is dropped whole,
+  not masked; transcripts reach a capture extension as visible text only (no
+  thinking, tool blocks, injected context or extension-supplied context), and inline `<think>` reasoning is
+  cut out of messages, replies, summaries and tool output. A compaction summary
+  is not delivered as a `before_message`; an event message is, screened and
+  marked as an event (`data.message_kind`), and is kept out of capture
+  transcripts. An `on_compaction` summary is sent only when `compaction_exclude` includes
+  `thinking`. A payload that cannot be screened is
+  not delivered. An extension cannot disable or narrow it; the new config key
+  `capture_scrub_prefixes` (comma separated) only adds prefixes of your own
+  (unusable entries get one startup warning with their count). See
+  [the capture screen](docs/extensions/hooks.md#the-capture-screen), which also
+  lists what it does not cover.
+- **Announced on the wire.** A daemon with the screen working lists
+  `capture_scrub_v1` in `Welcome.features`, and `synaps daemon status --json`
+  prints `"capture_scrub": true`. The daemon protocol stays v3.
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel

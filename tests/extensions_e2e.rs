@@ -1407,12 +1407,17 @@ async fn installed_extension_receives_on_compaction_as_observe_only() {
         "unexpected discovery failures: {failed:?}"
     );
 
+    // The host marks a summary written without the model's thinking; only
+    // such a summary is sent to extensions.
     let event = HookEvent::on_compaction(
         "old-session",
         "new-session",
         "Summary text",
         12,
-        serde_json::json!({"source": "manual"}),
+        serde_json::json!({
+            "source": "manual",
+            (synaps_cli::extensions::hooks::capture_scrub::COMPACTION_THINKING_EXCLUDED): true,
+        }),
     );
     let result = hook_bus.emit(&event).await;
     assert!(

@@ -408,7 +408,7 @@ const SECRET_VALUE_PREFIXES: &[&str] = &[
 
 const REDACTED: &str = "[REDACTED]";
 
-fn key_is_secret(key: &str) -> bool {
+pub(crate) fn key_is_secret(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     SECRET_KEY_MARKERS.iter().any(|m| lower.contains(m))
 }
@@ -559,7 +559,17 @@ fn apply_rules(s: &str, rules: &Rules) -> Option<String> {
 ///   required: `-u alice`, `docker -u 1000:1000` are left alone);
 /// - `mysql`/`mariadb` `-pSECRET` (attached, lower-case `-p`) and
 ///   `sshpass -p X`, anchored to those commands (`mkdir -p`,
-///   `ssh -p 2222`, `docker -p 8080:80` untouched).
+///   `ssh -p 2222`, `docker -p 8080:80` untouched);
+/// - a known credential prefix (`sk-`, `sk-ant`, `ghp_`/`gho_`/`ghu_`/
+///   `ghs_`/`ghr_`, `github_pat_`, `glpat-`, `xox[abposre]-`, `AKIA`,
+///   `ASIA`, `AIza`, `ya29.`, `npm_`, `eyJ`, `hf_`, …) wherever it starts
+///   after a non-alphanumeric byte (`KEY=sk-…`, `` `ghp_…` ``, `'glpat-…'`,
+///   `(xoxb-…)`, `"AIza…"`), with 16+ token bytes after it. A body of only
+///   lower-case letters and separators is an identifier, not a credential
+///   (`hf_hub_enable_hf_transfer`, `--sk-color-primary-hover`);
+/// - a credential-named assignment (`[export ]NAME=value`, `NAME: value`,
+///   `"name": "value"`, the name ending in key/token/secret/password/passwd,
+///   any case): see [`keyed_value_is_secret`] for which values count.
 fn scrub_secret_patterns(s: &str) -> Option<String> {
     use std::sync::LazyLock;
     static PRECISE: LazyLock<Rules> = LazyLock::new(|| {
@@ -589,7 +599,100 @@ fn scrub_secret_patterns(s: &str) -> Option<String> {
             (r"(\bsshpass\s+-p\s*)\S+".to_string(), "${1}[REDACTED]"),
         ])
     });
-    apply_rules(s, &PRECISE)
+    static PREFIXED: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(^|[^A-Za-z0-9])((?:sk-|sk_|gh[pousr]_|github_pat_|glpat-|xox[abposre]-|shpat_|shpss_|AKIA|ASIA|AIza|ya29\.|npm_|eyJ|hf_)([A-Za-z0-9._-]{16,}))",
+        )
+        .expect("static redaction pattern")
+    });
+    static KEYED: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)\b((?:[a-z0-9]+[_-])*(?:api_?key|key|token|secret|password|passwd))(["']?\s*[=:]\s*)([^\s&]+)"#,
+        )
+        .expect("static redaction pattern")
+    });
+    let precise = apply_rules(s, &PRECISE);
+    let base = precise.as_deref().unwrap_or(s);
+    let prefixed = PREFIXED.replace_all(base, |caps: &regex::Captures<'_>| {
+        if caps[3]
+            .bytes()
+            .any(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            format!("{}{REDACTED}", &caps[1])
+        } else {
+            caps[0].to_string()
+        }
+    });
+    let keyed = KEYED.replace_all(&prefixed, |caps: &regex::Captures<'_>| {
+        // A quoted value ends at its closing quote; a bare one sheds
+        // trailing punctuation (`KEY=x,` / `(KEY=x)` / `KEY=x.`).
+        let value = &caps[3];
+        let (lead, core) = match value.chars().next() {
+            Some(quote @ ('"' | '\'' | '`')) => {
+                let inner = &value[1..];
+                (1, inner.find(quote).map_or(inner, |end| &inner[..end]))
+            }
+            _ => (
+                0,
+                value.trim_end_matches([
+                    ',', ';', '.', ':', '!', '?', '"', '\'', '`', ')', ']', '}',
+                ]),
+            ),
+        };
+        if keyed_value_is_secret(&caps[1], &caps[2], core) {
+            let tail = &value[lead + core.len()..];
+            format!("{}{}{}{REDACTED}{tail}", &caps[1], &caps[2], &value[..lead])
+        } else {
+            caps[0].to_string()
+        }
+    });
+    (keyed != s).then(|| keyed.into_owned())
+}
+
+/// Whether the value of a credential-named assignment is a credential.
+/// Never: an empty value, a template or placeholder (`$X`, `%X%`, `<x>`,
+/// `{x}`, `***`), code (`load()?`, `Option<String>`, `&str`) or an
+/// already-redacted value. Always: an exact `password=`/`passwd=`/`token=`/
+/// `secret=`/`api_key=`/`apikey=` (no spaces, any case), and a `password`/
+/// `passwd` value holding a digit or a symbol (`password: hunter2`).
+/// Otherwise (`MY_KEY=value_in_docs`, `max_tokens: 4096`, `password: String`
+/// stay) a value of 8+ bytes with a letter that is either long (16+) or
+/// mixed (an upper-case letter with a digit), or 24+ bytes with no digit.
+fn keyed_value_is_secret(name: &str, separator: &str, value: &str) -> bool {
+    if value.is_empty() || value.starts_with(['$', '%', '*', '<', '{', '[']) {
+        return false;
+    }
+    let name = name.to_ascii_lowercase();
+    if separator == "="
+        && matches!(
+            name.as_str(),
+            "password" | "passwd" | "token" | "secret" | "api_key" | "apikey"
+        )
+    {
+        return true;
+    }
+    if value.starts_with(['#', '@', '/', '.'])
+        || value.contains(['(', ')', '[', ']', '{', '}', '<', '>', '&', '$', '%'])
+    {
+        return false;
+    }
+    if matches!(name.as_str(), "password" | "passwd")
+        && value
+            .bytes()
+            .any(|b| b.is_ascii_digit() || !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+    {
+        return true;
+    }
+    let len = value.len();
+    let digits = value.bytes().filter(u8::is_ascii_digit).count();
+    let upper = value.bytes().any(|b| b.is_ascii_uppercase());
+    if len < 8 || !value.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    if digits == 0 {
+        return len >= 24;
+    }
+    upper || len >= 16
 }
 
 /// Free-text scrub through the shared, high-precision rules
@@ -916,6 +1019,66 @@ fn sweep_expired_captures_except(dir: &Path, keep: Option<&Path>) -> u64 {
         }
     }
     removed
+}
+
+/// Test-only: the letters and digits, both cases, built at runtime.
+#[cfg(test)]
+pub(crate) fn alnum() -> String {
+    ('A'..='Z').chain('a'..='z').chain('0'..='9').collect()
+}
+
+/// Test-only canary of `len` bytes over `alphabet`, built at runtime so the
+/// repository holds no credential-shaped literal.
+#[cfg(test)]
+pub(crate) fn shaped(alphabet: &str, len: usize, salt: usize) -> String {
+    let chars: Vec<char> = alphabet.chars().collect();
+    (0..len)
+        .map(|i| chars[(i * 17 + salt) % chars.len()])
+        .collect()
+}
+
+/// Credential shapes for the shared screen's pins (this module's and the
+/// capture scrub's): `(text, canary)`, the canary placed after `=`, `:`, a
+/// quote, a backtick or a bracket, in an `export`/`KEY:` assignment, URL
+/// userinfo or an `Authorization: Bearer` header.
+#[cfg(test)]
+pub(crate) fn credential_test_rows() -> Vec<(String, String)> {
+    const UP: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const DIG: &str = "0123456789";
+    let letters = alnum();
+    let c = |len: usize, salt: usize| shaped(&letters, len, salt);
+    let rows = [
+        (c(40, 1), concat!("ANTHROPIC_API_KEY=sk", "-ant-api03-{}")),
+        (c(40, 2), "OPENAI_API_KEY=sk-proj-{}"),
+        (c(36, 3), "GITHUB_TOKEN=ghp_{}"),
+        (c(36, 4), "use `ghp_{}` for the push"),
+        (c(20, 5), "the token is 'glpat-{}' here"),
+        (c(40, 6), "AWS_SECRET_ACCESS_KEY={}"),
+        (c(24, 7), "slack (xoxb-{}) bot"),
+        (c(35, 8), "{\"key\": \"AIza{}\"}"),
+        (
+            format!("{}.eyJ{}.{}", c(20, 9), c(30, 23), c(43, 24)),
+            "\"eyJ{}\"",
+        ),
+        (c(32, 10), "API_KEY: {}"),
+        (c(32, 11), "export STRIPE_SECRET_KEY={}"),
+        (c(18, 12), "git clone https://deploy:{}@git.example.com/o/r"),
+        (c(32, 13), "curl -H 'Authorization: Bearer {}' https://a"),
+        (c(48, 14), "key=sk-{}"),
+        (c(36, 15), "cfg:gho_{}"),
+        (c(36, 16), "[ghs_{}]"),
+        (c(40, 17), "url=github_pat_{}"),
+        (c(28, 18), "<xoxp-{}>"),
+        (shaped(UP, 16, 19), "id=AKIA{}"),
+        (c(34, 20), "HF_HOME=x;hf_{}"),
+        (
+            format!("{}-{}", shaped(DIG, 12, 21), c(24, 22)),
+            "token:xoxb-{}",
+        ),
+    ];
+    rows.into_iter()
+        .map(|(canary, shape)| (shape.replacen("{}", &canary, 1), canary))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1386,6 +1549,65 @@ mod tests {
         assert!(
             flat.contains("https://x.test/cb#access_token="),
             "url shape kept"
+        );
+    }
+
+    /// Hugging Face tokens (`hf_` + 30-40 letters/digits) are a shared-screen
+    /// rule. The canary is built at runtime, so the repository holds no
+    /// credential-shaped literal.
+    #[test]
+    fn redaction_covers_hugging_face_tokens() {
+        let letters: Vec<char> = ('A'..='Z').chain('a'..='z').collect();
+        let body: String = (0..34).map(|i| letters[(i * 17 + 5) % 52]).collect();
+        let hf = format!("hf_{body}");
+        let digits = format!("hf_{}", "Ab1".repeat(12));
+        let mut value = serde_json::json!({
+            "env": format!("HF_TOKEN={hf}"),
+            "out": [format!("cat ~/.cache/huggingface/token\n{hf}\n"), format!("'{digits}'")],
+            "lib": "from huggingface_hub import hf_hub_download, hf_transfer",
+        });
+        assert_eq!(redact_value(&mut value), 3);
+        let flat = value.to_string();
+        assert!(!flat.contains(&hf) && !flat.contains(&digits), "{flat}");
+        assert_eq!(value["env"], "HF_TOKEN=[REDACTED]");
+        assert_eq!(value["out"][1], "'[REDACTED]'");
+        assert_eq!(
+            value["lib"],
+            "from huggingface_hub import hf_hub_download, hf_transfer"
+        );
+        assert_eq!(
+            redact_text(&format!("token {hf} ok")),
+            "token [REDACTED] ok"
+        );
+    }
+
+    #[test]
+    fn shared_screen_catches_credentials_after_any_non_alphanumeric() {
+        for (text, canary) in credential_test_rows() {
+            let out = redact_text(&text);
+            assert!(!out.contains(&canary), "{canary} survived in {out}");
+            assert!(out.contains(REDACTED), "{out}");
+            let mut value = serde_json::json!({ "text": text });
+            assert_eq!(redact_value(&mut value), 1, "{text}");
+        }
+        // Identifiers, code and prose around the same prefixes and names stay.
+        for ok in [
+            "hf_hub_enable_hf_transfer is on",
+            "--sk-color-primary-hover-dark: red;",
+            "set max_tokens: 4096",
+            "password: String,",
+            "let token = load()?;",
+            "MY_KEY=value_in_docs",
+            "primary key: the id column",
+            "api_key: &str,",
+            "token=$TOKEN and password=${PASSWORD} and secret=[REDACTED]",
+            "PWD=/home/user/project",
+        ] {
+            assert_eq!(redact_text(ok), ok, "over-redacted");
+        }
+        assert_eq!(
+            redact_text("password: hunter22 and MY_KEY=x"),
+            "password: [REDACTED] and MY_KEY=x"
         );
     }
 

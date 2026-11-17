@@ -746,6 +746,9 @@ async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
             "pid": pong.as_ref().map(|p| p.pid).or(info.as_ref().map(|i| i.pid)),
             "uptime_s": pong.as_ref().map(|p| p.uptime_s),
             "sessions": pong.as_ref().map(|p| p.sessions),
+            // `true` only when the daemon answered and announced the capture
+            // scrub (`capture_scrub_v1`); `false` for no answer or an older daemon.
+            "capture_scrub": pong.as_ref().is_some_and(|p| p.capture_scrub),
             "daemon_version": info.as_ref().map(|i| i.daemon_version.clone()),
             "protocol_version": info.as_ref().map(|i| i.protocol_version),
             "profile": info.as_ref().and_then(|i| i.profile.clone()),
@@ -771,6 +774,7 @@ async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
             for line in required_guard_status(p) {
                 println!("{line}");
             }
+            println!("capture scrub: {}", if p.capture_scrub { "on" } else { "not announced" });
         }
     }
     if pong.is_none() {
@@ -1049,7 +1053,14 @@ mod required_guard_status_tests {
     use agent_engine::session::wire::RequiredGuardHealth;
 
     fn pong(configured: bool, rows: Vec<RequiredGuardHealth>) -> Pong {
-        Pong { pid: 1, uptime_s: 2, sessions: 0, required_guards: rows, required_guards_configured: configured }
+        Pong {
+            pid: 1,
+            uptime_s: 2,
+            sessions: 0,
+            required_guards: rows,
+            required_guards_configured: configured,
+            capture_scrub: false,
+        }
     }
 
     /// No required guard reads "configured: no" and has no rows; the

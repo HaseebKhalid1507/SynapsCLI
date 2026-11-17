@@ -467,6 +467,112 @@ What it means, and what it does not:
 - **Removal is not announced.** When the retention sweep later deletes a
   tombstoned note for good, no event is sent.
 
+## The capture screen
+
+A capture or memory extension is sent chat text, tool output and memory
+metadata by hooks. Core screens that text **before the bus hands it to any
+extension**, so a credential that reached a tool result or a message is not
+stored by a plugin. The screen is part of core: a manifest, a config entry or a
+hook result cannot turn it off or thin it out.
+
+It applies to `after_tool_call`, `before_message`, `on_message_complete`,
+`on_compaction`, `on_session_end`, `on_context_archived` and
+`on_memory_forgotten`. It does not apply to `before_tool_call` (a guard has to
+judge the real call; the payload is never withheld) or `on_session_start` (no
+text). It runs for every delivery route of those hooks: the blocking chain, the
+concurrent observers, the notify-only deliveries and the subagent worker view.
+
+- **What is withheld.** Text holding a known credential shape (provider key
+  prefixes, private-key blocks, JWTs, credential-named values, credentials in
+  URLs), an opaque high-entropy token, or one of the extra prefixes in
+  `capture_scrub_prefixes`; and serialized thinking, signature or raw tool
+  blocks.
+- **Dropped, not masked.** A message or text block that needed anything removed
+  is left out whole. Your handler never sees a marker standing in for the secret,
+  and a transcript (`on_session_end`, `on_compaction`) arrives with only the
+  visible text of each message: no `thinking`, `tool_use` or `tool_result`
+  blocks, no injected recall or event text.
+- **Inline reasoning is cut out.** `<think>…</think>` and
+  `<thinking>…</thinking>` spans (any case) are removed from every message,
+  reply, summary and tool output, including a subagent's last reply returned as
+  a tool result. An opening tag that is never closed hides the rest of the text,
+  later blocks of the same message included; a closing tag with no opening one
+  hides what came before it.
+- **Compaction summaries are not delivered as a `before_message`; event
+  messages are, screened, and are kept out of capture transcripts.** A
+  `before_message` whose text is a compaction summary (`<context-summary>`) is
+  not delivered. One whose text is an agent event (`<event …>…</event>`: a
+  `synaps send` event, a subagent's completion notice) is delivered as an
+  event, never as the owner's input: `message` is the text the host wrote, its
+  `<event …>` header and `source` intact, after the same screen as the user's
+  words (a credential withholds it whole, inline reasoning is cut out), and
+  `data` is `{"message_kind": "event", "verified": false}` (the host vouches for
+  no sender). What you inject on it is saved or shown, and neutralized, as on
+  any other message. A transcript leaves both kinds of message out.
+- **Capture transcripts exclude extension-supplied context.** The blocks a
+  `before_message` hook added to a user message (saved extension context and
+  the markers left for turn-only context, told apart from the user's words by
+  the host's `_synaps_hooked` count) are left out of every transcript message,
+  and so is that count: a message arrives as its `role` and the user's own
+  text. A message with none of the user's text left is not delivered. Text the
+  user typed that only looks like a saved block is the user's and is screened
+  like any other text.
+- **The compaction summary needs thinking excluded.** A summary is model text
+  written from the conversation; by default the summarizer is also given the
+  model's thinking, and the summary can restate it. `on_compaction` therefore
+  arrives without its summary text (`message` is absent; the ids, count and
+  `source` still arrive) unless the summary's input held no thinking. To receive
+  it, add `thinking` to `compaction_exclude` in config. The summary is then sent
+  when the conversation also has no inline `<think>` text and any earlier
+  summary folded into it was written with thinking excluded too. The payload's
+  `data.thinking_excluded` says which case applies.
+- **Escapes and the size cap.** Text is also screened with every backslash
+  escape (`\n`, `\t`, `\uXXXX`, …) read as a space, so a key printed right after
+  an escape in a tool's JSON is still found by its prefix. A tool output over the
+  256 KiB hook cap is screened across the cut as well: a key the cut splits is
+  withheld, not half delivered.
+- **Fail closed.** A payload that cannot be screened (no screen on the bus,
+  over the 8 MiB, node or one-second budget, nested too deep, a malformed
+  archive id) is not delivered at all. The host logs the hook, the extension and
+  the reason, never the content.
+- **`capture_scrub_prefixes`** (config, comma separated, default empty) adds
+  prefixes (3 to 64 printable ASCII bytes with no space, at most 64 of them) for
+  credentials of your own organisation. It only adds: no value removes a rule of
+  the screen. Entries that do not fit are ignored with one warning at startup
+  that gives their count, never their values.
+- **Announced.** A daemon with the screen working lists `capture_scrub_v1` in
+  `Welcome.features`; `synaps daemon status --json` prints
+  `"capture_scrub": true`. A client that must not send text to a daemon without
+  the screen checks that feature first.
+
+The names and ids the host sets on a payload (`tool_name`,
+`tool_runtime_name`, `session_id`, `cwd`) are not screened.
+
+What the screening of `after_tool_call` does and does not give you:
+
+- `before_tool_call` is a decision hook and is sent the tool's **input
+  unscreened**. It needs the same `tools.intercept` permission as
+  `after_tool_call`, so screening the input of `after_tool_call` protects nothing
+  against a plugin that subscribes to both.
+- An output that holds a secret is withheld from `after_tool_call` whole, so a
+  transform (`tools.transform_output`) never sees it and cannot redact it: that
+  raw output goes into the chat history unchanged.
+
+What the screen does not cover: it sees text the host puts in a hook payload,
+and protects against extensions that use only what hooks send them.
+It does not see what an extension reads from disk (session files included),
+fetches or computes itself, the arguments of a `tool.call` request, the
+`provider.*`, `command.invoke` and `hook.handle` requests an extension answers,
+or what an extension sends to the host with `memory.append`, `memory.query` or
+`config.*`. A secret that matches no shape and no entropy rule is not detected,
+nor is one disguised: split across fields, blocks or messages, or written with
+zero-width or lookalike characters. Reasoning in shapes core does not produce
+today (structured or double-escaped tags, for example) is not recognised. The
+archive file an `on_context_archived` notice points to is not screened: the
+notice carries its path, and an extension that opens it reads the archived
+conversation as written. Screening a large payload can take up to about a
+second, during which the delivering task waits.
+
 ## `cwd`: the chat's working folder
 
 Every hook event carries `cwd`, and so does every `tool.call` request
