@@ -29,6 +29,9 @@ pub struct CommandChat<'a> {
     /// The environment the chat's tools spawn with. `None` = the process
     /// environment (in-process hosts, where that is the chat's).
     pub env: Option<&'a ToolEnv>,
+    /// The chat's confinement: a shell-backed command is spawned under it,
+    /// and an extension tool's context carries it.
+    pub sandbox: &'a crate::sandbox::SessionSandbox,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,11 +78,14 @@ fn interpolate_slash_args(value: Value, slash_args: &str) -> Value {
 /// Run a plugin command that needs none of the chat's tools. `env` is the
 /// environment a shell-backed command is spawned with: the session's, as
 /// the chat's `bash` gets it; `None` = inherit the process environment. The
-/// command still runs from the plugin's own folder.
+/// command still runs from the plugin's own folder. `sandbox` is the
+/// chat's confinement: a confined chat's command starts confined, or not
+/// at all.
 pub async fn execute_plugin_command(
     command: &RegisteredPluginCommand,
     slash_args: &str,
     env: Option<&ToolEnv>,
+    sandbox: &crate::sandbox::SessionSandbox,
 ) -> crate::Result<PluginCommandOutput> {
     match &command.backend {
         RegisteredPluginCommandBackend::Shell {
@@ -98,6 +104,7 @@ pub async fn execute_plugin_command(
             if let Some(env) = env {
                 cmd.env_clear().envs(env.spawn_vars());
             }
+            sandbox.confine_tokio(&mut cmd).map_err(crate::RuntimeError::Tool)?;
 
             let output = cmd.output().await.map_err(|e| {
                 crate::RuntimeError::Tool(format!(
@@ -169,7 +176,7 @@ pub async fn execute_plugin_command_with_tools(
             stderr: String::new(),
         })
     } else {
-        execute_plugin_command(command, slash_args, chat.env).await
+        execute_plugin_command(command, slash_args, chat.env, chat.sandbox).await
     }
 }
 
@@ -205,6 +212,7 @@ fn command_tool_context(chat: CommandChat<'_>) -> ToolContext {
             session_id: chat.session_id.map(str::to_string),
             hook_bus: None,
             continuation: None,
+            sandbox: chat.sandbox.clone(),
         },
         limits: ToolLimits {
             max_tool_output: 30_000,
@@ -255,7 +263,7 @@ mod tests {
         let root = tempdir();
         let command = cmd("printf", vec!["cwd=%s arg=%s", "."], root);
 
-        let output = execute_plugin_command(&command, "extra", None).await.unwrap();
+        let output = execute_plugin_command(&command, "extra", None, &Default::default()).await.unwrap();
 
         assert_eq!(output.status, Some(0));
         assert_eq!(output.stdout, "cwd=. arg=extra");
@@ -266,7 +274,7 @@ mod tests {
         let root = tempdir();
         let command = cmd("../evil", vec![], root);
 
-        let result = execute_plugin_command(&command, "", None).await;
+        let result = execute_plugin_command(&command, "", None, &Default::default()).await;
 
         assert!(result.is_err());
     }
@@ -284,7 +292,7 @@ mod tests {
             plugin_root: PathBuf::from("/tmp/p"),
         };
 
-        let output = execute_plugin_command(&command, "diff", None).await.unwrap();
+        let output = execute_plugin_command(&command, "diff", None, &Default::default()).await.unwrap();
         assert_eq!(output.status, Some(0));
         assert!(output.stdout.contains("Review: diff"));
     }

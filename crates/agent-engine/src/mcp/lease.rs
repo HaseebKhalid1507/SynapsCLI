@@ -45,6 +45,7 @@ use thiserror::Error;
 use super::connection::{CallError, McpConnection};
 use super::descriptors::{self, server_config_fingerprint};
 use super::McpServerConfig;
+use crate::sandbox::SessionSandbox;
 use crate::tools::activation::SessionId;
 use crate::tools::catalog::SchemaDigest;
 
@@ -166,6 +167,10 @@ pub struct McpRuntimeManager {
     /// Descriptor-cache path for write-back after `tools/list`
     /// (production: profile-resolved default; tests inject a temp path).
     cache_path: Arc<dyn Fn() -> std::path::PathBuf + Send + Sync>,
+    /// Sessions whose servers must start inside the session's write
+    /// confinement (see [`Self::set_session_sandbox`]). A session with no
+    /// entry is unconfined.
+    sandboxes: std::sync::Mutex<HashMap<String, SessionSandbox>>,
 }
 
 impl McpRuntimeManager {
@@ -176,6 +181,40 @@ impl McpRuntimeManager {
             idle_max,
             next_token: std::sync::atomic::AtomicU64::new(1),
             cache_path: Arc::new(descriptors::default_cache_path),
+            sandboxes: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record the write confinement `session`'s servers start under. A
+    /// confined session's servers are never shared with another session (a
+    /// `shared: true` server would otherwise be one child under one
+    /// session's domain for everyone), and are started with the session's
+    /// Landlock domain applied before exec. `Off` clears the entry.
+    pub fn set_session_sandbox(&self, session: &SessionId, sandbox: SessionSandbox) {
+        let mut map = self.sandboxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sandbox.is_off() {
+            map.remove(session.as_str());
+        } else {
+            map.insert(session.as_str().to_string(), sandbox);
+        }
+    }
+
+    fn session_sandbox(&self, session: &SessionId) -> SessionSandbox {
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session.as_str())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The session component of the lease key: a confined session never
+    /// uses the shared key.
+    fn key_session(&self, config: &McpServerConfig, session: &SessionId) -> String {
+        if self.session_sandbox(session).is_off() {
+            lease_session_key(config, session)
+        } else {
+            session.as_str().to_string()
         }
     }
 
@@ -191,7 +230,7 @@ impl McpRuntimeManager {
     /// server keys per session (it has no lease to find anyway).
     fn lease_key(&self, session: &SessionId, server: &str) -> (String, String) {
         let session_key = match (self.config_source)(server) {
-            Some(config) => lease_session_key(&config, session),
+            Some(config) => self.key_session(&config, session),
             None => session.as_str().to_string(),
         };
         (session_key, server.to_string())
@@ -304,6 +343,10 @@ impl McpRuntimeManager {
                 .collect();
             keys.into_iter().filter_map(|k| map.remove(&k)).collect()
         };
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session.as_str());
         let count = removed.len();
         for state in removed {
             Self::cancel_state(state);
@@ -378,7 +421,8 @@ impl McpRuntimeManager {
         }
         self.reap_idle();
 
-        let key = (lease_session_key(&config, session), server.to_string());
+        let sandbox = self.session_sandbox(session);
+        let key = (self.key_session(&config, session), server.to_string());
         let inner: Arc<LeaseInner> = loop {
             // 2. Single-flight acquisition. The guard-scoped decision below
             // returns an owned action, so the map lock is NEVER held across
@@ -461,7 +505,7 @@ impl McpRuntimeManager {
                 }
                 Acquire::Start { token, done_tx } => {
                     let started = self
-                        .start_lease(server, expected_fingerprint, &config)
+                        .start_lease(server, expected_fingerprint, &config, &sandbox)
                         .await
                         .map_err(|e| McpLeaseError::Transport(server.to_string(), e));
                     let ours = {
@@ -563,8 +607,9 @@ impl McpRuntimeManager {
         server: &str,
         fingerprint: &str,
         config: &McpServerConfig,
+        sandbox: &SessionSandbox,
     ) -> Result<Arc<LeaseInner>, String> {
-        let mut conn = McpConnection::start(server, config).await?;
+        let mut conn = McpConnection::start(server, config, sandbox).await?;
         let defs = match conn.list_tools().await {
             Ok(defs) => defs,
             Err(e) => {

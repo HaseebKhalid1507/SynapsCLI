@@ -98,6 +98,20 @@
       "compatibility": "additive hook kind within extension_protocol_version 1 (no version bump): extensions that do not name it are unaffected; an extension that subscribes to it fails to load on a host that predates it (unknown hook kind)",
       "event_data": "{archive_id: 32 lowercase hex, path: absolute path of the archive file | null, project_key: string, message_count: int, source_message_count: int, window: int (the window that starts after the archive), part: int (1-based), parts: int, first_source_index: int, reduced_messages: int}; a window within the limits of one archive is one event with part = parts = 1, first_source_index = 0 and reduced_messages = 0; a window over them is sealed as several archives, one event each, where the parts are consecutive (first_source_index of a part = first_source_index + source_message_count of the one before), source_message_count is that part's share of the window, and reduced_messages counts its messages stored with an oversized payload left out (marked _archive_reduced in the file); session_id is the chat the window belonged to and is always set"
     },
+    "sandbox_policy": {
+      "permission": "sandbox.policy",
+      "tool_filter": false,
+      "actions": [
+        "continue"
+      ],
+      "delivery": "request/answer, not an action: asked once when a session starts under confinement (sandbox.confine = enforce), only of the plugin named by the owner-set sandbox.policy_provider and only when that plugin declares this hook AND holds sandbox.policy; otherwise the session is refused. A hook.handle request whose params carry kind \"sandbox_policy\" plus session_id, workspace (absolute path), cwd (absolute path) and parent_session_id (null for a top-level session). The result IS the answer: {\"write\": [absolute path, ...], \"read\": [absolute path, ...]} or {\"refuse\": \"reason\"}. 5 s timeout. An error, a timeout or an answer that is not exactly that shape (every entry an absolute, canonicalisable path without NUL) refuses the session; nothing is ever guessed or run unconfined.",
+      "semantics": [
+        "the answer can only ADD writable directories beyond the workspace and the host's base set; the host drops every entry that equals, lies under or lies above a protected path (the engine base directory, credential stores, autostart directories, $HOME) and reports each drop",
+        "read is accepted and reported, not enforced in v1",
+        "{\"refuse\": reason} refuses the session with the reason (control and bidi characters stripped, at most 200 characters)"
+      ],
+      "compatibility": "additive hook kind and permission within extension_protocol_version 1 (no version bump): extensions that do not name them are unaffected; an extension that subscribes to it fails to load on a host that predates it (unknown hook kind). The host announces the seam as the Welcome feature sandbox_policy_v1"
+    },
     "on_memory_forgotten": {
       "permission": "session.lifecycle",
       "tool_filter": false,
@@ -119,6 +133,7 @@
     "memory.write",
     "privacy.llm_content",
     "providers.register",
+    "sandbox.policy",
     "session.drive",
     "session.lifecycle",
     "tools.intercept",

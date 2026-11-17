@@ -63,6 +63,7 @@ fn ctx(registry: &Arc<Mutex<SubagentRegistry>>) -> ToolContext {
             session_id: None,
             hook_bus: None,
             continuation: None,
+            sandbox: Default::default(),
         },
         limits: ToolLimits {
             max_tool_output: 30000,

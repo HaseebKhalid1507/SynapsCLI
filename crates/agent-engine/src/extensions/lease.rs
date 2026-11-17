@@ -50,6 +50,7 @@ use super::lifecycle::{
 use super::manager::{DeferredExtensionRecord, SharedDeferredRecords};
 use super::runtime::process::ProcessExtension;
 use super::runtime::ExtensionHandler;
+use crate::sandbox::SessionSandbox;
 use crate::tools::activation::SessionId;
 use crate::tools::catalog::SchemaDigest;
 use agent_core::memory::author::Author;
@@ -219,6 +220,10 @@ pub struct ExtensionRuntimeManager {
     /// shared child process per plugin. Unbound (tests/manual) falls back
     /// to a fixed private scope.
     host_scope: std::sync::OnceLock<SessionId>,
+    /// Sessions whose extension processes must start inside the session's
+    /// write confinement (see [`Self::set_session_sandbox`]). A session with
+    /// no entry is unconfined.
+    sandboxes: std::sync::Mutex<HashMap<String, SessionSandbox>>,
 }
 
 impl ExtensionRuntimeManager {
@@ -232,7 +237,31 @@ impl ExtensionRuntimeManager {
             idle_max,
             next_token: std::sync::atomic::AtomicU64::new(1),
             host_scope: std::sync::OnceLock::new(),
+            sandboxes: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record the write confinement `session`'s extension processes start
+    /// under: the process is started with the session's Landlock domain
+    /// applied before exec, and every restart of it re-applies it. `Off`
+    /// clears the entry. Processes the host starts for itself (hooks,
+    /// providers: the host scope) are not a session's and keep no entry.
+    pub fn set_session_sandbox(&self, session: &SessionId, sandbox: SessionSandbox) {
+        let mut map = self.sandboxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sandbox.is_off() {
+            map.remove(session.as_str());
+        } else {
+            map.insert(session.as_str().to_string(), sandbox);
+        }
+    }
+
+    fn session_sandbox(&self, session: &SessionId) -> SessionSandbox {
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session.as_str())
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Bind the host-scope session identity used by handler-based
@@ -343,6 +372,8 @@ impl ExtensionRuntimeManager {
     }
 
     /// Terminate every lease held by one session. Returns how many.
+    /// The session's recorded confinement goes with them: the last owner is
+    /// gone, and a stream start records it again.
     pub fn terminate_session(&self, session: &SessionId) -> usize {
         let removed: Vec<LeaseState> = {
             let mut map = self
@@ -356,6 +387,10 @@ impl ExtensionRuntimeManager {
                 .collect();
             keys.into_iter().filter_map(|k| map.remove(&k)).collect()
         };
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session.as_str());
         let count = removed.len();
         for state in removed {
             Self::cancel_state(state);
@@ -513,7 +548,13 @@ impl ExtensionRuntimeManager {
                 }
                 Acquire::Start { token, done_tx } => {
                     let started = self
-                        .start_lease(plugin, record, validated, expected_fingerprint.clone())
+                        .start_lease(
+                            plugin,
+                            record,
+                            validated,
+                            expected_fingerprint.clone(),
+                            &self.session_sandbox(session),
+                        )
                         .await;
                     let ours = {
                         let mut map = self
@@ -797,13 +838,15 @@ impl ExtensionRuntimeManager {
         record: &DeferredExtensionRecord,
         validated: &super::manifest::ValidatedExtensionManifest,
         fingerprint: SchemaDigest,
+        sandbox: &SessionSandbox,
     ) -> Result<Arc<LeaseInner>, ExtensionLeaseError> {
         let manifest = &record.manifest;
-        let process = ProcessExtension::spawn_with_cwd(
+        let process = ProcessExtension::spawn_confined(
             plugin,
             &manifest.command,
             &manifest.args,
             record.cwd.clone(),
+            sandbox.clone(),
         )
         .await
         .map_err(|e| ExtensionLeaseError::Transport(plugin.to_string(), bound_detail(&e)))?;
@@ -1185,6 +1228,16 @@ impl ExtensionHandler for LazyExtensionHandler {
             }
             Err(error) => Err(crate::extensions::required_guards::NoAnswer::CallFailed(error)),
         }
+    }
+
+    /// A deferred extension answers a raw `hook.handle` through its live
+    /// lease, starting it first; a failure to start is an `Err` (the
+    /// `sandbox_policy` caller refuses on it).
+    async fn hook_value(&self, params: Value) -> Result<Value, String> {
+        let inner = self.live().await?;
+        let answer = inner.handler.hook_value(params).await;
+        Self::touch(&inner);
+        answer
     }
 
     async fn call_tool_for(

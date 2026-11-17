@@ -321,6 +321,12 @@ enum Command {
         #[command(subcommand)]
         action: cmd::memory::MemoryAction,
     },
+    /// Write confinement for shell commands and file-writing tools (Linux,
+    /// opt-in with `sandbox.confine = enforce` in the config file).
+    Sandbox {
+        #[command(subcommand)]
+        action: cmd::sandbox::SandboxAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -823,6 +829,14 @@ async fn async_main() -> anyhow::Result<()> {
     // env-profiled client never lands on the default profile's daemon.
     let active_profile = synaps_cli::config::get_profile();
     check_profile_applied(cli.profile.as_deref(), active_profile.as_deref())?;
+    // Read-only and daemon-free: `sandbox check` prints the confinement a
+    // session started here would get, and exits 0 (usable or off) or 1.
+    if matches!(cli.command, Some(Command::Sandbox { .. })) {
+        if let Some(Command::Sandbox { action }) = cli.command {
+            std::process::exit(cmd::sandbox::run(action).await);
+        }
+        unreachable!();
+    }
 
     match cli.command {
         None if cli.attach.is_some() => {
@@ -1001,6 +1015,9 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Command::Prompt { .. }) | Some(Command::Memory { .. }) => {
             unreachable!("prompt and memory are dispatched before profile initialization")
+        }
+        Some(Command::Sandbox { .. }) => {
+            unreachable!("sandbox is dispatched right after profile initialization")
         }
         Some(Command::Tools { action }) => {
             cmd::tools::run(action).await?;

@@ -2274,6 +2274,25 @@ impl ExtensionManager {
             .register_with_handler(plugin_id, spec, Some(handler))
     }
 
+    /// Load just the extension named `name` (the way discovery would load
+    /// it: same directory choice, same `disabled_plugins` rule), and nothing
+    /// else. Used by `synaps sandbox check`, which needs the policy provider
+    /// and no other plugin. `Err` says why it could not be loaded.
+    pub async fn load_named(&mut self, name: &str) -> Result<(), String> {
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+            return Err(format!("'{name}' is not a plugin name"));
+        }
+        if crate::config::load_config().disabled_plugins.iter().any(|d| d == name) {
+            return Err(format!("plugin '{name}' is disabled"));
+        }
+        let dir = locate_plugin_dir(name).ok_or_else(|| format!("no plugin named '{name}' is installed"))?;
+        match read_extension_manifest(name, &dir) {
+            Ok(Some((manifest, _path, _json))) => self.load_with_cwd(name, &manifest, Some(dir)).await,
+            Ok(None) => Err(format!("plugin '{name}' has no extension")),
+            Err(failure) => Err(failure.concise_message()),
+        }
+    }
+
     /// Discover and load all extensions from the user and project plugin directories.
     ///
     /// Scans `~/.synaps-cli/plugins/*/.synaps-plugin/plugin.json` and

@@ -68,6 +68,9 @@ pub struct SessionOpts {
     pub cols: Option<u16>,
     pub readiness_timeout_ms: Option<u64>,
     pub idle_timeout: Option<u64>,
+    /// The owning session's write confinement ([`crate::sandbox`]): the
+    /// shell runs under it, whatever it is sent later.
+    pub sandbox: crate::sandbox::SessionSandbox,
 }
 
 /// Result of sending input to a session.
@@ -359,6 +362,11 @@ impl SessionManager {
         if cancel.is_some_and(|c| c.is_cancelled()) {
             return Err(RuntimeError::Tool("Shell canceled before launch".into()));
         }
+        // The session's write confinement, per spawn.
+        let sandbox = opts.sandbox.for_spawn();
+        if let crate::sandbox::SpawnSandbox::Refuse(why) = &sandbox {
+            return Err(RuntimeError::Tool(why.clone()));
+        }
         let probe_cwd = opts.working_directory.clone();
         let probe_env = opts.env;
         let base_env = opts.base_env;
@@ -376,7 +384,7 @@ impl SessionManager {
             return Err(RuntimeError::Tool("Shell canceled before launch".into()));
         }
         let mut pty = PtyHandle::spawn_prepared(
-            &command, opts.working_directory.as_deref(), rows, cols, prepared,
+            &command, opts.working_directory.as_deref(), rows, cols, prepared, sandbox,
         )?;
 
         // --- Build readiness detector (with per-session overrides) ---
@@ -681,6 +689,7 @@ mod tests {
             cols: None,
             readiness_timeout_ms: None,
             idle_timeout: None,
+            sandbox: Default::default(),
         }
     }
 

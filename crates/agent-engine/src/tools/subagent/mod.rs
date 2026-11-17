@@ -102,6 +102,19 @@ pub(crate) struct WorkerWorkspace {
     pub cwd: Option<std::path::PathBuf>,
     pub env: Option<crate::session::types::ToolEnv>,
     pub env_stripped: Vec<String>,
+    /// The parent's write confinement: a worker is never less confined
+    /// than the session that spawned it.
+    pub sandbox: crate::sandbox::SessionSandbox,
+    /// The session that spawned the worker, from the engine's own record of
+    /// the tool call ([`crate::tools::ToolCapabilities::session_id`], filled
+    /// by the host, never by a tool argument): what the sandbox policy
+    /// provider is told as `parent_session_id`.
+    pub parent_session_id: Option<String>,
+    /// The runtime the spawning tool call runs on (the host's). A worker
+    /// runs on its own throwaway current-thread runtime, and the policy
+    /// provider's child process and reader tasks must outlive it, so the
+    /// provider is asked on this one.
+    pub host_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl WorkerWorkspace {
@@ -110,8 +123,44 @@ impl WorkerWorkspace {
             cwd: caps.cwd.clone(),
             env: caps.env.clone(),
             env_stripped: caps.env_stripped.clone(),
+            sandbox: caps.sandbox.clone(),
+            parent_session_id: caps.session_id.clone(),
+            host_runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
+}
+
+/// Hold a worker to a sandbox of its own: with the parent confined, the
+/// policy provider is asked about the worker (its own id and the true id of
+/// the session that spawned it) and the answer is cut to the parent's write
+/// roots. `Off` stays off and a refusing parent stays refusing. An `Err`
+/// means the worker must not run: it is never left less confined than its
+/// parent.
+pub(crate) async fn confine_worker(
+    runtime: &mut crate::Runtime,
+    workspace: &WorkerWorkspace,
+    subagent_id: u64,
+) -> std::result::Result<(), String> {
+    let crate::sandbox::SessionSandbox::Confined(parent) = &workspace.sandbox else {
+        return Ok(());
+    };
+    let Some(host) = crate::EngineHost::current() else {
+        return Err("sandbox: no engine host to ask the policy provider about this worker".to_string());
+    };
+    let Some(runtime_handle) = workspace.host_runtime.clone() else {
+        return Err("sandbox: no host runtime to ask the policy provider about this worker".to_string());
+    };
+    let worker_id = format!("sa_{subagent_id}");
+    let (parent, parent_session_id, cwd) = (parent.clone(), workspace.parent_session_id.clone(), workspace.cwd.clone());
+    // Asked on the host's runtime, not this worker's throwaway one: a
+    // provider that has to be started would otherwise die with the worker.
+    let sandbox = runtime_handle
+        .spawn(async move { host.confine_worker(&parent, &worker_id, parent_session_id.as_deref(), cwd.as_deref()).await })
+        .await
+        .map_err(|_| "sandbox: the policy provider call was cancelled".to_string())?
+        .map_err(|refused| refused.to_string())?;
+    runtime.set_sandbox(sandbox);
+    Ok(())
 }
 
 /// Apply the subagent-spawn credential policy to a freshly-created `Runtime`
@@ -140,6 +189,7 @@ pub(crate) fn apply_subagent_runtime_policy(
     // directory. Set before the memory fallback below so it scopes to the
     // session's project too.
     runtime.set_cwd(workspace.cwd.clone());
+    runtime.set_sandbox(workspace.sandbox.clone());
     runtime.set_tool_env(workspace.env.clone());
     runtime.set_env_stripped(workspace.env_stripped.clone());
 
@@ -1360,6 +1410,11 @@ mod codex_ultra_worker_tests {
             let policy = production.find("super::apply_subagent_runtime_policy(").unwrap();
             let stream = production.find("runtime.run_stream").unwrap();
             assert!(spawned < policy && policy < stream, "{name}");
+            // Sandbox pin: every worker is confined (or refused) after the
+            // runtime policy and before its first model call.
+            assert_eq!(production.matches("super::confine_worker(").count(), 1, "{name}");
+            let confine = production.find("super::confine_worker(").unwrap();
+            assert!(policy < confine && confine < stream, "{name}");
         }
     }
 
@@ -1440,6 +1495,59 @@ mod codex_ultra_worker_tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn a_workers_parent_id_is_the_engines_record_never_a_claim() {
+        // The parent the sandbox policy provider is told is the session id
+        // the host put on the tool capabilities (its own record of who is
+        // running the tool call): a top-level session has one, a context
+        // with none gives null.
+        let caps = crate::tools::ToolCapabilities {
+            session_id: Some("true-parent".to_string()),
+            ..Default::default()
+        };
+        let ws = super::WorkerWorkspace::from_capabilities(&caps);
+        assert_eq!(ws.parent_session_id.as_deref(), Some("true-parent"));
+        let none = super::WorkerWorkspace::from_capabilities(&crate::tools::ToolCapabilities::default());
+        assert_eq!(none.parent_session_id, None);
+        // No spawn path reads a parent id out of the tool's own arguments (a
+        // worker or an agent can put anything there): the only mention of a
+        // parent session in the spawn paths is the capability record.
+        for (name, source) in [
+            ("oneshot", include_str!("oneshot.rs")),
+            ("start", include_str!("start.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(!production.contains("\"parent"), "{name}: reads a parent from its arguments");
+            assert!(!production.contains("parent_session_id"), "{name}: sets a parent of its own");
+            assert_eq!(production.matches("super::confine_worker(").count(), 1, "{name}");
+        }
+        // The production code ends at the first test-only item written in this
+        // file; an out-of-line `#[cfg(test)] mod name;` declaration near the
+        // top is not where it ends.
+        let module = include_str!("mod.rs");
+        let lines: Vec<&str> = module.lines().collect();
+        let end = (0..lines.len())
+            .find(|&i| {
+                lines[i].trim() == "#[cfg(test)]"
+                    && !lines.get(i + 1).is_some_and(|next| {
+                        let next = next.trim();
+                        next.starts_with("mod ") && next.ends_with(';')
+                    })
+            })
+            .unwrap_or(lines.len());
+        let production = lines[..end].join("\n");
+        assert_eq!(
+            production.matches("parent_session_id: caps.session_id.clone(),").count(),
+            1,
+            "the one place a worker's parent is set"
+        );
+        assert!(
+            !production.contains("parent_session_id: Some("),
+            "no other place sets a worker's parent"
+        );
     }
 
     #[test]

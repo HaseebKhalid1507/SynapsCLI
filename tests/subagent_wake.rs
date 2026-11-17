@@ -526,6 +526,7 @@ fn live_reactive_subagent_end_to_end() {
                 session_id: None,
                 hook_bus: None,
                 continuation: None,
+                sandbox: Default::default(),
             },
             limits: ToolLimits {
                 max_tool_output: 30000,
@@ -613,6 +614,7 @@ fn live_reactive_subagent_end_to_end() {
                 session_id: None,
                 hook_bus: None,
                 continuation: None,
+                sandbox: Default::default(),
             },
             limits: ToolLimits {
                 max_tool_output: 30000,

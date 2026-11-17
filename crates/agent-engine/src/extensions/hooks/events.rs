@@ -56,6 +56,13 @@ pub enum HookKind {
     /// Fires after `memory_forget` has forgotten an archive or a note.
     /// Notify-only ([`Self::is_notification`]).
     OnMemoryForgotten,
+    /// Asked once when a confined session starts: which extra directories
+    /// may it write? Only the plugin named by the owner-set
+    /// `sandbox.policy_provider` is asked, only when it also holds
+    /// `sandbox.policy`, and its answer is not a [`HookResult`] action but
+    /// `{"write": [...], "read": [...]}` or `{"refuse": "..."}` (see
+    /// [`crate::sandbox`]). Never part of [`HookBus::emit`](crate::extensions::hooks::HookBus::emit).
+    SandboxPolicy,
 }
 
 impl HookKind {
@@ -75,6 +82,7 @@ impl HookKind {
         Self::OnSessionEnd,
         Self::OnContextArchived,
         Self::OnMemoryForgotten,
+        Self::SandboxPolicy,
     ];
 
     /// Canonical string identifier for this kind, suitable for serialization
@@ -90,6 +98,7 @@ impl HookKind {
             Self::OnSessionEnd => "on_session_end",
             Self::OnContextArchived => "on_context_archived",
             Self::OnMemoryForgotten => "on_memory_forgotten",
+            Self::SandboxPolicy => "sandbox_policy",
         }
     }
 
@@ -109,6 +118,7 @@ impl HookKind {
             "on_session_end" => Some(Self::OnSessionEnd),
             "on_context_archived" => Some(Self::OnContextArchived),
             "on_memory_forgotten" => Some(Self::OnMemoryForgotten),
+            "sandbox_policy" => Some(Self::SandboxPolicy),
             _ => None,
         }
     }
@@ -132,7 +142,8 @@ impl HookKind {
             Self::OnCompaction
             | Self::OnSessionEnd
             | Self::OnContextArchived
-            | Self::OnMemoryForgotten => &["continue"],
+            | Self::OnMemoryForgotten
+            | Self::SandboxPolicy => &["continue"],
         }
     }
 
@@ -183,6 +194,7 @@ impl HookKind {
             Self::OnSessionStart | Self::OnSessionEnd | Self::OnMemoryForgotten => {
                 Permission::SessionLifecycle
             }
+            Self::SandboxPolicy => Permission::SandboxPolicy,
         }
     }
 }
@@ -1428,12 +1440,13 @@ mod tests {
                 | HookKind::OnSessionStart
                 | HookKind::OnSessionEnd
                 | HookKind::OnContextArchived
-                | HookKind::OnMemoryForgotten => {}
+                | HookKind::OnMemoryForgotten
+                | HookKind::SandboxPolicy => {}
             }
         }
         assert_eq!(
             HookKind::ALL.len(),
-            9,
+            10,
             "a HookKind variant was added or removed -- update HookKind::ALL \
              and docs/extensions/contract.json to match"
         );

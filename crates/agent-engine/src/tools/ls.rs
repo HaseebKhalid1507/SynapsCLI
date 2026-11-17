@@ -64,6 +64,12 @@ fn build_command(params: &Value, ctx: &ToolContext) -> Result<Command> {
     ));
     let mut cmd = super::unix_programs::unix_tool_command("ls", ctx)?;
     cmd.arg("-lah").arg(&path);
+    // A confined session's `ls` runs confined too (it writes nothing, but no
+    // spawn of a confined chat is left outside the domain).
+    ctx.capabilities
+        .sandbox
+        .confine_tokio(&mut cmd)
+        .map_err(RuntimeError::Tool)?;
     Ok(cmd)
 }
 

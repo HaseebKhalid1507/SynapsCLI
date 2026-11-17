@@ -213,6 +213,13 @@ pub struct ToolCapabilities {
     /// chat: the tool refuses there. (A worker carries its own state, which
     /// is never enabled, and its registry has no such tool.)
     pub continuation: Option<crate::runtime::continuation::SharedContinuation>,
+    /// The session's write confinement ([`crate::sandbox`]): `Off` (the
+    /// default, today's behaviour), `Confined` (shell commands run under a
+    /// Landlock domain and the file-writing tools check their targets), or
+    /// `Refused` (confinement is on but could not be set up, so the tools
+    /// that write or run commands refuse). Set once at session start and
+    /// never changed by a tool, an extension or a config edit.
+    pub sandbox: crate::sandbox::SessionSandbox,
 }
 
 impl ToolCapabilities {
@@ -564,6 +571,9 @@ pub trait Tool: Send + Sync {
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
+
+#[cfg(all(test, unix))]
+mod sandbox_pins;
 
 #[cfg(test)]
 mod stripped_env_notice_tests {

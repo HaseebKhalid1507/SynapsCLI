@@ -79,6 +79,26 @@ impl Tool for WriteTool {
 
         let path = resolve_path_in(raw_path, ctx.capabilities.cwd.as_deref());
 
+        // A confined session writes through a directory the policy checked
+        // and opened (not through the path string), or not at all.
+        if let Some(target) = ctx
+            .capabilities
+            .sandbox
+            .guard_write(&path, true)
+            .map_err(|e| RuntimeError::Tool(e.to_string()))?
+        {
+            let tmp = super::util::guarded_tmp_name(target.real_path());
+            target
+                .replace(&tmp, content.as_bytes(), target.mode())
+                .map_err(|e| RuntimeError::Tool(format!("Failed to write file: {}", e)))?;
+            return Ok(format!(
+                "Wrote {} lines ({} bytes) to {}",
+                content.lines().count(),
+                content.len(),
+                path.display()
+            ));
+        }
+
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await.map_err(|e| {

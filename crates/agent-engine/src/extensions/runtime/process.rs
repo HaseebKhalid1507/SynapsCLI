@@ -758,6 +758,10 @@ pub struct ProcessExtension {
     /// across process restarts so that any active notification subscriber
     /// survives a restart-on-error.
     inbox: Arc<Inbox>,
+    /// The write confinement every (re)start of the child applies before
+    /// exec: `Off` for the host's own processes, the owning session's for
+    /// a session lease. A restart is never unconfined.
+    sandbox: crate::sandbox::SessionSandbox,
 }
 
 /// Prefix the reader task gives every JSON-RPC `error` response from the
@@ -806,9 +810,24 @@ impl ProcessExtension {
         args: &[String],
         cwd: Option<PathBuf>,
     ) -> Result<Self, String> {
+        Self::spawn_confined(id, command, args, cwd, crate::sandbox::SessionSandbox::Off).await
+    }
+
+    /// [`Self::spawn_with_cwd`] for a process that belongs to a session:
+    /// the child (and every restart of it) starts under `sandbox`'s write
+    /// confinement, applied before exec. If that can't be set up the
+    /// process doesn't start.
+    pub async fn spawn_confined(
+        id: &str,
+        command: &str,
+        args: &[String],
+        cwd: Option<PathBuf>,
+        sandbox: crate::sandbox::SessionSandbox,
+    ) -> Result<Self, String> {
         let inbox = Arc::new(Inbox::new(id.to_string()));
-        let state = Self::spawn_state(id, command, args, cwd.as_ref(), inbox.clone()).await?;
+        let state = Self::spawn_state(id, command, args, cwd.as_ref(), inbox.clone(), &sandbox).await?;
         Ok(Self {
+            sandbox,
             id: id.to_string(),
             command: command.to_string(),
             args: args.to_vec(),
@@ -837,6 +856,7 @@ impl ProcessExtension {
         args: &[String],
         cwd: Option<&PathBuf>,
         inbox: Arc<Inbox>,
+        sandbox: &crate::sandbox::SessionSandbox,
     ) -> Result<ProcessState, String> {
         let mut cmd = Command::new(command);
         cmd.args(args)
@@ -860,6 +880,14 @@ impl ProcessExtension {
         }
 
         cmd.kill_on_drop(true);
+
+        // A session's process starts inside the session's write
+        // confinement (Landlock, applied in the child before exec, so it
+        // covers whatever the extension starts); if that can't be set up
+        // the process doesn't start.
+        sandbox
+            .confine_tokio(&mut cmd)
+            .map_err(|why| format!("Extension '{}' not started: {}", id, why))?;
 
         let mut child = cmd
             .spawn()
@@ -1842,6 +1870,7 @@ impl ProcessExtension {
                 &self.args,
                 self.cwd.as_ref(),
                 self.inbox.clone(),
+                &self.sandbox,
             )
             .await?,
         );
@@ -1968,6 +1997,7 @@ impl ProcessExtension {
                     &self.args,
                     self.cwd.as_ref(),
                     self.inbox.clone(),
+                    &self.sandbox,
                 )
                 .await?,
             );
@@ -2593,6 +2623,10 @@ impl ExtensionHandler for ProcessExtension {
         no_spawn: bool,
     ) -> Result<HookResult, NoAnswer> {
         self.handle_required_with(event, no_spawn).await
+    }
+
+    async fn hook_value(&self, params: Value) -> Result<Value, String> {
+        self.call("hook.handle", params).await
     }
 
     async fn get_info(&self) -> Result<crate::extensions::info::PluginInfo, String> {

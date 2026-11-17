@@ -1409,6 +1409,29 @@ impl HookBus {
         handlers.values().all(|v| v.is_empty())
     }
 
+    /// The handler of extension `extension_id` for the `sandbox_policy`
+    /// question, or `None`. Fail closed: `Some` only when that extension
+    /// itself subscribed to [`HookKind::SandboxPolicy`] AND holds
+    /// [`Permission::SandboxPolicy`] (two keys, the second re-checked here
+    /// rather than trusted from the subscribe-time gate). A worker's view
+    /// never has one.
+    pub async fn sandbox_policy_handler(
+        &self,
+        extension_id: &str,
+    ) -> Option<Arc<dyn crate::extensions::runtime::ExtensionHandler>> {
+        if self.is_worker_view() {
+            return None;
+        }
+        let handlers = self.handlers.read().await;
+        handlers
+            .get(&HookKind::SandboxPolicy)?
+            .iter()
+            .find(|reg| {
+                reg.handler.id() == extension_id && reg.permissions.has(Permission::SandboxPolicy)
+            })
+            .map(|reg| Arc::clone(&reg.handler))
+    }
+
     /// Return all (kind, tool_filter) pairs subscribed by the given extension id.
     /// Sorted by kind name, then by tool_filter (None first), for stable output.
     pub async fn subscriptions_for(&self, extension_id: &str) -> Vec<(HookKind, Option<String>)> {
@@ -2572,6 +2595,7 @@ mod tests {
                 session_id: None,
                 hook_bus: None,
                 continuation: None,
+                sandbox: Default::default(),
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30_000,

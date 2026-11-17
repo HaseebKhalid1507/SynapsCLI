@@ -792,6 +792,12 @@ pub struct Runtime {
     /// Cloned into every `ToolCapabilities` so the dedup survives across
     /// tool calls within the same session.
     env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The session's write confinement ([`crate::sandbox`]), set once by the
+    /// host at session start. With `sandbox.confine = enforce` it starts
+    /// `Unresolved` (every command and write refused) and stays so for a
+    /// host that never installs a resolved policy; with confinement off it
+    /// is `Off`.
+    sandbox: crate::sandbox::SessionSandbox,
 }
 
 /// Mint a fresh runtime-scoped tool-session identity. Process id + UUIDv4
@@ -1074,6 +1080,9 @@ impl Runtime {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            // Confinement on (or the config unreadable): refusing until a
+            // session start installs the resolved policy.
+            sandbox: crate::sandbox::SessionSandbox::from_settings(),
         };
         // Lease managers are installed through the same seams boot used, so
         // the per-runtime durable session-scope guards are minted exactly as
@@ -1686,11 +1695,25 @@ impl Runtime {
             cwd: self.cwd(),
             memory_backend: &self.memory_backend,
             env: self.env.as_ref(),
+            sandbox: &self.sandbox,
         }
     }
 
     pub fn env_stripped(&self) -> &[String] {
         &self.env_stripped
+    }
+
+    /// Confine this session's shell commands and file writes (or record
+    /// that confinement could not be set up). Called once, by the host, at
+    /// session start, before the first turn: workers inherit their parent's
+    /// state through [`Runtime::sandbox`], never a weaker one.
+    pub fn set_sandbox(&mut self, sandbox: crate::sandbox::SessionSandbox) {
+        self.sandbox = sandbox;
+    }
+
+    /// The session's write confinement.
+    pub fn sandbox(&self) -> &crate::sandbox::SessionSandbox {
+        &self.sandbox
     }
 
     /// Test seam: the work phase and the note this chat's rollover state
@@ -3457,6 +3480,7 @@ impl Runtime {
             env: self.env.clone(),
             env_stripped: self.env_stripped.clone(),
             env_warned: self.env_warned.clone(),
+            sandbox: self.sandbox.clone(),
             auto_approve_confirms,
             hook_confirm_prompt,
             hook_auto_approve,
@@ -3604,6 +3628,7 @@ impl Clone for Runtime {
             env: self.env.clone(),
             env_stripped: self.env_stripped.clone(),
             env_warned: self.env_warned.clone(),
+            sandbox: self.sandbox.clone(),
         }
     }
 }

@@ -189,6 +189,9 @@ impl Tool for SubagentTool {
                     super::apply_subagent_runtime_policy(&mut runtime, &config, memory_backend.as_ref(), session_allow_all.as_ref(), telemetry.as_ref(), &workspace);
                     // Required guards see this worker's tool calls too.
                     worker_hooks.apply(&mut runtime, &config);
+                    // Write confinement: ask the policy provider about this worker
+                    // and hold it to its parent's roots; refused = never runs.
+                    super::confine_worker(&mut runtime, &workspace, subagent_id).await?;
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
                     runtime.set_model(model);
                     super::fit_subagent_context_window(&mut runtime);

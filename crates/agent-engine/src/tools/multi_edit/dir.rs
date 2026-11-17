@@ -181,6 +181,11 @@ mod imp {
             Dir::open(&self.path).is_ok_and(|now| now.identity == self.identity)
         }
 
+        /// Where the kernel says this open directory is right now.
+        pub(crate) fn kernel_path(&self) -> io::Result<PathBuf> {
+            std::fs::read_link(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+        }
+
         /// `fstatat(name, AT_SYMLINK_NOFOLLOW)`.
         pub(crate) fn lstat(&self, name: &OsStr) -> io::Result<Meta> {
             let name = cstr(name)?;
@@ -344,6 +349,10 @@ mod imp {
 
         pub(crate) fn still_there(&self) -> bool {
             true
+        }
+
+        pub(crate) fn kernel_path(&self) -> io::Result<PathBuf> {
+            Ok(self.path.clone())
         }
 
         pub(crate) fn lstat(&self, name: &OsStr) -> io::Result<Meta> {

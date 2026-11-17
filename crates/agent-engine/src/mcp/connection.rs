@@ -31,6 +31,7 @@ impl McpConnection {
     pub(super) async fn start(
         server: &str,
         config: &super::McpServerConfig,
+        sandbox: &crate::sandbox::SessionSandbox,
     ) -> std::result::Result<Self, String> {
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args);
@@ -77,6 +78,14 @@ impl McpConnection {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+
+        // A confined session's server starts inside the session's write
+        // confinement (applied in the child before exec, so it covers every
+        // process the server starts); if that can't be set up the server
+        // doesn't start.
+        sandbox
+            .confine_tokio(&mut cmd)
+            .map_err(|why| format!("MCP server not started: {why}"))?;
 
         let mut child = cmd.spawn().map_err(|e| {
             // Static process metadata only: command/env values may be

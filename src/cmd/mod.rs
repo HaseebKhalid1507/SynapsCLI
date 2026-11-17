@@ -10,6 +10,7 @@ pub(crate) mod quota_keeper;
 pub(crate) mod removed;
 pub(crate) mod retention;
 pub(crate) mod rpc;
+pub(crate) mod sandbox;
 pub(crate) mod send;
 pub(crate) mod status;
 pub(crate) mod tools;

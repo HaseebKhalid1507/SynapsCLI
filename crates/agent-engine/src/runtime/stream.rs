@@ -211,6 +211,9 @@ pub(super) struct StreamSession {
     pub(super) env_stripped: Vec<String>,
     /// Shared per-session "already warned" set (T5 dedup fix).
     pub(super) env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The session's write confinement, forwarded as
+    /// `ToolCapabilities.sandbox` (`Off` for hosts that never set one).
+    pub(super) sandbox: crate::sandbox::SessionSandbox,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
     /// The prompt and auto-approve policy that answer a `before_tool_call`
@@ -794,6 +797,7 @@ impl StreamMethods {
             env,
             env_stripped,
             env_warned,
+            sandbox,
             secret_prompt,
             auto_approve_confirms,
             hook_confirm_prompt,
@@ -985,13 +989,17 @@ impl StreamMethods {
         // must never construct/drop a terminating guard itself — it only
         // keeps the shared scope alive while running; leases persist across
         // turns and terminate when the LAST owner (runtime or stream) drops.
+        // A confined chat's MCP servers and extension processes start under
+        // its write confinement: tell the lease managers, before any call.
         let mcp_lease_capability = mcp_runtime.as_ref().map(|manager| {
+            manager.set_session_sandbox(&tool_session_id, sandbox.clone());
             crate::mcp::McpLeaseCapability::new(tool_session_id.clone(), Arc::clone(manager))
         });
         let _mcp_session_scope = mcp_session_scope;
         // Task 20: same per-stream capability + durable shared scope HOLD
         // discipline for extension runtime leases.
         let extension_lease_capability = extension_runtime.as_ref().map(|manager| {
+            manager.set_session_sandbox(&tool_session_id, sandbox.clone());
             crate::extensions::lease::ExtensionLeaseCapability::new(
                 tool_session_id.clone(),
                 Arc::clone(manager),
@@ -1026,6 +1034,7 @@ impl StreamMethods {
                 env,
                 env_stripped,
                 env_warned,
+                sandbox,
                 session_id: session_id.clone(),
                 hook_bus: Some(hook_bus.clone()),
                 continuation: Some(continuation.clone()),
@@ -4595,6 +4604,7 @@ mod rich_output_tests {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            sandbox: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
             hook_confirm_prompt: None,
@@ -6666,6 +6676,7 @@ mod rich_output_tests {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            sandbox: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
             hook_confirm_prompt: None,

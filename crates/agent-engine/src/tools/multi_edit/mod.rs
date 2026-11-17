@@ -330,6 +330,7 @@ fn run(
     now: chrono::DateTime<chrono::Local>,
     cwd: Option<&Path>,
     scope_refuses: ScopeCheck<'_>,
+    sandbox: &crate::sandbox::SessionSandbox,
     hooks: &mut dyn commit::Hooks,
 ) -> std::result::Result<String, String> {
     let mut expander = placeholders::Expander::new(now);
@@ -357,6 +358,10 @@ fn run(
                 )));
             }
         }
+        // A confined session may only change what its policy allows. The
+        // check is on the resolved target; the handle below is then
+        // compared with it.
+        sandbox.check_write_target(&target).map_err(at)?;
         let slot = match index_of.get(&target) {
             Some(&slot) => slot,
             None => {
@@ -364,6 +369,7 @@ fn run(
                     return Err(at(format!("more than {MAX_FILES} files in one call")));
                 }
                 let (dir, name) = open_parent(&target).map_err(at)?;
+                sandbox.check_opened_parent(dir.kernel_path(), &target).map_err(at)?;
                 let entry = if exists {
                     let Loaded {
                         content,
@@ -630,6 +636,7 @@ impl Tool for MultiEditTool {
         let now = chrono::Local::now();
         let cwd = ctx.capabilities.cwd.clone();
         let orchestration = ctx.capabilities.orchestration.clone();
+        let sandbox = ctx.capabilities.sandbox.clone();
         tokio::task::spawn_blocking(move || {
             let refuses = |path: &str| {
                 orchestration.as_ref().is_some_and(|o| {
@@ -639,7 +646,7 @@ impl Tool for MultiEditTool {
                     )
                 })
             };
-            run(req, now, cwd.as_deref(), &refuses, &mut commit::RealHooks)
+            run(req, now, cwd.as_deref(), &refuses, &sandbox, &mut commit::RealHooks)
         })
         .await
         .map_err(|e| RuntimeError::Tool(format!("multi_edit task failed: {e}")))?

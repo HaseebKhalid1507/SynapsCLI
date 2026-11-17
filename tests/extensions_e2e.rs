@@ -241,6 +241,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     session_id: None,
                     hook_bus: None,
                     continuation: None,
+                    sandbox: Default::default(),
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -420,6 +421,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     session_id: None,
                     hook_bus: None,
                     continuation: None,
+                    sandbox: Default::default(),
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -475,6 +477,7 @@ fn whoami_ctx(session_id: Option<&str>, cwd: Option<&std::path::Path>) -> ToolCo
             session_id: session_id.map(str::to_string),
             hook_bus: None,
             continuation: None,
+            sandbox: Default::default(),
         },
         limits: synaps_cli::tools::ToolLimits {
             max_tool_output: 30_000,

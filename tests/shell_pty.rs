@@ -29,6 +29,7 @@ fn default_opts() -> SessionOpts {
         cols: None,
         readiness_timeout_ms: None,
         idle_timeout: None,
+        sandbox: Default::default(),
     }
 }
 
