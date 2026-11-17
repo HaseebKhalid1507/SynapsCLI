@@ -852,10 +852,12 @@ mod tests {
     fn every_parent_of_the_base_dir_is_dropped_even_outside_the_home() {
         let e = env("/srv/engine/.synaps-cli", "/home/u");
         let p = Protected::new(&e);
-        for parent in ["/srv/engine", "/srv", "/"] {
+        for parent in ["/srv/engine", "/srv"] {
             let reason = p.drop_reason(Path::new(parent)).unwrap_or_else(|| panic!("{parent} must drop"));
             assert!(reason.contains("a parent of the engine base directory"), "{parent}: {reason}");
         }
+        // The root contains the home as well, so that is the reason it gives.
+        assert!(p.drop_reason(Path::new("/")).is_some(), "/ must drop");
         assert_eq!(p.drop_reason(Path::new("/srv/other")), None);
         assert_eq!(p.drop_reason(Path::new("/srv/engine/work")), None);
     }
