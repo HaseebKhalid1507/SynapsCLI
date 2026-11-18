@@ -103,7 +103,7 @@ async fn page(sock: &Path, before: Option<CatalogCursor>, limit: Option<u32>, na
 /// Every saved row, `limit` at a time.
 async fn all_pages(sock: &Path, limit: u32, named_only: bool) -> Vec<SessionMeta> {
     let (mut rows, mut before) = (Vec::new(), None);
-    loop {
+    for _ in 0..100 {
         let p = page(sock, before, Some(limit), named_only).await;
         assert!(p.sessions.len() <= limit as usize);
         rows.extend(p.sessions);
@@ -112,6 +112,7 @@ async fn all_pages(sock: &Path, limit: u32, named_only: bool) -> Vec<SessionMeta
             None => return rows,
         }
     }
+    panic!("paging never ended: {:?}", ids(&rows));
 }
 
 fn ids(rows: &[SessionMeta]) -> Vec<&str> {
@@ -250,6 +251,8 @@ impl Raw {
     async fn recv_within(&mut self, budget: Duration) -> Result<Option<DaemonFrame>, ()> {
         let mut line = String::new();
         match tokio::time::timeout(budget, self.r.read_line(&mut line)).await {
+            // A daemon that closes with a frame of ours unread resets.
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => Ok(None),
             Ok(n) => Ok((n.unwrap() > 0).then(|| decode_line(line.trim_end()).unwrap())),
             Err(_) => Err(()),
         }
@@ -342,7 +345,9 @@ async fn a_held_page_never_holds_up_sessions_ping_or_a_reload() {
 
     // An announced reload with a page in flight: `Bye` at once, nothing after.
     let held = d.state.saved.hold().await;
+    let before = d.state.saved.requests();
     c.page(44).await;
+    wait_requests(&d, before + 1).await;
     let t1 = Instant::now();
     d.state.fire_announce();
     // `c`'s first page (43) may have been served in the window above.

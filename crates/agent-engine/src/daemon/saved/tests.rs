@@ -308,6 +308,7 @@ fn cursor_paging_lists_every_row_once_across_equal_updated_at() {
     for limit in [1, 2, 3, 4, 5, 7, 50] {
         let (mut got, mut before) = (Vec::new(), None::<CatalogCursor>);
         loop {
+            assert!(got.len() <= want.len(), "limit {limit}: paging never ends");
             let (rows, next) = page(&facts, is_held, before.as_ref(), limit, false);
             assert!(rows.len() <= limit);
             got.extend(rows);
