@@ -148,6 +148,11 @@ pub fn echo_factory() -> SessionFactory {
     })
 }
 
+/// A fresh `Welcome.boot_id`: 16 hex characters.
+pub fn mint_boot_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
+}
+
 /// The default factory for a booted host: `EngineHost::create_session` (A1) —
 /// the real `SessionActor` owning one `Runtime` + `ConversationState`.
 pub fn host_factory(host: &Arc<EngineHost>) -> SessionFactory {
@@ -204,6 +209,8 @@ pub struct DaemonState {
     // ── C3 reload ──
     /// Reload counter (`Welcome.generation`; starts at 1).
     pub generation: u64,
+    /// `Welcome.boot_id`: minted at a cold start, carried across reloads.
+    pub boot_id: String,
     /// Drain: refuse `Attach::Create` / new turns while set.
     pub reloading: AtomicBool,
     /// Generation announced in `Reloading`/`Bye{Reloading}`.
@@ -448,6 +455,13 @@ impl Daemon {
             }
         };
         let generation = reload_state.as_ref().map_or(1, |rs| rs.generation);
+        // An image from before `boot_id` carried none: mint one (clients see
+        // one spurious "new boot", which is safe).
+        let boot_id = reload_state
+            .as_ref()
+            .map(|rs| rs.boot_id.clone())
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(mint_boot_id);
         let listener = listener::bind(&paths.sock)?;
 
         let info = DaemonInfo {
@@ -473,6 +487,7 @@ impl Daemon {
             shutdown: CancellationToken::new(),
             force_shutdown: AtomicBool::new(false),
             generation,
+            boot_id,
             reloading: AtomicBool::new(false),
             reload_generation: std::sync::atomic::AtomicU64::new(generation),
             reload_announce: Mutex::new(CancellationToken::new()),

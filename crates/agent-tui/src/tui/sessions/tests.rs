@@ -46,6 +46,7 @@ pub(super) fn meta(id: &str, name: Option<&str>) -> SessionMeta {
         title: None,
         cost_usd: 0.0,
         messages: 0,
+        workers: Default::default(),
     }
 }
 
@@ -134,6 +135,21 @@ fn state_text_per_state() {
     // Older daemon: no state_since/due → bare state.
     let bare = meta("x", None);
     assert_eq!(state_text(&bare, now()), "idle");
+    // Turn over, background workers still running: not plain idle.
+    let mut w = idle();
+    w.park_due = None;
+    w.workers.running = 2;
+    assert_eq!(state_text(&w, now()), "idle 4m · 2 workers");
+    let mut s = streaming();
+    s.workers.running = 1;
+    assert_eq!(state_text(&s, now()), "streaming 2m · 1 worker");
+    let mut wt = waiting();
+    wt.workers.running = 3;
+    assert_eq!(state_text(&wt, now()), "waiting on you · 3 workers");
+    // A lifecycle a newer daemon added.
+    let mut u = meta("y", None);
+    u.lifecycle = SessionLifecycle::Unknown;
+    assert_eq!(state_text(&u, now()), "unknown");
 }
 
 #[test]

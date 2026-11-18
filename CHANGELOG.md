@@ -54,6 +54,18 @@ All notable changes to this project will be documented in this file.
   reports the configured default; `subagent_resume` keeps the worker's own
   model.
 
+- **A session's background workers show in the session list.**
+  `SessionMeta.workers` lists the `subagent_start` workers that keep a
+  session from parking (running, or finished with the result not yet
+  collected), with a `running` count, and `/sessions` and
+  `synaps daemon sessions` tag such a session ` · N workers`, so a session
+  whose turn ended while its workers run no longer looks idle. The daemon
+  advertises it as the `session_workers` feature, and `Welcome.boot_id`
+  (kept across `daemon reload`) tells a client when worker handle ids
+  started over. `SessionLifecycle` decodes a lifecycle this build does not
+  know as `unknown`. See "Workers in the session list" in
+  [docs/daemon-mode.md](docs/daemon-mode.md).
+
 ### Changed
 
 - **New session ids end in 8 random hex characters, not 4**
@@ -70,6 +82,10 @@ All notable changes to this project will be documented in this file.
   continues the conversation from before the `/clear` in a second session.
   The cleared session no longer counts as holding it, and its new
   conversation has nothing on disk until its first turn.
+
+- **`synaps daemon sessions --json` prints each session as the daemon sent
+  it**, with its keys in alphabetical order. Fields a newer daemon adds are
+  kept, and an older daemon's missing fields are left out, not defaulted.
 
 ### Fixed
 

@@ -288,7 +288,7 @@ fn finalize_subagent_impl(
     }
     {
         let mut s = state.write().unwrap_or_else(|p| p.into_inner());
-        s.finished_at = Some(std::time::Instant::now());
+        s.stamp_finished();
         s.finalization_ready = true;
     }
 

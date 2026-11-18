@@ -41,7 +41,11 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// Additive `ClientFrame` variants that only a new client sends follow this
 /// rule; `Closed` only ever answers `Close`, so old clients never see it.
 /// `Pin`/`Pinned` (`synaps daemon pin`) follow the same rule, and so does
-/// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it).
+/// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it),
+/// `SessionMeta.workers` (gated on [`FEATURE_SESSION_WORKERS`]) and
+/// `Welcome.boot_id`. `WorkerRow` is append-only: fields are only ever
+/// added, with `#[serde(default)]`, and an existing one never changes
+/// name or type (one unreadable row fails a Rust client's whole listing).
 /// `ReloadExtension` and its two replies (`ExtensionReloaded`,
 /// `ExtensionReloadFailed`) follow it too.
 /// Owned sessions (`Attach::Create{owned}`) are additive as well, but an
@@ -56,9 +60,16 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// `EndReason::OwnerGone`.
 pub const FEATURE_OWNED_SESSIONS: &str = "owned_sessions";
 
+/// `Welcome.features` entry: `SessionMeta.workers` is filled (the workers
+/// that hold each session's park). Without it the block is always empty.
+pub const FEATURE_SESSION_WORKERS: &str = "session_workers";
+
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
-    vec![FEATURE_OWNED_SESSIONS.to_string()]
+    vec![
+        FEATURE_OWNED_SESSIONS.to_string(),
+        FEATURE_SESSION_WORKERS.to_string(),
+    ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
@@ -590,6 +601,11 @@ pub struct Welcome {
     /// Empty from an older daemon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// Minted at the daemon's cold start and carried across reloads: a new
+    /// value means a cold start (worker handle ids `sa_N` start over). Empty
+    /// from an older daemon.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_id: String,
 }
 
 impl Welcome {
@@ -2024,6 +2040,7 @@ mod tests {
                 generation: 1,
                 daemon_build: "abc1234".into(),
                 features: Vec::new(),
+                boot_id: String::new(),
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
             DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
@@ -2204,6 +2221,122 @@ mod tests {
         assert!(back.pinned);
     }
 
+    fn worker_row(handle: &str, status: &str) -> WorkerRow {
+        WorkerRow {
+            handle_id: handle.into(),
+            subagent_id: handle.trim_start_matches("sa_").parse().unwrap(),
+            agent_name: "shady".into(),
+            model: String::new(),
+            status: status.into(),
+            cancel_requested: false,
+            started_at: "2026-11-16T06:41:10Z".parse().unwrap(),
+            finished_at: None,
+            step: String::new(),
+            tools: 0,
+        }
+    }
+
+    /// `SessionMeta.workers` is additive: omitted while empty (a session
+    /// without workers encodes exactly as before), round-trips, and an older
+    /// daemon's meta (no key) decodes as no workers. The pinned shape.
+    #[test]
+    fn session_meta_workers_are_additive() {
+        let plain = serde_json::to_value(meta()).unwrap();
+        assert!(
+            plain.get("workers").is_none(),
+            "no workers, no key: {plain}"
+        );
+
+        let mut m = meta();
+        let mut done = worker_row("sa_11", "completed");
+        done.finished_at = Some("2026-11-16T06:40:30Z".parse().unwrap());
+        m.workers = SessionWorkers {
+            running: 1,
+            rows: vec![worker_row("sa_12", "running"), done],
+            more: 0,
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            v["workers"],
+            serde_json::json!({"running": 1, "rows": [
+                {"handle_id": "sa_12", "subagent_id": 12, "agent_name": "shady", "status": "running",
+                 "started_at": "2026-11-16T06:41:10Z"},
+                {"handle_id": "sa_11", "subagent_id": 11, "agent_name": "shady", "status": "completed",
+                 "started_at": "2026-11-16T06:41:10Z", "finished_at": "2026-11-16T06:40:30Z"}]})
+        );
+        let back: SessionMeta = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back, m);
+
+        let mut old = v;
+        old.as_object_mut().unwrap().remove("workers");
+        let m: SessionMeta = serde_json::from_value(old).unwrap();
+        assert!(m.workers.is_empty());
+        assert_eq!(m.workers_tag(), "");
+        // A row from a newer daemon: unknown fields and a new status string.
+        let row: WorkerRow = serde_json::from_value(serde_json::json!({
+            "handle_id": "sa_1", "subagent_id": 1, "agent_name": "a", "status": "paused",
+            "started_at": "2026-11-16T06:41:10Z", "expires_at": "2026-11-16T07:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(row.status, "paused");
+    }
+
+    /// `SessionLifecycle::Unknown` takes any lifecycle a newer daemon adds;
+    /// the known ones are unchanged.
+    #[test]
+    fn an_unknown_lifecycle_decodes_as_unknown() {
+        let l: SessionLifecycle = serde_json::from_str("\"saved\"").unwrap();
+        assert_eq!(l, SessionLifecycle::Unknown);
+        for (s, l) in [
+            ("live", SessionLifecycle::Live),
+            ("parking", SessionLifecycle::Parking),
+            ("parked", SessionLifecycle::Parked),
+            ("ending", SessionLifecycle::Ending),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<SessionLifecycle>(&format!("\"{s}\"")).unwrap(),
+                l
+            );
+            assert_eq!(serde_json::to_string(&l).unwrap(), format!("\"{s}\""));
+        }
+        let mut v = serde_json::to_value(meta()).unwrap();
+        v["lifecycle"] = "saved".into();
+        let m: SessionMeta = serde_json::from_value(v).unwrap();
+        assert_eq!(m.lifecycle, SessionLifecycle::Unknown);
+    }
+
+    /// `Welcome.boot_id` is additive: omitted while empty, round-trips, and
+    /// an older daemon's `Welcome` (no key) decodes as empty. The daemon
+    /// advertises `session_workers`.
+    #[test]
+    fn welcome_boot_id_is_additive() {
+        let mut w = Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "v".into(),
+            pid: 1,
+            profile: None,
+            sessions: vec![],
+            progressive_tool_disclosure: false,
+            generation: 1,
+            daemon_build: String::new(),
+            features: daemon_features(),
+            boot_id: String::new(),
+        };
+        assert!(!serde_json::to_string(&w).unwrap().contains("boot_id"));
+        w.boot_id = "9f3c61d2a07e45b1".into();
+        let v = serde_json::to_value(&w).unwrap();
+        assert_eq!(v["boot_id"], "9f3c61d2a07e45b1");
+        let back: Welcome = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.boot_id, "9f3c61d2a07e45b1");
+        assert!(back.supports(FEATURE_SESSION_WORKERS));
+        let mut old = v;
+        old.as_object_mut().unwrap().remove("boot_id");
+        old.as_object_mut().unwrap().remove("features");
+        let back: Welcome = serde_json::from_value(old).unwrap();
+        assert_eq!(back.boot_id, "");
+        assert!(!back.supports(FEATURE_SESSION_WORKERS));
+    }
+
     #[test]
     fn debug_redacts_answer_and_submit_bodies() {
         let secret = "hunter2-very-secret";
@@ -2266,6 +2399,7 @@ mod tests {
             generation: 1,
             daemon_build: String::new(),
             features: daemon_features(),
+            boot_id: String::new(),
         })
         .unwrap()
         .to_lowercase();
@@ -2331,6 +2465,7 @@ mod tests {
             generation: 1,
             daemon_build: String::new(),
             features: Vec::new(),
+            boot_id: String::new(),
         };
         let old: Welcome = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
         assert!(!old.supports(FEATURE_OWNED_SESSIONS));

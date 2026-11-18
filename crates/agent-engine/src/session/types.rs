@@ -439,7 +439,7 @@ impl From<&crate::engine::setup::ContinueInfo> for ContinueInfoWire {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
     /// The actor (what `Attach::Existing` takes). Not a conversation: see
     /// `journal_id`.
@@ -514,6 +514,90 @@ pub struct SessionMeta {
     /// API message count, as of the last publish.
     #[serde(default)]
     pub messages: usize,
+    /// The workers that hold this session's park. Empty when none, when
+    /// parked or ending, and from a daemon without `session_workers`
+    /// (`wire::FEATURE_SESSION_WORKERS`). Filled in listings (`meta_live`:
+    /// `Welcome.sessions`, `SessionList`) only. `Attached.meta` is the
+    /// create-time record and never carries them, like the presence fields
+    /// (design Q14): a client keeps workers from the listing, never from an
+    /// attach. `busy` stays a turn or a compaction: clients combine the two.
+    #[serde(default, skip_serializing_if = "SessionWorkers::is_empty")]
+    pub workers: SessionWorkers,
+}
+
+impl SessionMeta {
+    /// ` · 2 workers` while background workers run, else empty: listings
+    /// append it to the state so idle-with-workers never reads as idle.
+    pub fn workers_tag(&self) -> String {
+        match self.workers.running {
+            0 => String::new(),
+            1 => " · 1 worker".into(),
+            n => format!(" · {n} workers"),
+        }
+    }
+}
+
+/// How many worker rows a [`SessionMeta`] carries ([`SessionWorkers::more`]
+/// counts the rest).
+pub const SESSION_WORKER_ROWS: usize = 8;
+
+/// A session's workers as listings see them: exactly the ones that hold its
+/// park (`SubagentRegistry::holds_park`), the same predicate that keeps it
+/// from parking.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionWorkers {
+    /// Running and not stopping (a cancelled worker is not counted).
+    #[serde(default)]
+    pub running: u32,
+    /// Running first (oldest first), then finished with an uncollected
+    /// result (newest first). At most [`SESSION_WORKER_ROWS`].
+    #[serde(default)]
+    pub rows: Vec<WorkerRow>,
+    /// Workers that hold the park but did not fit in `rows`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub more: u32,
+}
+
+impl SessionWorkers {
+    pub fn is_empty(&self) -> bool {
+        self.running == 0 && self.rows.is_empty() && self.more == 0
+    }
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// One worker in [`SessionWorkers`]. Field names match `SubagentDisplayRow`
+/// and the status labels `WatchPage::status`, so a client keys both by
+/// `handle_id`. Times are wall clock, stamped once.
+///
+/// Append-only: fields are only ever added, with `#[serde(default)]`; an
+/// existing one is never removed, renamed or retyped. Rust clients (TUI,
+/// `synaps daemon sessions`) decode a whole `SessionList` / `Welcome` as one
+/// frame, so one row they cannot read would fail the entire listing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerRow {
+    /// `sa_12`: what `SessionQuery::SubagentWatch` and `subagent_*` take.
+    pub handle_id: String,
+    pub subagent_id: u64,
+    pub agent_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// `running` | `completed` | `cancelled` | `timed_out` | `failed`: a
+    /// string, so a new status never breaks a client.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancel_requested: bool,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Latest progress line. Not sampled yet: always empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub step: String,
+    /// Tool calls so far; sent with `step`, under the same condition.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tools: u32,
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).
@@ -526,6 +610,10 @@ pub enum SessionLifecycle {
     Parking = 1,
     Parked = 2,
     Ending = 3,
+    /// A lifecycle this build does not know (from a newer daemon). Never
+    /// stored by an actor, never sent.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 impl SessionLifecycle {
@@ -534,6 +622,7 @@ impl SessionLifecycle {
             1 => Self::Parking,
             2 => Self::Parked,
             3 => Self::Ending,
+            255 => Self::Unknown,
             _ => Self::Live,
         }
     }
@@ -2129,7 +2218,13 @@ mod tests {
 
     #[test]
     fn session_lifecycle_u8_round_trip() {
-        for l in [SessionLifecycle::Live, SessionLifecycle::Parking, SessionLifecycle::Parked, SessionLifecycle::Ending] {
+        for l in [
+            SessionLifecycle::Live,
+            SessionLifecycle::Parking,
+            SessionLifecycle::Parked,
+            SessionLifecycle::Ending,
+            SessionLifecycle::Unknown,
+        ] {
             assert_eq!(SessionLifecycle::from_u8(l as u8), l);
         }
         assert_eq!(serde_json::to_string(&SessionLifecycle::Parked).unwrap(), r#""parked""#);

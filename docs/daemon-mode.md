@@ -565,6 +565,52 @@ nothing until the first real turn. The restore holds the daemon's idle exit.
 | `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket, exe, generation}` — never credentials. The daemon keeps the record in memory: when a Ping finds the file missing or naming another pid (an older `synaps` that lists sessions unlinks run-dir `*.json` files it can't parse as session cards), the lock holder writes it back (one INFO line `daemon.json rewritten` per 10 min). Every write of `daemon.json` and `daemon.pid` goes through that file's own `<name>.tmp`, created exclusively and without following a symlink, mode 0600, then renamed into place. One metadata lock serializes the start write, the heal, the reload's write and its restore, and the shutdown cleanup: a heal never writes back an older record than the one held, and nothing writes the files after the cleanup. `daemon status`, `daemon reload`, `daemon stop` and `daemon start --detach` Ping before they read it. |
 | `daemon.pid` | 0600 | pid |
 
+## Workers in the session list
+
+`SessionMeta.workers` lists the session's background workers (`subagent_start`) that hold its park,
+so a client sees a session whose turn has ended while its workers still run:
+
+```json
+"workers": {"running": 1, "rows": [
+  {"handle_id": "sa_12", "subagent_id": 12, "agent_name": "shady", "status": "running",
+   "started_at": "2026-11-16T06:41:10Z"},
+  {"handle_id": "sa_11", "subagent_id": 11, "agent_name": "shady", "status": "completed",
+   "started_at": "2026-11-16T06:38:02Z", "finished_at": "2026-11-16T06:40:30Z"}]}
+```
+
+- **Which workers**: exactly the ones that keep the session from parking
+  (`SubagentRegistry::holds_park`, one shared predicate): running (a cancelled one winding down
+  included), or finished on its own with its result uncollected, for up to 15 min
+  (`FINISHED_HANDLE_TTL`). A collected, cancelled-and-finished or expired worker is not listed.
+- **`running`**: running and not stopping (a cancelled worker is not counted; `/sessions` and
+  `synaps daemon sessions` show it as ` · 2 workers`). Independent of `busy` (a turn or a
+  compaction): a session whose turn ended with workers going is `busy: false` with workers.
+- **Rows**: running first (oldest first), then finished (newest first), at most 8; `more` counts
+  the rest. Times are wall clock, stamped once (`started_at` at registration, `finished_at` when the
+  run ends), so an unchanged worker gives an identical row. `status` is a string (`running`,
+  `completed`, `cancelled`, `timed_out`, `failed`); a client must accept new values. `step` and
+  `tools` are reserved: always empty for now. Keys at their default are left out (`more: 0`,
+  `cancel_requested: false`, an empty `model`, `finished_at` on a running worker, and the whole
+  `workers` key when there are none).
+- **Row fields are append-only**: a later daemon only adds fields (with a default), never removes,
+  renames or retypes one. A Rust client decodes a whole `session_list` / `welcome` as one frame, so
+  one unreadable row would fail its entire listing. `synaps daemon sessions --json` prints the rows
+  exactly as the daemon sent them, fields this build does not know included.
+- **Freshness**: the actor publishes the block to the handle's own cell (`publish_workers`), only
+  when it changed: with every presence publish; from the 1 Hz worker tick, which outlives the turn
+  while a worker runs (a start or finish shows within a second); at once on a cancel (`/workers
+  cancel`, Esc, the cost cap, a driver revoke, `/close force`); and from a one-shot at the earliest
+  listed result's expiry, which also re-arms the park. An idle session with no finished rows holds
+  no timer.
+- **Parked**: no runtime, so no workers (and a session with listed workers does not park).
+- **Ending**: none either. From the moment a session starts to end (`/close`, `daemon close`,
+  eviction, its owner gone) until it leaves the list, its workers are being stopped with it.
+- **Attach**: `Attached.meta` is the create-time record and never carries workers (nor the other
+  presence fields). Keep a session's workers from the listing, never from an attach.
+- **Handle ids**: never reused within a boot or across `daemon reload`; after a cold start they
+  begin again at `sa_1` and `Welcome.boot_id` changes, so a client keys worker state by
+  `(boot_id, handle_id)`.
+
 ## Per-session event endpoint ownership
 
 Session registry cards still use `<session-id>.json`, but active event sockets use
@@ -621,7 +667,7 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions"]}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers"], boot_id?}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
@@ -711,6 +757,14 @@ C: bye | socket close = Detach (turn keeps running)
   `owner_gone` only to clients that declare the `owner_gone` capability and tells the others
   `client_quit` (`ended_for`). `Bye` gains `owner_lagged`, sent only to an owner (a client that
   knows the feature).
+- Session workers are additive the same way. `Welcome.features` lists `session_workers` when the
+  listings (`Welcome.sessions`, `session_list`) carry each session's `workers` block (see "Workers
+  in the session list"); `attached.meta` is the create-time record and carries none, like the
+  other state fields. The block is omitted while empty, so a session without
+  workers encodes exactly as before. `Welcome.boot_id` (16 hex characters) is minted at a cold start
+  and carried across `daemon reload` (`ReloadState.boot_id`): a new value means worker handle ids
+  (`sa_N`) started over. `SessionLifecycle` decodes a lifecycle this build does not know as
+  `unknown` (`#[serde(other)]`); the daemon never sends it.
 
 ## Security posture
 
