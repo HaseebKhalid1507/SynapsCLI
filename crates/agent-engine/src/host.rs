@@ -493,12 +493,26 @@ impl EngineHost {
         *self.config_mtime.lock().unwrap_or_else(|e| e.into_inner()) = mtime;
     }
 
-    /// [`Self::reload_config`] only when the config file changed since the
-    /// snapshot was taken. Returns whether it reloaded. Boot-time-only keys
-    /// (`disabled_tools`, MCP, skills, `progressive_tool_disclosure`) still
-    /// need a restart; everything `apply_config` reads (model, thinking,
-    /// `context_window`, `context_management.*`, cache settings, …) takes
-    /// effect for the next session created.
+    /// [`Self::reload_config`] only when the config file's mtime changed
+    /// since the snapshot was taken. Returns whether it reloaded. Runs at the
+    /// top of every `create_session`, so the new snapshot reaches more than
+    /// the session being created:
+    /// 1. New sessions: everything `apply_config` reads (model, thinking,
+    ///    `context_window`, `context_management.*`, cache settings, …).
+    ///    Live sessions too, for what they read from the snapshot at use
+    ///    time: the extensions-ready timeout, turn budgets,
+    ///    `events.auto_turn` and `auto_turn_cap`. A parked session that
+    ///    wakes takes the new snapshot.
+    /// 2. Workers of every session, live or new: the retry config
+    ///    (`worker_runtime`) and `disabled_tools` (`worker_registry` is
+    ///    rebuilt with the new list, while each foreground registry keeps
+    ///    the list it booted with).
+    /// 3. Restart-only: provider keys and identity (first-writer-wins
+    ///    process globals in `load_config`), MCP, skills,
+    ///    `progressive_tool_disclosure` and the foreground `disabled_tools`.
+    /// 4. A changed `auth.*` credential source swaps the process-wide broker
+    ///    at the next create, while live sessions keep their old source:
+    ///    restart after changing it.
     pub fn reload_config_if_changed(&self) -> bool {
         let now = config_file_mtime();
         let stale = *self.config_mtime.lock().unwrap_or_else(|e| e.into_inner()) != now;
