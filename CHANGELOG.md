@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Workers report what they used.** `subagent_status`, `subagent_collect`
+  and a worker's completion event (`data.usage`) carry `usage`: provider
+  requests (the worker's keep-warm pings included), input / output /
+  cache-read / cache-write tokens (with the 5m/1h split when reported),
+  `context_tokens` (the latest prompt) and `cost_usd`, estimated at API list
+  prices from `agent_core::pricing`. `cost_usd` is left out when nothing was
+  used or the model has no list price (`pricing::has_list_price`), never
+  guessed. The completion text gains one sentence, e.g. "Used 325 requests,
+  1.2k input, 61.2M cache-read and 370k output tokens, about $19.64 at list
+  prices." Every terminal status reports it (completed, failed, timed out,
+  cancelled); a resumed worker reports its own run only. A reaped worker read
+  back from its archive has no `usage`. Tool names, parameters and
+  descriptions are unchanged.
+
 ### Changed
 
 - **New session ids end in 8 random hex characters, not 4**
