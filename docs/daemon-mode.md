@@ -666,7 +666,8 @@ C: {"type":"catalog_page","req":8,"limit":50,"before":{"updated_at":"2026-11-12T
   `{"type":"catalog_page","req":…,"sessions":[],"error":"too many catalog pages in flight …"}`. An
   unreadable sessions dir is `error` too. A page still loading when the connection ends (`bye`,
   stop, an announced reload) or attaches is dropped: no reply follows a `bye` or reaches an attach
-  stream.
+  stream. After sending `attach`, expect late `catalog_page` replies before `attached` (none, or
+  one per page already answered and queued) and treat every outstanding `req` as cancelled.
 - **Resume** a row with `Attach::Create` and `config.continue_session` set to its `journal_id` (by
   id: a `/chain` name can shadow a session name). It then leaves the pages and appears in
   `sessions`.
