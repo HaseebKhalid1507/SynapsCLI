@@ -6176,3 +6176,29 @@ mod parked_evict_tests {
         assert_eq!(prompt_abandon_timeout_from(Some("7"), 42), Some(Duration::from_secs(7)));
     }
 }
+
+#[cfg(test)]
+mod conversation_title_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn conv(title: &str, messages: &[serde_json::Value]) -> ConversationState {
+        let mut c = ConversationState::new(agent_core::core::session::Session::new("m", "low", None));
+        c.session.title = title.into();
+        c.api_messages = messages.iter().cloned().map(Arc::new).collect();
+        c
+    }
+
+    /// A held row's title is the one its saved row will show
+    /// (`listing_title` over what a person typed).
+    #[test]
+    fn the_title_is_the_listing_title() {
+        let typed = serde_json::json!({"role": "user", "content": "fix the\n  build"});
+        let event = serde_json::json!({"role": "user", "content": "<event id=\"1\">ping</event>"});
+        assert_eq!(conversation_title(&conv("", &[event.clone(), typed.clone()])).as_deref(), Some("fix the build"));
+        assert_eq!(conversation_title(&conv("Named\ttitle", &[typed])).as_deref(), Some("Named title"));
+        assert_eq!(conversation_title(&conv("  ", &[event])), None);
+        let long = conversation_title(&conv(&"word ".repeat(100), &[])).unwrap();
+        assert_eq!(long.chars().count(), agent_core::session_catalog::LISTING_TITLE_CHARS);
+    }
+}
