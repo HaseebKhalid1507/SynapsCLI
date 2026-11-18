@@ -67,6 +67,11 @@ struct WorkerRegistryKey {
 pub struct EngineHost {
     parts: HostParts,
     config: arc_swap::ArcSwap<crate::SynapsConfig>,
+    /// Modification time of the config file the snapshot in `config` was
+    /// read from (`None` = no file / unreadable). A long-lived host (the
+    /// daemon) compares it on every `create_session` so a config edited
+    /// after boot reaches new sessions instead of the boot-time snapshot.
+    config_mtime: std::sync::Mutex<Option<std::time::SystemTime>>,
     command_registry: Arc<crate::skills::registry::CommandRegistry>,
     keybind_registry: Arc<std::sync::RwLock<crate::skills::keybinds::KeybindRegistry>>,
     ext_manager: Arc<RwLock<crate::extensions::manager::ExtensionManager>>,
@@ -165,6 +170,7 @@ impl EngineHost {
         let _ = crate::runtime::trace::sweep_expired_captures(&capture_dir);
         let spill_root = crate::runtime::sweep_spill_root();
 
+        let config_mtime = config_file_mtime();
         let config = crate::config::load_config();
         let tools = Arc::new(RwLock::new(ToolRegistry::new()));
         // Same point the old boot's `apply_config` disabled tools: on the
@@ -221,6 +227,7 @@ impl EngineHost {
         Ok(Arc::new(Self {
             parts,
             config: arc_swap::ArcSwap::from_pointee(config),
+            config_mtime: std::sync::Mutex::new(config_mtime),
             command_registry,
             keybind_registry,
             ext_manager,
@@ -460,8 +467,40 @@ impl EngineHost {
     /// Re-read config from disk into the host's snapshot. Phase 1 callers
     /// keep `load_config()` where they use it today.
     pub fn reload_config(&self) {
+        let mtime = config_file_mtime();
         self.config
             .store(Arc::new(crate::config::load_config()));
+        *self.config_mtime.lock().unwrap_or_else(|e| e.into_inner()) = mtime;
+    }
+
+    /// [`Self::reload_config`] only when the config file's mtime changed
+    /// since the snapshot was taken. Returns whether it reloaded. Runs at the
+    /// top of every `create_session`, so the new snapshot reaches more than
+    /// the session being created:
+    /// 1. New sessions: everything `apply_config` reads (model, thinking,
+    ///    `context_window`, `context_management.*`, cache settings, …).
+    ///    Live sessions too, for what they read from the snapshot at use
+    ///    time: the extensions-ready timeout, turn budgets,
+    ///    `events.auto_turn` and `auto_turn_cap`. A parked session that
+    ///    wakes takes the new snapshot.
+    /// 2. Workers of every session, live or new: the retry config
+    ///    (`worker_runtime`) and `disabled_tools` (`worker_registry` is
+    ///    rebuilt with the new list, while each foreground registry keeps
+    ///    the list it booted with).
+    /// 3. Restart-only: provider keys and identity (first-writer-wins
+    ///    process globals in `load_config`), MCP, skills,
+    ///    `progressive_tool_disclosure` and the foreground `disabled_tools`.
+    /// 4. A changed `auth.*` credential source swaps the process-wide broker
+    ///    at the next create, while live sessions keep their old source:
+    ///    restart after changing it.
+    pub fn reload_config_if_changed(&self) -> bool {
+        let now = config_file_mtime();
+        let stale = *self.config_mtime.lock().unwrap_or_else(|e| e.into_inner()) != now;
+        if stale {
+            tracing::info!("config changed on disk since host boot — reloading for new session");
+            self.reload_config();
+        }
+        stale
     }
 
     // ── sessions (Phase 2) ────────────────────────────────────────────────
@@ -480,6 +519,11 @@ impl EngineHost {
     /// override, …) are ignored in that case — the live session wins.
     pub async fn create_session(self: &Arc<Self>, cfg: SessionConfig) -> Result<SessionHandle> {
         let _serial = self.create_lock.lock().await;
+        // A daemon host outlives config edits: without this every session it
+        // creates runs on the boot-time snapshot (e.g. `context_window = 1m`
+        // added later is silently ignored — the runtime budgets and the
+        // footer bar measure against 200k).
+        self.reload_config_if_changed();
         if let Some(live) = self.live_continue_target(&cfg.continue_session) {
             tracing::info!(session = %live.id, "create_session: target is live — attaching");
             return Ok(live);
@@ -840,6 +884,13 @@ impl EngineHost {
         }
         delivered
     }
+}
+
+/// mtime of the config file `load_config` reads (`None` if absent).
+fn config_file_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(crate::config::resolve_read_path("config"))
+        .and_then(|m| m.modified())
+        .ok()
 }
 
 /// Print `config.warnings` to stderr and the log (headless hosts).

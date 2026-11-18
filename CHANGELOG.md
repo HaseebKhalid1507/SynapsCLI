@@ -120,6 +120,20 @@ All notable changes to this project will be documented in this file.
   before it under the same id (the old conversation, resumed after the
   `/clear`), which dropped that session from the list.
 
+- **A config edit reaches the daemon without a restart.** The daemon read
+  the config file once at boot, so an edit made afterwards (for example
+  `context_window = 1m`) was silently ignored: a 1M-window session was
+  budgeted against 200k and its context bar read about 60% on the first
+  turn. Each session create now reloads the config when the file changed.
+  New sessions take everything `apply_config` reads; live sessions take
+  what they read at use time (turn budgets, `events.auto_turn`,
+  `auto_turn_cap`, the extensions-ready timeout), and a parked session that
+  wakes takes the new values. Workers of every session pick up a changed
+  `disabled_tools` (and the retry settings) at the next session create,
+  while each foreground session keeps the list it booted with. Provider
+  keys, identity, MCP, skills, `progressive_tool_disclosure` and a changed
+  `auth.*` source still need a restart.
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel

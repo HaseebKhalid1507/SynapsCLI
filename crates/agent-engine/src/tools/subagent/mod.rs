@@ -419,11 +419,12 @@ pub(crate) async fn subagent_tools(disabled: &[String]) -> crate::ToolRegistry {
 /// compact size all come from this one snapshot, never from a second read
 /// partway through the spawn.
 ///
-/// Read from disk, not `EngineHost::config()`: nothing refreshes the host's
-/// snapshot after boot in production (`reload_config` has no caller), and
+/// Read from disk, not `EngineHost::config()`: the host's snapshot is only
+/// refreshed when a session is created (`reload_config_if_changed`), and
 /// every `/settings` row that says "applies to workers started afterwards"
-/// only writes the file. The registry's `disabled_tools` stays on the host
-/// snapshot, the boot-time lockdown the foreground runs under.
+/// only writes the file. The worker registry's `disabled_tools` comes from
+/// the host snapshot, so a changed list reaches workers at the next session
+/// create; the foreground registries keep the list they booted with.
 pub(crate) fn spawn_config() -> std::sync::Arc<crate::config::SynapsConfig> {
     std::sync::Arc::new(crate::config::load_config())
 }
