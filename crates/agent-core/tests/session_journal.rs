@@ -344,19 +344,25 @@ fn history_shrink_triggers_full_resnapshot() {
 }
 
 #[test]
-fn edited_durable_tail_triggers_full_resnapshot() {
+fn edited_durable_tail_is_amended_and_an_earlier_edit_resnapshots() {
     let tmp = TempDir::new().unwrap();
     let mut s = session_with_messages(2);
     save(&tmp, &s, SessionPersistence::Journal);
     push_msg(&mut s, "will be edited");
     save(&tmp, &s, SessionPersistence::Journal);
-    // Rewrite the last durable message in memory (append-only assumption
-    // tripwire) — the journal tail no longer matches.
+    // Rewrite the last durable message in memory: an amend record (#414),
+    // O(message), replayed in place.
     *s.api_messages.last_mut().unwrap() =
         Arc::new(json!({"role":"assistant","content":"EDITED BODY"}));
     s.updated_at = chrono::Utc::now();
     let mode = save(&tmp, &s, SessionPersistence::Journal);
-    assert_eq!(mode, SaveMode::FullSnapshot, "edited tail must resnapshot");
+    assert_eq!(mode, SaveMode::Amend { messages: 0 }, "edited tail is amended");
+    assert_equivalent(&s, &load(&tmp, &s.id));
+    // Any edit before the last saved message still resnapshots.
+    s.api_messages[0] = Arc::new(json!({"role":"user","content":"EDITED HEAD"}));
+    s.updated_at = chrono::Utc::now();
+    let mode = save(&tmp, &s, SessionPersistence::Journal);
+    assert_eq!(mode, SaveMode::FullSnapshot, "edited head must resnapshot");
     assert_equivalent(&s, &load(&tmp, &s.id));
 }
 
