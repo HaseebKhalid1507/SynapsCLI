@@ -273,6 +273,50 @@ async fn exact_execute_starts_once_reuses_and_calls_only_exact_tool() {
     fx.cleanup();
 }
 
+/// A session whose sandbox changes drops its servers: the one started
+/// unconfined never serves the session once it has a sandbox (here one that
+/// starts nothing, so the call fails), and going back starts a fresh one.
+#[tokio::test]
+async fn a_server_started_under_one_sandbox_is_not_reused_under_another() {
+    use agent_engine::sandbox::SessionSandbox;
+    let fx = fixture("sandbox-key", "ok", advertised_tools());
+    let fp = server_config_fingerprint(&fx.config);
+    let (source, _) = shared_source(fx.config.clone());
+    let manager = Arc::new(
+        McpRuntimeManager::new(source, Duration::from_secs(300))
+            .with_cache_path(fx.dir.join("descriptors.json")),
+    );
+    let cap = McpLeaseCapability::new(sid(), Arc::clone(&manager));
+    let tools = dormant_tools_for_config(&config_with(fx.config.clone()), &seeded_cache(&fp));
+    let echo = tools
+        .iter()
+        .find(|t| t.name() == "ext__srv__echo_tool")
+        .unwrap();
+
+    echo.execute(json!({"text":"a"}), ctx_with(Some(cap.clone())))
+        .await
+        .unwrap();
+    assert_eq!(fx.count("spawn"), 1);
+
+    manager.set_session_sandbox(&sid(), SessionSandbox::Unresolved);
+    let refused = echo
+        .execute(json!({"text":"b"}), ctx_with(Some(cap.clone())))
+        .await;
+    assert!(refused.is_err(), "the unconfined server served a sandboxed session: {refused:?}");
+    assert_eq!(fx.count("request:tools/call:echo_tool"), 1);
+    assert_eq!(fx.count("spawn"), 1);
+    assert_eq!(manager.lease_count(), 0);
+
+    manager.set_session_sandbox(&sid(), SessionSandbox::Off);
+    echo.execute(json!({"text":"c"}), ctx_with(Some(cap.clone())))
+        .await
+        .unwrap();
+    assert_eq!(fx.count("spawn"), 2, "a fresh server for the new sandbox");
+    assert_eq!(fx.count("request:tools/call:echo_tool"), 2);
+    manager.terminate_all();
+    fx.cleanup();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_first_calls_are_single_flight() {
     let fx = fixture("single-flight", "ok", advertised_tools());

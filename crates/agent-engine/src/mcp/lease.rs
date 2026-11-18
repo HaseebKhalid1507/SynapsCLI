@@ -190,12 +190,35 @@ impl McpRuntimeManager {
     /// `shared: true` server would otherwise be one child under one
     /// session's domain for everyone), and are started with the session's
     /// Landlock domain applied before exec. `Off` clears the entry.
+    ///
+    /// A session whose sandbox changes (off to confined, or to another
+    /// confinement) drops its own servers, so one started under the old
+    /// sandbox is never reused under the new one.
     pub fn set_session_sandbox(&self, session: &SessionId, sandbox: SessionSandbox) {
-        let mut map = self.sandboxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if sandbox.is_off() {
-            map.remove(session.as_str());
-        } else {
-            map.insert(session.as_str().to_string(), sandbox);
+        let new_tag = sandbox.lease_tag();
+        let old_tag = {
+            let mut map = self.sandboxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let old = if sandbox.is_off() {
+                map.remove(session.as_str())
+            } else {
+                map.insert(session.as_str().to_string(), sandbox)
+            };
+            old.map_or(0, |s| s.lease_tag())
+        };
+        if old_tag != new_tag {
+            let removed: Vec<LeaseState> = {
+                let mut map =
+                    self.leases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let keys: Vec<(String, String)> = map
+                    .keys()
+                    .filter(|(s, _)| s != SHARED_SESSION_KEY && s == session.as_str())
+                    .cloned()
+                    .collect();
+                keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+            };
+            for state in removed {
+                Self::cancel_state(state);
+            }
         }
     }
 

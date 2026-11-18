@@ -8,7 +8,7 @@
 //! (which mints per-session capabilities and the durable session-end
 //! scope):
 //!
-//! - a lease is keyed by (session, plugin) and PINNED to the launch-record
+//! - a lease is keyed by (session, plugin, sandbox) and PINNED to the launch-record
 //!   fingerprint (manifest + cwd + resolved config) it was acquired under;
 //!   per-key SINGLE-FLIGHT acquisition (a `Starting` placeholder holding a
 //!   `watch` receiver whose stored state makes wakeups lost-proof)
@@ -205,9 +205,18 @@ enum LeaseState {
     Ready(Arc<LeaseInner>),
 }
 
+/// A lease's key: session, plugin, and the [`SessionSandbox::lease_tag`]
+/// of the sandbox its child was started under. A child started under one
+/// sandbox (or none) is never handed to a caller under another.
+type LeaseKey = (String, String, u64);
+
+fn lease_key(session: &SessionId, plugin: &str, sandbox: &SessionSandbox) -> LeaseKey {
+    (session.as_str().to_string(), plugin.to_string(), sandbox.lease_tag())
+}
+
 /// Session-scoped exact extension runtime lease manager. See module docs.
 pub struct ExtensionRuntimeManager {
-    leases: std::sync::Mutex<HashMap<(String, String), LeaseState>>,
+    leases: std::sync::Mutex<HashMap<LeaseKey, LeaseState>>,
     /// The `ExtensionManager`'s retained internal launch records (shared
     /// handle; sync lock held only for map operations, never across I/O).
     records: SharedDeferredRecords,
@@ -241,17 +250,42 @@ impl ExtensionRuntimeManager {
         }
     }
 
-    /// Record the write confinement `session`'s extension processes start
-    /// under: the process is started with the session's Landlock domain
-    /// applied before exec, and every restart of it re-applies it. `Off`
-    /// clears the entry. Processes the host starts for itself (hooks,
-    /// providers: the host scope) are not a session's and keep no entry.
+    /// Record the write confinement `session`'s extension tool calls run
+    /// under: their process is started with the session's Landlock domain
+    /// applied before exec, and every restart of it re-applies it. The
+    /// sandbox is part of the lease key, so a process started under another
+    /// sandbox (or none, such as the host's own hook process on the same
+    /// session key) is never reused for them. `Off` clears the entry.
+    /// Processes the host starts for itself (hooks, providers: the handler
+    /// scope) always start unconfined, under the `Off` key.
+    ///
+    /// A session that moves to another confinement drops the processes it
+    /// started under the old one.
     pub fn set_session_sandbox(&self, session: &SessionId, sandbox: SessionSandbox) {
-        let mut map = self.sandboxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if sandbox.is_off() {
-            map.remove(session.as_str());
-        } else {
-            map.insert(session.as_str().to_string(), sandbox);
+        let new_tag = sandbox.lease_tag();
+        let old_tag = {
+            let mut map = self.sandboxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let old = if sandbox.is_off() {
+                map.remove(session.as_str())
+            } else {
+                map.insert(session.as_str().to_string(), sandbox)
+            };
+            old.map_or(0, |s| s.lease_tag())
+        };
+        if old_tag != 0 && old_tag != new_tag {
+            let removed: Vec<LeaseState> = {
+                let mut map =
+                    self.leases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let keys: Vec<LeaseKey> = map
+                    .keys()
+                    .filter(|(s, _, t)| s == session.as_str() && *t == old_tag)
+                    .cloned()
+                    .collect();
+                keys.into_iter().filter_map(|k| map.remove(&k)).collect()
+            };
+            for state in removed {
+                Self::cancel_state(state);
+            }
         }
     }
 
@@ -329,17 +363,23 @@ impl ExtensionRuntimeManager {
             .len()
     }
 
-    /// Terminate one session's runtime lease for one PLUGIN (the lease
-    /// unit: one child shared by that session's exact tools of the plugin).
+    /// Terminate one session's runtime leases for one PLUGIN (the lease
+    /// unit: one child shared by that session's exact tools of the plugin),
+    /// under every sandbox.
     pub fn revoke_plugin_lease(&self, session: &SessionId, plugin: &str) {
-        let removed = {
+        let removed: Vec<LeaseState> = {
             let mut map = self
                 .leases
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            map.remove(&(session.as_str().to_string(), plugin.to_string()))
+            let keys: Vec<LeaseKey> = map
+                .keys()
+                .filter(|(s, p, _)| s == session.as_str() && p == plugin)
+                .cloned()
+                .collect();
+            keys.into_iter().filter_map(|k| map.remove(&k)).collect()
         };
-        if let Some(state) = removed {
+        for state in removed {
             Self::cancel_state(state);
         }
     }
@@ -360,8 +400,8 @@ impl ExtensionRuntimeManager {
                 .leases
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let keys: Vec<(String, String)> =
-                map.keys().filter(|(_, p)| p == plugin).cloned().collect();
+            let keys: Vec<LeaseKey> =
+                map.keys().filter(|(_, p, _)| p == plugin).cloned().collect();
             keys.into_iter().filter_map(|k| map.remove(&k)).collect()
         };
         let count = removed.len();
@@ -380,9 +420,9 @@ impl ExtensionRuntimeManager {
                 .leases
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let keys: Vec<(String, String)> = map
+            let keys: Vec<LeaseKey> = map
                 .keys()
-                .filter(|(s, _)| s == session.as_str())
+                .filter(|(s, _, _)| s == session.as_str())
                 .cloned()
                 .collect();
             keys.into_iter().filter_map(|k| map.remove(&k)).collect()
@@ -420,7 +460,7 @@ impl ExtensionRuntimeManager {
                 .leases
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let idle: Vec<(String, String)> = map
+            let idle: Vec<LeaseKey> = map
                 .iter()
                 .take(REAP_SCAN_MAX)
                 .filter(|(_, state)| match state {
@@ -444,7 +484,7 @@ impl ExtensionRuntimeManager {
     }
 
     /// Single-flight acquisition of the validated Ready lease for one
-    /// (session, plugin) key. Shared by exact tool calls and handler-based
+    /// (session, plugin, sandbox) key; a new child starts under `sandbox`. Shared by exact tool calls and handler-based
     /// (hook/provider/user) acquisition — one child per key. The map lock
     /// is never held across I/O; a live lease whose pinned launch
     /// fingerprint no longer matches the CURRENT record is launch drift
@@ -455,9 +495,10 @@ impl ExtensionRuntimeManager {
         plugin: &str,
         record: &DeferredExtensionRecord,
         validated: &super::manifest::ValidatedExtensionManifest,
+        sandbox: &SessionSandbox,
     ) -> Result<Arc<LeaseInner>, ExtensionLeaseError> {
         let expected_fingerprint = record_fingerprint(record);
-        let key = (session.as_str().to_string(), plugin.to_string());
+        let key = lease_key(session, plugin, sandbox);
         let inner: Arc<LeaseInner> = loop {
             // 4. Single-flight acquisition: the guard-scoped decision
             // returns an owned action, so the map lock is NEVER held
@@ -553,7 +594,7 @@ impl ExtensionRuntimeManager {
                             record,
                             validated,
                             expected_fingerprint.clone(),
-                            &self.session_sandbox(session),
+                            sandbox,
                         )
                         .await;
                     let ours = {
@@ -606,8 +647,10 @@ impl ExtensionRuntimeManager {
     /// command/settings APIs). Same record re-validation, exact
     /// runtime declaration matching, single-flight, and teardown rules as
     /// exact tool calls — and, when the host scope is bound to the
-    /// Runtime's tool session (engine boot), the SAME lease key: a Mixed
-    /// extension runs ONE shared child.
+    /// Runtime's tool session (engine boot), the SAME lease key while that
+    /// session is unconfined: a Mixed extension runs ONE shared child. The
+    /// handler scope's child is the host's own and always starts unconfined
+    /// (the `Off` key); a confined session's tool calls get their own.
     async fn acquire_handler_scope(
         &self,
         plugin: &str,
@@ -615,18 +658,19 @@ impl ExtensionRuntimeManager {
         let session = self.host_scope();
         let (record, validated) = self.record_and_validate(&session, plugin)?;
         self.reap_idle();
-        self.acquire_ready(&session, plugin, &record, &validated)
+        self.acquire_ready(&session, plugin, &record, &validated, &SessionSandbox::Off)
             .await
     }
 
-    /// Whether a Ready (non-cancelled) lease exists for one key.
+    /// Whether a Ready (non-cancelled) unconfined lease exists for one
+    /// (session, plugin).
     fn has_ready_lease(&self, session: &SessionId, plugin: &str) -> bool {
         let map = self
             .leases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         matches!(
-            map.get(&(session.as_str().to_string(), plugin.to_string())),
+            map.get(&lease_key(session, plugin, &SessionSandbox::Off)),
             Some(LeaseState::Ready(inner)) if !inner.cancelled()
         )
     }
@@ -643,7 +687,7 @@ impl ExtensionRuntimeManager {
             .leases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match map.get(&(session.as_str().to_string(), plugin.to_string())) {
+        match map.get(&lease_key(&session, plugin, &SessionSandbox::Off)) {
             Some(LeaseState::Ready(inner))
                 if !inner.cancelled() && inner.fingerprint == expected_fingerprint =>
             {
@@ -771,9 +815,11 @@ impl ExtensionRuntimeManager {
         }
         self.reap_idle();
 
-        // 4. Single-flight acquisition of the validated per-plugin lease.
+        // 4. Single-flight acquisition of the validated per-plugin lease,
+        // started under (and keyed by) the session's current sandbox.
+        let sandbox = self.session_sandbox(session);
         let inner = self
-            .acquire_ready(session, plugin, &record, &validated)
+            .acquire_ready(session, plugin, &record, &validated, &sandbox)
             .await?;
         // 5. Exact validation against the pinned validated listing BEFORE
         // any call.
@@ -915,7 +961,8 @@ impl ExtensionRuntimeManager {
         }))
     }
 
-    /// Test seam: `Weak` ownership token of one lease. `upgrade() == None`
+    /// Test seam: `Weak` ownership token of one lease (the one the session's
+    /// tool calls use under its current sandbox). `upgrade() == None`
     /// proves the manager (and any bounded shutdown task) released it.
     #[doc(hidden)]
     pub fn lease_liveness_for_tests(
@@ -923,11 +970,12 @@ impl ExtensionRuntimeManager {
         session: &SessionId,
         plugin: &str,
     ) -> Option<std::sync::Weak<()>> {
+        let key = lease_key(session, plugin, &self.session_sandbox(session));
         let map = self
             .leases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match map.get(&(session.as_str().to_string(), plugin.to_string())) {
+        match map.get(&key) {
             Some(LeaseState::Ready(inner)) => Some(Arc::downgrade(&inner.liveness)),
             _ => None,
         }

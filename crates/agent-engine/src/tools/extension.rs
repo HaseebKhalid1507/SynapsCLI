@@ -32,6 +32,15 @@ impl ExtensionTool {
     }
 }
 
+/// Why a sandboxed session can't call an eager extension's tool.
+fn unsandboxed_refusal(tool: &str) -> String {
+    format!(
+        "sandbox: '{tool}' runs in an extension process that every session shares and that is not \
+         sandboxed, so a sandboxed session can't call it (an extension whose manifest has a \
+         `deferred` block runs its tools per session, inside the session's sandbox)"
+    )
+}
+
 /// Who an extension tool call is made by, for `tool.call` `params.caller`:
 /// the author of the memory binding the call's context came with (an
 /// extension's forum records it as the run's author). `None` when
@@ -59,6 +68,12 @@ impl crate::tools::Tool for ExtensionTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        // This tool's process is an eager extension's: started once for the
+        // whole host, outside every session's sandbox, and shared by all of
+        // them. A sandboxed session's call must not run there.
+        if !ctx.capabilities.sandbox.is_off() {
+            return Err(RuntimeError::Tool(unsandboxed_refusal(&self.runtime_name)));
+        }
         let caller = caller_of(&ctx);
         let value = self
             .handler
@@ -175,6 +190,31 @@ mod tests {
             }
         }
         assert_eq!(handler.0.load(Ordering::SeqCst), named.len() * 2, "every call reached the extension");
+    }
+
+    /// An eager extension's process is shared by every session and runs
+    /// outside the sandbox: a sandboxed session (resolved or not) is refused
+    /// its tools with a reason, and the call never reaches the process. With
+    /// confinement off the same tool runs (the control).
+    #[tokio::test]
+    async fn a_sandboxed_session_is_refused_an_eager_extensions_tools() {
+        let handler = Arc::new(Counting::default());
+        let tool = tool("weather", "forecast", &handler);
+        #[allow(unused_mut)]
+        let mut sandboxes = vec![crate::sandbox::SessionSandbox::Unresolved];
+        #[cfg(unix)]
+        let tree = crate::sandbox::testkit::Tree::new();
+        #[cfg(unix)]
+        sandboxes.push(tree.session(vec![], vec![]));
+        for sandbox in sandboxes {
+            let mut ctx = create_tool_context();
+            ctx.capabilities.sandbox = sandbox;
+            let why = tool.execute(json!({}), ctx).await.expect_err("refused").to_string();
+            assert!(why.contains("'weather:forecast'") && why.contains("not sandboxed"), "{why}");
+        }
+        assert_eq!(handler.0.load(Ordering::SeqCst), 0, "no call reached the extension");
+        assert_eq!(tool.execute(json!({}), create_tool_context()).await.unwrap(), "extension result");
+        assert_eq!(handler.0.load(Ordering::SeqCst), 1);
     }
 
     /// The suffixed wire name the model sees beside the host's own tool

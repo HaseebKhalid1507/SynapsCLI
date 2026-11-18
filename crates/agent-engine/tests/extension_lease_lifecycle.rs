@@ -1173,6 +1173,79 @@ async fn mixed_class_shares_one_process_and_tool_search_never_triggers() {
     fx.cleanup();
 }
 
+/// The sandbox is part of the lease key. The host's own (unconfined) child,
+/// started for a provider call on the tool session's key, is never handed to
+/// that session's tool calls once the session has a sandbox: they need a
+/// child started under it (here a sandbox that starts nothing, so the call
+/// fails rather than reach the unconfined child). The handler scope keeps
+/// its unconfined child whatever the session's sandbox is.
+#[tokio::test]
+async fn a_lease_started_under_one_sandbox_is_not_reused_under_another() {
+    use agent_engine::sandbox::SessionSandbox;
+    hermetic_base_dir::pin();
+    let fx = fixture_with(
+        "sandbox-key",
+        "ok",
+        advertised_tools(),
+        Some(json!([registered_provider_json()])),
+        json!({
+            "permissions": ["tools.register", "providers.register"],
+            "deferred": {
+                "tools": [
+                    {"name": "search", "description": "deferred search", "input_schema": search_schema()},
+                    {"name": "sibling", "description": "sibling stays dormant", "input_schema": sibling_schema()},
+                ],
+                "providers": [declared_provider_json()]
+            }
+        }),
+    );
+    let (mgr, _registry) = deferred_manager(&fx).await;
+    let runtime = mgr.extension_runtime();
+    runtime.bind_host_scope(sid());
+    let handler = mgr
+        .provider(&format!("{PLUGIN}:prov"))
+        .unwrap()
+        .handler
+        .clone()
+        .unwrap();
+    let tools = dormant_extension_tools(PLUGIN, &fx.manifest);
+    let search = tools
+        .iter()
+        .find(|t| t.name() == "fixture-plugin:search")
+        .unwrap();
+    let call = || {
+        let cap = ExtensionLeaseCapability::new(sid(), Arc::clone(&runtime));
+        search.execute(json!({"q":"x"}), ctx_with(Some(cap)))
+    };
+
+    handler.provider_complete(provider_params()).await.unwrap();
+    assert_eq!(fx.count("spawn"), 1);
+
+    runtime.set_session_sandbox(&sid(), SessionSandbox::Unresolved);
+    let refused = call().await;
+    assert!(refused.is_err(), "the unconfined child served a sandboxed session: {refused:?}");
+    assert_eq!(fx.count("call:search"), 0);
+    assert_eq!(fx.count("spawn"), 1, "nothing starts under a sandbox that refuses");
+
+    // The host's handler child is still the unconfined one, and serves.
+    handler.provider_complete(provider_params()).await.unwrap();
+    assert_eq!(fx.count("spawn"), 1);
+
+    // A host scope with no child yet starts its own unconfined one even
+    // while the session's sandbox refuses every start.
+    runtime.terminate_all();
+    handler.provider_complete(provider_params()).await.unwrap();
+    assert_eq!(fx.count("spawn"), 2, "the handler scope starts unconfined");
+
+    // Back to no sandbox: the session's tool calls share that child again.
+    runtime.set_session_sandbox(&sid(), SessionSandbox::Off);
+    assert_eq!(call().await.unwrap(), "called:search");
+    assert_eq!(fx.count("spawn"), 2);
+    assert_eq!(runtime.lease_count(), 1);
+    runtime.terminate_all();
+    fx.cleanup();
+}
+
 #[tokio::test]
 async fn legacy_manifest_without_deferred_stays_eager_under_progressive_flag() {
     hermetic_base_dir::pin();
