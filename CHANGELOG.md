@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A session's background workers show in the session list.**
+  `SessionMeta.workers` lists the `subagent_start` workers that keep a
+  session from parking (running, or finished with the result not yet
+  collected), with a `running` count, and `/sessions` and
+  `synaps daemon sessions` tag such a session ` · N workers`, so a session
+  whose turn ended while its workers run no longer looks idle. The daemon
+  advertises it as the `session_workers` feature, and `Welcome.boot_id`
+  (kept across `daemon reload`) tells a client when worker handle ids
+  started over. `SessionLifecycle` decodes a lifecycle this build does not
+  know as `unknown`. See "Workers in the session list" in
+  [docs/daemon-mode.md](docs/daemon-mode.md).
+
 ### Changed
 
 - **`synaps daemon sessions --json` prints each session as the daemon sent
