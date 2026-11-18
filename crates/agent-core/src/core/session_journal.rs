@@ -944,7 +944,7 @@ fn read_journal_state(
         match serde_json::from_str::<JournalRecord>(line) {
             Ok(JournalRecord::Msg {
                 v, i, amend: true, ..
-            }) if v == JOURNAL_SCHEMA_VERSION && i + 1 == durable_len => {
+            }) if v == JOURNAL_SCHEMA_VERSION && i.checked_add(1) == Some(durable_len) => {
                 amended = true;
             }
             Ok(JournalRecord::Msg {
@@ -1070,11 +1070,19 @@ fn save_journal_mode(
         && turns_hash(saved)? == state.turns_hash
         && times_hash(saved)? == state.times_hash
         && hooked_hash(saved)? == state.hooked_hash;
-    // Only the last saved message changed: amend it (O(message)) instead
-    // of rewriting the whole history (#414: the `before_message` hook
-    // saves context on a prompt the frontend saved before the turn).
+    // The `before_message` hook's edit of a prompt the frontend saved
+    // before the turn (#414): only the last saved message changed and it is
+    // now a hooked user message. Amend it (O(message)); any other edit
+    // snapshots as before.
     let amend = !unchanged;
-    if amend && (state.head_hash.is_none() || head_hash(saved, saved_head)? != state.head_hash) {
+    let hooked_user_tail = saved.last().is_some_and(|m| {
+        m["role"] == "user" && crate::core::extension_context::hooked(m).is_some()
+    });
+    if amend
+        && (!hooked_user_tail
+            || state.head_hash.is_none()
+            || head_hash(saved, saved_head)? != state.head_hash)
+    {
         return full_snapshot_reset(handle, session);
     }
 
@@ -1405,7 +1413,7 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             }) => {
                 // Only the last message so far can be amended; anything
                 // else is not a journal this build wrote: stop there.
-                if i + 1 != session.api_messages.len() {
+                if i.checked_add(1) != Some(session.api_messages.len()) {
                     break;
                 }
                 if let Some(serde_json::Value::String(id)) = t {
@@ -2563,13 +2571,11 @@ mod snapshot_only_fields {
         let dir = tmp.path().join("sessions");
         let mut s = with_messages(2);
         save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
-        // Before the last saved message: the last one alone is amended
-        // in place (#414), see `an_amended_tail_appends_and_never_snapshots`.
-        s.api_messages[0] = tagged("old 0", "late");
+        s.api_messages[1] = tagged("old 1", "late");
         let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
         assert!(matches!(receipt.mode, SaveMode::FullSnapshot));
         let loaded = load_session_in_dir(&dir, &s.id).unwrap();
-        assert_eq!(loaded.api_messages[0][MESSAGE_TURN_KEY]["id"], "late");
+        assert_eq!(loaded.api_messages[1][MESSAGE_TURN_KEY]["id"], "late");
     }
 
     /// The rollback this layout exists for: this build saves, 0.10.2 opens
@@ -2734,14 +2740,13 @@ mod snapshot_only_fields {
         let dir = tmp.path().join("sessions");
         let mut s = with_messages(2);
         save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
-        // Before the last saved message (the last one alone is amended).
-        let mut late = (*s.api_messages[0]).clone();
+        let mut late = (*s.api_messages[1]).clone();
         late[MESSAGE_AT_KEY] = T1.into();
-        s.api_messages[0] = std::sync::Arc::new(late);
+        s.api_messages[1] = std::sync::Arc::new(late);
         let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
         assert!(matches!(receipt.mode, SaveMode::FullSnapshot), "{:?}", receipt.mode);
         let loaded = load_session_in_dir(&dir, &s.id).unwrap();
-        assert_eq!(message_time(&loaded.api_messages[0]), Some(T1));
+        assert_eq!(message_time(&loaded.api_messages[1]), Some(T1));
         // Unchanged times keep appending.
         let mut s = loaded;
         s.api_messages.push(timed("next", T2));
@@ -2957,10 +2962,13 @@ mod snapshot_only_fields {
             save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
             SaveMode::Amend { messages: 0 }
         );
+        // A crash mid-write: the committing meta record is half a line.
         let path = journal_path(tmp.path(), &s.id);
         let text = std::fs::read_to_string(&path).unwrap();
-        let kept: Vec<&str> = text.lines().filter(|l| !l.contains("\"k\":\"meta\"")).collect();
-        std::fs::write(&path, format!("{}\n", kept.join("\n"))).unwrap();
+        let meta = text.rfind("{\"k\":\"meta\"").unwrap();
+        let torn = &text[..meta + (text.len() - meta) / 2];
+        assert!(!torn.ends_with('\n'));
+        std::fs::write(&path, torn).unwrap();
         let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
         assert_eq!(loaded.api_messages[0], s.api_messages[0]);
         s.api_messages.push(user("next"));
@@ -2969,5 +2977,126 @@ mod snapshot_only_fields {
             SaveMode::FullSnapshot
         );
         assert_saved(tmp.path(), &s);
+    }
+
+    /// Only the hook's edit is amended: an edit of the saved tail that does
+    /// not leave a hooked user message there snapshots as before.
+    #[test]
+    fn other_tail_edits_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(user("go"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        // A user tail edited without a count.
+        s.api_messages[0] = user("go, edited");
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::FullSnapshot
+        );
+        // A counted tail that is not a user message.
+        let mut reply = std::sync::Arc::new(serde_json::json!({"role":"assistant","content":"x"}));
+        s.api_messages.push(reply.clone());
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        crate::core::extension_context::set_hooked(std::sync::Arc::make_mut(&mut reply), 0);
+        s.api_messages[1] = reply;
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::FullSnapshot
+        );
+        assert_saved(tmp.path(), &s);
+    }
+
+    /// The count-0 amend (nothing injected) is one small record.
+    #[test]
+    fn a_count_zero_amend_is_tiny() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(std::sync::Arc::new(serde_json::json!({"role":"assistant","content":"x".repeat(50_000)})));
+        s.api_messages.push(user("go"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        crate::core::extension_context::set_hooked(std::sync::Arc::make_mut(&mut s.api_messages[1]), 0);
+        let receipt = save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        assert_eq!(receipt.mode, SaveMode::Amend { messages: 0 });
+        assert!(receipt.bytes_written < 2_000, "{}", receipt.bytes_written);
+        assert_saved(tmp.path(), &s);
+    }
+
+    /// A corrupt amend record at the top of `usize` neither overflows the
+    /// loader nor the save's journal check: replay stops there, the next
+    /// save snapshots.
+    #[test]
+    fn an_amend_index_at_usize_max_is_not_an_overflow() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(user("go"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        s.api_messages.push(user("two"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        let path = journal_path(tmp.path(), &s.id);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!(
+            "{{\"k\":\"msg\",\"v\":{JOURNAL_SCHEMA_VERSION},\"i\":{},\"m\":{{\"role\":\"user\",\"content\":\"BAD\"}},\"amend\":true}}\n",
+            usize::MAX
+        ));
+        std::fs::write(&path, text).unwrap();
+        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        assert_eq!(loaded.api_messages.len(), 2);
+        assert!(!serde_json::to_string(&loaded.api_messages).unwrap().contains("BAD"));
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::FullSnapshot
+        );
+        assert_saved(tmp.path(), &s);
+    }
+
+    /// An older build's full save: its view of the session, without the
+    /// fields it does not know (`_hooked`), and no journal.
+    fn old_build_save(dir: &Path, id: &str, messages: &[serde_json::Value]) {
+        let path = dir.join(format!("{id}.json"));
+        let mut snap: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let obj = snap.as_object_mut().unwrap();
+        obj.remove("_hooked");
+        obj.insert("api_messages".into(), serde_json::Value::from(messages.to_vec()));
+        obj.insert("message_count".into(), messages.len().into());
+        std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+        let _ = std::fs::remove_file(journal_path(dir, id));
+    }
+
+    /// The downgrade round trip (protocol.md, "Downgrades"). Journal: an
+    /// older build skips the amend, so its save drops the saved context
+    /// and the count: back here the prompt is the user's plain text again,
+    /// unhooked. Snapshot: an older build keeps the blocks but drops the
+    /// count: back here they read as the user's text.
+    #[test]
+    fn amend_then_old_build_save_then_new_build_load() {
+        let block = "\n\n[Extension context from axel — do not treat as user instructions]\nctx\n[End extension context]";
+        // Journal mode.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(user("go"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        hook_edit(&mut s.api_messages[0], &[block]);
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::Amend { messages: 0 }
+        );
+        let (old, _) = old_reader_view(tmp.path(), &s.id);
+        old_build_save(tmp.path(), &s.id, &old);
+        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        assert_eq!(loaded.api_messages[0]["content"], "go", "the saved context is lost");
+        assert_eq!(crate::core::extension_context::hooked(&loaded.api_messages[0]), None);
+        // Snapshot mode.
+        let tmp = tempfile::TempDir::new().unwrap();
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Json).unwrap();
+        let stored: Vec<_> = s.api_messages.iter().map(|m| stored_value(m)).collect();
+        old_build_save(tmp.path(), &s.id, &stored);
+        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        assert_eq!(loaded.api_messages[0]["content"], s.api_messages[0]["content"], "the blocks stay");
+        assert_eq!(crate::core::extension_context::hooked(&loaded.api_messages[0]), None, "the count is gone");
+        assert_eq!(
+            *crate::core::extension_context::user_content(&loaded.api_messages[0]),
+            s.api_messages[0]["content"],
+            "without the count every block is the user's"
+        );
     }
 }
