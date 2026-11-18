@@ -103,7 +103,13 @@ fn trust_configured_default(inner: &mut Inner, raw: &str) -> Result<QualifiedMod
         && inner.registry.policy().authorize(&model).is_err()
     {
         // A failed grant leaves the policy as it was; authorization denies.
-        let _ = inner.registry.grant_worker_model(model.clone());
+        if let Err(error) = inner.registry.grant_worker_model(model.clone()) {
+            tracing::warn!(
+                model = model.as_str(),
+                error = %error,
+                "failed to apply configured subagent_model trust"
+            );
+        }
     }
     Ok(model)
 }
