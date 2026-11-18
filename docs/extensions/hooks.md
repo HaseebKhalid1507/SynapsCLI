@@ -61,11 +61,11 @@ Unsupported result actions are ignored fail-open and logged as warnings.
   `forget` entry in `parts`) shows it at the tail of every request of the
   turn instead, never stored, and saves a marker `[<extension id> context
   was shown here for one turn and not kept]`. A saved part over 16 KiB is
-  handled as `forget`. A message is hooked once, ever: a resend or resumed
-  turn does not run the hook again (forget content is not shown again; the
-  marker stays). Only the newest user message is hooked (the last of
+  handled as `forget`. A message is hooked once, ever (also when no
+  handler was registered then): a resend or resumed turn does not run the
+  hook again (forget content is not shown again; the marker stays). Only the newest user message is hooked (the last of
   several steers; a rollover or the preamble nudge does not re-hook).
-  Framing look-alike lines in content are escaped with a leading `\`.
+  Framing look-alikes in content are escaped with a `\` before their `[`.
   Hosts with this behaviour list `inject.forget` in the `initialize`
   params' `features`. See `protocol.md` §`inject` for the placement
   contract, the `_synaps_hooked` count that tells saved blocks from user

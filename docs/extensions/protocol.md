@@ -744,9 +744,12 @@ contains extension context saved earlier, yours or anyone's.
 
 Which messages are hooked:
 
-- **Once, ever.** The host records on the message that it was hooked
-  (whatever came back: content, `continue`, an error or a timeout). A
-  hooked message is never hooked again. A resend or a resumed run of a turn
+- **Once, ever.** The host records on every new user message that it was
+  hooked (whatever came back: content, `continue`, an error or a timeout;
+  also when no extension had a `before_message` handler then, with a count
+  of `0`). A hooked message is never hooked again, so a resend after a
+  daemon reload that loaded an extension does not hook a message that was
+  already sent. A resend or a resumed run of a turn
   (after an error, a cancel, a crash or a restart) does not run the hook
   for it: its saved parts and markers stay as they were, and its forget
   content is **not** shown again. The marker stays without the content,
@@ -814,18 +817,20 @@ Which messages are hooked:
 - Empty or whitespace-only content is ignored. Several extensions' results
   are kept apart, in handler order.
 - **Fence look-alikes are escaped.** In saved and forget content (and
-  `on_session_start` content), a line that reads like framing gets a
-  backslash before its first non-blank character, so content cannot close
-  its own block, open one in another extension's name, or forge a marker:
+  `on_session_start` content), text that reads like framing gets a
+  backslash right before its `[`, wherever it is in a line, so content
+  cannot close its own block, open one in another extension's name, or
+  forge a marker:
 
-  | Line (after indentation, ASCII case-insensitive) | Becomes |
+  | Text (anywhere, ASCII case-insensitive) | Becomes |
   |---|---|
-  | starts with `[Extension context` | `\[Extension context…` |
-  | starts with `[End extension context` | `\[End extension context…` |
-  | starts with `[` and ends with ` context was shown here for one turn and not kept]` | `\[… context was shown here for one turn and not kept]` |
+  | `[Extension context…` | `\[Extension context…` |
+  | `[End extension context…` | `\[End extension context…` |
+  | `[` + text without `[`, `]` or a line break + ` context was shown here for one turn and not kept]` | `\[… context was shown here for one turn and not kept]` |
 
-  Nothing else changes, and escaping is stable: the same content always
-  frames to the same bytes.
+  Line breaks are `\r`, `\n`, U+0085, U+2028 and U+2029. A `[` that
+  already follows a backslash is left alone. Nothing else changes, and
+  escaping is stable: the same content always frames to the same bytes.
 
 The marker and the saved fence differ from the turn-only fence: saved
 blocks and markers may carry the cache marker; turn-only blocks never do.
@@ -847,10 +852,26 @@ Grammar of an added block's `text` (it starts with a blank line):
 "\n\n[" <id> " context was shown here for one turn and not kept]"
 ```
 
-`<id>` has no brackets, control characters or newlines (64 characters at
-most); `<content>` has fence look-alike lines escaped (above). Keys
+`<id>` has no brackets, control characters or line breaks (64 characters
+at most); `<content>` has fence look-alikes escaped (above). Keys
 starting with `_synaps_` are host metadata: no provider ever receives
-them.
+them as message keys (`memory_fetch` shows an archived message as JSON,
+the count included).
+
+Rollover archives keep the count too: a stored user message carries
+`_synaps_hooked`, counted over its stored blocks (see
+[`context-archives.md`](./context-archives.md) §"The message").
+
+**Downgrades.** Older builds do not know `_synaps_hooked`. A session
+saved by one after it was opened by this build loses the count: in a
+stored snapshot the saved blocks and markers stay but, back on this
+build, read as the user's own text (titles, previews, search, compaction
+and the hook's `message` include them), and a user message at the end
+that no reply followed yet can be hooked again. In journal mode an older
+build skips the record that saved the context on the prompt, so it keeps
+(and saves) the prompt without it: the saved context is lost, never the
+rest of the history. Forget content is never stored, so no downgrade can
+bring it back.
 
 **Clients** see saved blocks and markers in the conversation history (daemon
 `Attach`/`Resync` display tails and stored sessions) as extra user-role
