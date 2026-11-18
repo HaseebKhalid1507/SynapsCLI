@@ -40,6 +40,20 @@ All notable changes to this project will be documented in this file.
   takes a token budget). Until now the level was in no log, so what a
   level costs could only be worked out from worker archives.
 
+- **`subagent_model`: a default model for subagent workers.** A
+  `subagent` or `subagent_start` call that omits `model` used to inherit the
+  foreground model, so switching the foreground to an expensive model
+  silently moved every worker to it. Set `subagent_model` (config or
+  `/settings`; `claude-sonnet-4-6` or a qualified id) and workers use it
+  instead; unset, empty or `inherit` keeps today's behaviour, and a per-call
+  `model` still wins. Naming a model in `subagent_model` trusts it for
+  workers the way a favorite does, and the trust lasts until the session
+  ends, like a favorite. An unknown id is denied
+  (`selection_source: configured_default`, with a remediation asking to tell
+  the user) rather than replaced by the foreground model. `subagent_models`
+  reports the configured default; `subagent_resume` keeps the worker's own
+  model.
+
 ### Changed
 
 - **New session ids end in 8 random hex characters, not 4**
