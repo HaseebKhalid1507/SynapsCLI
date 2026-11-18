@@ -217,8 +217,9 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
+      - build-deb
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.build-deb.result == 'skipped' || needs.build-deb.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
@@ -262,6 +263,12 @@ jobs:
           pattern: artifacts-*
           path: artifacts
           merge-multiple: true
+      - name: "Download the .deb"
+        if: ${{ needs.build-deb.result == 'success' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: deb-package
+          path: artifacts
       - name: Cleanup
         run: |
           # Remove the granular manifests
@@ -280,25 +287,46 @@ jobs:
 
   # ── Publish to crates.io ──
   # ── Build .deb package ──
-  publish-deb:
+  # Built before `host` publishes the release: this repo has immutable releases,
+  # so nothing can be added to a release once it is published (0.12.0 lost its
+  # .deb that way). The .deb wraps the exact x86_64 Linux binaries dist built;
+  # `host` attaches it with everything else in `gh release create`.
+  build-deb:
     needs:
       - plan
-      - host
-    if: ${{ always() && needs.host.result == 'success' && !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
+      - build-local-artifacts
+    if: ${{ needs.plan.outputs.publishing == 'true' && !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
     runs-on: "ubuntu-22.04"
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-deb
-        run: cargo install cargo-deb
-      - name: Build .deb
-        run: cargo deb --no-build --target x86_64-unknown-linux-gnu || cargo deb
-      - name: Upload .deb to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo install cargo-deb --locked
+      - name: Fetch the x86_64 Linux build
+        uses: actions/download-artifact@v7
+        with:
+          name: artifacts-build-local-x86_64-unknown-linux-gnu
+          path: dist-linux
+      - name: Put the released binaries where cargo-deb looks
         run: |
-          DEB=$(find target -name "*.deb" | head -1)
-          gh release upload "${{ needs.plan.outputs.tag }}" "$DEB" --clobber
+          tar -xzf dist-linux/synaps-x86_64-unknown-linux-gnu.tar.gz -C dist-linux
+          mkdir -p target/release
+          install -m 0755 dist-linux/synaps-x86_64-unknown-linux-gnu/synaps target/release/synaps
+          install -m 0755 dist-linux/synaps-x86_64-unknown-linux-gnu/hidden target/release/hidden
+      - name: Build .deb
+        # cargo-deb reads `target/release/...` relative to the target dir:
+        # pin it, so a cargo config elsewhere cannot point it at another build.
+        env:
+          CARGO_TARGET_DIR: target
+        run: cargo deb --no-build --no-strip --output target/debian/
+      - name: Upload .deb
+        uses: actions/upload-artifact@v6
+        with:
+          name: deb-package
+          path: target/debian/*.deb
+          if-no-files-found: error
 
   publish-crates:
     needs:

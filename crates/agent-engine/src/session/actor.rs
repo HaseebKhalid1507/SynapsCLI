@@ -755,19 +755,13 @@ impl SessionActor {
                 }
             }
         } else {
-            // Fresh session — best-effort lock.
-            let dir = agent_core::session_lock::sessions_dir();
+            // Fresh session: a taken id (another fresh session drew it) is
+            // never its own, so it draws another; never runs unlocked on it.
             let holder = agent_core::session_lock::LockHolder {
                 pid: std::process::id(),
                 kind: lock_kind.to_string(),
             };
-            match agent_core::session_lock::SessionLock::try_acquire(&dir, &sb.session.id, holder) {
-                Ok(lock) => Some(lock),
-                Err(e) => {
-                    tracing::warn!(session = %sb.session.id, "session lock: {e}");
-                    None
-                }
-            }
+            super::fresh_id::lock_fresh_session(&mut runtime, &mut sb, holder)?
         };
 
         // `--name` at create: apply BEFORE the registry entry is written so

@@ -556,6 +556,37 @@ async fn sessions_with_one_turn(paths: &registry::DaemonPaths, cwd: &Path, n: us
     ids
 }
 
+/// The daemon's trace logs (`synaps.log*` under the test HOME), last
+/// lines of each, for a failure message: the HOME is gone after the test,
+/// so a CI job log has nothing else to go on.
+fn daemon_logs(guard: &HomeGuard) -> String {
+    const TAIL: usize = 2000;
+    let mut logs: Vec<PathBuf> = std::fs::read_dir(guard.base_dir())
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    logs.retain(|p| {
+        p.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("synaps.log"))
+    });
+    logs.sort();
+    let mut out = String::new();
+    for p in logs {
+        let text = std::fs::read_to_string(&p).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let tail = &lines[lines.len().saturating_sub(TAIL)..];
+        out.push_str(&format!(
+            "==== {} (last {} lines) ====\n{}\n",
+            p.display(),
+            tail.len(),
+            tail.join("\n")
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("(no daemon log under the test HOME)");
+    }
+    out
+}
+
 /// Wait for the new image (`generation`) to answer Ping; returns how long
 /// that took after `t0`, or `None` past `budget`, including an answer that
 /// arrived only after it. A bound but not yet accepting socket holds the
@@ -603,8 +634,19 @@ async fn reload_with_a_slow_session_start_hook_answers_within_seconds() {
     assert_reload_pid(registry::read_daemon_json(&d.paths).unwrap().pid, pid_before);
 
     let listed = SocketTransport::sessions(&d.paths.sock).await.expect("sessions");
-    for id in &ids {
-        assert!(listed.iter().any(|m| &m.id == id), "{id} listed after the reload");
+    let missing: Vec<&SessionId> = ids
+        .iter()
+        .filter(|id| !listed.iter().any(|m| &m.id == *id))
+        .collect();
+    if !missing.is_empty() {
+        let listing: Vec<(&str, &str)> = listed
+            .iter()
+            .map(|m| (m.id.as_str(), m.journal_id.as_str()))
+            .collect();
+        panic!(
+            "{missing:?} not listed after the reload\ncreated: {ids:?}\nlisted (id, journal_id): {listing:?}\n{}",
+            daemon_logs(&guard)
+        );
     }
     for id in &ids {
         let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();

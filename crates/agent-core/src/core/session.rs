@@ -187,14 +187,25 @@ impl Session {
     }
 }
 
-/// A fresh session id at `now`: `YYYYMMDD-HHMMSS-xxxx` (4 random hex).
-/// Journals take it in [`Session::new`]; a daemon actor whose journal id is
+/// Random hex characters after a session id's `YYYYMMDD-HHMMSS-` stamp.
+/// It was 4: 16 bits per second, so two sessions started in the same second
+/// drew the same id about once in 65 000 pairs. Ids minted before stay
+/// valid; readers take 4 or more (`session_catalog::is_session_id`).
+pub const SESSION_ID_RANDOM_HEX: usize = 8;
+
+/// A fresh session id at `now`: `YYYYMMDD-HHMMSS-` (UTC), then
+/// [`SESSION_ID_RANDOM_HEX`] random hex characters. Ids sort by the second
+/// they were minted in. Journals take it in [`Session::new`] and
+/// [`Session::from_compaction_record`]; a daemon actor whose journal id is
 /// already some other live actor's id takes one too.
 pub fn mint_session_id(now: DateTime<Utc>) -> String {
+    // A v4 UUID's first group is all random bits (the version and variant
+    // nibbles come later).
+    let random = uuid::Uuid::new_v4().to_string();
     format!(
         "{}-{}",
         now.format("%Y%m%d-%H%M%S"),
-        &uuid::Uuid::new_v4().to_string()[..4]
+        &random[..SESSION_ID_RANDOM_HEX]
     )
 }
 
@@ -241,11 +252,7 @@ impl Session {
         record: crate::compaction::CompactionRecord,
     ) -> Self {
         let now = Utc::now();
-        let id = format!(
-            "{}-{}",
-            now.format("%Y%m%d-%H%M%S"),
-            &uuid::Uuid::new_v4().to_string()[..4]
-        );
+        let id = mint_session_id(now);
         // Transfer session name from parent — the compacted session is the
         // continuation, so the name should follow. Parent's name will be
         // cleared when the caller saves it with compacted_into set.
@@ -955,6 +962,25 @@ mod tests {
             redaction_policy: crate::compaction::RedactionPolicy::TruncationOnly,
             prior_system_prompt: parent.system_prompt.clone(),
         }
+    }
+
+    #[test]
+    fn a_minted_id_is_a_session_id_and_a_four_hex_id_still_is() {
+        use crate::core::session_catalog::is_session_id;
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 11, 17, 1, 53, 28).unwrap();
+        let id = mint_session_id(now);
+        assert!(id.starts_with("20261117-015328-"), "{id}");
+        assert_eq!(
+            id.len(),
+            "20261117-015328-".len() + SESSION_ID_RANDOM_HEX,
+            "{id}"
+        );
+        assert!(is_session_id(&id), "{id}");
+        // 32 random bits: two draws in one second do not meet.
+        assert_ne!(mint_session_id(now), mint_session_id(now));
+        assert_eq!(Session::new("m", "low", None).id.len(), id.len());
+        assert!(is_session_id("20261117-015328-de08"), "an id minted before");
     }
 
     #[cfg(unix)]

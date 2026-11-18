@@ -535,6 +535,19 @@ async fn broker_token_account_mapping_and_metadata_endpoints_on_real_router() {
         .await
         .unwrap();
     assert_eq!(cool.status().as_u16(), 200);
+    // A limit that covers one model: accepted, and the account itself is
+    // not cooling. A model id the route can't store is refused.
+    let model_cool = |model: &str| {
+        client
+            .post(format!("{base}/accounts/cooldown"))
+            .bearer_auth("synthetic-machine-auth")
+            .json(&json!({"provider": "openai-codex", "account": "default", "until_ms": until,
+                "reason": "test", "model": model}))
+            .send()
+    };
+    assert_eq!(model_cool("gpt-6-astra").await.unwrap().status().as_u16(), 200);
+    assert_eq!(model_cool("bad model").await.unwrap().status().as_u16(), 400);
+    assert_eq!(model_cool("  ").await.unwrap().status().as_u16(), 400);
     let caps: Value = client
         .get(format!("{base}/capabilities"))
         .bearer_auth("synthetic-machine-auth")
@@ -553,6 +566,15 @@ async fn broker_token_account_mapping_and_metadata_endpoints_on_real_router() {
         .find(|a| a["provider"] == "openai-codex" && a["label"] == "second")
         .expect("second slot listed");
     assert!(second["cooldown_until"].as_u64().is_some(), "{second}");
+    let default = caps
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["accounts"].as_array())
+        .flatten()
+        .find(|a| a["provider"] == "openai-codex" && a["label"] == "default")
+        .expect("default slot listed");
+    assert!(default["cooldown_until"].is_null(), "a model's cooldown is not the account's: {default}");
     let snap = client
         .get(format!("{base}/usage/snapshot"))
         .query(&[("provider", "openai-codex"), ("account", "Bad Label")])
@@ -645,4 +667,105 @@ async fn empty_account_usage_probe_is_a_json_400_that_reads_no_credential() {
     // Control: a real account on the same corrupt store must read it.
     let control = get("default").await.unwrap().status().as_u16();
     assert_ne!(control, 400, "control: a real account reads the (corrupt) store");
+}
+
+/// The bella path end to end, through the real binary's router: a client
+/// reports a 429 on Fable's own limit (`model`, with a routed
+/// `Anthropic/` prefix in any case); then an automatic token request for Fable is
+/// refused that account, while one for Opus, and one that names no model,
+/// is served from it. Debug builds only: the usage-endpoint seam
+/// (`SYNAPS_TEST_BROKER_USAGE_URL`) is compiled out of release builds.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn a_reported_model_cooldown_refuses_only_that_model_over_http() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.dir.path().join("auth.json");
+    let mut store = sandbox.auth();
+    store["anthropic@claude1"] = json!({"type": "oauth", "access": "synthetic-access-claude1",
+        "refresh": "refresh-claude1", "expires": 4102444800000_u64});
+    std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+    let usage = axum::Router::new().route(
+        "/usage",
+        axum::routing::get(|| async {
+            let reset = "2099-01-01T00:00:00Z";
+            axum::Json(json!({
+                "five_hour": {"utilization": 10.0, "resets_at": reset},
+                "seven_day": {"utilization": 10.0, "resets_at": reset}
+            }))
+        }),
+    );
+    let usage_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let usage_addr = usage_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(usage_listener, usage).await.unwrap() });
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let child = sandbox
+        .command()
+        .env("SYNAPS_BROKER_TOKEN", "synthetic-machine-auth")
+        .env("SYNAPS_TEST_BROKER_USAGE_URL", format!("http://{usage_addr}/usage"))
+        .args(["auth-broker", "--bind", &addr.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut process = BrokerProcess(child);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let base = format!("http://{addr}");
+    let mut ready = false;
+    for _ in 0..100 {
+        assert!(process.0.try_wait().unwrap().is_none(), "broker exited");
+        if let Ok(r) = client.get(format!("{base}/healthz")).send().await {
+            if r.status().is_success() {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready);
+
+    let token = |model: Option<&'static str>| {
+        let mut query = vec![("provider", "anthropic"), ("account", "auto")];
+        if let Some(model) = model {
+            query.push(("model", model));
+        }
+        client
+            .get(format!("{base}/token"))
+            .bearer_auth("synthetic-machine-auth")
+            .query(&query)
+            .send()
+    };
+    let served_by = |r: reqwest::Response| async move {
+        assert_eq!(r.status().as_u16(), 200);
+        let body: Value = r.json().await.unwrap();
+        body["account"].as_str().unwrap().to_string()
+    };
+    // Control: before the report, Fable is served from claude1.
+    assert_eq!(served_by(token(Some("claude-fable-5")).await.unwrap()).await, "claude1");
+
+    let until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 3_600_000;
+    let cool = client
+        .post(format!("{base}/accounts/cooldown"))
+        .bearer_auth("synthetic-machine-auth")
+        .json(&json!({"provider": "anthropic", "account": "claude1", "until_ms": until,
+            "reason": "anthropic_quota_exhausted", "model": "Anthropic/claude-fable-5"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cool.status().as_u16(), 200);
+
+    let fable = token(Some("claude-fable-5")).await.unwrap();
+    assert_eq!(fable.status().as_u16(), 503, "Fable is cooling on the only account");
+    assert_eq!(served_by(token(Some("claude-opus-4-7")).await.unwrap()).await, "claude1");
+    assert_eq!(served_by(token(None).await.unwrap()).await, "claude1");
+    drop(process);
 }
