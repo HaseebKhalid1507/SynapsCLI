@@ -6058,6 +6058,146 @@ mod calibration_transport_tests {
         }
     }
 
+    /// #414 second review: the rollover comes after a tool round, with the
+    /// forget set live. The archive and the new window hold the marker,
+    /// never the content; the tool round crosses with it; the hook ran
+    /// once; every request of the turn, both windows, carries the tail.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_rollover_after_a_tool_round_with_a_live_forget_set() {
+        use agent_core::core::extension_context as ec;
+        struct Forget(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl crate::extensions::runtime::ExtensionHandler for Forget {
+            fn id(&self) -> &str {
+                "axel"
+            }
+            async fn handle(
+                &self,
+                _event: &crate::extensions::hooks::events::HookEvent,
+            ) -> crate::extensions::hooks::events::HookResult {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                serde_json::from_value(json!({"action":"inject","content":"",
+                    "parts":[{"content":"SAVED-ROLL"},{"content":"FORGET-ROLL","forget":true}]}))
+                .unwrap()
+            }
+            async fn shutdown(&self) {}
+        }
+        /// ~29 KB of output per call: six of them push the window over
+        /// the rollover threshold.
+        struct Big;
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for Big {
+            fn name(&self) -> &str {
+                "big_out"
+            }
+            fn description(&self) -> &str {
+                "returns a lot of text"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object","properties":{}})
+            }
+            fn origin(&self) -> crate::tools::ToolOrigin {
+                crate::tools::ToolOrigin::Builtin
+            }
+            fn effect(&self) -> crate::tools::catalog::ToolEffect {
+                crate::tools::catalog::ToolEffect::ReadOnly
+            }
+            async fn execute(
+                &self,
+                _params: Value,
+                _ctx: crate::tools::ToolContext,
+            ) -> crate::Result<String> {
+                Ok(format!("TOOL-OUT {}", "y w ".repeat(7_000)))
+            }
+        }
+        fn tool_round() -> String {
+            let mut events = vec![json!({"type":"message_start","message":{"id":"msg_t","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null}})];
+            for i in 0..6 {
+                events.push(json!({"type":"content_block_start","index":i,"content_block":{"type":"tool_use","id":format!("toolu_{i}"),"name":"big_out"}}));
+                events.push(json!({"type":"content_block_delta","index":i,"delta":{"type":"input_json_delta","partial_json":"{}"}}));
+                events.push(json!({"type":"content_block_stop","index":i}));
+            }
+            events.push(json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}));
+            events.push(json!({"type":"message_stop"}));
+            events.iter().map(|e| format!("data: {e}\n\n")).collect()
+        }
+        let bodies: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (b, c) = (bodies.clone(), calls.clone());
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |body: String| {
+                let (b, c) = (b.clone(), c.clone());
+                async move {
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    b.lock().unwrap().push(body);
+                    let sse = if n == 0 { tool_round() } else { sse(None) };
+                    (StatusCode::OK, [("content-type", "text/event-stream")], sse).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let base = crate::test_env::BaseDirGuard::new();
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = runtime();
+        low_thresholds(&rt);
+        rt.tools_shared().write().await.register(Arc::new(Big));
+        let hooked = Arc::new(AtomicUsize::new(0));
+        let mut perms = crate::extensions::permissions::PermissionSet::new();
+        perms.grant(crate::extensions::hooks::events::HookKind::BeforeMessage.required_permission());
+        rt.hook_bus()
+            .subscribe(
+                crate::extensions::hooks::events::HookKind::BeforeMessage,
+                Arc::new(Forget(hooked.clone())),
+                None,
+                None,
+                perms,
+            )
+            .await
+            .unwrap();
+        // Under the thresholds until the tool round lands.
+        let mut history = vec![Arc::new(json!({"role":"user","content":"charter"})) as SharedMessage];
+        history.extend((0..90).map(event));
+        history.push(Arc::new(json!({"role":"user","content":"next"})));
+        let out = turn_with(&rt, history, Default::default()).await;
+
+        let bodies = bodies.lock().unwrap().clone();
+        assert!(bodies.len() >= 2, "a tool round, then the new window");
+        assert!(!bodies[0].contains("TOOL-OUT"), "the first request is before the tool round");
+        assert_eq!(out.heads.len(), 1, "rolled over after the tool round");
+        assert_eq!(hooked.load(Ordering::SeqCst), 1, "hooked once, not again after the rollover");
+        let head = serde_json::to_string(&out.heads[0]).unwrap();
+        assert!(head.contains("TOOL-OUT"), "the tool round crosses into the new window");
+        assert!(head.contains(&serde_json::to_string(&ec::marker_text("axel")).unwrap()[1..20]));
+        for body in &bodies {
+            assert!(body.contains("FORGET-ROLL"), "the tail rides every request of the turn");
+            assert!(body.contains("SAVED-ROLL"));
+        }
+        for head in &out.heads {
+            assert!(!serde_json::to_string(head).unwrap().contains("FORGET-ROLL"));
+        }
+        assert!(!serde_json::to_string(&out.history).unwrap().contains("FORGET-ROLL"));
+        let mut saw_marker = false;
+        let mut stack = vec![base.path().to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let bytes = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+                    assert!(!bytes.contains("FORGET-ROLL"), "{} holds forget content", path.display());
+                    saw_marker |= bytes.contains("axel context was shown here for one turn and not kept");
+                }
+            }
+        }
+        assert!(saw_marker, "the archive keeps the marker");
+    }
+
     /// The provider's count of a request whose fixed part (everything but
     /// `messages`) it reads 1:1 with the conservative estimate and whose
     /// messages it reads at 1/1.35 of it — the live shape.
