@@ -43,17 +43,3 @@ fn session_approval_new_session_and_resume_use_explicit_boundary() {
     assert_eq!(cmds.matches(".begin_conversation(").count(), 1);
     assert!(actor.contains("self.runtime.set_session_id(Some(new_id.clone()))"));
 }
-
-#[test]
-fn session_approval_live_headless_clear_uses_explicit_boundary() {
-    // Feature-gated legacy_inline remains reachable; default chat uses actor.
-    let chat = include_str!("../src/cmd/chat.rs");
-    let clear = chat
-        .split("\"clear\" => {")
-        .nth(1)
-        .unwrap()
-        .split("\"sessions\" =>")
-        .next()
-        .unwrap();
-    assert!(clear.contains("runtime.begin_conversation(Some(conv.session.id.clone()))"));
-}

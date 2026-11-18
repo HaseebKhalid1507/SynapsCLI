@@ -119,7 +119,7 @@ async fn close_in_actor(state: &DaemonState, handle: &SessionHandle, force: bool
                 };
             }
             Err(_) => {
-                state.remove(&sid);
+                state.remove(handle);
                 return DaemonFrame::Closed { session_id: sid.clone(), text: format!("session {sid} had already ended") };
             }
         }
@@ -161,7 +161,7 @@ async fn close_in_actor(state: &DaemonState, handle: &SessionHandle, force: bool
     let ended = tokio::time::timeout(CLOSE_END_BUDGET, handle.closed()).await.is_ok();
     // Idempotent with the host task's own removal; makes the very next
     // `daemon sessions` exact.
-    state.remove(&sid);
+    state.remove(handle);
     let text = if ended { text } else { format!("{text} (still ending in the background)") };
     DaemonFrame::Closed { session_id: sid, text }
 }
@@ -178,7 +178,7 @@ async fn close_placeholder(state: &DaemonState, handle: &SessionHandle, holder: 
     let sid = handle.id.clone();
     let _ = handle.send(SessionCommand::End { reason: EndReason::ClientQuit }).await;
     let _ = tokio::time::timeout(CLOSE_REPLY_BUDGET, handle.closed()).await;
-    state.remove(&sid);
+    state.remove(handle);
     DaemonFrame::Closed {
         session_id: sid.clone(),
         text: format!(

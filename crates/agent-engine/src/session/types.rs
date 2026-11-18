@@ -337,17 +337,6 @@ pub struct SessionConfig {
     /// host-owned circuit breaker for an actor-resident autonomous driver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_session_cost: Option<f64>,
-    /// The session's explicit `/memory` choice, recorded by the actor so a
-    /// rebuilt runtime (unpark, daemon reload) restores it instead of
-    /// re-applying the operator's `memory.default_mode`. `None` = no choice
-    /// yet: the default applies. Host-recorded: the daemon drops a value a
-    /// client sends at create.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "SessionMemoryMode::deserialize_lenient"
-    )]
-    pub memory_mode: Option<SessionMemoryMode>,
     /// Set by a daemon reload for a session it restores Parked (never on
     /// the wire): with `await_extensions=false`, `on_session_start` waits
     /// until the session is unparked instead of running right after create.
@@ -362,60 +351,20 @@ pub struct SessionConfig {
     /// presents its token (see `docs/daemon-mode.md`, "Owned sessions").
     #[serde(skip)]
     pub owned: Option<OwnedConfig>,
+    /// Set by a daemon reload (never on the wire; the reload record carries
+    /// it beside the config): what the old image's actor held besides its
+    /// journal, restored into the new actor's conversation cell.
+    #[serde(skip)]
+    pub restore_conversation: Option<RestoredConversation>,
 }
 
-/// A durable `/memory` mode the user chose for a session
-/// (`SessionConfig::memory_mode`). `/memory once` is a one-shot lease, not
-/// a mode, and is not recorded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionMemoryMode {
-    Off,
-    RecallEachPrompt,
-    CaptureOnly,
-    CaptureAndRecall,
-}
-
-impl SessionMemoryMode {
-    /// `SessionConfig::memory_mode` reader: a value this build does not know
-    /// (a newer image's mode) reads as `Off` — the consent-safe direction —
-    /// rather than an error that would fail the whole reload state and
-    /// rehydrate no session at all. Null (or a missing field) is no choice.
-    fn deserialize_lenient<'de, D>(d: D) -> Result<Option<Self>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let v = serde_json::Value::deserialize(d)?;
-        if v.is_null() {
-            return Ok(None);
-        }
-        Ok(Some(serde_json::from_value(v.clone()).unwrap_or_else(|_| {
-            tracing::warn!(mode = %v, "unknown session memory mode; treating as off");
-            Self::Off
-        })))
-    }
-
-    /// The mode `/memory <arg>` sets, if it sets one.
-    pub fn from_command_arg(arg: &str) -> Option<Self> {
-        match arg.trim() {
-            "off" => Some(Self::Off),
-            "recall" => Some(Self::RecallEachPrompt),
-            "capture" => Some(Self::CaptureOnly),
-            "on" => Some(Self::CaptureAndRecall),
-            _ => None,
-        }
-    }
-
-    /// The lease mode to grant; `None` for `Off`.
-    pub fn lease_mode(self) -> Option<crate::runtime::memory_context::MemoryContextMode> {
-        use crate::runtime::memory_context::MemoryContextMode as M;
-        match self {
-            Self::Off => None,
-            Self::RecallEachPrompt => Some(M::RecallEachPrompt),
-            Self::CaptureOnly => Some(M::CaptureOnly),
-            Self::CaptureAndRecall => Some(M::CaptureAndRecall),
-        }
-    }
+/// A reloaded actor's conversation cell (`SessionConfig::restore_conversation`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoredConversation {
+    /// Applied only when the new actor continues this journal.
+    pub journal_id: String,
+    pub supersedes: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn default_true() -> bool {
@@ -459,10 +408,10 @@ impl Default for SessionConfig {
             client_input: None,
             name: None,
             max_session_cost: None,
-            memory_mode: None,
             restore_parked: false,
             message_clock: None,
             owned: None,
+            restore_conversation: None,
         }
     }
 }
@@ -492,10 +441,16 @@ impl From<&crate::engine::setup::ContinueInfo> for ContinueInfoWire {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMeta {
+    /// The actor (what `Attach::Existing` takes). Not a conversation: see
+    /// `journal_id`.
     pub id: SessionId,
     pub name: Option<String>,
     pub model: String,
     pub cwd: Option<PathBuf>,
+    /// When the conversation this actor holds began. Kept across a
+    /// compaction (the chain's start) and a reload; moves with `/clear` and
+    /// an in-session `/resume` (in listings; `Attached.meta` is the record
+    /// at create).
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub continued: bool,
     pub continue_info: Option<ContinueInfoWire>,
@@ -518,7 +473,11 @@ pub struct SessionMeta {
     /// active client, not the only one that may type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_input: Option<ClientInput>,
-    /// `conv.session.id` — differs from `id` after a LinkedSuccessor compaction.
+    /// `conv.session.id`: the conversation this actor holds now. Key
+    /// conversations by this, never by `id`. It differs from `id` after a
+    /// LinkedSuccessor compaction, a `/clear`, an in-session `/resume`, and
+    /// on an actor created while another live actor had the journal's id
+    /// (it took a minted id). Empty from a very old daemon.
     #[serde(default)]
     pub journal_id: String,
     /// Set when the session's journal is locked by another process (F23):
@@ -1065,7 +1024,7 @@ pub enum SessionCommand {
     /// Resync after Lagged (B, day 3): actor re-sends history + turn_replay.
     Resync { client: ClientId, since_seq: u64 },
     /// Runtime-backed slash command (`engine::commands::handle_engine_command`:
-    /// /model /thinking /context /trace /memory /compact …). Reply =
+    /// /model /thinking /context /trace /compact …). Reply =
     /// `QueryResult { id, value: {"kind": .., "text": ..} }`.
     EngineCommand { id: u64, name: String, arg: String },
     /// (A3) dispatch.rs LoadSkill — pre-built tool_use/tool_result pair

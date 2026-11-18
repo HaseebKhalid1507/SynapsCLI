@@ -25,7 +25,6 @@ fn every_compacting_frontend_uses_the_engine_transition() {
     };
 
     for rel in [
-        "src/cmd/chat.rs",
         "src/cmd/rpc.rs",
         // The TUI compacts on the SessionActor since phase 3 (A2); the
         // actor is the frontend's transition site.

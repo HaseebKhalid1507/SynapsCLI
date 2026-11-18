@@ -37,16 +37,13 @@
 //!   only), and no launch-record (secret) config ever appears anywhere.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use thiserror::Error;
 
-use super::context_provider::{
-    resolve_context_provider, ContextProviderId, ContextProviderLookupError,
-    RegisteredContextProviderDescriptor, SharedContextProviderCatalog,
-};
 use super::lifecycle::{
     validate_runtime_provider_declarations, validate_runtime_tool_declarations,
 };
@@ -55,6 +52,7 @@ use super::runtime::process::ProcessExtension;
 use super::runtime::ExtensionHandler;
 use crate::tools::activation::SessionId;
 use crate::tools::catalog::SchemaDigest;
+use agent_core::memory::author::Author;
 
 /// Default idle bound for opportunistic reaping (parity with MCP leases).
 pub const DEFAULT_IDLE_MAX: Duration = Duration::from_secs(300);
@@ -212,15 +210,10 @@ pub struct ExtensionRuntimeManager {
     /// The `ExtensionManager`'s retained internal launch records (shared
     /// handle; sync lock held only for map operations, never across I/O).
     records: SharedDeferredRecords,
-    /// The `ExtensionManager`'s published context-provider catalog
-    /// snapshot (task A6; same sharing discipline as `records`). Read by
-    /// [`Self::resolve_context_provider`] for enable-time memory-context
-    /// provider validation — a PURE catalog read that never spawns.
-    context_catalog: SharedContextProviderCatalog,
     idle_max: Duration,
     next_token: std::sync::atomic::AtomicU64,
     /// Host-scope session identity for HANDLER-based acquisition (hook
-    /// events, provider routing, user sidecar/command APIs). Bound at
+    /// events, provider routing, user command/settings APIs). Bound at
     /// engine boot to the Runtime's durable tool session, so a MIXED
     /// extension's tool leases and handler leases share ONE key — one
     /// shared child process per plugin. Unbound (tests/manual) falls back
@@ -231,37 +224,15 @@ pub struct ExtensionRuntimeManager {
 impl ExtensionRuntimeManager {
     pub(crate) fn new(
         records: SharedDeferredRecords,
-        context_catalog: SharedContextProviderCatalog,
         idle_max: Duration,
     ) -> Self {
         Self {
             leases: std::sync::Mutex::new(HashMap::new()),
             records,
-            context_catalog,
             idle_max,
             next_token: std::sync::atomic::AtomicU64::new(1),
             host_scope: std::sync::OnceLock::new(),
         }
-    }
-
-    /// Task A6: resolve one memory-context provider request against the
-    /// published catalog of loaded extensions' declared context providers.
-    /// PURE CATALOG READ — never spawns a process, never touches lease
-    /// state (consistent with "discovery/status spawn zero processes").
-    /// Exact-scope, fail-closed matching per
-    /// [`resolve_context_provider`]: `Ok` only when exactly one loaded
-    /// declaration matches; zero matches fail `NotRegistered` and
-    /// overlapping declarations fail `Ambiguous`. Returns an owned clone
-    /// of the dormant descriptor (bounded metadata only).
-    pub fn resolve_context_provider(
-        &self,
-        requested: Option<&ContextProviderId>,
-    ) -> Result<RegisteredContextProviderDescriptor, ContextProviderLookupError> {
-        let catalog = self
-            .context_catalog
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        resolve_context_provider(&catalog, requested).cloned()
     }
 
     /// Bind the host-scope session identity used by handler-based
@@ -287,27 +258,6 @@ impl ExtensionRuntimeManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(plugin)
             .cloned()
-    }
-
-    /// Task B4: pinned schema digest of one plugin's CURRENTLY declared
-    /// deferred tool — a pure launch-record read that never spawns. The
-    /// memory recall dispatch uses it to address the provider's declared
-    /// recall tool through the same exact-digest [`Self::call_exact`] gate
-    /// as every other extension call (drift still re-checked there).
-    pub(crate) fn declared_tool_digest(
-        &self,
-        plugin: &str,
-        tool_name: &str,
-    ) -> Option<SchemaDigest> {
-        let record = self.current_record(plugin)?;
-        record
-            .manifest
-            .deferred
-            .as_ref()?
-            .tools
-            .iter()
-            .find(|tool| tool.name == tool_name)
-            .map(|tool| SchemaDigest::of_schema(&tool.input_schema))
     }
 
     /// Mark cancelled and hand the lease to ONE bounded cleanup task
@@ -612,7 +562,7 @@ impl ExtensionRuntimeManager {
 
     /// Acquire the shared validated per-plugin lease under the HOST scope
     /// for handler-based capabilities (hook events, provider routing, user
-    /// sidecar/command/settings APIs). Same record re-validation, exact
+    /// command/settings APIs). Same record re-validation, exact
     /// runtime declaration matching, single-flight, and teardown rules as
     /// exact tool calls — and, when the host scope is bound to the
     /// Runtime's tool session (engine boot), the SAME lease key: a Mixed
@@ -688,10 +638,16 @@ impl ExtensionRuntimeManager {
         Ok((record, validated))
     }
 
-    /// Execute one EXACT already-gate-authorized extension tool call. See
-    /// module docs for the lease/single-flight/validation contract.
-    /// Host-originated: the wire `session_id` is `null`.
-    pub async fn call_exact(
+    /// [`Self::call_exact_for`] for a call that belongs to no chat: on the
+    /// wire `session_id` is `null` and `cwd` is the process folder.
+    ///
+    /// Tests only (the `testing` feature). Production has no such call:
+    /// each one is made for a chat or a worker and says which folder (the
+    /// host's memory capture/recall calls pass their runtime's). Should a
+    /// genuine one appear, un-gate this and call it by name instead of
+    /// passing `None, None`, so every no-chat call can be found by grep.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn call_exact_no_chat(
         &self,
         session: &SessionId,
         plugin: &str,
@@ -699,13 +655,20 @@ impl ExtensionRuntimeManager {
         expected_digest: &SchemaDigest,
         params: Value,
     ) -> Result<Value, ExtensionLeaseError> {
-        self.call_exact_for(session, plugin, tool_name, expected_digest, params, None)
+        self.call_exact_for(session, plugin, tool_name, expected_digest, params, None, None)
             .await
     }
 
-    /// [`Self::call_exact`] on behalf of a conversation: `conversation_id`
-    /// is forwarded as `tool.call` `params.session_id` (the owning
-    /// conversation, not the lease scope `session`).
+    /// Execute one EXACT already-gate-authorized extension tool call. See
+    /// module docs for the lease/single-flight/validation contract.
+    ///
+    /// The call is made on behalf of a conversation: `conversation_id` is
+    /// forwarded as `tool.call` `params.session_id` (the owning
+    /// conversation, not the lease scope `session`; `None` = a worker or
+    /// host-originated) and `cwd`, the folder the caller runs in, as
+    /// `params.cwd` (`None` = the process folder, which under the daemon is
+    /// the daemon's).
+    #[allow(clippy::too_many_arguments)] // the exact call plus who it is for
     pub async fn call_exact_for(
         &self,
         session: &SessionId,
@@ -714,6 +677,36 @@ impl ExtensionRuntimeManager {
         expected_digest: &SchemaDigest,
         params: Value,
         conversation_id: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Result<Value, ExtensionLeaseError> {
+        self.call_exact_as(
+            session,
+            plugin,
+            tool_name,
+            expected_digest,
+            params,
+            conversation_id,
+            cwd,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::call_exact_for`], naming the run that calls: `caller` is the
+    /// author of the calling run's memory binding, forwarded as
+    /// `tool.call` `params.caller` (`None` = the key is left out: the host's
+    /// own calls, a context with no binding).
+    #[allow(clippy::too_many_arguments)] // the exact call plus who it is for
+    pub async fn call_exact_as(
+        &self,
+        session: &SessionId,
+        plugin: &str,
+        tool_name: &str,
+        expected_digest: &SchemaDigest,
+        params: Value,
+        conversation_id: Option<&str>,
+        cwd: Option<&Path>,
+        caller: Option<&Author>,
     ) -> Result<Value, ExtensionLeaseError> {
         // 1.-2. Record re-read + manifest re-validation (pure local).
         let (record, validated) = self.record_and_validate(session, plugin)?;
@@ -769,7 +762,7 @@ impl ExtensionRuntimeManager {
         }
         let result = inner
             .handler
-            .call_tool_once_no_spawn(tool_name, params, conversation_id)
+            .call_tool_once_no_spawn(tool_name, params, conversation_id, cwd, caller)
             .await;
         if inner.cancelled() {
             // Revoked while this already-started call ran: shut the child
@@ -806,12 +799,11 @@ impl ExtensionRuntimeManager {
         fingerprint: SchemaDigest,
     ) -> Result<Arc<LeaseInner>, ExtensionLeaseError> {
         let manifest = &record.manifest;
-        let process = ProcessExtension::spawn_with_memory_policy(
+        let process = ProcessExtension::spawn_with_cwd(
             plugin,
             &manifest.command,
             &manifest.args,
             record.cwd.clone(),
-            record.exclusive_memory,
         )
         .await
         .map_err(|e| ExtensionLeaseError::Transport(plugin.to_string(), bound_detail(&e)))?;
@@ -932,7 +924,10 @@ impl ExtensionLeaseCapability {
         &self.session
     }
 
-    pub async fn call_exact(
+    /// A call that belongs to no chat (tests only); see
+    /// [`ExtensionRuntimeManager::call_exact_no_chat`].
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn call_exact_no_chat(
         &self,
         plugin: &str,
         tool_name: &str,
@@ -940,12 +935,12 @@ impl ExtensionLeaseCapability {
         params: Value,
     ) -> Result<Value, ExtensionLeaseError> {
         self.manager
-            .call_exact(&self.session, plugin, tool_name, expected_digest, params)
+            .call_exact_no_chat(&self.session, plugin, tool_name, expected_digest, params)
             .await
     }
 
-    /// [`Self::call_exact`] on behalf of a conversation; see
-    /// [`ExtensionRuntimeManager::call_exact_for`].
+    /// One exact call on behalf of a conversation, in this capability's
+    /// session; see [`ExtensionRuntimeManager::call_exact_for`].
     pub async fn call_exact_for(
         &self,
         plugin: &str,
@@ -953,6 +948,7 @@ impl ExtensionLeaseCapability {
         expected_digest: &SchemaDigest,
         params: Value,
         conversation_id: Option<&str>,
+        cwd: Option<&Path>,
     ) -> Result<Value, ExtensionLeaseError> {
         self.manager
             .call_exact_for(
@@ -962,6 +958,34 @@ impl ExtensionLeaseCapability {
                 expected_digest,
                 params,
                 conversation_id,
+                cwd,
+            )
+            .await
+    }
+
+    /// [`Self::call_exact_for`], naming the run that calls; see
+    /// [`ExtensionRuntimeManager::call_exact_as`].
+    #[allow(clippy::too_many_arguments)] // the exact call plus who it is for
+    pub async fn call_exact_as(
+        &self,
+        plugin: &str,
+        tool_name: &str,
+        expected_digest: &SchemaDigest,
+        params: Value,
+        conversation_id: Option<&str>,
+        cwd: Option<&Path>,
+        caller: Option<&Author>,
+    ) -> Result<Value, ExtensionLeaseError> {
+        self.manager
+            .call_exact_as(
+                &self.session,
+                plugin,
+                tool_name,
+                expected_digest,
+                params,
+                conversation_id,
+                cwd,
+                caller,
             )
             .await
     }
@@ -1007,7 +1031,7 @@ impl std::fmt::Debug for ExtensionSessionEndGuard {
 /// (Task 20 Commit C). Registered/subscribed at load WITHOUT a process;
 /// the first AUTHORIZED use (a matching hook event delivered by the
 /// permission-checked `HookBus` subscription, a selected provider
-/// complete/stream, or an explicit user sidecar/command/settings action)
+/// complete/stream, or an explicit user command/settings action)
 /// single-flights through the SAME per-plugin lease manager — starting
 /// and exact-validating the child once. Discovery, load, search, and
 /// diagnostics never acquire.
@@ -1096,10 +1120,16 @@ impl ExtensionHandler for LazyExtensionHandler {
         }
     }
 
-    async fn call_tool(&self, _name: &str, _input: Value) -> Result<Value, String> {
+    async fn call_tool_for(
+        &self,
+        _name: &str,
+        _input: Value,
+        _session_id: Option<&str>,
+        _cwd: Option<&Path>,
+    ) -> Result<Value, String> {
         // FAIL CLOSED: deferred extension tool execution flows ONLY
         // through the gate-authorized exact lease path
-        // (`ExtensionRuntimeManager::call_exact`, which pins and checks
+        // (`ExtensionRuntimeManager::call_exact_for`, which pins and checks
         // the declared name + canonical schema digest). A generic handler
         // call with an arbitrary tool name would bypass those checks.
         Err(format!(
@@ -1149,14 +1179,6 @@ impl ExtensionHandler for LazyExtensionHandler {
     async fn get_info(&self) -> Result<crate::extensions::info::PluginInfo, String> {
         // Diagnostics must never spawn a deferred extension.
         Err("deferred extension info is unavailable without activation".to_string())
-    }
-
-    async fn sidecar_spawn_args(&self) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
-        // Explicit user sidecar action: a legitimate acquisition trigger.
-        let inner = self.live().await?;
-        let result = inner.handler.sidecar_spawn_args().await;
-        Self::touch(&inner);
-        result
     }
 
     async fn settings_editor_open(&self, category: &str, field: &str) -> Result<Value, String> {

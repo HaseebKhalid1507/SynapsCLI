@@ -3,7 +3,7 @@ name = "synaps-engine"
 version.workspace = true
 edition = "2021"
 rust-version = "1.88"
-description = "Runtime engine — streaming, tools, MCP, skills, extensions, sidecar"
+description = "Runtime engine — streaming, tools, MCP, skills, extensions"
 license = "Apache-2.0"
 
 [lib]

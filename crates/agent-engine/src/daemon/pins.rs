@@ -263,22 +263,24 @@ pub fn restore_enabled() -> bool {
     !super::env_is_off(std::env::var(RESTORE_ENV).ok().as_deref())
 }
 
-/// The live session for a journal, if this daemon holds it (a lock
-/// placeholder does not count).
+/// The live session that holds a journal ([`SessionHandle::holds`]), if
+/// this daemon has one (a lock placeholder does not count). Never by actor
+/// id: after `/clear` that names another conversation.
 pub fn live_for(state: &DaemonState, journal_id: &str) -> Option<SessionHandle> {
     state
         .live_sessions()
         .into_iter()
         .filter(|h| h.is_alive() && h.meta().locked_by.is_none())
-        .find(|h| h.id.as_str() == journal_id || h.journal_id() == journal_id)
+        .find(|h| h.holds(journal_id))
 }
 
 /// Entries that are not live in this daemon: what listings show as
-/// waiting / failed / not restored yet.
+/// waiting / failed / not restored yet. Matched by journal id, never by
+/// actor id.
 pub fn offline(entries: Vec<PinEntry>, live: &[crate::session::SessionMeta]) -> Vec<PinEntry> {
     entries
         .into_iter()
-        .filter(|e| !live.iter().any(|m| m.id.as_str() == e.journal_id || m.journal_id == e.journal_id))
+        .filter(|e| !live.iter().any(|m| m.journal_id == e.journal_id))
         .collect()
 }
 
@@ -372,7 +374,7 @@ pub async fn restore_one(state: &Arc<DaemonState>, entry: &PinEntry) -> Restored
     state.pins.set(id, |e| e.attempts += 1);
     let cfg = SessionConfig {
         continue_session: Some(Some(id.to_string())),
-        cwd: entry.cwd.clone().filter(|c| c.is_dir()),
+        cwd: super::reload::restorable_folder(entry.cwd.clone(), id),
         compaction_policy: CompactionPolicyWire::LinkedSuccessor,
         await_extensions: false,
         keep_warm: true,
@@ -455,6 +457,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let book = PinBook::at(dir.path().join(PINS_FILE));
         (dir, book)
+    }
+
+    /// A live actor whose id is a pinned journal but which holds another
+    /// conversation (after `/clear`) leaves that pin offline.
+    #[test]
+    fn offline_matches_by_journal_never_by_actor_id() {
+        let pin = |j: &str| PinEntry {
+            journal_id: j.into(),
+            ..Default::default()
+        };
+        let mut cleared =
+            crate::session::handle::echo::meta_for(&crate::session::SessionId::from("a"));
+        cleared.journal_id = "n".into();
+        let left = offline(vec![pin("a"), pin("n")], &[cleared]);
+        assert_eq!(left, [pin("a")]);
     }
 
     #[test]

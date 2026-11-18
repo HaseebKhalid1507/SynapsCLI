@@ -128,6 +128,14 @@ struct ParseState {
     server_diagnosis: Option<crate::runtime::trace::ServerCacheDiagnosis>,
 }
 
+/// HTTP statuses from the Anthropic API that a backoff retry can clear: 408
+/// request timeout, 429 rate limit, 500/502/503/504 server and gateway
+/// errors, Cloudflare's 520-524 edge errors, and 529 overloaded. The one
+/// retry set for the streaming and compaction paths and the keepwarm ping.
+pub(crate) fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 520..=524 | 529)
+}
+
 /// A failure surfaced as an in-stream Anthropic `error` event under a 200
 /// response. `retryable` follows Anthropic's error taxonomy: transient classes
 /// (`overloaded_error`, `api_error`, `rate_limit_error`) are retried with
@@ -148,7 +156,8 @@ struct StreamError {
 
 impl StreamError {
     /// Anthropic error `type`s that a retry can plausibly clear. Mirrors the
-    /// HTTP-status retry set (429 rate_limit, 500 api_error, 529 overloaded).
+    /// HTTP-status retry set in [`is_retryable_status`] (429 rate_limit,
+    /// 500 api_error, 529 overloaded).
     fn is_retryable_type(error_type: &str) -> bool {
         matches!(
             error_type,
@@ -305,6 +314,9 @@ struct EventCtx<'t> {
     /// This request sent `diagnostics`: capture the message id (chain) and
     /// the server's verdict from message_start.
     cache_diagnosis: bool,
+    /// The round's keep-warm follows this response as it streams
+    /// (`ApiOptions::round_signal`).
+    round_signal: Option<&'t super::tool_keepwarm::RoundSignal>,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -659,6 +671,15 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                     ctx.saw_1h_honored
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                // The prefix this request read from or wrote to the cache,
+                // known here and not booked until the response ends.
+                if let Some(signal) = ctx.round_signal {
+                    signal.message_started(
+                        usage
+                            .cache_read_input_tokens
+                            .saturating_add(usage.cache_creation_input_tokens),
+                    );
+                }
             }
         }
         AnthropicEvent::MessageStop => {}
@@ -832,9 +853,15 @@ fn classify_stream_outcome(
 /// Extensible — new flags go here instead of adding parameters to 4 signatures.
 #[derive(Debug, Clone, Default)]
 pub struct ApiOptions {
-    /// Immutable host binding for extension-provider interior tool execution.
-    /// `None` is only for internal/test callers without a runtime capability.
-    pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
+    /// What the tool calls of this turn are given, for the tool loop of an
+    /// extension-provided model (`openai::extension_route`): the very
+    /// [`TurnToolContext`](crate::tools::TurnToolContext) the stream loop
+    /// makes its own tools' contexts from, so that loop's
+    /// tools run in the chat's folder with the chat's environment, for the
+    /// chat. `None` (keep-warm pings, compaction, tests): a request that
+    /// runs no tool for a chat; a tool that loop runs then gets
+    /// `TurnToolContext::no_chat`.
+    pub tool_context: Option<crate::tools::TurnToolContext>,
     /// Opt into the 1M context window beta header.
     pub use_1m_context: bool,
     /// Configured prompt-cache TTL (spec: cache-ttl). Resolved to a wire
@@ -905,7 +932,7 @@ pub struct ApiOptions {
     pub telemetry: Option<crate::runtime::telemetry::TelemetryWriter>,
     /// Runtime-scoped tool-session identity (Task 16). Scopes the execution
     /// gate for extension-provider interior tool loops reached through
-    /// `try_route`. Stream turns (and `run_single`) thread the Runtime's
+    /// `try_route`. Stream turns thread the Runtime's
     /// host session; `None` (internal helpers, tests) makes the extension
     /// route fail closed to a locally minted identity with the identical
     /// default-core policy — never to ungated execution.
@@ -960,6 +987,14 @@ pub struct ApiOptions {
     /// `rollover_window` / `rollover` fields. `None` (default) before any
     /// rollover and on every non-turn request: records stay unchanged.
     pub context_rollover: Option<super::telemetry::RolloverStamp>,
+    /// Live view of this request for its round's keep-warm
+    /// (`runtime::tool_keepwarm`): the native Anthropic transport reports
+    /// the size of the cached prefix as the response starts
+    /// (`message_start`), so a response that outlasts the cache TTL can be
+    /// kept warm before it ends. `None` (default) reports nothing. Set only
+    /// on the stream loop's own round requests, never on a ping (its
+    /// `message_start` is not the round's).
+    pub round_signal: Option<std::sync::Arc<super::tool_keepwarm::RoundSignal>>,
 }
 
 /// What a keep-warm request does once its body is built.
@@ -1282,7 +1317,7 @@ impl ApiMethods {
                     options.codex_request_role,
                     options.tool_session_id.as_ref(),
                     options.session_tool_set.as_ref(),
-                    options.memory_backend.as_ref(),
+                    options.tool_context.as_ref(),
                     &options.trace,
                     options.suppress_stream_deltas,
                 )
@@ -1758,7 +1793,7 @@ impl ApiMethods {
                                     {
                                         await_or_cancel(
                                             cancel,
-                                            router.report_served(&seat, sent_at_ms),
+                                            router.report_served(&seat, model, sent_at_ms),
                                         )
                                         .await?;
                                         anthropic_cooled.retain(|c| c != &seat);
@@ -1839,8 +1874,7 @@ impl ApiMethods {
                             }
 
                             let is_429 = status.as_u16() == 429;
-                            let is_retryable =
-                                matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                            let is_retryable = is_retryable_status(status.as_u16());
 
                             // Capture headers before consuming the body.
                             let (delay, from_hdr) =
@@ -1923,7 +1957,10 @@ impl ApiMethods {
                                     // AutoRepin selects away from this seat.
                                     match seat.as_ref() {
                                         Some(seat) => {
-                                            await_or_cancel(cancel, router.report_exhausted(seat, &evidence))
+                                            await_or_cancel(
+                                                cancel,
+                                                router.report_exhausted(seat, model, &evidence),
+                                            )
                                                 .await?;
                                             if !anthropic_cooled.contains(seat) {
                                                 anthropic_cooled.push(seat.clone());
@@ -2353,6 +2390,7 @@ impl ApiMethods {
                 request_has_1h_marker,
                 usage_counters: options.usage_counters.clone(),
                 cache_diagnosis: diagnostics.is_some(),
+                round_signal: options.round_signal.as_deref(),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -2834,6 +2872,16 @@ mod tests {
     use super::*;
     use crate::runtime::telemetry::TelemetryLevel;
 
+    #[test]
+    fn retryable_statuses_are_the_transient_set() {
+        for status in [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529] {
+            assert!(is_retryable_status(status), "HTTP {status} must retry");
+        }
+        for status in [200, 400, 401, 403, 404, 413, 422, 501, 519, 525] {
+            assert!(!is_retryable_status(status), "HTTP {status} must not retry");
+        }
+    }
+
     #[tokio::test]
     async fn non_anthropic_usage_is_booked_into_the_turn_counters() {
         let counters = Arc::new(crate::runtime::budget::UsageCounters::default());
@@ -2891,6 +2939,7 @@ mod tests {
             request_has_1h_marker: true,
             usage_counters: None,
             cache_diagnosis: false,
+            round_signal: None,
         }
     }
 
@@ -2924,6 +2973,7 @@ mod tests {
             request_has_1h_marker: true,
             usage_counters: None,
             cache_diagnosis: false,
+            round_signal: None,
         }
     }
 
@@ -2949,6 +2999,7 @@ mod tests {
             request_has_1h_marker: true,
             usage_counters: None,
             cache_diagnosis: false,
+            round_signal: None,
         }
     }
 
@@ -3046,6 +3097,60 @@ mod tests {
             state.accumulated_content[1],
             json!({"type":"text","text":"second"})
         );
+    }
+
+    /// The round's keep-warm learns the size of the cached prefix as the
+    /// response starts (`ApiOptions::round_signal`): what `message_start`
+    /// says was read plus what it says was written. The round's own usage
+    /// is not booked until the response ends.
+    #[test]
+    fn message_start_reports_the_cached_prefix_to_the_round_signal() {
+        let (mut state, tx, mut rx) = harness();
+        let signal = crate::runtime::tool_keepwarm::RoundSignal::default();
+        let mut ctx = make_ctx(&tx);
+        ctx.round_signal = Some(&signal);
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":125655,"cache_creation_input_tokens":1974}}}"#,
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(signal.cached_tokens(), 127_629, "read + written");
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))),
+            "reported, not booked: usage is emitted once, when the response ends"
+        );
+        // A retried attempt reports its own.
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_2","usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":127629,"cache_creation_input_tokens":40}}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(signal.cached_tokens(), 127_669);
+    }
+
+    /// A request with no signal (every request but a round's own: pings,
+    /// probes, non-stream calls) reports nothing and parses the same.
+    #[test]
+    fn without_a_round_signal_message_start_parses_the_same() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        assert!(ctx.round_signal.is_none());
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":100,"cache_creation_input_tokens":20}}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(state.msg_start_cache_read, Some(100));
+        assert_eq!(state.msg_start_cache_create, Some(20));
     }
 
     #[test]
@@ -4527,6 +4632,7 @@ mod tests {
             request_has_1h_marker: false,
             usage_counters: None,
             cache_diagnosis: false,
+            round_signal: None,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(
@@ -5421,6 +5527,9 @@ mod anthropic_failover_tests {
         Rejected429 { reset_in_secs: u64 },
         /// Ordinary 429: `retry-after` only, no exhaustion signal.
         Plain429 { retry_after: u64 },
+        /// 2026-11-15's real 429: unified status rejected by one model's own
+        /// weekly limit (`7d_oi`), the account's 7d window still allowed.
+        ModelRejected429 { reset_in_secs: u64 },
         SseOk,
         SsePartialThenOverloaded,
     }
@@ -5486,6 +5595,27 @@ mod anthropic_failover_tests {
                                 (
                                     "anthropic-ratelimit-unified-reset",
                                     (now_secs + reset_in_secs).to_string(),
+                                ),
+                            ],
+                            body_429,
+                        )
+                            .into_response(),
+                        Reply::ModelRejected429 { reset_in_secs } => (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [
+                                ("content-type", "application/json".to_string()),
+                                ("anthropic-ratelimit-unified-status", "rejected".to_string()),
+                                (
+                                    "anthropic-ratelimit-unified-reset",
+                                    (now_secs + reset_in_secs).to_string(),
+                                ),
+                                (
+                                    "anthropic-ratelimit-unified-7d-status",
+                                    "allowed_warning".to_string(),
+                                ),
+                                (
+                                    "anthropic-ratelimit-unified-7d_oi-status",
+                                    "rejected".to_string(),
                                 ),
                             ],
                             body_429,
@@ -5584,6 +5714,7 @@ mod anthropic_failover_tests {
         async fn report_exhausted(
             &self,
             failed: &CredentialRef,
+            _model: &str,
             evidence: &AnthropicQuotaEvidence,
         ) {
             self.reports
@@ -5591,7 +5722,7 @@ mod anthropic_failover_tests {
                 .unwrap()
                 .push((failed.clone(), *evidence));
         }
-        async fn report_served(&self, seat: &CredentialRef, _sent_at_ms: u64) {
+        async fn report_served(&self, seat: &CredentialRef, _model: &str, _sent_at_ms: u64) {
             self.served.lock().unwrap().push(seat.clone());
         }
         async fn failover(
@@ -5649,6 +5780,18 @@ mod anthropic_failover_tests {
         max_retries: u32,
         base: ApiOptions,
     ) -> Outcome {
+        drive_model(upstream, auth, router, max_retries, base, "claude-haiku-4-5").await
+    }
+
+    /// [`drive_with`] for `model`.
+    async fn drive_model(
+        upstream: &MockUpstream,
+        auth: Arc<RwLock<AuthState>>,
+        router: &dyn AnthropicAccountRouter,
+        max_retries: u32,
+        base: ApiOptions,
+        model: &str,
+    ) -> Outcome {
         let options = ApiOptions {
             anthropic_base_url: Some(upstream.base_url.clone()),
             credential_source: CredentialSource::Local,
@@ -5663,7 +5806,7 @@ mod anthropic_failover_tests {
         let result = ApiMethods::anthropic_stream_with_router(
             &auth,
             &client,
-            "claude-haiku-4-5",
+            model,
             tools.tools_schema(),
             &None,
             0,
@@ -5864,6 +6007,40 @@ mod anthropic_failover_tests {
                     "{labels:?}: the turn stays on a"
                 );
             }
+        }
+
+        /// The real 429 path: a request for `anthropic/claude-fable-5` meets
+        /// Fable's own weekly limit on a. The broker holds a cooldown for the
+        /// requested model id with the prefix stripped (`claude-fable-5`), on
+        /// a only; a still serves Opus, and the request moves to b.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, anthropic_429_log_capture)]
+        async fn a_model_limit_429_cools_the_requested_model_on_that_account_only() {
+            let base = crate::test_env::BaseDirGuard::new();
+            let broker = auto_broker(base.path(), &["a", "b"]).await;
+            let router = BrokerAnthropicRouter::new(broker.clone());
+            let upstream = spawn_upstream(vec![
+                Reply::ModelRejected429 { reset_in_secs: 20 * 3600 },
+                Reply::SseOk,
+            ])
+            .await;
+            let auth = oauth_auth_pinned_to("a");
+            let out = drive_model(
+                &upstream,
+                Arc::clone(&auth),
+                &router,
+                2,
+                ApiOptions::default(),
+                "anthropic/claude-fable-5",
+            )
+            .await;
+            out.result.expect("b serves the request");
+            assert_eq!(upstream.auth_seen(), vec!["Bearer tok-a", "Bearer tok-b"]);
+            let a = seat("a");
+            assert!(broker.active_cooldown_for(&a, Some("claude-fable-5")).is_some());
+            assert_eq!(broker.active_cooldown_for(&a, Some("claude-opus-4-7")), None);
+            assert_eq!(broker.active_cooldown(&a), None, "the account is not cooling");
+            assert_eq!(broker.active_cooldown_for(&seat("b"), Some("claude-fable-5")), None);
         }
 
         /// Review fix 1 (belt and braces): a is cooling down and is the only

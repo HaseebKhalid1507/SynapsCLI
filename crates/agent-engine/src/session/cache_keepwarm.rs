@@ -2832,6 +2832,7 @@ mod tests {
             ("claude-opus-4-7", 19, 19),
             ("claude-opus-5-5", 39, 26),
             ("claude-fable-5-1", 79, 26),
+            ("claude-fable-5-2", 79, 26),
         ] {
             let mut c = cfg(CacheKeepWarm::Auto, CacheTtl::OneHour, model);
             let (pings, _, _, reason, elapsed) = run(c.clone(), &[usage(model, P, 0, 0, 0)]);
@@ -2853,6 +2854,7 @@ mod tests {
             ("claude-opus-4-7", 12),
             ("claude-opus-5-5", 24),
             ("claude-fable-5-1", 49),
+            ("claude-fable-5-2", 49),
         ] {
             let mut c = cfg(CacheKeepWarm::Auto, CacheTtl::FiveMinutes, model);
             c.auto_max_hours = 24;

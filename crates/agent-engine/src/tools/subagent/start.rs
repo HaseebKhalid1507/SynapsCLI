@@ -287,10 +287,7 @@ impl Tool for SubagentStartTool {
                             telemetry.as_ref(),
                             &workspace,
                         );
-                        runtime.set_system_prompt(super::compose_system_prompt(
-                            system_prompt,
-                            runtime.memory_backend_is_axel(),
-                        ));
+                        runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
                         runtime.set_model(model_a.clone());
                         super::fit_subagent_context_window(&mut runtime);
                         super::apply_codex_worker_reasoning(

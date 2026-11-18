@@ -4,6 +4,7 @@ pub(crate) mod auth_broker;
 pub(crate) mod chat;
 pub(crate) mod daemon;
 pub(crate) mod login;
+pub(crate) mod memory;
 pub(crate) mod prompt;
 pub(crate) mod quota_keeper;
 pub(crate) mod removed;

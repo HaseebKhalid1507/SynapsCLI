@@ -549,8 +549,8 @@ nothing until the first real turn. The restore holds the daemon's idle exit.
 - `SYNAPS_DAEMON_RESTORE_PINS=0` starts a daemon without restoring (the pin book
   is kept for the next start).
 - Not restored: `/system` overrides, `/settings` knobs changed in the session
-  (thinking, model override beyond the journal's, auto-approve), `/memory`
-  choice, running workers. The conversation, model, name and env come from the
+  (thinking, model override beyond the journal's, auto-approve), running
+  workers. The conversation, model, name and env come from the
   journal.
 - At boot: `deploy/synaps-daemon.service` (systemd user unit, with
   `loginctl enable-linger`) starts the daemon, and with it every pin.
@@ -656,7 +656,7 @@ C: bye | socket close = Detach (turn keeps running)
   daemon's `Attached` carries `conversation.api_messages = []` + `conversation.messages_len` + a
   `display_tail {items:[{kind:user|thinking|text|tool_use,…}], omitted, times?}` projected by
   `session::display::display_tail` — the SAME filter the in-process TUI applies to its history, so Local
-  and Socket render byte-identical transcripts (golden test, `differential.sh` S pane). `times` holds each
+  and Socket render byte-identical transcripts (golden test). `times` holds each
   item's message time (RFC 3339 UTC, parallel to `items`), omitted when no item has one (legacy history,
   an older daemon). The conn
   forwarder drops `Stream(MessageHistory)` for Digest clients (they key on the `Conversation` digest that
@@ -950,8 +950,10 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    cancel (partial history kept + restart marker), answer prompts `None`, save, close PTYs, notice.
    Workers do not hold the drain: an idle parent waiting on workers counts as idle.
 3. **reload-state** `daemon[-P].reload.json` (0600): generation, per-session `{id, journal_id, config
-   (continue_session = journal_id, cwd, model), keep_warm, lifecycle, workers, tool_activations}`, and
-   `next_subagent_id` (the `sa_N` counter).
+   (continue_session = journal_id, cwd, model), keep_warm, lifecycle, workers, tool_activations,
+   supersedes, created_at}`, and `next_subagent_id` (the `sa_N` counter). `supersedes` and `created_at`
+   are the actor's [conversation cell](#conversation-identity): the next image's actor still holds the
+   journals it compacted away from, and the listing keeps the conversation's start.
 4. **Announce**: every other connection gets `Event(Reloading{generation, retry_after_ms: 500})` +
    `Bye{Reloading}` (forwarders drain the checkpoint's events first); the requester gets `Bye{Reloading}`.
 5. **Exec**: `daemon.json` rewritten (`generation+1`, same pid), sidecars stopped (≤ 5 s), the flock fd made
@@ -972,7 +974,8 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
 6. **New image**: `Daemon::start` sees `SYNAPS_DAEMON_RELOAD_STATE` → `DaemonLock::adopt(fd)` (same open file
    description = same flock, no gap), no `reap_stale`, rehydrates every recorded session
    (`create_session(continue_session = journal_id)`) **before** accepting; `reload_aliases` maps old→new
-   ids for one generation (they differ only after a LinkedSuccessor compaction). Before the first session
+   ids for one generation (they differ after a LinkedSuccessor compaction, a `/clear`, an in-session
+   `/resume`, or for an actor that took a minted id). Before the first session
    the handle counter is raised to `next_subagent_id` (and past every carried id); each continued
    session with tool activations gets the host-only `RestoreToolActivations` first, and each session
    with carried workers gets the host-only `AdoptWorkers` (both before any `Park`). The restore does not wait
@@ -989,8 +992,8 @@ marker kept), pending prompts (`None`), PTY/background shells (closed, announced
 `turn_replay`, input ownership (re-established by reconnect order + `was_owner`), running reactive
 workers (stopped resumably, see below).
 **Preserved** — each session's `Checkpoint{Reload}` reply carries a `SessionReloadRecord` that the new
-image rehydrates from: the journal and session id (same journal continued; `reload_aliases` only after a
-LinkedSuccessor compaction), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
+image rehydrates from: the journal and session id (same journal continued; `reload_aliases` when the
+session comes back under another id, see step 6), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
 compaction policy, auto-compact, persist), the keep-warm pin, the lifecycle (**a Parked session comes
 back Parked** — rehydrate creates it then sends the host-only `Park`), the non-persisted runtime knobs
 (`settings_replay`: `/context`, compaction model, API retries, subagent/bash timeouts, tool-output cap,
@@ -1000,9 +1003,12 @@ activations** (`activate_tools` grants under progressive disclosure; see
 [Tool activations across a reload](#tool-activations-across-a-reload-or-a-park)). A session that never ran a turn has no
 journal (`save` skips an empty conversation): it is recreated fresh under a new id and aliased.
 A session whose journal lock is held by another process (e.g. an in-process `synaps --continue X`) is
-NOT recreated — it is registered as a **Parked placeholder** under the same id with `locked_by` set
-in its metadata. Attach is refused with a message naming the lock holder's pid and kind (F23).
-`daemon sessions` shows it as Parked with the `locked_by` marker.
+NOT recreated — it is registered as a **Parked placeholder** with `locked_by` set in its metadata,
+under the id a real session on that journal would take (the journal id, or a minted one if a session
+restored earlier has it), never replacing a session already registered; the old id is aliased to it. Attach is refused with a message naming the lock holder's pid and kind (F23).
+`daemon sessions` shows it as Parked with the `locked_by` marker. Every attach retries the real create;
+the placeholder stays listed while it runs and the real session replaces it in place under its id
+(it never leaves the list).
 
 Tested against a **real** `synaps daemon --foreground` process (`tests/daemon_reload.rs`): same pid before
 and after, `generation` 1→2, flock held throughout, conversation identical after reconnect, client is
@@ -1016,6 +1022,43 @@ whole session's hit rate instead of restarting at the first request after the re
 miss). They live in the session's `.json` snapshot only (`Session::total_cache_read_tokens` /
 `total_cache_creation_tokens`), never in the journal: 0.10.1 rejects unknown journal fields. In
 journal mode they are as of the last snapshot. A session saved before they persisted resumes them at 0.
+
+### Conversation identity
+
+A session's `id` is the **actor**: what `Attach::Existing`, `close`, `pin` and `rename` take. Its
+`journal_id` is the **conversation**. They start equal and part when the actor moves to another journal:
+a linked-successor compaction (the same conversation continues in a successor journal), `/clear` and an
+in-session `/resume` (another conversation). Each actor keeps one conversation cell: the journal id, the
+journals it compacted away from since it last began a conversation (`supersedes`, at most 32), and when
+that conversation began.
+
+- **"Is this conversation running here"** has one answer, `SessionHandle::holds(journal)`: its current
+  journal or one in `supersedes`. `config.continue_session` (and `--continue`, `Attach::Create{continue}`)
+  attaches to the actor that holds the conversation, or that has the name; never to an actor merely
+  because its id matches. After `/clear`, actor `A` holds only the new journal `N`: resuming `A` builds a
+  second actor on `A`, and the cleared actor's old name no longer resolves to it (`/clear` publishes the
+  new conversation at once: no name, no title, zero messages, its own `created_at`).
+- **Minted ids:** the session map is keyed by actor id. A new actor whose journal id is already another
+  live actor's id (resuming `A` while the cleared actor `A` lives) takes a fresh id in the journal id
+  format instead. Both are listed; ending either leaves the other.
+- **Removal is by identity:** an actor that ends removes its own map entry only, never a session adopted
+  under the same id meanwhile.
+- **A lock-held placeholder** (a reload that found the journal locked elsewhere) holds the conversation
+  its reload record continues: after `/clear` that is `N`, not the actor id `A`. It is registered under
+  `N`'s id (the reload alias `A → N` covers the old one), so it never evicts a session restored before
+  it, such as the resumed conversation `A` that took the id `A`. Once the lock is free, the next attach
+  builds `N` in its place, never the pre-clear `A`.
+- **`--continue` with no argument right after `/clear`** continues the latest saved conversation, which is
+  the pre-clear `A` (`N` has no journal until its first turn, and the cleared actor no longer holds `A`):
+  it opens a second actor on `A` rather than reattaching to the cleared one.
+- **Known residual:** after `/clear` → resume `A` → `daemon reload`, both actors come back under their
+  journal ids (`N` and `A`). A client of the cleared actor that reconnects with `Attach::Existing{A}` gets
+  conversation `A`, not `N` (the live `A` is found before the reload alias). It should reconnect by the
+  journal id `Cleared{session_id}` gave it. Pinned by
+  `q11_reconnecting_by_a_cleared_actor_id_after_a_reload_finds_the_resumed_conversation`.
+
+Tested in `crates/agent-engine/tests/session_conversation_identity.rs`, the `live_match_tests` in
+`host.rs`, and `tests/daemon_reload.rs` (`supersedes_and_the_start_survive_a_reload`).
 
 ### Tool activations across a reload or a park
 
@@ -1201,16 +1244,12 @@ note: $GH_TOKEN was stripped from the session env as a secret; reattach from a s
 
 Honest list of behaviour changes on this branch on the plain in-process path (`synaps`, `synaps chat` — no `--attach`):
 
-1. **`synaps chat` runs on `SessionActor`** (`LocalTransport`, in-process). The differential test
-   (`tests/session_actor_differential.rs`) compares the actor against a *frozen re-derivation* of the
-   inline engine halves (not a verbatim copy; it has no abort/prompt/save) on **three scenarios only**:
-   plain turn, provider error repairing history, idle auto-turn to cap. **Tool loop, steer-mid-stream,
-   queue-while-busy, cancel (history + marker), secret-prompt round-trip are asserted by actor unit
-   tests, not by the differential.** `tests/chat_stdin.rs` is unchanged and green but never runs a turn through a
-   stub. The kill-switch `SYNAPS_CHAT_INLINE=1` only exists in a `--features legacy_inline` build.
-   Cancel diverges from the frozen oracle by design: the oracle folds an `ABORT CONTEXT` recap into the
-   next user message; the actor keeps the interrupted turn as history plus an interruption marker
-   (`cancel_keeps_real_history_where_the_oracle_folded_a_recap` pins both sides).
+1. **`synaps chat` runs on `SessionActor`** (`LocalTransport`, in-process). The actor's turn
+   scenarios are asserted directly (`tests/session_actor_scenarios.rs` and
+   `crates/agent-engine/tests/session_actor*.rs`); the frozen-reference differential that compared it
+   with the pre-actor inline loop was removed in 0.12.0, with the inline loop and its kill-switch
+   (`SYNAPS_CHAT_INLINE=1`, `--features legacy_inline`). Cancel keeps the interrupted turn as history
+   plus an interruption marker (`session_actor_interrupt.rs`).
 2. **MCP descriptor cache write-back is ON by default, in-process too** (`docs/mcp.md`): after the first
    `tools/list` on an exact lease the listing is written to `~/.synaps-cli/mcp-descriptors.json`, so the
    *next* boot registers dormant MCP tools it did not know before → tool list, system prompt and the
@@ -1276,9 +1315,8 @@ compiles that grammar's regexes → **≈ 13.7 MB** idle until the syntect idle 
 dump bytes, not heap. On `[madvise]`/`[never]` kernels the re-exec is skipped (nothing is
 huge-mapped before `main`); the remaining knobs are applied in-process.
 
-The socket differential (`SYNAPS_TUI_E2E_SOCKET=1 scripts/tui-e2e/differential.sh`) compares
-**content order**, not layout: its normaliser drops blank rows, `█` cursor rows and the
-`│Extensions` line before diffing L against S.
+The socket differential (`SYNAPS_TUI_E2E_SOCKET=1 scripts/tui-e2e/differential.sh`, removed in
+0.12.0 with the reference-binary differential it extended) compared **content order**, not layout.
 
 ### Fix round: daemon-tree RssAnon column (§9 of the phase-2 review)
 

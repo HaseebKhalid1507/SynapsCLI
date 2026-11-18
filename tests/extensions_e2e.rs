@@ -18,6 +18,9 @@ use synaps_cli::extensions::runtime::ExtensionHandler;
 use synaps_cli::tools::ToolOrigin;
 use synaps_cli::{Tool, ToolContext};
 
+#[path = "support/notify_hooks.rs"]
+mod notify_hooks;
+
 struct EchoTestTool;
 
 #[async_trait]
@@ -186,6 +189,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         None,
         serde_json::json!({"command": "rm -rf /tmp/nope"}),
         None,
+        None,
     )
     .await;
     let decision = synaps_cli::runtime::resolve_before_tool_call_decision(
@@ -228,12 +232,13 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     tool_activation: None,
                     mcp_leases: None,
                     extension_leases: None,
-                    memory_context: None,
                     cwd: None,
                     env: None,
                     env_stripped: Vec::new(),
                     env_warned: Default::default(),
                     session_id: None,
+                    hook_bus: None,
+                    continuation: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -255,6 +260,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         input,
         output,
         256 * 1024,
+        None,
         None,
     )
     .await;
@@ -312,6 +318,7 @@ async fn after_tool_call_replace_substitutes_output_via_real_extension() {
         json!({"command": "echo big"}),
         raw,
         256 * 1024,
+        None,
         None,
     )
     .await;
@@ -403,12 +410,13 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     tool_activation: None,
                     mcp_leases: None,
                     extension_leases: None,
-                    memory_context: None,
                     cwd: None,
                     env: None,
                     env_stripped: Vec::new(),
                     env_warned: Default::default(),
                     session_id: None,
+                    hook_bus: None,
+                    continuation: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -435,7 +443,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
     manager.shutdown_all().await;
 }
 
-fn whoami_ctx(session_id: Option<&str>) -> ToolContext {
+fn whoami_ctx(session_id: Option<&str>, cwd: Option<&std::path::Path>) -> ToolContext {
     ToolContext {
         channels: synaps_cli::tools::ToolChannels {
             tx_delta: None,
@@ -457,12 +465,13 @@ fn whoami_ctx(session_id: Option<&str>) -> ToolContext {
             tool_activation: None,
             mcp_leases: None,
             extension_leases: None,
-            memory_context: None,
-            cwd: None,
+            cwd: cwd.map(std::path::Path::to_path_buf),
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
             session_id: session_id.map(str::to_string),
+            hook_bus: None,
+            continuation: None,
         },
         limits: synaps_cli::tools::ToolLimits {
             max_tool_output: 30_000,
@@ -474,14 +483,11 @@ fn whoami_ctx(session_id: Option<&str>) -> ToolContext {
     }
 }
 
-/// A daemon-shared plugin must learn which conversation invoked its tool:
-/// `tool.call` params carry the caller's `session_id` (the value hook events
-/// already carry), `null` for workers. The key is always present.
-#[tokio::test]
-async fn extension_tool_call_carries_caller_session_id() {
-    // Serialise with hook_json_carries_session_id, which flips the
-    // SYNAPS_HOOK_SESSION_ID kill switch process-wide.
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// The `whoami` fixture loaded as one plugin process, as a daemon shares it.
+async fn load_whoami_plugin() -> (
+    ExtensionManager,
+    Arc<tokio::sync::RwLock<synaps_cli::ToolRegistry>>,
+) {
     let fixture = std::env::current_dir()
         .unwrap()
         .join("tests/fixtures/whoami_tool_extension.py")
@@ -506,6 +512,18 @@ async fn extension_tool_call_carries_caller_session_id() {
         config: vec![],
     };
     manager.load("whoami-test", &manifest).await.unwrap();
+    (manager, tools)
+}
+
+/// A daemon-shared plugin must learn which conversation invoked its tool:
+/// `tool.call` params carry the caller's `session_id` (the value hook events
+/// already carry), `null` for workers. The key is always present.
+#[tokio::test]
+async fn extension_tool_call_carries_caller_session_id() {
+    // Serialise with hook_json_carries_session_id, which flips the
+    // SYNAPS_HOOK_SESSION_ID kill switch process-wide.
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut manager, tools) = load_whoami_plugin().await;
 
     let registry = tools.read().await;
     let tool = registry
@@ -515,7 +533,7 @@ async fn extension_tool_call_carries_caller_session_id() {
     // Two sessions sharing one plugin process → each call names its caller.
     for caller in [Some("sess-A"), Some("sess-B"), None] {
         let output = tool
-            .execute(json!({"k": 1}), whoami_ctx(caller))
+            .execute(json!({"k": 1}), whoami_ctx(caller, None))
             .await
             .unwrap();
         let seen: Value = serde_json::from_str(&output).unwrap();
@@ -534,6 +552,49 @@ async fn extension_tool_call_carries_caller_session_id() {
             json!({"k": 1}),
             "input must be unchanged: {seen}"
         );
+    }
+    drop(registry);
+
+    manager.shutdown_all().await;
+}
+
+/// ... and which folder that conversation runs in: `tool.call` params carry
+/// `cwd`, the caller's session folder when it has one (two chats in one
+/// daemon, a worker in its parent's folder), else the process folder. Never
+/// absent, and not the process folder when the caller has its own.
+#[tokio::test]
+async fn extension_tool_call_carries_caller_cwd() {
+    // Serialise with the test that moves the process folder.
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut manager, tools) = load_whoami_plugin().await;
+    let (chat_a, chat_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let process = std::env::current_dir().unwrap();
+
+    let registry = tools.read().await;
+    let tool = registry
+        .get("whoami-test:whoami")
+        .expect("whoami tool registered");
+
+    for (caller, cwd, expected) in [
+        (Some("sess-A"), Some(chat_a.path()), chat_a.path()),
+        (Some("sess-B"), Some(chat_b.path()), chat_b.path()),
+        // A worker: no conversation id, but its parent's folder.
+        (None, Some(chat_a.path()), chat_a.path()),
+        // No session folder (in-process host): the process folder.
+        (Some("sess-C"), None, process.as_path()),
+    ] {
+        let output = tool
+            .execute(json!({}), whoami_ctx(caller, cwd))
+            .await
+            .unwrap();
+        let seen: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(seen["has_cwd"], json!(true), "cwd key must be present: {seen}");
+        assert_eq!(
+            seen["cwd"],
+            json!(expected.to_str().unwrap()),
+            "caller {caller:?} in {cwd:?}: {seen}"
+        );
+        assert_eq!(seen["session_id"], json!(caller), "{seen}");
     }
     drop(registry);
 
@@ -1907,13 +1968,16 @@ async fn hook_json_carries_session_id() {
     assert_eq!(loaded, vec!["session-id-test".to_string()]);
     assert!(failed.is_empty(), "unexpected discovery failures: {failed:?}");
 
-    // Two sessions in one process → distinct ids on the wire.
+    // Two sessions in one process → distinct ids, and folders, on the wire.
+    let (chat_a, chat_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let process = std::env::current_dir().unwrap();
     let _ = synaps_cli::runtime::emit_before_tool_call(
         &hook_bus,
         "bash",
         None,
         json!({"command": "true"}),
         Some("sess-A"),
+        Some(chat_a.path()),
     )
     .await;
     let _ = synaps_cli::runtime::emit_after_tool_call(
@@ -1924,8 +1988,10 @@ async fn hook_json_carries_session_id() {
         "ok".to_string(),
         1024,
         Some("sess-B"),
+        Some(chat_b.path()),
     )
     .await;
+    // Built here, not by their emitter (the stream loop): no folder.
     let _ = hook_bus
         .emit(&HookEvent::before_message("hi").with_session(Some("sess-A")))
         .await;
@@ -1938,6 +2004,7 @@ async fn hook_json_carries_session_id() {
         "bash",
         None,
         json!({"command": "true"}),
+        None,
         None,
     )
     .await;
@@ -1970,6 +2037,19 @@ async fn hook_json_carries_session_id() {
             ("before_tool_call".into(), None),
         ],
         "hook JSON must carry the owning session id (log: {seen:?})"
+    );
+    // ... and the folder the tool-hook emitters were given: each session's
+    // own, and the process folder for the call with none. The key is on
+    // the wire for every event, `null` on the ones no emitter stamped (the
+    // stream loop's and the session actor's emitters are covered where
+    // they run: `stream_hooks_carry_the_streams_cwd`, `session_actor_hook_cwd`).
+    assert!(seen.iter().all(|e| e["has_cwd"] == json!(true)), "{seen:?}");
+    let folders: Vec<Value> = seen.iter().map(|e| e["cwd"].clone()).collect();
+    let (a, b) = (chat_a.path().to_str().unwrap(), chat_b.path().to_str().unwrap());
+    assert_eq!(
+        folders,
+        vec![json!(a), json!(b), Value::Null, Value::Null, json!(process.to_str().unwrap()), Value::Null],
+        "hook JSON must carry the folder its emitter was given (log: {seen:?})"
     );
 
     manager.shutdown_all().await;
@@ -2060,18 +2140,18 @@ async fn session_start_end_per_session() {
 
     use synaps_cli::extensions::loader::{emit_session_end, emit_session_start};
     // Two sessions in one host: two starts with distinct ids …
-    assert!(!emit_session_start(&hook_bus, "sess-A").await, "fixture does not inject");
-    assert!(!emit_session_start(&hook_bus, "sess-B").await);
+    assert!(!emit_session_start(&hook_bus, "sess-A", None).await, "fixture does not inject");
+    assert!(!emit_session_start(&hook_bus, "sess-B", None).await);
     // … keyed injections stay isolated (phase 1 keyed injection) …
     hook_bus.set_session_injection_for("sess-A", "A-only".into()).await;
     hook_bus.set_session_injection_for("sess-B", "B-only".into()).await;
     assert_eq!(hook_bus.session_injection_for("sess-A").await.as_deref(), Some("A-only"));
     assert_eq!(hook_bus.session_injection_for("sess-B").await.as_deref(), Some("B-only"));
     // … and two ends, each clearing only its own injection.
-    assert!(emit_session_end(&hook_bus, "sess-A", None, Duration::from_secs(5)).await);
+    assert!(emit_session_end(&hook_bus, "sess-A", None, None, Duration::from_secs(5)).await);
     assert_eq!(hook_bus.session_injection_for("sess-A").await, None);
     assert_eq!(hook_bus.session_injection_for("sess-B").await.as_deref(), Some("B-only"));
-    assert!(emit_session_end(&hook_bus, "sess-B", None, Duration::from_secs(5)).await);
+    assert!(emit_session_end(&hook_bus, "sess-B", None, None, Duration::from_secs(5)).await);
     assert_eq!(hook_bus.session_injection_for("sess-B").await, None);
 
     let seen = read_jsonl(&log_path);
@@ -2198,4 +2278,237 @@ async fn plugin_load_in_one_session_keeps_other_sessions_activations() {
     assert!(!set_b.is_stale(tools.read().await.catalog()));
 
     manager.shutdown_all().await;
+}
+
+// ── notify-only hooks over the real wire ─────────────────────────────────────
+
+/// `on_context_archived` as a process extension receives it: the full
+/// `hook.handle` params, with the chat's folder. The extension answers
+/// `block`, which this hook does not accept and nobody waits for. An
+/// extension written before the hook existed is sent nothing new.
+#[tokio::test(flavor = "current_thread")]
+async fn on_context_archived_reaches_its_subscriber_and_nobody_else() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    // Subscribed to every hook kind that existed before this one.
+    let bystander_log = install_session_id_echo_plugin(home.path(), "bystander");
+
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let (loaded, failed) = manager.discover_and_load().await;
+    assert_eq!(loaded, vec!["bystander".to_string()]);
+    assert!(failed.is_empty(), "unexpected discovery failures: {failed:?}");
+    let log = notify_hooks::load(
+        &mut manager,
+        home.path(),
+        "archive-indexer",
+        "block",
+        &["on_context_archived"],
+    )
+    .await;
+
+    let chat = tempfile::tempdir().unwrap();
+    assert_ne!(chat.path(), std::env::current_dir().unwrap());
+    let id = "9f2c".repeat(8);
+    let file = home.path().join("s000001").join(format!("{id}.json"));
+    hook_bus.notify(
+        HookEvent::on_context_archived("sess-A", &id, Some(&file), "p0123456789abcdef", 212, 240, 4)
+            .with_cwd(Some(chat.path())),
+    );
+
+    let seen = notify_hooks::wait_for(&log, 1).await;
+    assert_eq!(
+        seen[0]["params"],
+        json!({
+            "kind": "on_context_archived",
+            "tool_name": null,
+            "tool_runtime_name": null,
+            "tool_input": null,
+            "tool_output": null,
+            "message": null,
+            "session_id": "sess-A",
+            "cwd": chat.path().to_str().unwrap(),
+            "transcript": null,
+            "data": {
+                "archive_id": id,
+                "path": file.to_str().unwrap(),
+                "project_key": "p0123456789abcdef",
+                "message_count": 212,
+                "source_message_count": 240,
+                "window": 4,
+                "part": 1,
+                "parts": 1,
+                "first_source_index": 0,
+                "reduced_messages": 0
+            }
+        })
+    );
+
+    // The bystander is alive and was sent only what it subscribed to.
+    let _ = hook_bus.emit(&HookEvent::before_message("hi")).await;
+    let kinds: Vec<Value> = read_jsonl(&bystander_log)
+        .iter()
+        .map(|entry| entry["kind"].clone())
+        .collect();
+    assert_eq!(kinds, vec![json!("before_message")]);
+    assert_eq!(notify_hooks::logged(&log).len(), 1, "delivered once");
+
+    manager.shutdown_all().await;
+}
+
+/// The memory binding of a chat that runs in the project at `project`,
+/// with its store under the test's base dir.
+fn file_memory(project: &std::path::Path) -> agent_engine::memory_backend::MemoryBinding {
+    agent_engine::memory_backend::MemoryBinding::for_cwd(Some(project.to_path_buf()))
+}
+
+/// A `memory_*` tool call by chat `session_id`, which runs in `chat`.
+fn memory_ctx(
+    binding: &agent_engine::memory_backend::MemoryBinding,
+    hook_bus: &Arc<HookBus>,
+    session_id: &str,
+    chat: &std::path::Path,
+) -> ToolContext {
+    let mut ctx = whoami_ctx(Some(session_id), Some(chat));
+    ctx.capabilities.memory_backend = Some(binding.clone());
+    ctx.capabilities.hook_bus = Some(hook_bus.clone());
+    ctx
+}
+
+/// Store one note through `memory_store`; returns its id.
+async fn store_note(ctx: ToolContext) -> String {
+    let out = synaps_cli::tools::memory::MemoryStoreTool
+        .execute(json!({"content": "a synthetic note to forget"}), ctx)
+        .await
+        .unwrap();
+    out.split_whitespace()
+        .find(|word| word.starts_with("mem-"))
+        .expect("store output carries the stable id")
+        .to_string()
+}
+
+/// `on_memory_forgotten` as a process extension receives it: the full
+/// `hook.handle` params for a note the `memory_forget` tool forgot, with the
+/// calling chat's id and folder.
+#[tokio::test(flavor = "current_thread")]
+async fn on_memory_forgotten_reaches_its_subscriber_over_the_wire() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let log = notify_hooks::load(
+        &mut manager,
+        home.path(),
+        "forget-indexer",
+        "record",
+        &["on_memory_forgotten"],
+    )
+    .await;
+
+    let (project, chat) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    assert_ne!(chat.path(), std::env::current_dir().unwrap());
+    let binding = file_memory(project.path());
+    let id = store_note(memory_ctx(&binding, &hook_bus, "sess-A", chat.path())).await;
+    assert!(notify_hooks::logged(&log).is_empty(), "storing announces nothing");
+
+    synaps_cli::tools::memory::MemoryForgetTool
+        .execute(json!({"id": id}), memory_ctx(&binding, &hook_bus, "sess-A", chat.path()))
+        .await
+        .unwrap();
+
+    let seen = notify_hooks::wait_for(&log, 1).await;
+    assert_eq!(
+        seen[0]["params"],
+        json!({
+            "kind": "on_memory_forgotten",
+            "tool_name": null,
+            "tool_runtime_name": null,
+            "tool_input": null,
+            "tool_output": null,
+            "message": null,
+            "session_id": "sess-A",
+            "cwd": chat.path().to_str().unwrap(),
+            "transcript": null,
+            "data": {
+                "id": id,
+                "kind": "note",
+                "project_key": binding.scope().unwrap().key(),
+                "scope": "repository"
+            }
+        })
+    );
+    manager.shutdown_all().await;
+    assert_eq!(notify_hooks::logged(&log).len(), 1, "one forget, one event");
+}
+
+/// Fail-open, by result and by time. With a subscriber that never answers,
+/// answers with an error, answers `block`, or exits mid-call, `memory_forget`
+/// returns what it returns with no extension at all, the note is gone, and
+/// the call does not wait: waiting on the hung one would cost the 5 s
+/// handler timeout; the bound is half of that over the baseline.
+#[tokio::test(flavor = "current_thread")]
+async fn no_hook_can_change_or_hold_up_a_forget() {
+    use synaps_cli::tools::memory::{MemoryFetchTool, MemoryForgetTool};
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let chat = tempfile::tempdir().unwrap();
+    let mut baseline: Option<(String, Duration)> = None;
+
+    for mode in [None, Some("hang"), Some("error"), Some("block"), Some("exit")] {
+        let home = tempfile::tempdir().unwrap();
+        config::set_base_dir_for_tests(home.path().to_path_buf());
+        let hook_bus = Arc::new(HookBus::new());
+        let mut manager = ExtensionManager::new(hook_bus.clone());
+        let log = match mode {
+            Some(mode) => Some(
+                notify_hooks::load(&mut manager, home.path(), "forget-indexer", mode, &["on_memory_forgotten"])
+                    .await,
+            ),
+            None => None,
+        };
+        let project = tempfile::tempdir().unwrap();
+        let binding = file_memory(project.path());
+        let ctx = || memory_ctx(&binding, &hook_bus, "sess-A", chat.path());
+        let id = store_note(ctx()).await;
+
+        let started = std::time::Instant::now();
+        let out = MemoryForgetTool.execute(json!({"id": id}), ctx()).await;
+        let elapsed = started.elapsed();
+        // The same words whatever the note and project are called.
+        let out = out
+            .unwrap()
+            .replace(&id, "<id>")
+            .replace(binding.scope().unwrap().key(), "<project>");
+
+        // The forget happened.
+        let gone = MemoryFetchTool.execute(json!({"ids": [id]}), ctx()).await.unwrap_err();
+        assert!(gone.to_string().contains("not found"), "{mode:?}: {gone}");
+
+        match (&baseline, &log) {
+            (None, _) => {
+                assert_eq!(out, "tombstoned memory <id> in repository scope (project <project>)");
+                baseline = Some((out, elapsed));
+            }
+            (Some((expected, without)), log) => {
+                assert_eq!(&out, expected, "{mode:?}");
+                assert!(
+                    elapsed < *without + Duration::from_millis(2500),
+                    "{mode:?}: the forget took {elapsed:?}, {without:?} without an extension"
+                );
+                // The hook was really sent, to a process that then did as
+                // its mode says.
+                let log = log.as_ref().expect("a mode has a log");
+                let events = notify_hooks::wait_for(log, 1).await;
+                assert_eq!(events[0]["params"]["kind"], "on_memory_forgotten", "{mode:?}");
+                assert_eq!(events[0]["params"]["data"]["id"], json!(id), "{mode:?}");
+                manager.shutdown_all().await;
+                // Nothing is left running, the hung process included.
+                #[cfg(target_os = "linux")]
+                for logged in notify_hooks::logged(log) {
+                    assert!(notify_hooks::exited(logged["pid"].as_u64().unwrap()).await, "{mode:?}");
+                }
+            }
+        }
+    }
 }
