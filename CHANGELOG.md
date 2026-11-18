@@ -90,9 +90,9 @@ All notable changes to this project will be documented in this file.
 
 - **A held session's listing title is its saved row's title**: the header
   title, else the first message a person typed (not an injected event),
-  on one line without control characters, up to 120 characters (was the
-  first 80 characters of the first user message, raw). A row's title no
-  longer changes when the session ends. The title a save stores
+  on one line without control or bidi override characters, up to 120
+  characters (was the first 80 characters of the first user message,
+  raw). A row's title no longer changes when the session ends. The title a save stores
   (`auto_title`) skips injected events and context notes too, so a
   session an event started is titled by what was typed.
 

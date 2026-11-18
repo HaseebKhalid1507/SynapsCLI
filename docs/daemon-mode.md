@@ -635,10 +635,10 @@ C: {"type":"catalog_page","req":8,"limit":50,"before":{"updated_at":"2026-11-12T
   `error` on an attached connection.
 - **Rows** are `SessionMeta` with `lifecycle: "saved"` and `updated_at` set (the head journal's).
   `id` equals `journal_id`. `name` is the head's, else the newest named predecessor's; `title` is
-  the header title, else the first message a person typed, on one line, no control characters, at
-  most 120 characters; `model`, `cwd` and `cost_usd` are the head's; `created_at` is the chain's
-  first session's; `messages` the head's count (0 from a legacy file). `host_pid` is 0 and every
-  presence field has its default. `lifecycle: "saved"` appears **only** in `catalog_page` replies:
+  the header title, else the first message a person typed, on one line, no control or bidi
+  override characters, at most 120 characters; `model`, `cwd` and `cost_usd` are the head's;
+  `created_at` is the chain's first session's; `messages` the head's count (0 from a legacy
+  file). `host_pid` is 0 and every presence field has its default. `lifecycle: "saved"` appears **only** in `catalog_page` replies:
   never in `welcome`, `session_list` or `attached.meta`, whose 0.12.0 readers have no fallback.
 - **One row per conversation**: a compacted predecessor folds into its chain head (`compacted_into`,
   however long the chain). A chain that loops back on itself is not listed.

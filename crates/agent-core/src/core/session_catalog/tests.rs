@@ -1083,6 +1083,9 @@ fn listing_titles_are_one_clipped_line_without_control_characters() {
     assert_eq!(listing_title("  ", Some("fix the\n  build")), "fix the build");
     assert_eq!(listing_title("", None), "");
     assert_eq!(listing_title("a\u{1b}[31mred\u{7}\u{9b}x", None), "a[31mredx");
+    // Bidi overrides and isolates cannot reorder the row.
+    assert_eq!(listing_title("evil\u{202e}gnp.exe\u{2066}x\u{2069}\u{202a}", None), "evilgnp.exex");
+    assert_eq!(listing_title("\u{202e}\u{2067}", Some("typed")), "typed", "a title of only those falls back");
     let long = listing_title(&"word ".repeat(100), None);
     assert_eq!(long.chars().count(), LISTING_TITLE_CHARS);
     assert!(long.ends_with('…'));

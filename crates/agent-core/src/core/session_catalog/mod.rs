@@ -85,16 +85,25 @@ pub fn typed_user_text(m: &serde_json::Value) -> Option<String> {
 pub const LISTING_TITLE_CHARS: usize = 120;
 
 /// A session's title as listings show it, held or saved alike: the header
-/// title, else the first user message; one line, no control characters
-/// (a terminal client prints it), at most [`LISTING_TITLE_CHARS`]
-/// characters with `…`. Empty when there is neither.
+/// title, else the first user message; one line, no control or bidi
+/// override characters (a terminal client prints it), at most
+/// [`LISTING_TITLE_CHARS`] characters with `…`. Empty when there is
+/// neither.
 pub fn listing_title(title: &str, first_user: Option<&str>) -> String {
-    let src = Some(title)
-        .filter(|t| !t.trim().is_empty())
-        .or(first_user)
-        .unwrap_or("");
-    let line = src.split_whitespace().collect::<Vec<_>>().join(" ");
-    let line: String = line.chars().filter(|c| !c.is_control()).collect();
+    // Control and bidi override/isolate characters out (as
+    // `user_content_for_display` does for document names), then one line.
+    let clean = |s: &str| -> String {
+        let kept: String = s
+            .chars()
+            .filter(|&c| !c.is_control() || c.is_whitespace())
+            .filter(|c| !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+            .collect();
+        kept.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let line = Some(clean(title))
+        .filter(|t| !t.is_empty())
+        .or_else(|| first_user.map(clean))
+        .unwrap_or_default();
     if line.chars().count() <= LISTING_TITLE_CHARS {
         return line;
     }
