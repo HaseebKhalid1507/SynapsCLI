@@ -69,7 +69,8 @@ pub struct SavedFacts {
     pub chained: bool,
 }
 
-/// The one place the listing rules live. `None`: not listable — not on
+/// The one place the listing rules live. PR 3: the hub's retire builds the
+/// pushed row (`Watch{saved: true}`) with this too. `None`: not listable — not on
 /// disk, a junk id, or unnamed and either in a sandbox cwd or with few
 /// messages and not chained (a fresh successor holds just the summary).
 /// A named conversation is never hidden; `named_only` lists only those.

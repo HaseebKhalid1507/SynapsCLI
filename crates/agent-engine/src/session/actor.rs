@@ -5693,6 +5693,8 @@ impl SessionActor {
                 "session save timed out — data may be incomplete"
             );
         }
+        // PR 3: publish here, after the last save, so the saved facts the
+        // hub retires this session with (`saved::saved_row`) are final.
 
         // STEP 2 (C2): on_session_end — per session, concurrent, fail-open,
         // own budget; clears this session's keyed injection.

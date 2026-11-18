@@ -331,8 +331,9 @@ fn cursor_paging_lists_every_row_once_across_equal_updated_at() {
 // ── the property, disk driver ────────────────────────────────────────────────
 
 /// One conversation as its actor knows it, written to disk; the disk
-/// driver must recover exactly these facts. PR 3 runs the same cases
-/// through the actor driver and asserts both build the same row.
+/// driver must recover exactly these facts. PR 3: run the same cases
+/// through the actor driver (`Presence.saved`) and assert
+/// `saved_row(disk) == saved_row(actor)`.
 struct Case {
     what: &'static str,
     /// Oldest first; the last is the head.

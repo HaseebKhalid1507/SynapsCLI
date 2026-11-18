@@ -41,6 +41,9 @@ pub struct Presence {
     /// session waits for its owner to bind or re-bind). Always `None` for a
     /// session that is not owned (`SessionHandle::is_owned`).
     pub owning_client: Option<ClientId>,
+    // PR 3: `saved: daemon::saved::SavedFacts` (the actor driver), with
+    // `chain_facts` walked at create from the `parent_session` headers, so
+    // the hub can retire a session as the row `CatalogPage` will list.
 }
 
 /// The coarse state `Presence::state_since` dates.

@@ -70,6 +70,8 @@ pub const FEATURE_SESSION_WORKERS: &str = "session_workers";
 /// with `DaemonFrame::CatalogPage` (saved sessions, `lifecycle: saved`). An
 /// older daemon answers that frame with `Error{"malformed frame: unknown
 /// variant `catalog_page`…"}`, so a client checks this first.
+/// PR 3: with `session_watch` it also grants `Watch{saved: true}` (a
+/// session that leaves the held set is pushed as its saved row).
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
 
 /// `CatalogPage.limit` when absent, and its ceiling.
@@ -90,6 +92,7 @@ pub fn daemon_features() -> Vec<String> {
     vec![
         FEATURE_OWNED_SESSIONS.to_string(),
         FEATURE_SESSION_WORKERS.to_string(),
+        FEATURE_SESSION_PAGE.to_string(),
     ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
@@ -2605,6 +2608,7 @@ mod catalog_page_tests {
     #[test]
     fn catalog_page_frames_have_the_pinned_shape() {
         assert_eq!(FEATURE_SESSION_PAGE, "session_page");
+        assert!(daemon_features().iter().any(|f| f == FEATURE_SESSION_PAGE), "advertised");
         let req = ClientFrame::CatalogPage {
             req: 7,
             before: Some(CatalogCursor { updated_at: at(12, 4), id: "20261110-202033-64fb".into() }),
