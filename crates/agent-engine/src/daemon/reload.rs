@@ -159,6 +159,14 @@ pub struct ReloadSession {
     /// owner sends them again when it re-binds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_token: Option<crate::session::OwnerToken>,
+    /// The journal ids the actor compacted away from (`JournalCell`): the
+    /// next image's actor still holds them. Empty from an older image.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
+    /// When the conversation began (kept across compactions). Absent from
+    /// an older image: the journal's own `created_at` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// `registry_dir()/daemon[-P].reload.json` body.
@@ -349,7 +357,16 @@ async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
 /// current model from the published view, the `/keepwarm` override).
 fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSession {
     let meta = handle.meta();
-    let journal_id = handle.journal_id();
+    let journal = handle.journal();
+    let journal_id = journal.journal_id.clone();
+    // A lock-held placeholder knows the conversation's start and what it
+    // superseded only from the record it was restored from; without that,
+    // its cell's start is its own spawn time, which must not ride on.
+    let known = handle.placeholder_config().is_none_or(|c| {
+        c.restore_conversation
+            .as_ref()
+            .is_some_and(|r| r.journal_id == journal_id)
+    });
     if rec.is_none() {
         tracing::warn!(
             session = %handle.id,
@@ -411,6 +428,12 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         workers,
         tool_activations,
         owner_token: handle.owner_token().cloned(),
+        supersedes: if known {
+            journal.supersedes.clone()
+        } else {
+            Vec::new()
+        },
+        created_at: known.then_some(journal.created_at),
     }
 }
 
@@ -808,7 +831,7 @@ pub fn adopt_from_env(_paths: &DaemonPaths) -> anyhow::Result<Option<Adopted>> {
 /// F23: detect "is live in another process" in the error string — this is
 /// the `SessionLockError::Held` case, where an in-process runtime holds
 /// the journal lock. Instead of aliasing to an empty impostor, register a
-/// Parked placeholder under the SAME id.
+/// Parked placeholder for that journal (`rehydrate`).
 pub(crate) fn is_lock_held_error(e: &str) -> bool {
     e.contains("is live in another process")
 }
@@ -950,26 +973,65 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
         // Owned: restored unbound, its grace armed only once this image
         // accepts connections (`Daemon::start`), its autonomous work held
         // until the owner re-binds.
-        let owned = s.owner_token.clone().map(|token| crate::session::OwnedConfig { token, restored: true });
-        let config = SessionConfig { owned, ..restore_config(&s.config, s.lifecycle, &s.id) };
+        let owned = s
+            .owner_token
+            .clone()
+            .map(|token| crate::session::OwnedConfig {
+                token,
+                restored: true,
+            });
+        // What the actor held besides its journal; applied only if the new
+        // actor continues that journal (not a fresh fallback).
+        let restore_conversation =
+            s.created_at
+                .map(|created_at| crate::session::RestoredConversation {
+                    journal_id: s.journal_id.clone(),
+                    supersedes: s.supersedes.clone(),
+                    created_at,
+                });
+        let config = SessionConfig {
+            owned,
+            restore_conversation,
+            ..restore_config(&s.config, s.lifecycle, &s.id)
+        };
         let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
-            // placeholder under the SAME id. No alias, no fresh session.
+            // placeholder for that journal, no fresh session. Under the id a
+            // real session on it would take, as the success path does, never
+            // blindly under the old one: after `/clear` and a resume, a
+            // session rehydrated earlier in this loop can have that id (the
+            // resumed conversation), and must not be replaced. The old id
+            // reaches the placeholder by alias.
             Err(e) if is_lock_held_error(&e) => {
                 let holder = parse_holder_from_error(&e);
                 tracing::warn!(
                     session = %s.id, holder = %holder,
                     "daemon: journal locked by another process; registering Parked placeholder"
                 );
-                let sid = crate::session::SessionId::from(s.id.as_str());
+                let journal = match &config.continue_session {
+                    Some(Some(j)) => j.clone(),
+                    _ => s.journal_id.clone(),
+                };
                 // `config`, not `s.config`: an owned session stays owned.
-                let (handle, _task) = crate::session::handle::locked_placeholder::spawn(
-                    sid,
-                    config.clone(),
-                    holder,
-                );
-                state.insert(handle);
+                let handle = state
+                    .host
+                    .adopt_for_journal(&journal, |sid| {
+                        crate::session::handle::locked_placeholder::spawn(
+                            sid,
+                            config.clone(),
+                            holder,
+                        )
+                        .0
+                    })
+                    .await;
+                if handle.id.as_str() != s.id {
+                    state
+                        .reload_aliases
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(s.id.clone(), handle.id.0.clone());
+                }
                 continue;
             }
             Err(e) if s.config.continue_session.is_some() => {
@@ -1075,6 +1137,8 @@ mod tests {
             workers: Vec::new(),
             tool_activations: carried.clone(),
             owner_token: None,
+            supersedes: Vec::new(),
+            created_at: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         let back: ReloadSession = serde_json::from_value(v.clone()).unwrap();
@@ -1086,6 +1150,44 @@ mod tests {
         older.as_object_mut().unwrap().remove("tool_activations");
         let back: ReloadSession = serde_json::from_value(older).unwrap();
         assert!(back.tool_activations.is_empty());
+    }
+
+    /// The conversation cell rides the record beside the config, never in
+    /// the config's wire form; an older image's record has neither field.
+    #[test]
+    fn reload_session_carries_the_conversation_cell() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let s = ReloadSession {
+            id: "a".into(),
+            journal_id: "b".into(),
+            config: SessionConfig::default(),
+            keep_warm: false,
+            lifecycle: SessionLifecycle::Live,
+            settings_replay: Vec::new(),
+            cache_keepwarm: None,
+            input_owner_kind: None,
+            workers: Vec::new(),
+            tool_activations: Vec::new(),
+            owner_token: None,
+            supersedes: vec!["a".into()],
+            created_at: Some(at),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["supersedes"], serde_json::json!(["a"]));
+        assert!(v["config"].get("restore_conversation").is_none());
+        let back: ReloadSession = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(
+            (back.supersedes, back.created_at),
+            (vec!["a".to_string()], Some(at))
+        );
+
+        let mut older = v;
+        older.as_object_mut().unwrap().remove("supersedes");
+        older.as_object_mut().unwrap().remove("created_at");
+        let back: ReloadSession = serde_json::from_value(older).unwrap();
+        assert!(back.supersedes.is_empty() && back.created_at.is_none());
     }
 
     /// Reload-state written by an older image (no workers, no counter)
@@ -1131,6 +1233,8 @@ mod tests {
             workers,
             tool_activations: Vec::new(),
             owner_token: None,
+            supersedes: Vec::new(),
+            created_at: None,
         };
         let mut rs = ReloadState {
             generation: 10,
@@ -1359,6 +1463,46 @@ mod tests {
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("off"));
         *ep.cache_keepwarm.lock().unwrap() = Some(CacheKeepWarm::Hours(6));
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("6h"));
+    }
+
+    /// A lock-held placeholder holds the conversation its config continues
+    /// (after `/clear`, not its actor id), and its record carries a start
+    /// and what it superseded only when it was restored with them: never
+    /// its own spawn time.
+    #[tokio::test]
+    async fn a_placeholder_record_carries_its_conversation_not_its_spawn_time() {
+        use crate::session::handle::locked_placeholder;
+        let id = crate::session::SessionId::from("A");
+        let cfg = SessionConfig {
+            continue_session: Some(Some("N".into())),
+            ..SessionConfig::default()
+        };
+        let (bare, _t) = locked_placeholder::spawn(id.clone(), cfg.clone(), "pid 1 (tui)".into());
+        assert_eq!(bare.meta_live().journal_id, "N");
+        assert!(bare.holds("N") && !bare.holds("A"));
+        let r = record(&bare, None);
+        assert_eq!((r.id.as_str(), r.journal_id.as_str()), ("A", "N"));
+        assert_eq!(r.config.continue_session, Some(Some("N".into())));
+        assert_eq!(r.created_at, None, "no start known");
+        assert!(r.supersedes.is_empty());
+
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let restored = SessionConfig {
+            restore_conversation: Some(crate::session::RestoredConversation {
+                journal_id: "N".into(),
+                supersedes: vec!["P".into()],
+                created_at: at,
+            }),
+            ..cfg
+        };
+        let (known, _t) = locked_placeholder::spawn(id, restored, "pid 1 (tui)".into());
+        assert!(known.holds("P"));
+        assert_eq!(known.meta_live().created_at, at, "listed from its start");
+        let r = record(&known, None);
+        assert_eq!(r.created_at, Some(at));
+        assert_eq!(r.supersedes, ["P"]);
     }
 
     /// Likewise the pin: an unconfirmed checkpoint must not unpin a

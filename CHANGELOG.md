@@ -10,6 +10,17 @@ All notable changes to this project will be documented in this file.
   (`20261117-015328-1f2e3d4c`). They still start with the time they were
   made and sort by it. Ids from before, with 4, stay valid everywhere.
 
+- **Daemon: a session's `created_at` is when its conversation began.** It
+  was when the session was created. It now holds across a compaction (the
+  start of the chain) and a reload, and moves with `/clear` and an in-session
+  `/resume`. `SessionMeta.journal_id`, not `id`, names the conversation: they
+  also differ after `/clear`, `/resume`, and on a session that took a fresh
+  id because another live session had its journal's id.
+- **`synaps --attach --continue` with no argument right after `/clear`**
+  continues the conversation from before the `/clear` in a second session.
+  The cleared session no longer counts as holding it, and its new
+  conversation has nothing on disk until its first turn.
+
 ### Fixed
 
 - **Releases carry the `.deb` again.** The `.deb` was uploaded after the
@@ -44,6 +55,20 @@ All notable changes to this project will be documented in this file.
   then ran on the first's journal without its lock, and in the daemon the
   first dropped out of the session list while it kept running. A new
   session whose id is taken now draws another one.
+
+- **Daemon: `/clear` and an in-session `/resume` update the session list at
+  once.** The list showed the old conversation's name, title, cost and
+  message count until the next turn.
+- **Daemon: resuming a conversation after `/clear` resumes it.** Resuming
+  `A` (by id or by its old name) attached to the session that had cleared
+  `A` and now holds a new conversation. It now starts a second session on
+  `A`, and either one can end without taking the other out of the list.
+- **Daemon: a reload that finds a cleared session's journal locked brings
+  the right conversation back.** Once the lock was free, the next attach
+  loaded the conversation from before the `/clear` instead of the one the
+  session held. The waiting session no longer replaces a session restored
+  before it under the same id (the old conversation, resumed after the
+  `/clear`), which dropped that session from the list.
 
 ## [0.12.0] — 2026-11-14
 

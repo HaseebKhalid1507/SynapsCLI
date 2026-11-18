@@ -196,7 +196,8 @@ pub const SESSION_ID_RANDOM_HEX: usize = 8;
 /// A fresh session id at `now`: `YYYYMMDD-HHMMSS-` (UTC), then
 /// [`SESSION_ID_RANDOM_HEX`] random hex characters. Ids sort by the second
 /// they were minted in. Journals take it in [`Session::new`] and
-/// [`Session::from_compaction_record`].
+/// [`Session::from_compaction_record`]; a daemon actor whose journal id is
+/// already some other live actor's id takes one too.
 pub fn mint_session_id(now: DateTime<Utc>) -> String {
     // A v4 UUID's first group is all random bits (the version and variant
     // nibbles come later).
