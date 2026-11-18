@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Releases carry the `.deb` again.** The `.deb` was uploaded after the
+  GitHub release was published, and this repository has immutable releases,
+  so 0.12.0 shipped without one (`Cannot upload assets to an immutable
+  release`). It is now built before the release is published and attached
+  with the other files, and it holds the exact x86_64 Linux binaries of the
+  release tarball instead of a separate build. If it fails, the release
+  waits instead of going out without it.
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel
