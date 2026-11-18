@@ -365,6 +365,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
             }
+            Ok(Read::Frame(ClientFrame::CatalogPage { req, .. })) => {
+                let _ = tx
+                    .send(DaemonFrame::CatalogPage { req, sessions: Vec::new(), next: None, error: Some("not served".into()) })
+                    .await;
+            }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => {
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 let _ = writer.await;
@@ -770,7 +775,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             | Ok(Read::Frame(ClientFrame::Pin { .. }))
             | Ok(Read::Frame(ClientFrame::Rename { .. }))
             | Ok(Read::Frame(ClientFrame::ReloadExtension { .. }))
-            | Ok(Read::Frame(ClientFrame::AuthState(_))) => {
+            | Ok(Read::Frame(ClientFrame::AuthState(_)))
+            | Ok(Read::Frame(ClientFrame::CatalogPage { .. })) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,

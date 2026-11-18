@@ -530,6 +530,7 @@ pub mod echo {
             cost_usd: 0.0,
             messages: 0,
             workers: Default::default(),
+            updated_at: None,
         }
     }
 
@@ -798,6 +799,7 @@ pub mod locked_placeholder {
             cost_usd: 0.0,
             messages: 0,
             workers: Default::default(),
+            updated_at: None,
         };
         let view = crate::session::view::RuntimeView {
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),
