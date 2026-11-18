@@ -5751,15 +5751,16 @@ async fn next_stream_event(stream: &mut Option<ActiveStream>) -> Option<StreamEv
 
 /// The conversation's title for listings: the saved title, else what
 /// `Session::auto_title` will make of the first user message.
+/// The listing title (`listing_title`): the same text a saved row of this
+/// conversation shows, so a row's title does not change when it turns saved.
 fn conversation_title(conv: &ConversationState) -> Option<String> {
-    if !conv.session.title.is_empty() {
-        return Some(conv.session.title.clone());
-    }
-    conv.api_messages
-        .iter()
-        .filter(|m| m["role"].as_str() == Some("user"))
-        .find_map(|m| agent_core::core::session::user_content_for_display(&m["content"]))
-        .map(|t| t.chars().take(80).collect())
+    let first_user = || conv.api_messages.iter().find_map(|m| agent_core::session_catalog::typed_user_text(m));
+    let title = if conv.session.title.trim().is_empty() {
+        agent_core::session_catalog::listing_title("", first_user().as_deref())
+    } else {
+        agent_core::session_catalog::listing_title(&conv.session.title, None)
+    };
+    Some(title).filter(|t| !t.is_empty())
 }
 
 /// Whether the 1 Hz `SubagentRows` tick keeps running: always during a turn,

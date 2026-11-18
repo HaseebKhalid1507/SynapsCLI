@@ -1052,3 +1052,40 @@ fn rename_validation_errors() {
     ));
     assert!(!fx.dir().join(format!("{missing}.lock")).exists());
 }
+
+#[test]
+fn both_chain_links_are_read_and_one_thread_loads_the_same() {
+    let fx = Fx::new();
+    let mut c = fx.session(C, "t", "m", at(2026, 10, 1, 1), chat(4));
+    c.compacted_into = Some(A.into());
+    save_session_in_dir(fx.dir(), &c, SessionPersistence::Json).unwrap();
+    let mut a = fx.session(A, "t", "m", at(2026, 10, 2, 1), chat(2));
+    a.parent_session = Some(C.into());
+    save_session_in_dir(fx.dir(), &a, SessionPersistence::Json).unwrap();
+    let cat = fx.load();
+    let (head, pred) = (cat.get(A).unwrap(), cat.get(C).unwrap());
+    assert_eq!(head.parent_session.as_deref(), Some(C));
+    assert_eq!(head.compacted_into, None);
+    assert_eq!(pred.parent_session, None);
+    assert_eq!(pred.compacted_into.as_deref(), Some(A));
+    let one = load_catalog_with(&fx.paths, 1).unwrap();
+    let ids = |c: &Catalog| {
+        let mut v: Vec<_> = c.entries.iter().map(|e| (e.id.clone(), e.parent_session.clone())).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(ids(&one), ids(&cat));
+}
+
+#[test]
+fn listing_titles_are_one_clipped_line_without_control_characters() {
+    assert_eq!(listing_title("Alpha", Some("first")), "Alpha");
+    assert_eq!(listing_title("  ", Some("fix the\n  build")), "fix the build");
+    assert_eq!(listing_title("", None), "");
+    assert_eq!(listing_title("a\u{1b}[31mred\u{7}\u{9b}x", None), "a[31mredx");
+    let long = listing_title(&"word ".repeat(100), None);
+    assert_eq!(long.chars().count(), LISTING_TITLE_CHARS);
+    assert!(long.ends_with('…'));
+    let exact = "x".repeat(LISTING_TITLE_CHARS);
+    assert_eq!(listing_title(&exact, None), exact);
+}
