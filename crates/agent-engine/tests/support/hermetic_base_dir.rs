@@ -2,16 +2,13 @@
 //! one (06 I3).
 //!
 //! Integration tests link the engine without `cfg(test)`, so several of its
-//! constructors still fall back to the ambient config: `ExtensionManager::new`,
-//! `ProcessExtension::spawn*` and its inbox, the extension tools' memory
-//! check (`MemoryBinding::configured_current()` → `load_config()`). Unpinned,
-//! a test binary reads the developer's real `~/.synaps-cli/config`, so with
-//! `memory.backend = axel` every manager ran with `exclusive_memory = true`
-//! and latched that config's identity and provider keys. CI's clean HOME
+//! code paths still fall back to the ambient config (`load_config()`).
+//! Unpinned, a test binary reads the developer's real `~/.synaps-cli/config`
+//! and latches that config's identity and provider keys. CI's clean HOME
 //! never saw it.
 //!
 //! Including this module points `SYNAPS_BASE_DIR` at one private dir for
-//! the whole process, holding an explicit legacy memory config. On Linux and
+//! the whole process, holding an empty config. On Linux and
 //! macOS that happens in a load-time initializer, before `main` and so
 //! before libtest starts any thread: the `set_var` can't race a `getenv`.
 //! Elsewhere the first [`pin`] call does it. Every test still calls [`pin`]
@@ -65,7 +62,7 @@ fn create() -> PathBuf {
     let dir = root.join(format!("{prefix}{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir); // a recycled pid's leftovers
     std::fs::create_dir_all(&dir).expect("hermetic base dir");
-    std::fs::write(dir.join("config"), "memory.backend = legacy\n").expect("hermetic config");
+    std::fs::write(dir.join("config"), "# hermetic test config\n").expect("hermetic config");
     std::env::set_var("SYNAPS_BASE_DIR", &dir);
     dir
 }

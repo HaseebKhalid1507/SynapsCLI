@@ -30,7 +30,7 @@ use std::collections::HashMap;
 /// - **Toast** — never focusable, purely passive (`draw.rs:1564`).
 /// - **Gamba** — terminal handoff, gated upstream of the event loop
 ///   (`mod.rs:570`); the stack never sees events while it runs.
-/// - **Sidecars / lightbox helpers** — render-only.
+/// - **Lightbox helpers** — render-only.
 /// - **Models expanded lightbox** — internal view state of `ModelsModalState`
 ///   (`models/mod.rs:191`); its keys are already dispatched inside
 ///   `models::handle_event`. Promoting it would change behavior for zero

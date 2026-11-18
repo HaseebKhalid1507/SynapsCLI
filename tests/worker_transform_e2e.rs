@@ -68,6 +68,7 @@ async fn after(bus: &Arc<HookBus>, output: &str) -> String {
         output.to_string(),
         30_000,
         None,
+        None,
     )
     .await
 }
@@ -136,6 +137,7 @@ async fn parallel_workers_share_one_extension_and_never_respawn_it() {
             "bash",
             None,
             json!({"command": "rm -rf /"}),
+            None,
             None,
         )
         .await;

@@ -1,4 +1,4 @@
-//! `agent-engine` — streaming runtime, tools, MCP, skills, extensions, sidecar, events.
+//! `agent-engine` — streaming runtime, tools, MCP, skills, extensions, events.
 //! Depends on `agent-core` + external crates only. Never depends on tui or bin.
 
 pub mod engine;
@@ -14,7 +14,6 @@ pub mod mcp;
 pub mod memory_backend;
 pub mod runtime;
 pub mod session;
-pub mod sidecar;
 pub mod skills;
 #[cfg(test)]
 pub(crate) mod test_env;

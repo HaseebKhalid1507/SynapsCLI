@@ -115,9 +115,6 @@ pub(crate) struct Theme {
     pub(crate) models_title: Option<Color>,
     pub(crate) sessions_border: Option<Color>,
     pub(crate) sessions_title: Option<Color>,
-    /// Resting tint of the sidecar header pill (idle + unarmed). `None` falls
-    /// back to `muted`, the color the pill uses today.
-    pub(crate) sidecar_pill: Option<Color>,
 
     // --- Namespaced extension tokens (P19.2) -------------------------------
     /// User-TOML overrides for extension theme tokens, keyed by the full
@@ -212,7 +209,6 @@ impl Default for Theme {
             models_title: None,
             sessions_border: None,
             sessions_title: None,
-            sidecar_pill: None,
 
             // No user overrides for extension tokens by default.
             ext_overrides: std::collections::HashMap::new(),
@@ -346,7 +342,6 @@ impl Theme {
             "models.title" => self.models_title = Some(c),
             "sessions.border" => self.sessions_border = Some(c),
             "sessions.title" => self.sessions_title = Some(c),
-            "sidecar.pill" => self.sidecar_pill = Some(c),
 
             // Extension token overrides (P19.2): any `ext.<id>.<token>` key
             // is stored verbatim; resolution happens in `ext_token`.
@@ -618,11 +613,6 @@ impl Theme {
             ModalKind::Models => self.models_title,
             ModalKind::Sessions => self.sessions_title,
         }
-    }
-
-    /// Resting tint of the sidecar header pill. Falls back to `muted`.
-    pub(crate) fn sidecar_pill_color(&self) -> Color {
-        self.sidecar_pill.unwrap_or(self.muted)
     }
 
     /// Resolve a namespaced extension theme token `ext.<ext_id>.<token>`
@@ -1129,7 +1119,6 @@ mod theme_tests {
         assert_eq!(t.plugins_title, None);
         assert_eq!(t.models_border, None);
         assert_eq!(t.models_title, None);
-        assert_eq!(t.sidecar_pill, None);
     }
 
     #[test]
@@ -1149,12 +1138,6 @@ mod theme_tests {
         assert_eq!(t.modal_title(ModalKind::Settings), None);
         assert_eq!(t.modal_title(ModalKind::Plugins), None);
         assert_eq!(t.modal_title(ModalKind::Models), None);
-    }
-
-    #[test]
-    fn sidecar_pill_falls_back_to_muted_when_unset() {
-        let t = Theme::default();
-        assert_eq!(t.sidecar_pill_color(), t.muted);
     }
 
     #[test]
@@ -1205,11 +1188,6 @@ mod theme_tests {
                     "{name}: {kind:?} title must be None"
                 );
             }
-            assert_eq!(
-                t.sidecar_pill_color(),
-                t.muted,
-                "{name}: pill falls back to muted"
-            );
         }
     }
 
@@ -1237,16 +1215,18 @@ mod theme_tests {
         t.set("settings.title", Color::Rgb(1, 2, 3));
         t.set("plugins.title", Color::Rgb(4, 5, 6));
         t.set("models.border", Color::Rgb(7, 8, 9));
-        t.set("sidecar.pill", Color::Rgb(10, 11, 12));
         assert_eq!(
             t.modal_title(ModalKind::Settings),
             Some(Color::Rgb(1, 2, 3))
         );
         assert_eq!(t.modal_title(ModalKind::Plugins), Some(Color::Rgb(4, 5, 6)));
         assert_eq!(t.modal_border(ModalKind::Models), Color::Rgb(7, 8, 9));
-        assert_eq!(t.sidecar_pill_color(), Color::Rgb(10, 11, 12));
-        // Unknown dotted keys are still ignored, not panics.
+        // Unknown dotted keys are still ignored, not panics — including
+        // `sidecar.pill`, the key of the removed sidecar header pill.
+        let before = t.clone();
         t.set("bogus.key", Color::Rgb(0, 0, 0));
+        t.set("sidecar.pill", Color::Rgb(10, 11, 12));
+        assert!(t == before, "unknown keys change nothing");
     }
 
     // ---- Namespaced extension tokens (P19.2) -------------------------------

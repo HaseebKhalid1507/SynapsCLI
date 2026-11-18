@@ -62,6 +62,8 @@ def main():
             append_log({
                 "kind": params.get("kind"),
                 "session_id": params.get("session_id"),
+                "has_cwd": "cwd" in params,
+                "cwd": params.get("cwd"),
                 "tool_name": params.get("tool_name"),
                 "pid": os.getpid(),
             })

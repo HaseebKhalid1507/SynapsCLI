@@ -5,16 +5,20 @@
 //! (mode 0600, O_NOFOLLOW — same hardening as the legacy usage log).
 //!
 //! `basic` records timing, usage, an estimated `cost_usd` (from
-//! [`agent_core::pricing`]), the persisted conversation id (`session_id`,
-//! the `~/.synaps-cli/sessions/<id>.json` id) and the request-trace
+//! [`agent_core::pricing`]), the thinking level of the request (`thinking`,
+//! and `effort` when the request carried one), the persisted conversation
+//! id (`session_id`, the `~/.synaps-cli/sessions/<id>.json` id) and the request-trace
 //! correlation ids (`runtime_session_id` / `turn_id` / `trace_request_id`),
 //! so a record joins both its session and its `request-trace.jsonl` line.
 //! Worker records also carry the worker's identity (`worker_agent`,
 //! `worker_handle`, `parent_session_id`, `parent_runtime_session_id`).
 //! After an automatic context rollover a record names its context window
 //! (`rollover_window`), and the window's first request says `rollover: true`.
-//! `full` additionally records rate-limit headers. The `cache_diag` verdict
-//! is present at either level when `cache_diagnostics` is on.
+//! `full` additionally records rate-limit headers: the per-minute limits of
+//! an API key, or on a subscription login the usage windows
+//! (`ratelimit.unified_utilization`: how much of the 5-hour and weekly
+//! allowance is used, as of that response). The `cache_diag` verdict is
+//! present at either level when `cache_diagnostics` is on.
 //!
 //! Optional fields are omitted when unknown — never written as `0`.
 //!
@@ -25,6 +29,7 @@
 //! failure class.
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod writer;
@@ -211,6 +216,29 @@ pub struct RateLimitRecord {
     /// RFC 3339 timestamp when the most restrictive token limit resets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_reset: Option<String>,
+    /// Subscription (OAuth) usage windows, from the
+    /// `anthropic-ratelimit-unified-*` headers, when the response carries
+    /// them (a subscription login has none of the per-minute limits above).
+    ///
+    /// `anthropic-ratelimit-unified-status`: `allowed`, `allowed_warning` or
+    /// `rejected`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unified_status: Option<String>,
+    /// Unix seconds at which the window the status speaks for resets
+    /// (`anthropic-ratelimit-unified-reset`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unified_reset: Option<u64>,
+    /// The window the status speaks for
+    /// (`anthropic-ratelimit-unified-representative-claim`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unified_claim: Option<String>,
+    /// Used share of every window the response reported
+    /// (`anthropic-ratelimit-unified-<window>-utilization`), keyed by the
+    /// provider's own window name (`5h`, `7d`, `7d_oi`, ...): `0.62` is 62%
+    /// used. The window names are not a fixed list; whatever the provider
+    /// sends is recorded.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub unified_utilization: BTreeMap<String, f64>,
 }
 
 impl RateLimitRecord {
@@ -222,6 +250,10 @@ impl RateLimitRecord {
             && self.input_tokens_remaining.is_none()
             && self.output_tokens_remaining.is_none()
             && self.tokens_reset.is_none()
+            && self.unified_status.is_none()
+            && self.unified_reset.is_none()
+            && self.unified_claim.is_none()
+            && self.unified_utilization.is_empty()
     }
 }
 
@@ -257,6 +289,16 @@ pub struct TelemetryRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msg_id: Option<String>,
     pub model: String,
+    /// The thinking level the request was made at, by its config name
+    /// (`off`, `adaptive`, `low`, `medium`, `high`, `xhigh`, `max`, ...): the
+    /// session's level, or on a worker record the worker's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// The `output_config.effort` value the request carried. Absent when it
+    /// carried none: thinking off or adaptive, or a model that takes a token
+    /// budget instead of an effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// 1-based attempt number that succeeded (1 = no retries).
     pub attempt: u32,
     /// Number of refusal retries consumed (0 = no refusals). Present only when > 0.
@@ -392,7 +434,52 @@ pub fn ratelimit_from_headers(headers: &reqwest::header::HeaderMap) -> RateLimit
         input_tokens_remaining: header_u64(headers, "anthropic-ratelimit-input-tokens-remaining"),
         output_tokens_remaining: header_u64(headers, "anthropic-ratelimit-output-tokens-remaining"),
         tokens_reset: header_string(headers, "anthropic-ratelimit-tokens-reset"),
+        unified_status: header_string(headers, "anthropic-ratelimit-unified-status"),
+        unified_reset: header_u64(headers, "anthropic-ratelimit-unified-reset"),
+        unified_claim: header_string(
+            headers,
+            "anthropic-ratelimit-unified-representative-claim",
+        ),
+        unified_utilization: unified_utilization_from_headers(headers),
     }
+}
+
+/// Most usage windows recorded from one response, and the longest window
+/// name kept: a provider that sends more, or longer, is not trusted to bound
+/// the record by itself.
+const MAX_UNIFIED_WINDOWS: usize = 16;
+const MAX_UNIFIED_WINDOW_NAME: usize = 32;
+
+/// Every `anthropic-ratelimit-unified-<window>-utilization` header, as
+/// `window -> used share`. A value that is not a finite, non-negative number
+/// is skipped: unknown is not recorded as zero.
+fn unified_utilization_from_headers(headers: &reqwest::header::HeaderMap) -> BTreeMap<String, f64> {
+    const PREFIX: &str = "anthropic-ratelimit-unified-";
+    const SUFFIX: &str = "-utilization";
+    let mut windows = BTreeMap::new();
+    for (name, value) in headers {
+        let Some(window) = name
+            .as_str()
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.strip_suffix(SUFFIX))
+        else {
+            continue;
+        };
+        if window.is_empty() || window.len() > MAX_UNIFIED_WINDOW_NAME {
+            continue;
+        }
+        let Some(used) = value.to_str().ok().and_then(|v| v.trim().parse::<f64>().ok()) else {
+            continue;
+        };
+        if !used.is_finite() || used < 0.0 {
+            continue;
+        }
+        if windows.len() >= MAX_UNIFIED_WINDOWS && !windows.contains_key(window) {
+            continue;
+        }
+        windows.insert(window.to_string(), used);
+    }
+    windows
 }
 
 /// Extract the `request-id` response header.
@@ -534,6 +621,8 @@ mod tests {
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("request_id"));
+        assert!(!json.contains("thinking"), "unknown level is not written");
+        assert!(!json.contains("effort"));
         assert!(!json.contains("ratelimit"));
         assert!(!json.contains("cache_diag"));
         assert!(!json.contains("keepwarm"), "turn records carry no keepwarm field");
@@ -628,6 +717,104 @@ mod tests {
         );
         let r = ratelimit_from_headers(&headers);
         assert_eq!(r.requests_limit, None);
+    }
+
+    fn headers_of(pairs: &[(&'static str, &str)]) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    /// The header set a subscription account sent with its weekly rejection
+    /// on 2026-11-11: every window's used share is recorded under the
+    /// provider's own name, with the status, its window and the reset.
+    #[test]
+    fn ratelimit_records_subscription_usage_windows() {
+        let headers = headers_of(&[
+            ("anthropic-ratelimit-unified-7d-reset", "1794808800"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.62"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-surpassed-threshold", "1.0"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.0"),
+            ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day_overage_included",
+            ),
+            ("anthropic-ratelimit-unified-reset", "1794808800"),
+            ("anthropic-ratelimit-unified-status", "rejected"),
+        ]);
+        let r = ratelimit_from_headers(&headers);
+        assert!(!r.is_empty());
+        assert_eq!(r.unified_status.as_deref(), Some("rejected"));
+        assert_eq!(r.unified_reset, Some(1_794_808_800));
+        assert_eq!(r.unified_claim.as_deref(), Some("seven_day_overage_included"));
+        assert_eq!(
+            r.unified_utilization,
+            BTreeMap::from([("7d".to_string(), 0.62), ("7d_oi".to_string(), 1.0)]),
+            "utilization headers only: not the threshold, not the fallback share"
+        );
+        assert_eq!(r.requests_limit, None, "no per-minute limits on a subscription");
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "unified_status": "rejected",
+                "unified_reset": 1_794_808_800u64,
+                "unified_claim": "seven_day_overage_included",
+                "unified_utilization": {"7d": 0.62, "7d_oi": 1.0}
+            })
+        );
+    }
+
+    /// A window whose value is not a usable number is left out (unknown is
+    /// not zero), a nameless or oversized window name is dropped, and a
+    /// record with nothing in it stays empty and serializes without the map.
+    #[test]
+    fn ratelimit_skips_unusable_usage_windows() {
+        let long = format!(
+            "anthropic-ratelimit-unified-{}-utilization",
+            "w".repeat(MAX_UNIFIED_WINDOW_NAME + 1)
+        );
+        let mut headers = headers_of(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.25"),
+            ("anthropic-ratelimit-unified-7d-utilization", "n/a"),
+            ("anthropic-ratelimit-unified-1d-utilization", "NaN"),
+            ("anthropic-ratelimit-unified-30d-utilization", "-0.1"),
+            ("anthropic-ratelimit-unified--utilization", "0.5"),
+        ]);
+        headers.insert(
+            reqwest::header::HeaderName::from_bytes(long.as_bytes()).unwrap(),
+            "0.5".parse().unwrap(),
+        );
+        let r = ratelimit_from_headers(&headers);
+        assert_eq!(
+            r.unified_utilization,
+            BTreeMap::from([("5h".to_string(), 0.25)])
+        );
+
+        let none = ratelimit_from_headers(&reqwest::header::HeaderMap::new());
+        assert!(none.is_empty());
+        assert_eq!(serde_json::to_value(&none).unwrap(), serde_json::json!({}));
+
+        // More windows than the bound: the record stops growing.
+        let mut many = reqwest::header::HeaderMap::new();
+        for i in 0..(MAX_UNIFIED_WINDOWS + 5) {
+            many.insert(
+                reqwest::header::HeaderName::from_bytes(
+                    format!("anthropic-ratelimit-unified-w{i}-utilization").as_bytes(),
+                )
+                .unwrap(),
+                "0.1".parse().unwrap(),
+            );
+        }
+        assert_eq!(
+            ratelimit_from_headers(&many).unified_utilization.len(),
+            MAX_UNIFIED_WINDOWS
+        );
     }
 }
 

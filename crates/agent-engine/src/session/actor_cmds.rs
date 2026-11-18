@@ -143,10 +143,6 @@ impl SessionActor {
                 self.note_in_main_conversation(super::actor::subagent_user_cancel_event(id, agent));
             }
         }
-        if cmd == "memory" {
-            self.note_memory_choice(&arg);
-            self.observe_memory();
-        }
         if view_changed {
             self.publish_view().await;
             // Clients mirror the view from `SettingChanged` (and `Attached`)
@@ -169,84 +165,6 @@ impl SessionActor {
             self.compact(custom_instructions, "manual").await;
         }
         self.emit(SessionEventWire::QueryResult { id, value });
-    }
-
-    /// The memory choice a rebuilt runtime must honour: the recorded one,
-    /// or `Off` once memory is effectively off while a recorded on-mode or
-    /// the operator's durable default would grant it again. Consent can be
-    /// revoked without `/memory` — the model's `memory_context` tool
-    /// (`action: "disable"`), a lease expiry, a host-side revoke — and
-    /// recording `Off` is always the safe direction. On-modes are recorded
-    /// only from `/memory` ([`Self::note_memory_choice`]): the tool cannot
-    /// enable (that needs the command's ExplicitCommand proof), so no other
-    /// path may make one sticky.
-    ///
-    /// Off counts as a revocation only once memory was seen active in this
-    /// runtime (`memory_seen_active`): a grant that never took effect — an
-    /// extension-backed provider not registered yet after a reload or
-    /// unpark — leaves the choice alone, so the next rebuild retries it.
-    pub(crate) fn effective_memory_mode(&self) -> Option<super::SessionMemoryMode> {
-        use crate::runtime::memory_context::DurableStatus;
-        let recorded = self.config.memory_mode;
-        if !self.runtime.is_live() {
-            return recorded;
-        }
-        let off = matches!(self.runtime.memory_context_status().durable, DurableStatus::Off);
-        let would_grant = match recorded {
-            Some(mode) => mode.lease_mode().is_some(),
-            None => self.memory_default_is_durable(),
-        };
-        if off && would_grant && self.memory_seen_active {
-            Some(super::SessionMemoryMode::Off)
-        } else {
-            recorded
-        }
-    }
-
-    /// The operator's confirmed `memory.default_mode` grants a durable
-    /// session lease (`recall_once` is a one-shot, not a mode).
-    fn memory_default_is_durable(&self) -> bool {
-        let memory = &self.host.config().memory;
-        memory.default_mode_confirmed
-            && matches!(
-                memory.default_mode.as_str(),
-                "recall_each_prompt" | "capture_only" | "capture_and_recall"
-            )
-    }
-
-    /// Latch `memory_seen_active` if this runtime's memory is active now.
-    /// Called where a grant can take effect: the runtime's build, `/memory`,
-    /// each turn's start and end.
-    pub(crate) fn observe_memory(&mut self) {
-        use crate::runtime::memory_context::DurableStatus;
-        if self.runtime.is_live()
-            && matches!(
-                self.runtime.memory_context_status().durable,
-                DurableStatus::Active { .. }
-            )
-        {
-            self.memory_seen_active = true;
-        }
-    }
-
-    /// Record [`Self::effective_memory_mode`] (config + the handle's slot).
-    /// A revocation recorded here (not by `/memory`) is told to the user.
-    pub(crate) fn sync_memory_choice(&mut self) {
-        self.observe_memory();
-        let mode = self.effective_memory_mode();
-        if mode != self.config.memory_mode {
-            self.config.memory_mode = mode;
-            *self
-                .memory_mode_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
-            if mode == Some(super::SessionMemoryMode::Off) {
-                self.emit(SessionEventWire::SystemNotice(
-                    "memory stays off for this session: its consent was revoked, and a park or daemon reload keeps it off (/memory on turns it back on)"
-                        .into(),
-                ));
-            }
-        }
     }
 
     /// `/close [force]`: end this session in the daemon. It is saved and
@@ -348,7 +266,7 @@ impl SessionActor {
                 self.note_in_main_conversation(super::actor::subagent_close_cancel_event(handle_id, agent));
             }
         }
-        let session = (**self.journal_id.load()).clone();
+        let session = self.journal_id_now();
         // No history, no journal: there is nothing to continue (a parked
         // session always has one).
         let text = if self.conv.is_live() && self.conv.api_messages.is_empty() {
@@ -374,29 +292,6 @@ impl SessionActor {
             .collect();
         workers.sort();
         workers
-    }
-
-    /// `/memory on|recall|capture|off` that took effect becomes the
-    /// session's own choice (`SessionConfig::memory_mode`): a rebuilt
-    /// runtime restores it rather than the operator default. A failed grant
-    /// leaves the previous choice in place.
-    fn note_memory_choice(&mut self, arg: &str) {
-        use crate::runtime::memory_context::DurableStatus;
-        let Some(choice) = super::SessionMemoryMode::from_command_arg(arg) else {
-            return;
-        };
-        let took = match (self.runtime.memory_context_status().durable, choice.lease_mode()) {
-            (DurableStatus::Off, None) => true,
-            (DurableStatus::Active { mode, .. }, Some(want)) => mode == want,
-            _ => false,
-        };
-        if took {
-            self.config.memory_mode = Some(choice);
-            *self
-                .memory_mode_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(choice);
-        }
     }
 
     /// `/saveas <name>` | `/saveas` (clear). Force-saves even with no
@@ -471,6 +366,11 @@ impl SessionActor {
                 &cmd,
                 &arg,
                 self.runtime.tools_shared(),
+                // The command is this chat's: an extension tool it runs is
+                // told the chat and its folder and given its memory
+                // binding, as in a turn; a shell command gets the
+                // session's environment.
+                self.runtime.command_chat(),
             )
             .await
             {
@@ -595,7 +495,11 @@ impl SessionActor {
         }
         self.consecutive_auto_turns = 0;
         self.runtime.begin_conversation(Some(new_id.clone()));
-        self.set_journal_id(new_id.clone());
+        self.set_journal_id(new_id.clone(), super::handle::JournalMove::Resume);
+        // The listing follows the conversation now held: its name, title,
+        // cost and messages (as `/clear` does).
+        self.sync_name();
+        self.publish_presence();
         self.publish_view().await;
         self.emit(SessionEventWire::Resumed {
             id,
@@ -886,7 +790,7 @@ impl SessionActor {
     async fn rename_parked(&mut self, want: Option<String>, expect: Option<Option<String>>) -> serde_json::Value {
         use agent_core::session_catalog::RenameError;
         let dir = agent_core::session_lock::sessions_dir();
-        let id = (**self.journal_id.load()).clone();
+        let id = self.journal_id_now();
         let name = want.clone();
         let res = tokio::task::spawn_blocking(move || {
             let expect = expect.as_ref().map(|e| e.as_deref());

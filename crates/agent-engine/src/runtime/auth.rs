@@ -115,14 +115,21 @@ impl AuthMethods {
     }
 }
 
-/// True if `model` routes to the Anthropic path (not OpenAI/codex/local). Used
-/// to skip the Anthropic pre-stream refresh for non-Anthropic models — they
-/// resolve their own provider auth (incl. via the broker), so fetching an
-/// Anthropic token first is wasteful and would FAIL on a codex-only Remote
-/// broker. (#158 C4/#7)
+/// True if `model` routes to the Anthropic path (not OpenAI/codex/local, and
+/// not a model an extension provides). Used to skip the Anthropic pre-stream
+/// refresh for non-Anthropic models — they resolve their own provider auth
+/// (incl. via the broker), so fetching an Anthropic token first is wasteful
+/// and would FAIL on a codex-only Remote broker (#158 C4/#7) — and to keep
+/// cache keep-warm requests off every other transport.
+///
+/// `plugin:provider:model` is asked about first, as routing does
+/// (`openai::try_route_with_memory_backend`): it has no `/`, and
+/// `resolve_route` sends every id without one to Anthropic.
 pub(super) fn model_is_anthropic(model: &str) -> bool {
-    crate::runtime::openai::resolve_route(model)
-        .is_some_and(|route| route.wire == crate::runtime::openai::WireProtocol::AnthropicMessages)
+    crate::extensions::providers::ProviderRegistry::parse_model_id(model).is_none()
+        && crate::runtime::openai::resolve_route(model).is_some_and(|route| {
+            route.wire == crate::runtime::openai::WireProtocol::AnthropicMessages
+        })
 }
 
 /// The model key handed to the broker's capacity selector for an Anthropic
@@ -350,16 +357,21 @@ impl AuthMethods {
     ) -> Result<()> {
         let selector = broker.account_selector(OAuthProviderId::Anthropic);
         if point == RefreshPoint::KeepWarm {
-            return Self::refresh_for_keepwarm(auth, source, broker, &selector).await;
+            return Self::refresh_for_keepwarm(auth, source, broker, &selector, model).await;
         }
         // Auto mid-turn: a seat this turn pinned that is now cooling down
-        // (another session met its limit) is not kept; the request would
-        // meet the same limit. Memory only, outside the auth lock.
+        // for this turn's model (another session met its limit) is not
+        // kept; the request would meet the same limit. Another model's
+        // cooldown does not move the turn. Memory only, outside the auth
+        // lock.
         let cooling = match (&selector, point) {
             (AccountSelector::Auto, RefreshPoint::WithinTurn) => {
                 let bound = auth.read().await.bound_credential.clone();
-                turn_pinned_credential(source, bound.as_deref())
-                    .is_some_and(|cred| broker.active_cooldown(&cred).is_some())
+                turn_pinned_credential(source, bound.as_deref()).is_some_and(|cred| {
+                    broker
+                        .active_cooldown_for(&cred, model.map(quota_model_key))
+                        .is_some()
+                })
             }
             _ => false,
         };
@@ -471,18 +483,20 @@ impl AuthMethods {
     /// names, or a failed re-vend stops the ping with an error, never
     /// another account.
     ///
-    /// A cooldown on the account stops the ping only under `auto`, where the
-    /// next request leaves a cooling account and the cache is lost anyway.
-    /// An explicit selector keeps the session on its account, cooling or
-    /// not, and the account cools as a whole while a provider limit can be
-    /// one model's (one model's weekly window running out leaves the others
-    /// served): the ping goes, and a limit that does cover the model meets
-    /// its 429, which ends keep-warm like any refusal and bills no tokens.
+    /// `model` is the ping's: a cooldown that covers another model alone
+    /// never stops it. A cooldown that does apply (account-wide, fail-closed
+    /// or stale, or this model's own) stops the ping only under `auto`,
+    /// where the next request leaves a cooling account and the cache is lost
+    /// anyway. An explicit selector keeps the session on its account,
+    /// cooling or not: the ping goes, and a limit that does cover the model
+    /// meets its 429, which ends keep-warm like any refusal and bills no
+    /// tokens.
     async fn refresh_for_keepwarm(
         auth: Arc<RwLock<AuthState>>,
         source: &CredentialSource,
         broker: &dyn CredentialBroker,
         selector: &AccountSelector,
+        model: Option<&str>,
     ) -> Result<()> {
         let (bound, fresh, recorded_mtime) = {
             let g = auth.read().await;
@@ -511,7 +525,7 @@ impl AuthMethods {
                     .into(),
             ));
         };
-        if let Some(until_ms) = broker.active_cooldown(&cred) {
+        if let Some(until_ms) = broker.active_cooldown_for(&cred, model.map(quota_model_key)) {
             if !matches!(selector, AccountSelector::Auto) {
                 tracing::info!(
                     credential = %cred,
@@ -607,11 +621,14 @@ impl AuthMethods {
         let mut cooling_pin = None;
         if point == RefreshPoint::WithinTurn {
             if let Some(cred) = turn_pinned_credential(source, bound) {
-                // A pinned seat that is cooling down is not re-vended: the
-                // selection below never picks it while the cooldown lasts.
-                // If no account can serve (every one cooling), the turn
-                // keeps it (below) rather than dying after its tools ran.
-                if let Some(until_ms) = broker.active_cooldown(&cred) {
+                // A pinned seat that is cooling down for this model is not
+                // re-vended: the selection below never picks it while the
+                // cooldown lasts. If no account can serve (every one
+                // cooling), the turn keeps it (below) rather than dying
+                // after its tools ran.
+                if let Some(until_ms) =
+                    broker.active_cooldown_for(&cred, model.map(quota_model_key))
+                {
                     tracing::info!(
                         credential = %cred,
                         until_ms,
@@ -788,6 +805,10 @@ fn account_failure_part(a: &crate::auth::AccountFailure, now_ms: u64) -> String 
         extra.push(format!("retry after {secs}s"));
     }
     let cooling = a.cooling_down && a.kind != crate::auth::AccountFailureKind::CoolingDown;
+    // A cooldown of one model: the account still serves the others.
+    if let Some(model) = a.cooldown_model.as_deref().filter(|_| a.cooling_down) {
+        extra.push(format!("{model} only"));
+    }
     match a.until_ms.filter(|t| *t > now_ms) {
         Some(until) => extra.push(format!(
             "{}until {}",
@@ -1111,6 +1132,70 @@ fn auth_file_changed(recorded: Option<std::time::SystemTime>) -> bool {
 mod tests {
     use super::*;
     use crate::auth::TokenCache;
+
+    /// What routing sends to the Anthropic transport is Anthropic's, and
+    /// nothing else: a model an extension provides has no `/` either, and
+    /// routing hands it to the extension before it looks for a route.
+    #[test]
+    fn an_extension_provided_model_is_not_anthropic() {
+        for anthropic in ["claude-opus-4-7", "claude-sonnet-4-6", "anthropic/claude-opus-4-7"] {
+            assert!(model_is_anthropic(anthropic), "{anthropic}");
+        }
+        for other in [
+            "plug:prov:model-x",
+            "my-plugin:local:claude-opus-4-7",
+            "groq/llama-3.3-70b-versatile",
+        ] {
+            assert!(!model_is_anthropic(other), "{other}");
+        }
+    }
+
+    /// A turn asks for an Anthropic token only for a model the Anthropic
+    /// transport serves. A chat on a model an extension provides asks the
+    /// broker for nothing, at turn start and for a keep-warm ping; it used
+    /// to count as Anthropic's, so its turn failed when no Anthropic
+    /// credential could be had, though the extension needs none.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_turn_on_an_extension_model_asks_for_no_anthropic_token() {
+        use axum::{http::StatusCode, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _config = crate::test_env::BaseDirGuard::new();
+        // A broker with no Anthropic seat to vend: it counts and refuses.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let app = Router::new().fallback(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { (StatusCode::FORBIDDEN, "no Anthropic account") }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut rt = crate::Runtime::new_headless();
+        rt.credential_source = CredentialSource::Remote {
+            endpoint: format!("http://{addr}"),
+            machine_token: "m".into(),
+        };
+        rt.set_model("claude-sonnet-4-6".to_string());
+        assert!(rt.refresh_if_needed().await.is_err(), "a Claude model needs the token");
+        let for_claude = asked.load(Ordering::SeqCst);
+        assert!(for_claude > 0, "the broker was asked");
+
+        rt.set_model("plug:prov:model-x".to_string());
+        assert_eq!(rt.model(), "plug:prov:model-x");
+        rt.refresh_if_needed()
+            .await
+            .expect("an extension's model needs no Anthropic token");
+        rt.refresh_for_keepwarm().await.expect("nor does a ping it never gets");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            for_claude,
+            "the broker was asked for an Anthropic token for an extension's model"
+        );
+    }
 
     /// Tiny in-test broker that always returns `token_json` at GET /token.
     async fn spawn_broker(token_json: &'static str) -> String {
@@ -1720,6 +1805,8 @@ mod tests {
         auto_error: Mutex<Option<BrokerError>>,
         /// Storage keys of seats that are cooling down.
         cooling: Vec<String>,
+        /// (storage key, model) of seats cooling down for one model.
+        model_cooling: Vec<(String, String)>,
     }
 
     impl ScriptedBroker {
@@ -1732,6 +1819,7 @@ mod tests {
                 auto_pick: "auto-pick",
                 auto_error: Mutex::new(None),
                 cooling: Vec::new(),
+                model_cooling: Vec::new(),
             }
         }
         fn explicit(&self) -> Vec<String> {
@@ -1757,6 +1845,13 @@ mod tests {
             self.cooling
                 .contains(&cred.storage_key())
                 .then_some(FRESH)
+        }
+        fn active_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>) -> Option<u64> {
+            let key = cred.storage_key();
+            let for_model = model.is_some_and(|m| {
+                self.model_cooling.iter().any(|(k, cm)| *k == key && cm == m)
+            });
+            self.active_cooldown(cred).or(for_model.then_some(FRESH))
         }
         async fn access_token_for(
             &self,
@@ -2061,6 +2156,43 @@ mod tests {
             assert_eq!(broker.auto(), vec![Some("claude-opus-4-7".to_string())]);
         }
 
+        // The pinned seat cools for another model only: kept, no broker
+        // call. For this turn's own model: left, as above.
+        let fable = || {
+            let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+            broker.model_cooling = vec![("anthropic@work".into(), "claude-fable-5".into())];
+            broker
+        };
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let broker = fable();
+        AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some("anthropic/claude-opus-4-7"),
+            RefreshPoint::WithinTurn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth.read().await.auth_token, "sk-HELD", "kept for opus");
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+        for expires in [FRESH, STALE] {
+            let auth = bound_state(&source, &work_cred(), expires);
+            let broker = fable();
+            AuthMethods::refresh_with_broker(
+                Arc::clone(&auth),
+                &source,
+                &broker,
+                Some("anthropic/claude-fable-5"),
+                RefreshPoint::WithinTurn,
+            )
+            .await
+            .unwrap();
+            assert_eq!(auth.read().await.auth_token, "tok-auto-auto-pick", "left for fable");
+            assert!(broker.explicit().is_empty(), "not re-vended for fable");
+            assert_eq!(broker.auto(), vec![Some("claude-fable-5".to_string())]);
+        }
+
         let auth = bound_state(&source, &work_cred(), FRESH);
         let mut broker = ScriptedBroker::new(AccountSelector::Auto);
         broker.cooling = vec!["anthropic@other".into()];
@@ -2199,6 +2331,7 @@ mod tests {
             retry_after_s: None,
             until_ms: None,
             cooling_down: false,
+            cooldown_model: None,
         }
     }
 
@@ -2492,6 +2625,23 @@ mod tests {
         );
         assert!(!text.contains("synaps login"), "{text}");
         assert!(turn_warn(&log).contains("kind=all_cooling_down"));
+
+        // A cooldown of one model names it.
+        let mut c7 = account("claude7", AK::CoolingDown);
+        c7.cooling_down = true;
+        c7.cooldown_model = Some("claude-fable-5".into());
+        c7.until_ms = Some(soon);
+        let failure = SelectionFailure {
+            kind: SK::AllCoolingDown,
+            accounts: vec![c7],
+            earliest_reset_ms: Some(soon),
+            usage_read_retry_ms: None,
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        assert!(
+            text.contains(&format!("claude7: cooling_down (claude-fable-5 only, until {soon_text})")),
+            "{text}"
+        );
     }
 
     /// Review fix 1: the seat this turn pinned is cooling down and no
@@ -2576,14 +2726,39 @@ mod tests {
         assert!(err.to_string().contains("account cooling"), "{err}");
         assert!(broker.auto().is_empty() && broker.explicit().is_empty());
         assert_eq!(auth.read().await.auth_token, "sk-HELD");
+
+        // Cooling for fable only: an opus ping goes, a fable ping stops.
+        let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+        broker.model_cooling = vec![("anthropic@work".into(), "claude-fable-5".into())];
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some("claude-opus-4-7"),
+            RefreshPoint::KeepWarm,
+        )
+        .await
+        .expect("another model's cooldown does not stop the ping");
+        let err = AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some("anthropic/claude-fable-5"),
+            RefreshPoint::KeepWarm,
+        )
+        .await
+        .expect_err("the ping's own model is cooling");
+        assert!(err.to_string().contains("account cooling"), "{err}");
+        assert!(broker.auto().is_empty() && broker.explicit().is_empty());
     }
 
     /// Under an explicit selector a cooling account does not stop a
     /// keep-warm refresh: the session stays on that account, and the
-    /// cooldown may come from another model's limit (2026-11-11: fable's
-    /// weekly window ran out and every opus/sonnet ping was refused for five
-    /// hours while their requests were served). Fresh: served from memory.
-    /// Stale: re-vended by credential, never selected.
+    /// cooldown is account-wide (fail-closed or stale) or this model's own;
+    /// a limit that still holds meets the ping as a 429, which bills
+    /// nothing. Fresh: served from memory. Stale: re-vended by credential,
+    /// never selected.
     #[tokio::test]
     async fn keepwarm_refresh_under_an_explicit_selector_pings_a_cooling_account() {
         let source = remote("principal-A");

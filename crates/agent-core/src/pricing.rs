@@ -11,6 +11,7 @@
 //!
 //! | Model                         | Input  | Output | Cache read |
 //! |-------------------------------|--------|--------|------------|
+//! | Fable 5.2 / Mythos 5.2        | $8.00  | $40.00 | 0.025×     |
 //! | Fable 5.1 / Mythos 5.1        | $10.00 | $50.00 | 0.025×     |
 //! | Fable 5 / Mythos 5            | $10.00 | $50.00 | 0.10×      |
 //! | Opus 5.5                      | $4.00  | $20.00 | 0.05×      |
@@ -105,10 +106,25 @@ fn is_sonnet_5(m: &str) -> bool {
 /// Falls back to Sonnet pricing for unknown models.
 #[inline]
 fn model_prices(model: &str, prompt_tokens: u64) -> (f64, f64) {
-    match model {
+    listed_prices(model, prompt_tokens).unwrap_or((3.0, 15.0)) // default: Sonnet pricing
+}
+
+/// Whether this table has a price for `model`, i.e. its cost is not the
+/// Sonnet fallback guess. Callers that must not guess (a worker's reported
+/// cost) omit the cost when this is false.
+pub fn has_list_price(model: &str) -> bool {
+    listed_prices(model, 0).is_some()
+}
+
+/// [`model_prices`] without the fallback: `None` for a model not in the table.
+fn listed_prices(model: &str, prompt_tokens: u64) -> Option<(f64, f64)> {
+    Some(match model {
         // InferX publishes DeepSeek V4 Flash at $0/M input and output.
         // Keep this exact ID before generic DeepSeek entries are ever added.
         "inferx/deepseek-v4-flash" | "deepseek-v4-flash" => (0.0, 0.0),
+        // Fable 5.2 / Mythos 5.2: $8 / $40 in the model overview (verified
+        // 2026-11-12: <https://platform.claude.com/docs/en/models/fable-5-2/overview>).
+        m if is_version(m, "fable-5-2") || is_version(m, "mythos-5-2") => (8.0, 40.0),
         m if m.contains("fable") || m.contains("mythos") => (10.0, 50.0),
         m if is_version(m, "opus-5-5") => (4.0, 20.0),
         m if is_legacy_opus(m) => (15.0, 75.0),
@@ -132,19 +148,25 @@ fn model_prices(model: &str, prompt_tokens: u64) -> (f64, f64) {
         }
         m if is_version(m, "3-haiku") || is_version(m, "haiku-3") => (0.25, 1.25),
         m if m.contains("haiku") => (1.0, 5.0),
-        _ => (3.0, 15.0), // default: Sonnet pricing
-    }
+        _ => return None,
+    })
 }
 
 /// Cache-read price as a multiple of the input price
 /// (<https://platform.claude.com/docs/en/about-claude/pricing>, "Prompt
 /// caching"). The docs list 0.025×
-/// for Fable 5.1 / Mythos 5.1 and 0.05× for Opus 5.5 / Sonnet 5.5; every
+/// for Fable 5.1 / 5.2 and Mythos 5.1 / 5.2 and 0.05× for Opus 5.5 / Sonnet 5.5; every
 /// other model uses the standard 0.1× (also the conservative default for
 /// models this table does not know).
 pub fn cache_read_multiplier(model: &str) -> f64 {
     match model {
-        m if is_version(m, "fable-5-1") || is_version(m, "mythos-5-1") => 0.025,
+        m if is_version(m, "fable-5-1")
+            || is_version(m, "mythos-5-1")
+            || is_version(m, "fable-5-2")
+            || is_version(m, "mythos-5-2") =>
+        {
+            0.025
+        }
         m if is_version(m, "opus-5-5") || is_version(m, "sonnet-5-5") => 0.05,
         _ => 0.1,
     }
@@ -362,6 +384,8 @@ mod tests {
             ("sonnet-5.5", "sonnet-5-5"),
             ("haiku-5.5", "haiku-5-5"),
             ("fable-5.1", "fable-5-1"),
+            ("fable-5.2", "fable-5-2"),
+            ("mythos-5.2", "mythos-5-2"),
             ("mythos-5.1", "mythos-5-1"),
             ("haiku-3.5", "haiku-3-5"),
         ] {
@@ -472,6 +496,23 @@ mod tests {
         assert!((cost_unknown - cost_sonnet).abs() < 1e-9);
     }
 
+    /// The fallback above is a guess; `has_list_price` tells it apart.
+    #[test]
+    fn has_list_price_is_false_only_for_the_fallback() {
+        for m in [
+            "claude-sonnet-4-6",
+            "anthropic/claude-opus-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5",
+            "inferx/deepseek-v4-flash",
+        ] {
+            assert!(has_list_price(m), "{m}");
+        }
+        for m in ["gpt-99-turbo", "openai/gpt-5", "z-ai/glm-5.2", ""] {
+            assert!(!has_list_price(m), "{m}");
+        }
+    }
+
     #[test]
     fn zero_usage_is_zero_cost() {
         assert_eq!(calculate_cost("claude-opus-4-5", 0, 0, 0, 0), 0.0);
@@ -513,11 +554,15 @@ mod tests {
 
     #[test]
     fn documented_cache_read_multipliers() {
-        // Fable 5.1: $10 × 0.025 = $0.25/MTok; Opus 5.5: $4 × 0.05 = $0.20;
+        // Fable 5.1: $10 × 0.025 = $0.25/MTok; Fable 5.2: $8 × 0.025 = $0.20
+        // (the documented cache-read price); Opus 5.5: $4 × 0.05 = $0.20;
         // Sonnet 5.5: $2 × 0.05 = $0.10; Opus 4.7: $5 × 0.1 = $0.50.
         for (m, want) in [
             ("claude-fable-5-1", 0.25),
             ("claude-mythos-5-1", 0.25),
+            ("claude-fable-5-2", 0.20),
+            ("claude-mythos-5-2", 0.20),
+            ("claude-fable-5-2-20261109", 0.20),
             ("claude-opus-5-5", 0.20),
             ("claude-sonnet-5-5", 0.10),
             ("claude-opus-4-7", 0.50),
