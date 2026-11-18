@@ -24,7 +24,17 @@ All notable changes to this project will be documented in this file.
   saved extension context. Clients see saved blocks and markers in history
   (display tails show them as extra user-role items; the TUI renders them
   dimmed under the user message with their source). Daemon protocol is
-  unchanged. Migration: `docs/extensions/protocol.md` §`inject`.
+  unchanged. A message is hooked once, ever: the host records it (and how
+  many trailing blocks it added, `_synaps_hooked`, beside the message, never
+  sent to a provider), so a resend or resumed turn never re-runs the hook
+  and forget content is not shown again. Titles, previews, display and
+  compaction go by that count, never by the text, so a user's own text that
+  looks like a fence stays theirs. Framing look-alike lines in extension
+  content are escaped with a leading `\`. In journal mode the hook's edit of
+  a prompt the frontend already saved is one append-only amend record
+  (O(message)) instead of a full snapshot; builds without amends keep their
+  copy of that message (they lose the saved context, not the history).
+  Migration: `docs/extensions/protocol.md` §`inject`.
 
 ## [0.12.0] — 2026-11-14
 
