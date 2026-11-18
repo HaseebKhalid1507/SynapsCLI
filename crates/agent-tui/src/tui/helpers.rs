@@ -203,6 +203,27 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
     apply_display_tail(&tail, app);
 }
 
+/// The dimmed transcript line for a saved extension block or marker (a
+/// `DisplayItem::User` holding the block's text, see
+/// `session::display`): source, first line, and how many lines follow.
+fn extension_context_line(text: &str) -> Option<String> {
+    use agent_core::core::extension_context::{parse_saved, SavedBlock};
+    Some(match parse_saved(text)? {
+        SavedBlock::Context { source, body } => {
+            let mut lines = body.lines().filter(|l| !l.trim().is_empty());
+            let first = lines.next().unwrap_or_default().trim();
+            let first: String = first.chars().take(120).collect();
+            match lines.count() {
+                0 => format!("↳ {source} context: {first}"),
+                more => format!("↳ {source} context: {first} (+{more} lines)"),
+            }
+        }
+        SavedBlock::Marker { source } => {
+            format!("↳ {source} context was shown here for one turn and not kept")
+        }
+    })
+}
+
 /// Replace the transcript with a daemon-projected tail. `omitted > 0`
 /// prepends the identical sentinel `cap_resumed_display` produced at
 /// 741b6b60 (same text, same position).
@@ -236,7 +257,12 @@ pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app:
                 // was shown live, not something the user typed.
                 None => match tool_in_flight_note_label(text) {
                     Some(note) => ChatMessage::System(note.to_string()),
-                    None => ChatMessage::User(text.clone()),
+                    // Extension context saved on the user message (#414):
+                    // a dimmed line under it, never the user's words.
+                    None => match extension_context_line(text) {
+                        Some(line) => ChatMessage::System(line),
+                        None => ChatMessage::User(text.clone()),
+                    },
                 },
             },
             DisplayItem::Thinking { text } => ChatMessage::Thinking(text.clone()),
@@ -516,6 +542,36 @@ mod tests {
 
     fn j(v: serde_json::Value) -> synaps_cli::SharedMessage {
         std::sync::Arc::new(v)
+    }
+
+    /// #414: extension context saved on a user message shows as dimmed
+    /// system lines under it (source, first line, +N lines), never as text
+    /// the user typed; the user's own words stay one user line.
+    #[test]
+    fn saved_extension_context_renders_dimmed_under_the_user_message() {
+        use agent_core::core::extension_context::{marker_text, saved_block_text};
+        use serde_json::json;
+        let mut app = test_app();
+        let history = vec![
+            j(json!({"role": "user", "content": [
+                {"type": "text", "text": "go"},
+                {"type": "text", "text": saved_block_text("axel", "first line\nsecond\n\nthird")},
+                {"type": "text", "text": saved_block_text("clock", "22:15")},
+                {"type": "text", "text": marker_text("agent-comms")},
+            ]})),
+            j(json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})),
+        ];
+        rebuild_display_messages(&history, &mut app);
+        assert_eq!(
+            transcript_repr(&app),
+            vec![
+                "U|go".to_string(),
+                "S|↳ axel context: first line (+2 lines)".to_string(),
+                "S|↳ clock context: 22:15".to_string(),
+                "S|↳ agent-comms context was shown here for one turn and not kept".to_string(),
+                "T|ok".to_string(),
+            ]
+        );
     }
 
     fn golden_fixtures() -> Vec<(&'static str, Vec<synaps_cli::SharedMessage>)> {
