@@ -660,6 +660,12 @@ C: {"type":"catalog_page","req":8,"limit":50,"before":{"updated_at":"2026-11-12T
   queue behind a running load share the next one. A continuation page may reuse a load at most
   30 s old, so paging through is one disk scan. Saved sessions changed by another process are seen
   by the next first page.
+- **Cost** (`examples/catalog_page_bench.rs`, one thread, load + fold + a page of 50): the gate is a
+  warm first page under 250 ms at 1,500 sessions; cold is recorded, not gated. On bella: 19 ms
+  warm and a 256 ms median cold (page cache dropped) at 1,500; 14–18 ms warm and 243 ms cold on
+  1,161 real sessions. A cold load delays only the first paint of the saved list, about once per
+  boot; it runs off the control loop. Revisit when the warm first page nears 100 ms (about 8,000
+  sessions): an in-memory header cache in `SavedLoader`, keyed by file name, mtime and length.
 - **Never blocks the connection**: each page runs as its own task; `sessions`, `ping`, `reload` and
   the rest are answered meanwhile, and a pipelining client matches the reply by type and `req`.
   At most 4 pages are in flight per connection; a fifth is answered at once with
