@@ -20,6 +20,26 @@ All notable changes to this project will be documented in this file.
   back from its archive has no `usage`. Tool names, parameters and
   descriptions are unchanged.
 
+- **The api-log can record how much of a subscription's usage windows is
+  used** (`telemetry = full`). On a subscription login the provider
+  reports usage windows in `anthropic-ratelimit-unified-*` response
+  headers. Only the per-minute limits of an API key were kept, so a
+  subscription's records had no `ratelimit` at all. When a response
+  carries those headers, its record now has `ratelimit.unified_utilization`
+  (the used share of each window under the provider's own name, e.g.
+  `{"5h": 0.31, "7d": 0.62}`), `unified_status`, `unified_claim` and
+  `unified_reset`. With that the log shows how fast a run is using up the
+  weekly allowance, before the provider starts refusing requests. Nothing
+  is recorded when the headers are absent.
+- **The api-log records the thinking level of each request**
+  (`telemetry = basic` and up): `thinking` is the level the request was
+  made at by its config name (`medium`, `xhigh`, ...; a worker's own level
+  on a worker record), and `effort` is the `output_config.effort` value the
+  request carried, read from the body that was sent. `effort` is absent
+  when the request carried none (thinking off or adaptive, or a model that
+  takes a token budget). Until now the level was in no log, so what a
+  level costs could only be worked out from worker archives.
+
 ### Changed
 
 - **New session ids end in 8 random hex characters, not 4**
