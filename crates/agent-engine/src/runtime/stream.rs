@@ -1277,21 +1277,25 @@ impl StreamMethods {
             // turn's forget set rides their requests instead. Of several
             // steers drained at once only the last (the newest message) is
             // hooked.
-            // A message is marked hooked once a handler could see it, also
-            // when none answered with content; with no handler it is left
-            // as it was (nothing to save, no edit to persist).
-            if std::mem::take(&mut hook_pending)
-                && hook_bus
-                    .has_handlers(crate::extensions::hooks::events::HookKind::BeforeMessage)
-                    .await
-            {
+            // Every new user message is marked hooked, count 0 when nothing
+            // was injected or no handler is registered: a resend after a
+            // daemon reload (which may load an extension) never hooks a
+            // message already sent.
+            if std::mem::take(&mut hook_pending) {
                 if let Some(text) =
                     messages.last().and_then(|m| super::turn_inject::hook_target_text(m))
                 {
-                    let hook_event = HookEvent::before_message(&text)
-                        .with_session(session_id.as_deref())
-                        .with_cwd(cwd.as_deref());
-                    let parts = hook_bus.emit(&hook_event).await.inject_parts();
+                    let parts = if hook_bus
+                        .has_handlers(crate::extensions::hooks::events::HookKind::BeforeMessage)
+                        .await
+                    {
+                        let hook_event = HookEvent::before_message(&text)
+                            .with_session(session_id.as_deref())
+                            .with_cwd(cwd.as_deref());
+                        hook_bus.emit(&hook_event).await.inject_parts()
+                    } else {
+                        Vec::new()
+                    };
                     if let Some(target) = messages.last_mut() {
                         turn_injection.absorb(target, parts);
                     }
@@ -10290,6 +10294,22 @@ mod rich_output_tests {
             assert_eq!(ec::hooked(&first.history[0]), Some(0), "but hooked");
             let resend = turn(first.history[..1].to_vec(), 0, false, hooks).await;
             assert_eq!(axel.seen(), ["go"], "never hooked again");
+            assert_eq!(sent_messages(&resend.bodies[0]), sent_messages(&first.bodies[0]));
+        }
+
+        // #414 second review, item 2: with no `before_message` handler the
+        // message is still marked (count 0) and published before its first
+        // request; after a reload that loads an extension, a resend does
+        // not hook it.
+        #[tokio::test]
+        async fn no_handler_marks_zero_and_a_resend_after_a_load_is_not_hooked() {
+            let first = turn(vec![user("go")], 0, false, bus(&[]).await).await;
+            assert_eq!(first.history[0]["content"], "go");
+            assert_eq!(ec::hooked(&first.history[0]), Some(0));
+            assert!(first.published_at_request[0] >= 1, "published before the request");
+            let axel = Injector::new("axel", vec![json!({"action":"inject","content":"LATE"})]);
+            let resend = turn(first.history[..1].to_vec(), 0, false, bus(&[&axel]).await).await;
+            assert!(axel.seen().is_empty(), "never hooked");
             assert_eq!(sent_messages(&resend.bodies[0]), sent_messages(&first.bodies[0]));
         }
 
