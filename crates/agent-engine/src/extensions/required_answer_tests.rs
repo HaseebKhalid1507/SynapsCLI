@@ -763,6 +763,45 @@ async fn a_later_extensions_modify_cannot_pass_an_input_the_guard_refuses() {
     assert_eq!(second.seen(), ["echo hi"]);
 }
 
+/// Pin (with the capture screen in force): the same chain on a bus that
+/// screens capture payloads for an operator prefix and has a capture
+/// extension on `after_tool_call` and `before_tool_call`. The required
+/// guard is still asked last and refuses the rewritten input, and the
+/// screen still withholds the prefixed output from the capture extension.
+#[tokio::test]
+async fn required_guards_still_run_last_with_the_capture_screen_in_force() {
+    let guard = Fake::new("example-guard", Mode::Refuse("rm -rf"));
+    let rewriter = Fake::new("rewriter", Mode::Answer(rewritten_to("rm -rf /")));
+    let (bus, later) = gated(&[
+        (guard.clone(), HookFailurePolicy::Continue),
+        (rewriter.clone(), HookFailurePolicy::Continue),
+    ])
+    .await;
+    let capture = Fake::new("capture", Mode::Answer(HookResult::Continue));
+    for kind in [HookKind::AfterToolCall, HookKind::BeforeToolCall] {
+        bus.subscribe(kind, capture.clone(), None, None, intercept()).await.unwrap();
+    }
+    let output = |text: &str| HookEvent::after_tool_call("bash", json!({"command": "ls"}), text.into());
+    let corporate = output("use corp_tok_Ab12cd34 now");
+    bus.emit(&corporate).await;
+    assert_eq!(capture.calls(), 1, "no extra prefix yet: delivered");
+    bus.set_capture_scrub_prefixes(["corp_tok_"]);
+
+    assert_eq!(bus.emit(&harmless()).await, said_no());
+    assert_eq!(guard.seen(), ["rm -rf /"], "the guard vetted the final input");
+    assert_eq!(capture.seen(), ["ls", "rm -rf /"], "the capture extension saw the rewritten input");
+    assert_eq!(
+        (rewriter.calls(), later.calls(), capture.calls()),
+        (1, 1, 2),
+        "every other handler was asked before the guard's block ended the chain"
+    );
+
+    bus.emit(&corporate).await;
+    assert_eq!(capture.calls(), 2, "the screen withholds the prefixed output");
+    bus.emit(&output("plain output")).await;
+    assert_eq!(capture.calls(), 3, "and a clean output is still delivered");
+}
+
 const MODIFY_AFTER_A_GUARD: &str = "Refused: required guard 'second-guard' gave no usable answer (bad-answer: its answer is not a usable hook result: 'modify' cannot apply here: required guard 'example-guard' had already vetted the input as it was). No tool call runs without a required guard's answer, whatever its on_failure says.";
 
 /// Pin (two guards): a required guard's rewrite after another required
