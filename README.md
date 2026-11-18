@@ -220,7 +220,7 @@ Found a vulnerability? Report it privately: [SECURITY.md](SECURITY.md).
 
 <p align="center"><img src="https://raw.githubusercontent.com/HaseebKhalid1507/capri-syn/main/docs/media/tour-summon.webp" width="640" alt="Capri, a desktop companion, comes over when her Synaps session needs you"></p>
 
-Synaps is a daemon, so a client doesn't have to be a terminal. [Capri](https://github.com/HaseebKhalid1507/capri-syn) is a desktop companion with a session of her own: she perches on your windows, takes a message by key or by voice, and comes over when her session needs you. Already running Synaps? She installs in one line and finds your daemon.
+Synaps is a daemon, so a client doesn't have to be a terminal. [Capri](https://github.com/HaseebKhalid1507/capri-syn) is a desktop companion that runs on Linux (X11 and Hyprland), with a session of her own: she perches on your windows, takes a message by key or by voice, and comes over when her session needs you. Already running Synaps? She installs in one line and finds your daemon.
 
 ## Docs and help
 
