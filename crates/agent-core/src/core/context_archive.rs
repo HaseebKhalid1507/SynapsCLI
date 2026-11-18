@@ -2931,7 +2931,12 @@ impl Projector {
         self.as_text.set(0);
         if let Some(text) = content.as_str() {
             let content = json!(self.text(text, class)?);
-            return Ok(Some((self.stored(role, content), Vec::new())));
+            let mut stored = self.stored(role, content);
+            // A hooked message with string content: the hook added nothing.
+            if role == "user" && crate::core::extension_context::hooked(message).is_some() {
+                crate::core::extension_context::set_hooked(&mut stored, 0);
+            }
+            return Ok(Some((stored, Vec::new())));
         }
         let Some(blocks) = content.as_array() else {
             return Ok(None);
@@ -3004,10 +3009,16 @@ impl Projector {
             }
         }
         if output.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some((self.stored(role, json!(output)), indices)))
+            return Ok(None);
         }
+        let hooked = (role == "user")
+            .then(|| stored_hooked(message, blocks.len(), &output, &indices))
+            .flatten();
+        let mut stored = self.stored(role, json!(output));
+        if let Some(n) = hooked {
+            crate::core::extension_context::set_hooked(&mut stored, n);
+        }
+        Ok(Some((stored, indices)))
     }
 
     /// A tool input as stored: exact, or, where a reduction says so, as its
@@ -3224,6 +3235,29 @@ fn eligible_class(value: &Value) -> Option<DisclosureClass> {
 /// Shared message-envelope selection for preflight and projection. Host
 /// continuation notes and the host's tool-in-flight note are derived
 /// working context, never source evidence (nor the user's words).
+/// `_synaps_hooked` of a stored user message (#414): how many of its
+/// trailing stored blocks are blocks the `before_message` hook added and
+/// that were stored intact (a saved block or marker, by the fence grammar,
+/// from the source message's own trailing count). `None` when the source
+/// was never hooked.
+fn stored_hooked(source: &Value, source_blocks: usize, output: &[Value], indices: &[usize]) -> Option<usize> {
+    use crate::core::extension_context as ec;
+    let added = ec::hooked(source)?;
+    let first = source_blocks.saturating_sub(added);
+    Some(
+        output
+            .iter()
+            .zip(indices)
+            .rev()
+            .take_while(|(block, &index)| {
+                index >= first
+                    && block["type"] == "text"
+                    && block["text"].as_str().is_some_and(|t| ec::parse_saved(t).is_some())
+            })
+            .count(),
+    )
+}
+
 fn projection_content(message: &Value) -> Option<(DisclosureClass, &str, &Value)> {
     if message.get("_synaps_context").is_some()
         || crate::core::host_note::is_tool_in_flight_note(message)
@@ -6605,6 +6639,42 @@ mod tests {
         let reference = store.seal(&messages, "large source window").unwrap();
         assert_eq!(store.fetch(&reference.id, 0, 1).unwrap(), messages);
         assert_eq!(store.seal(&messages, "retry").unwrap(), reference);
+    }
+
+    /// #414: a sealed archive keeps `_synaps_hooked` on hooked user
+    /// messages, counted over the stored blocks: an image the archive
+    /// leaves out does not shift it, and a hooked message the hook added
+    /// nothing to keeps `0`. Unhooked messages carry no key.
+    #[test]
+    fn a_sealed_archive_keeps_the_before_message_count() {
+        use crate::core::extension_context::{hooked, marker_text, saved_block_text, HOOKED_KEY};
+        let (_tmp, store) = setup();
+        let messages = vec![
+            Arc::new(json!({"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},
+                {"type":"text","text":"go"},
+                {"type":"text","text":saved_block_text("axel","base branch is dev")},
+                {"type":"text","text":marker_text("agent-comms")}],
+                HOOKED_KEY: 2})),
+            Arc::new(json!({"role":"assistant","content":"ok"})),
+            Arc::new(json!({"role":"user","content":"quiet", HOOKED_KEY: 0})),
+            Arc::new(json!({"role":"user","content":"plain"})),
+        ];
+        let reference = store.seal(&messages, "").unwrap();
+        let fetched = store.fetch_with_provenance(&reference.id, 0, 4).unwrap();
+        let first = &fetched[0];
+        assert_eq!(hooked(&first.message), Some(2), "{}", first.message);
+        let content = first.message["content"].as_array().unwrap();
+        assert_eq!(content[content.len() - 1]["text"], marker_text("agent-comms"));
+        assert_eq!(hooked(&fetched[2].message), Some(0));
+        assert_eq!(hooked(&fetched[3].message), None);
+        assert_eq!(hooked(&fetched[1].message), None);
+        // The count is in the digest: the same window seals to the same
+        // archive, and a window without it to another one.
+        assert_eq!(store.seal(&messages, "").unwrap(), reference);
+        let mut unhooked = messages.clone();
+        Arc::make_mut(&mut unhooked[2]).as_object_mut().unwrap().remove(HOOKED_KEY);
+        assert_ne!(store.seal(&unhooked, "").unwrap().id, reference.id);
     }
 
     #[test]
