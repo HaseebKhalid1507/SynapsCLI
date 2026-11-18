@@ -214,13 +214,13 @@ impl SessionStart {
     pub(crate) fn queue(
         host: &Arc<EngineHost>,
         bus: Arc<HookBus>,
-        journal_id: Arc<arc_swap::ArcSwap<String>>,
+        journal_id: super::handle::JournalSlot,
         cwd: Option<PathBuf>,
         discovery: Duration,
     ) -> Self {
         let ticket = StartTicket::new(false);
         #[cfg(any(test, feature = "testing"))]
-        let _ = ticket.label.set((**journal_id.load()).clone());
+        let _ = ticket.label.set(journal_id.load().journal_id.clone());
         let task = tokio::spawn(run_queued(
             Arc::clone(host),
             bus,
@@ -277,7 +277,7 @@ impl Drop for SessionStart {
 async fn run_queued(
     host: Arc<EngineHost>,
     bus: Arc<HookBus>,
-    journal_id: Arc<arc_swap::ArcSwap<String>>,
+    journal_id: super::handle::JournalSlot,
     cwd: Option<PathBuf>,
     discovery: Duration,
     ticket: Arc<StartTicket>,
@@ -304,11 +304,11 @@ async fn run_queued(
 /// injection lock.
 async fn emit_keyed(
     bus: &Arc<HookBus>,
-    journal_id: &arc_swap::ArcSwap<String>,
+    journal_id: &arc_swap::ArcSwap<super::handle::JournalCell>,
     cwd: Option<&Path>,
     ticket: &StartTicket,
 ) {
-    let id = (**journal_id.load()).clone();
+    let id = journal_id.load().journal_id.clone();
     #[cfg(any(test, feature = "testing"))]
     testing::note_call(&id);
     crate::extensions::loader::emit_session_start(bus, &id, cwd).await;
@@ -624,7 +624,9 @@ mod tests {
         .await
         .expect("subscribe");
         let ticket = StartTicket::new(false);
-        let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(id.to_string()));
+        let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::session::handle::JournalCell::new(id.to_string(), chrono::Utc::now()),
+        ));
         let (gate, b, t) = (Arc::clone(gate), Arc::clone(&bus), Arc::clone(&ticket));
         let task = tokio::spawn(async move {
             call_in_line(&gate, &t, || emit_keyed(&b, &journal_id, None, &t)).await

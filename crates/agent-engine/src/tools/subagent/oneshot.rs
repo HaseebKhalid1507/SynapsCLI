@@ -48,7 +48,7 @@ impl Tool for SubagentTool {
                     "type": "string",
                     "description": "The task/prompt to send to the subagent."
                 },
-                "model": {"type": "string", "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices."},
+                "model": {"type": "string", "description": "Omit for the session default: config `subagent_model` when set, otherwise the foreground model. Explicit values must be one of subagent_models' listed exact choices."},
                 "thinking": {
                     "type": "string",
                     "enum": ["low", "medium", "high", "xhigh", "max"],
@@ -104,7 +104,11 @@ impl Tool for SubagentTool {
             .orchestration
             .as_ref()
             .ok_or_else(|| RuntimeError::Tool("delegation policy unavailable".into()))?
-            .resolve_and_authorize(&orchestration_id, requested_model)
+            .resolve_and_authorize_with_default(
+                &orchestration_id,
+                requested_model,
+                config.subagent_model.as_deref(),
+            )
             .map_err(|error| RuntimeError::Tool(error.to_string()))?;
         let model = decision.model.as_str().to_owned();
         let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
@@ -121,10 +125,11 @@ impl Tool for SubagentTool {
         let task_preview: String = task.chars().take(80).collect();
 
         tracing::info!(
-            "Dispatching subagent '{}' (id={}) with model {}",
+            "Dispatching subagent '{}' (id={}) with model {} (source={})",
             label,
             subagent_id,
-            model
+            model,
+            decision.selection_source.as_str()
         );
 
         if let Some(ref tx) = ctx.channels.tx_events {

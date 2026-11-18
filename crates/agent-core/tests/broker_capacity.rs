@@ -2288,3 +2288,119 @@ async fn a_rotation_while_a_refresh_waits_holds_the_login_that_was_refused() {
         json!({"kind": "refresh_rejected", "http_status": 400})
     );
 }
+
+/// A selection for `model` that may not answer with b.
+async fn pick_without_b(
+    broker: &LocalBroker,
+    model: Option<&str>,
+) -> Result<CredentialRef, BrokerError> {
+    tokio::time::timeout(
+        SELECTION_DEADLINE,
+        broker.access_token_pinned_excluding(OAuthProviderId::Anthropic, model, &[anthropic("b")]),
+    )
+    .await
+    .expect("the selection terminates")
+    .map(|t| t.credential)
+}
+
+/// A limit that covers one model (2026-11-15: Fable's own weekly limit)
+/// cools that model on the account and nothing else: a Fable selection
+/// does not get `a`, an Opus selection and one that names no model still
+/// do. The model is matched case-insensitively. The all-cooling failure
+/// names the model. `auth state` shows the cooldown with its model, not as
+/// the account's; `--clear` drops it.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_model_cooldown_cools_only_that_model_on_the_account() {
+    let _home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE)]);
+    let script: Script = Arc::default();
+    for label in ["a", "b"] {
+        script.lock().unwrap().insert(label, roomy());
+    }
+    let broker = auto_broker(&spawn_usage(script).await);
+    let until = agent_core::epoch_millis() + 3_600_000;
+    broker
+        .report_model_cooldown(&anthropic("a"), "Claude-Fable-5", Some(until), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+
+    let a = anthropic("a");
+    assert_eq!(broker.active_cooldown(&a), None, "the account itself is not cooling");
+    assert_eq!(broker.active_cooldown_for(&a, None), None);
+    assert_eq!(broker.active_cooldown_for(&a, Some("claude-fable-5")), Some(until));
+    assert_eq!(broker.active_cooldown_for(&a, Some("claude-opus-4-7")), None);
+    assert_eq!(broker.active_cooldown_for(&anthropic("b"), Some("claude-fable-5")), None);
+
+    assert_eq!(pick_without_b(&broker, Some("claude-opus-4-7")).await.unwrap(), a);
+    assert_eq!(pick_without_b(&broker, None).await.unwrap(), a);
+    let err = pick_without_b(&broker, Some("claude-fable-5"))
+        .await
+        .expect_err("a is cooling for fable");
+    let BrokerError::NoAccountAvailable {
+        failure: Some(failure),
+        ..
+    } = &err
+    else {
+        panic!("typed selection failure expected: {err:?}");
+    };
+    assert_eq!(failure.kind.as_str(), "all_cooling_down", "{failure:?}");
+    let failed_a = failure.accounts.iter().find(|f| f.account == "a").unwrap();
+    assert_eq!(
+        serde_json::to_value(failed_a).unwrap(),
+        json!({"account": "a", "kind": "cooling_down", "until_ms": until,
+               "cooling_down": true, "cooldown_model": "claude-fable-5"})
+    );
+
+    let state = account_state(&broker, "a");
+    assert!(state.get("cooldown").is_none(), "{state}");
+    assert_eq!(
+        state["model_cooldowns"],
+        json!([{"until_ms": until, "reason": "anthropic_quota_exhausted", "model": "claude-fable-5"}])
+    );
+    let text = render_text(&broker.auth_state(&anthropic_query()).unwrap());
+    assert!(text.contains("    cooldown claude-fable-5  "), "{text}");
+
+    broker
+        .auth_state(&AuthStateQuery {
+            account: Some("a".into()),
+            clear: true,
+            ..anthropic_query()
+        })
+        .unwrap();
+    assert_eq!(broker.active_cooldown_for(&a, Some("claude-fable-5")), None);
+    assert!(account_state(&broker, "a").get("model_cooldowns").is_none());
+}
+
+/// An accepted request clears the account's own cooldown whatever its
+/// model, but a model's cooldown only when it was for that model: a Sonnet
+/// answer says nothing about Fable's limit.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_served_request_clears_only_its_own_models_cooldown() {
+    let _home = install_accounts(&[("a", FAR_FUTURE)]);
+    let broker = auto_broker("http://127.0.0.1:9");
+    let a = anthropic("a");
+    let until = agent_core::epoch_millis() + 3_600_000;
+    broker
+        .report_model_cooldown(&a, "claude-fable-5", Some(until), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+    broker
+        .report_cooldown(&a, Some(until + 1), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+    assert_eq!(broker.active_cooldown_for(&a, Some("claude-fable-5")), Some(until + 1));
+    let sent = agent_core::epoch_millis();
+
+    broker.clear_cooldown_for(&a, Some("claude-sonnet-5-5"), sent);
+    assert_eq!(broker.active_cooldown(&a), None, "the account's own cooldown goes");
+    assert_eq!(
+        broker.active_cooldown_for(&a, Some("claude-fable-5")),
+        Some(until),
+        "fable's stays"
+    );
+    broker.clear_cooldown(&a, sent);
+    assert_eq!(broker.active_cooldown_for(&a, Some("claude-fable-5")), Some(until));
+    broker.clear_cooldown_for(&a, Some("CLAUDE-FABLE-5"), sent);
+    assert_eq!(broker.active_cooldown_for(&a, Some("claude-fable-5")), None);
+}

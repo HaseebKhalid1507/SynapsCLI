@@ -246,6 +246,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         generation: state.generation,
         daemon_build: crate::session::wire::build_id().to_string(),
         features: crate::session::wire::daemon_features(),
+        boot_id: state.boot_id.clone(),
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
@@ -851,7 +852,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         let _ = handle.send(SessionCommand::Detach { client }).await;
     }
     if !handle.is_alive() {
-        state.remove(&sid);
+        state.remove(&handle);
     }
     if lagged {
         send_owner_lagged(&tx, &sid, owner_lag_dropped.load(Ordering::SeqCst)).await;

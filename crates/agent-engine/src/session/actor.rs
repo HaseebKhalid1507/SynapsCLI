@@ -641,13 +641,21 @@ pub struct SessionActor {
     pub(crate) turn_awaiting_start: Option<TurnStart>,
     /// 1 Hz `SubagentRows` cadence while a turn runs (`None` when idle).
     pub(crate) subagent_tick: Option<tokio::time::Interval>,
+    /// Mirrors `handle.meta_live().workers` (`publish_workers`).
+    pub(crate) workers_cell: Arc<arc_swap::ArcSwap<super::types::SessionWorkers>>,
+    /// When the earliest listed finished worker's result expires
+    /// (`finished_at + FINISHED_HANDLE_TTL`): its row leaves the listing
+    /// then, and the park it held is re-armed. `None` while no finished
+    /// worker is listed, so an idle session holds no timer.
+    pub(crate) worker_expiry: Option<tokio::time::Instant>,
     /// Worker-registry generation of the current/last turn: a user
     /// interrupt cancels only the workers this turn launched.
     pub(crate) turn_worker_generation: u64,
     /// Mirrors `handle.lifecycle()` (B3 writes Parking/Parked).
     pub(crate) lifecycle: Arc<std::sync::atomic::AtomicU8>,
-    /// Mirrors `handle.journal_id()` (B2 stores the successor id).
-    pub(crate) journal_id: Arc<arc_swap::ArcSwap<String>>,
+    /// Mirrors `handle.journal()`: the journal id (B2 stores the successor
+    /// id), what it superseded, the conversation's start.
+    pub(crate) journal: super::handle::JournalSlot,
     /// Mirrors `handle.presence()` (clients / owner / pending prompts).
     pub(crate) presence: Arc<arc_swap::ArcSwap<super::handle::Presence>>,
     /// Mirrors `handle.name()`; `sync_name` after any rename.
@@ -754,19 +762,13 @@ impl SessionActor {
                 }
             }
         } else {
-            // Fresh session — best-effort lock.
-            let dir = agent_core::session_lock::sessions_dir();
+            // Fresh session: a taken id (another fresh session drew it) is
+            // never its own, so it draws another; never runs unlocked on it.
             let holder = agent_core::session_lock::LockHolder {
                 pid: std::process::id(),
                 kind: lock_kind.to_string(),
             };
-            match agent_core::session_lock::SessionLock::try_acquire(&dir, &sb.session.id, holder) {
-                Ok(lock) => Some(lock),
-                Err(e) => {
-                    tracing::warn!(session = %sb.session.id, "session lock: {e}");
-                    None
-                }
-            }
+            super::fresh_id::lock_fresh_session(&mut runtime, &mut sb, holder)?
         };
 
         // `--name` at create: apply BEFORE the registry entry is written so
@@ -865,14 +867,26 @@ impl SessionActor {
             .await;
         }
 
-        let id = SessionId::from(sb.session.id.clone());
+        // The journal id, unless a live actor already has it as its id (a
+        // `/clear`ed actor keeps its id while its old conversation is
+        // resumed here): then a minted one. `create_session` holds the
+        // create lock, so no other create can take it meanwhile.
+        let id = host.actor_id_for(&sb.session.id);
+        // A reload hands back what the old image's actor held besides its
+        // journal; only for that same journal (a fresh fallback is not it).
+        let restored = cfg
+            .restore_conversation
+            .take()
+            .filter(|r| r.journal_id == sb.session.id);
 
         let meta = SessionMeta {
             id: id.clone(),
             name: sb.session.name.clone(),
             model: runtime.model().to_string(),
             cwd: cfg.cwd.clone(),
-            created_at: sb.session.created_at,
+            created_at: restored
+                .as_ref()
+                .map_or(sb.session.created_at, |r| r.created_at),
             continued: sb.continued,
             continue_info: sb.continue_info.as_ref().map(ContinueInfoWire::from),
             host_pid: std::process::id(),
@@ -892,6 +906,7 @@ impl SessionActor {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            workers: Default::default(),
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
@@ -921,13 +936,21 @@ impl SessionActor {
                 events,
                 view,
                 lifecycle,
-                journal_id,
+                journal,
                 presence,
+                workers: workers_cell,
                 name,
                 keep_warm: keep_warm_cell,
                 cache_keepwarm,
             },
         ) = SessionHandle::new(meta.clone(), view);
+        if let Some(r) = restored {
+            journal.store(Arc::new(super::handle::JournalCell {
+                journal_id: r.journal_id,
+                supersedes: r.supersedes,
+                created_at: r.created_at,
+            }));
+        }
         let handle = handle.with_owner_token(cfg.owned.as_ref().map(|o| o.token.clone()));
         let owned = cfg.owned.clone().map(super::owned::OwnedState::new);
         // The mode is fixed for the session: seed the listing with it now.
@@ -949,7 +972,7 @@ impl SessionActor {
             super::session_start::SessionStart::queue(
                 host,
                 Arc::clone(&hook_bus),
-                Arc::clone(&journal_id),
+                Arc::clone(&journal),
                 cfg.cwd.clone(),
                 ext_ready_timeout,
             )
@@ -1012,9 +1035,11 @@ impl SessionActor {
             session_start,
             turn_awaiting_start: None,
             subagent_tick: None,
+            workers_cell,
+            worker_expiry: None,
             turn_worker_generation: 0,
             lifecycle,
-            journal_id,
+            journal,
             presence,
             name,
             keep_warm_cell,
@@ -1045,7 +1070,7 @@ impl SessionActor {
     /// in-process): the entry is added while pinned, dropped otherwise.
     pub(crate) fn note_pin(&self) {
         let Some(sink) = self.host.pin_sink() else { return };
-        let journal = (**self.journal_id.load()).clone();
+        let journal = self.journal_id_now();
         if self.keep_warm {
             let kw = self.cache_keepwarm.override_mode.map(|m| m.to_string());
             sink.pinned(self.id.as_str(), &journal, self.conv.session.name.as_deref(), self.config.cwd.as_deref(), kw.as_deref());
@@ -1054,12 +1079,23 @@ impl SessionActor {
         }
     }
 
+    /// The journal id as last published.
+    pub(crate) fn journal_id_now(&self) -> String {
+        self.journal.load().journal_id.clone()
+    }
+
     /// Publish a new journal id; a pinned session's book entry follows it.
-    pub(crate) fn set_journal_id(&mut self, new_id: String) {
-        let old = self.journal_id.swap(Arc::new(new_id.clone()));
-        if self.keep_warm && *old != new_id {
+    /// `why` decides what the actor still holds (`JournalCell::moved`): a
+    /// compaction keeps the old id, a `/clear` or a resume lets it go and
+    /// dates the conversation from `conv.session.created_at`.
+    pub(crate) fn set_journal_id(&mut self, new_id: String, why: super::handle::JournalMove) {
+        let created_at = self.conv.session.created_at;
+        let old = self.journal.load_full();
+        self.journal
+            .store(Arc::new(old.moved(new_id.clone(), why, created_at)));
+        if self.keep_warm && old.journal_id != new_id {
             if let Some(sink) = self.host.pin_sink() {
-                sink.moved(&old, &new_id);
+                sink.moved(&old.journal_id, &new_id);
             }
         }
     }
@@ -1077,7 +1113,7 @@ impl SessionActor {
         self.name.store(Arc::new(name.clone()));
         if self.keep_warm {
             if let Some(sink) = self.host.pin_sink() {
-                let journal = (**self.journal_id.load()).clone();
+                let journal = self.journal_id_now();
                 sink.renamed(&journal, name.as_deref());
             }
         }
@@ -1230,7 +1266,7 @@ impl SessionActor {
         self.flush_saves().await;
         // Before `Idle`, so a test that saw `Idle` knows the hook is in line.
         #[cfg(any(test, feature = "testing"))]
-        if super::session_start::testing::take_requeue(&self.journal_id.load()) {
+        if super::session_start::testing::take_requeue(&self.journal_id_now()) {
             self.queue_session_start();
         }
         self.emit(SessionEventWire::Idle);
@@ -1328,8 +1364,12 @@ impl SessionActor {
     /// clock, and the conversation's title / cost / message count (kept as
     /// last published while Parked). Every transition that moves them —
     /// turn and compaction start/end, attach/detach, `rearm_park`,
-    /// park/unpark — ends in a publish; stream deltas do not.
-    pub(crate) fn publish_presence(&self) {
+    /// park/unpark — ends in a publish; stream deltas do not. The deadlines
+    /// are whole seconds, so republishing an unchanged deadline usually
+    /// compares equal (wall and monotonic clocks are read apart: one on a
+    /// second boundary can move by a second). The worker block is published
+    /// with it (`publish_workers`): a parked or ending session lists none.
+    pub(crate) fn publish_presence(&mut self) {
         use super::handle::{Presence, PresenceState};
         self.background
             .set_inbox_accepting(self.input_owner.is_some());
@@ -1349,10 +1389,12 @@ impl SessionActor {
             _ => Some(now),
         };
         let wall = |at: tokio::time::Instant| {
+            use chrono::SubsecRound;
             let left = at.saturating_duration_since(tokio::time::Instant::now());
             chrono::Duration::from_std(left)
                 .ok()
                 .and_then(|d| now.checked_add_signed(d))
+                .map(|t| t.trunc_subsecs(0))
         };
         // A worker re-check is not a park (it only looks again), nor is a
         // grace that workers now hold: its firing would only re-check. The
@@ -1388,6 +1430,42 @@ impl SessionActor {
             messages,
             owning_client: self.owned.as_ref().and_then(|o| o.client),
         }));
+        self.publish_workers();
+    }
+
+    /// Publish the workers that hold the park (`SubagentRegistry::listing`,
+    /// one pass) to the listing, only when the block changed, and arm the
+    /// one-shot at the earliest listed result's expiry. Parked: none. An
+    /// ending session lists none either: its workers are being stopped with
+    /// it, and none of them will be collected here. Callers hold no registry
+    /// guard (it locks the registry).
+    pub(crate) fn publish_workers(&mut self) {
+        let (block, expiry) = if self.runtime.is_live() && !self.is_ending() {
+            self.runtime
+                .subagent_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .listing()
+        } else {
+            Default::default()
+        };
+        self.worker_expiry = expiry.map(tokio::time::Instant::from_std);
+        if **self.workers_cell.load() != block {
+            self.workers_cell.store(Arc::new(block));
+        }
+    }
+
+    /// A listed worker result just expired: drop its row and re-arm the park
+    /// it held (the park re-check only runs detached and unpinned). One
+    /// publish: `rearm_park`'s carries the worker block.
+    fn on_worker_expiry(&mut self) {
+        self.worker_expiry = None;
+        self.rearm_park();
+    }
+
+    /// `finish` has begun: the session is on its way out.
+    fn is_ending(&self) -> bool {
+        self.lifecycle.load(std::sync::atomic::Ordering::Acquire) == SessionLifecycle::Ending as u8
     }
 
     /// Every attached client, by id.
@@ -1547,7 +1625,8 @@ impl SessionActor {
     }
 
     /// `<sessions>/<id>.json` — written by both persistence modes.
-    fn journal_exists(&self) -> bool {        let id = (**self.journal_id.load()).clone();
+    fn journal_exists(&self) -> bool {
+        let id = self.journal_id_now();
         crate::config::resolve_write_path("sessions")
             .join(format!("{id}.json"))
             .is_file()
@@ -2587,8 +2666,12 @@ impl SessionActor {
         self.parked_tool_activations = self.runtime.carried_tool_activations();
         // Drop order: conv first, then runtime — a panic between them can
         // never leave a Runtime without state to save.
+        // No worker tick or expiry on a parked runtime: one pending since a
+        // worker just wound down (a cancelled one holds no park) would read it.
+        self.subagent_tick = None;
         // Last look at the conversation for listings (title/cost/messages).
         self.publish_presence();
+        self.worker_expiry = None;
         let conv = self.conv.park_take();
         drop(conv);
         let runtime = self.runtime.park_take();
@@ -2621,7 +2704,7 @@ impl SessionActor {
         let started = std::time::Instant::now();
         // Somebody came back: the eviction deadline armed by `park()` is void.
         self.park_deadline = None;
-        let journal_id = (**self.journal_id.load()).clone();
+        let journal_id = self.journal_id_now();
 
         // F10: re-acquire the journal lock before rebuilding the runtime.
         // If an in-process --continue took over while we were parked, fail
@@ -2787,28 +2870,39 @@ impl SessionActor {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .display_rows();
+        #[cfg(any(test, feature = "testing"))]
+        crate::runtime::subagent::after_tick_rows_for_test();
+        // From the rows just read, never a second walk: a worker finishing
+        // in between would stop the tick on rows that still show it
+        // running, and those would be the last rows clients get.
         let running = rows
             .iter()
-            .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running));
+            .any(|r| r.status == crate::runtime::subagent::SubagentStatus::Running);
         if !rows.is_empty() {
             self.emit(SessionEventWire::SubagentRows(rows));
         }
         if !keep_subagent_tick(self.streaming, running) {
             self.subagent_tick = None;
-            // The last worker finished: a park it held may be due now.
+            // The last worker finished: a park it held may be due now. Its
+            // publish carries the worker block to listings.
             self.rearm_park();
+        } else {
+            // Listings read the workers from their own cell: one that
+            // started or ended since the last publish shows here, turn or
+            // no turn.
+            self.publish_workers();
         }
     }
 
-    /// Whether any worker in the registry is still running.
-    fn subagents_running(&self) -> bool {
+    /// Whether any worker is still running, cancelled ones winding down
+    /// included: the tick's lifetime. `SessionWorkers::running` leaves
+    /// those out.
+    fn any_worker_running(&self) -> bool {
         self.runtime
             .subagent_registry()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .display_rows()
-            .iter()
-            .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running))
+            .any_running()
     }
 
     /// Codex hosted web_search is read from this (engine/daemon) process's
@@ -2903,7 +2997,7 @@ impl SessionActor {
         self.session_start = super::session_start::SessionStart::queue(
             &self.host,
             Arc::clone(&self.hook_bus),
-            Arc::clone(&self.journal_id),
+            Arc::clone(&self.journal),
             self.config.cwd.clone(),
             extensions_ready_timeout(&self.host.config()),
         );
@@ -3031,7 +3125,7 @@ impl SessionActor {
         self.revoked_turn_deadline = None;
         // Background workers outlive the turn: keep publishing their rows
         // until the last one finishes (see `publish_subagent_rows`).
-        if !keep_subagent_tick(false, self.subagents_running()) {
+        if !keep_subagent_tick(false, self.any_worker_running()) {
             self.subagent_tick = None;
         }
         if !self.turn_steered_events.is_empty() && self.conv.is_live() {
@@ -3558,9 +3652,7 @@ impl SessionActor {
         // teardown, cost cap, host checkpoint, driver revocation — stops all.
         {
             use crate::runtime::subagent::WorkerCancelScope;
-            let ending = self.lifecycle.load(std::sync::atomic::Ordering::Acquire)
-                == SessionLifecycle::Ending as u8;
-            let scope = worker_cancel_scope(reason, ending, self.turn_worker_generation);
+            let scope = worker_cancel_scope(reason, self.is_ending(), self.turn_worker_generation);
             let mut registry = match self.runtime.subagent_registry().lock() {
                 Ok(g) => g,
                 Err(poisoned) => {
@@ -3578,18 +3670,16 @@ impl SessionActor {
                     "turn interrupted: cancelled running workers"
                 );
             }
+            // Still running and staying so: not the ones just cancelled
+            // (they read as running until their next step).
+            let spared = registry.live_worker_count();
+            drop(registry);
+            // The listing shows the cancelled workers stopping now, not a
+            // tick later.
+            if !cancelled.is_empty() {
+                self.publish_workers();
+            }
             if let WorkerCancelScope::Turn(_) = scope {
-                // Still running and staying so: not the ones just cancelled
-                // (they read as running until their next step).
-                let spared = registry
-                    .display_rows()
-                    .iter()
-                    .filter(|r| {
-                        r.status == crate::runtime::subagent::SubagentStatus::Running
-                            && !r.cancel_requested
-                    })
-                    .count();
-                drop(registry);
                 if spared > 0 {
                     self.emit(SessionEventWire::Stream(StreamEvent::Session(
                         SessionEvent::Notice(format!(
@@ -4271,7 +4361,7 @@ impl SessionActor {
                         }
                         let new_id = self.conv.session.id.clone();
                         self.runtime.set_session_id(Some(new_id.clone()));
-                        self.set_journal_id(new_id.clone());
+                        self.set_journal_id(new_id.clone(), super::handle::JournalMove::Compaction);
                         // F10: lock follows the new journal id.
                         self.reacquire_session_lock(&new_id);
                         // Wall 1: reset continuation state for the new session id
@@ -4585,7 +4675,7 @@ impl SessionActor {
         if self.is_parked() {
             let value = match query {
                 SessionQuery::Status => serde_json::json!({
-                    "session": (**self.journal_id.load()).clone(),
+                    "session": self.journal_id_now(),
                     "model": self.view.load().model,
                     "lifecycle": SessionLifecycle::Parked,
                     "streaming": false,
@@ -5393,9 +5483,19 @@ impl SessionActor {
                 self.conv.clear(&self.runtime).await;
                 self.runtime
                     .begin_conversation(Some(self.conv.session.id.clone()));
-                self.set_journal_id(self.conv.session.id.clone());
+                // A new conversation: the old one is no longer held here
+                // (resuming it builds another actor), and the listing dates
+                // from the fresh session.
+                self.set_journal_id(
+                    self.conv.session.id.clone(),
+                    super::handle::JournalMove::Clear,
+                );
                 // F10: lock follows the new session id.
                 self.reacquire_session_lock(&self.conv.session.id.clone());
+                // The fresh session has no name: the old one must stop
+                // resolving to this actor. Title, cost and messages restart.
+                self.sync_name();
+                self.publish_presence();
                 self.emit(SessionEventWire::Cleared {
                     session_id: self.conv.session.id.clone(),
                 });
@@ -5527,6 +5627,10 @@ impl SessionActor {
             SessionLifecycle::Ending as u8,
             std::sync::atomic::Ordering::Release,
         );
+        // An ending session lists no workers (`publish_workers`): every
+        // listing from here on, until it leaves the map, shows none, whatever
+        // ends it (`/close force`, `daemon close`, eviction, its owner gone).
+        self.publish_workers();
         // Quitting the client mid-turn is the user's interruption (so is
         // an owned session's owner going away: `Cancel`'s marker); every
         // other end reason is the host's.
@@ -5551,7 +5655,7 @@ impl SessionActor {
         }
 
         let parked = !self.conv.is_live();
-        let session_id = (**self.journal_id.load()).clone();
+        let session_id = self.journal_id_now();
         let api_messages = if parked {
             None
         } else {
@@ -5816,6 +5920,7 @@ impl SessionTask {
                     actor.publish_subagent_rows();
                     actor.flush_turn_draft();
                 }
+                _ = park_timer(actor.worker_expiry) => actor.on_worker_expiry(),
                 _ = park_timer(actor.park_deadline), if !actor.holds(WorkSource::ParkTimer) => {
                     if let std::ops::ControlFlow::Break(reason) = actor.park().await {
                         break reason;

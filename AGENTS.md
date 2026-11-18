@@ -469,6 +469,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `bash_max_timeout` | int | 300 | Max allowed bash timeout |
 | `subagent_timeout` | int | 300 | Default subagent timeout (seconds; 0 = no limit) |
 | `subagent_thinking` | string | xhigh | Worker thinking default (`low`, `medium`, `high`, `xhigh`, `max`), independent of `thinking`; a per-call `thinking` argument wins ([docs/subagent-thinking.md](docs/subagent-thinking.md)) |
+| `subagent_model` | string | inherit | Worker model when a `subagent`/`subagent_start` call omits `model` (e.g. `claude-sonnet-4-6` or `openai-codex/gpt-5.6-sol`, same forms as `model`); `inherit` or empty = the foreground model. A per-call `model` wins; resume keeps the worker's own model. Naming a model here trusts it for workers the way a favorite does, and the trust lasts until the session ends, like a favorite; an unknown id is denied rather than replaced by the foreground model |
 | `subagent_context_management` | string | auto | `auto` or `off`: workers roll their context over instead of filling the window ([docs/design/subagent-rollover.md](docs/design/subagent-rollover.md)) |
 | `subagent_rollover_tokens` | int | 200000 | Estimated footprint at which a worker rolls over (at least 20000; a lower window band wins) |
 | `subagent_cold_resume_compact_tokens` | int | 100000 | `subagent_resume` of a worker whose cache has expired replays a compact context once history is at least this big; `0` = off |
@@ -493,7 +494,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `provider.<name>` | string | — | API key for provider (e.g. `provider.groq = gsk_...`) |
 | `provider.<name>.url` | string | — | Custom base URL (e.g. `provider.local.url = http://...`) |
 | `keybind.<key>` | string | — | Custom keybind (e.g. `keybind.F5 = /compact`) |
-| `telemetry` | string | off | Per-request API telemetry: `off`, `basic` (Anthropic streaming calls: turns, keep-warm, workers; timing incl. `ttft_ms`, usage, `cost_usd` estimated at API list prices, the persisted conversation `session_id` plus the request-trace `runtime_session_id`/`turn_id`/`trace_request_id`, worker identity on subagent records, plus the `cache_diag` verdict when `cache_diagnostics` is on), `full` (adds rate-limit headers). JSONL at `~/.cache/synaps/api-log.jsonl` (0600, O_NOFOLLOW); `basic`/`full` also write the metadata-only `~/.cache/synaps/request-trace.jsonl` ([docs/trace-schema.md](docs/trace-schema.md)) |
+| `telemetry` | string | off | Per-request API telemetry: `off`, `basic` (Anthropic streaming calls: turns, keep-warm, workers; timing incl. `ttft_ms`, usage, `cost_usd` estimated at API list prices, the request's thinking level as `thinking` and the `effort` it carried if any, the persisted conversation `session_id` plus the request-trace `runtime_session_id`/`turn_id`/`trace_request_id`, worker identity on subagent records, plus the `cache_diag` verdict when `cache_diagnostics` is on), `full` (adds rate-limit headers: an API key's per-minute limits, or a subscription login's usage windows as `ratelimit.unified_utilization`, e.g. `{"5h": 0.31, "7d": 0.62}` = share used as of that response). JSONL at `~/.cache/synaps/api-log.jsonl` (0600, O_NOFOLLOW); `basic`/`full` also write the metadata-only `~/.cache/synaps/request-trace.jsonl` ([docs/trace-schema.md](docs/trace-schema.md)) |
 | `telemetry_log_generations` | int | 1 | Rotated generations kept for `api-log.jsonl` and `request-trace.jsonl` (each rotates at 50 MB): `<log>.1` (newest) .. `<log>.N` (oldest), 1–100. `1` is the historical single `<log>.1`. Read when the session's telemetry writer starts |
 | `cache_diagnostics` | bool | false | Anthropic cache diagnostics: each turn sends `diagnostics.previous_message_id` and records the server's reason: how this request diverges from the previous request in the chain, not what the cache did (it can appear on a full cache hit — read it with `cache_read_input_tokens`). An unknown or nonexistent previous id returns 200 with `previous_message_not_found`. Written to `cache_diag` in `api-log.jsonl` (telemetry `basic`+) and `cache.server_diagnosis` in the request trace. Beta header `cache-diagnosis-2026-04-07` on API-key auth only; a rejection turns it off for the session and the request is re-sent without it |
 | `shell.*` / `server.*` | — | — | `shell.*`: the eight keys were removed in 0.12.0; a config that sets them loads, ignores them and gets one warning naming them (`REMOVED_SHELL_KEYS` in `crates/agent-core/src/core/config.rs`). `server.*`: parsed by `parse_server_config_key` in the same file; it is only `server.auto_approve_confirms` now: the other keys of the removed `synaps server` (and the removed watcher's `bridge.*` keys) load with one deprecation warning and are ignored |
@@ -687,7 +688,7 @@ Dispatch a specialist. **Not available to subagents.**
 | `task` | string | ✓ | — | |
 | `agent` | string | * | — | Loads `~/.synaps-cli/agents/{name}.md` |
 | `system_prompt` | string | * | — | Inline alternative to `agent` |
-| `model` | string | | sonnet | Override |
+| `model` | string | | `subagent_model`, else the foreground model | Exact qualified id from `subagent_models` |
 | `timeout` | integer | | 300 | Seconds |
 | `thinking` | string | | `subagent_thinking` (xhigh) | `low`, `medium`, `high`, `xhigh`, `max` |
 
@@ -750,6 +751,18 @@ subagent_steer(handle_id, message)      → {"acknowledged": true}
 subagent_collect(handle_id)             → {"status": "completed", "output": "full result"}
 subagent_resume(handle_id, instructions) → new handle_id; the worker continues its archived conversation
 ```
+
+`subagent_status`, `subagent_collect` (running and terminal) and the completion
+event's `data` carry `usage`, what this run used so far: `requests` (provider
+responses that reported usage, keep-warm pings included), `input_tokens`,
+`output_tokens`, `cache_read_tokens`, `cache_write_tokens` (plus
+`cache_write_5m_tokens`/`cache_write_1h_tokens` when split), `context_tokens`
+(the latest prompt) and `cost_usd` (list-price estimate from
+`agent_core::pricing`, 4 decimals; absent when nothing was used or the model has
+no list price). The completion text adds one "Used N requests, … tokens, about
+$X at list prices." sentence before "Call subagent_collect". A resumed worker
+counts its own run only; a reaped worker read back from its archive has no
+`usage`.
 
 Use `subagent` for simple sequential delegation (blocks until done).
 Use `subagent_start` for parallel execution or when you want to continue working while the subagent runs.

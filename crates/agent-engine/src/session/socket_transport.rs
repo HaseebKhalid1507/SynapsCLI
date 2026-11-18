@@ -106,6 +106,14 @@ impl FrameBuf {
 }
 
 async fn read_frame(reader: &mut BufReader<ClientReadHalf>, buf: &mut FrameBuf) -> Result<Option<DaemonFrame>, TransportError> {
+    read_frame_as(reader, buf).await
+}
+
+/// [`read_frame`], decoded as `T` (`serde_json::Value`: the frame as sent).
+async fn read_frame_as<T: serde::de::DeserializeOwned>(
+    reader: &mut BufReader<ClientReadHalf>,
+    buf: &mut FrameBuf,
+) -> Result<Option<T>, TransportError> {
     // Cancel-safe: the TUI polls this inside `select!`, so a partial line
     // stays in `buf.line` across a dropped future and is cleared only once
     // a whole frame has been taken out of it.
@@ -128,7 +136,12 @@ async fn read_frame(reader: &mut BufReader<ClientReadHalf>, buf: &mut FrameBuf) 
                 .map(str::trim_end);
             match t {
                 Ok("") => None,
-                Ok(t) => Some((decode_line::<DaemonFrame>(t).map(Some).map_err(TransportError::Protocol), t.len())),
+                Ok(t) => Some((
+                    decode_line::<T>(t)
+                        .map(Some)
+                        .map_err(TransportError::Protocol),
+                    t.len(),
+                )),
                 Err(e) => Some((Err(e), 0)),
             }
         };
@@ -220,6 +233,29 @@ impl Connected {
         match self.request(ClientFrame::Sessions).await? {
             DaemonFrame::SessionList { sessions } => Ok(sessions),
             other => Err(TransportError::Protocol(format!("expected session list, got {other:?}"))),
+        }
+    }
+
+    /// [`Self::sessions`] as the daemon sent them, untyped: a newer daemon's
+    /// fields and values (a lifecycle or worker-row field this build does
+    /// not know) are kept. For printing (`synaps daemon sessions --json`).
+    pub async fn sessions_raw(&mut self) -> Result<serde_json::Value, TransportError> {
+        self.writer
+            .send(ClientFrame::Sessions)
+            .await
+            .map_err(|_| TransportError::Closed)?;
+        let mut frame: serde_json::Value = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            read_frame_as(&mut self.reader, &mut self.buf),
+        )
+        .await
+        .map_err(|_| TransportError::Protocol("reply timed out".into()))??
+        .ok_or(TransportError::Closed)?;
+        match frame.get("type").and_then(|t| t.as_str()) {
+            Some("session_list") => Ok(frame["sessions"].take()),
+            _ => Err(TransportError::Protocol(format!(
+                "expected session list, got {frame}"
+            ))),
         }
     }
 
@@ -730,6 +766,14 @@ impl SocketTransport {
         s
     }
 
+    /// [`Connected::sessions_raw`] on a fresh connection.
+    pub async fn sessions_raw(path: &Path) -> Result<serde_json::Value, TransportError> {
+        let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
+        let s = c.sessions_raw().await;
+        c.bye().await;
+        s
+    }
+
     pub async fn shutdown(path: &Path, force: bool) -> Result<(), TransportError> {
         let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
         c.shutdown(force).await
@@ -1138,6 +1182,7 @@ mod tests {
                         generation: 1,
                         daemon_build: String::new(),
                         features: Vec::new(),
+                        boot_id: String::new(),
                     })
                 }
                 ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
@@ -1504,6 +1549,7 @@ mod tests {
                 generation: 1,
                 daemon_build: String::new(),
                 features: Vec::new(),
+                boot_id: String::new(),
             });
             w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
             line.clear();
@@ -1517,6 +1563,52 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, TransportError::Refused(ref m) if m == "unknown session"), "{err}");
+        srv.await.unwrap();
+    }
+
+    /// `sessions_raw` hands back a newer daemon's listing as sent: a
+    /// lifecycle and fields this build does not know survive (the typed
+    /// decode would read `unknown` and drop the fields).
+    #[tokio::test]
+    async fn raw_sessions_keep_what_a_newer_daemon_sends() {
+        let (_d, path) = sock();
+        let mut l = Listener::bind(&path).unwrap();
+        let list = r#"{"type":"session_list","sessions":[{"id":"s","name":null,"model":"m","cwd":null,"created_at":"2026-11-16T06:00:00Z","continued":false,"continue_info":null,"host_pid":1,"lifecycle":"saved","journal_id":"s","future":7,"workers":{"running":1,"rows":[{"handle_id":"sa_1","subagent_id":1,"agent_name":"a","status":"running","started_at":"2026-11-16T06:00:00Z","new_field":"x"}]}}]}"#;
+        let srv = tokio::spawn(async move {
+            let stream = l.accept().await.unwrap();
+            let (r, mut w) = crate::ipc::split_server(stream);
+            let mut reader = BufReader::new(r);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let welcome = DaemonFrame::Welcome(Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "t".into(),
+                pid: 1,
+                profile: None,
+                sessions: vec![],
+                progressive_tool_disclosure: true,
+                generation: 1,
+                daemon_build: String::new(),
+                features: Vec::new(),
+                boot_id: String::new(),
+            });
+            w.write_all(encode_line(&welcome).unwrap().as_bytes())
+                .await
+                .unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(matches!(
+                decode_line::<ClientFrame>(line.trim_end()),
+                Ok(ClientFrame::Sessions)
+            ));
+            w.write_all(format!("{list}\n").as_bytes()).await.unwrap();
+            line.clear();
+            let _ = reader.read_line(&mut line).await; // bye
+        });
+        let raw = SocketTransport::sessions_raw(&path).await.unwrap();
+        assert_eq!(raw[0]["lifecycle"], "saved");
+        assert_eq!(raw[0]["future"], 7);
+        assert_eq!(raw[0]["workers"]["rows"][0]["new_field"], "x");
         srv.await.unwrap();
     }
 
@@ -1539,6 +1631,7 @@ mod tests {
             generation: 1,
             daemon_build: String::new(),
             features,
+            boot_id: String::new(),
         });
         w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
         let mut sent = Vec::new();
