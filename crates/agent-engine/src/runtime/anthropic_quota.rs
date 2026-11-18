@@ -74,6 +74,7 @@ const H_7D_STATUS: &str = "anthropic-ratelimit-unified-7d-status";
 const H_7D_RESET: &str = "anthropic-ratelimit-unified-7d-reset";
 const H_RETRY_AFTER: &str = "retry-after";
 const RATELIMIT_PREFIX: &str = "anthropic-ratelimit-";
+const UNIFIED_PREFIX: &str = "anthropic-ratelimit-unified-";
 
 /// Which provider-declared signal proved exhaustion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +96,11 @@ pub(crate) struct AnthropicQuotaEvidence {
     /// one that is in the future and within [`MAX_RESET_HORIZON_SECS`].
     /// `None` = unknown, never guessed.
     pub(crate) resets_at_ms: Option<u64>,
+    /// The provider says the account-wide windows are not what rejected
+    /// the request, and another limit is: one that covers the requested
+    /// model only (e.g. `7d_oi`, the weekly limit of one model). Only that
+    /// model cools on the account. `false` (fail closed): the account.
+    pub(crate) model_scoped: bool,
 }
 
 impl AnthropicQuotaEvidence {
@@ -214,7 +220,13 @@ fn body_error_type(body_prefix: &str) -> Option<String> {
 /// Decision table (first match wins):
 /// 1. `anthropic-ratelimit-unified-status == rejected` (case-insensitive,
 ///    trimmed) ⇒ exhausted; reset from `…-unified-reset`, else the rejected
-///    window's reset, else `retry-after`.
+///    window's reset, else `retry-after`. It is model-scoped
+///    ([`AnthropicQuotaEvidence::model_scoped`]) only when the provider
+///    positively clears the account-wide windows (`…-5h-status` and/or
+///    `…-7d-status` present, neither `rejected`) and another
+///    `…-unified-<claim>-status` is `rejected` (not `overage`), and every
+///    such claim is a known per-model claim ([`MODEL_CLAIMS`]); else the
+///    account (an unknown claim is logged by header name).
 /// 2. `…-unified-5h-status` / `…-unified-7d-status == rejected` ⇒ exhausted
 ///    with that window's `-reset` (else `retry-after`).
 /// 3. Body parses as JSON with `error.type == "rate_limit_error"` AND the
@@ -232,28 +244,54 @@ pub(crate) fn classify_anthropic_429(
     let seven_d_rejected = header_status_is(headers, H_7D_STATUS, "rejected");
 
     if header_status_is(headers, H_UNIFIED_STATUS, "rejected") {
-        let mut names: Vec<&str> = vec![H_UNIFIED_RESET];
+        let mut names: Vec<String> = vec![H_UNIFIED_RESET.to_string()];
         if five_h_rejected {
-            names.push(H_5H_RESET);
+            names.push(H_5H_RESET.to_string());
         }
         if seven_d_rejected {
-            names.push(H_7D_RESET);
+            names.push(H_7D_RESET.to_string());
         }
+        // Account-wide windows positively not rejected: at least one is
+        // reported, none says `rejected`. A missing header proves nothing.
+        let account_clear = (header_str(headers, H_5H_STATUS).is_some()
+            || header_str(headers, H_7D_STATUS).is_some())
+            && !five_h_rejected
+            && !seven_d_rejected;
+        let scoped = rejected_scoped_claims(headers);
+        let unknown: Vec<&str> = scoped
+            .iter()
+            .copied()
+            .filter(|c| !MODEL_CLAIMS.contains(c))
+            .collect();
+        for claim in &unknown {
+            tracing::warn!(
+                header = %format!("{UNIFIED_PREFIX}{claim}-status"),
+                "anthropic 429 rejects a limit not known to cover one model; cooling the whole account"
+            );
+        }
+        let model_scoped = account_clear && !scoped.is_empty() && unknown.is_empty();
+        if model_scoped {
+            names.extend(scoped.iter().map(|c| format!("{UNIFIED_PREFIX}{c}-reset")));
+        }
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
         return Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
             signal: AnthropicQuotaSignal::UnifiedStatusRejected,
             resets_at_ms: first_reset_ms(headers, &names, now_ms),
+            model_scoped,
         });
     }
     if five_h_rejected {
         return Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
             signal: AnthropicQuotaSignal::WindowStatusRejected { window: "5h" },
             resets_at_ms: first_reset_ms(headers, &[H_5H_RESET], now_ms),
+            model_scoped: false,
         });
     }
     if seven_d_rejected {
         return Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
             signal: AnthropicQuotaSignal::WindowStatusRejected { window: "7d" },
             resets_at_ms: first_reset_ms(headers, &[H_7D_RESET], now_ms),
+            model_scoped: false,
         });
     }
     // Secondary evidence: the provider declared a rate-limit error AND a
@@ -266,11 +304,42 @@ pub(crate) fn classify_anthropic_429(
                 return Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                     signal: AnthropicQuotaSignal::LongResetWithRateLimitBody,
                     resets_at_ms: Some(reset_ms),
+                    model_scoped: false,
                 });
             }
         }
     }
     Anthropic429::RateLimited
+}
+
+/// Unified claims known to cover one model's own limit: `7d_oi`, the only
+/// one seen live (2026-11-15; its usage counterpart is the `weekly_scoped`
+/// limit of a single model). Per-model names such as `7d_opus` are not
+/// listed: they are unconfirmed, and the classifier cannot check that the
+/// claim's model is the requested one. Any other rejected claim
+/// (`seven_day_oauth_apps`, `seven_day_cowork`, … or one not yet seen)
+/// is treated as covering the account.
+const MODEL_CLAIMS: &[&str] = &["7d_oi"];
+
+/// The `anthropic-ratelimit-unified-<claim>-status: rejected` headers other
+/// than the account-wide `5h` / `7d` windows and `overage` (paid extra
+/// usage, rejected whenever it is switched off): the claims that cover
+/// something narrower than the account, e.g. `7d_oi`.
+fn rejected_scoped_claims(headers: &HeaderMap) -> Vec<&str> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let claim = name
+                .as_str()
+                .strip_prefix(UNIFIED_PREFIX)?
+                .strip_suffix("-status")?;
+            let rejected = value
+                .to_str()
+                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("rejected"));
+            (rejected && !claim.is_empty() && !matches!(claim, "5h" | "7d" | "overage"))
+                .then_some(claim)
+        })
+        .collect()
 }
 
 /// Truncate `body` to at most `cap` bytes on a char boundary. The result is
@@ -532,17 +601,25 @@ pub(crate) trait AnthropicAccountRouter: Send + Sync {
     /// mode in which the runtime may switch accounts.
     fn auto_selected(&self) -> bool;
 
-    /// Best-effort cooldown report for `failed`. Must never fail the turn.
-    /// Always called on recognized exhaustion, even when the gate then
-    /// refuses to switch, so the next turn boundary re-selects away.
-    async fn report_exhausted(&self, failed: &CredentialRef, evidence: &AnthropicQuotaEvidence);
+    /// Best-effort cooldown report for `failed`, whose request was for
+    /// `model`: the account, or `model` alone on it when the evidence is
+    /// model-scoped. Must never fail the turn. Always called on recognized
+    /// exhaustion, even when the gate then refuses to switch, so the next
+    /// turn boundary re-selects away.
+    async fn report_exhausted(
+        &self,
+        failed: &CredentialRef,
+        model: &str,
+        evidence: &AnthropicQuotaEvidence,
+    );
 
-    /// A request on `seat` sent at `sent_at_ms` (epoch ms) was accepted
-    /// after this request reported `seat` exhausted (a short or unknown
-    /// reset the ordinary retry outlived): drop the cooldown, so the next
+    /// A request for `model` on `seat` sent at `sent_at_ms` (epoch ms) was
+    /// accepted after this request reported `seat` exhausted (a short or
+    /// unknown reset the ordinary retry outlived): drop the account's
+    /// cooldown and `model`'s own (never another model's), so the next
     /// round does not move the turn off an account that serves. Must never
     /// fail the turn.
-    async fn report_served(&self, seat: &CredentialRef, sent_at_ms: u64);
+    async fn report_served(&self, seat: &CredentialRef, model: &str, sent_at_ms: u64);
 
     /// After recognized exhaustion, ask the broker to select again for
     /// `model`, never answering with an account in `attempted`: every
@@ -618,14 +695,25 @@ impl AnthropicAccountRouter for BrokerAnthropicRouter {
         )
     }
 
-    async fn report_exhausted(&self, failed: &CredentialRef, evidence: &AnthropicQuotaEvidence) {
+    async fn report_exhausted(
+        &self,
+        failed: &CredentialRef,
+        model: &str,
+        evidence: &AnthropicQuotaEvidence,
+    ) {
         let now_ms = crate::epoch_millis();
         let until_ms = evidence.cooldown_until_ms(now_ms);
-        if let Err(e) = self
-            .broker()
-            .report_cooldown(failed, until_ms, COOLDOWN_REASON_QUOTA)
-            .await
-        {
+        let model = super::auth::quota_model_key(model);
+        let reported = if evidence.model_scoped {
+            self.broker()
+                .report_model_cooldown(failed, model, until_ms, COOLDOWN_REASON_QUOTA)
+                .await
+        } else {
+            self.broker()
+                .report_cooldown(failed, until_ms, COOLDOWN_REASON_QUOTA)
+                .await
+        };
+        if let Err(e) = reported {
             tracing::warn!(
                 account = %failed,
                 error = %e,
@@ -635,14 +723,17 @@ impl AnthropicAccountRouter for BrokerAnthropicRouter {
         tracing::warn!(
             account = %failed,
             signal = ?evidence.signal,
+            model_scoped = evidence.model_scoped,
+            model,
             resets_at_ms = ?evidence.resets_at_ms,
             until_ms = ?until_ms,
             "anthropic usage window exhausted"
         );
     }
 
-    async fn report_served(&self, seat: &CredentialRef, sent_at_ms: u64) {
-        self.broker().clear_cooldown(seat, sent_at_ms);
+    async fn report_served(&self, seat: &CredentialRef, model: &str, sent_at_ms: u64) {
+        self.broker()
+            .clear_cooldown_for(seat, Some(super::auth::quota_model_key(model)), sent_at_ms);
     }
 
     async fn failover(
@@ -682,10 +773,13 @@ mod tests {
 
     const NOW_MS: u64 = 1_758_000_000_000; // 2025-09-16T05:20:00Z
 
-    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
-            h.append(*k, HeaderValue::from_str(v).unwrap());
+            h.append(
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
         }
         h
     }
@@ -710,6 +804,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::UnifiedStatusRejected,
                 resets_at_ms: Some(NOW_MS + 3 * 3600 * 1000),
+                model_scoped: false,
             })
         );
         // Case and whitespace on the status value are tolerated.
@@ -719,6 +814,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::UnifiedStatusRejected,
                 resets_at_ms: None,
+                model_scoped: false,
             })
         ));
     }
@@ -734,6 +830,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::UnifiedStatusRejected,
                 resets_at_ms: Some(NOW_MS + 3 * 3600 * 1000),
+                model_scoped: false,
             })
         );
         // A small integer cannot be an epoch: relative seconds from now.
@@ -746,6 +843,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::UnifiedStatusRejected,
                 resets_at_ms: Some(NOW_MS + 7200 * 1000),
+                model_scoped: false,
             })
         );
     }
@@ -788,6 +886,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::WindowStatusRejected { window: "5h" },
                 resets_at_ms: Some(NOW_MS + 1800 * 1000),
+                model_scoped: false,
             })
         );
         let h = headers(&[
@@ -799,6 +898,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::WindowStatusRejected { window: "7d" },
                 resets_at_ms: Some(NOW_MS + 5 * 86400 * 1000),
+                model_scoped: false,
             })
         );
     }
@@ -816,6 +916,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::UnifiedStatusRejected,
                 resets_at_ms: Some(NOW_MS + 86400 * 1000),
+                model_scoped: false,
             })
         );
         let h = headers(&[
@@ -827,6 +928,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::UnifiedStatusRejected,
                 resets_at_ms: Some(NOW_MS + 600 * 1000),
+                model_scoped: false,
             })
         );
     }
@@ -839,6 +941,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::LongResetWithRateLimitBody,
                 resets_at_ms: Some(NOW_MS + 3600 * 1000),
+                model_scoped: false,
             })
         );
         // HTTP-date retry-after and RFC 3339 reset headers count too.
@@ -848,6 +951,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::LongResetWithRateLimitBody,
                 resets_at_ms: Some(NOW_MS + 3600 * 1000),
+                model_scoped: false,
             })
         );
         let h = headers(&[("anthropic-ratelimit-tokens-reset", "2025-09-16T06:20:00Z")]);
@@ -856,6 +960,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::LongResetWithRateLimitBody,
                 resets_at_ms: Some(NOW_MS + 3600 * 1000),
+                model_scoped: false,
             })
         );
     }
@@ -949,6 +1054,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::UnifiedStatusRejected,
                 resets_at_ms: None,
+                model_scoped: false,
             })
         );
         let h = headers(&[
@@ -963,6 +1069,7 @@ mod tests {
             Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
                 signal: AnthropicQuotaSignal::UnifiedStatusRejected,
                 resets_at_ms: None,
+                model_scoped: false,
             })
         );
         // Unparsable values are ignored, not errors.
@@ -985,16 +1092,119 @@ mod tests {
         );
     }
 
+    /// The 429 of 2026-11-15: the unified status is rejected, but the
+    /// overall weekly window is only `allowed_warning`; what is rejected is
+    /// `7d_oi`, one model's weekly limit (and paid overage, which is off).
+    fn fable_429(seven_d: Option<&str>, five_h: Option<&str>) -> HeaderMap {
+        let reset = epoch_secs_in(20 * 3600);
+        let mut pairs = vec![
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-representative-claim", "seven_day_overage_included"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.0"),
+            ("anthropic-ratelimit-unified-overage-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", reset.as_str()),
+        ];
+        if let Some(v) = seven_d {
+            pairs.push(("anthropic-ratelimit-unified-7d-status", v));
+        }
+        if let Some(v) = five_h {
+            pairs.push(("anthropic-ratelimit-unified-5h-status", v));
+        }
+        headers(&pairs)
+    }
+
+    fn model_scoped(h: &HeaderMap) -> bool {
+        match classify_anthropic_429(h, "", NOW_MS) {
+            Anthropic429::QuotaExhausted(e) => e.model_scoped,
+            other => panic!("exhaustion expected: {other:?}"),
+        }
+    }
+
+    /// A rejection is model-scoped only when the provider positively clears
+    /// the account-wide windows and another claim is rejected; anything
+    /// less cools the account (fail closed).
+    #[test]
+    fn a_rejected_model_claim_beside_allowed_account_windows_is_model_scoped() {
+        let real = fable_429(Some("allowed_warning"), None);
+        assert_eq!(
+            classify_anthropic_429(&real, "", NOW_MS),
+            Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
+                signal: AnthropicQuotaSignal::UnifiedStatusRejected,
+                resets_at_ms: Some(NOW_MS + 20 * 3600 * 1000),
+                model_scoped: true,
+            })
+        );
+        assert!(model_scoped(&fable_429(None, Some("allowed"))), "5h alone clears it too");
+        assert!(model_scoped(&fable_429(Some("allowed"), Some("allowed_warning"))));
+        // The account-wide window is rejected too: the account.
+        assert!(!model_scoped(&fable_429(Some("rejected"), None)));
+        assert!(!model_scoped(&fable_429(Some("allowed"), Some("REJECTED"))));
+        // No account-wide window reported: nothing proves it is not the account.
+        assert!(!model_scoped(&fable_429(None, None)));
+        // Only paid overage is rejected besides the unified status: unknown cause.
+        let overage_only = headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-overage-status", "rejected"),
+        ]);
+        assert!(!model_scoped(&overage_only));
+        // A model claim rejected without a rejected unified status: as before.
+        let no_unified = headers(&[
+            ("anthropic-ratelimit-unified-7d-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+        ]);
+        assert!(!model_scoped(&no_unified));
+    }
+
+    /// A rejected claim not known to cover one model (Anthropic has
+    /// account-level ones too, e.g. OAuth apps, Cowork) cools the whole
+    /// account, even beside allowed account windows and a known model claim.
+    #[test]
+    fn an_unknown_rejected_claim_cools_the_whole_account() {
+        for claim in [
+            "7d_oauth_apps",
+            "7d_cowork",
+            "7d_opus",
+            "7d_sonnet",
+            "something_new",
+        ] {
+            let name = format!("anthropic-ratelimit-unified-{claim}-status");
+            let unknown = headers(&[
+                ("anthropic-ratelimit-unified-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-status", "allowed"),
+                ("anthropic-ratelimit-unified-7d-status", "allowed"),
+                (name.as_str(), "rejected"),
+            ]);
+            assert!(!model_scoped(&unknown), "{claim}");
+            let beside_known = headers(&[
+                ("anthropic-ratelimit-unified-status", "rejected"),
+                ("anthropic-ratelimit-unified-7d-status", "allowed"),
+                ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+                (name.as_str(), "rejected"),
+            ]);
+            assert!(!model_scoped(&beside_known), "{claim} beside 7d_oi");
+        }
+        let known = headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+        ]);
+        assert!(model_scoped(&known), "7d_oi");
+    }
+
     #[test]
     fn cooldown_deadline_defaults_and_caps() {
         let with = AnthropicQuotaEvidence {
             signal: AnthropicQuotaSignal::UnifiedStatusRejected,
             resets_at_ms: Some(NOW_MS + 90_000),
+            model_scoped: false,
         };
         assert_eq!(with.cooldown_until_ms(NOW_MS), Some(NOW_MS + 90_000));
         let without = AnthropicQuotaEvidence {
             signal: AnthropicQuotaSignal::UnifiedStatusRejected,
             resets_at_ms: None,
+            model_scoped: false,
         };
         assert_eq!(
             without.cooldown_until_ms(NOW_MS),
@@ -1003,6 +1213,7 @@ mod tests {
         let past = AnthropicQuotaEvidence {
             signal: AnthropicQuotaSignal::UnifiedStatusRejected,
             resets_at_ms: Some(NOW_MS - 1),
+            model_scoped: false,
         };
         assert_eq!(
             past.cooldown_until_ms(NOW_MS),
@@ -1011,6 +1222,7 @@ mod tests {
         let far = AnthropicQuotaEvidence {
             signal: AnthropicQuotaSignal::UnifiedStatusRejected,
             resets_at_ms: Some(NOW_MS + 30 * 86400 * 1000),
+            model_scoped: false,
         };
         assert_eq!(
             far.cooldown_until_ms(NOW_MS),
@@ -1141,6 +1353,7 @@ mod tests {
         let at = |signal, resets_at_ms| AnthropicQuotaEvidence {
             signal,
             resets_at_ms,
+            model_scoped: false,
         };
         let unified = at(
             AnthropicQuotaSignal::UnifiedStatusRejected,
@@ -1255,6 +1468,10 @@ mod tests {
         /// Force a non-availability broker error from the auto vend.
         vend_error: Mutex<Option<BrokerError>>,
         cooldowns: Mutex<Vec<(String, Option<u64>, String)>>,
+        /// `report_model_cooldown`: (account, model, until).
+        model_cooldowns: Mutex<Vec<(String, String, Option<u64>)>>,
+        /// `clear_cooldown_for`: (account, model, sent at).
+        cleared: Mutex<Vec<(String, Option<String>, u64)>>,
         auto_calls: Mutex<Vec<Option<String>>>,
         /// The `exclude` list of every excluding vend.
         excluded: Mutex<Vec<Vec<CredentialRef>>>,
@@ -1267,6 +1484,8 @@ mod tests {
                 pick: Mutex::new(pick),
                 vend_error: Mutex::new(None),
                 cooldowns: Mutex::new(Vec::new()),
+                model_cooldowns: Mutex::new(Vec::new()),
+                cleared: Mutex::new(Vec::new()),
                 auto_calls: Mutex::new(Vec::new()),
                 excluded: Mutex::new(Vec::new()),
             })
@@ -1339,6 +1558,25 @@ mod tests {
                 .push((cred.storage_key(), until_ms, reason.to_string()));
             Ok(())
         }
+        async fn report_model_cooldown(
+            &self,
+            cred: &CredentialRef,
+            model: &str,
+            until_ms: Option<u64>,
+            _reason: &str,
+        ) -> Result<(), BrokerError> {
+            self.model_cooldowns
+                .lock()
+                .unwrap()
+                .push((cred.storage_key(), model.to_string(), until_ms));
+            Ok(())
+        }
+        fn clear_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>, sent_at_ms: u64) {
+            self.cleared
+                .lock()
+                .unwrap()
+                .push((cred.storage_key(), model.map(str::to_string), sent_at_ms));
+        }
         async fn proxy(
             &self,
             _r: crate::auth::ProxyRequest,
@@ -1367,6 +1605,7 @@ mod tests {
         AnthropicQuotaEvidence {
             signal: AnthropicQuotaSignal::UnifiedStatusRejected,
             resets_at_ms: reset_ms,
+            model_scoped: false,
         }
     }
 
@@ -1376,7 +1615,7 @@ mod tests {
         let router = BrokerAnthropicRouter::new(broker.clone());
         let reset = crate::epoch_millis() + 2 * 3600 * 1000;
         router
-            .report_exhausted(&seat("claude4"), &evidence(Some(reset)))
+            .report_exhausted(&seat("claude4"), "claude-opus-4-7", &evidence(Some(reset)))
             .await;
         let reports = broker.cooldowns.lock().unwrap().clone();
         assert_eq!(
@@ -1389,12 +1628,42 @@ mod tests {
         );
         // No reset: the short default deadline, never `None`.
         router
-            .report_exhausted(&seat("claude4"), &evidence(None))
+            .report_exhausted(&seat("claude4"), "claude-opus-4-7", &evidence(None))
             .await;
         let reports = broker.cooldowns.lock().unwrap().clone();
         let until = reports[1].1.expect("default cooldown deadline");
         let now = crate::epoch_millis();
         assert!(until > now && until <= now + DEFAULT_COOLDOWN_SECS * 1000 + 1000);
+        assert!(broker.model_cooldowns.lock().unwrap().is_empty());
+    }
+
+    /// Model-scoped evidence cools the requested model on the account (its
+    /// bare id), never the account; a served request clears that model's
+    /// cooldown (and the account's), named by the model it was for.
+    #[tokio::test]
+    async fn router_reports_a_model_scoped_limit_for_the_requested_model_only() {
+        let broker = ScriptedBroker::new(AccountSelector::Auto, Some("claude2"));
+        let router = BrokerAnthropicRouter::new(broker.clone());
+        let reset = crate::epoch_millis() + 2 * 3600 * 1000;
+        let scoped = AnthropicQuotaEvidence {
+            model_scoped: true,
+            ..evidence(Some(reset))
+        };
+        router
+            .report_exhausted(&seat("claude4"), "anthropic/claude-fable-5", &scoped)
+            .await;
+        assert!(broker.cooldowns.lock().unwrap().is_empty(), "the account is not cooled");
+        assert_eq!(
+            broker.model_cooldowns.lock().unwrap().clone(),
+            vec![("anthropic@claude4".to_string(), "claude-fable-5".to_string(), Some(reset))]
+        );
+        router
+            .report_served(&seat("claude4"), "anthropic/claude-fable-5", 42)
+            .await;
+        assert_eq!(
+            broker.cleared.lock().unwrap().clone(),
+            vec![("anthropic@claude4".to_string(), Some("claude-fable-5".to_string()), 42)]
+        );
     }
 
     #[tokio::test]

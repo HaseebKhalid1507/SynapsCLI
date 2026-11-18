@@ -357,16 +357,21 @@ impl AuthMethods {
     ) -> Result<()> {
         let selector = broker.account_selector(OAuthProviderId::Anthropic);
         if point == RefreshPoint::KeepWarm {
-            return Self::refresh_for_keepwarm(auth, source, broker, &selector).await;
+            return Self::refresh_for_keepwarm(auth, source, broker, &selector, model).await;
         }
         // Auto mid-turn: a seat this turn pinned that is now cooling down
-        // (another session met its limit) is not kept; the request would
-        // meet the same limit. Memory only, outside the auth lock.
+        // for this turn's model (another session met its limit) is not
+        // kept; the request would meet the same limit. Another model's
+        // cooldown does not move the turn. Memory only, outside the auth
+        // lock.
         let cooling = match (&selector, point) {
             (AccountSelector::Auto, RefreshPoint::WithinTurn) => {
                 let bound = auth.read().await.bound_credential.clone();
-                turn_pinned_credential(source, bound.as_deref())
-                    .is_some_and(|cred| broker.active_cooldown(&cred).is_some())
+                turn_pinned_credential(source, bound.as_deref()).is_some_and(|cred| {
+                    broker
+                        .active_cooldown_for(&cred, model.map(quota_model_key))
+                        .is_some()
+                })
             }
             _ => false,
         };
@@ -477,11 +482,14 @@ impl AuthMethods {
     /// refused refresh. No bound account, an account the selector no longer
     /// names, an account that is cooling down, or a failed re-vend stops
     /// the ping with an error, never another account.
+    /// `model` is the ping's: a cooldown that covers another model alone
+    /// never stops it.
     async fn refresh_for_keepwarm(
         auth: Arc<RwLock<AuthState>>,
         source: &CredentialSource,
         broker: &dyn CredentialBroker,
         selector: &AccountSelector,
+        model: Option<&str>,
     ) -> Result<()> {
         let (bound, fresh, recorded_mtime) = {
             let g = auth.read().await;
@@ -510,7 +518,7 @@ impl AuthMethods {
                     .into(),
             ));
         };
-        if let Some(until_ms) = broker.active_cooldown(&cred) {
+        if let Some(until_ms) = broker.active_cooldown_for(&cred, model.map(quota_model_key)) {
             let now = crate::epoch_millis();
             tracing::info!(
                 credential = %cred,
@@ -598,11 +606,14 @@ impl AuthMethods {
         let mut cooling_pin = None;
         if point == RefreshPoint::WithinTurn {
             if let Some(cred) = turn_pinned_credential(source, bound) {
-                // A pinned seat that is cooling down is not re-vended: the
-                // selection below never picks it while the cooldown lasts.
-                // If no account can serve (every one cooling), the turn
-                // keeps it (below) rather than dying after its tools ran.
-                if let Some(until_ms) = broker.active_cooldown(&cred) {
+                // A pinned seat that is cooling down for this model is not
+                // re-vended: the selection below never picks it while the
+                // cooldown lasts. If no account can serve (every one
+                // cooling), the turn keeps it (below) rather than dying
+                // after its tools ran.
+                if let Some(until_ms) =
+                    broker.active_cooldown_for(&cred, model.map(quota_model_key))
+                {
                     tracing::info!(
                         credential = %cred,
                         until_ms,
@@ -779,6 +790,10 @@ fn account_failure_part(a: &crate::auth::AccountFailure, now_ms: u64) -> String 
         extra.push(format!("retry after {secs}s"));
     }
     let cooling = a.cooling_down && a.kind != crate::auth::AccountFailureKind::CoolingDown;
+    // A cooldown of one model: the account still serves the others.
+    if let Some(model) = a.cooldown_model.as_deref().filter(|_| a.cooling_down) {
+        extra.push(format!("{model} only"));
+    }
     match a.until_ms.filter(|t| *t > now_ms) {
         Some(until) => extra.push(format!(
             "{}until {}",
@@ -1775,6 +1790,8 @@ mod tests {
         auto_error: Mutex<Option<BrokerError>>,
         /// Storage keys of seats that are cooling down.
         cooling: Vec<String>,
+        /// (storage key, model) of seats cooling down for one model.
+        model_cooling: Vec<(String, String)>,
     }
 
     impl ScriptedBroker {
@@ -1787,6 +1804,7 @@ mod tests {
                 auto_pick: "auto-pick",
                 auto_error: Mutex::new(None),
                 cooling: Vec::new(),
+                model_cooling: Vec::new(),
             }
         }
         fn explicit(&self) -> Vec<String> {
@@ -1812,6 +1830,13 @@ mod tests {
             self.cooling
                 .contains(&cred.storage_key())
                 .then_some(FRESH)
+        }
+        fn active_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>) -> Option<u64> {
+            let key = cred.storage_key();
+            let for_model = model.is_some_and(|m| {
+                self.model_cooling.iter().any(|(k, cm)| *k == key && cm == m)
+            });
+            self.active_cooldown(cred).or(for_model.then_some(FRESH))
         }
         async fn access_token_for(
             &self,
@@ -2116,6 +2141,43 @@ mod tests {
             assert_eq!(broker.auto(), vec![Some("claude-opus-4-7".to_string())]);
         }
 
+        // The pinned seat cools for another model only: kept, no broker
+        // call. For this turn's own model: left, as above.
+        let fable = || {
+            let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+            broker.model_cooling = vec![("anthropic@work".into(), "claude-fable-5".into())];
+            broker
+        };
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let broker = fable();
+        AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some("anthropic/claude-opus-4-7"),
+            RefreshPoint::WithinTurn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth.read().await.auth_token, "sk-HELD", "kept for opus");
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+        for expires in [FRESH, STALE] {
+            let auth = bound_state(&source, &work_cred(), expires);
+            let broker = fable();
+            AuthMethods::refresh_with_broker(
+                Arc::clone(&auth),
+                &source,
+                &broker,
+                Some("anthropic/claude-fable-5"),
+                RefreshPoint::WithinTurn,
+            )
+            .await
+            .unwrap();
+            assert_eq!(auth.read().await.auth_token, "tok-auto-auto-pick", "left for fable");
+            assert!(broker.explicit().is_empty(), "not re-vended for fable");
+            assert_eq!(broker.auto(), vec![Some("claude-fable-5".to_string())]);
+        }
+
         let auth = bound_state(&source, &work_cred(), FRESH);
         let mut broker = ScriptedBroker::new(AccountSelector::Auto);
         broker.cooling = vec!["anthropic@other".into()];
@@ -2254,6 +2316,7 @@ mod tests {
             retry_after_s: None,
             until_ms: None,
             cooling_down: false,
+            cooldown_model: None,
         }
     }
 
@@ -2547,6 +2610,23 @@ mod tests {
         );
         assert!(!text.contains("synaps login"), "{text}");
         assert!(turn_warn(&log).contains("kind=all_cooling_down"));
+
+        // A cooldown of one model names it.
+        let mut c7 = account("claude7", AK::CoolingDown);
+        c7.cooling_down = true;
+        c7.cooldown_model = Some("claude-fable-5".into());
+        c7.until_ms = Some(soon);
+        let failure = SelectionFailure {
+            kind: SK::AllCoolingDown,
+            accounts: vec![c7],
+            earliest_reset_ms: Some(soon),
+            usage_read_retry_ms: None,
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        assert!(
+            text.contains(&format!("claude7: cooling_down (claude-fable-5 only, until {soon_text})")),
+            "{text}"
+        );
     }
 
     /// Review fix 1: the seat this turn pinned is cooling down and no
@@ -2631,6 +2711,31 @@ mod tests {
         assert!(err.to_string().contains("account cooling"), "{err}");
         assert!(broker.auto().is_empty() && broker.explicit().is_empty());
         assert_eq!(auth.read().await.auth_token, "sk-HELD");
+
+        // Cooling for fable only: an opus ping goes, a fable ping stops.
+        let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+        broker.model_cooling = vec![("anthropic@work".into(), "claude-fable-5".into())];
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some("claude-opus-4-7"),
+            RefreshPoint::KeepWarm,
+        )
+        .await
+        .expect("another model's cooldown does not stop the ping");
+        let err = AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some("anthropic/claude-fable-5"),
+            RefreshPoint::KeepWarm,
+        )
+        .await
+        .expect_err("the ping's own model is cooling");
+        assert!(err.to_string().contains("account cooling"), "{err}");
+        assert!(broker.auto().is_empty() && broker.explicit().is_empty());
     }
 
     /// Review fix 2: an explicit selector that no longer names the bound
