@@ -415,9 +415,18 @@ impl Connected {
             .send(ClientFrame::CatalogPage { req, before, limit, named_only })
             .await
             .map_err(|_| TransportError::Closed)?;
-        let frame = tokio::time::timeout(CATALOG_PAGE_TIMEOUT, read_frame(&mut self.reader, &mut self.buf))
-            .await
-            .map_err(|_| TransportError::Protocol("catalog page reply timed out".into()))??;
+        // A page an earlier call gave up on (timed out, or its future was
+        // dropped) may still answer first: skip it, within this deadline.
+        let deadline = tokio::time::Instant::now() + CATALOG_PAGE_TIMEOUT;
+        let frame = loop {
+            let frame = tokio::time::timeout_at(deadline, read_frame(&mut self.reader, &mut self.buf))
+                .await
+                .map_err(|_| TransportError::Protocol("catalog page reply timed out".into()))??;
+            match frame {
+                Some(DaemonFrame::CatalogPage { req: r, .. }) if r < req => continue,
+                f => break f,
+            }
+        };
         match frame.ok_or(TransportError::Closed)? {
             DaemonFrame::CatalogPage { req: r, error: Some(e), .. } if r == req => Err(TransportError::Protocol(e)),
             DaemonFrame::CatalogPage { req: r, sessions, next, .. } if r == req => Ok(SavedPage { sessions, next }),

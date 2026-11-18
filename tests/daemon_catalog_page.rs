@@ -296,6 +296,30 @@ async fn concurrent_pages_share_one_catalog_load() {
     stop(d).await;
 }
 
+/// A `Connected` whose page call was given up on stays usable: the next
+/// call skips the stale reply to the earlier `req` and returns its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_page_given_up_on_does_not_answer_the_next_one() {
+    let guard = HomeGuard::new();
+    seed_home(&guard);
+    let d = start(&guard).await;
+    let mut conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let held = d.state.saved.hold().await;
+    let before = d.state.saved.requests();
+    let gave_up = tokio::time::timeout(Duration::from_millis(300), conn.catalog_page(None, Some(1), true)).await;
+    assert!(gave_up.is_err(), "the load is held");
+    wait_requests(&d, before + 1).await;
+    drop(held);
+    let p = tokio::time::timeout(Duration::from_secs(20), conn.catalog_page(None, None, false))
+        .await
+        .expect("timely")
+        .expect("its own page, not the stale one");
+    assert_eq!(ids(&p.sessions), [ALPHA, BRAVO, GAMMA, DELTA]);
+    conn.bye().await;
+    stop(d).await;
+}
+
 /// A page whose load is held open for 2 s blocks nothing on its own
 /// connection: `Sessions` and `Ping` are answered at once, and so is a
 /// `Reload` (refused here: a bad exe). An announced reload says
