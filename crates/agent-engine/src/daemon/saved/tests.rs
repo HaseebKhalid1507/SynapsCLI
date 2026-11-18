@@ -245,6 +245,8 @@ fn handle(actor: &str, journal: &str, supersedes: &[&str]) -> (SessionHandle, to
 /// The one rule: a head is out of the pages iff a live session holds it.
 /// After a LinkedSuccessor compaction whose successor is not on disk yet,
 /// the disk chain ends at the predecessor, which the actor still holds.
+/// Mid-compaction the successor is on disk (the head) while the actor is
+/// still on the predecessor: the head is held through its parent.
 /// After `/clear` the actor keeps its id but no longer holds its old
 /// conversation: that one is saved and listed.
 #[tokio::test]
@@ -257,17 +259,23 @@ async fn held_excludes_a_compacted_predecessor_but_never_a_cleared_id() {
     const CLEARED: &str = "20260101-000002-bbbb"; // actor BBBB, cleared to NNNN
     const HELD: &str = "20260101-000003-cccc";
     const FREE: &str = "20260101-000004-dddd";
+    const MID: &str = "20260101-000005-ee01"; // compacting: successor saved, actor not moved yet
+    const SUCC: &str = "20260101-000005-ee02";
     seed_full(d, PRED, Some("pred"), "P", t - Days::hours(1), 9, Some("20260101-000001-aa02"), None);
     seed(d, CLEARED, Some("cleared"), "B", t - Days::hours(2), 9, None);
     seed(d, HELD, None, "C", t - Days::hours(3), 9, None);
     seed(d, FREE, None, "D", t - Days::hours(4), 9, None);
+    seed_full(d, MID, None, "E", t - Days::hours(5), 9, Some(SUCC), None);
+    seed_full(d, SUCC, None, "E", t - Days::minutes(30), 2, None, Some(MID));
     let facts = facts_of(&p);
-    assert_eq!(facts.iter().map(|f| f.journal_id.as_str()).collect::<Vec<_>>(), [PRED, CLEARED, HELD, FREE]);
+    assert_eq!(facts.iter().map(|f| f.journal_id.as_str()).collect::<Vec<_>>(), [SUCC, PRED, CLEARED, HELD, FREE]);
 
     let (compacted, _a) = handle(PRED, "20260101-000001-aa02", &[PRED]);
     let (cleared, _b) = handle(CLEARED, "20260101-000009-nnnn", &[]);
     let (plain, _c) = handle(HELD, HELD, &[]);
-    let handles = [compacted, cleared, plain];
+    let (compacting, _e) = handle(MID, MID, &[]);
+    let handles = [compacted, cleared, plain, compacting];
+    assert!(!held(&handles, SUCC), "not yet moved onto the successor");
     assert!(held(&handles, PRED), "the actor holds what it compacted away from");
     assert!(!held(&handles, CLEARED), "an actor id is not a conversation");
     assert!(held(&handles, HELD));
@@ -395,7 +403,7 @@ fn actor_facts(c: &Case) -> SavedFacts {
         created_at: c.chain[0].created,
         updated_at: head.updated,
         messages: Some(head.messages),
-        chained: c.chain.len() > 1,
+        parent: (c.chain.len() > 1).then(|| c.chain[c.chain.len() - 2].id.into()),
     }
 }
 

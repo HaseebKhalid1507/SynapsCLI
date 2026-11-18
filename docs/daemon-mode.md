@@ -644,7 +644,8 @@ C: {"type":"catalog_page","req":8,"limit":50,"before":{"updated_at":"2026-11-12T
   however long the chain). A chain that loops back on itself is not listed.
 - **Held vs saved**: a head is left out iff a session this daemon holds holds it
   (`SessionHandle::holds`: its current journal, or one it compacted away from, whose successor may
-  not be on disk yet). Never by actor id: after `/clear`, actor `A` holds the new conversation `N`,
+  not be on disk yet), or holds its parent (`parent_session`): a compaction saves the successor
+  before the actor moves onto it. Never by actor id: after `/clear`, actor `A` holds the new conversation `N`,
   and conversation `A` is saved and listed. The held set is read after the disk load, so a session
   resumed during the load is left out.
 - **Listable**: on disk, not a junk id, and named, or else neither in a sandbox cwd (under a temp

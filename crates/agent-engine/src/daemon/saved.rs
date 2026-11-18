@@ -65,8 +65,10 @@ pub struct SavedFacts {
     pub updated_at: DateTime<Utc>,
     /// The head's message count; `None` from a legacy file.
     pub messages: Option<usize>,
-    /// The head is a compaction's successor (`parent_session` is set).
-    pub chained: bool,
+    /// The head's `parent_session`: it is a compaction's successor. An
+    /// actor that has written the successor but not yet moved onto it
+    /// still holds this one, so the head is held too ([`page`]).
+    pub parent: Option<String>,
 }
 
 /// The one place the listing rules live. PR 3: the hub's retire builds the
@@ -80,7 +82,7 @@ pub fn saved_row(f: &SavedFacts, named_only: bool) -> Option<SessionMeta> {
     }
     if f.name.is_none() {
         let sandbox = f.cwd.as_deref().is_some_and(is_sandbox_cwd);
-        let few = f.messages.is_some_and(|n| n < MIN_MESSAGES) && !f.chained;
+        let few = f.messages.is_some_and(|n| n < MIN_MESSAGES) && f.parent.is_none();
         if sandbox || few {
             return None;
         }
@@ -156,7 +158,10 @@ pub fn page_error(req: u64, error: String) -> DaemonFrame {
 
 /// One page of `facts` (sorted by [`fold`]): rows strictly after `before`,
 /// listable and not held, at most `limit`; `next` is the last row's cursor
-/// when another row follows.
+/// when another row follows. A head is held when it or its parent is: a
+/// compaction writes the successor before the actor moves onto it, and in
+/// that window the actor holds only the parent. No actor holds any other
+/// non-head member (resume follows the chain).
 pub fn page(
     facts: &[SavedFacts],
     held: impl Fn(&str) -> bool,
@@ -167,7 +172,7 @@ pub fn page(
     let start = before.map_or(0, |c| facts.partition_point(|f| !after(f, c)));
     let mut rows = facts[start..]
         .iter()
-        .filter(|f| !held(&f.journal_id))
+        .filter(|f| !held(&f.journal_id) && !f.parent.as_deref().is_some_and(&held))
         .filter_map(|f| saved_row(f, named_only));
     let out: Vec<SessionMeta> = rows.by_ref().take(limit).collect();
     let next = match (out.last(), rows.next()) {
@@ -305,7 +310,7 @@ pub fn fold(entries: &[CatalogEntry]) -> Vec<SavedFacts> {
                 created_at: chain.iter().map(|e| e.created_at).min().unwrap_or(h.created_at),
                 updated_at: h.updated_at,
                 messages: h.message_count,
-                chained: h.parent_session.is_some(),
+                parent: h.parent_session.clone(),
             }
         })
         .collect();
