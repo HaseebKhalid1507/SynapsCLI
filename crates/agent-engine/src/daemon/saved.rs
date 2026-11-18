@@ -118,12 +118,18 @@ pub fn saved_row(f: &SavedFacts, named_only: bool) -> Option<SessionMeta> {
     })
 }
 
-/// Whether a live session holds conversation `c` ([`SessionHandle::holds`]:
-/// its journal, or one it compacted away from, whose successor may not be
-/// on disk yet). Never the actor id: after `/clear` the actor keeps its id
-/// while its old conversation is saved.
-pub fn held(handles: &[SessionHandle], c: &str) -> bool {
-    handles.iter().any(|h| h.holds(c))
+/// The conversations live sessions hold ([`SessionHandle::holds`]: each
+/// one's journal, and those it compacted away from, whose successor may
+/// not be on disk yet), read once per page. Never an actor id: after
+/// `/clear` the actor keeps its id while its old conversation is saved.
+pub fn held(handles: &[SessionHandle]) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for h in handles {
+        let cell = h.journal();
+        set.insert(cell.journal_id.clone());
+        set.extend(cell.supersedes.iter().cloned());
+    }
+    set
 }
 
 /// Absent → 50; at least 1, at most 200.
@@ -146,8 +152,8 @@ pub async fn catalog_page(
         Err(e) => return page_error(req, format!("saved sessions: {e}")),
     };
     // After the load: a session resumed meanwhile is held, not saved.
-    let handles = state.host.session_handles();
-    let (sessions, next) = page(&facts, |c| held(&handles, c), before.as_ref(), effective_limit(limit), named_only);
+    let held = held(&state.host.session_handles());
+    let (sessions, next) = page(&facts, |c| held.contains(c), before.as_ref(), effective_limit(limit), named_only);
     DaemonFrame::CatalogPage { req, sessions, next, error: None }
 }
 

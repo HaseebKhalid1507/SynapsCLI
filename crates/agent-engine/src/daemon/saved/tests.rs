@@ -274,12 +274,12 @@ async fn held_excludes_a_compacted_predecessor_but_never_a_cleared_id() {
     let (cleared, _b) = handle(CLEARED, "20260101-000009-nnnn", &[]);
     let (plain, _c) = handle(HELD, HELD, &[]);
     let (compacting, _e) = handle(MID, MID, &[]);
-    let handles = [compacted, cleared, plain, compacting];
-    assert!(!held(&handles, SUCC), "not yet moved onto the successor");
-    assert!(held(&handles, PRED), "the actor holds what it compacted away from");
-    assert!(!held(&handles, CLEARED), "an actor id is not a conversation");
-    assert!(held(&handles, HELD));
-    let (rows, next) = page(&facts, |c| held(&handles, c), None, 50, false);
+    let held = held(&[compacted, cleared, plain, compacting]);
+    assert!(!held.contains(SUCC), "not yet moved onto the successor");
+    assert!(held.contains(PRED), "the actor holds what it compacted away from");
+    assert!(!held.contains(CLEARED), "an actor id is not a conversation");
+    assert!(held.contains(HELD));
+    let (rows, next) = page(&facts, |c| held.contains(c), None, 50, false);
     assert_eq!(ids(&rows), [CLEARED, FREE]);
     assert_eq!(next, None);
 }
