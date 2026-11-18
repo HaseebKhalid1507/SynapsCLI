@@ -405,14 +405,18 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_restrict_runs_nothing_and_spawns_nothing() {
+    fn a_failed_restrict_runs_nothing() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let ruleset = unusable_ruleset();
         let ran = AtomicBool::new(false);
         let result = run_confined(&ruleset, || ran.store(true, Ordering::SeqCst));
         assert!(result.is_err(), "the restrict failed, so must the call");
         assert!(!ran.load(Ordering::SeqCst), "the closure must not run unrestricted");
+    }
 
+    #[test]
+    fn a_failed_restrict_spawns_nothing() {
+        let ruleset = unusable_ruleset();
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
         let mut cmd = Command::new("/bin/sh");
