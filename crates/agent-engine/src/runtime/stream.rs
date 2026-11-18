@@ -1127,6 +1127,21 @@ impl StreamMethods {
             // Append-only (never rewrites a sent message) — no effect on the
             // request bytes or the provider's cached prefix.
             stamper.stamp(&mut messages, &message_clock);
+            // With no `before_message` handler the new user message is
+            // marked hooked (count 0) here, so this publish carries the mark
+            // and no extra one is needed (see the hook below).
+            if hook_pending
+                && !hook_bus
+                    .has_handlers(crate::extensions::hooks::events::HookKind::BeforeMessage)
+                    .await
+            {
+                hook_pending = false;
+                if let Some(target) = messages.last_mut() {
+                    if super::turn_inject::hook_target_text(target).is_some() {
+                        turn_injection.absorb(target, Vec::new());
+                    }
+                }
+            }
             round_checkpoint.publish(&tx, &messages);
 
             // Budget pre-flight: wall clock, then the exact round cap —
@@ -1278,24 +1293,18 @@ impl StreamMethods {
             // steers drained at once only the last (the newest message) is
             // hooked.
             // Every new user message is marked hooked, count 0 when nothing
-            // was injected or no handler is registered: a resend after a
-            // daemon reload (which may load an extension) never hooks a
-            // message already sent.
+            // was injected or no handler is registered (marked at the round
+            // checkpoint above, in the publish it makes anyway): a resend
+            // after a daemon reload (which may load an extension) never
+            // hooks a message already sent.
             if std::mem::take(&mut hook_pending) {
                 if let Some(text) =
                     messages.last().and_then(|m| super::turn_inject::hook_target_text(m))
                 {
-                    let parts = if hook_bus
-                        .has_handlers(crate::extensions::hooks::events::HookKind::BeforeMessage)
-                        .await
-                    {
-                        let hook_event = HookEvent::before_message(&text)
-                            .with_session(session_id.as_deref())
-                            .with_cwd(cwd.as_deref());
-                        hook_bus.emit(&hook_event).await.inject_parts()
-                    } else {
-                        Vec::new()
-                    };
+                    let hook_event = HookEvent::before_message(&text)
+                        .with_session(session_id.as_deref())
+                        .with_cwd(cwd.as_deref());
+                    let parts = hook_bus.emit(&hook_event).await.inject_parts();
                     if let Some(target) = messages.last_mut() {
                         turn_injection.absorb(target, parts);
                     }

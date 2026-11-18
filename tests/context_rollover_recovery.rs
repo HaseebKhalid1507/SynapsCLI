@@ -78,6 +78,7 @@ fn untagged(message: &SharedMessage) -> serde_json::Value {
     let mut message = (**message).clone();
     if let Some(object) = message.as_object_mut() {
         object.remove("_synaps_turn");
+        object.remove("_synaps_hooked");
     }
     message
 }
