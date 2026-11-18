@@ -66,7 +66,33 @@ All notable changes to this project will be documented in this file.
   know as `unknown`. See "Workers in the session list" in
   [docs/daemon-mode.md](docs/daemon-mode.md).
 
+- **Daemon: saved sessions over the socket** (`catalog_page`), for clients
+  that can't read the sessions dir themselves, like synaps-desktop or a
+  remote client. A control frame (no attach) returns one page of the
+  conversations on disk that the daemon does not hold, newest first, as
+  `SessionMeta` rows with `lifecycle: "saved"` and `updated_at`: name,
+  title, model, cwd, cost, message count, when the conversation began.
+  A compacted chain is one row (its head). Held and saved never overlap:
+  a session the daemon holds (or compacted away from) is left out, and
+  after `/clear` the old conversation is listed. Keyset paging: `before`
+  takes the previous reply's `next`; `limit` defaults to 50, at most 200;
+  `named_only` keeps named rows. A named conversation is never hidden as
+  noise. The daemon reads the catalog on one thread, one load at a time;
+  a page never holds up another frame, a stop or a reload, and at most 4
+  are in flight per connection. Additive, no protocol bump: the daemon
+  lists `session_page` in `Welcome.features`, and `saved` never appears
+  in `Welcome`, `session_list` or `attached.meta`. Resume a row with
+  `Attach::Create` and `continue_session` set to its id.
+  `SocketTransport::catalog_page` asks for one page.
+  [docs/daemon-mode.md](docs/daemon-mode.md#saved-sessions-catalog_page)
+
 ### Changed
+
+- **A held session's listing title is its saved row's title**: the header
+  title, else the first message a person typed (not an injected event),
+  on one line without control characters, up to 120 characters (was the
+  first 80 characters of the first user message, raw). A row's title no
+  longer changes when the session ends.
 
 - **New session ids end in 8 random hex characters, not 4**
   (`20261117-015328-1f2e3d4c`). They still start with the time they were
