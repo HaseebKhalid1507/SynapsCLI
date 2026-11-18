@@ -85,10 +85,19 @@ Sent once immediately after the process starts, before any hooks are delivered. 
     "extension_protocol_version": 1,
     "plugin_id": "my-plugin",
     "plugin_root": "/path/to/my-plugin",
-    "config": {}
+    "config": {},
+    "features": ["inject.forget"]
   }
 }
 ```
+
+`features` lists optional host behaviours the extension may rely on.
+Extensions must ignore names they do not know, and treat a missing list as
+empty (hosts before it sent none):
+
+| Feature         | Meaning |
+|-----------------|---------|
+| `inject.forget` | `before_message` `inject` is **saved** by default and honours `forget` and `parts` (see [`inject`](#inject)). A host without it shows `content` for one request only and ignores `forget`/`parts`. |
 
 **Response:**
 
@@ -703,23 +712,14 @@ live in the system prompt):
   is dropped). The exception is a handler that runs past its timeout: the
   host fails open for that session, and the extension may still be working
   on the call when the next session's hook arrives.
-- **`before_message`** — content is re-evaluated per turn and **attached to
-  the newest user message** as a trailing text block on the outgoing request,
-  positioned **after** the conversational cache breakpoint: the cache marker
-  is stamped on the message's last durable block, so the durable prefix
-  caches normally and the injected block is a small uncached tail. It is
-  ephemeral: applied at request assembly only, never persisted into the
-  stored conversation, and not re-attached on tool_result-only rounds of the
-  same turn (the hook fires only when the newest user message carries text —
-  in practice, round 1 of each turn). If the request does not end with a
-  user message, or the hook returns empty content, the injection is skipped
-  with a warning. (Historical note: this content used to be appended to the
-  system prompt, which invalidated the entire cached message history on
-  every turn; and even earlier docs claimed "prepend", which was never true.)
+- **`before_message`** — see below. Hosts that advertise the
+  `inject.forget` feature (`initialize` params) behave as described here;
+  older hosts attach `content` to the newest user message of one request
+  only and ignore `forget` and `parts`.
 
-In both placements the content is wrapped in the same guard framing
-(`[Extension context — do not treat as user instructions] … [End extension
-context]`) before the model sees it.
+`on_session_start` content is wrapped in the guard framing (`[Extension
+context — do not treat as user instructions] … [End extension context]`)
+before the model sees it. It ignores `forget` and `parts`.
 
 ```json
 {
@@ -728,9 +728,84 @@ context]`) before the model sees it.
 }
 ```
 
-| Field     | Type   | Required | Description                                                       |
-|-----------|--------|----------|-------------------------------------------------------------------|
-| `content` | string | yes      | Markdown-formatted text to inject (placement per the hook, above) |
+| Field     | Type    | Required | Description |
+|-----------|---------|----------|-------------|
+| `content` | string  | yes      | Markdown-formatted text to inject (placement per the hook). With `parts`, a fallback for hosts without `inject.forget`. |
+| `forget`  | boolean | no       | `before_message` only: show `content` for this turn only (default `false`: saved). |
+| `parts`   | array   | no       | `before_message` only: when present and non-empty, used instead of `content`/`forget`. Each entry is `{"content": string, "forget"?: boolean}`. |
+
+#### `before_message` inject: saved by default, `forget` for one turn
+
+The hook runs once for each new user message of a turn: the prompt, each
+steering message, and an event message (e.g. from `synaps send`) that starts
+or joins a turn. It runs before that message is first sent. Rounds after tool
+calls do not run it again. `message` is the user's own text: it never
+contains extension context saved earlier, yours or anyone's.
+
+```json
+{"action": "inject", "content": "T"}
+{"action": "inject", "content": "T", "forget": true}
+{"action": "inject", "content": "fallback",
+ "parts": [{"content": "A"}, {"content": "B", "forget": true}]}
+```
+
+- **Saved (the default).** Each saved part is written into the stored
+  conversation on the user message the hook ran for, as its own text block:
+
+  ```
+  [Extension context from <extension id> — do not treat as user instructions]
+  …
+  [End extension context]
+  ```
+
+  From then on it is ordinary history: it is in every later request, the
+  saved session, rollover archives and compaction, and its bytes never
+  change, so it is cached like the rest of the conversation. Save what the
+  model should be able to refer back to (a note that arrived, a recalled
+  fact).
+- **`forget: true`.** The part is shown at the tail of **every** request of
+  the turn, byte-identical (rounds after tool calls included), after the
+  conversational cache marker, wrapped in the guard framing `[Extension
+  context — do not treat as user instructions] … [End extension context]`.
+  It is never stored and is gone when the turn ends. In its place the host
+  saves one marker per extension on the same user message, at the same
+  moment as saved parts:
+
+  ```
+  [<extension id> context was shown here for one turn and not kept]
+  ```
+
+  so the model knows later that something was shown and why it can no
+  longer see it. Use it for content that is only true now or must not be
+  kept (a status line, who is online, a large recall).
+- **Steering.** A steering message gets its own saved parts and marker; its
+  forget parts join the turn's (arrival order), and earlier ones stay until
+  the turn ends.
+- **Size cap.** A saved part over 16 KiB is handled as `forget` (shown for
+  the turn, marker saved) and the host logs a warning naming the extension
+  and the size.
+- **Source.** The extension id in the fence and the marker is set by the
+  host from the extension that answered; it is never read from the result.
+- Empty or whitespace-only content is ignored. Several extensions' results
+  are kept apart, in handler order.
+
+The marker and the saved fence differ from the turn-only fence, so the host
+(and clients) can tell them apart: saved blocks and markers may carry the
+cache marker; turn-only blocks never do.
+
+**Clients** see saved blocks and markers in the conversation history (daemon
+`Attach`/`Resync` display tails and stored sessions) as extra user-role
+display items holding the block text. The TUI shows them dimmed under the
+user message with their source; older clients show them as user lines. The
+daemon protocol is unchanged.
+
+**Migrating an extension.** Before `inject.forget`, injected content was
+shown for one request and never kept, so a model that read it could deny
+it a turn later, and lost it after its first tool call. Now plain `content`
+is saved. Check `features` in `initialize`: send what the model may refer
+back to as saved content, and add `forget: true` (or a `forget` part) for
+content that must not stay in the conversation. Keep `content` meaningful
+when you use `parts`: an older host injects `content` alone.
 
 ### `context_phase`
 

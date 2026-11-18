@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **Behaviour change for extensions: `before_message` inject is saved by
+  default (#414).** Injected content used to be shown for one request and
+  never kept, so the model disowned answers it had given from it and lost
+  it after its first tool call. Now each part is written once into the
+  stored conversation on the user message the hook ran for, fenced with the
+  extension id, and is ordinary history from then on (later requests,
+  sessions, rollover archives, compaction). `"forget": true` shows content
+  at the tail of every request of the turn instead, never stored, and saves
+  a marker `[<extension id> context was shown here for one turn and not
+  kept]`; `parts` mixes both in one result. A saved part over 16 KiB is
+  handled as `forget`. Hosts announce this with `features:
+  ["inject.forget"]` in the `initialize` params; extension protocol stays
+  1 and `content` remains required, so older hosts keep working. The hook
+  now runs once per new user message of a turn (prompt, steer, event
+  message), and its `message`, titles, previews and search never include
+  saved extension context. Clients see saved blocks and markers in history
+  (display tails show them as extra user-role items; the TUI renders them
+  dimmed under the user message with their source). Daemon protocol is
+  unchanged. Migration: `docs/extensions/protocol.md` §`inject`.
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel
