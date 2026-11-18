@@ -92,7 +92,9 @@ All notable changes to this project will be documented in this file.
   title, else the first message a person typed (not an injected event),
   on one line without control characters, up to 120 characters (was the
   first 80 characters of the first user message, raw). A row's title no
-  longer changes when the session ends.
+  longer changes when the session ends. The title a save stores
+  (`auto_title`) skips injected events and context notes too, so a
+  session an event started is titled by what was typed.
 
 - **New session ids end in 8 random hex characters, not 4**
   (`20261117-015328-1f2e3d4c`). They still start with the time they were

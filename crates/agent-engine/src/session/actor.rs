@@ -6201,4 +6201,41 @@ mod conversation_title_tests {
         let long = conversation_title(&conv(&"word ".repeat(100), &[])).unwrap();
         assert_eq!(long.chars().count(), agent_core::session_catalog::LISTING_TITLE_CHARS);
     }
+
+    /// A session an event started: after its first save the held title and
+    /// the saved row's title agree, and both are what the person typed.
+    #[test]
+    fn an_event_first_session_is_titled_by_its_typed_text_held_and_saved() {
+        let msgs = [
+            serde_json::json!({"role": "user", "content": "<event id=\"1\">ping</event>"}),
+            serde_json::json!({"role": "assistant", "content": "pong"}),
+            serde_json::json!({"role": "user", "content": "fix the build"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        let mut c = conv("", &msgs);
+        c.session.api_messages = c.api_messages.clone();
+        c.session.auto_title(); // what every save runs
+        assert_eq!(c.session.title, "fix the build");
+        let held = conversation_title(&c);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        agent_core::core::session_journal::save_session_in_dir(
+            &sessions_dir,
+            &c.session,
+            agent_core::core::session_journal::SessionPersistence::Json,
+        )
+        .unwrap();
+        let paths = agent_core::session_catalog::CatalogPaths {
+            index_path: sessions_dir.join("index.jsonl"),
+            cache_path: root.join("catalog").join("session-previews.json"),
+            sessions_dir,
+        };
+        let facts = crate::daemon::saved::fold(&crate::daemon::saved::load(&paths).unwrap());
+        let saved = crate::daemon::saved::saved_row(&facts[0], false).expect("listed");
+        assert_eq!(held.as_deref(), Some("fix the build"));
+        assert_eq!(saved.title, held);
+    }
 }
