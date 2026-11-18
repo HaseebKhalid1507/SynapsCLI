@@ -134,6 +134,18 @@ All notable changes to this project will be documented in this file.
   keys, identity, MCP, skills, `progressive_tool_disclosure` and a changed
   `auth.*` source still need a restart.
 
+- **Keep-warm on a cooling account you chose.** With an explicit account
+  (the default), a cooldown on it no longer stops keep-warm pings. On
+  2026-11-11 a rejection at 04:10 EST left the account cooling until Nov 16
+  although requests were served again within seconds, and keep-warm refused
+  52 pings over ten hours while the requests went through. Another model's
+  limit no longer cools the account at all (see the per-model cooldown
+  above), so the cooldowns left are account-wide ones and the ping's own
+  model's. Under an explicit selector the ping now goes through both: a
+  limit that still holds meets the ping with a 429, at most one per
+  keep-warm period, which ends keep-warm and bills no tokens. Under `auto` a
+  cooling account still stops the ping (the next request leaves it).
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel
