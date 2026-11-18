@@ -673,6 +673,12 @@ C: {"type":"catalog_page","req":8,"limit":50,"before":{"updated_at":"2026-11-12T
 - **After a reconnect** (a reload, a cold start, any disconnect) a client that shows saved rows
   re-pages from the first page: sessions that ended, were evicted or failed to restore in the gap
   are saved now, at their `updated_at` position.
+- **When the held set changes**: nothing pushes saved rows yet (no `session_watch`). Without it,
+  request a first page (`before` absent) whenever the set of `(id, journal_id)` in `sessions`
+  changes, and replace the saved list with it; never merge it into older pages. That covers a
+  session that ended, was closed or evicted (it leaves `sessions` and is saved now, above any
+  cursor), a saved row another client resumed, and a resumed conversation that compacted to a new
+  `journal_id`. A re-page is one warm scan (about 19 ms at 1,500 sessions).
 
 ## Per-session event endpoint ownership
 
