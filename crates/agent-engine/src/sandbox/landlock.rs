@@ -61,6 +61,25 @@ pub const FILE_WRITE_RIGHTS: u64 = ACCESS_FS_WRITE_FILE | ACCESS_FS_TRUNCATE;
 /// truncation outside the set. Below 3 the sandbox is "unavailable".
 pub const MIN_ABI: u32 = 3;
 
+/// A sandboxed process can't connect to an abstract unix socket made
+/// outside its domain (an X11 or D-Bus abstract address). ABI 6.
+pub const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+/// A sandboxed process can't signal a process outside its domain (the
+/// daemon, the owner's shell). ABI 6.
+pub const SCOPE_SIGNAL: u64 = 1 << 1;
+/// The first ABI with scopes.
+pub const SCOPE_MIN_ABI: u32 = 6;
+
+/// The scopes a ruleset sets on a running ABI: both from ABI 6, none
+/// before (an older kernel rejects the field).
+pub fn scoped_for_abi(abi: u32) -> u64 {
+    if abi >= SCOPE_MIN_ABI {
+        SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL
+    } else {
+        0
+    }
+}
+
 const CREATE_RULESET_VERSION: u32 = 1 << 0;
 const RULE_PATH_BENEATH: libc::c_int = 1;
 
@@ -166,15 +185,18 @@ pub struct Ruleset {
     fd: OwnedFd,
     abi: u32,
     handled: u64,
+    scoped: u64,
     rules: usize,
 }
 
 impl Ruleset {
-    /// A ruleset handling every write right the running ABI supports.
+    /// A ruleset handling every write right the running ABI supports, with
+    /// the scopes ([`scoped_for_abi`]) on ABI 6 and above.
     pub fn new() -> Result<Self, Unavailable> {
         let abi = abi_version()?;
         let handled = handled_for_abi(abi)?;
-        let attr = RulesetAttr { handled_access_fs: handled, handled_access_net: 0, scoped: 0 };
+        let scoped = scoped_for_abi(abi);
+        let attr = RulesetAttr { handled_access_fs: handled, handled_access_net: 0, scoped };
         // SAFETY: attr is a valid, fully initialised landlock_ruleset_attr.
         let fd = unsafe {
             libc::syscall(
@@ -191,7 +213,7 @@ impl Ruleset {
         // SAFETY: the kernel returned a new fd (created close-on-exec) that
         // we own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
-        Ok(Ruleset { fd, abi, handled, rules: 0 })
+        Ok(Ruleset { fd, abi, handled, scoped, rules: 0 })
     }
 
     /// Allow `requested` rights on the object `fd` refers to (best opened
@@ -239,6 +261,10 @@ impl Ruleset {
 
     pub fn abi(&self) -> u32 {
         self.abi
+    }
+    /// The scopes set ([`SCOPE_ABSTRACT_UNIX_SOCKET`], [`SCOPE_SIGNAL`]).
+    pub fn scoped(&self) -> u64 {
+        self.scoped
     }
     pub fn rules(&self) -> usize {
         self.rules
@@ -353,8 +379,7 @@ mod tests {
 
     #[test]
     fn a_confined_child_writes_inside_and_not_outside() {
-        if usable_abi().is_err() {
-            eprintln!("skipped: no usable Landlock on this host");
+        if !crate::sandbox::testkit::kernel_ok("a_confined_child_writes_inside_and_not_outside") {
             return;
         }
         let inside = tempfile::tempdir().unwrap();
@@ -379,9 +404,63 @@ mod tests {
     }
 
     #[test]
+    fn the_scopes_are_set_from_abi_6() {
+        assert_eq!(scoped_for_abi(3), 0);
+        assert_eq!(scoped_for_abi(5), 0);
+        assert_eq!(scoped_for_abi(6), SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL);
+        assert_eq!(scoped_for_abi(8), SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL);
+    }
+
+    /// On ABI 6 and above a confined child can neither signal a process
+    /// outside its domain (this test process) nor connect to an abstract
+    /// unix socket made outside it; unconfined, both work (the undo).
+    #[test]
+    fn a_confined_child_cannot_signal_or_reach_an_abstract_socket_outside_its_domain() {
+        if !crate::sandbox::testkit::kernel_ok(
+            "a_confined_child_cannot_signal_or_reach_an_abstract_socket_outside_its_domain",
+        ) {
+            return;
+        }
+        let rs = Ruleset::new().unwrap();
+        if rs.abi() < SCOPE_MIN_ABI {
+            assert_eq!(rs.scoped(), 0);
+            eprintln!("SKIPPED scope check: landlock abi {} has no scopes", rs.abi());
+            return;
+        }
+        assert_eq!(rs.scoped(), SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL);
+        use std::os::linux::net::SocketAddrExt;
+        let name = format!("synaps-scope-pin-{}", std::process::id());
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        let me = std::process::id();
+        let signal = format!("kill -0 {me}");
+        let connect = format!(
+            "import socket; s = socket.socket(socket.AF_UNIX); s.connect('\\0{name}')"
+        );
+        let run = |confined: bool, program: &str, args: &[&str]| {
+            let mut cmd = Command::new(program);
+            cmd.args(args);
+            if confined {
+                confine_command(&mut cmd, &rs).unwrap();
+            }
+            let out = cmd.output().unwrap();
+            if !out.status.success() {
+                eprintln!("denied: {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim());
+            }
+            out.status.success()
+        };
+        assert!(run(false, "/bin/sh", &["-c", &signal]), "unconfined, the signal goes");
+        assert!(!run(true, "/bin/sh", &["-c", &signal]), "a confined child signalled out of its domain");
+        assert!(run(false, "python3", &["-c", &connect]), "unconfined, the abstract socket answers");
+        assert!(
+            !run(true, "python3", &["-c", &connect]),
+            "a confined child reached an abstract socket outside its domain"
+        );
+    }
+
+    #[test]
     fn run_confined_restricts_only_its_own_thread() {
-        if usable_abi().is_err() {
-            eprintln!("skipped: no usable Landlock on this host");
+        if !crate::sandbox::testkit::kernel_ok("run_confined_restricts_only_its_own_thread") {
             return;
         }
         let inside = tempfile::tempdir().unwrap();
@@ -401,7 +480,7 @@ mod tests {
     /// Landlock ruleset at all. Works on a host with no Landlock too.
     fn unusable_ruleset() -> Ruleset {
         let fd = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
-        Ruleset { fd, abi: MIN_ABI, handled: WRITE_RIGHTS, rules: 0 }
+        Ruleset { fd, abi: MIN_ABI, handled: WRITE_RIGHTS, scoped: 0, rules: 0 }
     }
 
     #[test]
@@ -440,8 +519,7 @@ mod tests {
 
     #[test]
     fn a_confined_thread_cannot_truncate_a_file_outside_its_grant() {
-        if usable_abi().is_err() {
-            eprintln!("skipped: no usable Landlock on this host");
+        if !crate::sandbox::testkit::kernel_ok("a_confined_thread_cannot_truncate_a_file_outside_its_grant") {
             return;
         }
         let inside = tempfile::tempdir().unwrap();

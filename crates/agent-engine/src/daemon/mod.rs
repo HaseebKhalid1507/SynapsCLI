@@ -19,6 +19,7 @@ pub mod frame_creds;
 pub mod lifecycle;
 pub mod listener;
 pub mod owner_claim;
+pub mod peer;
 pub mod pin;
 pub mod pins;
 pub mod registry;
