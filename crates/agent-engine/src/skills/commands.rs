@@ -6,9 +6,30 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::memory_backend::MemoryBinding;
+use crate::session::types::ToolEnv;
 use crate::skills::registry::{RegisteredPluginCommand, RegisteredPluginCommandBackend};
 use crate::tools::{ToolCapabilities, ToolChannels, ToolLimits};
 use crate::{ToolContext, ToolRegistry};
+
+/// The chat a slash command is run for: whose command it is, and that
+/// chat's own folder, memory binding and environment. A runtime hands out
+/// its own ([`crate::Runtime::command_chat`]); under the daemon the
+/// process's folder, project and environment are the daemon's, never a
+/// chat's.
+#[derive(Clone, Copy)]
+pub struct CommandChat<'a> {
+    /// The chat the command was typed in. `None` = no conversation.
+    pub session_id: Option<&'a str>,
+    /// The folder that chat runs in. `None` = the process folder.
+    pub cwd: Option<&'a Path>,
+    /// The chat's memory binding. Required: a tool the command runs is
+    /// never left to work one out from the process folder.
+    pub memory_backend: &'a MemoryBinding,
+    /// The environment the chat's tools spawn with. `None` = the process
+    /// environment (in-process hosts, where that is the chat's).
+    pub env: Option<&'a ToolEnv>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginCommandOutput {
@@ -51,9 +72,14 @@ fn interpolate_slash_args(value: Value, slash_args: &str) -> Value {
     }
 }
 
+/// Run a plugin command that needs none of the chat's tools. `env` is the
+/// environment a shell-backed command is spawned with: the session's, as
+/// the chat's `bash` gets it; `None` = inherit the process environment. The
+/// command still runs from the plugin's own folder.
 pub async fn execute_plugin_command(
     command: &RegisteredPluginCommand,
     slash_args: &str,
+    env: Option<&ToolEnv>,
 ) -> crate::Result<PluginCommandOutput> {
     match &command.backend {
         RegisteredPluginCommandBackend::Shell {
@@ -69,6 +95,9 @@ pub async fn execute_plugin_command(
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            if let Some(env) = env {
+                cmd.env_clear().envs(env.spawn_vars());
+            }
 
             let output = cmd.output().await.map_err(|e| {
                 crate::RuntimeError::Tool(format!(
@@ -108,10 +137,16 @@ pub async fn execute_plugin_command(
     }
 }
 
+/// [`execute_plugin_command`], plus the backend that needs the chat's tools:
+/// an extension tool. `chat` is the chat the command was typed in: the
+/// tool's `tool.call` carries its id and folder, the tool's context holds
+/// its memory binding and environment, and a shell-backed command is
+/// spawned with that environment.
 pub async fn execute_plugin_command_with_tools(
     command: &RegisteredPluginCommand,
     slash_args: &str,
     tools: Arc<tokio::sync::RwLock<ToolRegistry>>,
+    chat: CommandChat<'_>,
 ) -> crate::Result<PluginCommandOutput> {
     if let RegisteredPluginCommandBackend::ExtensionTool { tool, input } = &command.backend {
         let runtime_tool_name = format!("{}:{}", command.plugin, tool);
@@ -127,18 +162,21 @@ pub async fn execute_plugin_command_with_tools(
             })?
             .clone();
         drop(registry);
-        let stdout = tool.execute(params, empty_tool_context()).await?;
+        let stdout = tool.execute(params, command_tool_context(chat)).await?;
         Ok(PluginCommandOutput {
             status: Some(0),
             stdout,
             stderr: String::new(),
         })
     } else {
-        execute_plugin_command(command, slash_args).await
+        execute_plugin_command(command, slash_args, chat.env).await
     }
 }
 
-fn empty_tool_context() -> ToolContext {
+/// The context a slash command's tool runs in: whose call it is, with the
+/// chat's memory binding and environment, and no other capability of the
+/// chat's.
+fn command_tool_context(chat: CommandChat<'_>) -> ToolContext {
     ToolContext {
         channels: ToolChannels {
             tx_delta: None,
@@ -147,7 +185,7 @@ fn empty_tool_context() -> ToolContext {
         capabilities: ToolCapabilities {
             session_allow_all: None,
             launch_cancel: None,
-            memory_backend: None,
+            memory_backend: Some(chat.memory_backend.clone()),
             telemetry: None,
             tool_register_tx: None,
             session_manager: None,
@@ -160,12 +198,13 @@ fn empty_tool_context() -> ToolContext {
             tool_activation: None,
             mcp_leases: None,
             extension_leases: None,
-            memory_context: None,
-            cwd: None,
-            env: None,
+            cwd: chat.cwd.map(Path::to_path_buf),
+            env: chat.env.cloned(),
             env_stripped: Vec::new(),
             env_warned: Default::default(),
-            session_id: None,
+            session_id: chat.session_id.map(str::to_string),
+            hook_bus: None,
+            continuation: None,
         },
         limits: ToolLimits {
             max_tool_output: 30_000,
@@ -216,7 +255,7 @@ mod tests {
         let root = tempdir();
         let command = cmd("printf", vec!["cwd=%s arg=%s", "."], root);
 
-        let output = execute_plugin_command(&command, "extra").await.unwrap();
+        let output = execute_plugin_command(&command, "extra", None).await.unwrap();
 
         assert_eq!(output.status, Some(0));
         assert_eq!(output.stdout, "cwd=. arg=extra");
@@ -227,7 +266,7 @@ mod tests {
         let root = tempdir();
         let command = cmd("../evil", vec![], root);
 
-        let result = execute_plugin_command(&command, "").await;
+        let result = execute_plugin_command(&command, "", None).await;
 
         assert!(result.is_err());
     }
@@ -245,7 +284,7 @@ mod tests {
             plugin_root: PathBuf::from("/tmp/p"),
         };
 
-        let output = execute_plugin_command(&command, "diff").await.unwrap();
+        let output = execute_plugin_command(&command, "diff", None).await.unwrap();
         assert_eq!(output.status, Some(0));
         assert!(output.stdout.contains("Review: diff"));
     }
@@ -282,10 +321,12 @@ mod tests {
         };
         let registry = Arc::new(tokio::sync::RwLock::new(ToolRegistry::without_subagent()));
         registry.write().await.register(Arc::new(EchoTool));
+        let runtime = crate::Runtime::new_headless();
 
-        let output = execute_plugin_command_with_tools(&command, "hello", registry)
-            .await
-            .unwrap();
+        let output =
+            execute_plugin_command_with_tools(&command, "hello", registry, runtime.command_chat())
+                .await
+                .unwrap();
 
         assert_eq!(output.status, Some(0));
         assert_eq!(output.stdout, "echo hello");

@@ -120,10 +120,83 @@ pub fn open_private_append(path: &Path) -> Result<File, PrivateFsError> {
     }
 }
 
+/// Sync the directory `path` is in, so that a rename into it is on disk.
+/// Nothing to do on Windows, which cannot open a directory to flush it.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    sync_dir(dir)
+}
+
+/// Sync the directory `dir`, so that a name created or renamed in it is on
+/// disk. The one rule, for this module and the notes store, of which errors
+/// say "this directory cannot be synced at all" and are left as they are:
+///
+/// - `EINVAL` / `ENOTSUP`: the file system does not sync directories.
+/// - `PermissionDenied`: the directory may be written but not opened for
+///   reading (a write-and-search-only mode such as `0300`). The rename or
+///   the append into it has worked; only the open for the sync is refused.
+///
+/// Such a directory is not a reason to call a finished write failed; the
+/// `PermissionDenied` is logged as a warning with the directory. Any other
+/// error is returned. A no-op on Windows (not unix), which cannot open
+/// a directory to flush it, and where NTFS journals the new name itself.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
+        match File::open(dir).and_then(|dir| dir.sync_all()) {
+            Err(e) if e.kind() == PermissionDenied => {
+                // Left as it is, but not in silence: after a power cut a
+                // name newly made in this directory may be missing.
+                warn_unsynced(dir, &e);
+                Ok(())
+            }
+            Err(e) if matches!(e.kind(), InvalidInput | Unsupported) => Ok(()),
+            result => result,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// The one warning for a directory [`sync_dir`] leaves unsynced because it
+/// may not be opened: which directory, and the error.
+#[cfg(unix)]
+fn warn_unsynced(dir: &Path, error: &std::io::Error) {
+    tracing::warn!(
+        directory = %dir.display(),
+        error = %error,
+        "a directory could not be opened to be synced; what was written into it stays, \
+         but a new name in it is not confirmed to be on disk"
+    );
+    #[cfg(test)]
+    UNSYNCED.with(|seen| seen.borrow_mut().push((dir.to_path_buf(), error.kind())));
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// The warnings [`warn_unsynced`] gave on this thread. A test reads
+    /// these and not a captured log: a log captured on one test thread
+    /// loses lines to tracing's callsite cache when another test reaches
+    /// the same line first.
+    static UNSYNCED: std::cell::RefCell<Vec<(std::path::PathBuf, std::io::ErrorKind)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Atomically replace `path` with `data`: the temp file is created in the
 /// same directory with `create_new` + mode `0600` (never create-then-chmod,
-/// so no interval is broader than policy), written, then renamed over the
-/// target. A symlink at the target or temp path yields a typed refusal.
+/// so no interval is broader than policy), written, synced, then renamed
+/// over the target, and the directory is synced after the rename. A symlink
+/// at the target or temp path yields a typed refusal.
+///
+/// An error after the rename (the directory sync) means the replace is NOT
+/// acknowledged, not that it did not happen: the new file is in place.
 pub fn write_atomic_private(path: &Path, data: &[u8]) -> Result<(), PrivateFsError> {
     refuse_symlink(path)?;
     let mut tmp_name = path
@@ -163,6 +236,9 @@ pub fn write_atomic_private(path: &Path, data: &[u8]) -> Result<(), PrivateFsErr
         // following it, so this is policy enforcement, not a traversal fix).
         refuse_symlink(path)?;
         std::fs::rename(&tmp, path)?;
+        // The rename is in the directory, not in the file: without this a
+        // crash can bring the old file back.
+        sync_parent_dir(path)?;
         Ok(())
     })();
     if result.is_err() {
@@ -350,6 +426,39 @@ mod tests {
         let _g = ModeGuard::set(&gate, 0o111);
         assert!(ConfinedDir::create_absolute_no_symlinks(&gate.join("link/sessions")).is_err());
         assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+    }
+
+    /// The one directory-sync rule: a directory that can be written but not
+    /// opened for reading is left unsynced, not an error; a directory that is
+    /// not there is an error.
+    #[test]
+    fn sync_dir_tolerates_an_unreadable_directory_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        sync_dir(tmp.path()).unwrap();
+        assert_eq!(
+            sync_dir(&tmp.path().join("missing")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        if !dac_enforced() {
+            return;
+        }
+        let gate = tmp.path().join("gate");
+        std::fs::create_dir(&gate).unwrap();
+        let _g = ModeGuard::set(&gate, 0o311);
+        assert_eq!(
+            File::open(&gate).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        // Tolerated, and said: one warning, with the directory and the
+        // error. A directory that syncs says nothing; one that is missing
+        // is an error, not a warning.
+        let warned = || UNSYNCED.with(|seen| seen.borrow().clone());
+        UNSYNCED.with(|seen| seen.borrow_mut().clear());
+        sync_dir(&gate).unwrap();
+        assert_eq!(warned(), [(gate.clone(), std::io::ErrorKind::PermissionDenied)]);
+        sync_dir(tmp.path()).unwrap();
+        sync_dir(&tmp.path().join("missing")).unwrap_err();
+        assert_eq!(warned().len(), 1);
     }
 
     #[cfg(target_os = "linux")]

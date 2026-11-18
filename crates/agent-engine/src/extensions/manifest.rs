@@ -35,9 +35,8 @@ pub struct ExtensionManifest {
     /// root). When present, the marketplace install flow runs this
     /// script after the plugin source is in place — used by source-shipped
     /// extensions (e.g. Rust binaries) that need to compile a binary
-    /// before [`Self::command`] resolves. Same security model as
-    /// `provides.sidecar.setup` (path must stay inside the plugin dir;
-    /// see [`crate::skills::post_install`] for the runner).
+    /// before [`Self::command`] resolves. The path must stay inside the
+    /// plugin dir; see [`crate::skills::post_install`] for the runner.
     #[serde(default)]
     pub setup: Option<String>,
     /// Optional per-host-triple prebuilt asset map. When the installer
@@ -148,7 +147,7 @@ impl TryFrom<RawExtensionManifest> for ExtensionManifest {
                 tools: raw.tools,
                 providers: Vec::new(),
                 lifecycle: None,
-                context_providers: Vec::new(),
+                context_providers: Value::Null,
             })
         } else {
             raw.deferred

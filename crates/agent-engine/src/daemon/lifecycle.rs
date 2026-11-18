@@ -28,7 +28,7 @@ pub async fn shutdown_all(state: &Arc<DaemonState>, force: bool) {
         tracing::warn!(budget = ?budget, "daemon: session shutdown budget exceeded; continuing");
     }
     for h in &sessions {
-        state.host.remove_session(&h.id);
+        state.remove(h);
     }
 
     let ext = Arc::clone(state.host.ext_manager());

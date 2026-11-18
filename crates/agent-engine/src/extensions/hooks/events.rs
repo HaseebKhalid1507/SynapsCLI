@@ -8,6 +8,8 @@
 //! every `HookKind` declares a [`required_permission`][HookKind::required_permission]
 //! so the runtime can gate subscriptions before any payload is delivered.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -22,11 +24,11 @@ pub const MAX_HOOK_OUTPUT: usize = 256 * 1024; // 256 KB
 
 // ── HookKind ──────────────────────────────────────────────────────────────────
 
-/// All hook event kinds in the phase-1 catalog.
+/// All hook event kinds.
 ///
 /// Each variant identifies a well-defined extension point in the agent loop.
-/// The set is intentionally closed; new kinds are added via a breaking version
-/// bump so existing permission grants stay coherent.
+/// Kinds are added additively within protocol version 1; an extension that
+/// names a kind the host does not know fails to load on that host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookKind {
@@ -44,6 +46,12 @@ pub enum HookKind {
     OnSessionStart,
     /// Fires when a session is torn down.
     OnSessionEnd,
+    /// Fires after a context rollover has sealed a window into an archive
+    /// file. Notify-only ([`Self::is_notification`]).
+    OnContextArchived,
+    /// Fires after `memory_forget` has forgotten an archive or a note.
+    /// Notify-only ([`Self::is_notification`]).
+    OnMemoryForgotten,
 }
 
 impl HookKind {
@@ -61,6 +69,8 @@ impl HookKind {
         Self::OnCompaction,
         Self::OnSessionStart,
         Self::OnSessionEnd,
+        Self::OnContextArchived,
+        Self::OnMemoryForgotten,
     ];
 
     /// Canonical string identifier for this kind, suitable for serialization
@@ -74,6 +84,8 @@ impl HookKind {
             Self::OnCompaction => "on_compaction",
             Self::OnSessionStart => "on_session_start",
             Self::OnSessionEnd => "on_session_end",
+            Self::OnContextArchived => "on_context_archived",
+            Self::OnMemoryForgotten => "on_memory_forgotten",
         }
     }
 
@@ -91,6 +103,8 @@ impl HookKind {
             "on_compaction" => Some(Self::OnCompaction),
             "on_session_start" => Some(Self::OnSessionStart),
             "on_session_end" => Some(Self::OnSessionEnd),
+            "on_context_archived" => Some(Self::OnContextArchived),
+            "on_memory_forgotten" => Some(Self::OnMemoryForgotten),
             _ => None,
         }
     }
@@ -111,8 +125,20 @@ impl HookKind {
             // `context_checkpoint` tool without a note). Never capacity or
             // permission authority.
             Self::OnMessageComplete => &["continue", "context_phase"],
-            Self::OnCompaction | Self::OnSessionEnd => &["continue"],
+            Self::OnCompaction
+            | Self::OnSessionEnd
+            | Self::OnContextArchived
+            | Self::OnMemoryForgotten => &["continue"],
         }
+    }
+
+    /// Whether this kind is notify-only: sent with
+    /// [`HookBus::notify`](crate::extensions::hooks::HookBus::notify), which
+    /// does not wait for the handlers and discards whatever they answer. A
+    /// slow, failing or absent handler cannot delay or change what the
+    /// event reports.
+    pub fn is_notification(&self) -> bool {
+        matches!(self, Self::OnContextArchived | Self::OnMemoryForgotten)
     }
 
     /// Whether this hook can be filtered by tool name in a manifest.
@@ -143,10 +169,16 @@ impl HookKind {
     pub fn required_permission(&self) -> Permission {
         match self {
             Self::BeforeToolCall | Self::AfterToolCall => Permission::ToolsIntercept,
-            Self::BeforeMessage | Self::OnMessageComplete | Self::OnCompaction => {
-                Permission::LlmContent
+            // `on_context_archived` carries no content, but its path leads
+            // to the archived conversation.
+            Self::BeforeMessage
+            | Self::OnMessageComplete
+            | Self::OnCompaction
+            | Self::OnContextArchived => Permission::LlmContent,
+            // `on_memory_forgotten` carries ids only, no content.
+            Self::OnSessionStart | Self::OnSessionEnd | Self::OnMemoryForgotten => {
+                Permission::SessionLifecycle
             }
-            Self::OnSessionStart | Self::OnSessionEnd => Permission::SessionLifecycle,
         }
     }
 }
@@ -162,22 +194,47 @@ pub fn hook_session_id_enabled() -> bool {
     )
 }
 
+/// The chat's working folder as extensions get it: `cwd` on hook events and
+/// in `tool.call` params. The session's folder when there is one (daemon
+/// chats, workers), else the host process's (in-process hosts, where the two
+/// are the same). As the client gave it: not canonicalised, not walked up to
+/// a repository root. `None` (JSON `null`) when that path is not valid UTF-8
+/// or the process folder cannot be read. No off switch, unlike `session_id`.
+pub fn hook_cwd(cwd: Option<&Path>) -> Option<String> {
+    match cwd {
+        Some(dir) => dir.to_str().map(str::to_string),
+        None => std::env::current_dir().ok()?.to_str().map(str::to_string),
+    }
+}
+
 /// A hook event payload dispatched to extension handlers.
 ///
 /// Fields are optional and populated only when relevant to the hook kind:
 ///
-/// | Kind                  | tool_name | tool_input | tool_output | message | session_id |
-/// |-----------------------|-----------|------------|-------------|---------|------------|
-/// | `before_tool_call`    | ✓         | ✓          |             |         | ✓*         |
-/// | `after_tool_call`     | ✓         | ✓          | ✓           |         | ✓*         |
-/// | `before_message`      |           |            |             | ✓       | ✓*         |
-/// | `on_message_complete` |           |            |             | ✓       | ✓*         |
-/// | `on_compaction`       |           |            |             | ✓       | ✓          |
-/// | `on_session_start`    |           |            |             |         | ✓          |
-/// | `on_session_end`      |           |            |             |         | ✓          |
+/// | Kind                  | tool_name | tool_input | tool_output | message | session_id | cwd |
+/// |-----------------------|-----------|------------|-------------|---------|------------|-----|
+/// | `before_tool_call`    | ✓         | ✓          |             |         | ✓*         | ✓   |
+/// | `after_tool_call`     | ✓         | ✓          | ✓           |         | ✓*         | ✓   |
+/// | `before_message`      |           |            |             | ✓       | ✓*         | ✓   |
+/// | `on_message_complete` |           |            |             | ✓       | ✓*         | ✓   |
+/// | `on_compaction`       |           |            |             | ✓       | ✓          | ✓   |
+/// | `on_session_start`    |           |            |             |         | ✓          | ✓   |
+/// | `on_session_end`      |           |            |             |         | ✓          | ✓   |
+/// | `on_context_archived` |           |            |             |         | ✓          | ✓   |
+/// | `on_memory_forgotten` |           |            |             |         | ✓†         | ✓   |
+///
+/// `on_context_archived` and `on_memory_forgotten` carry their payload in
+/// `data`.
 ///
 /// `✓*` — set via [`HookEvent::with_session`] for foreground sessions; `null`
 /// for workers (no conversation id) and when `SYNAPS_HOOK_SESSION_ID=0`.
+///
+/// `✓†` — the chat whose tool call did the forgetting; `null` when the call
+/// had no chat behind it.
+///
+/// `cwd` is stamped by [`HookEvent::with_cwd`] where the event is emitted,
+/// workers included. The constructors leave it `None`: only the emitter
+/// knows which chat the event is for.
 ///
 /// The `data` field is available on all events for extensions that need to
 /// attach arbitrary structured context when constructing synthetic events.
@@ -200,6 +257,9 @@ pub struct HookEvent {
     pub message: Option<String>,
     /// Session identifier for session lifecycle hooks.
     pub session_id: Option<String>,
+    /// The chat's working folder ([`hook_cwd`]).
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// Session message history for `on_session_end`.
     /// Contains the conversation transcript so extensions (like Stelline)
     /// can extract memories without reaching into runtime internals.
@@ -225,6 +285,15 @@ impl HookEvent {
         self
     }
 
+    /// Stamp the chat's working folder (builder). `None` = the session has
+    /// no folder of its own, so the process folder; see [`hook_cwd`].
+    ///
+    /// Additive: extensions that ignore `cwd` are unaffected.
+    pub fn with_cwd(mut self, cwd: Option<&Path>) -> Self {
+        self.cwd = hook_cwd(cwd);
+        self
+    }
+
     /// Construct a `before_tool_call` event.
     pub fn before_tool_call(tool_name: &str, input: Value) -> Self {
         Self {
@@ -234,6 +303,7 @@ impl HookEvent {
             tool_output: None,
             message: None,
             session_id: None,
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -264,6 +334,7 @@ impl HookEvent {
             tool_output: Some(truncated_output),
             message: None,
             session_id: None,
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -279,6 +350,7 @@ impl HookEvent {
             tool_output: None,
             message: Some(message.to_string()),
             session_id: None,
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -294,6 +366,7 @@ impl HookEvent {
             tool_output: None,
             message: Some(message.to_string()),
             session_id: None,
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data,
@@ -332,9 +405,110 @@ impl HookEvent {
             tool_output: None,
             message: Some(summary.to_string()),
             session_id: Some(new_session_id.to_string()),
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data,
+        }
+    }
+
+    /// Construct an `on_context_archived` event: a context rollover sealed a
+    /// window of chat `session_id` into the archive file at `path` (`None`
+    /// when the file could not be located, or its path is not UTF-8).
+    /// `window` is the window that starts after the archive.
+    ///
+    /// A window is one archive unless it was over a per-archive limit, so
+    /// the event is built as part 1 of 1, starting at source message 0, with
+    /// nothing reduced. An oversized window is sealed as several archives,
+    /// one event each: [`HookEvent::with_part`] then says which one this is.
+    pub fn on_context_archived(
+        session_id: &str,
+        archive_id: &str,
+        path: Option<&Path>,
+        project_key: &str,
+        message_count: usize,
+        source_message_count: usize,
+        window: u64,
+    ) -> Self {
+        Self {
+            kind: HookKind::OnContextArchived,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            message: None,
+            session_id: Some(session_id.to_string()),
+            cwd: None,
+            tool_runtime_name: None,
+            transcript: None,
+            data: serde_json::json!({
+                "archive_id": archive_id,
+                "path": path.and_then(Path::to_str),
+                "project_key": project_key,
+                "message_count": message_count,
+                "source_message_count": source_message_count,
+                "window": window,
+                "part": 1,
+                "parts": 1,
+                "first_source_index": 0,
+                "reduced_messages": 0,
+            }),
+        }
+    }
+
+    /// Say which of its window's archives an `on_context_archived` event is
+    /// for (builder): archive `part` of `parts`, counting from 1, covering
+    /// the window's source messages from `first_source_index`, with
+    /// `reduced_messages` of them stored with an oversized payload left out.
+    /// The fields are already in `data`; on any other event this does nothing.
+    pub fn with_part(
+        mut self,
+        part: usize,
+        parts: usize,
+        first_source_index: usize,
+        reduced_messages: usize,
+    ) -> Self {
+        if let (HookKind::OnContextArchived, Some(data)) = (self.kind, self.data.as_object_mut()) {
+            for (field, value) in [
+                ("part", part),
+                ("parts", parts),
+                ("first_source_index", first_source_index),
+                ("reduced_messages", reduced_messages),
+            ] {
+                data.insert(field.to_owned(), value.into());
+            }
+        }
+        self
+    }
+
+    /// Construct an `on_memory_forgotten` event: `memory_forget` forgot the
+    /// archive or note `id` in project `project_key`. `kind` is `"archive"`
+    /// or `"note"`, `scope` is `"repository"` (the tool has no other). `session_id` is
+    /// the chat whose tool call it was (`None`: no chat behind the call). An
+    /// archive's `id` is the bare id, as in `on_context_archived`, without
+    /// the model-facing `ctx-` prefix.
+    pub fn on_memory_forgotten(
+        session_id: Option<&str>,
+        id: &str,
+        kind: &str,
+        project_key: &str,
+        scope: &str,
+    ) -> Self {
+        Self {
+            kind: HookKind::OnMemoryForgotten,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            message: None,
+            session_id: session_id.map(str::to_string),
+            cwd: None,
+            tool_runtime_name: None,
+            transcript: None,
+            data: serde_json::json!({
+                "id": id,
+                "kind": kind,
+                "project_key": project_key,
+                "scope": scope,
+            }),
         }
     }
 
@@ -347,6 +521,7 @@ impl HookEvent {
             tool_output: None,
             message: None,
             session_id: Some(session_id.to_string()),
+            cwd: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -362,6 +537,7 @@ impl HookEvent {
             tool_output: None,
             message: None,
             session_id: Some(session_id.to_string()),
+            cwd: None,
             tool_runtime_name: None,
             transcript,
             data: Value::Null,
@@ -591,6 +767,8 @@ mod tests {
             HookKind::OnCompaction,
             HookKind::OnSessionStart,
             HookKind::OnSessionEnd,
+            HookKind::OnContextArchived,
+            HookKind::OnMemoryForgotten,
         ];
         for kind in all {
             let s = kind.as_str();
@@ -651,6 +829,44 @@ mod tests {
             HookKind::OnSessionEnd.required_permission(),
             Permission::SessionLifecycle
         );
+        assert_eq!(
+            HookKind::OnContextArchived.required_permission(),
+            Permission::LlmContent
+        );
+        assert_eq!(
+            HookKind::OnMemoryForgotten.required_permission(),
+            Permission::SessionLifecycle
+        );
+    }
+
+    /// The notify-only kinds: no tool filter, and `continue` is the only
+    /// answer they accept (it is discarded anyway).
+    #[test]
+    fn notification_kinds_are_continue_only() {
+        let notifications: Vec<HookKind> = HookKind::ALL
+            .iter()
+            .copied()
+            .filter(HookKind::is_notification)
+            .collect();
+        assert_eq!(
+            notifications,
+            [HookKind::OnContextArchived, HookKind::OnMemoryForgotten]
+        );
+        for kind in notifications {
+            assert_eq!(kind.allowed_action_names(), ["continue"], "{kind:?}");
+            assert!(!kind.allows_tool_filter(), "{kind:?}");
+            assert!(kind.allows_result(&HookResult::Continue));
+            for refused in [
+                HookResult::Block { reason: "r".into() },
+                HookResult::Inject { content: "c".into() },
+                HookResult::confirm("m"),
+                HookResult::Modify { input: json!({}) },
+                HookResult::Replace { output: "o".into() },
+                HookResult::ContextPhase { phase: "new_task".into() },
+            ] {
+                assert!(!kind.allows_result(&refused), "{kind:?} {refused:?}");
+            }
+        }
     }
 
     // ── HookEvent constructors ────────────────────────────────────────────────
@@ -727,6 +943,120 @@ mod tests {
         assert!(ev.transcript.is_none());
     }
 
+    /// The wire shape of `on_context_archived`: everything new is in `data`,
+    /// and a single archive is part 1 of 1.
+    #[test]
+    fn hook_event_on_context_archived() {
+        let id = "9f2c".repeat(8);
+        let file = std::env::temp_dir().join("s000001").join(format!("{id}.json"));
+        let ev = HookEvent::on_context_archived(
+            "chat-1",
+            &id,
+            Some(&file),
+            "p0123456789abcdef",
+            212,
+            240,
+            4,
+        );
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            json!({
+                "kind": "on_context_archived",
+                "tool_name": null,
+                "tool_runtime_name": null,
+                "tool_input": null,
+                "tool_output": null,
+                "message": null,
+                "session_id": "chat-1",
+                "cwd": null,
+                "transcript": null,
+                "data": {
+                    "archive_id": id,
+                    "path": file.to_str().unwrap(),
+                    "project_key": "p0123456789abcdef",
+                    "message_count": 212,
+                    "source_message_count": 240,
+                    "window": 4,
+                    "part": 1,
+                    "parts": 1,
+                    "first_source_index": 0,
+                    "reduced_messages": 0,
+                },
+            })
+        );
+        // The id is always set: the SYNAPS_HOOK_SESSION_ID switch is for the
+        // tool and message hooks, whose constructors leave it unset.
+        assert_eq!(ev.session_id.as_deref(), Some("chat-1"));
+        // A file that could not be located is `null`, never a guessed path.
+        let lost = HookEvent::on_context_archived("chat-1", &id, None, "p0", 1, 1, 2);
+        assert_eq!(lost.data["path"], Value::Null);
+        assert_eq!(lost.data["archive_id"], json!(id));
+    }
+
+    /// One archive of a window sealed as several: `with_part` changes the
+    /// four part fields and nothing else, and the values of a whole window
+    /// leave the event exactly as it was built, key order included.
+    #[test]
+    fn hook_event_on_context_archived_for_one_part_of_several() {
+        let id = "9f2c".repeat(8);
+        let whole = || HookEvent::on_context_archived("chat-1", &id, None, "p0", 212, 240, 4);
+        let wire = |ev: &HookEvent| serde_json::to_string(ev).unwrap();
+        assert_eq!(wire(&whole().with_part(1, 1, 0, 0)), wire(&whole()));
+
+        let second = whole().with_part(2, 3, 240, 1);
+        let mut expected = serde_json::to_value(whole()).unwrap();
+        expected["data"]["part"] = json!(2);
+        expected["data"]["parts"] = json!(3);
+        expected["data"]["first_source_index"] = json!(240);
+        expected["data"]["reduced_messages"] = json!(1);
+        assert_eq!(serde_json::to_value(&second).unwrap(), expected);
+        assert_eq!(
+            second.data.as_object().unwrap().len(),
+            whole().data.as_object().unwrap().len(),
+            "no field is added"
+        );
+
+        // Not an archive event: untouched, whatever its data is.
+        let other = HookEvent::on_session_start("chat-1");
+        assert_eq!(wire(&other.clone().with_part(2, 3, 240, 1)), wire(&other));
+    }
+
+    /// The wire shape of `on_memory_forgotten`: ids only, in `data`.
+    #[test]
+    fn hook_event_on_memory_forgotten() {
+        let id = "9f2c".repeat(8);
+        let ev =
+            HookEvent::on_memory_forgotten(Some("chat-1"), &id, "archive", "p0123456789abcdef", "repository");
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            json!({
+                "kind": "on_memory_forgotten",
+                "tool_name": null,
+                "tool_runtime_name": null,
+                "tool_input": null,
+                "tool_output": null,
+                "message": null,
+                "session_id": "chat-1",
+                "cwd": null,
+                "transcript": null,
+                "data": {
+                    "id": id,
+                    "kind": "archive",
+                    "project_key": "p0123456789abcdef",
+                    "scope": "repository",
+                },
+            })
+        );
+        // A user-wide note, forgotten by a call with no chat behind it.
+        let note =
+            HookEvent::on_memory_forgotten(None, "mem-1", "note", "p0000000000000000", "user");
+        assert_eq!(note.session_id, None);
+        assert_eq!(
+            note.data,
+            json!({"id": "mem-1", "kind": "note", "project_key": "p0000000000000000", "scope": "user"})
+        );
+    }
+
     #[test]
     fn hook_event_on_session_start() {
         let ev = HookEvent::on_session_start("sess-abc-123");
@@ -757,6 +1087,68 @@ mod tests {
         assert_eq!(back.kind, ev.kind);
         assert_eq!(back.tool_name, ev.tool_name);
         assert_eq!(back.tool_input, ev.tool_input);
+    }
+
+    // ── cwd ───────────────────────────────────────────────────────────────────
+
+    /// A session folder is sent as given: not canonicalised, not required to
+    /// exist. Built from the platform temp dir so the shape is the host's.
+    #[test]
+    fn with_cwd_serialises_the_session_folder_as_given() {
+        let dir = std::env::temp_dir().join("hook-cwd").join("..").join("proj");
+        let ev = HookEvent::before_message("hi").with_cwd(Some(&dir));
+        let wire = serde_json::to_value(&ev).unwrap();
+        assert_eq!(wire["cwd"], json!(dir.to_str().unwrap()));
+    }
+
+    /// No session folder (in-process hosts): the process folder.
+    #[test]
+    fn with_cwd_none_serialises_the_process_folder() {
+        let process = std::env::current_dir().unwrap();
+        let ev = HookEvent::on_session_start("s").with_cwd(None);
+        let wire = serde_json::to_value(&ev).unwrap();
+        assert_eq!(wire["cwd"], json!(process.to_str().unwrap()));
+    }
+
+    /// Every kind has the key on the wire, `null` until an emitter stamps it.
+    #[test]
+    fn cwd_key_is_always_present() {
+        for ev in [
+            HookEvent::before_tool_call("bash", json!({})),
+            HookEvent::after_tool_call("bash", json!({}), "o".into()),
+            HookEvent::before_message("m"),
+            HookEvent::on_message_complete("m", json!({})),
+            HookEvent::on_compaction("a", "b", "s", 1, json!({})),
+            HookEvent::on_session_start("s"),
+            HookEvent::on_session_end("s", None),
+            HookEvent::on_context_archived("s", "a", None, "p", 1, 1, 2),
+            HookEvent::on_memory_forgotten(Some("s"), "a", "archive", "p", "repository"),
+        ] {
+            let wire = serde_json::to_value(&ev).unwrap();
+            assert_eq!(wire.get("cwd"), Some(&Value::Null), "{:?}", ev.kind);
+        }
+    }
+
+    /// A folder that cannot be written as a JSON string is `null`, never a
+    /// lossy rewrite and never the process folder.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_cwd_is_null() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/hook-cwd-\xff"));
+        assert_eq!(hook_cwd(Some(dir)), None);
+        let ev = HookEvent::before_message("hi").with_cwd(Some(dir));
+        assert_eq!(serde_json::to_value(&ev).unwrap()["cwd"], Value::Null);
+    }
+
+    /// The same rule for an archive's `path`.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_archive_path_is_null() {
+        use std::os::unix::ffi::OsStrExt;
+        let file = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/archives-\xff/a.json"));
+        let ev = HookEvent::on_context_archived("s", "a", Some(file), "p", 1, 1, 2);
+        assert_eq!(ev.data["path"], Value::Null);
     }
 
     // ── HookResult ────────────────────────────────────────────────────────────
@@ -851,12 +1243,14 @@ mod tests {
                 | HookKind::OnMessageComplete
                 | HookKind::OnCompaction
                 | HookKind::OnSessionStart
-                | HookKind::OnSessionEnd => {}
+                | HookKind::OnSessionEnd
+                | HookKind::OnContextArchived
+                | HookKind::OnMemoryForgotten => {}
             }
         }
         assert_eq!(
             HookKind::ALL.len(),
-            7,
+            9,
             "a HookKind variant was added or removed -- update HookKind::ALL \
              and docs/extensions/contract.json to match"
         );

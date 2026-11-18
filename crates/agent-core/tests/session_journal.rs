@@ -504,6 +504,7 @@ fn retention_age_sweep_deletes_session_and_journal_as_one_artifact() {
     let policy = RetentionPolicy {
         max_age_days: Some(30),
         max_disk_bytes: None,
+        include_notes: false,
     };
     sweep_at(&h.roots, &policy, now_ms).unwrap();
 
@@ -535,6 +536,7 @@ fn retention_chain_head_protects_journal_too() {
     let policy = RetentionPolicy {
         max_age_days: Some(30),
         max_disk_bytes: None,
+        include_notes: false,
     };
     sweep_at(&h.roots, &policy, 1_800_000_000_000).unwrap();
 
@@ -561,6 +563,7 @@ fn retention_sweeps_orphan_journals() {
     let policy = RetentionPolicy {
         max_age_days: Some(30),
         max_disk_bytes: None,
+        include_notes: false,
     };
     sweep_at(&h.roots, &policy, 1_800_000_000_000).unwrap();
     assert!(

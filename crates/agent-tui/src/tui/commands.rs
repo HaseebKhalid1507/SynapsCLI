@@ -95,13 +95,6 @@ pub(super) enum CommandAction {
     ExtensionsAudit { tail: Option<usize> },
     /// Inspect local memory store (namespaces, recent records).
     ExtensionsMemory(ExtensionsMemoryAction),
-    /// Toggle the active sidecar plugin on/off (`/sidecar` or `/sidecar toggle`).
-    ///
-    /// `plugin_id = Some(pid)` selects a specific claimed sidecar (Phase 8 8B).
-    /// `plugin_id = None` falls back to the legacy single-sidecar slot.
-    SidecarToggle { plugin_id: Option<String> },
-    /// Show sidecar subsystem status (`/sidecar status`).
-    SidecarStatus { plugin_id: Option<String> },
     /// `/takeover` typed mid-stream: [`takeover`] needs the session link,
     /// which [`handle_streaming_command`] doesn't have.
     TakeOver,
@@ -513,46 +506,6 @@ async fn run_command(
     keybind_registry: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> CommandAction {
     use synaps_cli::skills::registry::Resolution;
-    // Phase 8 slice 8A: plugin-claimed lifecycle commands take precedence
-    // over builtins. If a plugin's manifest claims `/capture` (or any other
-    // top-level word) via `provides.sidecar.lifecycle`, route
-    // `<word> toggle` and `<word> status` to the generic sidecar
-    // lifecycle actions. Other subcommands (e.g. `/capture models`) fall
-    // through to the normal plugin-command resolver below.
-    if let Some(claim) = registry.lifecycle_for_command(cmd) {
-        let trimmed = arg.trim();
-        match trimmed {
-            "" | "toggle" => {
-                return CommandAction::SidecarToggle {
-                    plugin_id: Some(claim.plugin.clone()),
-                }
-            }
-            "status" => {
-                return CommandAction::SidecarStatus {
-                    plugin_id: Some(claim.plugin.clone()),
-                }
-            }
-            _ => {
-                // Fall through to the plugin-command resolver: the
-                // plugin can define `<command> <other-sub>` (e.g.
-                // `/capture models`) as a normal interactive command.
-                if let Some(command) = registry.find_plugin_command_unqualified(&claim.command) {
-                    return CommandAction::PluginCommand {
-                        command,
-                        arg: trimmed.to_string(),
-                    };
-                }
-                // No plugin command; surface a usage hint scoped to
-                // the claimed display name.
-                app.push_msg(ChatMessage::Error(format!(
-                    "unknown /{} subcommand: `{}` (try: toggle, status)",
-                    claim.command, trimmed,
-                )));
-                return CommandAction::None;
-            }
-        }
-    }
-
     // ── Engine-level commands (shared with headless) ──
     // `/context` with the TUI's own conversation history: the runtime does
     // not own session messages, so the surface passes them in. Must run
@@ -596,7 +549,7 @@ async fn run_command(
         };
     }
     if synaps_cli::engine::commands::evaluate_engine_command(cmd, arg).is_some()
-        || matches!(cmd, "context" | "trace" | "memory" | "workers" | "confirms" | "auth" | "close")
+        || matches!(cmd, "context" | "trace" | "workers" | "confirms" | "auth" | "close")
     {
         use synaps_cli::engine::commands::persist_to_config;
         let value = match link.engine_command(cmd, arg).await {
@@ -1154,137 +1107,6 @@ async fn run_command(
         "ping" => {
             return CommandAction::Ping;
         }
-        "sidecar" => {
-            // Phase 8 8A.6 / 8A.7: ambiguity-aware dispatcher.
-            //
-            // Two surface forms:
-            //   * unqualified — `/sidecar [toggle|status]` — back-compat
-            //     for the single-sidecar slot. With ≥2 claims we refuse
-            //     to dispatch and force disambiguation.
-            //   * qualified   — `/sidecar <plugin-id> <subcommand>` —
-            //     selects a specific claimed sidecar. (In slice 8A the
-            //     action variants don't carry a plugin-id payload yet;
-            //     we just validate the plugin-id against the loaded
-            //     lifecycle claims and dispatch the bare action.)
-            //
-            // TODO(phase 8 8B): plumb plugin_id into SidecarToggle /
-            //                   SidecarStatus so multi-sidecar hosting
-            //                   can route to a specific instance.
-            let trimmed = arg.trim();
-            let mut tokens = trimmed.split_whitespace();
-            let first = tokens.next().unwrap_or("");
-            let rest: String = tokens.collect::<Vec<_>>().join(" ");
-
-            if rest.is_empty() {
-                // Unqualified form.
-                let claims = registry.lifecycle_claims();
-                let render_disambig =
-                    |verb: &str,
-                     claims: &[synaps_cli::skills::registry::LifecycleClaim]|
-                     -> String {
-                        let mut sorted: Vec<_> = claims.iter().collect();
-                        sorted.sort_by(|a, b| a.plugin.cmp(&b.plugin));
-                        let plugins = sorted
-                            .iter()
-                            .map(|c| c.plugin.clone())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let cmds = sorted
-                            .iter()
-                            .map(|c| format!("/{}", c.command))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!(
-                        "multiple sidecars loaded: {}; use /sidecar <plugin-id> {} or one of the per-plugin commands ({})",
-                        plugins, verb, cmds
-                    )
-                    };
-                match first {
-                    "" | "toggle" => match claims.len() {
-                        0 => return CommandAction::SidecarToggle { plugin_id: None },
-                        1 => {
-                            let c = &claims[0];
-                            app.push_msg(ChatMessage::System(format!(
-                                "hint: this sidecar is claimed by /{} — try /{} toggle",
-                                c.command, c.command
-                            )));
-                            return CommandAction::SidecarToggle {
-                                plugin_id: Some(c.plugin.clone()),
-                            };
-                        }
-                        _ => {
-                            app.push_msg(ChatMessage::Error(render_disambig("toggle", &claims)));
-                            return CommandAction::None;
-                        }
-                    },
-                    "status" => match claims.len() {
-                        0 => return CommandAction::SidecarStatus { plugin_id: None },
-                        1 => {
-                            let c = &claims[0];
-                            app.push_msg(ChatMessage::System(format!(
-                                "hint: this sidecar is claimed by /{} — try /{} status",
-                                c.command, c.command
-                            )));
-                            return CommandAction::SidecarStatus {
-                                plugin_id: Some(c.plugin.clone()),
-                            };
-                        }
-                        _ => {
-                            app.push_msg(ChatMessage::Error(render_disambig("status", &claims)));
-                            return CommandAction::None;
-                        }
-                    },
-                    other => {
-                        app.push_msg(ChatMessage::Error(format!(
-                            "unknown /sidecar subcommand: `{}` (try: toggle, status)",
-                            other
-                        )));
-                        return CommandAction::None;
-                    }
-                }
-            } else {
-                // Qualified form: first = plugin-id, rest = subcommand.
-                let plugin_id = first;
-                let claims = registry.lifecycle_claims();
-                if !claims.iter().any(|c| c.plugin == plugin_id) {
-                    let mut sorted: Vec<_> = claims.iter().collect();
-                    sorted.sort_by(|a, b| a.plugin.cmp(&b.plugin));
-                    let list = if sorted.is_empty() {
-                        "none".to_string()
-                    } else {
-                        sorted
-                            .iter()
-                            .map(|c| c.plugin.clone())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    };
-                    app.push_msg(ChatMessage::Error(format!(
-                        "unknown sidecar plugin: '{}' (loaded: {})",
-                        plugin_id, list
-                    )));
-                    return CommandAction::None;
-                }
-                match rest.as_str() {
-                    "toggle" => {
-                        return CommandAction::SidecarToggle {
-                            plugin_id: Some(plugin_id.to_string()),
-                        }
-                    }
-                    "status" => {
-                        return CommandAction::SidecarStatus {
-                            plugin_id: Some(plugin_id.to_string()),
-                        }
-                    }
-                    other => {
-                        app.push_msg(ChatMessage::Error(format!(
-                            "unknown /sidecar subcommand: `{}` (try: toggle, status)",
-                            other
-                        )));
-                        return CommandAction::None;
-                    }
-                }
-            }
-        }
         "keybinds" => {
             let custom = keybind_registry.custom_binds();
             if custom.is_empty() {
@@ -1841,7 +1663,6 @@ mod tests {
                     compatibility: None,
                     extension: None,
                     help_entries: vec![],
-                    provides: None,
                     settings: None,
                     commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
                         ManifestSkillPromptCommand {
@@ -1878,6 +1699,95 @@ mod tests {
             }
             _ => panic!("expected plugin command action"),
         }
+    }
+
+    /// The real builtins plus, when `with_plugin`, a plugin `axel` that
+    /// owns a bare `memory` command.
+    fn memory_registry(with_plugin: bool) -> Arc<CommandRegistry> {
+        let plugins = if with_plugin {
+            vec![synaps_cli::skills::Plugin {
+                name: "axel".to_string(),
+                root: PathBuf::from("/tmp/axel"),
+                marketplace: None,
+                version: None,
+                description: None,
+                extension: None,
+                manifest: Some(synaps_cli::skills::manifest::PluginManifest {
+                    name: "axel".to_string(),
+                    version: None,
+                    description: None,
+                    keybinds: vec![],
+                    compatibility: None,
+                    extension: None,
+                    help_entries: vec![],
+                    settings: None,
+                    commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
+                        ManifestSkillPromptCommand {
+                            name: "memory".to_string(),
+                            description: None,
+                            skill: "axel".to_string(),
+                            prompt: "Memory: ${args}".to_string(),
+                        },
+                    )],
+                }),
+            }]
+        } else {
+            vec![]
+        };
+        Arc::new(CommandRegistry::new_with_plugins(
+            synaps_cli::skills::BUILTIN_COMMANDS,
+            vec![],
+            plugins,
+        ))
+    }
+
+    /// `/memory` is not a builtin: a plugin command named `memory` gets it,
+    /// and completion offers it only through that plugin.
+    #[tokio::test]
+    async fn a_plugin_memory_command_wins_over_the_removed_builtin() {
+        let registry = memory_registry(true);
+        assert!(registry.all_commands().contains(&"memory".to_string()));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        match handle_command("memory", "status", &mut app, &mut link, &system_prompt_path, &registry, &keybinds)
+            .await
+        {
+            CommandAction::PluginCommand { command, arg } => {
+                assert_eq!((command.plugin.as_str(), command.name.as_str()), ("axel", "memory"));
+                assert_eq!(arg, "status");
+            }
+            _ => panic!("expected the plugin's /memory"),
+        }
+        let removed = synaps_cli::engine::commands::memory_removed_line();
+        assert!(
+            !app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if *s == removed)),
+            "no removal line"
+        );
+    }
+
+    /// Without a plugin `memory` command, `/memory` is not offered in
+    /// completion, and typing it still prints the one removal line.
+    #[tokio::test]
+    async fn without_a_plugin_memory_prints_the_removal_line() {
+        let registry = memory_registry(false);
+        assert!(!synaps_cli::skills::BUILTIN_COMMANDS.contains(&"memory"));
+        assert!(!registry.all_commands().contains(&"memory".to_string()));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        let action =
+            handle_command("memory", "on", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(matches!(action, CommandAction::None));
+        let want = synaps_cli::engine::commands::memory_removed_line();
+        assert!(
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if *s == want)),
+            "the removal line is shown"
+        );
     }
 
     /// `/close` is the session's to run (it ends it): the TUI forwards it
@@ -2658,325 +2568,89 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_is_in_builtin_commands_and_capture_is_plugin_owned() {
-        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"sidecar"));
+    fn sidecar_and_capture_are_not_builtin_commands() {
+        assert!(!synaps_cli::skills::BUILTIN_COMMANDS.contains(&"sidecar"));
         assert!(!synaps_cli::skills::BUILTIN_COMMANDS.contains(&"capture"));
     }
 
-    // ---- Phase 8 slice 8A: lifecycle-claim dispatcher ----
+    /// The sidecar system is gone: `/sidecar` is an unknown command like
+    /// any other.
+    #[test]
+    fn sidecar_is_an_unknown_command() {
+        use crate::tui::testing::TestHarness;
+        for arg in ["", "toggle", "status"] {
+            let mut h = TestHarness::boot_with_size(120, 30);
+            h.run_slash_command("sidecar", arg);
+            let frame = h.snapshot();
+            assert!(frame.contains("unknown command: /sidecar"), "{arg:?}: {frame}");
+        }
+    }
 
-    fn lifecycle_plugin(plugin: &str, command: &str) -> synaps_cli::skills::Plugin {
-        use synaps_cli::skills::manifest::{
-            PluginManifest, PluginProvides, SidecarLifecycle, SidecarManifest,
-        };
+    /// The installed `local-voice` manifest shape: a `voice` interactive
+    /// command next to an ignored `provides.sidecar` block that used to
+    /// claim `/voice toggle|status`. Those now reach the plugin's own
+    /// command, as any extension command does.
+    fn legacy_voice_plugin() -> synaps_cli::skills::Plugin {
+        let manifest: synaps_cli::skills::manifest::PluginManifest = serde_json::from_str(
+            r#"{
+                "name": "local-voice",
+                "extension": {"protocol_version": 1, "runtime": "process",
+                              "command": "bin/synaps-voice-plugin", "args": ["--extension-rpc"]},
+                "commands": [{"name": "voice", "description": "Manage voice.", "interactive": true,
+                              "subcommands": ["help", "models", "download", "rebuild"]}],
+                "provides": {"sidecar": {"command": "bin/synaps-voice-plugin", "protocol_version": 2,
+                             "lifecycle": {"command": "voice", "display_name": "Voice"}}}
+            }"#,
+        )
+        .expect("legacy manifest parses");
         synaps_cli::skills::Plugin {
-            name: plugin.to_string(),
-            root: PathBuf::from(format!("/tmp/{plugin}")),
+            name: manifest.name.clone(),
+            root: PathBuf::from("/tmp/local-voice"),
             marketplace: None,
             version: None,
             description: None,
-            extension: None,
-            manifest: Some(PluginManifest {
-                name: plugin.to_string(),
-                version: None,
-                description: None,
-                keybinds: vec![],
-                compatibility: None,
-                commands: vec![],
-                extension: None,
-                help_entries: vec![],
-                provides: Some(PluginProvides {
-                    sidecar: Some(SidecarManifest {
-                        command: "bin/run".to_string(),
-                        setup: None,
-                        protocol_version: 1,
-                        model: None,
-                        lifecycle: Some(SidecarLifecycle {
-                            command: command.to_string(),
-                            settings_category: None,
-                            display_name: None,
-                            importance: 0,
-                        }),
-                    }),
-                }),
-                settings: None,
-            }),
+            extension: manifest.extension.clone(),
+            manifest: Some(manifest),
         }
     }
 
     #[tokio::test]
-    async fn lifecycle_claim_routes_toggle_to_sidecar_toggle() {
+    async fn voice_toggle_and_status_go_to_the_plugins_own_command() {
         let registry = Arc::new(CommandRegistry::new_with_plugins(
             &[],
             vec![],
-            vec![lifecycle_plugin("sample-sidecar", "capture")],
+            vec![legacy_voice_plugin()],
         ));
-        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
         let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
-        let action = handle_command(
-            "capture",
-            "toggle",
-            &mut app,
-            &mut link,
-            &PathBuf::from("/tmp/sp"),
-            &registry,
-            &keybinds,
-        )
-        .await;
-        match action {
-            CommandAction::SidecarToggle { plugin_id } => {
-                assert_eq!(plugin_id.as_deref(), Some("sample-sidecar"));
+        for arg in ["toggle", "status", "", "models"] {
+            let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+            let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
+            let action = handle_command(
+                "voice",
+                arg,
+                &mut app,
+                &mut link,
+                &PathBuf::from("/tmp/sp"),
+                &registry,
+                &keybinds,
+            )
+            .await;
+            match action {
+                CommandAction::PluginCommand { command, arg: got } => {
+                    assert_eq!(command.plugin, "local-voice", "{arg:?}");
+                    assert_eq!(command.name, "voice", "{arg:?}");
+                    assert_eq!(got, arg, "the subcommand is passed through");
+                    assert!(matches!(
+                        command.backend,
+                        RegisteredPluginCommandBackend::Interactive { .. }
+                    ));
+                }
+                other => panic!(
+                    "{arg:?}: expected the plugin's own command, got {:?}",
+                    std::mem::discriminant(&other)
+                ),
             }
-            other => panic!(
-                "expected SidecarToggle with plugin_id, got {:?}",
-                std::mem::discriminant(&other)
-            ),
         }
-    }
-
-    #[tokio::test]
-    async fn lifecycle_claim_routes_bare_command_to_toggle() {
-        // `/capture` (no arg) is treated as `/capture toggle`.
-        let registry = Arc::new(CommandRegistry::new_with_plugins(
-            &[],
-            vec![],
-            vec![lifecycle_plugin("sample-sidecar", "capture")],
-        ));
-        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
-        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
-        let action = handle_command(
-            "capture",
-            "",
-            &mut app,
-            &mut link,
-            &PathBuf::from("/tmp/sp"),
-            &registry,
-            &keybinds,
-        )
-        .await;
-        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
-    }
-
-    #[tokio::test]
-    async fn lifecycle_claim_routes_status_to_sidecar_status() {
-        let registry = Arc::new(CommandRegistry::new_with_plugins(
-            &[],
-            vec![],
-            vec![lifecycle_plugin("sample-sidecar", "capture")],
-        ));
-        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
-        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
-        let action = handle_command(
-            "capture",
-            "status",
-            &mut app,
-            &mut link,
-            &PathBuf::from("/tmp/sp"),
-            &registry,
-            &keybinds,
-        )
-        .await;
-        match action {
-            CommandAction::SidecarStatus { plugin_id } => {
-                assert_eq!(plugin_id.as_deref(), Some("sample-sidecar"));
-            }
-            other => panic!(
-                "expected SidecarStatus with plugin_id, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
-    }
-
-    #[tokio::test]
-    async fn lifecycle_claim_takes_precedence_over_capture_builtin_alias() {
-        // When a plugin declares the `capture` lifecycle, the dispatcher
-        // routes via the lifecycle path — NOT the legacy `"capture"`
-        // builtin alias — so the lifecycle answer is reached even if
-        // the alias would error out (no plugin command registered).
-        let registry = Arc::new(CommandRegistry::new_with_plugins(
-            &[],
-            vec![],
-            vec![lifecycle_plugin("sample-sidecar", "capture")],
-        ));
-        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
-        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
-        let action = handle_command(
-            "capture",
-            "toggle",
-            &mut app,
-            &mut link,
-            &PathBuf::from("/tmp/sp"),
-            &registry,
-            &keybinds,
-        )
-        .await;
-        // No "no plugin owns /capture" error pushed — lifecycle path won.
-        let pushed_legacy_error = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("no plugin owns /capture")));
-        assert!(!pushed_legacy_error);
-        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
-    }
-
-    #[tokio::test]
-    async fn lifecycle_claim_unknown_subcommand_pushes_error() {
-        let registry = Arc::new(CommandRegistry::new_with_plugins(
-            &[],
-            vec![],
-            vec![lifecycle_plugin("sample-sidecar", "capture")],
-        ));
-        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
-        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
-        let action = handle_command(
-            "capture",
-            "bogus",
-            &mut app,
-            &mut link,
-            &PathBuf::from("/tmp/sp"),
-            &registry,
-            &keybinds,
-        )
-        .await;
-        assert!(matches!(action, CommandAction::None));
-        let pushed = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown /capture subcommand")));
-        assert!(pushed);
-    }
-
-    // ---- Phase 8 slices 8A.6 / 8A.7 — `/sidecar` ambiguity-aware dispatcher ----
-
-    async fn invoke_sidecar_with_plugins(
-        arg: &str,
-        plugins: Vec<synaps_cli::skills::Plugin>,
-    ) -> (CommandAction, crate::tui::app::App) {
-        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
-        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], plugins));
-        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
-        let action = handle_command(
-            "sidecar",
-            arg,
-            &mut app,
-            &mut link,
-            &PathBuf::from("/tmp/sp"),
-            &registry,
-            &keybinds,
-        )
-        .await;
-        (action, app)
-    }
-
-    #[tokio::test]
-    async fn sidecar_toggle_works_when_zero_claims_loaded() {
-        let (action, app) = invoke_sidecar_with_plugins("toggle", vec![]).await;
-        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
-        let pushed_err = app
-            .transcript
-            .messages()
-            .iter()
-            .any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(_)));
-        assert!(!pushed_err, "no errors expected for zero-claim back-compat");
-    }
-
-    #[tokio::test]
-    async fn sidecar_toggle_with_one_claim_dispatches_with_hint() {
-        let (action, app) = invoke_sidecar_with_plugins(
-            "toggle",
-            vec![lifecycle_plugin("sample-sidecar", "capture")],
-        )
-        .await;
-        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
-        let pushed_hint = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::System(s) if s.contains("try /capture toggle")));
-        assert!(
-            pushed_hint,
-            "expected a System hint mentioning `try /capture toggle`"
-        );
-    }
-
-    #[tokio::test]
-    async fn sidecar_toggle_with_two_claims_errors_with_disambiguation() {
-        let (action, app) = invoke_sidecar_with_plugins(
-            "toggle",
-            vec![
-                lifecycle_plugin("sample-sidecar", "capture"),
-                lifecycle_plugin("local-ocr", "ocr"),
-            ],
-        )
-        .await;
-        assert!(matches!(action, CommandAction::None));
-        let pushed = app.transcript.messages().iter().find_map(|m| match &m.msg {
-            crate::tui::app::ChatMessage::Error(s) => Some(s.clone()),
-            _ => None,
-        });
-        let s = pushed.expect("expected an Error message");
-        assert!(
-            s.contains("sample-sidecar"),
-            "error should list sample-sidecar; got: {s}"
-        );
-        assert!(
-            s.contains("local-ocr"),
-            "error should list local-ocr; got: {s}"
-        );
-        assert!(
-            s.contains("/capture"),
-            "error should mention /capture; got: {s}"
-        );
-        assert!(s.contains("/ocr"), "error should mention /ocr; got: {s}");
-    }
-
-    #[tokio::test]
-    async fn sidecar_qualified_plugin_id_toggle_works() {
-        let (action, app) = invoke_sidecar_with_plugins(
-            "sample-sidecar toggle",
-            vec![
-                lifecycle_plugin("sample-sidecar", "capture"),
-                lifecycle_plugin("local-ocr", "ocr"),
-            ],
-        )
-        .await;
-        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
-        let pushed_err = app
-            .transcript
-            .messages()
-            .iter()
-            .any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(_)));
-        assert!(!pushed_err, "no errors expected for valid qualified form");
-    }
-
-    #[tokio::test]
-    async fn sidecar_qualified_unknown_plugin_id_errors() {
-        let (action, app) = invoke_sidecar_with_plugins(
-            "nonexistent toggle",
-            vec![lifecycle_plugin("sample-sidecar", "capture")],
-        )
-        .await;
-        assert!(matches!(action, CommandAction::None));
-        let pushed = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown sidecar plugin")));
-        assert!(pushed, "expected `unknown sidecar plugin` error");
-    }
-
-    #[tokio::test]
-    async fn sidecar_qualified_plugin_id_status() {
-        let (action, _app) = invoke_sidecar_with_plugins(
-            "sample-sidecar status",
-            vec![lifecycle_plugin("sample-sidecar", "capture")],
-        )
-        .await;
-        assert!(matches!(action, CommandAction::SidecarStatus { .. }));
-    }
-
-    #[tokio::test]
-    async fn sidecar_qualified_plugin_id_unknown_subcommand_errors() {
-        let (action, app) = invoke_sidecar_with_plugins(
-            "sample-sidecar bogus",
-            vec![lifecycle_plugin("sample-sidecar", "capture")],
-        )
-        .await;
-        assert!(matches!(action, CommandAction::None));
-        let pushed = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown /sidecar subcommand")));
-        assert!(pushed, "expected `unknown /sidecar subcommand` error");
     }
 
     // ── /stats unit tests ─────────────────────────────────────────────────

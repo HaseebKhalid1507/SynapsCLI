@@ -159,6 +159,14 @@ pub struct ReloadSession {
     /// owner sends them again when it re-binds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_token: Option<crate::session::OwnerToken>,
+    /// The journal ids the actor compacted away from (`JournalCell`): the
+    /// next image's actor still holds them. Empty from an older image.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
+    /// When the conversation began (kept across compactions). Absent from
+    /// an older image: the journal's own `created_at` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// `registry_dir()/daemon[-P].reload.json` body.
@@ -349,7 +357,16 @@ async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
 /// current model from the published view, the `/keepwarm` override).
 fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSession {
     let meta = handle.meta();
-    let journal_id = handle.journal_id();
+    let journal = handle.journal();
+    let journal_id = journal.journal_id.clone();
+    // A lock-held placeholder knows the conversation's start and what it
+    // superseded only from the record it was restored from; without that,
+    // its cell's start is its own spawn time, which must not ride on.
+    let known = handle.placeholder_config().is_none_or(|c| {
+        c.restore_conversation
+            .as_ref()
+            .is_some_and(|r| r.journal_id == journal_id)
+    });
     if rec.is_none() {
         tracing::warn!(
             session = %handle.id,
@@ -371,9 +388,6 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         None => (
             SessionConfig {
                 cwd: meta.cwd.clone(),
-                // Like `/keepwarm`: the user's `/memory` choice survives a
-                // reload whose checkpoint did not confirm.
-                memory_mode: handle.memory_mode(),
                 env: None,
             env_stripped: Vec::new(),
                 ..SessionConfig::default()
@@ -414,6 +428,12 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         workers,
         tool_activations,
         owner_token: handle.owner_token().cloned(),
+        supersedes: if known {
+            journal.supersedes.clone()
+        } else {
+            Vec::new()
+        },
+        created_at: known.then_some(journal.created_at),
     }
 }
 
@@ -811,7 +831,7 @@ pub fn adopt_from_env(_paths: &DaemonPaths) -> anyhow::Result<Option<Adopted>> {
 /// F23: detect "is live in another process" in the error string — this is
 /// the `SessionLockError::Held` case, where an in-process runtime holds
 /// the journal lock. Instead of aliasing to an empty impostor, register a
-/// Parked placeholder under the SAME id.
+/// Parked placeholder for that journal (`rehydrate`).
 pub(crate) fn is_lock_held_error(e: &str) -> bool {
     e.contains("is live in another process")
 }
@@ -872,12 +892,77 @@ pub(crate) async fn send_reload_aborted(h: &SessionHandle, budget: Duration) -> 
 /// use), so the restore of N sessions does not take N hook round trips
 /// while the socket waits. A session restored Parked runs it only once it
 /// is unparked.
-fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle) -> SessionConfig {
+///
+/// A folder that is no longer there is dropped ([`restorable_folder`]), as
+/// the pinned restore drops it (`pins::restore_one`): the chat `chat` then
+/// runs in the daemon's folder and its project. Kept, the dead path gave
+/// the chat no project at all: discovery fails on a path it cannot resolve,
+/// the memory tools answer "host project scope unavailable" and the next
+/// rollover cannot seal.
+fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle, chat: &str) -> SessionConfig {
     SessionConfig {
         await_extensions: false,
         restore_parked: matches!(lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking),
+        cwd: restorable_folder(saved.cwd.clone(), chat),
         ..saved.clone()
     }
+}
+
+/// The folder a chat is restored in, by a reload, as a pinned session or by
+/// an unpark (`session/actor.rs`):
+/// `folder` as saved, or `None` when it is gone, and the chat then runs in
+/// the daemon's folder and that folder's project.
+///
+/// Gone means that the path does not exist, is not a directory, or runs
+/// through something that is not a directory (a file where one of its
+/// parents was), which no folder can be under. A folder that cannot be
+/// looked at for a reason that can pass (no permission, a mount that is
+/// away for a moment, an I/O error) is kept: the chat stays in its
+/// own project, where its tools fail until the folder is back, rather than
+/// being moved to another project's files and memory without a word. Every
+/// drop is logged with the folder and the chat. The lines name no host: an
+/// unpark in a host that is not the daemon writes them too.
+pub(crate) fn restorable_folder(folder: Option<PathBuf>, chat: &str) -> Option<PathBuf> {
+    let folder = folder?;
+    let gone = match std::fs::metadata(&folder) {
+        Ok(found) if found.is_dir() => return Some(folder),
+        Ok(_) => "it is not a directory",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "it does not exist",
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+            "its path runs through something that is not a directory"
+        }
+        Err(error) => {
+            tracing::warn!(
+                session = %chat,
+                folder = %folder.display(),
+                error = %error,
+                "{}",
+                UNSEEN_NOTICE
+            );
+            return Some(folder);
+        }
+    };
+    tracing::warn!(
+        session = %chat,
+        folder = %folder.display(),
+        "{}",
+        gone_notice(gone)
+    );
+    None
+}
+
+/// What [`restorable_folder`] logs for a folder it keeps without having
+/// seen it. Like [`gone_notice`] it names no host.
+const UNSEEN_NOTICE: &str = "the chat's folder cannot be looked at; restored with it all the same";
+
+/// What [`restorable_folder`] logs for a folder it drops, `gone` being why.
+/// It names no host ("daemon:" it once began with): a reload and a pinned
+/// restore run in the daemon, an unpark in whichever host holds the chat.
+fn gone_notice(gone: &str) -> String {
+    format!(
+        "the chat's folder is gone ({gone}); it is restored in the host process's folder \
+         and that folder's project"
+    )
 }
 
 pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
@@ -888,26 +973,65 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
         // Owned: restored unbound, its grace armed only once this image
         // accepts connections (`Daemon::start`), its autonomous work held
         // until the owner re-binds.
-        let owned = s.owner_token.clone().map(|token| crate::session::OwnedConfig { token, restored: true });
-        let config = SessionConfig { owned, ..restore_config(&s.config, s.lifecycle) };
+        let owned = s
+            .owner_token
+            .clone()
+            .map(|token| crate::session::OwnedConfig {
+                token,
+                restored: true,
+            });
+        // What the actor held besides its journal; applied only if the new
+        // actor continues that journal (not a fresh fallback).
+        let restore_conversation =
+            s.created_at
+                .map(|created_at| crate::session::RestoredConversation {
+                    journal_id: s.journal_id.clone(),
+                    supersedes: s.supersedes.clone(),
+                    created_at,
+                });
+        let config = SessionConfig {
+            owned,
+            restore_conversation,
+            ..restore_config(&s.config, s.lifecycle, &s.id)
+        };
         let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
-            // placeholder under the SAME id. No alias, no fresh session.
+            // placeholder for that journal, no fresh session. Under the id a
+            // real session on it would take, as the success path does, never
+            // blindly under the old one: after `/clear` and a resume, a
+            // session rehydrated earlier in this loop can have that id (the
+            // resumed conversation), and must not be replaced. The old id
+            // reaches the placeholder by alias.
             Err(e) if is_lock_held_error(&e) => {
                 let holder = parse_holder_from_error(&e);
                 tracing::warn!(
                     session = %s.id, holder = %holder,
                     "daemon: journal locked by another process; registering Parked placeholder"
                 );
-                let sid = crate::session::SessionId::from(s.id.as_str());
+                let journal = match &config.continue_session {
+                    Some(Some(j)) => j.clone(),
+                    _ => s.journal_id.clone(),
+                };
                 // `config`, not `s.config`: an owned session stays owned.
-                let (handle, _task) = crate::session::handle::locked_placeholder::spawn(
-                    sid,
-                    config.clone(),
-                    holder,
-                );
-                state.insert(handle);
+                let handle = state
+                    .host
+                    .adopt_for_journal(&journal, |sid| {
+                        crate::session::handle::locked_placeholder::spawn(
+                            sid,
+                            config.clone(),
+                            holder,
+                        )
+                        .0
+                    })
+                    .await;
+                if handle.id.as_str() != s.id {
+                    state
+                        .reload_aliases
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(s.id.clone(), handle.id.0.clone());
+                }
                 continue;
             }
             Err(e) if s.config.continue_session.is_some() => {
@@ -1013,6 +1137,8 @@ mod tests {
             workers: Vec::new(),
             tool_activations: carried.clone(),
             owner_token: None,
+            supersedes: Vec::new(),
+            created_at: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         let back: ReloadSession = serde_json::from_value(v.clone()).unwrap();
@@ -1024,6 +1150,44 @@ mod tests {
         older.as_object_mut().unwrap().remove("tool_activations");
         let back: ReloadSession = serde_json::from_value(older).unwrap();
         assert!(back.tool_activations.is_empty());
+    }
+
+    /// The conversation cell rides the record beside the config, never in
+    /// the config's wire form; an older image's record has neither field.
+    #[test]
+    fn reload_session_carries_the_conversation_cell() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let s = ReloadSession {
+            id: "a".into(),
+            journal_id: "b".into(),
+            config: SessionConfig::default(),
+            keep_warm: false,
+            lifecycle: SessionLifecycle::Live,
+            settings_replay: Vec::new(),
+            cache_keepwarm: None,
+            input_owner_kind: None,
+            workers: Vec::new(),
+            tool_activations: Vec::new(),
+            owner_token: None,
+            supersedes: vec!["a".into()],
+            created_at: Some(at),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["supersedes"], serde_json::json!(["a"]));
+        assert!(v["config"].get("restore_conversation").is_none());
+        let back: ReloadSession = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(
+            (back.supersedes, back.created_at),
+            (vec!["a".to_string()], Some(at))
+        );
+
+        let mut older = v;
+        older.as_object_mut().unwrap().remove("supersedes");
+        older.as_object_mut().unwrap().remove("created_at");
+        let back: ReloadSession = serde_json::from_value(older).unwrap();
+        assert!(back.supersedes.is_empty() && back.created_at.is_none());
     }
 
     /// Reload-state written by an older image (no workers, no counter)
@@ -1069,6 +1233,8 @@ mod tests {
             workers,
             tool_activations: Vec::new(),
             owner_token: None,
+            supersedes: Vec::new(),
+            created_at: None,
         };
         let mut rs = ReloadState {
             generation: 10,
@@ -1143,7 +1309,7 @@ mod tests {
             await_extensions: true,
             ..Default::default()
         };
-        let restored = restore_config(&saved, SessionLifecycle::Live);
+        let restored = restore_config(&saved, SessionLifecycle::Live, "chat");
         assert!(!restored.await_extensions);
         assert!(!restored.restore_parked);
         let as_saved = SessionConfig {
@@ -1155,12 +1321,122 @@ mod tests {
             serde_json::to_value(&saved).unwrap()
         );
         for parked in [SessionLifecycle::Parked, SessionLifecycle::Parking] {
-            let restored = restore_config(&saved, parked);
+            let restored = restore_config(&saved, parked, "chat");
             assert!(restored.restore_parked, "{parked:?}");
             assert!(!restored.await_extensions);
             let wire = serde_json::to_value(&restored).unwrap();
             assert!(wire.get("restore_parked").is_none(), "never on the wire");
         }
+    }
+
+    /// A chat whose folder was deleted while the daemon held it. The pinned
+    /// restore drops such a folder (`pins::restore_one`, by the same
+    /// [`restorable_folder`]) and the chat runs in the
+    /// daemon's folder: a runtime without a folder of its own takes the
+    /// process's. A reload kept the dead path. The chat's memory binding was
+    /// then built on a path project discovery cannot resolve, so it had no
+    /// project: memory tools answered "host project scope unavailable" and a
+    /// rollover could not seal. Reload now drops it too.
+    #[test]
+    fn a_restore_drops_a_folder_that_is_gone_as_the_pinned_restore_does() {
+        let parent = tempfile::tempdir().unwrap();
+        let (kept, gone) = (parent.path().join("kept"), parent.path().join("gone"));
+        std::fs::create_dir(&kept).unwrap();
+        let saved = |folder: &Path| SessionConfig {
+            cwd: Some(folder.to_path_buf()),
+            ..Default::default()
+        };
+
+        // What the dead path does to a chat that keeps it.
+        let binding = crate::memory_backend::MemoryBinding::for_cwd(Some(gone.clone()));
+        let error = binding.scope().unwrap_err().to_string();
+        assert!(error.contains("host project scope unavailable"), "{error}");
+        let binding = crate::memory_backend::MemoryBinding::for_cwd(Some(kept.clone()));
+        assert!(binding.scope().is_ok());
+
+        for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked] {
+            assert_eq!(restore_config(&saved(&kept), lifecycle, "chat").cwd, Some(kept.clone()));
+            assert_eq!(restore_config(&saved(&gone), lifecycle, "chat").cwd, None, "{lifecycle:?}");
+        }
+        // A file where the folder was is not a folder to run in either.
+        std::fs::write(&gone, b"").unwrap();
+        assert_eq!(restore_config(&saved(&gone), SessionLifecycle::Live, "chat").cwd, None);
+        // No folder saved: nothing to drop.
+        assert_eq!(restore_config(&SessionConfig::default(), SessionLifecycle::Live, "chat").cwd, None);
+    }
+
+    /// The two lines `restorable_folder` logs do not say "daemon": an unpark
+    /// in a host that is not the daemon goes through the same function.
+    /// (The text is checked, not a captured log: a log captured on one test
+    /// thread loses lines to tracing's callsite cache when another test
+    /// reaches the same line first.)
+    #[test]
+    fn the_lines_about_a_chats_folder_name_no_host() {
+        let gone = gone_notice("it does not exist");
+        assert!(gone.starts_with("the chat's folder is gone (it does not exist); "), "{gone}");
+        for line in [gone.as_str(), UNSEEN_NOTICE] {
+            assert!(line.starts_with("the chat's folder "), "{line}");
+            assert!(!line.contains("daemon"), "{line}");
+        }
+    }
+
+    /// The rule a reload and the pinned restore share. A folder is dropped,
+    /// and the chat moved to the daemon's folder and project, only when it
+    /// is known to be gone. `is_dir()` said "gone" for every failure, so a
+    /// folder that could not be looked at for a moment (a mount that was
+    /// away, a permission) moved the chat as well, without a log line.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_is_dropped_only_when_it_is_absent_or_not_a_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let at = |name: &str| parent.path().join(name);
+        let restored = |folder: &Path| restorable_folder(Some(folder.to_path_buf()), "chat");
+        assert_eq!(restorable_folder(None, "chat"), None);
+
+        // Absent, and a file: dropped.
+        assert_eq!(restored(&at("absent")), None);
+        std::fs::write(at("file"), b"").unwrap();
+        assert_eq!(restored(&at("file")), None);
+        // A path under a file (ENOTDIR, not ENOENT): no folder can be
+        // there, so it is absent, whatever is asked for under it.
+        let under = at("file").join("project");
+        let not_a_directory = std::fs::metadata(&under).unwrap_err().kind();
+        assert_eq!(not_a_directory, std::io::ErrorKind::NotADirectory);
+        assert_eq!(restored(&under), None);
+        assert_eq!(restored(&under.join("deeper")), None);
+        // A link to nothing is absent too.
+        std::os::unix::fs::symlink(at("absent"), at("dangling")).unwrap();
+        assert_eq!(restored(&at("dangling")), None);
+
+        // A directory, and a link to one: kept, as saved.
+        std::fs::create_dir(at("dir")).unwrap();
+        assert_eq!(restored(&at("dir")), Some(at("dir")));
+        std::os::unix::fs::symlink(at("dir"), at("link")).unwrap();
+        assert_eq!(restored(&at("link")), Some(at("link")));
+
+        // A folder that is there and cannot be looked at: kept. The same
+        // answer whether or not it exists behind the closed directory, which
+        // is the point: nobody can tell from here.
+        let closed = at("closed");
+        std::fs::create_dir_all(closed.join("project")).unwrap();
+        let mode = |mode: u32| {
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(0o000);
+        let denied = |path: &Path| {
+            std::fs::metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+        };
+        // Root reads through any mode: nothing to test there.
+        if denied(&closed.join("project")) {
+            assert!(!closed.join("project").is_dir(), "what the old rule went by");
+            for hidden in [closed.join("project"), closed.join("nothing")] {
+                assert_eq!(restored(&hidden), Some(hidden.clone()));
+            }
+        }
+        mode(0o700);
+        assert_eq!(restored(&closed.join("project")), Some(closed.join("project")));
+        assert_eq!(restored(&closed.join("nothing")), None);
     }
 
     #[test]
@@ -1189,6 +1465,46 @@ mod tests {
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("6h"));
     }
 
+    /// A lock-held placeholder holds the conversation its config continues
+    /// (after `/clear`, not its actor id), and its record carries a start
+    /// and what it superseded only when it was restored with them: never
+    /// its own spawn time.
+    #[tokio::test]
+    async fn a_placeholder_record_carries_its_conversation_not_its_spawn_time() {
+        use crate::session::handle::locked_placeholder;
+        let id = crate::session::SessionId::from("A");
+        let cfg = SessionConfig {
+            continue_session: Some(Some("N".into())),
+            ..SessionConfig::default()
+        };
+        let (bare, _t) = locked_placeholder::spawn(id.clone(), cfg.clone(), "pid 1 (tui)".into());
+        assert_eq!(bare.meta_live().journal_id, "N");
+        assert!(bare.holds("N") && !bare.holds("A"));
+        let r = record(&bare, None);
+        assert_eq!((r.id.as_str(), r.journal_id.as_str()), ("A", "N"));
+        assert_eq!(r.config.continue_session, Some(Some("N".into())));
+        assert_eq!(r.created_at, None, "no start known");
+        assert!(r.supersedes.is_empty());
+
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let restored = SessionConfig {
+            restore_conversation: Some(crate::session::RestoredConversation {
+                journal_id: "N".into(),
+                supersedes: vec!["P".into()],
+                created_at: at,
+            }),
+            ..cfg
+        };
+        let (known, _t) = locked_placeholder::spawn(id, restored, "pid 1 (tui)".into());
+        assert!(known.holds("P"));
+        assert_eq!(known.meta_live().created_at, at, "listed from its start");
+        let r = record(&known, None);
+        assert_eq!(r.created_at, Some(at));
+        assert_eq!(r.supersedes, ["P"]);
+    }
+
     /// Likewise the pin: an unconfirmed checkpoint must not unpin a
     /// session (it would park, and stop holding the daemon's idle exit).
     #[test]
@@ -1202,89 +1518,56 @@ mod tests {
         assert!(r.keep_warm && r.config.keep_warm);
     }
 
-    /// A `memory_mode` this image does not know (written by a newer one)
-    /// reads as `Off` — the consent-safe reading — instead of failing the
-    /// session's config and with it the whole reload state, so no session
-    /// would be rehydrated. A missing or null value stays no choice.
+    /// T-B4: a session config written before the session memory mode was
+    /// removed still carries `memory_mode`. It is read and ignored, in the
+    /// config alone and inside a reload state, whatever its value, and the
+    /// rest of the config is kept.
     #[test]
-    fn an_unknown_memory_mode_reads_as_off() {
-        use crate::session::SessionMemoryMode;
-        let cfg = |v: serde_json::Value| {
-            serde_json::from_value::<SessionConfig>(serde_json::json!({ "memory_mode": v }))
-        };
-        assert_eq!(cfg(serde_json::json!("off")).unwrap().memory_mode, Some(SessionMemoryMode::Off));
-        assert_eq!(
-            cfg(serde_json::json!("capture_and_recall")).unwrap().memory_mode,
-            Some(SessionMemoryMode::CaptureAndRecall)
-        );
-        assert_eq!(
-            cfg(serde_json::json!("recall_forever")).unwrap().memory_mode,
-            Some(SessionMemoryMode::Off)
-        );
-        assert_eq!(cfg(serde_json::json!(7)).unwrap().memory_mode, Some(SessionMemoryMode::Off));
-        assert_eq!(cfg(serde_json::Value::Null).unwrap().memory_mode, None);
-        let missing = serde_json::from_value::<SessionConfig>(serde_json::json!({})).unwrap();
-        assert_eq!(missing.memory_mode, None);
+    fn an_old_memory_mode_is_read_and_ignored() {
+        for v in [
+            serde_json::json!("capture_and_recall"),
+            serde_json::json!("off"),
+            serde_json::json!("recall_forever"),
+            serde_json::json!(7),
+            serde_json::Value::Null,
+        ] {
+            let cfg: SessionConfig = serde_json::from_value(serde_json::json!({
+                "memory_mode": v,
+                "model_override": "claude-sonnet-4-5",
+                "keep_warm": true
+            }))
+            .unwrap_or_else(|e| panic!("memory_mode = {v}: {e}"));
+            assert_eq!(cfg.model_override.as_deref(), Some("claude-sonnet-4-5"));
+            assert!(cfg.keep_warm);
+            let back = serde_json::to_value(&cfg).unwrap();
+            assert!(back.get("memory_mode").is_none(), "not written back: {back}");
+        }
         let rs: ReloadState = serde_json::from_value(serde_json::json!({
             "generation": 2,
             "written_at": "2026-10-14T18:17:03Z",
             "sessions": [{
                 "id": "s1", "journal_id": "s1", "keep_warm": false, "lifecycle": "live",
-                "config": { "memory_mode": "recall_forever" }
+                "config": { "memory_mode": "capture_and_recall", "cwd": "/srv/chat" }
             }],
             "expected_clients": 0
         }))
         .expect("the reload state still parses");
-        assert_eq!(rs.sessions[0].config.memory_mode, Some(SessionMemoryMode::Off));
+        assert_eq!(rs.sessions.len(), 1);
+        let restored = restore_config(&rs.sessions[0].config, SessionLifecycle::Live, "s1");
+        assert!(!restored.await_extensions);
     }
 
-    /// The restore without the hook wait keeps #255's `/memory` carry: the
-    /// session's recorded choice rides in the saved config, Parked or not.
+    /// The restore without the hook wait, Parked or not.
     #[test]
     fn a_restore_keeps_the_sessions_memory_choice() {
-        use crate::session::SessionMemoryMode;
-        for mode in [Some(SessionMemoryMode::Off), Some(SessionMemoryMode::CaptureOnly), None] {
-            let saved = SessionConfig {
-                memory_mode: mode,
-                await_extensions: true,
-                ..Default::default()
-            };
-            for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked, SessionLifecycle::Parking] {
-                let restored = restore_config(&saved, lifecycle);
-                assert_eq!(restored.memory_mode, mode, "{lifecycle:?}");
-                assert!(!restored.await_extensions, "{lifecycle:?}");
-            }
-        }
-    }
-
-    /// Likewise the session's `/memory` choice: a reload without a
-    /// checkpoint reply must not re-grant memory the user turned off.
-    #[test]
-    fn memory_choice_survives_an_unconfirmed_checkpoint() {
-        use crate::session::handle::echo::{meta_for, view_for};
-        use crate::session::SessionMemoryMode;
-        let id = crate::session::SessionId("mem-reload".into());
-        let (handle, ep) = SessionHandle::new(meta_for(&id), view_for());
-        assert_eq!(record(&handle, None).config.memory_mode, None);
-        *ep.memory_mode.lock().unwrap() = Some(SessionMemoryMode::Off);
-        assert_eq!(record(&handle, None).config.memory_mode, Some(SessionMemoryMode::Off));
-    }
-
-    /// A lock-held placeholder (F23) never answers a checkpoint, so the
-    /// next reload records it from its handle: its memory choice must ride
-    /// along, or a session reloaded twice comes back in the default.
-    #[tokio::test]
-    async fn a_locked_placeholder_keeps_its_memory_choice() {
-        use crate::session::SessionMemoryMode;
-        let sid = crate::session::SessionId("locked-mem".into());
-        let config = SessionConfig {
-            memory_mode: Some(SessionMemoryMode::Off),
-            ..SessionConfig::default()
+        let saved = SessionConfig {
+            await_extensions: true,
+            ..Default::default()
         };
-        let (handle, task) =
-            crate::session::handle::locked_placeholder::spawn(sid, config, "pid 1 (tui)".into());
-        assert_eq!(record(&handle, None).config.memory_mode, Some(SessionMemoryMode::Off));
-        task.abort();
+        for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked, SessionLifecycle::Parking] {
+            let restored = restore_config(&saved, lifecycle, "chat");
+            assert!(!restored.await_extensions, "{lifecycle:?}");
+        }
     }
 
     /// `ReloadAborted` reaches a session whose command queue is full (the

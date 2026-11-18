@@ -459,9 +459,10 @@ fn frontend_trigger_paths_contain_no_local_token_math() {
             "src/cmd/chat.rs still carries local trigger math ({forbidden})"
         );
     }
+    let actor = read("crates/agent-engine/src/session/actor.rs");
     assert!(
-        chat.contains("assess_context"),
-        "src/cmd/chat.rs must consume the engine context assessment"
+        actor.contains("assess_context"),
+        "the session actor (which runs `synaps chat`) must consume the engine context assessment"
     );
 
     // The legacy chars/4 estimator on the engine conversation state was the

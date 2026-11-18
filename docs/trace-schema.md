@@ -155,8 +155,7 @@ the preceding failed attempt was already recorded.
   starts) prune to their own N: the smallest N in use wins.
 - **What api-log covers:** Anthropic **streaming** calls only: foreground
   turns, keep-warm pings and subagent turns. Compaction (`call_api_simple`)
-  and the non-stream `call_api` path write a trace record but no api-log
-  record (#324), so summing api-log `cost_usd` will not match
+  writes a trace record but no api-log record (#324), so summing api-log `cost_usd` will not match
   `session_cost`. OpenAI-compatible and Google transports write trace
   records only.
 - **Timing versions:** a row that has `runtime_session_id` measures

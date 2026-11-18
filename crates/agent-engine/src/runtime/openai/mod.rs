@@ -268,8 +268,10 @@ pub(crate) fn routed_wire_messages(
     super::continuation::wire_messages(messages)
 }
 
-/// Runtime route retaining the host's immutable memory binding. The public
-/// compatibility facade above has no runtime capability and cannot mint one.
+/// Runtime route carrying what the turn's tool calls are given, for the tool
+/// loop of an extension-provided model (`tool_context`; see
+/// [`crate::runtime::api::ApiOptions`]). The public compatibility facade
+/// above has no runtime capability and cannot mint one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_route_with_memory_backend(
     model: &str,
@@ -289,7 +291,7 @@ pub(crate) async fn try_route_with_memory_backend(
     codex_request_role: catalog::CodexRequestRole,
     tool_session_id: Option<&crate::tools::activation::SessionId>,
     session_tool_set: Option<&crate::tools::activation::SharedSessionToolSet>,
-    memory_backend: Option<&crate::memory_backend::MemoryBinding>,
+    tool_context: Option<&crate::tools::TurnToolContext>,
     trace: &crate::runtime::trace::TraceContext,
     suppress_stream_deltas: bool,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
@@ -329,7 +331,7 @@ pub(crate) async fn try_route_with_memory_backend(
                     cancel,
                     tool_session_id,
                     session_tool_set,
-                    memory_backend,
+                    tool_context,
                     trace,
                 )
                 .await,
@@ -736,7 +738,9 @@ mod tests {
         }
     }
 
+    // The routing manager is process-wide: tests that install one share a key.
     #[test]
+    #[serial_test::serial(extension_routing)]
     fn set_extension_manager_for_routing_overwrites_previous_manager() {
         clear_extension_manager_for_routing();
         let first = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(Arc::new(

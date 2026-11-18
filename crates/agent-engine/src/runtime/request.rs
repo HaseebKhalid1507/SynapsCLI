@@ -272,6 +272,12 @@ impl<'a> RequestBody<'a> {
         self.max_tokens
     }
 
+    /// The `output_config.effort` value this body will send, if it sends one
+    /// (the api-log's `effort`).
+    pub(super) fn effort(&self) -> Option<&str> {
+        self.output_config.as_ref()?.get("effort")?.as_str()
+    }
+
     /// Pre-assembly equivalent of the legacy `body["tools"]` non-empty probe.
     pub(super) fn has_tool_marker(&self) -> bool {
         !self.tools.tools.is_empty()

@@ -1,5 +1,9 @@
 # T33 decision — memory retrieval index without SQLite
 
+> **Removed in 0.12.0.** The staged lexical index this records was never
+> called outside its tests; it was deleted with its retention domain
+> (`memory-index`). Memory search is the store's own scan.
+
 Date: recorded before any T33 implementation, per the plan's ask-first gate
 (spec §2.10, §14 "Ask first"; plan Task 33).
 

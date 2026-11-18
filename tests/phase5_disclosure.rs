@@ -23,7 +23,6 @@ fn every_frontend_surfaces_disclosure_before_dispatch() {
     };
 
     for rel in [
-        "src/cmd/chat.rs",
         "src/cmd/rpc.rs",
         // The TUI compacts on the SessionActor since phase 3 (A2): the
         // disclosure is computed there and shipped as `CompactionStarted`.

@@ -22,7 +22,7 @@ The old `core/context_archive.rs::project_hashed` walked the **entire raw JSON h
 
 Core tests cover aggregate excluded blobs above 16 MiB, projection/digest equivalence to tiny excluded blobs, eligible aggregate failure before the first redactor call, exact multi-MiB tool logs, already-withheld payloads, both traversal orders for whole-argument withholding, nested binary-looking input compatibility, structural caps, and escape-expanding scratch input. Golden digests were captured against the pre-change projector and are asserted for redacted and unredacted fixtures.
 
-Engine tests exercise legacy and real Axel history round trips, retry deduplication, tombstone replay, atomic overflow refusal and no-backend-call failure; a rollover regression covers the unchanged head barrier and failed source/window/note preservation. All use synthetic data. Validation results are recorded in `docs/reviews/forum-archive-validation.md`.
+Engine tests exercise legacy and real Axel history round trips, retry deduplication, tombstone replay, atomic overflow refusal and no-backend-call failure; a rollover regression covers the unchanged head barrier and failed source/window/note preservation. All use synthetic data. Validation results were recorded in `docs/reviews/forum-archive-validation.md`, removed with the built-in forum (see git history).
 
 ## Deliberate limits
 
