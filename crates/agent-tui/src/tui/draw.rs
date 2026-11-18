@@ -60,114 +60,9 @@ impl AppAreas {
     }
 }
 
-/// Build a single sidecar pill segment for one `SidecarUiState`.
-#[allow(dead_code)] // used in tests
-fn sidecar_pill_segment(
-    sidecar: &super::sidecar::SidecarUiState,
-    spinner_frame: usize,
-) -> Span<'static> {
-    let label = sidecar.display_name.as_deref().unwrap_or("sidecar");
-    let text = sidecar_pill_text(label, &sidecar.status, sidecar.armed, spinner_frame);
-    let color = match &sidecar.status {
-        super::sidecar::SidecarUiStatus::Idle => {
-            if sidecar.armed {
-                let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
-                let base = match THEME.load().status_streaming {
-                    Color::Rgb(r, g, b) => (r, g, b),
-                    _ => (220, 80, 80),
-                };
-                Color::Rgb(
-                    (base.0 as f64 * pulse) as u8,
-                    (base.1 as f64 * pulse) as u8,
-                    (base.2 as f64 * pulse) as u8,
-                )
-            } else {
-                // P19.1: resting pill tint — `sidecar.pill` override if set,
-                // else `muted` (the color used today).
-                THEME.load().sidecar_pill_color()
-            }
-        }
-        super::sidecar::SidecarUiStatus::Active { .. } => {
-            let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
-            let base = match THEME.load().status_streaming {
-                Color::Rgb(r, g, b) => (r, g, b),
-                _ => (220, 80, 80),
-            };
-            Color::Rgb(
-                (base.0 as f64 * pulse) as u8,
-                (base.1 as f64 * pulse) as u8,
-                (base.2 as f64 * pulse) as u8,
-            )
-        }
-        super::sidecar::SidecarUiStatus::Loading => THEME.load().muted,
-        super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
-    };
-    let modifier = Modifier::BOLD;
-    Span::styled(text, Style::default().fg(color).add_modifier(modifier))
-}
-
-/// Pure helper — given a set of (plugin_id, display_name?)
-/// pairs and the registry's lifecycle claims, return the plugin ids in
-/// display order: importance desc, then display_name alphabetical, then
-/// plugin id. Pulled out so the ordering can be unit-tested without
-/// constructing a full `SidecarUiState` (which owns a child process).
-pub(crate) fn order_sidecar_pills(
-    sidecars: &[(String, Option<String>)],
-    claims: &[synaps_cli::skills::registry::LifecycleClaim],
-) -> Vec<String> {
-    let importance_for = |pid: &str| -> i32 {
-        claims
-            .iter()
-            .find(|c| c.plugin == pid)
-            .map(|c| c.importance)
-            .unwrap_or(0)
-    };
-    let mut keys: Vec<&(String, Option<String>)> = sidecars.iter().collect();
-    keys.sort_by(|a, b| {
-        let imp_a = importance_for(&a.0);
-        let imp_b = importance_for(&b.0);
-        imp_b
-            .cmp(&imp_a)
-            .then_with(|| {
-                let an = a.1.as_deref().unwrap_or(a.0.as_str());
-                let bn = b.1.as_deref().unwrap_or(b.0.as_str());
-                an.cmp(bn)
-            })
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    keys.into_iter().map(|(p, _)| p.clone()).collect()
-}
-
-/// Pure helper backing the sidecar pill text — returns the rendered
-/// text only. Lives separately so tests can exercise the label logic
-/// without spawning a real sidecar process or mounting the full App.
-pub(crate) fn sidecar_pill_text(
-    label: &str,
-    status: &super::sidecar::SidecarUiStatus,
-    armed: bool,
-    spinner_frame: usize,
-) -> String {
-    match status {
-        super::sidecar::SidecarUiStatus::Loading => format!(" {label}: loading "),
-        super::sidecar::SidecarUiStatus::Idle => {
-            if armed {
-                format!(" \u{25cf} {label} active ")
-            } else {
-                format!(" \u{25cb} {label} ")
-            }
-        }
-        super::sidecar::SidecarUiStatus::Active { label: state_label } => {
-            let spinner_idx = (spinner_frame / 3) % SPINNER_FRAMES.len();
-            let frame = SPINNER_FRAMES[spinner_idx];
-            format!(" {frame} {label}: {state_label} ")
-        }
-        super::sidecar::SidecarUiStatus::Error(_) => format!(" \u{26a0} {label} error "),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)] // test mod precedes helper items in this file
-mod sidecar_pill_tests {
+mod draw_tests {
     use super::*;
 
     #[test]
@@ -191,111 +86,6 @@ mod sidecar_pill_tests {
     }
 
     #[test]
-    fn pill_uses_display_name_when_set() {
-        // Idle, unarmed pill should show the display name.
-        let text = sidecar_pill_text(
-            "Voice",
-            &super::super::sidecar::SidecarUiStatus::Idle,
-            false,
-            0,
-        );
-        assert!(
-            text.contains("Voice"),
-            "expected pill to contain 'Voice', got: {text:?}"
-        );
-        assert!(
-            !text.contains("sidecar"),
-            "expected no 'sidecar' fallback, got: {text:?}"
-        );
-    }
-
-    #[test]
-    fn pill_falls_back_to_sidecar_when_no_display_name() {
-        let text = sidecar_pill_text(
-            "sidecar",
-            &super::super::sidecar::SidecarUiStatus::Idle,
-            false,
-            0,
-        );
-        assert!(text.contains("sidecar"), "got: {text:?}");
-    }
-
-    #[test]
-    fn pill_error_state_uses_display_name() {
-        let text = sidecar_pill_text(
-            "Voice",
-            &super::super::sidecar::SidecarUiStatus::Error("oops".into()),
-            false,
-            0,
-        );
-        assert!(text.contains("Voice error"), "got: {text:?}");
-    }
-
-    #[test]
-    fn pill_active_state_shows_plugin_supplied_label() {
-        let text = sidecar_pill_text(
-            "Plugin",
-            &super::super::sidecar::SidecarUiStatus::Active {
-                label: "Working".into(),
-            },
-            true,
-            0,
-        );
-        assert!(text.contains("Plugin"), "got: {text:?}");
-        assert!(text.contains("Working"), "got: {text:?}");
-    }
-
-    #[test]
-    fn pill_loading_state_shows_label() {
-        let text = sidecar_pill_text(
-            "Voice",
-            &super::super::sidecar::SidecarUiStatus::Loading,
-            false,
-            0,
-        );
-        assert!(text.contains("Voice"), "got: {text:?}");
-        assert!(text.contains("loading"), "got: {text:?}");
-    }
-
-    fn claim(
-        plugin: &str,
-        command: &str,
-        importance: i32,
-    ) -> synaps_cli::skills::registry::LifecycleClaim {
-        synaps_cli::skills::registry::LifecycleClaim {
-            plugin: plugin.into(),
-            command: command.into(),
-            settings_category: None,
-            display_name: command.into(),
-            importance,
-        }
-    }
-
-    #[test]
-    fn multi_segment_pill_orders_by_importance_desc() {
-        // alpha @ 10, beta @ 90 — beta should come first.
-        let claims = vec![claim("alpha", "alpha", 10), claim("beta", "beta", 90)];
-        let inputs = vec![
-            ("alpha".to_string(), Some("Alpha".to_string())),
-            ("beta".to_string(), Some("Beta".to_string())),
-        ];
-        let order = super::order_sidecar_pills(&inputs, &claims);
-        assert_eq!(order, vec!["beta".to_string(), "alpha".to_string()]);
-    }
-
-    #[test]
-    fn multi_segment_pill_tiebreaks_alphabetical_by_display_name() {
-        // Both importance 50 — Alpha before Beta by display name.
-        let claims = vec![claim("p2", "p2", 50), claim("p1", "p1", 50)];
-        let inputs = vec![
-            ("p2".to_string(), Some("Alpha".to_string())),
-            ("p1".to_string(), Some("Beta".to_string())),
-        ];
-        let order = super::order_sidecar_pills(&inputs, &claims);
-        assert_eq!(order, vec!["p2".to_string(), "p1".to_string()]);
-    }
-
-    #[test]
     fn active_tasks_progress_line_renders_fraction() {
         let mut tasks = synaps_cli::extensions::active_tasks::ActiveTasks::new();
         tasks.apply(synaps_cli::extensions::tasks::TaskEvent::Start {
@@ -313,7 +103,6 @@ mod sidecar_pill_tests {
     }
 }
 
-use super::app::SPINNER_FRAMES;
 use super::markdown::format_tokens;
 use super::theme::THEME;
 use super::view_model::{RenderPatch, ViewInputs};
@@ -513,7 +302,7 @@ pub(crate) fn render_active_tasks_line<'a>(
 // ══════════════════════════════════════════════════════════════════════════════
 
 use super::render_model::{
-    GhostHint, RenderModel, SecretPromptSnap, SidecarPillSnap, SubagentSnap,
+    GhostHint, RenderModel, SecretPromptSnap, SubagentSnap,
 };
 
 /// Build a [`RenderModel`] snapshot from the narrow render-input view.
@@ -600,33 +389,6 @@ pub(crate) fn build_render_model(
             watched: inputs.watched_subagent == Some(sa.id),
         })
         .collect();
-
-    // ── 8. Sidecar pills ──────────────────────────────────────────────────────
-    let sidecar_pills: Vec<SidecarPillSnap> = {
-        if inputs.sidecars.is_empty() {
-            Vec::new()
-        } else {
-            let claims = registry.lifecycle_claims();
-            let pill_inputs: Vec<(String, Option<String>)> = inputs
-                .sidecars
-                .iter()
-                .map(|(pid, st)| (pid.clone(), st.display_name.clone()))
-                .collect();
-            let order = order_sidecar_pills(&pill_inputs, &claims);
-            order
-                .into_iter()
-                .filter_map(|pid| {
-                    let st = inputs.sidecars.get(&pid)?;
-                    Some(SidecarPillSnap {
-                        plugin_id: pid,
-                        display_name: st.display_name.clone(),
-                        status: st.status.clone(),
-                        armed: st.armed,
-                    })
-                })
-                .collect()
-        }
-    };
 
     // ── 9. Ghost hint ─────────────────────────────────────────────────────────
     let ghost_hint: Option<GhostHint> = {
@@ -732,7 +494,6 @@ pub(crate) fn build_render_model(
         streaming: inputs.streaming,
         spinner_frame: inputs.spinner_frame,
         watch_banner: inputs.watch_banner.clone(),
-        sidecar_pills,
         runtime_model,
         runtime_thinking,
         lines: vw.lines,

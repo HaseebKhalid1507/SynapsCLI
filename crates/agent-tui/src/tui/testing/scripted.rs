@@ -359,6 +359,7 @@ impl ScriptedTransport {
                             &command,
                             &arg,
                             self.runtime.tools_shared(),
+                            self.runtime.command_chat(),
                         )
                         .await
                         {

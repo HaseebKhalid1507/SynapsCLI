@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn download_commit_routes_to_declared_plugin_command() {
         let effect = effect_from_commit(
-            "sample-sidecar",
+            "sample-plugin",
             "model_path",
             SettingsEditorCommitParams {
                 value: json!("download:base.en"),
@@ -282,8 +282,8 @@ mod tests {
         assert_eq!(
             effect,
             PluginEditorEffect::InvokeCommand {
-                plugin_id: "sample-sidecar".into(),
-                command: "sample-sidecar".into(),
+                plugin_id: "sample-plugin".into(),
+                command: "sample-plugin".into(),
                 args: vec!["download".into(), "base.en".into()],
             }
         );
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn select_commit_routes_to_plugin_config_write() {
         let effect = effect_from_commit(
-            "sample-sidecar",
+            "sample-plugin",
             "model_path",
             SettingsEditorCommitParams {
                 value: json!({"kind":"select", "path":"/tmp/ggml.bin"}),
@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(
             effect,
             PluginEditorEffect::ConfigWrite {
-                plugin_id: "sample-sidecar".into(),
+                plugin_id: "sample-plugin".into(),
                 key: "model_path".into(),
                 value: "/tmp/ggml.bin".into(),
             }

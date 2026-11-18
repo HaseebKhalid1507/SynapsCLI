@@ -881,7 +881,6 @@ mod tests {
         assert_eq!(t.tool_bash, Color::Reset);
         assert_eq!(t.tool_generic, Color::Reset);
         assert_eq!(t.settings_border, None);
-        assert_eq!(t.sidecar_pill, None);
     }
 
     #[cfg(unix)]

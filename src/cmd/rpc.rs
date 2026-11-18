@@ -1096,11 +1096,11 @@ async fn handle_tools_list(
     state: Arc<Mutex<RpcState>>,
     writer_tx: mpsc::Sender<RpcEvent>,
 ) {
+    // As this session is offered it: the registry also holds tools a
+    // session without context management never sees.
     let schema = {
         let st = state.lock().await;
-        let registry = st.runtime.tools_shared();
-        let guard = registry.read().await;
-        guard.tools_schema().as_ref().clone()
+        st.runtime.offered_tools_schema().await.as_ref().clone()
     };
 
     let body = build_tools_list_body(&schema);

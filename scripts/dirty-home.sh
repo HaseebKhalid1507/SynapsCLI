@@ -6,12 +6,14 @@
 #
 # CI's runners have an empty HOME, so a test that silently reads
 # ~/.synaps-cli passes there and fails only on a maintainer's laptop: the
-# process-wide identity latch, `memory.backend = axel` turning every
-# ExtensionManager exclusive, and so on. This seeds a throwaway HOME with:
+# process-wide identity latch, a config line the parser warns about, and so
+# on. This seeds a throwaway HOME with:
 #
 #   - `identity = You are Claude Code, …` (the line that broke the helpers
 #     identity assertion and silently skipped the oauth golden fixture)
-#   - `memory.backend = axel`
+#   - `memory.backend = axel`: a removed key. A config that still has it
+#     must start with one warning and act on plain files, so the whole
+#     suite runs under it (cut spec, T-B3)
 #   - `context_management.mode = auto`
 #   - an `auth.json` with populated, obviously dummy OAuth slots
 #

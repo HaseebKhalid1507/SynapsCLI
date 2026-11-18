@@ -12,7 +12,6 @@ use std::sync::Arc;
 use super::models::ModelsModalState;
 use super::plugins::PluginsModalState;
 use super::settings::{RuntimeSnapshot, SettingsState};
-use super::sidecar::SidecarUiStatus;
 
 /// The per-frame snapshot shipped to the render side.
 pub(crate) struct RenderModel {
@@ -24,11 +23,6 @@ pub(crate) struct RenderModel {
     pub(crate) spinner_frame: usize,
     /// The focused worker view's banner (header), `None` on the main thread.
     pub(crate) watch_banner: Option<super::watch::Banner>,
-
-    /// Sidecar pills projected out of the live `HashMap<String, SidecarUiState>`.
-    /// Ordered by importance desc then display_name asc, as computed on the
-    /// main side.  Strips the `Child` process entirely.
-    pub(crate) sidecar_pills: Vec<SidecarPillSnap>,
 
     /// `runtime.model()` string — cheap clone, avoids shipping the Runtime.
     pub(crate) runtime_model: String,
@@ -114,17 +108,6 @@ pub(crate) struct RenderModel {
 }
 
 // ── Projection types ─────────────────────────────────────────────────────────
-
-/// Render-safe projection of `SidecarUiState` — strips the `Child` process.
-#[derive(Clone)]
-pub(crate) struct SidecarPillSnap {
-    /// Plugin id — retained for ordering / debug; not read by renderer.
-    #[allow(dead_code)]
-    pub(crate) plugin_id: String,
-    pub(crate) display_name: Option<String>,
-    pub(crate) status: SidecarUiStatus,
-    pub(crate) armed: bool,
-}
 
 /// Render-safe projection of `SubagentState`.
 #[derive(Clone)]

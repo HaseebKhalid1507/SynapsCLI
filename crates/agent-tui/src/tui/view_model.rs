@@ -65,7 +65,6 @@ pub(crate) struct ViewInputs<'a> {
 
     // ── panes / pills / toasts ──
     pub(crate) subagents: &'a [SubagentState],
-    pub(crate) sidecars: &'a std::collections::HashMap<String, super::sidecar::SidecarUiState>,
     pub(crate) active_tasks: &'a std::sync::Arc<synaps_cli::extensions::active_tasks::ActiveTasks>,
     pub(crate) toasts: &'a super::toast::ToastProvider,
 
@@ -139,7 +138,6 @@ impl<'a> ViewInputs<'a> {
             logo_build_t: app.logo_build_t,
             logo_dismiss_t: app.logo_dismiss_t,
             subagents: &app.subagents,
-            sidecars: &app.sidecars,
             active_tasks: &app.active_tasks,
             toasts: &app.toasts,
             session_cost: app.session_cost,

@@ -488,6 +488,10 @@ impl BrokerClient {
 /// compatibility adapter for CLI callers (`synaps status`). Delegates to the
 /// typed credential broker: the local in-process broker or the authenticated
 /// remote transport. Vends the access token only.
+///
+/// Catalog / usage reads only: it asks with no model, so a limit or
+/// cooldown on one model does not apply to it. Inference must vend with
+/// its model (`access_token_pinned_for`).
 pub async fn resolve_access_token(
     provider: &str,
     source: &CredentialSource,

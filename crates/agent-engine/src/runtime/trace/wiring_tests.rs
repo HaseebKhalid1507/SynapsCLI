@@ -347,6 +347,29 @@ async fn retry_emits_one_record_per_attempt_with_shared_request_id() {
     }
 }
 
+/// A Cloudflare 520 (seen live, failed for good before) retries like a 5xx
+/// and succeeds on the next attempt, classed as a server error.
+#[tokio::test]
+async fn cloudflare_520_is_retried_and_the_next_attempt_succeeds() {
+    let (url, _bodies, hits) = spawn_stub(vec![520]).await;
+    let h = harness(url);
+
+    drive_stream(&h.options, 2, &CancellationToken::new())
+        .await
+        .expect("a 520 must be retried");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "one 520, then success");
+
+    let records = h.sink.records();
+    assert_eq!(records.len(), 2, "one record per actual attempt");
+    assert_eq!(records[0].outcome.http_status, Some(520));
+    assert_eq!(records[1].outcome.retries.len(), 1);
+    assert_eq!(
+        records[1].outcome.retries[0].class,
+        super::RetryClass::ServerError
+    );
+    assert_eq!(records[1].outcome.terminal, TurnOutcome::Completed);
+}
+
 // ─── Cancellation ───────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -566,80 +589,6 @@ async fn key_failure_degrades_trace_but_never_the_request() {
     assert!(r.system_segments.is_empty());
     assert_eq!(r.outcome.terminal, TurnOutcome::Completed);
     assert!(trace.degraded_records() >= 1, "degradation is counted");
-}
-
-// ─── Sync (non-streaming) path: call_api ────────────────────────────────────
-
-#[tokio::test]
-async fn sync_call_api_emits_one_record_from_exact_bytes() {
-    let bodies: CapturedBodies = Arc::new(Mutex::new(Vec::new()));
-    let bodies_c = Arc::clone(&bodies);
-    let app = Router::new().route(
-        "/v1/messages",
-        axum_post(move |body: Bytes| {
-            let bodies = Arc::clone(&bodies_c);
-            async move {
-                bodies.lock().unwrap().push(body.to_vec());
-                (
-                    StatusCode::OK,
-                    [
-                        ("content-type", "application/json"),
-                        ("request-id", "req_sync_1"),
-                    ],
-                    json!({
-                        "content": [{"type": "text", "text": "ok"}],
-                        "stop_reason": "end_turn",
-                        "usage": {"input_tokens": 7, "output_tokens": 2}
-                    })
-                    .to_string(),
-                )
-            }
-        }),
-    );
-    let url = serve(app).await;
-    let h = harness(url);
-
-    let client = Client::new();
-    let tools = ToolRegistry::new();
-    let messages = vec![Arc::new(json!({
-        "role": "user",
-        "content": format!("{SENTINEL} sync"),
-    }))];
-    ApiMethods::call_api(
-        &auth(),
-        &client,
-        "claude-haiku-4-5",
-        &tools,
-        &Some(format!("system {SENTINEL}")),
-        0,
-        agent_core::reasoning::ReasoningLevel::Adaptive,
-        &messages,
-        0,
-        &h.options,
-    )
-    .await
-    .expect("sync call must succeed");
-
-    let records = h.sink.records();
-    assert_eq!(records.len(), 1);
-    assert_schema_valid_and_content_free(&records);
-    let r = &records[0];
-    assert_eq!(r.outcome.terminal, TurnOutcome::Completed);
-    assert_eq!(r.outcome.http_status, Some(200));
-    assert_eq!(r.outcome.stop_reason, Some(StopReason::EndTurn));
-    assert_eq!(
-        r.outcome.usage.and_then(|u| u.input_tokens),
-        Some(7),
-        "usage from the provider JSON body"
-    );
-    assert_eq!(
-        r.outcome.provider_request_id.as_ref().map(|id| id.as_str()),
-        Some("req_sync_1")
-    );
-    let received = bodies.lock().unwrap();
-    let wire = r.wire.as_ref().expect("wire populated");
-    assert_eq!(wire.byte_len, received[0].len() as u64);
-    assert_eq!(wire.digest, expected_wire_digest(&h.key_path, &received[0]));
 }
 
 // ─── Compaction path: call_api_simple ───────────────────────────────────────

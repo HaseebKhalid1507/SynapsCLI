@@ -871,26 +871,21 @@ mod tests {
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Off);
     }
 
-    /// merge(112) DARK test: default config boots with legacy memory and no
-    /// context_checkpoint tool — Axel features are invisible until opted in.
-    #[test]
-    fn default_config_is_dark_no_checkpoint_tool_legacy_binding() {
+    /// DARK test: default config is offered no context_checkpoint, and no
+    /// built-in forum tool exists.
+    /// `context_checkpoint` is in the registry, which every chat on a host
+    /// shares; what a chat is offered is its own.
+    #[tokio::test]
+    async fn default_config_is_dark_no_checkpoint_tool() {
         let runtime = Runtime::new_headless();
-        // Default memory backend must be legacy (no Axel sidecar spawn).
-        assert!(
-            !runtime.memory_backend_exclusive(),
-            "default config must NOT be exclusive (Axel); it must be legacy"
-        );
-        // The tool registry must not contain context_checkpoint.
-        let tools = runtime.tools_shared();
-        let registry = tools.blocking_read();
-        let has_checkpoint = registry
-            .iter_tools_sorted()
-            .iter()
-            .any(|t| t.name() == "context_checkpoint");
-        assert!(
-            !has_checkpoint,
-            "context_checkpoint must not appear in the default tool set"
-        );
+        let offered = runtime.offered_tools_schema().await;
+        let names: Vec<&str> = offered.iter().filter_map(|t| t["name"].as_str()).collect();
+        for dark in ["context_checkpoint", "forum_post", "forum_read", "forum_forget"] {
+            assert!(
+                !names.contains(&dark),
+                "{dark} must not appear in the default tool set: {names:?}"
+            );
+        }
+        assert!(names.contains(&"read"), "{names:?}");
     }
 }

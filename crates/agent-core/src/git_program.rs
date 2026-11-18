@@ -1,5 +1,4 @@
-//! Which Git program to execute. Compiled into the host and, by path, into the
-//! independently built Axel memory service.
+//! Which Git program the host executes.
 //!
 //! On macOS `/usr/bin/git` is Apple's `xcrun` shim. Without the Command Line
 //! Tools, executing it opens the "install developer tools" dialog, and
@@ -7,27 +6,15 @@
 //! the shim: it runs a Git by absolute path, or treats Git as unavailable.
 //! Every other platform runs plain `git` from `PATH`, as before.
 //!
-//! On macOS the host and the service deliberately follow different rules.
-//! Do not unify them:
-//!
-//! - The host ([`git_program`]) runs the Git the user's shell runs: the first
-//!   `PATH` directory with a `git`, so Homebrew, Nix and MacPorts Git keep
-//!   working. Where `PATH` reaches the shim it runs the developer Git the shim
-//!   would have run (so a `PATH` with `/usr/bin` first still gets Apple's Git),
-//!   or skips the shim when there is no developer Git. With no Git on `PATH`
-//!   at all it falls back to the developer Git.
-//! - The Axel service ([`developer_git`]) never consults `PATH`. The host
-//!   spawns it with an empty environment (`env_clear`: no `PATH`, no
-//!   `DEVELOPER_DIR`), so nothing the host inherits picks the program the
-//!   verifier runs. It runs the developer Git the shim would choose in an
-//!   empty environment, as `xcrun` did for it before: the `xcode-select`
-//!   choice, then Xcode, then the Command Line Tools.
-//!
-//! So the two can run different Gits (say Homebrew's and Apple's). Both only
-//! run read-only `rev-parse` (Git 2.31 or newer), whose paths do not depend on
-//! the Git build. A service Git that cannot read the repository (too old for
-//! its format, say) makes the service fail closed with no scope, never yield a
-//! different identity.
+//! On macOS [`git_program`] runs the Git the user's shell runs: the first
+//! `PATH` directory with a `git`, so Homebrew, Nix and MacPorts Git keep
+//! working. Where `PATH` reaches the shim it runs the developer Git the shim
+//! would have run (so a `PATH` with `/usr/bin` first still gets Apple's Git),
+//! or skips the shim when there is no developer Git. When `PATH` has no
+//! usable Git it falls back to [`developer_git`]: the `xcode-select` choice,
+//! then Xcode, then the Command Line Tools. The two follow different rules
+//! because [`developer_git`] stands for what the shim would run, which never
+//! depends on `PATH`.
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
@@ -69,11 +56,11 @@ pub fn git_program() -> Result<PathBuf, GitUnavailable> {
     .ok_or(GitUnavailable)
 }
 
-/// The Axel service's Git (and the host's fallback), for `Command::new`:
-/// `<dir>/usr/bin/git` by absolute path from [`resolve_developer_git`] with
-/// this process's `DEVELOPER_DIR` (never set in the service, whose environment
-/// is empty) and the `xcode-select` link, or [`GitUnavailable`]. Never
-/// `/usr/bin/git`, never a `PATH` lookup.
+/// The host's fallback when `PATH` has no usable Git, and what a shim on
+/// `PATH` stands for, for `Command::new`: `<dir>/usr/bin/git` by absolute path
+/// from [`resolve_developer_git`] with this process's `DEVELOPER_DIR` and the
+/// `xcode-select` link, or [`GitUnavailable`]. Never `/usr/bin/git`, never a
+/// `PATH` lookup.
 #[cfg(target_os = "macos")]
 pub fn developer_git() -> Result<PathBuf, GitUnavailable> {
     let developer_dir = std::env::var_os("DEVELOPER_DIR");
@@ -395,8 +382,7 @@ mod tests {
         assert_eq!(host(&path[..3], &present, &[], None), None);
     }
 
-    /// A unique temporary directory, removed on drop (no dev-dependency: this
-    /// module is also built into the Axel service).
+    /// A unique temporary directory, removed on drop.
     #[cfg(unix)]
     struct TempDir(PathBuf);
 

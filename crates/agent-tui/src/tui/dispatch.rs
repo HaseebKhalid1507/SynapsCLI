@@ -369,7 +369,6 @@ pub(crate) async fn handle_input_action(
                 }
                 CommandAction::ReloadPlugins => {
                     synaps_cli::skills::reload_registry(registry, config);
-                    self::sidecar::retain_enabled(app, registry);
                     app.push_msg(ChatMessage::System("plugins reloaded".to_string()));
                 }
                 CommandAction::LoadSkill { skill, arg } => {
@@ -1105,22 +1104,6 @@ pub(crate) async fn handle_input_action(
                     });
                 }
 
-                CommandAction::SidecarToggle { plugin_id } => {
-                    // G3b: non-blocking path via sidecar::toggle().
-                    // Under socket transport the extension manager is a
-                    // stand-in empty — toggle requires in-process hosting.
-                    if is_socket {
-                        app.push_msg(ChatMessage::System(
-                            "sidecars are managed in-process only for now — see G §Q1".into(),
-                        ));
-                    } else {
-                        self::sidecar::toggle(app, plugin_id, registry, ext_mgr_shared).await;
-                    }
-                }
-                CommandAction::SidecarStatus { plugin_id } => {
-                    let line = self::sidecar::status(app, plugin_id.as_deref(), registry);
-                    app.push_msg(ChatMessage::System(line));
-                }
                 CommandAction::TakeOver => commands::takeover(app, link).await,
             }
         }
@@ -1273,8 +1256,6 @@ pub(crate) async fn handle_input_action(
                     CommandAction::ExtensionsAudit { .. } => {}
                     CommandAction::ExtensionsMemory(_) => {}
                     CommandAction::Ping => {}
-                    CommandAction::SidecarToggle { .. } => {}
-                    CommandAction::SidecarStatus { .. } => {}
                     CommandAction::TakeOver => commands::takeover(app, link).await,
                 },
             }
@@ -1734,7 +1715,6 @@ pub(crate) async fn handle_input_action(
                     }
                 }
             }
-            self::sidecar::retain_enabled(app, registry);
         }
         InputAction::OpenPluginsMarketplace => {
             let path = synaps_cli::skills::state::PluginsState::default_path();
@@ -1811,10 +1791,10 @@ fn read_only_blocked(app: &mut App, link: &super::session_link::SessionLink, tex
 mod tests {
     use super::*;
 
-    /// `/sidecar toggle` under Socket mode (is_socket=true) must emit
-    /// the in-process-only notice rather than attempting the spawn.
+    /// The sidecar system is gone: `/sidecar toggle` (here under Socket
+    /// mode) is an unknown command like any other.
     #[tokio::test]
-    async fn sidecar_toggle_socket_mode_emits_notice() {
+    async fn sidecar_toggle_is_an_unknown_command() {
         let mut app = App::new(synaps_cli::Session::new("test", "medium", None));
         let runtime = synaps_cli::Runtime::new().await.unwrap();
         let mut link = crate::tui::session_link::SessionLink::new(Box::new(
@@ -1857,10 +1837,10 @@ mod tests {
         let found = app.transcript.messages().iter().any(|m| {
             matches!(
                 &m.msg,
-                ChatMessage::System(s) if s.contains("sidecars are managed in-process only")
+                ChatMessage::Error(s) if s == "unknown command: /sidecar"
             )
         });
-        assert!(found, "expected in-process-only notice under Socket mode");
+        assert!(found, "expected `unknown command: /sidecar`");
     }
 
     /// A client that may not drive (`--observe`; not the owner under
