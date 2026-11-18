@@ -211,6 +211,13 @@ pub struct LocalTransport {
 }
 
 impl LocalTransport {
+    /// Send as this client with what a daemon connection saw of the
+    /// frame's writer (`FramePeer`), as `daemon::conn` does for an
+    /// origin-carrying `Submit`/`Steer`. For in-process hosts and tests.
+    pub async fn send_from_peer(&self, cmd: SessionCommand, peer: super::types::FramePeer) -> Result<(), TransportError> {
+        self.handle.send_from_peer(self.client, cmd, peer).await
+    }
+
     /// Attach in-process as a `Mirror` (= `attach_with(.., Mirror)`).
     pub async fn attach(
         handle: SessionHandle,

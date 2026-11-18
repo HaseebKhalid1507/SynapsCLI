@@ -15,8 +15,10 @@
 pub mod close;
 pub mod conn;
 pub mod extension_reload;
+pub mod frame_creds;
 pub mod lifecycle;
 pub mod listener;
+pub mod owner_claim;
 pub mod pin;
 pub mod pins;
 pub mod registry;
@@ -182,6 +184,10 @@ pub struct DaemonOpts {
     pub runtime_dir: Option<PathBuf>,
     /// Test seam / A1 hook: how `Attach::Create` builds a session.
     pub factory: Option<SessionFactory>,
+    /// [`owner_claim::APP_EXE_ENV`] as [`run_foreground`] took it from the
+    /// environment before starting anything; `None`: [`Daemon::start`]
+    /// takes it itself.
+    pub owner_app_exe_env: Option<String>,
 }
 
 impl DaemonOpts {
@@ -240,6 +246,8 @@ pub struct DaemonState {
     /// `CatalogPage`: one catalog load at a time, shared by the requests
     /// that arrive before it starts.
     pub saved: saved::SavedLoader,
+    /// Which link is the owner's own app (`owner_claim`).
+    pub owner: Arc<owner_claim::OwnerClaims>,
 }
 
 impl DaemonState {
@@ -511,6 +519,11 @@ impl Daemon {
         let meta = registry::Metadata::start(paths.clone(), info.clone())?;
 
         let factory = opts.factory.clone().unwrap_or_else(|| host_factory(&host));
+        // G and both owner app paths are read once here (the env one, which
+        // wins, taken out of the environment by `run_foreground`, else
+        // here); the path is resolved to a file at each claim.
+        let env_exe = opts.owner_app_exe_env.clone().or_else(owner_claim::take_app_exe_env);
+        let owner = owner_claim::OwnerClaims::new(owner_claim::settle_from_env(), env_exe, host.config().daemon.owner_app_exe.clone());
         let state = Arc::new(DaemonState {
             host,
             paths: paths.clone(),
@@ -531,6 +544,7 @@ impl Daemon {
             pins: Arc::new(pins::PinBook::for_active_profile()),
             restoring: AtomicBool::new(false),
             saved: saved::SavedLoader::default(),
+            owner,
         });
         state.host.set_pin_sink(Arc::clone(&state.pins) as Arc<dyn crate::session::PinSink>);
 
@@ -551,6 +565,8 @@ impl Daemon {
 
         // C3: rehydrate BEFORE accepting so a reconnecting client finds its session.
         if let Some(rs) = &reload_state {
+            // The owner claim's registrant, before any link connects.
+            state.owner.restore(rs.owner.as_ref());
             reload::rehydrate(&state, rs).await;
         }
 
@@ -779,6 +795,11 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     let mut effective_env = crate::process_scope::inherited_env();
     crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
     effective_env.retain(|(k, _)| k != READY_FD_ENV);
+    // `main` moved the owner app path out of this process's env before its
+    // runtime; the daemon still gets it.
+    if let Some(app) = owner_claim::stashed_app_exe_env() {
+        crate::process_scope::set_env(&mut effective_env, owner_claim::APP_EXE_ENV, app);
+    }
     let (program, cmd_args) = daemon_launch(&effective_env, exe, cmd_args);
     let mut fds = [0i32; 2];
     // SAFETY: plain pipe(2) on a valid 2-slot array.
@@ -920,6 +941,10 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     let mut effective_env = crate::process_scope::inherited_env();
     crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
     effective_env.retain(|(k, _)| k != READY_FD_ENV && k != READY_EVENT_ENV);
+    // As on unix: the stashed owner app path is handed on.
+    if let Some(app) = owner_claim::stashed_app_exe_env() {
+        crate::process_scope::set_env(&mut effective_env, owner_claim::APP_EXE_ENV, app);
+    }
     let ready = win::Event::create_unique("ready")?;
     crate::process_scope::set_env(&mut effective_env, READY_EVENT_ENV, ready.name());
     let mut child = win::spawn_detached(&exe, &cmd_args, &effective_env)?;
@@ -1080,6 +1105,13 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     // replaced it, so nothing below ever runs beside it.
     #[cfg(windows)]
     reload::take_over_from_env(&opts.paths())?;
+    // The owner app path leaves the environment before this image starts
+    // any process (the host boot below starts extensions and MCP servers),
+    // so no child of the daemon inherits it.
+    let mut opts = opts;
+    if opts.owner_app_exe_env.is_none() {
+        opts.owner_app_exe_env = owner_claim::take_app_exe_env();
+    }
     // Background MCP discovery: a hung/dead MCP server must never delay the
     // ready byte (the spawner waits only SPAWN_READY_TIMEOUT).
     let host = EngineHost::boot_and_install(crate::HostOpts {
@@ -1111,7 +1143,6 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     // session (daemon-global widgets today — frames carry no session id).
     let _router = crate::extensions::notify_router::spawn_notification_router(Arc::clone(&host));
 
-    let mut opts = opts;
     if opts.factory.is_none() {
         opts.factory = Some(host_factory(&host));
     }

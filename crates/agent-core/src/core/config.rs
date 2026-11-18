@@ -339,7 +339,7 @@ impl Default for StartupConfig {
 
 /// Daemon lifetime knobs (`daemon.*` keys). Config-file fallbacks; the matching
 /// `SYNAPS_DAEMON_*` env vars still WIN over these when set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     /// Seconds an auto-spawned daemon stays alive after the last client
     /// disconnects. `0` = never idle-exit. Env `SYNAPS_DAEMON_IDLE_EXIT_SECS`
@@ -352,6 +352,12 @@ pub struct DaemonConfig {
     /// Seconds a PARKED session row lingers before eviction. `0` = keep
     /// forever. Env `SYNAPS_DAEMON_PARKED_EVICT_SECS` overrides. Default: 3600.
     pub parked_evict_secs: u64,
+    /// `daemon.owner_app_exe`: the owner app's stable path, the image an
+    /// owner claim must run (`agent_engine::daemon::owner_claim`), resolved
+    /// at each claim. Env `SYNAPS_DAEMON_OWNER_APP_EXE` wins when set and
+    /// non-empty (this value is then ignored). Unset = no claim binds
+    /// (`unsupported`). Default: unset.
+    pub owner_app_exe: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -360,6 +366,7 @@ impl Default for DaemonConfig {
             idle_exit_secs: 10,
             prompt_abandon_secs: 3600,
             parked_evict_secs: 3600,
+            owner_app_exe: None,
         }
     }
 }
@@ -448,6 +455,10 @@ fn parse_daemon_config_key(
         "daemon.idle_exit_secs" => config.idle_exit_secs = secs()?,
         "daemon.prompt_abandon_secs" => config.prompt_abandon_secs = secs()?,
         "daemon.parked_evict_secs" => config.parked_evict_secs = secs()?,
+        "daemon.owner_app_exe" => {
+            let path = value.trim();
+            config.owner_app_exe = (!path.is_empty()).then(|| path.to_string());
+        }
         _ => return Err("unknown daemon key"),
     }
     Ok(())
@@ -1654,6 +1665,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "daemon.idle_exit_secs",
     "daemon.prompt_abandon_secs",
     "daemon.parked_evict_secs",
+    "daemon.owner_app_exe",
     "max_tool_output",
     "tool_output_spill_bytes",
     "tool_output_spill_head_bytes",
@@ -3404,6 +3416,18 @@ mod tests {
         ] {
             assert!(super::KNOWN_CONFIG_KEYS.contains(&k), "{k} not in KNOWN_CONFIG_KEYS");
         }
+    }
+
+    /// `daemon.owner_app_exe` is a known key, unset by default, a trimmed
+    /// path when set, and blank means unset.
+    #[test]
+    fn daemon_owner_app_exe_is_a_known_key_and_parses_a_path() {
+        assert!(super::KNOWN_CONFIG_KEYS.contains(&"daemon.owner_app_exe"));
+        assert_eq!(super::load_config_from_str("").daemon.owner_app_exe, None);
+        let c = super::load_config_from_str("daemon.owner_app_exe = /opt/app/current/example-app \n");
+        assert_eq!(c.daemon.owner_app_exe.as_deref(), Some("/opt/app/current/example-app"));
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert_eq!(super::load_config_from_str("daemon.owner_app_exe =   \n").daemon.owner_app_exe, None);
     }
 
     #[test]

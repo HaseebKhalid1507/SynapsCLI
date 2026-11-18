@@ -1,4 +1,4 @@
-//! `synaps daemon {start,status,stop,sessions,purge,reload,close,pin,rename,reload-extension}`
+//! `synaps daemon {start,status,stop,sessions,purge,reload,close,pin,rename,reload-extension,owner reset}`
 //! (PLAN-phase2 §2.11, B4; phase 3 C2 `purge`, C3 `reload`).
 
 use std::path::PathBuf;
@@ -140,6 +140,12 @@ pub(crate) enum DaemonAction {
         #[arg(long)]
         json: bool,
     },
+    /// The owner claim (which connection is the owner app's own, so its
+    /// composer turns are marked as the owner's).
+    Owner {
+        #[command(subcommand)]
+        action: OwnerAction,
+    },
     /// Restart one extension from what is installed now, in every session,
     /// without `daemon reload`: no session is checkpointed and no turn is
     /// cancelled (only a call into the old process that is in flight
@@ -153,6 +159,18 @@ pub(crate) enum DaemonAction {
     },
 }
 
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum OwnerAction {
+    /// Clear the owner claim, also a contested one: no connection is the
+    /// owner's until the app claims again, passes the image check and the
+    /// settle window ends. Denial only: it never binds anything, and any
+    /// program running as you can run it.
+    Reset {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn opts_from(profile: Option<String>, a: &StartArgs) -> DaemonOpts {
     DaemonOpts {
         socket: a.socket.clone(),
@@ -161,6 +179,7 @@ fn opts_from(profile: Option<String>, a: &StartArgs) -> DaemonOpts {
         allow_legacy_mcp: a.allow_legacy_mcp,
         runtime_dir: None,
         factory: None,
+        owner_app_exe_env: None,
     }
 }
 
@@ -188,6 +207,34 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
             rename(profile, target, if clear { None } else { name }, force, json).await
         }
         Some(DaemonAction::ReloadExtension { name, json }) => reload_extension(profile, name, json).await,
+        Some(DaemonAction::Owner { action: OwnerAction::Reset { json } }) => owner_reset(profile, json).await,
+    }
+}
+
+/// `daemon owner reset`: send `OwnerReset`, report. Exit 0 on the daemon's
+/// `owner_claim {reset}`, `EXIT_REFUSED` otherwise.
+async fn owner_reset(profile: Option<String>, json: bool) -> anyhow::Result<()> {
+    let paths = registry::daemon_paths(profile.as_deref());
+    if !registry::is_alive(&paths) {
+        anyhow::bail!("daemon not running");
+    }
+    match SocketTransport::owner_reset(&paths.sock).await {
+        Ok(()) => {
+            if json {
+                println!("{}", serde_json::json!({"ok": true, "owner_claim": "vacant"}));
+            } else {
+                println!("owner claim reset: vacant (the owner app's next claim registers after the settle window)");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({"ok": false, "error": e.to_string()}));
+            } else {
+                eprintln!("owner reset refused: {e}");
+            }
+            std::process::exit(EXIT_REFUSED);
+        }
     }
 }
 

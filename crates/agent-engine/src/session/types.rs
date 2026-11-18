@@ -1087,6 +1087,20 @@ pub struct PromptRequest {
 pub struct Addressed {
     pub from: Option<ClientId>,
     pub cmd: SessionCommand,
+    /// What the daemon saw of the frame's writer (an origin-carrying
+    /// `Submit`/`Steer` from a socket client only).
+    pub peer: Option<FramePeer>,
+}
+
+/// A frame's writer as the daemon saw it. `owner` is set only by the
+/// daemon connection, from `daemon::owner_claim::OwnerClaims::is_owner`:
+/// the frame came on the owner app's bound link from its registrant
+/// process. `pid`/`exe` are for the log line only, never proof.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FramePeer {
+    pub owner: bool,
+    pub pid: Option<u32>,
+    pub exe: Option<String>,
 }
 
 /// Why a `Checkpoint` was requested.

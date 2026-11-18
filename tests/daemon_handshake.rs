@@ -123,6 +123,7 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
                     FEATURE_SESSION_WORKERS,
                     FEATURE_SESSION_PAGE,
                     FEATURE_TURN_ORIGIN,
+                    FEATURE_TURN_ORIGIN_OWNER,
                 ],
                 "every feature this daemon serves"
             );

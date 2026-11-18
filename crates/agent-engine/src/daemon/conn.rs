@@ -17,12 +17,73 @@ use crate::session::handle::CMD_CHAN_CAP;
 use crate::session::transport::{TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
 use crate::session::wire::*;
 use crate::session::*;
-use crate::ipc::{ServerReadHalf, ServerStream, ServerWriteHalf};
+use crate::ipc::{ServerStream, ServerWriteHalf};
 use crate::{SessionEvent, StreamEvent};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
-type Reader = BufReader<ServerReadHalf>;
+/// The read half remembers which process wrote each byte
+/// ([`super::frame_creds`]).
+type Reader = BufReader<super::frame_creds::CredRead>;
+
+/// Where the next frame starts: the bytes read minus those still buffered.
+fn frame_start(reader: &Reader) -> u64 {
+    reader.get_ref().received() - reader.buffer().len() as u64
+}
+
+/// The one process that wrote the frame read since `start` (`None`: more
+/// than one, or unknown).
+fn frame_writer(reader: &mut Reader, start: u64) -> Option<u32> {
+    let end = frame_start(reader);
+    reader.get_mut().writer_of(start, end)
+}
+
+/// A `claim_owner`. The key is hashed and its bytes wiped before the
+/// verdict; the reply (`owner_claim`) is queued by the claim itself, so no
+/// push overtakes it. A second claim while this link's is live is an
+/// `Error` (non-terminal). The link's mark is `reader`'s horizon once the
+/// claim's image check has passed.
+async fn claim_owner(
+    state: &DaemonState,
+    tx: &mpsc::Sender<DaemonFrame>,
+    link: super::owner_claim::LinkId,
+    mut key: OwnerKey,
+    writer: Option<u32>,
+    reader: &Reader,
+    session_id: Option<SessionId>,
+) {
+    let digest = key.digest_and_wipe();
+    drop(key);
+    let frame = match state.owner.claim(link, digest, writer, || reader.get_ref().horizon()) {
+        Ok(super::owner_claim::Delivery::Pending(frame)) => frame,
+        Ok(super::owner_claim::Delivery::Queued | super::owner_claim::Delivery::Closed) => return,
+        Err(message) => DaemonFrame::Error { session_id, message: message.into() },
+    };
+    let _ = tx.send(frame).await;
+}
+
+/// What this connection saw of an origin-carrying `Submit`/`Steer`'s writer
+/// (the frame starts at socket offset `start`): whether it is the owner
+/// app's bound link ([`super::owner_claim::OwnerClaims::is_owner`]), and the
+/// writer's pid and exe for the log line. `None` for any other command (it
+/// carries no origin to admit).
+fn origin_peer(
+    state: &DaemonState,
+    link: super::owner_claim::LinkId,
+    cmd: &SessionCommand,
+    writer: Option<u32>,
+    start: u64,
+) -> Option<FramePeer> {
+    let marked = matches!(
+        cmd,
+        SessionCommand::Submit { origin: Some(_), .. } | SessionCommand::Steer { origin: Some(_), .. }
+    );
+    marked.then(|| FramePeer {
+        owner: state.owner.is_owner(link, writer, start),
+        pid: writer,
+        exe: writer.and_then(super::owner_claim::exe_of),
+    })
+}
 
 /// Which `SessionCommand`s a socket client may originate (§4 MED). The UDS
 /// is 0600 same-uid, so this is a footgun guard, not an auth boundary:
@@ -114,10 +175,22 @@ const FRAME_BUF_SHRINK_ABOVE: usize = 1024 * 1024;
 /// client detaches, which for a daemon-attached TUI is days. Released right
 /// after the read, on every outcome, not before the next one: an idle client
 /// can go hours between frames. Same policy as the client's `FrameBuf`.
-async fn read_frame(reader: &mut Reader, line: &mut String) -> std::io::Result<Read> {
+async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, line: &mut String) -> std::io::Result<Read> {
     let read = read_frame_into(reader, line).await;
+    // Before the release below can drop the buffer unscrubbed.
+    if may_hold_owner_key(&read) {
+        zeroize::Zeroize::zeroize(line);
+    }
     release_large_frame_buf(line);
     read
+}
+
+/// Whether the frame just read may have carried an owner key's hex: a
+/// `claim_owner` (its key is decoded into a wiping buffer, the line still
+/// holds the text), or a frame that did not decode, was too large or was
+/// cut off (it could be one).
+fn may_hold_owner_key(read: &std::io::Result<Read>) -> bool {
+    matches!(read, Ok(Read::Frame(ClientFrame::ClaimOwner { .. }) | Read::Bad(_) | Read::Oversize) | Err(_))
 }
 
 fn release_large_frame_buf(line: &mut String) {
@@ -126,7 +199,7 @@ fn release_large_frame_buf(line: &mut String) {
     }
 }
 
-async fn read_frame_into(reader: &mut Reader, line: &mut String) -> std::io::Result<Read> {
+async fn read_frame_into<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, line: &mut String) -> std::io::Result<Read> {
     loop {
         line.clear();
         let n = tokio::io::AsyncReadExt::take(&mut *reader, MAX_FRAME_BYTES as u64 + 1)
@@ -149,15 +222,28 @@ async fn read_frame_into(reader: &mut Reader, line: &mut String) -> std::io::Res
     }
 }
 
+/// The longest one frame's write may block on a client that does not read
+/// before the writer gives the connection up (its queue then closes, so a
+/// push or a reply never waits on it for good).
+const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Writer task: owns the write half; bounded queue = per-client backpressure.
-fn spawn_writer(mut w: ServerWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::task::JoinHandle<()>) {
+fn spawn_writer(w: ServerWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::task::JoinHandle<()>) {
+    spawn_writer_with(w, FRAME_WRITE_TIMEOUT)
+}
+
+/// [`spawn_writer`] with `frame_timeout` as the bound on one frame's write.
+fn spawn_writer_with(
+    mut w: ServerWriteHalf,
+    frame_timeout: Duration,
+) -> (mpsc::Sender<DaemonFrame>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<DaemonFrame>(CMD_CHAN_CAP);
     let task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             let bye = matches!(frame, DaemonFrame::Bye { .. } | DaemonFrame::Refused { .. });
             match encode_line(&frame) {
                 Ok(line) => {
-                    if w.write_all(line.as_bytes()).await.is_err() {
+                    if !matches!(tokio::time::timeout(frame_timeout, w.write_all(line.as_bytes())).await, Ok(Ok(()))) {
                         break;
                     }
                 }
@@ -167,7 +253,7 @@ fn spawn_writer(mut w: ServerWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::ta
                     tracing::warn!("daemon: encode failed: {e}");
                     let err = DaemonFrame::Error { session_id: None, message: format!("daemon could not encode a frame: {e}") };
                     if let Ok(line) = encode_line(&err) {
-                        let _ = w.write_all(line.as_bytes()).await;
+                        let _ = tokio::time::timeout(frame_timeout, w.write_all(line.as_bytes())).await;
                     }
                     let _ = w.shutdown().await;
                     break;
@@ -183,9 +269,12 @@ fn spawn_writer(mut w: ServerWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::ta
 }
 
 pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: CancellationToken) {
+    // Before the first read, so every frame after the hello names its
+    // writer.
+    super::frame_creds::pass_creds(&stream);
     let (r, w) = crate::ipc::split_server(stream);
-    let mut reader = BufReader::new(r);
-    let (tx, writer) = spawn_writer(w);
+    let mut reader = BufReader::new(super::frame_creds::CredRead::new(r));
+    let (tx, mut writer) = spawn_writer(w);
     let mut line = String::new();
 
     // ── handshake: first frame MUST be Hello ──
@@ -258,6 +347,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
     }
+    // This connection's place in the owner claim, after Welcome so nothing
+    // is pushed before it; removed when the connection ends. Only a link
+    // that sends `claim_owner` ever hears of it.
+    let owner_link = state.owner.link(&tx);
     tracing::debug!(kind = ?hello.client.kind, "daemon: client connected");
 
     // ── control loop (no session allocated) ──
@@ -269,6 +362,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     let attach = loop {
         while pages.try_join_next().is_some() {}
         let announce = state.announce();
+        let start = frame_start(&reader);
         let frame = tokio::select! {
             _ = shutdown.cancelled() => {
                 pages.shutdown().await;
@@ -284,7 +378,16 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             }
             r = read_frame(&mut reader, &mut line) => r,
         };
+        let frame_pid = frame_writer(&mut reader, start);
         match frame {
+            Ok(Read::Frame(ClientFrame::ClaimOwner { key })) => {
+                claim_owner(&state, &tx, owner_link.id, key, frame_pid, &reader, None).await;
+            }
+            // `synaps daemon owner reset`: denial only (Vacant, never binds).
+            Ok(Read::Frame(ClientFrame::OwnerReset)) => {
+                tracing::warn!(pid = frame_pid, "daemon: owner claim reset requested over the socket");
+                let _ = tx.send(state.owner.reset(owner_link.id)).await;
+            }
             Ok(Read::Frame(ClientFrame::Ping)) => {
                 // `daemon status` and `daemon reload` read daemon.json after a Ping.
                 state.heal_daemon_json();
@@ -628,7 +731,17 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         // To the owner only: what it re-binds with after a reload.
         attached_wire.owner_token = handle.owner_token().cloned();
     }
-    if tx.send(DaemonFrame::Attached(attached_wire)).await.is_err() {
+    // `owner_bound` only for a link that claimed, set under the claim's lock
+    // so a push about it can't go out first.
+    let delivered = match state.owner.send_bound(owner_link.id, |bound| {
+        attached_wire.owner_bound = bound;
+        DaemonFrame::Attached(attached_wire)
+    }) {
+        super::owner_claim::Delivery::Queued => true,
+        super::owner_claim::Delivery::Closed => false,
+        super::owner_claim::Delivery::Pending(frame) => tx.send(frame).await.is_ok(),
+    };
+    if !delivered {
         let _ = handle.send(SessionCommand::Detach { client }).await;
         return;
     }
@@ -740,16 +853,27 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     let mut stopping = false;
     let mut reloading = false;
     let mut lagged = false;
+    // The writer gave up (a write past its bound, or the socket closed):
+    // the connection ends as a detach. A finished handle is never polled
+    // again.
+    let mut writer_gone = false;
     let announce = state.announce();
     loop {
+        let start = frame_start(&reader);
         let frame = tokio::select! {
             _ = shutdown.cancelled() => { stopping = true; break; }
             _ = owner_lag.cancelled() => { lagged = true; break; }
             _ = announce.cancelled() => { reloading = true; break; }
             _ = handle.closed() => { ended = true; break; }
+            _ = &mut writer => { writer_gone = true; break; }
             r = read_frame(&mut reader, &mut line) => r,
         };
+        let frame_pid = frame_writer(&mut reader, start);
         match frame {
+            // A claim again after a pushed unbind.
+            Ok(Read::Frame(ClientFrame::ClaimOwner { key })) => {
+                claim_owner(&state, &tx, owner_link.id, key, frame_pid, &reader, Some(sid.clone())).await;
+            }
             Ok(Read::Frame(ClientFrame::Cmd { session_id, cmd })) => {
                 if session_id != sid {
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(session_id), message: "not attached to that session".into() }).await;
@@ -770,7 +894,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                 if matches!(&cmd, SessionCommand::Detach { client: c } if *c == client) {
                     forward.abort();
                 }
-                match handle.send_from(client, cmd).await {
+                let sent = match origin_peer(&state, owner_link.id, &cmd, frame_pid, start) {
+                    Some(peer) => handle.send_from_peer(client, cmd, peer).await,
+                    None => handle.send_from(client, cmd).await,
+                };
+                match sent {
                     Ok(()) => {}
                     Err(TransportError::Backpressure) => {
                         let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "backpressure: command queue full".into() }).await;
@@ -809,7 +937,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             | Ok(Read::Frame(ClientFrame::Rename { .. }))
             | Ok(Read::Frame(ClientFrame::ReloadExtension { .. }))
             | Ok(Read::Frame(ClientFrame::AuthState(_)))
-            | Ok(Read::Frame(ClientFrame::CatalogPage { .. })) => {
+            | Ok(Read::Frame(ClientFrame::CatalogPage { .. }))
+            | Ok(Read::Frame(ClientFrame::OwnerReset)) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,
@@ -845,7 +974,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         if owner && owner_lag.is_cancelled() {
             send_owner_lagged(&tx, &sid, owner_lag_dropped.load(Ordering::SeqCst)).await;
             drop(tx);
-            let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+            if !writer_gone {
+                let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+            }
             return;
         }
         let (generation, retry_after_ms) = match reload_bye(&state) {
@@ -860,7 +991,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         };
         let _ = tx.send(DaemonFrame::Event(env.into())).await;
         let _ = tx.send(DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation, retry_after_ms }) }).await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+        if !writer_gone {
+            let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+        }
         return;
     }
 
@@ -899,7 +1032,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
     }
     drop(tx);
-    let _ = tokio::time::timeout(Duration::from_millis(500), writer).await;
+    if !writer_gone {
+        let _ = tokio::time::timeout(Duration::from_millis(500), writer).await;
+    }
     tracing::debug!(session = %sid, client = client.0, "daemon: client detached");
 }
 
@@ -1114,6 +1249,55 @@ mod tests {
         assert!(matches!(third, Read::Frame(ClientFrame::Ping)));
         drop(writer.await.unwrap());
         assert!(matches!(read_frame(&mut reader, &mut line).await.unwrap(), Read::Eof));
+    }
+
+    /// A `claim_owner` frame's text (the owner key's hex) is wiped from the
+    /// connection's line buffer as soon as it is read, and so is a frame
+    /// that did not decode (a claim with a malformed key); any other frame
+    /// is left as read.
+    #[tokio::test]
+    async fn an_owner_claim_frame_is_wiped_from_the_line_after_the_read() {
+        let key = "3c".repeat(32);
+        let bad = format!("{}G", "3c".repeat(31));
+        let input = format!(
+            "{{\"type\":\"claim_owner\",\"key\":\"{key}\"}}\n{{\"type\":\"claim_owner\",\"key\":\"{bad}\"}}\n{{\"type\":\"ping\"}}\n"
+        );
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut line = String::new();
+        let first = read_frame(&mut reader, &mut line).await.unwrap();
+        assert!(matches!(first, Read::Frame(ClientFrame::ClaimOwner { .. })));
+        assert!(!line.contains(&key[..16]), "the key's hex is wiped: {line:?}");
+        let second = read_frame(&mut reader, &mut line).await.unwrap();
+        assert!(matches!(second, Read::Bad(_)), "a malformed key is a bad frame");
+        assert!(!line.contains(&bad[..16]), "a bad frame is wiped: {line:?}");
+        let third = read_frame(&mut reader, &mut line).await.unwrap();
+        assert!(matches!(third, Read::Frame(ClientFrame::Ping)));
+        assert!(line.contains("ping"), "another frame is left as read");
+    }
+
+    /// An ordinary frame's write is bounded too. A client that never reads
+    /// makes the writer give the connection up once the bound passes, and
+    /// its queue closes, so a push or a reply never waits on it for good.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_frame_write_is_bounded() {
+        assert_eq!(FRAME_WRITE_TIMEOUT, Duration::from_secs(60));
+        let (server, _peer) = tokio::net::UnixStream::pair().unwrap();
+        let (_read, write) = crate::ipc::split_server(server);
+        let (tx, mut writer) = spawn_writer_with(write, Duration::from_millis(300));
+        let big = || DaemonFrame::Error { session_id: None, message: "x".repeat(2 * 1024 * 1024) };
+        tx.send(big()).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut writer).await.is_err(),
+            "the write blocks on the full socket first"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .expect("the writer gives up once the bound passes")
+                .is_ok()
+        );
+        assert!(tx.is_closed());
     }
 
     /// Ordinary frames reuse the buffer: no reallocation per frame.
