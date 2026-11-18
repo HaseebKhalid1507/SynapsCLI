@@ -259,6 +259,10 @@ impl PtyHandle {
 
         cmd.env_clear();
         for (k, v) in &effective_env { cmd.env(k, v); }
+        // A confined command's temporary files go to its session's own folder.
+        if let crate::sandbox::SpawnSandbox::Apply(plan) = &sandbox {
+            cmd.env("TMPDIR", plan.tmp_dir());
+        }
 
         // 3. Spawn the child on the slave side. Under a write sandbox the
         //    spawn runs on a dedicated thread that is under the Landlock

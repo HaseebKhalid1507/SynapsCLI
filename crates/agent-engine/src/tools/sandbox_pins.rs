@@ -102,12 +102,16 @@ async fn a_confined_sessions_write_tools_stay_inside_the_policy() {
         ("the engine base dir", t.base.join("config")),
         ("a project plugin folder", in_plugins.clone()),
         ("a $PATH entry in the workspace", on_path.clone()),
+        ("a hook of a repository the workspace doesn't have yet", t.ws.join(".git/hooks/pre-commit")),
+        ("a gitfile", t.ws.join(".git")),
+        ("a nested repository's config", t.ws.join("src/vendored/.git/config")),
     ] {
         let why = refusal(&WriteTool, json!({"path": s(&path), "content": "x"}), confined()).await;
         assert!(why.contains("sandbox: write refused"), "{what}: {why}");
         assert!(!path.exists(), "{what}: nothing was written");
     }
     assert!(!t.ws.join(".synaps").exists(), "no directory was made on the way to a protected path");
+    assert!(!t.ws.join("src/vendored").exists(), "nor on the way to git metadata");
 
     refusal(&EditTool, edit_call(&victim, "keep", "gone"), confined()).await;
     refusal(&MultiEditTool, multi_call(&[(&victim, "keep", "gone")]), confined()).await;
@@ -135,6 +139,8 @@ async fn a_confined_bash_command_writes_inside_and_not_outside() {
     }
     let t = Tree::new();
     std::fs::create_dir_all(t.ws.join("bin")).unwrap();
+    // A project plugin folder that exists stays read-only to commands.
+    std::fs::create_dir_all(t.ws.join(".synaps/plugins")).unwrap();
     let confined = ctx(t.session(vec![t.ws.join("bin")], vec![]), &t.ws);
 
     let inside = t.ws.join("src/in.txt");
@@ -264,4 +270,70 @@ async fn a_confined_pty_shell_writes_inside_and_not_outside() {
     let loose = spawn_pty(&t, &run, SessionSandbox::Off.for_spawn());
     assert!(loose.is_ok());
     assert!(appears(&outside).await, "control: the script writes there when confinement is off");
+}
+
+/// A plain workspace (no `.synaps/plugins`, no `.git`) is granted whole: a
+/// confined command creates new files and folders at its top (`echo > f`,
+/// `mkdir build`). The undo: once a protected folder sits inside it, the
+/// workspace is split and the same command can't make new top-level
+/// entries. Needs Landlock; skips loudly without.
+#[tokio::test]
+async fn a_confined_command_creates_files_and_folders_at_a_plain_workspace_root() {
+    if !kernel_ok("a_confined_command_creates_files_and_folders_at_a_plain_workspace_root") {
+        return;
+    }
+    let t = Tree::new();
+    let script = |tag: &str| {
+        format!("echo x > '{0}/f-{tag}'; mkdir '{0}/build-{tag}' && echo y > '{0}/build-{tag}/out'", s(&t.ws))
+    };
+    let _ = BashTool.execute(json!({"command": script("plain")}), ctx(t.session(vec![], vec![]), &t.ws)).await;
+    assert_eq!(std::fs::read_to_string(t.ws.join("f-plain")).unwrap_or_default().trim(), "x", "a new file at the root");
+    assert_eq!(std::fs::read_to_string(t.ws.join("build-plain/out")).unwrap_or_default().trim(), "y", "a new folder at the root");
+
+    std::fs::create_dir_all(t.ws.join(".synaps/plugins")).unwrap();
+    let _ = BashTool.execute(json!({"command": script("split")}), ctx(t.session(vec![], vec![]), &t.ws)).await;
+    assert!(!t.ws.join("f-split").exists() && !t.ws.join("build-split").exists(), "undo: a split root takes no new entries");
+}
+
+/// Every confined process gets its session's own temporary folder as
+/// `TMPDIR` (made under `/tmp`, mode 0700, one per session), through the
+/// shell tool and a PTY alike; `mktemp` lands there. The undo: with
+/// confinement off `TMPDIR` is whatever the environment says. Needs
+/// Landlock; skips loudly without.
+#[tokio::test]
+async fn a_confined_command_gets_its_sessions_own_tmpdir() {
+    use std::os::unix::fs::PermissionsExt;
+    if !kernel_ok("a_confined_command_gets_its_sessions_own_tmpdir") {
+        return;
+    }
+    let t = Tree::new();
+    let session = t.session(vec![], vec![]);
+    let tmp = session.confinement().unwrap().tmp_dir().expect("the session's temporary folder");
+    assert!(tmp.starts_with("/tmp") && tmp != Path::new("/tmp"), "{}", tmp.display());
+    assert_eq!(std::fs::symlink_metadata(&tmp).unwrap().permissions().mode() & 0o7777, 0o700);
+    let other = t.session(vec![], vec![]);
+    assert_ne!(other.confinement().unwrap().tmp_dir().unwrap(), tmp, "one folder per session");
+
+    let seen = t.ws.join("src/tmpdir.txt");
+    let made = t.ws.join("src/mktemp.txt");
+    let command = format!("printf %s \"$TMPDIR\" > '{}'; mktemp > '{}'", s(&seen), s(&made));
+    let _ = BashTool.execute(json!({"command": command}), ctx(session.clone(), &t.ws)).await;
+    assert_eq!(std::fs::read_to_string(&seen).unwrap(), s(&tmp));
+    assert!(std::fs::read_to_string(&made).unwrap().trim().starts_with(&s(&tmp)), "mktemp uses it");
+
+    let pty_seen = t.ws.join("src/pty-tmpdir.txt");
+    let run = t.script("tmpdir.sh", &format!("printf %s \"$TMPDIR\" > '{}'\n", s(&pty_seen)));
+    let pty = spawn_pty(&t, &run, session.for_spawn());
+    assert!(pty.is_ok() && appears(&pty_seen).await);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(std::fs::read_to_string(&pty_seen).unwrap(), s(&tmp), "the PTY's command too");
+    drop(pty);
+
+    let loose = t.root.join("loose-tmpdir.txt");
+    let command = format!("printf %s \"$TMPDIR\" > '{}'", s(&loose));
+    let _ = BashTool.execute(json!({"command": command}), ctx(SessionSandbox::Off, &t.ws)).await;
+    assert_ne!(std::fs::read_to_string(&loose).unwrap(), s(&tmp), "undo: off leaves TMPDIR alone");
+
+    drop(session);
+    assert!(!tmp.exists(), "the folder goes with the session");
 }

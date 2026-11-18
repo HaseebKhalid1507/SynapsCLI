@@ -24,9 +24,15 @@ use std::process::{Command, Output, Stdio};
 const FROZEN_KEYS: [&str; 8] = ["abi", "confine", "dropped", "provider", "provider_state", "read", "refusal", "write"];
 
 /// Whether this kernel can confine a child at all. Without it every
-/// enforcing check refuses with `abi-too-old` (also a pinned answer).
+/// enforcing check refuses with `abi-too-old` (also a pinned answer). Under
+/// `SYNAPS_REQUIRE_LANDLOCK=1` (CI) a kernel without one fails the test
+/// instead of skipping it.
 fn kernel_usable() -> bool {
-    agent_engine::sandbox::landlock::usable_abi().is_ok()
+    let ok = agent_engine::sandbox::landlock::usable_abi().is_ok();
+    if !ok && std::env::var_os("SYNAPS_REQUIRE_LANDLOCK").is_some_and(|v| v == "1") {
+        panic!("SYNAPS_REQUIRE_LANDLOCK=1, but this kernel has no usable Landlock");
+    }
+    ok
 }
 
 struct Rig {
@@ -290,10 +296,13 @@ fn a_usable_answer_is_screened_and_the_inner_paths_are_listed() {
     }
     // Each inner path a grant leaves out is listed, with a reason, and so is
     // the directory that can't take new entries.
-    for inner in [rig.ws.join(".git/hooks"), rig.ws.join(".git/config"), rig.ws.join(".synaps/plugins")] {
+    for inner in [rig.ws.join(".git/hooks"), rig.ws.join(".git/config")] {
         let why = reason_of(&inner).unwrap_or_else(|| panic!("{} is not listed: {dropped:?}", inner.display()));
         assert!(why.starts_with("left out of its write grant"), "{why}");
     }
+    // A project plugin folder that doesn't exist splits nothing (enforce
+    // doesn't load a project's own plugins).
+    assert!(reason_of(&rig.ws.join(".synaps/plugins")).is_none(), "{dropped:?}");
     let why = reason_of(&rig.ws).expect("the split directory is listed");
     assert!(why.contains("new entries"), "{why}");
     assert!(
@@ -306,6 +315,7 @@ fn a_usable_answer_is_screened_and_the_inner_paths_are_listed() {
     assert_eq!(seen["kind"], "sandbox_policy");
     assert_eq!(seen["session_id"], "check");
     assert_eq!(Path::new(seen["workspace"].as_str().unwrap()), rig.ws);
+    assert_eq!(Path::new(seen["base_dir"].as_str().unwrap()), rig.base, "the engine's own base dir");
     assert!(seen["parent_session_id"].is_null());
 
     // `--session` changes only the id it is asked about.
@@ -321,6 +331,7 @@ fn a_usable_answer_is_screened_and_the_inner_paths_are_listed() {
     assert!(text.contains(&format!("dropped: {}", rig.ws.join(".git/hooks").display())), "{text}");
     assert!(text.contains("read: not enforced (v1)"), "{text}");
     assert!(text.contains("note: a directory on a split path"), "{text}");
+    assert!(text.contains("project_plugins: not loaded (sandbox.confine = enforce)\n"), "{text}");
 
     assert_eq!(rig.snapshot(), before, "the check wrote something");
 }

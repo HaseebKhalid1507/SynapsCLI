@@ -331,6 +331,11 @@ pub struct PolicyEnv {
     /// The absolute values of `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME` and
     /// `$XDG_STATE_HOME` when set.
     pub xdg_dirs: Vec<PathBuf>,
+    /// Other `$HOME` values: a session's own environment's (see
+    /// [`Self::add_session_vars`]).
+    pub more_homes: Vec<PathBuf>,
+    /// Other `$XDG_RUNTIME_DIR` values, the same way.
+    pub more_runtime_dirs: Vec<PathBuf>,
 }
 
 impl PolicyEnv {
@@ -345,6 +350,39 @@ impl PolicyEnv {
             xdg_runtime_dir: None,
             path_dirs: Vec::new(),
             xdg_dirs: Vec::new(),
+            more_homes: Vec::new(),
+            more_runtime_dirs: Vec::new(),
+        }
+    }
+
+    /// Add what a session's own environment names to this one (the
+    /// engine's): a session's commands run with the environment its client
+    /// sent, and the owner's later commands with the engine's, so both are
+    /// protected. Absolute `$PATH` entries, `$HOME`, `$XDG_RUNTIME_DIR` and
+    /// the `$XDG_*_HOME` values are added when this one lacks them. A later
+    /// `(name, value)` pair wins over an earlier one, as at a spawn.
+    pub fn add_session_vars(&mut self, vars: &[(String, String)]) {
+        let var = |name: &str| vars.iter().rev().find(|(k, _)| k == name).map(|(_, v)| OsString::from(v));
+        let session = Self::from_vars(&var, self.base_dir.clone(), None, None);
+        for dir in session.path_dirs {
+            if !self.path_dirs.contains(&dir) {
+                self.path_dirs.push(dir);
+            }
+        }
+        for dir in session.xdg_dirs {
+            if !self.xdg_dirs.contains(&dir) {
+                self.xdg_dirs.push(dir);
+            }
+        }
+        if let Some(home) = session.env_home {
+            if self.home.as_ref() != Some(&home) && self.env_home.as_ref() != Some(&home) && !self.more_homes.contains(&home) {
+                self.more_homes.push(home);
+            }
+        }
+        if let Some(dir) = session.xdg_runtime_dir {
+            if self.xdg_runtime_dir.as_ref() != Some(&dir) && !self.more_runtime_dirs.contains(&dir) {
+                self.more_runtime_dirs.push(dir);
+            }
         }
     }
 
@@ -388,7 +426,17 @@ impl PolicyEnv {
             .iter()
             .filter_map(|name| absolute(name))
             .collect();
-        PolicyEnv { home, env_home, base_dir, runtime_dir, xdg_runtime_dir, path_dirs, xdg_dirs }
+        PolicyEnv {
+            home,
+            env_home,
+            base_dir,
+            runtime_dir,
+            xdg_runtime_dir,
+            path_dirs,
+            xdg_dirs,
+            more_homes: Vec::new(),
+            more_runtime_dirs: Vec::new(),
+        }
     }
 }
 
@@ -446,6 +494,22 @@ pub struct Protected {
 }
 
 impl Protected {
+    /// This set plus every path of `other` it lacks: a worker's set holds
+    /// all of its parent session's.
+    pub fn with(mut self, other: &Protected) -> Self {
+        for entry in &other.tree {
+            if !self.tree.iter().any(|(p, _)| p == &entry.0) {
+                self.tree.push(entry.clone());
+            }
+        }
+        for entry in &other.homes {
+            if !self.homes.iter().any(|(p, _)| p == &entry.0) {
+                self.homes.push(entry.clone());
+            }
+        }
+        self
+    }
+
     pub fn new(env: &PolicyEnv) -> Self {
         let mut tree: Vec<(PathBuf, String)> = Vec::new();
         let mut homes: Vec<(PathBuf, String)> = Vec::new();
@@ -458,7 +522,7 @@ impl Protected {
         };
         add_tree(&env.base_dir, "the engine base directory".to_string());
         add_tree(&env.runtime_dir, "the socket directory".to_string());
-        if let Some(dir) = &env.xdg_runtime_dir {
+        for dir in env.xdg_runtime_dir.iter().chain(&env.more_runtime_dirs) {
             add_tree(dir, "the runtime directory".to_string());
         }
         for dir in &env.path_dirs {
@@ -467,7 +531,7 @@ impl Protected {
         for dir in &env.xdg_dirs {
             add_tree(dir, "an XDG base directory".to_string());
         }
-        for home in env.home.iter().chain(env.env_home.iter()) {
+        for home in env.home.iter().chain(env.env_home.iter()).chain(&env.more_homes) {
             let classes: [(&[&str], &str); 5] = [
                 (HOME_CREDENTIALS, "credentials"),
                 (HOME_AUTOSTART, "autostart"),
@@ -1140,6 +1204,40 @@ mod tests {
     fn vars(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
         let pairs: Vec<(&'static str, &'static str)> = pairs.to_vec();
         move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| OsString::from(*v))
+    }
+
+    /// The protected set covers the union of the engine's environment and a
+    /// session's own (the one its commands run with): `$PATH` folders,
+    /// `$HOME`, `$XDG_RUNTIME_DIR` and the `$XDG_*_HOME` values only the
+    /// session names are added; the engine's stay; the last value of a
+    /// repeated name is the one that counts.
+    #[test]
+    fn a_sessions_own_environment_adds_to_the_protected_set() {
+        let mut e = env("/home/u/.synaps-cli", "/home/u");
+        e.path_dirs = vec![PathBuf::from("/usr/bin")];
+        e.xdg_runtime_dir = Some(PathBuf::from("/run/user/1000"));
+        let session: Vec<(String, String)> = [
+            ("PATH", "/ignored"),
+            ("PATH", "/usr/bin:/opt/session/bin:relative"),
+            ("HOME", "/srv/clienthome"),
+            ("XDG_RUNTIME_DIR", "/run/user/7"),
+            ("XDG_CONFIG_HOME", "/xdg/client-config"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let before = Protected::new(&e);
+        for p in ["/opt/session/bin/git", "/srv/clienthome", "/srv/clienthome/.ssh/id", "/run/user/7/bus", "/xdg/client-config/x"] {
+            assert!(before.drop_reason(Path::new(p)).is_none(), "the undo: {p} is not protected yet");
+        }
+        e.add_session_vars(&session);
+        assert_eq!(e.path_dirs, vec![PathBuf::from("/usr/bin"), PathBuf::from("/opt/session/bin")]);
+        let p = Protected::new(&e);
+        for path in ["/opt/session/bin/git", "/srv/clienthome", "/srv/clienthome/.ssh/id", "/run/user/7/bus", "/xdg/client-config/x", "/run/user/1000/x", "/usr/bin/x"] {
+            assert!(p.drop_reason(Path::new(path)).is_some(), "{path} must be protected");
+        }
+        assert!(p.drop_reason(Path::new("/ignored/x")).is_none(), "an overridden value names nothing");
+        assert!(p.drop_reason(Path::new("/srv/clienthome/proj")).is_none());
     }
 
     #[test]

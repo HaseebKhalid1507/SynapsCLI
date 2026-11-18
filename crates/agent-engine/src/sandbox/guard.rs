@@ -210,6 +210,7 @@ fn open_target_with(
             .map(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFLNK)
             .unwrap_or(false);
         if !is_link {
+            refuse_hard_linked(&target)?;
             return Ok(target);
         }
         let c = cstr(&target.tail)?;
@@ -228,6 +229,20 @@ fn open_target_with(
         path = lexical_normalize(&joined).ok_or_else(|| WriteError::Refused("sandbox: write refused: bad link".to_string()))?;
     }
     Err(WriteError::Refused("sandbox: write refused: too many symbolic links".to_string()))
+}
+
+/// A target that exists with more than one hard link is refused: another
+/// name of the same file may sit in a protected folder, and the policy only
+/// sees this one.
+fn refuse_hard_linked(target: &GuardedTarget) -> Result<(), WriteError> {
+    match target.stat() {
+        Ok(st) if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR && st.st_nlink > 1 => Err(WriteError::Refused(format!(
+            "sandbox: write refused: {} has {} hard links, and another one may be protected",
+            target.real.display(),
+            st.st_nlink
+        ))),
+        _ => Ok(()),
+    }
 }
 
 fn open_once(
@@ -342,6 +357,28 @@ mod tests {
         }
         assert!(!t.ws.join(".synaps").exists(), "no directory was made on the way to a protected path");
         assert!(!t.home.join(".ssh").exists());
+    }
+
+    /// A file in the workspace that is also linked from elsewhere (here from
+    /// outside every grant, as a protected file could be) is refused, for a
+    /// write and an edit's open alike; its content is untouched. Once the other
+    /// name is gone the same file can be written (the control).
+    #[test]
+    fn a_target_with_another_hard_link_is_refused() {
+        let t = Tree::new();
+        let c = t.confinement(vec![], vec![]);
+        let inside = t.ws.join("src/shared.txt");
+        let outside = t.root.join("protected-elsewhere.txt");
+        std::fs::write(&outside, "keep").unwrap();
+        std::fs::hard_link(&outside, &inside).unwrap();
+        let why = refused(write(&c, &inside, "changed"));
+        assert!(why.contains("hard links"), "{why}");
+        let why = refused(open_target(&c, &inside, false));
+        assert!(why.contains("hard links"), "{why}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        std::fs::remove_file(&outside).unwrap();
+        write(&c, &inside, "changed").unwrap();
+        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "changed");
     }
 
     #[test]

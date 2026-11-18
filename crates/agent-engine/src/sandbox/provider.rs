@@ -29,15 +29,43 @@ pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
 /// The session id `synaps sandbox check` calls the provider with.
 pub const CHECK_SESSION_ID: &str = "check";
 
-/// Why a session was refused: the cause text it carries.
+/// Why a session was refused: the cause text it carries, and the provider
+/// it came from when the provider is the cause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxRefused {
     pub cause: String,
+    /// The configured provider's id, when the refusal is the provider's
+    /// (not loaded, late, failed, garbage, or its own refusal).
+    pub provider: Option<String>,
+}
+
+impl SandboxRefused {
+    fn of(refusal: &super::policy::Refusal, provider: Option<&str>) -> Self {
+        use super::policy::Cause;
+        let from_provider = matches!(
+            refusal.cause,
+            Cause::ProviderMissing | Cause::ProviderTimeout | Cause::ProviderError | Cause::ProviderBadAnswer | Cause::ProviderRefused
+        );
+        SandboxRefused {
+            cause: refusal.session_cause.clone(),
+            provider: if from_provider { provider.map(str::to_string) } else { None },
+        }
+    }
+
+    fn split(cause: String) -> Self {
+        SandboxRefused { cause, provider: None }
+    }
 }
 
 impl std::fmt::Display for SandboxRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "sandbox: this session cannot be confined, so it was refused ({})", self.cause)
+        match &self.provider {
+            Some(id) => {
+                let cause = self.cause.strip_prefix("provider-").unwrap_or(&self.cause);
+                write!(f, "sandbox policy provider '{id}' {cause}")
+            }
+            None => write!(f, "sandbox: this session cannot be confined, so it was refused ({})", self.cause),
+        }
     }
 }
 
@@ -48,6 +76,13 @@ impl std::error::Error for SandboxRefused {}
 pub fn workspace_for(cwd: Option<&Path>) -> PathBuf {
     let base = cwd.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok()).unwrap_or_else(|| PathBuf::from("/"));
     canon_lossy(&base)
+}
+
+/// The engine's base dir (config, plugins, sessions) in canonical form: what
+/// the `sandbox_policy` question sends as `base_dir`, so a provider never has
+/// to guess it from its own environment.
+pub fn engine_base_dir() -> PathBuf {
+    canon_lossy(&crate::config::base_dir())
 }
 
 /// The `hook.handle` params for the `sandbox_policy` question.
@@ -69,6 +104,7 @@ pub fn hook_params(session_id: &str, workspace: &Path, cwd: Option<&Path>, paren
     let mut params = serde_json::to_value(&event).unwrap_or(Value::Null);
     if let Some(object) = params.as_object_mut() {
         object.insert("workspace".to_string(), json!(workspace.to_string_lossy()));
+        object.insert("base_dir".to_string(), json!(engine_base_dir().to_string_lossy()));
         object.insert("parent_session_id".to_string(), json!(parent_session_id));
     }
     params
@@ -121,7 +157,25 @@ pub async fn evaluate_with_abi(
     parent_session_id: Option<&str>,
     cwd: Option<&Path>,
 ) -> (Resolution, PolicyEnv) {
-    let env = PolicyEnv::from_process();
+    evaluate_in(abi, bus, settings, session_id, parent_session_id, cwd, None).await
+}
+
+/// [`evaluate_with_abi`] for a session whose commands run with
+/// `session_env` (the environment its client sent): what it names is
+/// protected as well as what the engine's own environment names.
+async fn evaluate_in(
+    abi: Result<u32, ()>,
+    bus: &HookBus,
+    settings: &SandboxSettings,
+    session_id: &str,
+    parent_session_id: Option<&str>,
+    cwd: Option<&Path>,
+    session_env: Option<&[(String, String)]>,
+) -> (Resolution, PolicyEnv) {
+    let mut env = PolicyEnv::from_process();
+    if let Some(vars) = session_env {
+        env.add_session_vars(vars);
+    }
     let workspace = workspace_for(cwd);
     let confine_on = settings.confine == SandboxConfine::Enforce;
     let provider = settings.policy_provider.as_deref();
@@ -155,6 +209,20 @@ pub async fn establish(
     establish_with_abi(super::kernel_abi(), bus, settings, session_id, parent_session_id, cwd).await
 }
 
+/// [`establish`] for a session whose commands run with `session_env` (the
+/// environment its client sent, `None` = the engine's own): the `$PATH`,
+/// `$HOME` and `$XDG_*` folders it names are protected too.
+pub async fn establish_with_env(
+    bus: &HookBus,
+    settings: &SandboxSettings,
+    session_id: &str,
+    parent_session_id: Option<&str>,
+    cwd: Option<&Path>,
+    session_env: Option<&[(String, String)]>,
+) -> Result<SessionSandbox, SandboxRefused> {
+    establish_in(super::kernel_abi(), bus, settings, session_id, parent_session_id, cwd, session_env).await
+}
+
 /// [`establish`] with the kernel's ABI given, so a test need not have Landlock.
 pub async fn establish_with_abi(
     abi: Result<u32, ()>,
@@ -164,12 +232,26 @@ pub async fn establish_with_abi(
     parent_session_id: Option<&str>,
     cwd: Option<&Path>,
 ) -> Result<SessionSandbox, SandboxRefused> {
+    establish_in(abi, bus, settings, session_id, parent_session_id, cwd, None).await
+}
+
+/// [`establish_with_abi`] with the session's own environment (see
+/// [`establish_with_env`]).
+pub async fn establish_in(
+    abi: Result<u32, ()>,
+    bus: &HookBus,
+    settings: &SandboxSettings,
+    session_id: &str,
+    parent_session_id: Option<&str>,
+    cwd: Option<&Path>,
+    session_env: Option<&[(String, String)]>,
+) -> Result<SessionSandbox, SandboxRefused> {
     if settings.confine == SandboxConfine::Off {
         return Ok(SessionSandbox::Off);
     }
-    let (resolution, env) = evaluate_with_abi(abi, bus, settings, session_id, parent_session_id, cwd).await;
+    let (resolution, env) = evaluate_in(abi, bus, settings, session_id, parent_session_id, cwd, session_env).await;
     if let Some(refusal) = &resolution.refusal {
-        return Err(SandboxRefused { cause: refusal.session_cause.clone() });
+        return Err(SandboxRefused::of(refusal, settings.policy_provider.as_deref()));
     }
     let protected = Protected::new(&env);
     let workspace = workspace_for(cwd);
@@ -177,7 +259,7 @@ pub async fn establish_with_abi(
     // A root with a protected path inside that can't be split around it
     // refuses the session here, not at the first command.
     if let Err(split) = confinement.plan() {
-        return Err(SandboxRefused { cause: split.cause() });
+        return Err(SandboxRefused::split(split.cause()));
     }
     Ok(SessionSandbox::Confined(std::sync::Arc::new(confinement)))
 }
@@ -216,7 +298,7 @@ pub async fn establish_worker_with_abi(
     };
     let (mut resolution, env) = evaluate_with_abi(abi, bus, &settings, worker_id, parent_session_id, cwd).await;
     if let Some(refusal) = &resolution.refusal {
-        return Err(SandboxRefused { cause: refusal.session_cause.clone() });
+        return Err(SandboxRefused::of(refusal, settings.policy_provider.as_deref()));
     }
     let mut kept = Vec::new();
     for root in std::mem::take(&mut resolution.write) {
@@ -227,11 +309,12 @@ pub async fn establish_worker_with_abi(
         }
     }
     resolution.write = kept;
-    let protected = Protected::new(&env);
+    // The parent's protected set holds what its client's environment named.
+    let protected = Protected::new(&env).with(parent.protected());
     let workspace = workspace_for(cwd);
     let confinement = Confinement::new(resolution, protected, &workspace, cwd);
     if let Err(split) = confinement.plan() {
-        return Err(SandboxRefused { cause: split.cause() });
+        return Err(SandboxRefused::split(split.cause()));
     }
     Ok(SessionSandbox::Confined(std::sync::Arc::new(confinement)))
 }
@@ -278,7 +361,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_params_are_the_hook_envelope_with_two_fields_added() {
+    fn the_params_are_the_hook_envelope_with_its_fields_added() {
         let params = hook_params("s1", Path::new("/w"), Some(Path::new("/w/sub")), Some("p0"));
         assert_eq!(params["kind"], "sandbox_policy");
         assert_eq!(params["session_id"], "s1");
@@ -290,6 +373,56 @@ mod tests {
         assert!(top["cwd"].is_null());
         // The same envelope a tool hook has: the other fields are present, null.
         assert!(top["tool_name"].is_null() && top["tool_input"].is_null());
+    }
+
+    /// The question carries the engine's base dir as the core resolves it,
+    /// canonical (a base dir reached through a link is sent as its target),
+    /// next to `workspace` and `cwd`, for every session.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn the_params_carry_the_engines_canonical_base_dir() {
+        let _guard = crate::test_env::BaseDirGuard::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let real = canon_lossy(tmp.path()).join("real-base");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("via-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(not(unix))]
+        let link = real.clone();
+        agent_core::config::set_base_dir_for_tests(link);
+        for params in [
+            hook_params("s1", Path::new("/w"), Some(Path::new("/w/sub")), Some("p0")),
+            hook_params("s2", Path::new("/w"), None, None),
+        ] {
+            assert_eq!(params["base_dir"], json!(real.to_string_lossy()), "{params}");
+            assert_eq!(params["workspace"], "/w");
+        }
+    }
+
+    /// A refusal that comes from the provider names it and the cause, in the
+    /// frozen form `sandbox policy provider '<id>' <cause>`; one that doesn't
+    /// (no Landlock) keeps the general text and names no provider.
+    #[tokio::test]
+    async fn a_refused_session_names_the_provider_and_the_cause() {
+        let settings = SandboxSettings { confine: SandboxConfine::Enforce, policy_provider: Some("guard".into()) };
+        let ws = Path::new("/tmp");
+        for (answer, text) in [
+            (Err("boom".to_string()), "sandbox policy provider 'guard' error"),
+            (Ok(json!("garbage")), "sandbox policy provider 'guard' bad-answer"),
+            (Ok(json!({"refuse": "nope"})), "sandbox policy provider 'guard' refused: nope"),
+        ] {
+            let bus = bus_with(Fake::new("guard", answer), &["sandbox.policy"]).await;
+            let refused = establish_with_abi(Ok(7), &bus, &settings, "s", None, Some(ws)).await.expect_err("refused");
+            assert_eq!(refused.to_string(), text);
+            assert_eq!(refused.provider.as_deref(), Some("guard"));
+        }
+        let refused = establish_with_abi(Ok(7), &HookBus::new(), &settings, "s", None, Some(ws)).await.expect_err("refused");
+        assert_eq!(refused.to_string(), "sandbox policy provider 'guard' missing");
+        let bus = bus_with(Fake::new("guard", Ok(json!({"write": []}))), &["sandbox.policy"]).await;
+        let refused = establish_with_abi(Err(()), &bus, &settings, "s", None, Some(ws)).await.expect_err("refused");
+        assert_eq!(refused.provider, None);
+        assert_eq!(refused.to_string(), "sandbox: this session cannot be confined, so it was refused (abi-too-old)");
     }
 
     #[tokio::test]
@@ -534,6 +667,9 @@ mod tests {
         let settings = SandboxSettings { confine: SandboxConfine::Enforce, policy_provider: Some("guard".into()) };
         let bus = bus_with(Fake::new("guard", Ok(json!({"write": []}))), &["sandbox.policy"]).await;
         let parent = parent_for(&ws, &[]);
+        // An existing project plugin folder stays read-only, so the workspace
+        // is split around it.
+        std::fs::create_dir_all(ws.join(".synaps").join("plugins")).unwrap();
         // Control: few entries, split around `<ws>/.synaps/plugins`, confined.
         let ok = establish_with_abi(Ok(7), &bus, &settings, "s1", None, Some(&ws)).await.expect("splittable");
         assert!(ok.confinement().is_some());
@@ -549,6 +685,38 @@ mod tests {
             .await
             .expect_err("must refuse");
         assert_eq!(refused.cause, want);
+    }
+
+    /// A session's commands run with the environment its client sent. A
+    /// `$PATH` folder only that environment names (here inside the
+    /// workspace) is protected like one the engine's own `$PATH` names: the
+    /// write tools refuse it and the shell's grants leave it out; so is a
+    /// worker the session spawns. Without the session's environment the same
+    /// folder is writable (the undo).
+    #[tokio::test]
+    async fn a_path_folder_only_the_sessions_own_environment_names_is_protected() {
+        let tmp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let ws = canon_lossy(tmp.path()).join("ws");
+        let bin = ws.join("session-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let target = bin.join("git");
+        let settings = SandboxSettings { confine: SandboxConfine::Enforce, policy_provider: Some("guard".into()) };
+        let bus = bus_with(Fake::new("guard", Ok(json!({"write": []}))), &["sandbox.policy"]).await;
+        let vars = vec![("PATH".to_string(), format!("/usr/bin:{}", bin.display()))];
+
+        let s = establish_in(Ok(7), &bus, &settings, "s1", None, Some(&ws), Some(&vars)).await.expect("confined");
+        let c = s.confinement().expect("confined").clone();
+        let why = c.allows_write(&target).expect_err("a session-only $PATH folder is protected");
+        assert!(why.contains("a $PATH entry"), "{why}");
+        let plan = c.plan().expect("splittable");
+        assert!(plan.left_out.iter().any(|h| h.path == bin), "{:?}", plan.left_out);
+        assert!(!plan.grants.iter().any(|g| g.path == ws || (bin.starts_with(&g.path) && g.path.starts_with(&ws))));
+
+        let w = establish_worker_with_abi(Ok(7), &bus, &c, "sa_1", Some("s1"), Some(&ws)).await.expect("worker");
+        assert!(w.confinement().unwrap().allows_write(&target).is_err(), "the worker keeps its parent's protected set");
+
+        let plain = establish_in(Ok(7), &bus, &settings, "s1", None, Some(&ws), None).await.expect("confined");
+        assert!(plain.confinement().unwrap().allows_write(&target).is_ok(), "control: the engine's own $PATH lacks it");
     }
 
     #[tokio::test]

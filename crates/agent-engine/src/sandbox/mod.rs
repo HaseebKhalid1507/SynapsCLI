@@ -19,7 +19,10 @@
 //! A session that cannot be confined (no usable kernel support, no valid
 //! policy) never runs unconfined: it is refused at start, and a runtime whose
 //! policy is unresolved refuses every command and write. v1 confines writes
-//! only: reads, the network and process control are not restricted.
+//! only: reads and the network are not restricted. Process control is in
+//! part: on Landlock ABI 6 and later a sandboxed process can't signal out of
+//! its domain or reach an abstract unix socket made outside it, and the
+//! daemon refuses a client from inside a sandbox ([`crate::daemon::peer`]).
 
 pub mod check;
 pub mod confinement;
@@ -150,15 +153,25 @@ pub enum SpawnSandbox {
 pub struct SpawnPlan {
     #[cfg(target_os = "linux")]
     ruleset: landlock::Ruleset,
+    /// The session's own temporary folder: the child's `TMPDIR`.
+    tmp_dir: PathBuf,
 }
 
 impl SpawnPlan {
     /// Make `cmd`'s child restrict itself before exec. Add this after any
     /// other `pre_exec` hooks (`setsid`, …). If the restrict fails the spawn
     /// fails; the child never runs unconfined.
+    /// The child's `TMPDIR` is set to the session's own temporary folder.
     #[cfg(target_os = "linux")]
     pub fn install(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+        cmd.env("TMPDIR", &self.tmp_dir);
         landlock::confine_command(cmd, &self.ruleset)
+    }
+
+    /// The session's own temporary folder, for a spawn that sets the child's
+    /// environment itself (a PTY's command): set it as `TMPDIR`.
+    pub fn tmp_dir(&self) -> &Path {
+        &self.tmp_dir
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -203,6 +216,18 @@ impl SessionSandbox {
         matches!(self, SessionSandbox::Off)
     }
 
+    /// The number per-session process caches key this sandbox by: 0 when
+    /// off, the confinement's own number when confined (never 0), and
+    /// `u64::MAX` when unresolved. A process started under one sandbox is
+    /// never handed to a caller under another.
+    pub fn lease_tag(&self) -> u64 {
+        match self {
+            SessionSandbox::Off => 0,
+            SessionSandbox::Unresolved => u64::MAX,
+            SessionSandbox::Confined(c) => c.id(),
+        }
+    }
+
     /// The resolved confinement, when there is one.
     pub fn confinement(&self) -> Option<&Arc<Confinement>> {
         match self {
@@ -220,8 +245,8 @@ impl SessionSandbox {
             SessionSandbox::Confined(c) => {
                 #[cfg(target_os = "linux")]
                 {
-                    match c.build_ruleset() {
-                        Ok(ruleset) => SpawnSandbox::Apply(SpawnPlan { ruleset }),
+                    match c.build_ruleset().and_then(|ruleset| Ok((ruleset, c.tmp_dir()?))) {
+                        Ok((ruleset, tmp_dir)) => SpawnSandbox::Apply(SpawnPlan { ruleset, tmp_dir }),
                         Err(why) => SpawnSandbox::Refuse(why),
                     }
                 }

@@ -585,10 +585,12 @@ and only if that plugin declares this hook **and** holds the permission;
 any other plugin that names the hook is never asked. If the named plugin is
 not loaded, lacks either key, fails, times out (5 s) or answers anything
 else than the shape below, the session is **refused**: it never starts
-unconfined.
+unconfined. The refusal reads `sandbox policy provider '<id>' <cause>`, the
+cause being `missing`, `timeout`, `error`, `bad-answer` or
+`refused: <reason>`.
 
 The request is the ordinary `hook.handle` envelope (the same fields as any
-other hook) with `kind` set to `sandbox_policy` and two fields beside it:
+other hook) with `kind` set to `sandbox_policy` and three fields beside it:
 
 ```json
 {
@@ -603,11 +605,15 @@ other hook) with `kind` set to `sandbox_policy` and two fields beside it:
   "transcript": null,
   "data": null,
   "workspace": "/home/u/project",
+  "base_dir": "/home/u/.synaps-cli",
   "parent_session_id": null
 }
 ```
 
 `workspace` is the session's working folder, absolute and canonical.
+`base_dir` is the engine's base directory (config, plugins, sessions) as the
+engine itself resolves it, absolute and canonical; it is always sent, so a
+provider never has to work it out from its own environment.
 `parent_session_id` is the engine's own record of the session this one came
 from (a compaction or fork successor), `null` for a top-level session. It
 comes from the engine's session record only: nothing an agent, a worker, a

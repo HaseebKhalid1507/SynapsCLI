@@ -37,6 +37,9 @@ fn kernel_ok(test: &str) -> bool {
             true
         }
         Err(why) => {
+            if std::env::var_os("SYNAPS_REQUIRE_LANDLOCK").is_some_and(|v| v == "1") {
+                panic!("{test}: SYNAPS_REQUIRE_LANDLOCK=1, but this host has no usable Landlock ({why:?})");
+            }
             eprintln!("SKIPPED {test}: no usable Landlock on this host ({why:?})");
             false
         }
@@ -58,9 +61,8 @@ fn tree() -> Tree {
     let base = home.join(".synaps-cli");
     let ws = home.join("proj");
     std::fs::create_dir_all(base.join("sandbox")).unwrap();
-    // `src` exists up front: the workspace is always split (the project's
-    // plugin folder is left out of it), so a shell can add files in `src`
-    // but not directly in the workspace.
+    // `src` exists up front, for the tests whose workspace is split (around
+    // a protected folder inside it) and that write inside `src`.
     std::fs::create_dir_all(ws.join("src")).unwrap();
     Tree { _dir: dir, root, home, base, ws }
 }
@@ -175,7 +177,9 @@ fn a_main_checkouts_git_hooks_and_config_cannot_be_written() {
     assert!(sandbox.guard_write(&t.ws.join(".git/hooks/pre-commit"), true).is_err());
     assert!(sandbox.guard_write(&t.ws.join(".git/config"), false).is_err());
 
-    // What git needs to commit still works.
+    // The work tree and git's object, ref and log stores stay writable. Git
+    // commands that write the index (`add`, `commit`, `checkout`) still fail
+    // here: `.git/index` and its lock sit in the read-only part of `.git`.
     assert!(confined_ok(&c, &t.ws, &write_script(&t.ws.join("src/lib.rs"))));
     assert!(confined_ok(&c, &t.ws, &write_script(&t.ws.join(".git/refs/heads/topic"))));
     assert!(confined_ok(&c, &t.ws, &write_script(&t.ws.join(".git/objects/ab/cdef"))));
@@ -310,8 +314,14 @@ fn node_modules_bin_on_the_path_cannot_be_written() {
     assert!(whole_tree_ok(&t.ws, &t.ws, &write_script(&t.ws.join("node_modules/.bin/tsc"))));
 }
 
+/// A project plugin folder that exists stays read-only to commands. One
+/// that doesn't exist splits nothing: the workspace root stays fully
+/// writable (new files and folders at its top), and a folder a command
+/// makes there is never loaded while confinement is on (enforce skips a
+/// project's own plugins; see the extension manager). The write tools refuse
+/// it either way.
 #[test]
-fn a_project_plugin_folder_cannot_be_written_even_before_it_exists() {
+fn an_existing_project_plugin_folder_is_read_only_and_a_bare_workspace_root_stays_writable() {
     if !kernel_ok("project plugins") {
         return;
     }
@@ -323,17 +333,20 @@ fn a_project_plugin_folder_cannot_be_written_even_before_it_exists() {
     assert!(!confined_ok(&c, &t.ws, &write_script(&t.ws.join(".synaps/plugins/p/run.sh"))));
     assert!(!confined_ok(&c, &t.ws, "mkdir .synaps/plugins/q"));
     assert!(confined_ok(&c, &t.ws, &write_script(&t.ws.join(".synaps/notes/a.md"))));
+    // Split around it, the root takes no new entries.
+    assert!(!confined_ok(&c, &t.ws, "mkdir build"));
 
-    // A project with no plugin folder yet can't grow one either.
+    // A project with no plugin folder: the root is granted whole.
     let bare = tree();
     std::fs::create_dir_all(bare.ws.join("src")).unwrap();
     let c = confine(&bare, &bare.ws, &[], &[]);
-    assert!(!confined_ok(&c, &bare.ws, "mkdir -p .synaps/plugins/p && printf x > .synaps/plugins/p/run.sh"));
-    assert!(!bare.ws.join(".synaps").exists());
+    assert!(confined_ok(&c, &bare.ws, "printf x > new-file && mkdir build && printf y > build/out"));
+    assert_eq!(std::fs::read_to_string(bare.ws.join("new-file")).unwrap(), "x");
+    assert_eq!(std::fs::read_to_string(bare.ws.join("build/out")).unwrap(), "y");
     assert!(confined_ok(&c, &bare.ws, &write_script(&bare.ws.join("src/a.rs"))));
-
-    // Undo.
-    assert!(whole_tree_ok(&bare.ws, &bare.ws, "mkdir -p .synaps/plugins/p && printf x > .synaps/plugins/p/run.sh"));
+    let sandbox = SessionSandbox::Confined(Arc::clone(&c));
+    assert!(sandbox.guard_write(&bare.ws.join(".synaps/plugins/p/run.sh"), true).is_err());
+    assert!(!bare.ws.join(".synaps").exists());
 }
 
 /// The consequence of granting per child, stated in the docs' section on

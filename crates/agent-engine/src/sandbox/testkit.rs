@@ -66,12 +66,14 @@ impl Tree {
     }
 
     /// A confined session whose ruleset can no longer be built: its
-    /// workspace is gone, so it cannot be split around the project's plugin
-    /// folder. Every spawn for it must be refused; none may run loose. The
-    /// fixture checks that it does refuse. (Needs no Landlock kernel: the
-    /// refusal comes before any kernel call.)
+    /// workspace holds a protected `$PATH` folder and is then removed, so it
+    /// cannot be split around that folder. Every spawn for it must be
+    /// refused; none may run loose. The fixture checks that it does refuse.
+    /// (Needs no Landlock kernel: the refusal comes before any kernel call.)
     pub fn session_that_cannot_spawn(&self) -> SessionSandbox {
-        let session = self.session(vec![], vec![]);
+        let bin = self.ws.join("bin");
+        std::fs::create_dir_all(&bin).expect("a $PATH folder in the workspace");
+        let session = self.session(vec![bin], vec![]);
         std::fs::remove_dir_all(&self.ws).expect("remove the workspace");
         assert!(
             matches!(session.for_spawn(), super::SpawnSandbox::Refuse(_)),
@@ -105,14 +107,42 @@ pub(crate) async fn appears(path: &std::path::Path) -> bool {
 /// minimum). Tests that start a real confined process skip, loudly, when it
 /// can't.
 pub(crate) fn kernel_ok(test: &str) -> bool {
-    match super::kernel_abi() {
+    kernel_ok_with(test, super::kernel_abi(), require_landlock())
+}
+
+/// [`kernel_ok`] with the kernel's answer and the switch given.
+fn kernel_ok_with(test: &str, abi: Result<u32, ()>, required: bool) -> bool {
+    match abi {
         Ok(abi) => {
             eprintln!("{test}: Landlock ABI {abi}");
             true
         }
         Err(()) => {
+            if required {
+                panic!("{test}: SYNAPS_REQUIRE_LANDLOCK=1, but this kernel has no usable Landlock");
+            }
             eprintln!("SKIPPED {test}: this kernel has no usable Landlock");
             false
         }
     }
+}
+
+/// `SYNAPS_REQUIRE_LANDLOCK=1`: a real-kernel test fails instead of skipping
+/// when the kernel has no usable Landlock (CI sets it).
+pub(crate) fn require_landlock() -> bool {
+    require_landlock_in(std::env::var_os("SYNAPS_REQUIRE_LANDLOCK"))
+}
+
+fn require_landlock_in(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+#[test]
+fn a_kernel_without_landlock_fails_a_real_kernel_test_when_landlock_is_required() {
+    assert!(kernel_ok_with("t", Ok(6), true) && kernel_ok_with("t", Ok(6), false));
+    assert!(!kernel_ok_with("t", Err(()), false), "not required: the test skips");
+    let required = std::panic::catch_unwind(|| kernel_ok_with("t", Err(()), true));
+    assert!(required.is_err(), "required: the test fails instead of skipping");
+    assert!(require_landlock_in(Some("1".into())));
+    assert!(!require_landlock_in(Some("0".into())) && !require_landlock_in(Some("".into())) && !require_landlock_in(None));
 }

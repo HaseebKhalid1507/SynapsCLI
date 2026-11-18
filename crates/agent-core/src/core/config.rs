@@ -2119,7 +2119,35 @@ fn required_guards_in(base: &std::path::Path, profile: Option<&str>) -> Vec<Stri
 /// and `synaps sandbox check` use, so a hand edit applies to the next
 /// session.
 pub fn read_sandbox_settings() -> SandboxSettings {
-    match std::fs::read_to_string(resolve_read_path("config")) {
+    sandbox_settings_in(&base_dir(), get_profile().as_deref())
+}
+
+/// [`read_sandbox_settings`] for a given base dir and profile. The active
+/// file is the profile's config when it exists (as [`resolve_read_path`]
+/// picks it), else the base config. The base config's `enforce` holds
+/// either way: a profile's config can add a provider or turn confinement on,
+/// never off. A profile config without a provider uses the base config's.
+pub fn sandbox_settings_in(base: &std::path::Path, profile: Option<&str>) -> SandboxSettings {
+    let base_file = base.join("config");
+    let active = profile
+        .map(|p| base.join(p).join("config"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| base_file.clone());
+    let mut settings = sandbox_settings_of_file(&active);
+    if active != base_file {
+        let floor = sandbox_settings_of_file(&base_file);
+        if floor.confine == SandboxConfine::Enforce {
+            settings.confine = SandboxConfine::Enforce;
+        }
+        if settings.policy_provider.is_none() {
+            settings.policy_provider = floor.policy_provider;
+        }
+    }
+    settings
+}
+
+fn sandbox_settings_of_file(path: &std::path::Path) -> SandboxSettings {
+    match std::fs::read_to_string(path) {
         Ok(content) => sandbox_settings_from_str(&content),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => SandboxSettings::default(),
         Err(_) => SandboxSettings { confine: SandboxConfine::Enforce, policy_provider: None },
@@ -5083,6 +5111,40 @@ context_window = 200k\n\
             assert_eq!(read_sandbox_settings().confine, SandboxConfine::Enforce);
         });
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A profile's config is the active file when it exists, but the base
+    /// config's `enforce` still holds: a profile can't switch confinement
+    /// off, and without a provider of its own it uses the base's.
+    #[test]
+    fn a_profile_config_cannot_switch_off_the_base_configs_enforce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let profile = base.join("work");
+        std::fs::create_dir_all(&profile).unwrap();
+        let write = |path: &std::path::Path, text: &str| std::fs::write(path, text).unwrap();
+        let get = || {
+            let s = sandbox_settings_in(base, Some("work"));
+            (s.confine, s.policy_provider)
+        };
+        let enforce = |p: &str| (SandboxConfine::Enforce, Some(p.to_string()));
+        write(&base.join("config"), "sandbox.confine = enforce\nsandbox.policy_provider = g\n");
+        assert_eq!(get(), enforce("g"), "no profile file: the base config");
+        write(&profile.join("config"), "model = m\n");
+        assert_eq!(get(), enforce("g"), "a profile file without sandbox keys");
+        write(&profile.join("config"), "sandbox.confine = off\n");
+        assert_eq!(get(), enforce("g"), "a profile file that says off");
+        write(&profile.join("config"), "sandbox.confine = off\nsandbox.policy_provider = h\n");
+        assert_eq!(get(), enforce("h"), "the profile's provider, still enforced");
+        write(&base.join("config"), "model = m\n");
+        write(&profile.join("config"), "sandbox.confine = enforce\nsandbox.policy_provider = h\n");
+        assert_eq!(get(), enforce("h"), "a profile can turn it on");
+        write(&profile.join("config"), "sandbox.confine = off\n");
+        assert_eq!(get(), (SandboxConfine::Off, None), "both off: off");
+        // A base config that can't be read counts as enforce here too.
+        std::fs::remove_file(base.join("config")).unwrap();
+        std::fs::create_dir(base.join("config")).unwrap();
+        assert_eq!(get().0, SandboxConfine::Enforce);
     }
 
     #[test]

@@ -222,11 +222,64 @@ pub struct Confinement {
     existing_only: Vec<PathBuf>,
     /// Grants dropped while the last ruleset was built.
     late_dropped: Mutex<Vec<Dropped>>,
+    /// This confinement's own number, unique in the process (a clone keeps
+    /// it: same policy). Per-session processes are keyed by it, so one
+    /// started under one confinement is never handed to another.
+    id: u64,
+    /// The session's own temporary folder (see [`Self::tmp_dir`]).
+    tmp: std::sync::Arc<SessionTmp>,
+}
+
+static NEXT_CONFINEMENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Where a session's temporary folders are made: `/tmp`, which every
+/// confined process may write.
+pub const SESSION_TMP_PARENT: &str = "/tmp";
+
+/// A session's own temporary folder, made on first use and removed when
+/// the last copy of its confinement goes.
+#[derive(Debug, Default)]
+struct SessionTmp(std::sync::OnceLock<Result<PathBuf, String>>);
+
+impl Drop for SessionTmp {
+    fn drop(&mut self) {
+        if let Some(Ok(dir)) = self.0.get() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Make a fresh folder under `parent`, mode 0700, with a name nobody had
+/// (`mkdtemp`: it never follows or reuses an existing entry).
+#[cfg(unix)]
+fn make_private_dir(parent: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let mut template = parent.join("synaps-session-XXXXXX").into_os_string().into_vec();
+    template.push(0);
+    // SAFETY: `template` is a writable NUL-terminated buffer that outlives
+    // the call; mkdtemp only rewrites the trailing Xs in place.
+    let made = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+    if made.is_null() {
+        return Err(format!(
+            "sandbox: cannot make this session's temporary folder in {}: {}",
+            parent.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    template.pop();
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&template)))
+}
+
+#[cfg(not(unix))]
+fn make_private_dir(_parent: &Path) -> Result<PathBuf, String> {
+    Err("sandbox: not available on this platform".to_string())
 }
 
 impl Clone for Confinement {
     fn clone(&self) -> Self {
         Confinement {
+            id: self.id,
+            tmp: std::sync::Arc::clone(&self.tmp),
             resolution: self.resolution.clone(),
             roots: self.roots.clone(),
             protected: self.protected.clone(),
@@ -252,7 +305,31 @@ impl Confinement {
             project_dirs,
             existing_only: existing_only_paths(),
             late_dropped: Mutex::new(Vec::new()),
+            id: NEXT_CONFINEMENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            tmp: std::sync::Arc::default(),
         }
+    }
+
+    /// This confinement's number, unique in the process (never 0).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The session's own temporary folder, `TMPDIR` for every process it
+    /// starts confined: made on first use under [`SESSION_TMP_PARENT`] with
+    /// mode 0700 and a fresh name, inside the write grants (or an error, and
+    /// then nothing is started). It is still under the shared `/tmp`: it
+    /// keeps a session's temporary files apart, it doesn't hide them.
+    pub fn tmp_dir(&self) -> Result<PathBuf, String> {
+        let made = self.tmp.0.get_or_init(|| {
+            let dir = make_private_dir(&canon_lossy(Path::new(SESSION_TMP_PARENT)))?;
+            if let Err(why) = self.allows_write(&dir.join("f")) {
+                let _ = std::fs::remove_dir(&dir);
+                return Err(why);
+            }
+            Ok(dir)
+        });
+        made.clone()
     }
 
     pub fn roots(&self) -> &[PathBuf] {
@@ -314,8 +391,15 @@ impl Confinement {
                 push(h);
             }
         }
+        // The project plugin folder splits a root only once it exists. With
+        // confinement on a project's own plugins are not loaded at all, so a
+        // folder a command creates there never runs while confined, and the
+        // root stays fully writable (new files and folders at its top). One
+        // that already exists stays read-only to commands.
         for h in self.project_holes() {
-            push(h);
+            if std::fs::symlink_metadata(&h.path).is_ok() {
+                push(h);
+            }
         }
         out
     }
@@ -381,6 +465,13 @@ impl Confinement {
                 ));
             }
         }
+        if let Some(dot_git) = stray_git(path, &layouts) {
+            return Err(format!(
+                "sandbox: write refused: {} is git metadata outside a write root's own checkout ({}), read-only while confined (git runs hooks and config from it)",
+                path.display(),
+                dot_git.display()
+            ));
+        }
         for hole in self.project_holes() {
             if path.starts_with(&hole.path) {
                 return Err(format!("sandbox: write refused: {} is {}", path.display(), hole.why));
@@ -397,6 +488,27 @@ impl Confinement {
             path.display()
         ))
     }
+}
+
+/// The first `.git` component of `path` (any depth, any ASCII case, a
+/// directory or a gitfile, existing or not) that is not the `.git` entry or
+/// common dir of one of `layouts`, the checkouts the roots belong to. A
+/// write there could make a repository (or repoint one) whose hooks and
+/// config the owner's next git command runs.
+fn stray_git(path: &Path, layouts: &[GitLayout]) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component);
+        let std::path::Component::Normal(name) = component else { continue };
+        if !name.as_encoded_bytes().eq_ignore_ascii_case(b".git") {
+            continue;
+        }
+        let known = layouts.iter().any(|l| l.dot_git == prefix || l.common.as_deref() == Some(prefix.as_path()));
+        if !known {
+            return Some(prefix);
+        }
+    }
+    None
 }
 
 /// Grant `dir` entry by entry, recursing only where a hole lies beneath.
@@ -667,16 +779,27 @@ mod tests {
         assert!(plan.left_out.iter().all(|h| !h.path.starts_with(&cache)));
     }
 
+    /// A plain workspace (no `.synaps/plugins`) is granted whole, so a
+    /// command can make new files and folders at its top; project plugins are
+    /// not loaded while confined, so one it creates there never runs. Once the
+    /// folder exists the workspace is split around it. The write tools refuse
+    /// it either way.
     #[test]
-    fn the_workspace_is_split_even_when_the_project_plugin_folder_is_absent() {
+    fn the_workspace_is_granted_whole_until_the_project_plugin_folder_exists() {
         let f = fixture();
         std::fs::create_dir_all(f.ws.join("src")).unwrap();
         let c = confine(&f, vec![], vec![]);
         let (grants, plan) = ws_plan(&c, &f.ws);
-        // A shell could create `.synaps/plugins` in a whole-granted workspace.
-        assert_eq!(grants, vec![f.ws.join("src")]);
+        assert_eq!(grants, vec![f.ws.clone()]);
+        assert!(plan.left_out.is_empty() && plan.no_new_entries.is_empty(), "{:?}", plan.left_out);
+        assert!(c.allows_write(&f.ws.join(".synaps/plugins/p/run.sh")).is_err());
+
+        std::fs::create_dir_all(f.ws.join(".synaps/plugins")).unwrap();
+        let (grants, plan) = ws_plan(&c, &f.ws);
+        assert!(grants.contains(&f.ws.join("src")) && !grants.contains(&f.ws), "{grants:?}");
         assert!(plan.left_out.iter().any(|h| h.path == f.ws.join(".synaps/plugins")));
         assert!(plan.no_new_entries.contains(&f.ws));
+        assert!(c.allows_write(&f.ws.join(".synaps/plugins/p/run.sh")).is_err());
     }
 
     #[test]
@@ -744,6 +867,31 @@ mod tests {
         assert!(c.allows_write(&f.ws.join(".git/config")).is_err());
         assert!(c.allows_write(&f.ws.join(".git/refs/heads/topic")).is_ok());
         assert!(c.allows_write(&f.ws.join(".git/objects/ab/cdef")).is_ok());
+    }
+
+    /// Where a root has no `.git` of its own, the write tools refuse every
+    /// path with a `.git` component, at any depth and in any case, a gitfile
+    /// included: such a write would make a repository whose hooks and config
+    /// the owner's next git command there runs. A root's own checkout keeps
+    /// its object, ref and log stores writable.
+    #[test]
+    fn a_git_entry_that_is_not_a_roots_own_checkout_is_refused_to_the_write_tools() {
+        let f = fixture();
+        let c = confine(&f, vec![], vec![]);
+        for stray in [".git", ".git/config", ".git/hooks/pre-commit", "sub/.git", "a/b/.git/HEAD", "x/.GIT/config", "y/.Git"] {
+            let err = c.allows_write(&f.ws.join(stray)).expect_err(stray);
+            assert!(err.contains("git metadata outside a write root's own checkout"), "{stray}: {err}");
+        }
+        for fine in [".gitignore", "src/git/x", "a.git/x", "notes/.github/ci.yml", "x/.git-blame-ignore-revs"] {
+            assert!(c.allows_write(&f.ws.join(fine)).is_ok(), "{fine}");
+        }
+
+        make_main_checkout(&f.ws);
+        let c = confine(&f, vec![], vec![]);
+        assert!(c.allows_write(&f.ws.join(".git/objects/ab/cdef")).is_ok());
+        assert!(c.allows_write(&f.ws.join(".git/refs/heads/topic")).is_ok());
+        assert!(c.allows_write(&f.ws.join(".git/hooks/pre-commit")).is_err());
+        assert!(c.allows_write(&f.ws.join("vendor/lib/.git/config")).is_err(), "a nested repository");
     }
 
     /// A main repository at `<root>/repo` and a linked worktree of it at
@@ -902,8 +1050,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_write_existing_grant_gets_file_rights_only_in_the_ruleset() {
-        if crate::sandbox::landlock::usable_abi().is_err() {
-            eprintln!("skipped: no usable Landlock on this host");
+        if !crate::sandbox::testkit::kernel_ok("a_write_existing_grant_gets_file_rights_only_in_the_ruleset") {
             return;
         }
         let f = fixture();

@@ -432,7 +432,19 @@ impl EngineHost {
             );
         }
         let hook_bus = Arc::clone(runtime.hook_bus());
-        match crate::sandbox::provider::establish(&hook_bus, &settings, session_id, parent_session_id, cwd).await {
+        // The session's commands run with its client's environment: what that
+        // names is protected along with what the engine's own names.
+        let session_env = runtime.env().cloned();
+        match crate::sandbox::provider::establish_with_env(
+            &hook_bus,
+            &settings,
+            session_id,
+            parent_session_id,
+            cwd,
+            session_env.as_deref(),
+        )
+        .await
+        {
             Ok(sandbox) => {
                 runtime.set_sandbox(sandbox);
                 Ok(())

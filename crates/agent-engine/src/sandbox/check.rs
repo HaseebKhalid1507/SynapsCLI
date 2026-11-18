@@ -33,6 +33,10 @@ pub const NO_NEW_ENTRIES: &str =
 pub const SPLIT_NOTE: &str =
     "a directory on a split path can't get new entries created directly in it by a shell command; its existing entries stay writable";
 
+/// The plain report's line under enforce: a project's own plugins
+/// (`<workspace>/.synaps/plugins`) are not loaded.
+pub const PROJECT_PLUGINS_SKIPPED: &str = "project_plugins: not loaded (sandbox.confine = enforce)";
+
 /// The outcome of one check.
 #[derive(Debug, Clone)]
 pub struct CheckReport {
@@ -122,6 +126,9 @@ impl CheckReport {
         }
         if !self.split_dirs.is_empty() {
             out.push(format!("note: {SPLIT_NOTE}"));
+        }
+        if self.confine == SandboxConfine::Enforce {
+            out.push(PROJECT_PLUGINS_SKIPPED.to_string());
         }
         out
     }
@@ -302,7 +309,7 @@ mod tests {
     #[test]
     fn the_report_lists_each_inner_path_left_out_and_the_cost_of_the_split() {
         let t = crate::sandbox::testkit::Tree::new();
-        for d in ["bin", "src", "node_modules/.bin"] {
+        for d in ["bin", "src", "node_modules/.bin", ".synaps/plugins"] {
             std::fs::create_dir_all(t.ws.join(d)).unwrap();
         }
         let env = t.env(vec![t.ws.join("bin"), t.ws.join("node_modules/.bin")]);
@@ -365,6 +372,16 @@ mod tests {
         let lines = report.lines();
         assert!(lines.contains(&"refusal: protected-inside-grant: /work/app/bin".to_string()), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("dropped: /work/app/bin (")), "{lines:?}");
+    }
+
+    /// Under enforce the report says a project's own plugins are not loaded;
+    /// with confinement off it says nothing about them.
+    #[test]
+    fn the_report_says_project_plugins_are_not_loaded_under_enforce() {
+        let mut r = report(true, ProviderOutcome::Answer(Answer::default()), Ok(7));
+        assert!(r.lines().contains(&PROJECT_PLUGINS_SKIPPED.to_string()), "{:?}", r.lines());
+        r.confine = SandboxConfine::Off;
+        assert!(!r.lines().iter().any(|l| l.starts_with("project_plugins:")), "{:?}", r.lines());
     }
 
     #[tokio::test]
