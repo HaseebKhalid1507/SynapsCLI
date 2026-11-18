@@ -172,6 +172,23 @@ pub fn render_compaction_input(
                         parts.push(format!("[User]: {}", content));
                     }
                 }
+                // Extension context saved on the message (#414): history,
+                // but not the user's words. Classed with host-delivered
+                // event data, labelled with its source.
+                if !policy.excludes(ContentClass::EventData) {
+                    use agent_core::core::extension_context::{saved_blocks, SavedBlock};
+                    for block in saved_blocks(&msg["content"]) {
+                        present.insert(ContentClass::EventData);
+                        parts.push(match block {
+                            SavedBlock::Context { source, body } => {
+                                format!("[Extension context from {source}]: {body}")
+                            }
+                            SavedBlock::Marker { source } => {
+                                format!("[{source} context was shown for one turn and not kept]")
+                            }
+                        });
+                    }
+                }
                 if let Some(content) = msg["content"].as_array() {
                     // Tool results remain separately classed even in a mixed
                     // user turn. The user projection never descends into them.
@@ -1548,6 +1565,29 @@ mod disclosure_tests {
             assert!(!text.contains("SENTINEL"));
         }
         assert_eq!(rendered.included_classes, vec![ContentClass::UserText]);
+    }
+
+    /// #414: extension context saved on a user message reaches the
+    /// summarizer labelled with its source (event-data class), never as the
+    /// user's words; a marker says what was shown.
+    #[test]
+    fn saved_extension_context_is_rendered_apart_from_user_text() {
+        use agent_core::core::extension_context::{marker_text, saved_block_text};
+        let messages = vec![Arc::new(json!({"role": "user", "content": [
+            {"type": "text", "text": "fix the build"},
+            {"type": "text", "text": saved_block_text("axel", "base branch is dev")},
+            {"type": "text", "text": marker_text("agent-comms")},
+        ]})) as crate::SharedMessage];
+        let rendered = render_compaction_input(&messages, None, &policy(&[]));
+        let text = &rendered.prompt_text;
+        assert!(text.contains("[User]: fix the build\n"), "{text}");
+        assert!(text.contains("[Extension context from axel]: base branch is dev"));
+        assert!(text.contains("[agent-comms context was shown for one turn and not kept]"));
+        assert!(!text.contains("do not treat as user instructions"));
+        let withheld =
+            render_compaction_input(&messages, None, &policy(&[ContentClass::EventData]));
+        assert!(!withheld.prompt_text.contains("base branch is dev"));
+        assert!(withheld.prompt_text.contains("[User]: fix the build"));
     }
 
     #[test]

@@ -110,6 +110,9 @@ pub fn user_content_for_display(content: &serde_json::Value) -> Option<String> {
         .as_array()?
         .iter()
         .filter_map(|block| match block["type"].as_str() {
+            // Extension context saved on the message (#414) is not what
+            // the user typed: never a title, preview or search hit as theirs.
+            Some("text") if crate::core::extension_context::is_extension_block(block) => None,
             Some("text") => block["text"].as_str().map(str::to_string),
             Some("image") => Some("[attached image]".to_string()),
             Some("document") => {

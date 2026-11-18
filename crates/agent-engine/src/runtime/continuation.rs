@@ -528,15 +528,19 @@ fn has_attachment(message: &Value) -> bool {
         })
 }
 
+/// Both read the message as sent before any extension context was saved
+/// on it (#414): a pushed event stays an event, and a preview shows the
+/// request's own words.
 fn is_event(message: &Value) -> bool {
-    message["content"]
+    agent_core::core::extension_context::user_content(&message["content"])
         .as_str()
         .is_some_and(|c| c.trim_start().starts_with("<event"))
 }
 
 /// Single-line, tag-neutral preview of a request's own text.
 fn preview(message: &Value, chars: usize) -> String {
-    let text = match &message["content"] {
+    let content = agent_core::core::extension_context::user_content(&message["content"]);
+    let text = match content.as_ref() {
         Value::String(s) => s.clone(),
         Value::Array(blocks) => blocks
             .iter()
@@ -2049,6 +2053,25 @@ fn successor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #414: extension context saved on a request does not change what it
+    /// is: an event stays an event (no turn start) and a preview shows the
+    /// request's own words.
+    #[test]
+    fn saved_extension_context_keeps_events_and_previews() {
+        use agent_core::core::extension_context::{marker_text, saved_block_text};
+        let ctx = json!({"type": "text", "text": saved_block_text("axel", "CTX-BODY")});
+        let mark = json!({"type": "text", "text": marker_text("comms")});
+        let event = json!({"role": "user", "content": [
+            {"type": "text", "text": "<event id=\"e1\" type=\"message\">hi</event>"}, ctx.clone(), mark.clone()]});
+        let request = json!({"role": "user", "content": [
+            {"type": "text", "text": "do it"}, ctx, mark]});
+        assert!(is_event(&event));
+        assert!(!starts_turn(&event));
+        assert!(starts_turn(&request));
+        let shown = preview(&request, 80);
+        assert_eq!(shown, "do it");
+    }
     use crate::test_env::BaseDirGuard;
     fn history() -> Vec<SharedMessage> {
         vec![

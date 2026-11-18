@@ -918,7 +918,7 @@ mod tests {
         (format!("http://{addr}"), mock)
     }
 
-    /// `before_message` hook that counts its calls and injects per-turn text.
+    /// `before_message` hook that counts its calls and injects turn-only text.
     struct CountingInject(Arc<AtomicUsize>);
     #[async_trait::async_trait]
     impl crate::extensions::runtime::ExtensionHandler for CountingInject {
@@ -927,7 +927,13 @@ mod tests {
         }
         async fn handle(&self, _event: &HookEvent) -> HookResult {
             self.0.fetch_add(1, Ordering::SeqCst);
-            HookResult::inject("PER-TURN-INJECTED-CONTEXT")
+            // Turn-only (#414): saved context is durable history, which a
+            // ping replays like any other; turn-only context never is.
+            HookResult::Inject {
+                content: "PER-TURN-INJECTED-CONTEXT".into(),
+                forget: true,
+                parts: Vec::new(),
+            }
         }
         async fn shutdown(&self) {}
     }

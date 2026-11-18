@@ -8,6 +8,7 @@
 //!
 //! No TUI types here — this crate never depends on agent-tui.
 
+use agent_core::core::extension_context::{self, user_content};
 use serde::{Deserialize, Serialize};
 
 use crate::SharedMessage;
@@ -63,18 +64,38 @@ pub fn is_event_payload(content: &str) -> bool {
     content.starts_with("<event ") && content.ends_with("</event>")
 }
 
+/// The saved extension blocks and markers of a message, as display text.
+fn saved_texts(content: &serde_json::Value) -> impl Iterator<Item = String> + '_ {
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| extension_context::is_saved_block(block))
+        .filter_map(|block| block["text"].as_str())
+        .map(|text| text.trim_start().to_string())
+}
+
 /// Display items of ONE api message, in order. Empty for skipped messages.
+///
+/// A user message is read as the user sent it (`user_content`: extension
+/// context saved on it removed, #414); each saved extension block or marker
+/// then follows as its own `User` item holding the block's text, which
+/// clients recognise with `extension_context::parse_saved` and show as
+/// extension context, not as something the user typed. Older clients show
+/// it as a user line (the wire shape is unchanged).
 fn items_of(msg: &serde_json::Value, out: &mut Vec<DisplayItem>) {
-    if let Some(content) = msg["content"].as_str() {
+    let content = user_content(&msg["content"]);
+    if let Some(content) = content.as_str() {
         if content.contains("<context-summary>") || is_event_payload(content) {
             return;
         }
     }
     match msg["role"].as_str() {
         Some("user") => {
-            if let Some(content) = msg["content"].as_str() {
+            if let Some(content) = content.as_str() {
                 out.push(DisplayItem::User { text: content.to_string() });
             }
+            out.extend(saved_texts(&msg["content"]).map(|text| DisplayItem::User { text }));
         }
         Some("assistant") => {
             if let Some(content) = msg["content"].as_array() {
@@ -110,13 +131,14 @@ fn items_of(msg: &serde_json::Value, out: &mut Vec<DisplayItem>) {
 /// no string clones (M4 — the daemon runs this over the whole history on
 /// every attach/compaction/resync).
 fn count_items_of(msg: &serde_json::Value) -> usize {
-    if let Some(content) = msg["content"].as_str() {
+    let content = user_content(&msg["content"]);
+    if let Some(content) = content.as_str() {
         if content.contains("<context-summary>") || is_event_payload(content) {
             return 0;
         }
     }
     match msg["role"].as_str() {
-        Some("user") => usize::from(msg["content"].is_string()),
+        Some("user") => usize::from(content.is_string()) + saved_texts(&msg["content"]).count(),
         Some("assistant") => msg["content"]
             .as_array()
             .map(|blocks| {
