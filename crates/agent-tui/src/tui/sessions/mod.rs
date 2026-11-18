@@ -208,13 +208,20 @@ impl SessionsState {
                 .then_with(|| a.id.0.cmp(&b.id.0))
         });
         self.live = rows;
-        // Past = disk minus every session the daemon holds (by session id
-        // and by journal id) — those are on the Live tab.
+        // Past = disk minus every conversation the daemon holds — those are
+        // on the Live tab. By journal id, not session id: after `/clear` the
+        // session id names the conversation it left, which is saved and
+        // resumable from Past. An older daemon without journal ids: by id.
         let live_ids: std::collections::HashSet<String> = self
             .live
             .iter()
-            .flat_map(|m| [m.id.0.clone(), m.journal_id.clone()])
-            .filter(|id| !id.is_empty())
+            .map(|m| {
+                if m.journal_id.is_empty() {
+                    m.id.0.clone()
+                } else {
+                    m.journal_id.clone()
+                }
+            })
             .collect();
         self.past.set_exclude(live_ids.clone());
         self.offline = self.pins.iter().filter(|e| !live_ids.contains(&e.journal_id)).cloned().collect();

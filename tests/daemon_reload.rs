@@ -556,6 +556,37 @@ async fn sessions_with_one_turn(paths: &registry::DaemonPaths, cwd: &Path, n: us
     ids
 }
 
+/// The daemon's trace logs (`synaps.log*` under the test HOME), last
+/// lines of each, for a failure message: the HOME is gone after the test,
+/// so a CI job log has nothing else to go on.
+fn daemon_logs(guard: &HomeGuard) -> String {
+    const TAIL: usize = 2000;
+    let mut logs: Vec<PathBuf> = std::fs::read_dir(guard.base_dir())
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    logs.retain(|p| {
+        p.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("synaps.log"))
+    });
+    logs.sort();
+    let mut out = String::new();
+    for p in logs {
+        let text = std::fs::read_to_string(&p).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let tail = &lines[lines.len().saturating_sub(TAIL)..];
+        out.push_str(&format!(
+            "==== {} (last {} lines) ====\n{}\n",
+            p.display(),
+            tail.len(),
+            tail.join("\n")
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("(no daemon log under the test HOME)");
+    }
+    out
+}
+
 /// Wait for the new image (`generation`) to answer Ping; returns how long
 /// that took after `t0`, or `None` past `budget`, including an answer that
 /// arrived only after it. A bound but not yet accepting socket holds the
@@ -603,8 +634,19 @@ async fn reload_with_a_slow_session_start_hook_answers_within_seconds() {
     assert_reload_pid(registry::read_daemon_json(&d.paths).unwrap().pid, pid_before);
 
     let listed = SocketTransport::sessions(&d.paths.sock).await.expect("sessions");
-    for id in &ids {
-        assert!(listed.iter().any(|m| &m.id == id), "{id} listed after the reload");
+    let missing: Vec<&SessionId> = ids
+        .iter()
+        .filter(|id| !listed.iter().any(|m| &m.id == *id))
+        .collect();
+    if !missing.is_empty() {
+        let listing: Vec<(&str, &str)> = listed
+            .iter()
+            .map(|m| (m.id.as_str(), m.journal_id.as_str()))
+            .collect();
+        panic!(
+            "{missing:?} not listed after the reload\ncreated: {ids:?}\nlisted (id, journal_id): {listing:?}\n{}",
+            daemon_logs(&guard)
+        );
     }
     for id in &ids {
         let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
@@ -943,4 +985,263 @@ async fn successor_dying_before_the_handoff_keeps_serving() {
 
     t.detach().await;
     SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
+}
+
+// ── conversation identity across a reload (watch-sessions §3.1, §4.4) ──────
+
+/// Streaming turns → `ANTHROPIC_SSE`; the non-streaming compaction call → a
+/// summary.
+async fn stub_with_compaction() -> String {
+    use axum::response::IntoResponse;
+    serve(
+        axum::Router::new().fallback(move |body: String| async move {
+            if body.contains("\"stream\":true") {
+                return (
+                    axum::http::StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    ANTHROPIC_SSE.to_string(),
+                )
+                    .into_response();
+            }
+            axum::Json(serde_json::json!({
+                "id": "msg_c", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-5", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "SUMMARY: the user said hello."}],
+                "usage": {"input_tokens": 50, "output_tokens": 10}
+            }))
+            .into_response()
+        }),
+    )
+    .await
+}
+
+async fn attach_with(
+    paths: &registry::DaemonPaths,
+    attach: Attach,
+) -> (SocketTransport, AttachSnapshot) {
+    let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test))
+        .await
+        .unwrap();
+    SocketTransport::attach(conn, attach).await.unwrap()
+}
+
+fn resume_config(cwd: &Path, journal: &str) -> SessionConfig {
+    SessionConfig {
+        continue_session: Some(Some(journal.into())),
+        cwd: Some(cwd.to_path_buf()),
+        env: None,
+        model_override: Some("claude-sonnet-4-5".into()),
+        ..Default::default()
+    }
+}
+
+async fn wait_event(
+    t: &mut SocketTransport,
+    pred: impl Fn(&SessionEventWire) -> bool,
+) -> SessionEventWire {
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(20), t.next_event())
+            .await
+            .expect("timely")
+            .expect("alive");
+        if pred(&env.event) {
+            return env.event;
+        }
+    }
+}
+
+fn listed(sessions: &[SessionMeta], journal: &str) -> SessionMeta {
+    sessions
+        .iter()
+        .find(|m| m.journal_id == journal)
+        .cloned()
+        .unwrap_or_else(|| panic!("{journal} not listed"))
+}
+
+/// The listing once the next image serves it: every journal in `journals`
+/// is listed under an actor id equal to it (what a reload recreates).
+async fn listing_after_reload(
+    paths: &registry::DaemonPaths,
+    journals: &[&str],
+) -> Vec<SessionMeta> {
+    let t0 = std::time::Instant::now();
+    loop {
+        if let Ok(list) = SocketTransport::sessions(&paths.sock).await {
+            if journals.iter().all(|j| {
+                list.iter()
+                    .any(|m| m.journal_id == *j && m.id.as_str() == *j)
+            }) {
+                return list;
+            }
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "the next image never listed {journals:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The conversations an actor compacted away from ride the reload record:
+/// after the reload, resuming the predecessor still finds the actor even
+/// when the disk chain does not lead to its successor, and the listing
+/// keeps the conversation's start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn supersedes_and_the_start_survive_a_reload() {
+    let guard = HomeGuard::new();
+    let url = stub_with_compaction().await;
+    let d = spawn_daemon(&guard, &url).await;
+    let (mut t, snap) = attach_with(
+        &d.paths,
+        Attach::create(
+            SessionConfig {
+                cwd: Some(guard.home.path().to_path_buf()),
+                env: None,
+                model_override: Some("claude-sonnet-4-5".into()),
+                await_extensions: true,
+                compaction_policy: CompactionPolicyWire::LinkedSuccessor,
+                ..Default::default()
+            },
+            AttachMode::Mirror,
+        ),
+    )
+    .await;
+    let a = snap.meta.journal_id.clone();
+    one_turn(&mut t, "hello 0").await;
+    one_turn(&mut t, "hello 1").await;
+    t.send_from_self(SessionCommand::Compact { instructions: None })
+        .await
+        .unwrap();
+    let b = match wait_event(&mut t, |e| {
+        matches!(e, SessionEventWire::CompactionApplied { .. })
+    })
+    .await
+    {
+        SessionEventWire::CompactionApplied { session_id, .. } => session_id,
+        _ => unreachable!(),
+    };
+    wait_event(&mut t, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert_ne!(a, b);
+    let before = listed(&SocketTransport::sessions(&d.paths.sock).await.unwrap(), &b);
+    assert_eq!(
+        before.created_at, snap.meta.created_at,
+        "a compaction keeps the start"
+    );
+
+    // Cut the predecessor's forward link: only `supersedes` says `a` is held.
+    let file = guard.base_dir().join("sessions").join(format!("{a}.json"));
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(v["compacted_into"], serde_json::json!(b));
+    v.as_object_mut().unwrap().remove("compacted_into");
+    std::fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+    // Precondition: the cut holds as the daemon reads it (a journal's meta
+    // overlay would put the link back, and the resume below would pass on
+    // the disk chain alone).
+    let chain = agent_engine::core::session::follow_compaction_chain(
+        agent_engine::core::session::resolve_session(&a).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        chain.session.id, a,
+        "the disk chain ends at the predecessor"
+    );
+
+    assert_eq!(
+        SocketTransport::reload(&d.paths.sock, true, None, None)
+            .await
+            .expect("reload"),
+        2
+    );
+    drop(t);
+    let after = listed(&listing_after_reload(&d.paths, &[b.as_str()]).await, &b);
+    assert_eq!(
+        after.created_at, before.created_at,
+        "the start survives the reload"
+    );
+
+    let (_r, resumed) = attach_with(
+        &d.paths,
+        Attach::create(resume_config(guard.home.path(), &a), AttachMode::Mirror),
+    )
+    .await;
+    assert_eq!(
+        resumed.meta.id, after.id,
+        "resuming the predecessor finds the actor that holds it"
+    );
+    assert_eq!(resumed.meta.journal_id, b);
+    assert_eq!(
+        SocketTransport::sessions(&d.paths.sock)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "no second actor"
+    );
+    SocketTransport::shutdown(&d.paths.sock, true)
+        .await
+        .unwrap();
+}
+
+/// Q11, a known residual kept on purpose (design §4.4): after `/clear` (actor
+/// `A` → journal `N`) and a resume of `A` (a minted actor on journal `A`), a
+/// hot reload recreates both actors with id = journal id. A client of the
+/// cleared actor that reconnects by the id it last saw, `A`, lands in the
+/// resumed conversation `A`, not in `N`: the real `A` is found before the
+/// reload alias `A → N` is consulted. The fix (reconnect by the journal id
+/// from `Cleared`) needs a client change; this test pins today's behaviour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn q11_reconnecting_by_a_cleared_actor_id_after_a_reload_finds_the_resumed_conversation() {
+    let guard = HomeGuard::new();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon(&guard, &url).await;
+    let (mut t, snap) = attach_create(&d.paths, guard.home.path()).await;
+    let a = snap.meta.id.clone();
+    one_turn(&mut t, "conversation A").await;
+    t.send_from_self(SessionCommand::NewSession).await.unwrap();
+    let n = match wait_event(&mut t, |e| matches!(e, SessionEventWire::Cleared { .. })).await {
+        SessionEventWire::Cleared { session_id } => session_id,
+        _ => unreachable!(),
+    };
+    one_turn(&mut t, "conversation N").await;
+
+    let (_r, resumed) = attach_with(
+        &d.paths,
+        Attach::create(
+            resume_config(guard.home.path(), a.as_str()),
+            AttachMode::Mirror,
+        ),
+    )
+    .await;
+    assert_ne!(resumed.meta.id, a, "a second actor, minted id");
+    assert_eq!(resumed.meta.journal_id, a.as_str());
+
+    assert_eq!(
+        SocketTransport::reload(&d.paths.sock, true, None, None)
+            .await
+            .expect("reload"),
+        2
+    );
+    // The cleared actor is back under its journal id `N`, the resumed one
+    // under `A`.
+    listing_after_reload(&d.paths, &[n.as_str(), a.as_str()]).await;
+
+    let (_c, back) = attach_with(
+        &d.paths,
+        Attach::Existing {
+            session_id: a.clone(),
+            mode: AttachMode::Mirror,
+        },
+    )
+    .await;
+    assert_eq!(
+        back.meta.journal_id,
+        a.as_str(),
+        "Q11: `A` is the resumed conversation now, not `N`"
+    );
+    SocketTransport::shutdown(&d.paths.sock, true)
+        .await
+        .unwrap();
 }

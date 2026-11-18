@@ -349,6 +349,22 @@ fn bar(percent: f64) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(WIDTH - filled))
 }
 
+/// The provider's name for what a limit covers (`Fable`), when it gave one.
+fn limit_name(w: &UsageWindow) -> Option<&str> {
+    w.limit_status.as_ref().and_then(|s| s.name.as_deref())
+}
+
+/// `EXHAUSTED` for a used-up window: the limit stopping requests. The
+/// provider's severity / `is_active` are shown as its own words in
+/// `--verbose`, never as EXHAUSTED.
+fn window_flags(w: &UsageWindow, sep: &str) -> String {
+    if w.is_exhausted() {
+        format!("{sep}EXHAUSTED")
+    } else {
+        String::new()
+    }
+}
+
 fn window_title(w: &UsageWindow) -> String {
     let scope = match &w.scope {
         WindowScope::Account => String::new(),
@@ -362,7 +378,8 @@ fn window_title(w: &UsageWindow) -> String {
     } else {
         format!("{} ({})", w.id, w.label)
     };
-    format!("{label}{scope}")
+    let name = limit_name(w).map(|n| format!("{n} {} limit · ", w.label)).unwrap_or_default();
+    format!("{name}{label}{scope}")
 }
 
 fn render_window(out: &mut String, w: &UsageWindow, now_ms: u64) {
@@ -380,10 +397,22 @@ fn render_window(out: &mut String, w: &UsageWindow, now_ms: u64) {
         Some(at) => format!("{} · {}", relative_time(now_ms, at), absolute_time(at)),
         None => "reset unknown".into(),
     };
-    let flag = if w.is_exhausted() { "  EXHAUSTED" } else { "" };
+    let flag = window_flags(w, "  ");
     out.push_str(&format!("    {}\n", window_title(w)));
     out.push_str(&format!("    {gauge}{percent_text}{flag}\n"));
     out.push_str(&format!("    {reset}\n"));
+    if let Some(status) = &w.limit_status {
+        let mut said = Vec::new();
+        if let Some(severity) = &status.severity {
+            said.push(format!("severity {severity}"));
+        }
+        if status.active == Some(true) {
+            said.push("active".to_string());
+        }
+        if !said.is_empty() {
+            out.push_str(&format!("    provider: {}\n", said.join(", ")));
+        }
+    }
 }
 
 fn render_snapshot(out: &mut String, s: &UsageSnapshot, now_ms: u64) {
@@ -526,17 +555,19 @@ fn compact_window(w: &UsageWindow, now_ms: u64) -> String {
     } else {
         &w.label
     };
+    // A limit the provider named (`Fable 7d`) needs no model suffix.
+    let label = match limit_name(w) {
+        Some(name) => format!("{name} {label}"),
+        None => label.clone(),
+    };
     let scope = match &w.scope {
+        WindowScope::Model { .. } if limit_name(w).is_some() => String::new(),
         WindowScope::Model { model } => format!(" · {model}"),
         WindowScope::Feature { feature } if *feature == w.id => String::new(),
         WindowScope::Feature { feature } => format!(" · {feature}"),
         WindowScope::Account => String::new(),
     };
-    let flag = if w.is_exhausted() {
-        " · EXHAUSTED"
-    } else {
-        ""
-    };
+    let flag = window_flags(w, " · ");
     format!("{label}{scope}: {used} · {reset}{flag}")
 }
 
@@ -1189,6 +1220,68 @@ mod usage_tests {
         assert!(text.contains("Spend control reached"));
         assert!(text.contains("Account limit reached"));
         assert!(text.contains("Provider schema unverified"));
+    }
+
+    /// 2026-11-15's reading of `default`: the overall weekly limit at 82 %
+    /// and Fable's own weekly limit at 100 %. Status shows the Fable limit
+    /// by name and marks it as the one blocking; the overall row is not.
+    #[test]
+    fn a_model_limit_is_shown_by_name_and_marked_blocking() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-15T16:11:49Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+        let snapshot = parse_anthropic_usage(
+            include_str!("../../crates/agent-core/src/core/auth/testdata/anthropic_usage_limits_default.json"),
+            "default",
+            at,
+        )
+        .unwrap();
+        let mut report = UsageReport::new("local", at);
+        report.accounts.push(AccountUsageEntry {
+            provider: "anthropic".into(),
+            account: "default".into(),
+            identity: None,
+            outcome: AccountUsageOutcome::ok(snapshot),
+        });
+        let text = render_text(&report, at);
+        let fable = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("Fable 7d: 100% used"))
+            .unwrap_or_else(|| panic!("no Fable row:\n{text}"));
+        assert!(fable.ends_with(" · EXHAUSTED"), "{fable}");
+        let weekly = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("7d: 82% used"))
+            .unwrap_or_else(|| panic!("no weekly row:\n{text}"));
+        assert!(!weekly.contains("EXHAUSTED"), "{weekly}");
+        let verbose = render_verbose(&report, at);
+        assert!(
+            verbose.contains("Fable 7d limit · limits.weekly_scoped.fable (7d) · model fable"),
+            "{verbose}"
+        );
+        assert!(verbose.contains("100%  EXHAUSTED"), "{verbose}");
+        assert!(verbose.contains("provider: severity critical, active"), "{verbose}");
+        let json = serde_json::to_value(&report).unwrap();
+        let windows = json["accounts"][0]["snapshot"]["windows"].as_array().unwrap();
+        let fable = windows.iter().find(|w| w["id"] == "limits.weekly_scoped.fable").unwrap();
+        assert_eq!(fable["limit_status"]["severity"], "critical", "{fable}");
+        assert_eq!(fable["scope"], serde_json::json!({"kind": "model", "model": "fable"}));
+        // Under 100 % but reported critical and active: not exhausted. The
+        // provider's words stay in the verbose view.
+        if let AccountUsageOutcome::Ok { snapshot } = &mut report.accounts[0].outcome {
+            let w = snapshot
+                .windows
+                .iter_mut()
+                .find(|w| w.id == "limits.weekly_scoped.fable")
+                .unwrap();
+            w.used_percent = UsedPercent::from_f64(95.0);
+        }
+        let text = render_text(&report, at);
+        assert!(text.contains("Fable 7d: 95% used · resets in 13h 48m\n"), "{text}");
+        assert!(!text.contains("EXHAUSTED"), "{text}");
+        let verbose = render_verbose(&report, at);
+        assert!(!verbose.contains("EXHAUSTED"), "{verbose}");
+        assert!(verbose.contains("provider: severity critical, active"), "{verbose}");
     }
 
     /// An account without extra usage enabled shows no extra_usage

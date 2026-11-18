@@ -2,6 +2,74 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **New session ids end in 8 random hex characters, not 4**
+  (`20261117-015328-1f2e3d4c`). They still start with the time they were
+  made and sort by it. Ids from before, with 4, stay valid everywhere.
+
+- **Daemon: a session's `created_at` is when its conversation began.** It
+  was when the session was created. It now holds across a compaction (the
+  start of the chain) and a reload, and moves with `/clear` and an in-session
+  `/resume`. `SessionMeta.journal_id`, not `id`, names the conversation: they
+  also differ after `/clear`, `/resume`, and on a session that took a fresh
+  id because another live session had its journal's id.
+- **`synaps --attach --continue` with no argument right after `/clear`**
+  continues the conversation from before the `/clear` in a second session.
+  The cleared session no longer counts as holding it, and its new
+  conversation has nothing on disk until its first turn.
+
+### Fixed
+
+- **Releases carry the `.deb` again.** The `.deb` was uploaded after the
+  GitHub release was published, and this repository has immutable releases,
+  so 0.12.0 shipped without one (`Cannot upload assets to an immutable
+  release`). It is now built before the release is published and attached
+  with the other files, and it holds the exact x86_64 Linux binaries of the
+  release tarball instead of a separate build. If it fails, the release
+  waits instead of going out without it.
+
+- **A limit on one model no longer blocks the whole Anthropic account.**
+  When Fable's own weekly limit ran out, the 429 put the account in a
+  cooldown for every model until the reset, so Opus and Sonnet requests
+  failed without being sent while the account still had weekly usage left.
+  Now a 429 that only rejects a per-model limit (the account-wide 5-hour and
+  weekly limits reported and not rejected) cools just that model on that
+  account; other models keep using it, and a later answer for another model
+  does not clear it. A missing header, or a rejected limit not known to
+  cover one model, still cools the whole account. The usage reading also
+  reads Anthropic's new `limits` list, so the per-model limit is seen
+  before the first 429. `synaps status` shows it by name (e.g. `Fable 7d:
+  100% used · resets in 13h 48m · EXHAUSTED`), and `synaps auth state` shows
+  a model's cooldown with its model.
+
+  Upgrade a credential broker and its clients together (e.g. a machine that
+  uses another machine's `synaps auth-broker`): an older client reports a
+  429 on one model's limit as the whole account's, and an older broker
+  ignores the model in a newer client's report and cools the whole account.
+
+- **Two sessions that drew the same id no longer share a journal.** Two
+  sessions started in the same second could draw the same id. The second
+  then ran on the first's journal without its lock, and in the daemon the
+  first dropped out of the session list while it kept running. A new
+  session whose id is taken now draws another one.
+
+- **Daemon: `/clear` and an in-session `/resume` update the session list at
+  once.** The list showed the old conversation's name, title, cost and
+  message count until the next turn.
+- **Daemon: resuming a conversation after `/clear` resumes it.** Resuming
+  `A` (by id or by its old name) attached to the session that had cleared
+  `A` and now holds a new conversation. It now starts a second session on
+  `A`, and either one can end without taking the other out of the list.
+- **Daemon: a reload that finds a cleared session's journal locked brings
+  the right conversation back.** Once the lock was free, the next attach
+  loaded the conversation from before the `/clear` instead of the one the
+  session held. The waiting session no longer replaces a session restored
+  before it under the same id (the old conversation, resumed after the
+  `/clear`), which dropped that session from the list.
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel
