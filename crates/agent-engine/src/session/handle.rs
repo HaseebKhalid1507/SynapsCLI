@@ -4,7 +4,7 @@
 //! `ClientTransport` is built on it. `echo_for_test` ships a stand-in actor
 //! so package B can build the wire before the real `SessionActor` exists.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc};
@@ -53,6 +53,85 @@ pub enum PresenceState {
 }
 use super::view::RuntimeView;
 
+/// How many superseded journal ids a handle remembers (oldest dropped).
+pub const SUPERSEDES_CAP: usize = 32;
+
+/// The conversation an actor holds. One cell, so a reader sees the journal
+/// id, what it superseded and when it started together.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JournalCell {
+    /// `conv.session.id`.
+    pub journal_id: String,
+    /// The journal ids this actor compacted away from since it last began a
+    /// conversation (create, resume or `/clear`), oldest first. A successor
+    /// may not be on disk yet, so the disk chain can still end at one of
+    /// these: the actor holds them all ([`SessionHandle::holds`]).
+    pub supersedes: Vec<String>,
+    /// When the conversation began: kept across compactions (chain start),
+    /// replaced when the actor begins another conversation.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Why an actor's journal id changes ([`JournalCell::moved`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalMove {
+    /// A linked-successor compaction: the same conversation, a new journal.
+    Compaction,
+    /// `/clear`: a new conversation; the old one is no longer held here.
+    Clear,
+    /// In-session `/resume`: another conversation; the old one is let go.
+    Resume,
+}
+
+impl JournalCell {
+    pub fn new(journal_id: String, created_at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            journal_id,
+            supersedes: Vec::new(),
+            created_at,
+        }
+    }
+
+    /// The cell after a move to `new_id`. A compaction keeps `created_at`
+    /// and appends the old id (unless it is the same journal: an in-place
+    /// compaction); a clear or resume starts over at `created_at`, unless
+    /// it lands on the journal already held (`/resume` of the current
+    /// session reloads it from disk: the same conversation, cell kept).
+    pub fn moved(
+        &self,
+        new_id: String,
+        why: JournalMove,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        match why {
+            JournalMove::Compaction => {
+                let mut supersedes = self.supersedes.clone();
+                if self.journal_id != new_id {
+                    supersedes.retain(|j| *j != self.journal_id && *j != new_id);
+                    supersedes.push(self.journal_id.clone());
+                    let over = supersedes.len().saturating_sub(SUPERSEDES_CAP);
+                    supersedes.drain(..over);
+                }
+                Self {
+                    journal_id: new_id,
+                    supersedes,
+                    created_at: self.created_at,
+                }
+            }
+            JournalMove::Clear | JournalMove::Resume if new_id == self.journal_id => self.clone(),
+            JournalMove::Clear | JournalMove::Resume => Self::new(new_id, created_at),
+        }
+    }
+
+    /// This conversation: the current journal or one it superseded.
+    pub fn holds(&self, conversation: &str) -> bool {
+        self.journal_id == conversation || self.supersedes.iter().any(|j| j == conversation)
+    }
+}
+
+/// The actor's end of [`JournalCell`].
+pub type JournalSlot = Arc<arc_swap::ArcSwap<JournalCell>>;
+
 /// Bounded command queue depth (rpc `WRITER_CHAN_CAP` precedent).
 pub const CMD_CHAN_CAP: usize = 256;
 /// Default broadcast capacity; `SYNAPS_SESSION_EVENTS_CAP` overrides.
@@ -77,8 +156,9 @@ pub struct SessionHandle {
     view: Arc<arc_swap::ArcSwap<RuntimeView>>,
     /// Written by the actor (Live/Parking/Parked/Ending).
     lifecycle: Arc<AtomicU8>,
-    /// `conv.session.id` — changes on LinkedSuccessor compaction.
-    journal_id: Arc<arc_swap::ArcSwap<String>>,
+    /// `conv.session.id` and what it superseded — changes on a
+    /// LinkedSuccessor compaction, `/clear` and an in-session `/resume`.
+    journal: JournalSlot,
     /// Clients / input owner / pending prompts, written by the actor.
     presence: Arc<arc_swap::ArcSwap<Presence>>,
     /// The workers that hold the park (`SessionMeta::workers`), written by
@@ -98,6 +178,12 @@ pub struct SessionHandle {
     /// F23: only on a lock-held placeholder — the config to retry the real
     /// `create` with on the next attach. `None` for real actors.
     placeholder_config: Option<Arc<SessionConfig>>,
+    /// F23: how many real `create`s of this placeholder are running
+    /// ([`RetryGuard`]). While any is, it stays listed (no flicker) but is
+    /// not a resume target nor an id holder until the real session
+    /// replaces it. A count, not a flag: one retry ending never clears
+    /// another's.
+    retrying: Arc<AtomicUsize>,
     /// Owned sessions only: the owner token, fixed at create. Here so a
     /// reload whose checkpoint did not confirm still records the session
     /// as owned (it would otherwise come back unowned and never end).
@@ -113,13 +199,36 @@ impl std::fmt::Debug for SessionHandle {
     }
 }
 
+/// One running retry of a placeholder ([`SessionHandle::retry_guard`]).
+#[must_use = "the retry ends when the guard drops"]
+pub(crate) struct RetryGuard(Arc<AtomicUsize>);
+
+impl Drop for RetryGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A session's identity without its command sender
+/// ([`SessionHandle::session_ref`]): holding it never keeps the actor alive.
+#[derive(Clone)]
+pub struct SessionRef {
+    cmd_tx: mpsc::WeakSender<Addressed>,
+}
+
+impl std::fmt::Debug for SessionRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionRef")
+    }
+}
+
 /// Actor-side ends of a session's channels, minted with the handle.
 pub struct SessionEndpoints {
     pub cmd_rx: mpsc::Receiver<Addressed>,
     pub events: broadcast::Sender<Envelope>,
     pub view: Arc<arc_swap::ArcSwap<RuntimeView>>,
     pub lifecycle: Arc<AtomicU8>,
-    pub journal_id: Arc<arc_swap::ArcSwap<String>>,
+    pub journal: JournalSlot,
     pub presence: Arc<arc_swap::ArcSwap<Presence>>,
     pub workers: Arc<arc_swap::ArcSwap<super::types::SessionWorkers>>,
     pub name: Arc<arc_swap::ArcSwap<Option<String>>>,
@@ -135,7 +244,10 @@ impl SessionHandle {
         let (events, _) = broadcast::channel(events_cap());
         let view = Arc::new(arc_swap::ArcSwap::from_pointee(view));
         let lifecycle = Arc::new(AtomicU8::new(SessionLifecycle::Live as u8));
-        let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(meta.id.0.clone()));
+        let journal = Arc::new(arc_swap::ArcSwap::from_pointee(JournalCell::new(
+            meta.journal_id.clone(),
+            meta.created_at,
+        )));
         let presence = Arc::new(arc_swap::ArcSwap::from_pointee(Presence::default()));
         let workers = Arc::new(arc_swap::ArcSwap::from_pointee(
             super::types::SessionWorkers::default(),
@@ -150,13 +262,14 @@ impl SessionHandle {
             meta: Arc::new(meta),
             view: Arc::clone(&view),
             lifecycle: Arc::clone(&lifecycle),
-            journal_id: Arc::clone(&journal_id),
+            journal: Arc::clone(&journal),
             presence: Arc::clone(&presence),
             workers: Arc::clone(&workers),
             name: Arc::clone(&name),
             keep_warm: Arc::clone(&keep_warm),
             cache_keepwarm: Arc::clone(&cache_keepwarm),
             placeholder_config: None,
+            retrying: Arc::new(AtomicUsize::new(0)),
             owner_token: None,
         };
         (
@@ -166,7 +279,7 @@ impl SessionHandle {
                 events,
                 view,
                 lifecycle,
-                journal_id,
+                journal,
                 presence,
                 workers,
                 name,
@@ -202,9 +315,60 @@ impl SessionHandle {
         SessionLifecycle::from_u8(self.lifecycle.load(Ordering::Acquire))
     }
 
-    /// Current `conv.session.id` (= `id` until a LinkedSuccessor compaction).
+    /// Current `conv.session.id` (= `id` until a LinkedSuccessor compaction,
+    /// a `/clear` or a resume, unless the actor took a minted id).
     pub fn journal_id(&self) -> String {
-        (**self.journal_id.load()).clone()
+        self.journal.load().journal_id.clone()
+    }
+
+    /// The conversation cell as last written by the actor.
+    pub fn journal(&self) -> Arc<JournalCell> {
+        self.journal.load_full()
+    }
+
+    /// Whether this actor holds `conversation` (a journal id): its current
+    /// journal or one it compacted away from. The one test for "is this
+    /// conversation running here"; never the actor id, which a `/clear`
+    /// leaves on a different conversation.
+    pub fn holds(&self, conversation: &str) -> bool {
+        self.journal.load().holds(conversation)
+    }
+
+    /// This session's identity, which (unlike a handle) does not keep its
+    /// command queue open.
+    pub fn session_ref(&self) -> SessionRef {
+        SessionRef {
+            cmd_tx: self.cmd_tx.downgrade(),
+        }
+    }
+
+    /// Whether `which` is this very session (same command channel), not
+    /// merely one registered under the same id.
+    pub fn is_session(&self, which: &SessionRef) -> bool {
+        // No strong sender left: no handle of that session exists, so this
+        // one is not it.
+        which
+            .cmd_tx
+            .upgrade()
+            .is_some_and(|tx| tx.same_channel(&self.cmd_tx))
+    }
+
+    /// F23: a placeholder whose real `create` is running.
+    pub fn retrying(&self) -> bool {
+        self.retrying.load(Ordering::Acquire) > 0
+    }
+
+    /// F23: mark one real `create` of this placeholder as running until the
+    /// guard drops (also when the retrying future is dropped mid-await).
+    pub(crate) fn retry_guard(&self) -> RetryGuard {
+        self.retrying.fetch_add(1, Ordering::AcqRel);
+        RetryGuard(Arc::clone(&self.retrying))
+    }
+
+    /// Test seam: write the conversation cell as an actor would.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_journal_for_test(&self, cell: JournalCell) {
+        self.journal.store(Arc::new(cell));
     }
 
     /// Clients / input owner / pending prompts as last published.
@@ -253,7 +417,9 @@ impl SessionHandle {
         m.client_input = p.client_input;
         // `/model` from any client changes it; the create-time meta doesn't.
         m.model = self.view.load().model.clone();
-        m.journal_id = self.journal_id();
+        let journal = self.journal();
+        m.journal_id = journal.journal_id.clone();
+        m.created_at = journal.created_at;
         m.name = self.name();
         m.pinned = self.pinned();
         m.busy = p.busy;
@@ -583,18 +749,35 @@ pub mod locked_placeholder {
     /// Spawn a placeholder actor for session `id` whose journal is locked
     /// by `holder_desc` (e.g. `"pid 1234 (tui)"`). The handle starts
     /// Parked; Attach emits `AttachRefused` naming the holder. The caller
-    /// registers it in the session map under the SAME id — no alias.
+    /// registers it under the id a real session on its journal would take
+    /// (`EngineHost::adopt_for_journal`), aliasing the old id to it.
+    ///
+    /// It holds the conversation `config` continues, which after a `/clear`
+    /// is not the old actor id, with what the reload record knew of it
+    /// (`restore_conversation`: what it superseded, its start).
     pub fn spawn(
         id: SessionId,
         config: SessionConfig,
         holder_desc: String,
     ) -> (SessionHandle, tokio::task::JoinHandle<()>) {
+        let journal_id = match &config.continue_session {
+            Some(Some(j)) => j.clone(),
+            _ => id.0.clone(),
+        };
+        let cell = match &config.restore_conversation {
+            Some(r) if r.journal_id == journal_id => JournalCell {
+                journal_id: journal_id.clone(),
+                supersedes: r.supersedes.clone(),
+                created_at: r.created_at,
+            },
+            _ => JournalCell::new(journal_id.clone(), chrono::Utc::now()),
+        };
         let meta = SessionMeta {
             id: id.clone(),
             name: config.name.clone(),
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),
             cwd: config.cwd.clone(),
-            created_at: chrono::Utc::now(),
+            created_at: cell.created_at,
             continued: true,
             continue_info: None,
             host_pid: std::process::id(),
@@ -604,7 +787,7 @@ pub mod locked_placeholder {
             awaiting_input: 0,
             roster: Vec::new(),
             client_input: None,
-            journal_id: id.0.clone(),
+            journal_id,
             locked_by: Some(holder_desc.clone()),
             pinned: false,
             busy: false,
@@ -638,6 +821,7 @@ pub mod locked_placeholder {
         let handle = handle
             .with_placeholder_config(config.clone())
             .with_owner_token(config.owned.as_ref().map(|o| o.token.clone()));
+        ep.journal.store(Arc::new(cell));
         // Start as Parked.
         ep.lifecycle.store(SessionLifecycle::Parked as u8, Ordering::Release);
         let task = tokio::spawn(run(id, ep, config, holder_desc));
@@ -745,6 +929,20 @@ mod tests {
             .expect("open")
     }
 
+    /// Overlapping retries of one placeholder: the first to end does not
+    /// end the other's.
+    #[tokio::test]
+    async fn a_retry_ends_only_itself() {
+        let (handle, _task) = SessionHandle::echo_for_test(SessionId::from("p"));
+        assert!(!handle.retrying());
+        let first = handle.retry_guard();
+        let second = handle.clone().retry_guard();
+        drop(first);
+        assert!(handle.retrying(), "the second retry still runs");
+        drop(second);
+        assert!(!handle.retrying());
+    }
+
     #[tokio::test]
     async fn echo_actor_submit_emits_turn_in_order() {
         let (handle, task) = SessionHandle::echo_for_test(SessionId::from("echo-1"));
@@ -831,5 +1029,93 @@ mod tests {
         assert_eq!(handle.view().model, "other");
         drop(handle);
         task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod journal_cell_tests {
+    use super::{JournalCell, JournalMove, SUPERSEDES_CAP};
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn a_compaction_keeps_the_old_id_and_the_start() {
+        let a = JournalCell::new("A".into(), at("2026-11-01T10:00:00Z"));
+        let b = a.moved(
+            "B".into(),
+            JournalMove::Compaction,
+            at("2026-11-02T10:00:00Z"),
+        );
+        assert_eq!(b.journal_id, "B");
+        assert_eq!(b.supersedes, ["A"]);
+        assert_eq!(b.created_at, a.created_at, "the chain start");
+        assert!(b.holds("A") && b.holds("B") && !b.holds("C"));
+        let c = b.moved(
+            "C".into(),
+            JournalMove::Compaction,
+            at("2026-11-03T10:00:00Z"),
+        );
+        assert_eq!(c.supersedes, ["A", "B"]);
+        // In place: the journal id does not change, nothing is superseded.
+        assert_eq!(
+            c.moved(
+                "C".into(),
+                JournalMove::Compaction,
+                at("2026-11-04T10:00:00Z")
+            ),
+            c
+        );
+    }
+
+    #[test]
+    fn a_clear_or_a_resume_lets_the_old_conversation_go() {
+        let b = JournalCell::new("A".into(), at("2026-11-01T10:00:00Z")).moved(
+            "B".into(),
+            JournalMove::Compaction,
+            at("2026-11-02T10:00:00Z"),
+        );
+        for why in [JournalMove::Clear, JournalMove::Resume] {
+            let n = b.moved("N".into(), why, at("2026-11-05T10:00:00Z"));
+            assert_eq!(
+                n,
+                JournalCell::new("N".into(), at("2026-11-05T10:00:00Z")),
+                "{why:?}"
+            );
+            assert!(!n.holds("A") && !n.holds("B"));
+        }
+    }
+
+    /// `/resume` of the journal already held reloads it: the same
+    /// conversation, so the cell (start, supersedes) is kept.
+    #[test]
+    fn a_resume_of_the_held_journal_keeps_the_cell() {
+        let b = JournalCell::new("A".into(), at("2026-11-01T10:00:00Z")).moved(
+            "B".into(),
+            JournalMove::Compaction,
+            at("2026-11-02T10:00:00Z"),
+        );
+        for why in [JournalMove::Clear, JournalMove::Resume] {
+            assert_eq!(
+                b.moved("B".into(), why, at("2026-11-02T10:00:00Z")),
+                b,
+                "{why:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn supersedes_is_capped_oldest_first() {
+        let t = at("2026-11-01T10:00:00Z");
+        let mut c = JournalCell::new("j0".into(), t);
+        for i in 1..=SUPERSEDES_CAP + 5 {
+            c = c.moved(format!("j{i}"), JournalMove::Compaction, t);
+        }
+        assert_eq!(c.supersedes.len(), SUPERSEDES_CAP);
+        assert_eq!(c.supersedes.first().map(String::as_str), Some("j5"));
+        assert!(c.holds(&format!("j{}", SUPERSEDES_CAP + 4)) && !c.holds("j4"));
     }
 }

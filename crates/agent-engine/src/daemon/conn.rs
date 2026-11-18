@@ -852,7 +852,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         let _ = handle.send(SessionCommand::Detach { client }).await;
     }
     if !handle.is_alive() {
-        state.remove(&sid);
+        state.remove(&handle);
     }
     if lagged {
         send_owner_lagged(&tx, &sid, owner_lag_dropped.load(Ordering::SeqCst)).await;

@@ -261,6 +261,41 @@ fn live_ids_are_excluded_from_past() {
     assert!(rows(&st).contains(&KITE.to_string()));
 }
 
+/// After `/clear` a live session's id names the conversation it left: that
+/// one is saved, so it stays in Past; the conversation it holds does not.
+/// An older daemon sends no journal id: excluded by session id then.
+#[test]
+fn a_cleared_sessions_old_conversation_stays_in_past() {
+    let (_fx, cat) = fixture();
+    let mut st = state_with(cat);
+    let mut cleared = own_meta();
+    cleared.id = SessionId(KITE.into());
+    cleared.journal_id = "20261025-115800-n3w0".into();
+    st.apply(
+        SessionsMsg::Live {
+            gen: 1,
+            result: Ok(vec![own_meta(), cleared.clone()]),
+        },
+        own_meta,
+    );
+    assert!(
+        rows(&st).contains(&KITE.to_string()),
+        "the conversation it left is resumable"
+    );
+    cleared.journal_id = String::new();
+    st.apply(
+        SessionsMsg::Live {
+            gen: 1,
+            result: Ok(vec![own_meta(), cleared]),
+        },
+        own_meta,
+    );
+    assert!(
+        !rows(&st).contains(&KITE.to_string()),
+        "older daemon: by id"
+    );
+}
+
 // ── facets ──────────────────────────────────────────────────────────────────
 
 #[track_caller]

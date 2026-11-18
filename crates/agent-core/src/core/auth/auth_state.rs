@@ -87,9 +87,13 @@ pub struct AccountState {
     /// Access-token expiry, epoch ms; `None` when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_expires_ms: Option<u64>,
-    /// An active cooldown (a reported provider limit).
+    /// An active cooldown of the whole account (a reported provider limit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown: Option<CooldownState>,
+    /// Active cooldowns of single models (a limit that covers one model,
+    /// e.g. its own weekly window): the account still serves the others.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_cooldowns: Vec<CooldownState>,
     /// The last usage read of this account (cache hits are not reads).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_usage: Option<ObservedOutcome>,
@@ -122,6 +126,10 @@ pub struct CooldownState {
     pub until_ms: u64,
     /// Who reported it, as a fixed kind; never the reporter's own string.
     pub reason: CooldownReason,
+    /// The model the limit covers (the requested id, lowercased); `None`:
+    /// the whole account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Why an account is cooling down: one of the known `report_cooldown`
@@ -290,9 +298,20 @@ pub fn render_text(report: &AuthStateReport) -> String {
                     c.reason
                 );
             }
-            None => {
+            None if account.model_cooldowns.is_empty() => {
                 let _ = writeln!(out, "    cooldown  none");
             }
+            None => {}
+        }
+        for c in &account.model_cooldowns {
+            let _ = writeln!(
+                out,
+                "    cooldown {}  {} left (until {}): {}; other models are served",
+                c.model.as_deref().unwrap_or("?"),
+                span(c.until_ms.saturating_sub(now)),
+                utc(c.until_ms),
+                c.reason
+            );
         }
         match &account.last_usage {
             Some(u) => {
@@ -378,7 +397,9 @@ mod tests {
                     cooldown: Some(CooldownState {
                         until_ms: NOW + 41 * 60 * 1000,
                         reason: CooldownReason::AnthropicQuotaExhausted,
+                        model: None,
                     }),
+                    model_cooldowns: vec![],
                     last_usage: Some(ObservedOutcome {
                         at_ms: NOW - 12_000,
                         failure: Some(
@@ -400,6 +421,11 @@ mod tests {
                     identity: IdentityKind::Rotating,
                     access_expires_ms: None,
                     cooldown: None,
+                    model_cooldowns: vec![CooldownState {
+                        until_ms: NOW + 2 * 3600 * 1000,
+                        reason: CooldownReason::AnthropicQuotaExhausted,
+                        model: Some("claude-fable-5".into()),
+                    }],
                     last_usage: None,
                     last_usage_ok_ms: None,
                     last_refresh: None,
@@ -425,6 +451,7 @@ mod tests {
                         retry_after_s: Some(120),
                         until_ms: None,
                         cooling_down: false,
+                        cooldown_model: None,
                     }],
                     earliest_reset_ms: None,
                     usage_read_retry_ms: None,
@@ -445,6 +472,8 @@ mod tests {
             "usage     usage_rate_limited, HTTP 429, retry after 120s, 12s ago (last ok 6m ago)",
             "refresh   ok, 2h03m ago",
             "claude6  identity rotating  token expiry unknown",
+            "cooldown claude-fable-5  2h00m left (until ",
+            "anthropic_quota_exhausted; other models are served",
             "usage     not read yet",
             "anthropic claude-opus-4-1: failed: usage_read_failed (claude5:usage_rate_limited:429), 3s ago",
         ] {
@@ -457,6 +486,7 @@ mod tests {
         );
         assert!(text.contains(&held), "{held:?} missing from:\n{text}");
         assert_eq!(text.matches("    held ").count(), 1, "only claude6 is held:\n{text}");
+        assert!(!text.contains("cooldown  none"), "claude6 cools for one model:\n{text}");
         assert!(
             text.contains("): anthropic_quota_exhausted\n"),
             "the cooldown's reason kind:\n{text}"

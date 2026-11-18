@@ -267,7 +267,7 @@ impl SessionActor {
             // At once on a cancel, like every other cancel site.
             self.publish_workers();
         }
-        let session = (**self.journal_id.load()).clone();
+        let session = self.journal_id_now();
         // No history, no journal: there is nothing to continue (a parked
         // session always has one).
         let text = if self.conv.is_live() && self.conv.api_messages.is_empty() {
@@ -496,7 +496,11 @@ impl SessionActor {
         }
         self.consecutive_auto_turns = 0;
         self.runtime.begin_conversation(Some(new_id.clone()));
-        self.set_journal_id(new_id.clone());
+        self.set_journal_id(new_id.clone(), super::handle::JournalMove::Resume);
+        // The listing follows the conversation now held: its name, title,
+        // cost and messages (as `/clear` does).
+        self.sync_name();
+        self.publish_presence();
         self.publish_view().await;
         self.emit(SessionEventWire::Resumed {
             id,
@@ -762,7 +766,7 @@ impl SessionActor {
     async fn rename_parked(&mut self, want: Option<String>, expect: Option<Option<String>>) -> serde_json::Value {
         use agent_core::session_catalog::RenameError;
         let dir = agent_core::session_lock::sessions_dir();
-        let id = (**self.journal_id.load()).clone();
+        let id = self.journal_id_now();
         let name = want.clone();
         let res = tokio::task::spawn_blocking(move || {
             let expect = expect.as_ref().map(|e| e.as_deref());

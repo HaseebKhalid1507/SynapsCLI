@@ -653,8 +653,9 @@ pub struct SessionActor {
     pub(crate) turn_worker_generation: u64,
     /// Mirrors `handle.lifecycle()` (B3 writes Parking/Parked).
     pub(crate) lifecycle: Arc<std::sync::atomic::AtomicU8>,
-    /// Mirrors `handle.journal_id()` (B2 stores the successor id).
-    pub(crate) journal_id: Arc<arc_swap::ArcSwap<String>>,
+    /// Mirrors `handle.journal()`: the journal id (B2 stores the successor
+    /// id), what it superseded, the conversation's start.
+    pub(crate) journal: super::handle::JournalSlot,
     /// Mirrors `handle.presence()` (clients / owner / pending prompts).
     pub(crate) presence: Arc<arc_swap::ArcSwap<super::handle::Presence>>,
     /// Mirrors `handle.name()`; `sync_name` after any rename.
@@ -761,19 +762,13 @@ impl SessionActor {
                 }
             }
         } else {
-            // Fresh session — best-effort lock.
-            let dir = agent_core::session_lock::sessions_dir();
+            // Fresh session: a taken id (another fresh session drew it) is
+            // never its own, so it draws another; never runs unlocked on it.
             let holder = agent_core::session_lock::LockHolder {
                 pid: std::process::id(),
                 kind: lock_kind.to_string(),
             };
-            match agent_core::session_lock::SessionLock::try_acquire(&dir, &sb.session.id, holder) {
-                Ok(lock) => Some(lock),
-                Err(e) => {
-                    tracing::warn!(session = %sb.session.id, "session lock: {e}");
-                    None
-                }
-            }
+            super::fresh_id::lock_fresh_session(&mut runtime, &mut sb, holder)?
         };
 
         // `--name` at create: apply BEFORE the registry entry is written so
@@ -872,14 +867,26 @@ impl SessionActor {
             .await;
         }
 
-        let id = SessionId::from(sb.session.id.clone());
+        // The journal id, unless a live actor already has it as its id (a
+        // `/clear`ed actor keeps its id while its old conversation is
+        // resumed here): then a minted one. `create_session` holds the
+        // create lock, so no other create can take it meanwhile.
+        let id = host.actor_id_for(&sb.session.id);
+        // A reload hands back what the old image's actor held besides its
+        // journal; only for that same journal (a fresh fallback is not it).
+        let restored = cfg
+            .restore_conversation
+            .take()
+            .filter(|r| r.journal_id == sb.session.id);
 
         let meta = SessionMeta {
             id: id.clone(),
             name: sb.session.name.clone(),
             model: runtime.model().to_string(),
             cwd: cfg.cwd.clone(),
-            created_at: sb.session.created_at,
+            created_at: restored
+                .as_ref()
+                .map_or(sb.session.created_at, |r| r.created_at),
             continued: sb.continued,
             continue_info: sb.continue_info.as_ref().map(ContinueInfoWire::from),
             host_pid: std::process::id(),
@@ -929,7 +936,7 @@ impl SessionActor {
                 events,
                 view,
                 lifecycle,
-                journal_id,
+                journal,
                 presence,
                 workers: workers_cell,
                 name,
@@ -937,6 +944,13 @@ impl SessionActor {
                 cache_keepwarm,
             },
         ) = SessionHandle::new(meta.clone(), view);
+        if let Some(r) = restored {
+            journal.store(Arc::new(super::handle::JournalCell {
+                journal_id: r.journal_id,
+                supersedes: r.supersedes,
+                created_at: r.created_at,
+            }));
+        }
         let handle = handle.with_owner_token(cfg.owned.as_ref().map(|o| o.token.clone()));
         let owned = cfg.owned.clone().map(super::owned::OwnedState::new);
         // The mode is fixed for the session: seed the listing with it now.
@@ -958,7 +972,7 @@ impl SessionActor {
             super::session_start::SessionStart::queue(
                 host,
                 Arc::clone(&hook_bus),
-                Arc::clone(&journal_id),
+                Arc::clone(&journal),
                 cfg.cwd.clone(),
                 ext_ready_timeout,
             )
@@ -1025,7 +1039,7 @@ impl SessionActor {
             worker_expiry: None,
             turn_worker_generation: 0,
             lifecycle,
-            journal_id,
+            journal,
             presence,
             name,
             keep_warm_cell,
@@ -1056,7 +1070,7 @@ impl SessionActor {
     /// in-process): the entry is added while pinned, dropped otherwise.
     pub(crate) fn note_pin(&self) {
         let Some(sink) = self.host.pin_sink() else { return };
-        let journal = (**self.journal_id.load()).clone();
+        let journal = self.journal_id_now();
         if self.keep_warm {
             let kw = self.cache_keepwarm.override_mode.map(|m| m.to_string());
             sink.pinned(self.id.as_str(), &journal, self.conv.session.name.as_deref(), self.config.cwd.as_deref(), kw.as_deref());
@@ -1065,12 +1079,23 @@ impl SessionActor {
         }
     }
 
+    /// The journal id as last published.
+    pub(crate) fn journal_id_now(&self) -> String {
+        self.journal.load().journal_id.clone()
+    }
+
     /// Publish a new journal id; a pinned session's book entry follows it.
-    pub(crate) fn set_journal_id(&mut self, new_id: String) {
-        let old = self.journal_id.swap(Arc::new(new_id.clone()));
-        if self.keep_warm && *old != new_id {
+    /// `why` decides what the actor still holds (`JournalCell::moved`): a
+    /// compaction keeps the old id, a `/clear` or a resume lets it go and
+    /// dates the conversation from `conv.session.created_at`.
+    pub(crate) fn set_journal_id(&mut self, new_id: String, why: super::handle::JournalMove) {
+        let created_at = self.conv.session.created_at;
+        let old = self.journal.load_full();
+        self.journal
+            .store(Arc::new(old.moved(new_id.clone(), why, created_at)));
+        if self.keep_warm && old.journal_id != new_id {
             if let Some(sink) = self.host.pin_sink() {
-                sink.moved(&old, &new_id);
+                sink.moved(&old.journal_id, &new_id);
             }
         }
     }
@@ -1088,7 +1113,7 @@ impl SessionActor {
         self.name.store(Arc::new(name.clone()));
         if self.keep_warm {
             if let Some(sink) = self.host.pin_sink() {
-                let journal = (**self.journal_id.load()).clone();
+                let journal = self.journal_id_now();
                 sink.renamed(&journal, name.as_deref());
             }
         }
@@ -1241,7 +1266,7 @@ impl SessionActor {
         self.flush_saves().await;
         // Before `Idle`, so a test that saw `Idle` knows the hook is in line.
         #[cfg(any(test, feature = "testing"))]
-        if super::session_start::testing::take_requeue(&self.journal_id.load()) {
+        if super::session_start::testing::take_requeue(&self.journal_id_now()) {
             self.queue_session_start();
         }
         self.emit(SessionEventWire::Idle);
@@ -1600,7 +1625,8 @@ impl SessionActor {
     }
 
     /// `<sessions>/<id>.json` — written by both persistence modes.
-    fn journal_exists(&self) -> bool {        let id = (**self.journal_id.load()).clone();
+    fn journal_exists(&self) -> bool {
+        let id = self.journal_id_now();
         crate::config::resolve_write_path("sessions")
             .join(format!("{id}.json"))
             .is_file()
@@ -2678,7 +2704,7 @@ impl SessionActor {
         let started = std::time::Instant::now();
         // Somebody came back: the eviction deadline armed by `park()` is void.
         self.park_deadline = None;
-        let journal_id = (**self.journal_id.load()).clone();
+        let journal_id = self.journal_id_now();
 
         // F10: re-acquire the journal lock before rebuilding the runtime.
         // If an in-process --continue took over while we were parked, fail
@@ -2971,7 +2997,7 @@ impl SessionActor {
         self.session_start = super::session_start::SessionStart::queue(
             &self.host,
             Arc::clone(&self.hook_bus),
-            Arc::clone(&self.journal_id),
+            Arc::clone(&self.journal),
             self.config.cwd.clone(),
             extensions_ready_timeout(&self.host.config()),
         );
@@ -4335,7 +4361,7 @@ impl SessionActor {
                         }
                         let new_id = self.conv.session.id.clone();
                         self.runtime.set_session_id(Some(new_id.clone()));
-                        self.set_journal_id(new_id.clone());
+                        self.set_journal_id(new_id.clone(), super::handle::JournalMove::Compaction);
                         // F10: lock follows the new journal id.
                         self.reacquire_session_lock(&new_id);
                         // Wall 1: reset continuation state for the new session id
@@ -4649,7 +4675,7 @@ impl SessionActor {
         if self.is_parked() {
             let value = match query {
                 SessionQuery::Status => serde_json::json!({
-                    "session": (**self.journal_id.load()).clone(),
+                    "session": self.journal_id_now(),
                     "model": self.view.load().model,
                     "lifecycle": SessionLifecycle::Parked,
                     "streaming": false,
@@ -5457,9 +5483,19 @@ impl SessionActor {
                 self.conv.clear(&self.runtime).await;
                 self.runtime
                     .begin_conversation(Some(self.conv.session.id.clone()));
-                self.set_journal_id(self.conv.session.id.clone());
+                // A new conversation: the old one is no longer held here
+                // (resuming it builds another actor), and the listing dates
+                // from the fresh session.
+                self.set_journal_id(
+                    self.conv.session.id.clone(),
+                    super::handle::JournalMove::Clear,
+                );
                 // F10: lock follows the new session id.
                 self.reacquire_session_lock(&self.conv.session.id.clone());
+                // The fresh session has no name: the old one must stop
+                // resolving to this actor. Title, cost and messages restart.
+                self.sync_name();
+                self.publish_presence();
                 self.emit(SessionEventWire::Cleared {
                     session_id: self.conv.session.id.clone(),
                 });
@@ -5619,7 +5655,7 @@ impl SessionActor {
         }
 
         let parked = !self.conv.is_live();
-        let session_id = (**self.journal_id.load()).clone();
+        let session_id = self.journal_id_now();
         let api_messages = if parked {
             None
         } else {

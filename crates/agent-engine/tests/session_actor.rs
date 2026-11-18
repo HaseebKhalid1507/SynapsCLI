@@ -1393,3 +1393,35 @@ async fn submit_with_image_is_refused_on_text_model_and_accepted_on_image_model(
     drop(b);
     handle.closed().await;
 }
+
+/// Bug: a long-lived host (the daemon) snapshotted config at boot and every
+/// session it created later ran on that snapshot — `context_window = 1m`
+/// added after the daemon started left new sessions budgeting (and the TUI
+/// footer bar measuring) against 200k. `create_session` now re-reads a
+/// config file that changed since the snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn create_session_picks_up_config_edited_after_boot() {
+    let h = Home::new();
+    let config_path = h._dir.path().join(".synaps-cli").join("config");
+    std::fs::write(&config_path, "context_window = 200k\n").unwrap();
+    let host = host().await;
+    let first = host.create_session(cfg()).await.unwrap();
+    assert_eq!(first.view().context_window, 200_000);
+
+    // Edit after boot; bump mtime explicitly so coarse filesystems still see it.
+    std::fs::write(&config_path, "context_window = 1m\n").unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    std::fs::File::options()
+        .write(true)
+        .open(&config_path)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+
+    let second = host.create_session(cfg()).await.unwrap();
+    assert_eq!(host.config().context_window, Some(1_000_000), "host snapshot refreshed");
+    assert_eq!(second.view().context_window, 1_000_000, "new session runs on the edited config");
+    // Unchanged file: no reload churn.
+    assert!(!host.reload_config_if_changed());
+}
