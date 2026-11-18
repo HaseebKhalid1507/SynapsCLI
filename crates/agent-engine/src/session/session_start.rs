@@ -592,9 +592,7 @@ mod tests {
             if let Some(rx) = self.release.lock().await.take() {
                 let _ = rx.await;
             }
-            crate::extensions::hooks::events::HookResult::Inject {
-                content: INJECTED.into(),
-            }
+            crate::extensions::hooks::events::HookResult::inject(INJECTED)
         }
 
         async fn shutdown(&self) {}

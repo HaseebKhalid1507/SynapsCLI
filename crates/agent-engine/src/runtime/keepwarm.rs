@@ -927,9 +927,7 @@ mod tests {
         }
         async fn handle(&self, _event: &HookEvent) -> HookResult {
             self.0.fetch_add(1, Ordering::SeqCst);
-            HookResult::Inject {
-                content: "PER-TURN-INJECTED-CONTEXT".into(),
-            }
+            HookResult::inject("PER-TURN-INJECTED-CONTEXT")
         }
         async fn shutdown(&self) {}
     }

@@ -1291,7 +1291,7 @@ impl StreamMethods {
                     crate::extensions::hooks::events::HookEvent::before_message(msg_text)
                         .with_session(session_id.as_deref())
                         .with_cwd(cwd.as_deref());
-                if let crate::extensions::hooks::events::HookResult::Inject { content } =
+                if let crate::extensions::hooks::events::HookResult::Inject { content, .. } =
                     hook_bus.emit(&hook_event).await
                 {
                     // Empty/whitespace inject is a no-op: attaching it would
