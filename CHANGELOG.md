@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Releases carry the `.deb` again.** The `.deb` was uploaded after the
+  GitHub release was published, and this repository has immutable releases,
+  so 0.12.0 shipped without one (`Cannot upload assets to an immutable
+  release`). It is now built before the release is published and attached
+  with the other files, and it holds the exact x86_64 Linux binaries of the
+  release tarball instead of a separate build. If it fails, the release
+  waits instead of going out without it.
+
 - **A limit on one model no longer blocks the whole Anthropic account.**
   When Fable's own weekly limit ran out, the 429 put the account in a
   cooldown for every model until the reset, so Opus and Sonnet requests
