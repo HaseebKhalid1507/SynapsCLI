@@ -757,11 +757,40 @@ pub trait CredentialBroker: Send + Sync {
         Ok(())
     }
 
-    /// When `cred`'s active cooldown ends (epoch ms), if this broker knows
-    /// of one. No network request and no token refresh. Default: none.
+    /// Report that `cred` hit a provider limit that covers only `model`
+    /// (one model's own window, e.g. Fable's weekly limit): selection for
+    /// `model` skips the account until `until_ms`, every other model still
+    /// gets it. `model` is the requested id; brokers match it
+    /// case-insensitively. Default: the account-wide
+    /// [`report_cooldown`](Self::report_cooldown), so a broker that keeps no
+    /// per-model state errs toward not using the account.
+    async fn report_model_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: &str,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let _ = model;
+        self.report_cooldown(cred, until_ms, reason).await
+    }
+
+    /// When `cred`'s active ACCOUNT-WIDE cooldown ends (epoch ms), if this
+    /// broker knows of one. A cooldown that covers one model only is not
+    /// one ([`active_cooldown_for`](Self::active_cooldown_for)). No network
+    /// request and no token refresh. Default: none.
     fn active_cooldown(&self, cred: &CredentialRef) -> Option<u64> {
         let _ = cred;
         None
+    }
+
+    /// When the cooldown that keeps `cred` from serving `model` ends (epoch
+    /// ms): the later of its account-wide cooldown and the one reported for
+    /// `model` alone. `None` model: account-wide only. Default:
+    /// [`active_cooldown`](Self::active_cooldown).
+    fn active_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>) -> Option<u64> {
+        let _ = model;
+        self.active_cooldown(cred)
     }
 
     /// A request sent on `cred` at `sent_at_ms` (epoch ms) was accepted:
@@ -772,6 +801,15 @@ pub trait CredentialBroker: Send + Sync {
     /// nothing about it). Memory only. Default: no-op.
     fn clear_cooldown(&self, cred: &CredentialRef, sent_at_ms: u64) {
         let _ = (cred, sent_at_ms);
+    }
+
+    /// [`clear_cooldown`](Self::clear_cooldown) for a request for `model`:
+    /// also drops the cooldown reported for that model alone, never another
+    /// model's (a Sonnet answer says nothing about Fable's limit). Default:
+    /// [`clear_cooldown`](Self::clear_cooldown).
+    fn clear_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>, sent_at_ms: u64) {
+        let _ = model;
+        self.clear_cooldown(cred, sent_at_ms)
     }
 
     /// Re-vend `cred` for automatic selection (a turn keeping the account
@@ -1835,9 +1873,22 @@ type CachedPolicy = (Option<std::time::SystemTime>, AccountPolicy);
 struct Cooldown {
     until_ms: u64,
     reason: String,
+    /// The model the limit covers (normalized, [`cooldown_model`]); `None`:
+    /// the whole account.
+    model: Option<String>,
     /// When it was reported (epoch ms): only a request sent after this
     /// clears it ([`CredentialBroker::clear_cooldown`]).
     reported_at_ms: u64,
+}
+
+impl Cooldown {
+    fn state(&self) -> super::auth_state::CooldownState {
+        super::auth_state::CooldownState {
+            until_ms: self.until_ms,
+            reason: super::auth_state::CooldownReason::from_reported(&self.reason),
+            model: self.model.clone(),
+        }
+    }
 }
 
 /// The keys one account's cooldown is kept under
@@ -1864,6 +1915,24 @@ impl CooldownKeys {
     fn read(&self) -> impl Iterator<Item = &str> + '_ {
         self.seat.as_deref().into_iter().chain([self.slot.as_str()])
     }
+}
+
+/// A requested model id as cooldowns store and match it: trimmed and
+/// lowercased (`Claude-Fable-5` and `claude-fable-5` are one model).
+fn cooldown_model(model: &str) -> String {
+    model.trim().to_ascii_lowercase()
+}
+
+/// Where the cooldown of one model is kept beside the account's own `key`.
+fn model_cooldown_key(key: &str, model: &str) -> String {
+    format!("{key}|model={model}")
+}
+
+/// Whether `stored` is `key`'s account-wide cooldown or one of its models'.
+fn is_cooldown_under(stored: &str, key: &str) -> bool {
+    stored
+        .strip_prefix(key)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("|model="))
 }
 
 /// Cooldown applied when a limit is reported without a reset hint.
@@ -2241,30 +2310,121 @@ impl LocalBroker {
             .any(|c| c.until_ms > now_ms)
     }
 
-    /// `cred`'s active cooldown: the latest one under its keys.
-    fn active_cooldown_at(&self, cred: &CredentialRef, now_ms: u64) -> Option<Cooldown> {
+    /// The active cooldown that keeps `cred` from serving `model` (`None`:
+    /// account-wide only): the latest one under its keys.
+    fn active_cooldown_at(
+        &self,
+        cred: &CredentialRef,
+        model: Option<&str>,
+        now_ms: u64,
+    ) -> Option<Cooldown> {
         // Nothing cooling, nothing to look up: no read of the stored login
         // (a turn asks before every request).
         if !self.any_cooldown_active(now_ms) {
             return None;
         }
-        self.cooldown_for_keys(&self.cooldown_keys(cred), now_ms)
+        self.cooldown_for_keys(&self.cooldown_keys(cred), model, now_ms)
     }
 
-    /// The latest active cooldown under `keys`.
-    fn cooldown_for_keys(&self, keys: &CooldownKeys, now_ms: u64) -> Option<Cooldown> {
+    /// The latest active cooldown under `keys` that covers `model`: the
+    /// account-wide ones, and with a model also that model's.
+    fn cooldown_for_keys(
+        &self,
+        keys: &CooldownKeys,
+        model: Option<&str>,
+        now_ms: u64,
+    ) -> Option<Cooldown> {
+        let model = model.map(cooldown_model).filter(|m| !m.is_empty());
         let cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
         keys.read()
-            .filter_map(|key| cooldowns.get(key))
+            .flat_map(|key| {
+                let scoped = model.as_deref().map(|m| model_cooldown_key(key, m));
+                [cooldowns.get(key), scoped.and_then(|k| cooldowns.get(&k))]
+            })
+            .flatten()
             .filter(|c| c.until_ms > now_ms)
             .max_by_key(|c| c.until_ms)
             .cloned()
     }
 
+    /// Every active cooldown of one model under `cred`'s keys, the latest
+    /// per model, by model (`synaps auth state`).
+    fn model_cooldowns_at(&self, cred: &CredentialRef, now_ms: u64) -> Vec<Cooldown> {
+        if !self.any_cooldown_active(now_ms) {
+            return Vec::new();
+        }
+        let keys = self.cooldown_keys(cred);
+        let cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        let mut latest: BTreeMap<String, Cooldown> = BTreeMap::new();
+        for key in keys.read() {
+            for (stored, c) in cooldowns.iter() {
+                let Some(model) = c.model.as_ref() else {
+                    continue;
+                };
+                if c.until_ms > now_ms
+                    && is_cooldown_under(stored, key)
+                    && latest.get(model).is_none_or(|l| l.until_ms < c.until_ms)
+                {
+                    latest.insert(model.clone(), c.clone());
+                }
+            }
+        }
+        latest.into_values().collect()
+    }
+
     /// Reading an expired cooldown is non-mutating (preview shares this path).
     fn cooldown_until(&self, storage_key: &str, now_ms: u64) -> Option<u64> {
         let cred = CredentialRef::parse_storage_key(storage_key)?;
-        self.active_cooldown_at(&cred, now_ms).map(|c| c.until_ms)
+        self.active_cooldown_at(&cred, None, now_ms).map(|c| c.until_ms)
+    }
+
+    /// Record a reported limit on `cred`: account-wide, or for `model`
+    /// (already [`cooldown_model`]-normalized) alone.
+    fn store_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: Option<&str>,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) {
+        let now_ms = crate::epoch_millis();
+        let max_until = now_ms.saturating_add(MAX_COOLDOWN.as_millis() as u64);
+        let until_ms = until_ms
+            .filter(|t| *t > now_ms)
+            .unwrap_or(now_ms + DEFAULT_COOLDOWN.as_millis() as u64)
+            .min(max_until);
+        let reason = crate::truncate_str(reason, 64).to_string();
+        tracing::info!(
+            credential = %cred,
+            model = model.unwrap_or("-"),
+            until_ms,
+            reason = %reason,
+            "account cooldown reported"
+        );
+        let keys = self.cooldown_keys(cred);
+        {
+            let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+            for key in keys.written() {
+                let stored = match model {
+                    Some(m) => model_cooldown_key(key, m),
+                    None => key.to_string(),
+                };
+                cooldowns.insert(
+                    stored,
+                    Cooldown {
+                        until_ms,
+                        reason: reason.clone(),
+                        model: model.map(str::to_string),
+                        reported_at_ms: now_ms,
+                    },
+                );
+            }
+        }
+        // The cached reading predates the limit report; drop it so the next
+        // selection re-reads instead of trusting stale headroom, and drop
+        // the slot's last good reading so grace can never outlive the limit.
+        self.forget_snapshots(cred);
+        self.usage_reads.forget_last_good(&self.read_key(cred));
     }
 
     // ── `synaps auth state` ─────────────────────────────────────────────
@@ -2279,17 +2439,27 @@ impl LocalBroker {
         auth_state_report(Some(self), query)
     }
 
-    /// The active cooldown of `cred`'s current seat, with its reason.
+    /// The active account-wide cooldown of `cred`'s current seat, with its
+    /// reason.
     fn cooldown_state(
         &self,
         cred: &CredentialRef,
         now_ms: u64,
     ) -> Option<super::auth_state::CooldownState> {
-        self.active_cooldown_at(cred, now_ms)
-            .map(|c| super::auth_state::CooldownState {
-                until_ms: c.until_ms,
-                reason: super::auth_state::CooldownReason::from_reported(&c.reason),
-            })
+        self.active_cooldown_at(cred, None, now_ms)
+            .map(|c| c.state())
+    }
+
+    /// The active cooldowns of single models on `cred`'s current seat.
+    fn model_cooldown_states(
+        &self,
+        cred: &CredentialRef,
+        now_ms: u64,
+    ) -> Vec<super::auth_state::CooldownState> {
+        self.model_cooldowns_at(cred, now_ms)
+            .iter()
+            .map(Cooldown::state)
+            .collect()
     }
 
     /// Drop the in-memory state of `creds`: cooldowns, cached usage
@@ -2305,7 +2475,7 @@ impl LocalBroker {
         {
             let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
             for key in keys.iter().flat_map(|k| k.read()) {
-                cooldowns.remove(key);
+                cooldowns.retain(|stored, _| !is_cooldown_under(stored, key));
             }
             for provider in whole_providers {
                 let prefix = format!("{store}|{provider}|");
@@ -3053,7 +3223,7 @@ impl LocalBroker {
             // check; the policy rejects it as cooling down.
             let read = if keys
                 .get(&cred.storage_key())
-                .and_then(|k| self.cooldown_for_keys(k, crate::epoch_millis()))
+                .and_then(|k| self.cooldown_for_keys(k, model, crate::epoch_millis()))
                 .is_some()
             {
                 CandidateRead {
@@ -3099,10 +3269,11 @@ impl LocalBroker {
             }
         }
         for capacity in &mut candidates {
-            capacity.cooldown_until_ms = keys
+            let cooldown = keys
                 .get(&capacity.credential.storage_key())
-                .and_then(|k| self.cooldown_for_keys(k, now_ms))
-                .map(|c| c.until_ms);
+                .and_then(|k| self.cooldown_for_keys(k, model, now_ms));
+            capacity.cooldown_until_ms = cooldown.as_ref().map(|c| c.until_ms);
+            capacity.cooldown_model = cooldown.and_then(|c| c.model);
         }
         let previous = self
             .current_accounts
@@ -3675,6 +3846,7 @@ pub fn capacity_from_snapshot(
         observed_at_ms: Some(snapshot.observed_at),
         observation: QuotaObservation::Ok { windows, models },
         cooldown_until_ms: None,
+        cooldown_model: None,
         failure: None,
     }
 }
@@ -4192,31 +4364,44 @@ impl CredentialBroker for LocalBroker {
     }
 
     fn active_cooldown(&self, cred: &CredentialRef) -> Option<u64> {
-        self.active_cooldown_at(cred, crate::epoch_millis())
+        self.active_cooldown_for(cred, None)
+    }
+
+    fn active_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>) -> Option<u64> {
+        self.active_cooldown_at(cred, model, crate::epoch_millis())
             .map(|c| c.until_ms)
     }
 
     fn clear_cooldown(&self, cred: &CredentialRef, sent_at_ms: u64) {
+        self.clear_cooldown_for(cred, None, sent_at_ms)
+    }
+
+    fn clear_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>, sent_at_ms: u64) {
         let now_ms = crate::epoch_millis();
         if !self.any_cooldown_active(now_ms) {
             return;
         }
         let keys = self.cooldown_keys(cred);
-        let mut cleared = None;
+        let model = model.map(cooldown_model).filter(|m| !m.is_empty());
+        let mut cleared = Vec::new();
         {
             let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
             for key in keys.read() {
-                if cooldowns
-                    .get(key)
-                    .is_some_and(|c| c.until_ms > now_ms && c.reported_at_ms <= sent_at_ms)
-                {
-                    cleared = cooldowns.remove(key).or(cleared);
+                let scoped = model.as_deref().map(|m| model_cooldown_key(key, m));
+                for stored in std::iter::once(key.to_string()).chain(scoped) {
+                    if cooldowns
+                        .get(&stored)
+                        .is_some_and(|c| c.until_ms > now_ms && c.reported_at_ms <= sent_at_ms)
+                    {
+                        cleared.extend(cooldowns.remove(&stored));
+                    }
                 }
             }
         }
-        if let Some(c) = cleared {
+        for c in cleared {
             tracing::info!(
                 credential = %cred,
+                model = c.model.as_deref().unwrap_or("-"),
                 until_ms = c.until_ms,
                 reason = %c.reason,
                 "account cooldown cleared: a request sent after it was reported was accepted"
@@ -4251,33 +4436,20 @@ impl CredentialBroker for LocalBroker {
         until_ms: Option<u64>,
         reason: &str,
     ) -> Result<(), BrokerError> {
-        let now_ms = crate::epoch_millis();
-        let max_until = now_ms.saturating_add(MAX_COOLDOWN.as_millis() as u64);
-        let until_ms = until_ms
-            .filter(|t| *t > now_ms)
-            .unwrap_or(now_ms + DEFAULT_COOLDOWN.as_millis() as u64)
-            .min(max_until);
-        let reason = crate::truncate_str(reason, 64).to_string();
-        tracing::info!(credential = %cred, until_ms, reason = %reason, "account cooldown reported");
-        let keys = self.cooldown_keys(cred);
-        {
-            let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
-            for key in keys.written() {
-                cooldowns.insert(
-                    key.to_string(),
-                    Cooldown {
-                        until_ms,
-                        reason: reason.clone(),
-                        reported_at_ms: now_ms,
-                    },
-                );
-            }
-        }
-        // The cached reading predates the limit report; drop it so the next
-        // selection re-reads instead of trusting stale headroom, and drop
-        // the slot's last good reading so grace can never outlive the limit.
-        self.forget_snapshots(cred);
-        self.usage_reads.forget_last_good(&self.read_key(cred));
+        self.store_cooldown(cred, None, until_ms, reason);
+        Ok(())
+    }
+
+    async fn report_model_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: &str,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let model = cooldown_model(model);
+        // No model to scope it to: the account cools, as before.
+        self.store_cooldown(cred, Some(model.as_str()).filter(|m| !m.is_empty()), until_ms, reason);
         Ok(())
     }
 
@@ -4455,6 +4627,43 @@ async fn route_missing(resp: reqwest::Response) -> bool {
 }
 
 impl RemoteBroker {
+    /// `POST /accounts/cooldown`; `model` only when the limit covers one
+    /// model (an old daemon ignores it and cools the account).
+    async fn post_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: Option<&str>,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let mut body = serde_json::json!({
+            "provider": cred.provider.as_str(),
+            "account": cred.account.label_str(),
+            "until_ms": until_ms,
+            "reason": crate::truncate_str(reason, 64),
+        });
+        if let Some(model) = model {
+            body["model"] = serde_json::Value::from(model);
+        }
+        let resp = self
+            .machine_token
+            .send(|t| {
+                self.http
+                    .post(format!("{}/accounts/cooldown", self.endpoint))
+                    .bearer_auth(t)
+                    .json(&body)
+            })
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => Err(BrokerError::Unauthorized),
+            s if !(200..300).contains(&s) => {
+                Err(BrokerError::Transport(format!("broker returned HTTP {s}")))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// True if the broker has no `/usage/snapshot` (0.10.2 and older). The
     /// probe sends an empty account, which a current broker rejects with a
     /// 400 before touching any credential.
@@ -4803,28 +5012,20 @@ impl CredentialBroker for RemoteBroker {
         until_ms: Option<u64>,
         reason: &str,
     ) -> Result<(), BrokerError> {
-        let resp = self
-            .machine_token
-            .send(|t| {
-                self.http
-                .post(format!("{}/accounts/cooldown", self.endpoint))
-                .bearer_auth(t)
-                .json(&serde_json::json!({
-                    "provider": cred.provider.as_str(),
-                    "account": cred.account.label_str(),
-                    "until_ms": until_ms,
-                    "reason": crate::truncate_str(reason, 64),
-                }))
-            })
-            .await
-            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
-        match resp.status().as_u16() {
-            401 => Err(BrokerError::Unauthorized),
-            s if !(200..300).contains(&s) => {
-                Err(BrokerError::Transport(format!("broker returned HTTP {s}")))
-            }
-            _ => Ok(()),
-        }
+        self.post_cooldown(cred, None, until_ms, reason).await
+    }
+
+    /// Sends `model` beside the account. A daemon that predates per-model
+    /// cooldowns ignores the field (its body type allows unknown fields)
+    /// and cools the whole account, as it always did.
+    async fn report_model_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: &str,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        self.post_cooldown(cred, Some(model), until_ms, reason).await
     }
 
     async fn proxy(&self, request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
@@ -5149,6 +5350,9 @@ fn auth_state_report(
             },
             access_expires_ms: (summary.expires != 0).then_some(summary.expires),
             cooldown: broker.and_then(|b| b.cooldown_state(&cred, now_ms)),
+            model_cooldowns: broker
+                .map(|b| b.model_cooldown_states(&cred, now_ms))
+                .unwrap_or_default(),
             last_usage: observed.last_usage,
             last_usage_ok_ms: observed.last_usage_ok_ms,
             last_refresh: super::token::last_refresh_exchange(&store, &cred.storage_key()).map(
@@ -5292,6 +5496,10 @@ pub fn global_broker() -> Arc<dyn CredentialBroker> {
 
 /// Legacy signature bridge: resolve an access token via the appropriate
 /// broker for `source`. Kept for CLI paths (`synaps status`).
+///
+/// Catalog / usage reads only: it asks with no model, so a limit or
+/// cooldown on one model does not apply to it. Inference must vend with
+/// its model (`access_token_pinned_for`).
 pub async fn broker_access_token(
     provider: OAuthProviderId,
     source: &super::CredentialSource,
