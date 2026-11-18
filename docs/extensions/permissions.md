@@ -13,8 +13,8 @@ These are the only permissions currently accepted in `extension.permissions`:
 |---|---|
 | `tools.intercept` | Subscribe to `before_tool_call` and `after_tool_call` (observe, block, confirm, modify input) |
 | `tools.transform_output` | Rewrite tool **output** via `after_tool_call` → `replace`. Required *in addition to* `tools.intercept`; without it a `replace` is ignored |
-| `privacy.llm_content` | Subscribe to `before_message`, `on_message_complete`, and `on_compaction`; receive message/summary content |
-| `session.lifecycle` | Subscribe to `on_session_start` and `on_session_end` |
+| `privacy.llm_content` | Subscribe to `before_message`, `on_message_complete`, and `on_compaction`; receive message/summary content. Subscribe to `on_context_archived`; receive the path of each archived context window |
+| `session.lifecycle` | Subscribe to `on_session_start`, `on_session_end` and `on_memory_forgotten` (the ids of forgotten archives and notes, no content) |
 | `tools.register` | Register extension-provided tools during initialization |
 | `providers.register` | Register extension-provided provider metadata during initialization; chat routing is not wired yet |
 

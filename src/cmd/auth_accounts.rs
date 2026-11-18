@@ -939,6 +939,7 @@ mod chooser_tests {
                 credential: CredentialRef::new(provider, Account::named(label).unwrap()),
                 observed_at_ms: Some(now),
                 cooldown_until_ms: None,
+                cooldown_model: None,
                 failure: None,
                 observation: QuotaObservation::Ok {
                     windows: vec![WindowLimit {
@@ -1173,6 +1174,7 @@ mod state_tests {
                     progressive_tool_disclosure: false,
                     generation: 1,
                     daemon_build: "oldbld1".into(),
+                    features: Vec::new(),
                 });
                 w.write_all(encode_line(&welcome).unwrap().as_bytes())
                     .await
@@ -1227,6 +1229,7 @@ mod state_tests {
                 identity: IdentityKind::Rotating,
                 access_expires_ms: None,
                 cooldown: None,
+                model_cooldowns: vec![],
                 last_usage: None,
                 last_usage_ok_ms: None,
                 last_refresh: None,

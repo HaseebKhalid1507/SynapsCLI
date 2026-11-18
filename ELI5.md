@@ -17,16 +17,15 @@ Most robot apps are like a toy that comes glued together — you can't open it u
 
 ## 🏷️ Plugins are like magic stickers you put on your robot
 
-Want your robot to also do voice? **Stick on a voice plugin.** 🎤
-Want it to check your code is safe? **Stick on a security plugin.** 🛡️
+Want your robot to check your code is safe? **Stick on a security plugin.** 🛡️
 Want it to remember things forever? **Stick on a memory plugin.** 🧠
 
 ```
    Your Robot 🤖
       │
-   ┌──┴──┬─────┬─────┬─────┐
-   🎤    🛡️    🧠    📚    🎨
-  voice  safe  mem  skills theme
+   ┌──┴──┬─────┬─────┐
+   🛡️    🧠    📚    🎨
+  safe  mem  skills theme
 ```
 
 Each sticker is just a folder you drop in with its own programs for the robot to run. The cool part: stickers can talk to other stickers, but they can't do mean things — the robot has strict rules ("you can read files but not delete them," "you can listen but not see the chat").

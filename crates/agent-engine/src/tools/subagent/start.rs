@@ -63,20 +63,7 @@ impl Tool for SubagentStartTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices."
-                },
-                "role": {
-                    "type": "string",
-                    "enum": ["planner", "implementer", "tester", "reviewer", "researcher", "debugger"],
-                    "description": "Typed orchestration role."
-                },
-                "write_policy": {
-                    "oneOf": [
-                        {"type": "object", "properties": {"mode": {"const": "read_only"}}, "required": ["mode"]},
-                        {"type": "object", "properties": {"mode": {"const": "isolated_worktree"}}, "required": ["mode"]},
-                        {"type": "object", "properties": {"mode": {"const": "non_overlapping_paths"}, "scopes": {"type": "array", "items": {"type": "string"}}}, "required": ["mode", "scopes"]}
-                    ],
-                    "description": "Declared write isolation and path scopes."
+                    "description": "Omit for the session default: config `subagent_model` when set, otherwise the foreground model. Explicit values must be one of subagent_models' listed exact choices."
                 },
                 "thinking": {
                     "type": "string",
@@ -143,7 +130,11 @@ impl Tool for SubagentStartTool {
             .reserve_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref())
             .map_err(|reason| RuntimeError::Tool(format!("delegation denied: {reason}")))?;
         let decision = orchestration
-            .resolve_and_authorize(&handle_id, requested_model)
+            .resolve_and_authorize_with_default(
+                &handle_id,
+                requested_model,
+                config.subagent_model.as_deref(),
+            )
             .map_err(|error| {
                 orchestration
                     .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
@@ -165,10 +156,11 @@ impl Tool for SubagentStartTool {
         let task_full = task.clone();
 
         tracing::info!(
-            "subagent_start: dispatching '{}' (id={}) model={}",
+            "subagent_start: dispatching '{}' (id={}) model={} source={}",
             label,
             handle_id,
-            model
+            model,
+            decision.selection_source.as_str()
         );
 
         // ── Shared state ───────────────────────────────────────────────────────
@@ -300,10 +292,7 @@ impl Tool for SubagentStartTool {
                             telemetry.as_ref(),
                             &workspace,
                         );
-                        runtime.set_system_prompt(super::compose_system_prompt(
-                            system_prompt,
-                            runtime.memory_backend_is_axel(),
-                        ));
+                        runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
                         runtime.set_model(model_a.clone());
                         super::fit_subagent_context_window(&mut runtime);
                         super::apply_codex_worker_reasoning(
@@ -590,6 +579,51 @@ mod tests {
                 "gif-recorder"
             );
         }
+        join_worker(&registry, handle_id);
+    }
+
+    /// `role` and `write_policy` are no longer advertised (they were never
+    /// read). A caller that still sends them is not refused, and the worker
+    /// is dispatched exactly as without them: as an implementer.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn test_subagent_start_ignores_retired_role_and_write_policy() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let _offline = crate::test_env::OfflineProviderEnv::new();
+        let tool = SubagentStartTool;
+        let mut ctx = create_tool_context();
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        ctx.capabilities.subagent_registry = Some(registry.clone());
+        let orchestration = Arc::clone(ctx.capabilities.orchestration.as_ref().unwrap());
+
+        let params = json!({
+            "system_prompt": "You are a concise test subagent. Reply with only: ok",
+            "task": "Say ok",
+            "model": "anthropic/claude-sonnet-4-6",
+            "timeout": 1,
+            "role": "reviewer",
+            "write_policy": {"mode": "read_only"}
+        });
+
+        let result = tool
+            .execute(params, ctx)
+            .await
+            .expect("old params must be ignored, not refused");
+        let body: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(body["status"], "running");
+        assert_eq!(body["agent_name"], "inline");
+        let handle_id = body["handle_id"].as_str().unwrap();
+        assert!(registry.lock().unwrap().get(handle_id).is_some());
+
+        let events: serde_json::Value =
+            serde_json::from_str(&orchestration.telemetry_json()).unwrap();
+        let dispatch = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["name"] == "worker.dispatch_allowed")
+            .expect("dispatch recorded");
+        assert_eq!(dispatch["worker_role"], "implementer");
         join_worker(&registry, handle_id);
     }
 }

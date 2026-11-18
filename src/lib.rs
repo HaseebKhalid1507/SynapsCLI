@@ -5,7 +5,7 @@ pub use agent_core::pricing;
 
 // agent-engine is now a separate crate; re-export its modules as if they lived here
 pub use agent_engine::{
-    attachments, engine, events, extensions, help, mcp, orchestration, runtime, sidecar, skills,
+    attachments, engine, events, extensions, help, mcp, orchestration, runtime, skills,
     tools, EngineHost,
 };
 
@@ -22,10 +22,8 @@ pub use core::config;
 pub use core::error;
 pub use core::logging;
 pub use core::models;
-pub use core::protocol;
 pub use core::reasoning;
 pub use core::session;
-pub use core::watcher_types;
 
 pub use agent_core::SharedMessage;
 pub use agent_core::{next_turn_correlation_id, BudgetDimension, TurnError, TurnOutcome};
@@ -37,12 +35,6 @@ pub use session::{
     resolve_session, validate_name, Session, SessionInfo,
 };
 pub use tools::{Tool, ToolContext, ToolRegistry};
-pub use watcher_types::{
-    AgentConfig, AgentStatusInfo, ExitReason, HandoffState, HooksConfig, SessionLimits, SessionStats,
-    WatcherCommand, WatcherResponse,
-};
-
-pub mod watcher_session;
 
 // Re-export for convenience
 pub use serde_json::Value;

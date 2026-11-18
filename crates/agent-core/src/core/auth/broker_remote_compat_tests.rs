@@ -140,3 +140,58 @@ async fn an_empty_json_404_is_not_a_missing_route() {
     let err = broker.usage(&cred).await.unwrap_err();
     assert!(matches!(err, BrokerError::UnknownAccount { .. }), "{err:?}");
 }
+
+/// A limit on one model goes to the broker with its `model`; an account's
+/// limit goes without one (the body an older client always sent). A
+/// broker that predates `model` reads the body with its old type, which
+/// allows unknown fields: it accepts the report (and cools the account).
+#[tokio::test]
+async fn a_model_cooldown_report_names_its_model_and_an_old_broker_accepts_it() {
+    use axum::{routing::post, Json};
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OldCooldownReport {
+        provider: String,
+        account: String,
+        #[serde(default)]
+        until_ms: Option<u64>,
+        #[serde(default)]
+        reason: Option<String>,
+    }
+    let bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let seen = Arc::clone(&bodies);
+    let app = axum::Router::new().route(
+        "/accounts/cooldown",
+        post(move |Json(body): Json<serde_json::Value>| {
+            let seen = Arc::clone(&seen);
+            async move {
+                let old: Result<OldCooldownReport, _> = serde_json::from_value(body.clone());
+                seen.lock().unwrap().push(body);
+                match old {
+                    Ok(_) => axum::http::StatusCode::OK,
+                    Err(_) => axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                }
+            }
+        }),
+    );
+    let broker = remote(spawn(app).await);
+    let cred = CredentialRef::new(OAuthProviderId::Anthropic, Account::named("work").unwrap());
+    broker
+        .report_model_cooldown(&cred, "claude-fable-5", Some(42), "anthropic_quota_exhausted")
+        .await
+        .expect("an old broker accepts the report");
+    broker
+        .report_cooldown(&cred, Some(43), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(
+        bodies,
+        vec![
+            serde_json::json!({"provider": "anthropic", "account": "work", "until_ms": 42,
+                "reason": "anthropic_quota_exhausted", "model": "claude-fable-5"}),
+            serde_json::json!({"provider": "anthropic", "account": "work", "until_ms": 43,
+                "reason": "anthropic_quota_exhausted"}),
+        ]
+    );
+}

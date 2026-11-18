@@ -345,7 +345,12 @@ fn an_unknown_slash_in_a_worker_view_is_refused_there_not_sent_to_main() {
     assert!(h.take_actions().is_empty(), "nothing is sent");
     assert_eq!(h.input_contents(), "/zzz-not-a-command please");
     let worker = h.worker_transcript_text("sa_9");
-    assert!(worker.contains("unknown command: /zzz-not-a-command"), "{worker}");
+    assert!(
+        worker.contains(
+            "/zzz-not-a-command: not a command here while a turn runs; nothing was sent."
+        ),
+        "{worker}"
+    );
     assert!(!h.main_transcript_text().contains("zzz"));
 }
 

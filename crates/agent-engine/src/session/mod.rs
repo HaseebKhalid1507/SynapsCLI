@@ -13,7 +13,13 @@ pub mod cache_keepwarm;
 pub mod client_args;
 pub mod display;
 pub mod driver;
+mod fresh_id;
+/// Test-only: force the ids fresh sessions draw (`cfg(test)` / the
+/// `testing` feature).
+#[cfg(any(test, feature = "testing"))]
+pub use fresh_id::testing as fresh_id_testing;
 pub mod handle;
+pub(crate) mod owned;
 mod persister;
 pub(crate) mod session_start;
 /// Test-only controls of `on_session_start` scheduling (`cfg(test)` / the

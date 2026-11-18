@@ -17,7 +17,7 @@
 | `SYNAPS_DAEMON_PARKED_EVICT_SECS` | A **parked** session stays in the daemon's map (so `--attach <ID>`/the adopt banner find it) for this long, then is evicted (`Ended(Evicted)`). Default **1 h**; `never` keeps rows forever. Nothing is lost — the journal stays and `--continue <ID>` rebuilds it, exactly as after a daemon restart. A zero-turn session never parks: it ends (`Idle`) at the park deadline (F18). |
 | `SYNAPS_DAEMON_ADOPT=0` | Disable **adopt**: by default a plain `synaps` (no subcommand, no `--attach`; only `--system`/`-s`, `--continue`, `--prompt-manifest`, `--profile` allowed) runs as the thin socket client with `--attach --new` semantics (fresh session; `--continue` still continues) against the daemon for that profile — **spawning it first if none is running**, exactly like `--attach` (jcode model). A failed spawn, or `SYNAPS_DAEMON_AUTOSPAWN=0` with no daemon, falls back to the ordinary in-process boot with a notice. `SYNAPS_DAEMON_ADOPT=0`, or any other flag (`--no-extensions`, `--help`, attach modifiers) → in-process, untouched. |
 | `SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1` | Deprecated, ignored. Legacy MCP was removed: every mode uses per-session MCP leases, so the daemon no longer refuses to start with `progressive_tool_disclosure=false` and MCP servers configured. (`--allow-legacy-mcp` is likewise accepted and ignored.) |
-| `tools.activation_confirm = auto \| prompt \| deny` (config key, default `auto`) | Host policy for MODEL-INITIATED `activate_tools` under progressive disclosure. `auto`: granted without asking. `prompt`: the session raises a `Prompt{kind: Confirm}` ("Confirm tool activation" — the TUI shows a y/n dialog listing the exact ids; `synaps attach` prints `[confirm #id] …\n(y/n):`); only `y`/`yes` allows, anything else/Esc denies (fail-closed). `deny`: always refused, no prompt is raised (locked-down hosts). `server.auto_approve_confirms = true` / `--auto-approve-confirms` still grants regardless. The mode is logged once at boot (`tools.activation_confirm: …`). |
+| `tools.activation_confirm = auto \| prompt \| deny` (config key, default `auto`) | Host policy for MODEL-INITIATED `activate_tools` under progressive disclosure. `auto`: granted without asking. `prompt`: the session raises a `Prompt{kind: Confirm}` ("Confirm tool activation" — the TUI shows a y/n dialog listing the exact ids; `synaps attach` prints `[confirm #id] …\n(y/n):`); only `y`/`yes` allows, anything else/Esc denies (fail-closed). `deny`: always refused, no prompt is raised (locked-down hosts). `server.auto_approve_confirms = true` still grants regardless. The mode is logged once at boot (`tools.activation_confirm: …`). |
 | `SYNAPS_RUNTIME_DIR` | Where the socket/lock/json/pid live (default `~/.synaps-cli/run`, 0700). |
 | `process_scopes = auto \| off` (config key, default `auto`) / `SYNAPS_PROCESS_SCOPES` (env wins) | On Linux with a reachable systemd user manager, the spawned daemon, every bash tool command and every PTY shell start in their **own** transient scope (`systemd-run --user --scope`). systemd-oomd kills a whole cgroup at once; without this a runaway tool command shared the cgroup of the terminal that started the daemon, and an OOM kill took the command, the daemon and every session down together (S348). Separate scopes reduce shared-cgroup OOM exposure; they are not memory caps. Ancestor-cgroup or global kernel OOM can still kill the daemon and other sessions. Windows isolation is not implemented. Off, unavailable (macOS, containers, no user bus), or a session env without `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`: processes launch directly. Each launch probes with its effective environment and working directory (a three-second polling deadline after spawn, plus best-effort cleanup; offloaded for async bash and PTY startup). The probe never dispatches the requested command, but exact-environment execution is not a side-effect-free sandbox. Kernel-stalled spawn/reaping is not covered by an absolute wall-clock guarantee. A failed probe selects direct launch. Availability can race after a successful probe: any subsequent wrapper failure surfaces as an error, never an automatic direct retry, because the command may already have started. `daemon reload` re-execs in place and keeps the current cgroup; a daemon moves into its own scope at its next fresh start. Scopes show in `systemctl --user list-units --type=scope` as `synaps daemon` / `synaps tool: bash|shell`. |
 | `tool_scope_slice = <name>.slice` / `daemon_scope_slice = <name>.slice` (config keys, default unset) | The systemd slice the scopes above go in: `tool_scope_slice` for bash tool commands and PTY shells, `daemon_scope_slice` for the daemon's own scope (separate, so tools can be capped without the daemon). Set, Synaps passes `--slice=<name>` to `systemd-run`; unset or empty (`tool_scope_slice =`), the command line is exactly as without the keys. **Synaps sets no limits** — the operator does, on the slice. Use a top-level name such as `synaps_tools.slice`: a `-` nests, and `CPUWeight` only counts against siblings. A slice that doesn't exist is created empty, not refused. Recipe, rules and checks: [Capping tool commands with a slice](#capping-tool-commands-with-a-slice). |
@@ -162,6 +162,8 @@ Real systemd smoke tests require explicit `SYNAPS_TEST_REAL_SCOPES=1`; this does
 override an operator's `SYNAPS_PROCESS_SCOPES=off`.
 
 `synaps attach` is a thin line client: stdin lines → `Submit` (or `Steer` while streaming);
+any `/name` line that is none of the commands below is unknown and never sent (start a line with
+`//` to send text that begins with `/`: `//etc/hosts` sends `/etc/hosts`; the TUI reads `//` the same way);
 `/abort` → `Cancel`; `/detach`, `/quit` or **Ctrl-C → `Detach` + `Bye` — the turn keeps running**;
 `/close [force]` → engine command `close` (ends the session; see [Closing a session](#closing-a-session-close));
 `/model NAME`; `/cmd NAME [ARG]` (engine command); `/save`; `/new`; `/sessions` (status query);
@@ -194,6 +196,148 @@ To avoid accidental headless turns:
 The line client (`synaps attach`) follows the same double-press rule. The notice
 is printed to stderr so scripts piping stdout are not affected.
 
+## Owned sessions (headless clients)
+
+A session normally outlives its client: a client dying only detaches (F27),
+and the daemon strips secret env vars from `Hello.env`. Headless callers that
+abort by killing their `synaps` child (Pria's guest agent, Harbor and
+synaps-bench timeouts) need the in-process semantics back. An **owned**
+session gives them: it is bound to the connection that created it.
+
+- **Opt-in at create**: `Attach::Create{config, mode, owned: {forward_secrets?}}`.
+  Old clients never send `owned`, so they get today's session, byte for byte.
+- **Capability**: a daemon that honours it lists `"owned_sessions"` in
+  `Welcome.features` (absent on older daemons → empty). `PROTOCOL_VERSION` stays
+  exact-match and is not bumped, so older TUIs still reconnect after a reload.
+  A client asking for an owned session checks the feature **before** sending
+  the attach and fails with `DaemonTooOld` ("… predates owned sessions; run
+  `synaps daemon reload`") instead of getting an unowned session. It also
+  refuses an `Attached` reply without an owner token.
+- **Lifetime**: when the owner's connection goes away for any reason (`Detach`,
+  `Bye`, EOF, socket error, its process SIGKILLed), the daemon cancels a running
+  turn as `Cancel` does (partial reply kept, `InterruptReason::User` marker),
+  saves the journal and **ends** the session: no park grace, no keep-warm, it
+  leaves the map, and every other attached client gets
+  `Ended{reason: owner_gone}`. The connection's `Detach` is only the fast path:
+  the connection task hands the session a liveness lease with its claim and
+  holds it until it ends, however it ends (a full command queue that lost the
+  `Detach`, a panic), so the session never stays bound to nobody. A claim
+  whose lease is already closed when the session reads it (the connection
+  gave up on the attach first) never binds and attaches nobody: on a fresh
+  create, where nobody else ever had the token, the session ends right away
+  (`owner_gone`); on a re-bind it is ignored and the grace keeps running, so a
+  stale attempt cannot end a session the owner's next retry is about to
+  re-bind.
+- **Only the owner drives it**: other clients may attach with `mirror` or
+  `observe` and watch. A `takeover` attach by anyone but the owner is refused
+  ("… cannot be taken over"), and so is anything they send that would drive the
+  session: input (`Submit`, `Steer`), `Cancel`, prompt answers, settings,
+  engine/plugin commands such as `/close`, `/takeover`
+  ("… only that client can drive it"). They may still `Query`, `Resync`, `Save`
+  and detach. Input never passes to a watcher (the tools run with the owner's
+  env, and with `forward_secrets` its tokens). `synaps daemon close` from a
+  control connection keeps its host authority (refused while clients are
+  attached unless `--attached`, as for any session; the session itself makes
+  that check, together with the close, so an attach that gets there first is
+  never closed under).
+- **Owner lag is fatal for the owner**: a headless owner keys on every
+  `Usage`/`Done`/tool-result frame, so when its event stream lags the daemon
+  does not drop events silently: it sends an `Error` and
+  `Bye{bye: "owner_lagged", dropped}` (`TransportError::OwnerLagged` on
+  `SocketTransport`) and closes the owner's connection, which ends the session
+  as above. Lag wins over a reload: an owner that lost events (before the
+  reload announce or while its stream drained for it) gets `owner_lagged`, not
+  `Bye{reloading}`, and `SocketTransport` keeps `OwnerLagged` as its
+  `last_error()` whatever came first (no reload pending; `reconnect` refuses),
+  so it never re-binds across the gap. Its session, fenced for the exec, ends
+  when the re-bind grace passes. Other clients keep the usual "event stream
+  lagged" notice.
+- **Never parked, idle-ended or pinned**: `synaps daemon pin` and `/pin`
+  (`KeepWarm{on}`) are refused ("owned by the client that created it … cannot be
+  pinned or kept warm"); `synaps attach --owned --keep-warm` is a usage error.
+- **Never cache keep-warm**: no keep-warm period starts for an owned session,
+  whatever `cache_keepwarm`, `cache_keepwarm_headless` or its clients say, and
+  `/keepwarm <mode>` is refused (`/keepwarm status` still answers). Those pings
+  would be spend the owning client (rpc, chat) never sees in its usage
+  frames.
+- **Afterwards**: the journal is an ordinary one. `--continue` loads it as a
+  normal (unowned) session.
+- **Idle exit**: a live owner counts as a client like any other. Once it leaves,
+  the session is gone, so an auto-spawned daemon idle-exits as usual.
+- **Continuing a live session**: `config.continue_session` naming a session
+  that is live in this daemon with **no** clients attached (parked, or idle
+  between clients) ends it the way `synaps daemon close` does (saved, never
+  mid-turn) and adopts its journal as the new owned session. With clients
+  attached it is refused ("… attached by N client(s) …"), and so is another
+  client's owned session. Whether anyone is attached is decided by the
+  session, atomically with the close (a host-only `close unattached`), so a
+  client attaching meanwhile is never closed under: the create is refused.
+
+### Reload
+
+`synaps daemon reload` re-execs the daemon, which drops every connection,
+owners included. The owner gets a token for this: `Attached.owner_token`
+(sent to the owner only, never listed or logged). On a reload-initiated
+disconnect the session is checkpointed as usual and its token is recorded in
+the reload-state file (0600, deleted after the exec); the next image restores
+the session **unbound** (also when its journal is held by another process: the
+lock placeholder keeps the token). The grace, `SYNAPS_DAEMON_OWNER_REBIND_SECS`
+(default 30 s), starts once the new image accepts connections (the restore
+itself, extension rediscovery included, can take longer than the grace): the
+daemon then sends each restored owned session `ArmOwnerRebind`, retried while
+its command queue is full. A restored session is never unbounded, though: it
+starts with a fallback deadline of `SYNAPS_DAEMON_OWNER_RESTORE_CAP_SECS`
+(default 300 s) plus the grace, which the arm only ever shortens, so a lost arm
+still ends it. Until the owner is back the session starts no work of its own:
+carried worker wakes and queued events wait, then run once the owner
+re-binds. `SocketTransport::reconnect` sends the token in
+`Hello.reconnect_of.owner` and attaches to the same session, with the usual
+reconnect budget (`SYNAPS_TUI_ATTACH_RECONNECT_SECS`, 60 s): a re-bind after
+the session ended is refused ("unknown session"), which stops the retries.
+Tokens are compared in constant time. A wrong token is refused loudly
+(`owner token rejected`) and binds nothing. No re-bind within the grace → the
+session ends `OwnerGone` as above. If the exec fails, the old image keeps the
+session under the same rule, holding its work until the owner re-binds. Only a
+reload gives a grace: any other disconnect ends the session (its turn
+cancelled, the journal saved) as soon as the session sees the connection
+gone.
+
+### Forwarding secrets (`forward_secrets`)
+
+`owned.forward_secrets` (only honoured on an owned create; `synaps attach --owned
+--forward-secrets`, `SocketTransport::create_owned(.., forward_secrets: true)`)
+sends the variables `Hello.env` strips as secrets (the `is_secret_env` rule:
+name denylist or credential-shaped value), names and values, so the session's
+tools see the env an in-process run would: `bash`, `grep`/`find`/`ls` and the
+interactive shell (`shell_start`, which starts from the session's env, not the
+daemon's, and names the secrets the session lacks, as `bash` does when a
+failed command references one). Daemon side they are held in memory for the session's lifetime,
+kept apart from the session env (a `SecretEnv` whose `Debug` prints names
+only, inside the runtime's and the workers' tool env) and merged into a
+child's environment only when it is spawned; the forwarded names leave the
+`env_stripped` notice list. They are **never written by Synaps**: not copied
+into `SessionConfig` (the journal's env and the reload record come from it),
+not into the session files, the reload-state file, logs, traces or status
+output. What a tool does with them is the tool's business, as in-process: a
+command that prints a secret puts it in the conversation (and so the
+journal). A re-binding owner sends them again (they do not survive the exec).
+Unowned sessions are unchanged: secrets are stripped as before.
+`tests/daemon_owned.rs::forwarded_secrets_reach_the_tools_and_never_the_disk`
+has a tool print the dummy secret hex-encoded (so the conversation never holds
+it), then greps the whole test HOME (journals, session index, run dir, the
+daemon's `trace`-level log and stderr, and its `TMPDIR`, pointed under HOME)
+for the value. This widens the security model: **DECISION NEEDED** (see the
+PR).
+
+### Knobs
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `Attach::Create.owned` / `synaps attach --owned` | off | Create an owned session. |
+| `owned.forward_secrets` / `--forward-secrets` | off | Also forward secret env vars (owned only). |
+| `SYNAPS_DAEMON_OWNER_REBIND_SECS` | 30 | Re-bind grace after a daemon reload (from when the new image accepts connections). |
+| `SYNAPS_DAEMON_OWNER_RESTORE_CAP_SECS` | 300 | A restored owned session's longest wait for the arm: its fallback deadline is this plus the grace. |
+
 ## Closing a session (`/close`)
 
 Detaching leaves the session loaded in the daemon. It parks after the grace
@@ -224,7 +368,9 @@ session you are done with should be **closed**:
   input) unless `--attached` is given: closing it exits their TUIs and drops
   unsent input. `--force` only overrides work in flight, not attached
   clients; an attached session that is mid-turn needs both. The
-  daemon sends the session `close` (`force` with `--force`) with host authority
+  daemon sends the session `close` (`force` with `--force`; without
+  `--attached`, also the host-only `unattached`, so the session itself
+  refuses if a client attached after the daemon looked) with host authority
   under a fresh reserved id per request (from `CLOSE_QUERY_ID_BASE`), waits for that reply and for the actor to
   end, and answers `Closed`; the attached TUIs exit as above. Exit codes: 0
   closed; 3 refused (work in flight: the reply names it, `--force` closes
@@ -403,8 +549,8 @@ nothing until the first real turn. The restore holds the daemon's idle exit.
 - `SYNAPS_DAEMON_RESTORE_PINS=0` starts a daemon without restoring (the pin book
   is kept for the next start).
 - Not restored: `/system` overrides, `/settings` knobs changed in the session
-  (thinking, model override beyond the journal's, auto-approve), `/memory`
-  choice, running workers. The conversation, model, name and env come from the
+  (thinking, model override beyond the journal's, auto-approve), running
+  workers. The conversation, model, name and env come from the
   journal.
 - At boot: `deploy/synaps-daemon.service` (systemd user unit, with
   `loginctl enable-linger`) starts the daemon, and with it every pin.
@@ -475,15 +621,15 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions"]}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
 C: rename{session_id, name?, expect?}         → D: renamed{session_id, name, in_memory_only?} | rename_failed{session_id, reason, message, taken_by?, current_name?} | refused{unknown_session} (→ daemon closes)
 C: reload_extension{extension}                → D: extension_reloaded{report} | extension_reload_failed{extension, message, unloaded} | refused{busy} (→ daemon closes)
-C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode}
-D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients} | error
+C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode, owned?:{forward_secrets?:[[k,v]]}}
+D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients, owner_token?} | error
 C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event", session_id, seq, ts, event:WireSessionEvent} …
 C: bye | socket close = Detach (turn keeps running)
 ```
@@ -510,7 +656,7 @@ C: bye | socket close = Detach (turn keeps running)
   daemon's `Attached` carries `conversation.api_messages = []` + `conversation.messages_len` + a
   `display_tail {items:[{kind:user|thinking|text|tool_use,…}], omitted, times?}` projected by
   `session::display::display_tail` — the SAME filter the in-process TUI applies to its history, so Local
-  and Socket render byte-identical transcripts (golden test, `differential.sh` S pane). `times` holds each
+  and Socket render byte-identical transcripts (golden test). `times` holds each
   item's message time (RFC 3339 UTC, parallel to `items`), omitted when no item has one (legacy history,
   an older daemon). The conn
   forwarder drops `Stream(MessageHistory)` for Digest clients (they key on the `Conversation` digest that
@@ -556,6 +702,15 @@ C: bye | socket close = Detach (turn keeps running)
   `synaps daemon stop` ends them all. This is a footgun guard on a same-uid 0600 socket, not an auth boundary
   (`client_commands_are_whitelisted`).
 - `Attach::Create` fills `cwd` from `Hello.cwd`; it must be absolute and exist.
+- Owned sessions (see "Owned sessions") are additive, without a protocol bump: `Welcome.features`
+  (`#[serde(default)]`) advertises `owned_sessions`; `Attach::Create.owned`, `Attached.owner_token`
+  and `Hello.reconnect_of.owner` (`{token, forward_secrets?}`) are omitted when unused, so a plain
+  create/attach/reconnect encodes exactly as before. A client must not send `owned` to a daemon
+  without the feature (an older daemon ignores the unknown field). `Ended.reason` gains `owner_gone`;
+  `EndReason` has no catch-all, so an older client would fail the whole frame: the daemon sends
+  `owner_gone` only to clients that declare the `owner_gone` capability and tells the others
+  `client_quit` (`ended_for`). `Bye` gains `owner_lagged`, sent only to an owner (a client that
+  knows the feature).
 
 ## Security posture
 
@@ -701,11 +856,11 @@ reload-state are the same; the operating-system pieces differ:
   saved, then the draft is removed (if that save fails, the draft stays for the next holder). A leftover
   draft of a turn that actually concluded (history already ends with the model's final reply or an
   interruption marker) is just removed; a stale one (its round already committed) contributes no text.
-  Recovery only ever appends, so the cached prefix is untouched. rpc and `synaps server` save every
-  round but keep no draft; they DO take the session lock (`setup::lock_session`): continuing a
+  Recovery only ever appends, so the cached prefix is untouched. rpc saves every
+  round but keeps no draft; it DOES take the session lock (`setup::lock_session`): continuing a
   session another process has live (a TUI, the daemon, another rpc), or one already compacted into a
   successor, is refused with the reason named, instead of running a second writer on the same
-  history — and, as lock holders, they recover a draft their predecessor left. Legacy chat takes no
+  history — and, as a lock holder, it recovers a draft its predecessor left. Legacy chat takes no
   lock. Deleting a session (and retention) removes its draft.
 - Refuse-to-start (exit 3): flag unset; another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
@@ -757,8 +912,8 @@ Two transports carry an external `Event` into a session; they differ in who
 receives it.
 
 - **Per-session socket (targeted).** `synaps send --session <id|name|prefix>`,
-  the only-session case of a bare `synaps send`, `--broadcast`, agent-comms
-  and watcher `notify_session` all write to the socket on the session's
+  the only-session case of a bare `synaps send`, `--broadcast` and
+  agent-comms all write to the socket on the session's
   registry card. It always reaches that session, and wakes it even when
   parked (unpark, then an `EventAuto` turn as under Remote steering above).
 - **Shared inbox (untargeted).** `~/.synaps-cli/inbox/*.json`. A daemon
@@ -768,9 +923,7 @@ receives it.
   a session rehydrated by a reload takes none until a client reattaches. Each
   file is claimed by rename first, so exactly one session takes it. An
   in-process session (`synaps chat` without the daemon) takes inbox files
-  while it runs. A headless `synaps agent` never takes them: nobody is at
-  it, and it would race the session someone is at for the one copy. Reach
-  an agent through its socket (`synaps send --session <agent>`).
+  while it runs.
 - **`synaps send` and the inbox.** A `--session` that matches nothing is an
   error (exit 1, nothing written) that lists the running sessions; `--inbox`
   opts in to leaving it in the shared inbox instead. With no flag and zero or
@@ -797,8 +950,10 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    cancel (partial history kept + restart marker), answer prompts `None`, save, close PTYs, notice.
    Workers do not hold the drain: an idle parent waiting on workers counts as idle.
 3. **reload-state** `daemon[-P].reload.json` (0600): generation, per-session `{id, journal_id, config
-   (continue_session = journal_id, cwd, model), keep_warm, lifecycle, workers, tool_activations}`, and
-   `next_subagent_id` (the `sa_N` counter).
+   (continue_session = journal_id, cwd, model), keep_warm, lifecycle, workers, tool_activations,
+   supersedes, created_at}`, and `next_subagent_id` (the `sa_N` counter). `supersedes` and `created_at`
+   are the actor's [conversation cell](#conversation-identity): the next image's actor still holds the
+   journals it compacted away from, and the listing keeps the conversation's start.
 4. **Announce**: every other connection gets `Event(Reloading{generation, retry_after_ms: 500})` +
    `Bye{Reloading}` (forwarders drain the checkpoint's events first); the requester gets `Bye{Reloading}`.
 5. **Exec**: `daemon.json` rewritten (`generation+1`, same pid), sidecars stopped (≤ 5 s), the flock fd made
@@ -819,7 +974,8 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
 6. **New image**: `Daemon::start` sees `SYNAPS_DAEMON_RELOAD_STATE` → `DaemonLock::adopt(fd)` (same open file
    description = same flock, no gap), no `reap_stale`, rehydrates every recorded session
    (`create_session(continue_session = journal_id)`) **before** accepting; `reload_aliases` maps old→new
-   ids for one generation (they differ only after a LinkedSuccessor compaction). Before the first session
+   ids for one generation (they differ after a LinkedSuccessor compaction, a `/clear`, an in-session
+   `/resume`, or for an actor that took a minted id). Before the first session
    the handle counter is raised to `next_subagent_id` (and past every carried id); each continued
    session with tool activations gets the host-only `RestoreToolActivations` first, and each session
    with carried workers gets the host-only `AdoptWorkers` (both before any `Park`). The restore does not wait
@@ -836,8 +992,8 @@ marker kept), pending prompts (`None`), PTY/background shells (closed, announced
 `turn_replay`, input ownership (re-established by reconnect order + `was_owner`), running reactive
 workers (stopped resumably, see below).
 **Preserved** — each session's `Checkpoint{Reload}` reply carries a `SessionReloadRecord` that the new
-image rehydrates from: the journal and session id (same journal continued; `reload_aliases` only after a
-LinkedSuccessor compaction), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
+image rehydrates from: the journal and session id (same journal continued; `reload_aliases` when the
+session comes back under another id, see step 6), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
 compaction policy, auto-compact, persist), the keep-warm pin, the lifecycle (**a Parked session comes
 back Parked** — rehydrate creates it then sends the host-only `Park`), the non-persisted runtime knobs
 (`settings_replay`: `/context`, compaction model, API retries, subagent/bash timeouts, tool-output cap,
@@ -847,9 +1003,12 @@ activations** (`activate_tools` grants under progressive disclosure; see
 [Tool activations across a reload](#tool-activations-across-a-reload-or-a-park)). A session that never ran a turn has no
 journal (`save` skips an empty conversation): it is recreated fresh under a new id and aliased.
 A session whose journal lock is held by another process (e.g. an in-process `synaps --continue X`) is
-NOT recreated — it is registered as a **Parked placeholder** under the same id with `locked_by` set
-in its metadata. Attach is refused with a message naming the lock holder's pid and kind (F23).
-`daemon sessions` shows it as Parked with the `locked_by` marker.
+NOT recreated — it is registered as a **Parked placeholder** with `locked_by` set in its metadata,
+under the id a real session on that journal would take (the journal id, or a minted one if a session
+restored earlier has it), never replacing a session already registered; the old id is aliased to it. Attach is refused with a message naming the lock holder's pid and kind (F23).
+`daemon sessions` shows it as Parked with the `locked_by` marker. Every attach retries the real create;
+the placeholder stays listed while it runs and the real session replaces it in place under its id
+(it never leaves the list).
 
 Tested against a **real** `synaps daemon --foreground` process (`tests/daemon_reload.rs`): same pid before
 and after, `generation` 1→2, flock held throughout, conversation identical after reconnect, client is
@@ -863,6 +1022,43 @@ whole session's hit rate instead of restarting at the first request after the re
 miss). They live in the session's `.json` snapshot only (`Session::total_cache_read_tokens` /
 `total_cache_creation_tokens`), never in the journal: 0.10.1 rejects unknown journal fields. In
 journal mode they are as of the last snapshot. A session saved before they persisted resumes them at 0.
+
+### Conversation identity
+
+A session's `id` is the **actor**: what `Attach::Existing`, `close`, `pin` and `rename` take. Its
+`journal_id` is the **conversation**. They start equal and part when the actor moves to another journal:
+a linked-successor compaction (the same conversation continues in a successor journal), `/clear` and an
+in-session `/resume` (another conversation). Each actor keeps one conversation cell: the journal id, the
+journals it compacted away from since it last began a conversation (`supersedes`, at most 32), and when
+that conversation began.
+
+- **"Is this conversation running here"** has one answer, `SessionHandle::holds(journal)`: its current
+  journal or one in `supersedes`. `config.continue_session` (and `--continue`, `Attach::Create{continue}`)
+  attaches to the actor that holds the conversation, or that has the name; never to an actor merely
+  because its id matches. After `/clear`, actor `A` holds only the new journal `N`: resuming `A` builds a
+  second actor on `A`, and the cleared actor's old name no longer resolves to it (`/clear` publishes the
+  new conversation at once: no name, no title, zero messages, its own `created_at`).
+- **Minted ids:** the session map is keyed by actor id. A new actor whose journal id is already another
+  live actor's id (resuming `A` while the cleared actor `A` lives) takes a fresh id in the journal id
+  format instead. Both are listed; ending either leaves the other.
+- **Removal is by identity:** an actor that ends removes its own map entry only, never a session adopted
+  under the same id meanwhile.
+- **A lock-held placeholder** (a reload that found the journal locked elsewhere) holds the conversation
+  its reload record continues: after `/clear` that is `N`, not the actor id `A`. It is registered under
+  `N`'s id (the reload alias `A → N` covers the old one), so it never evicts a session restored before
+  it, such as the resumed conversation `A` that took the id `A`. Once the lock is free, the next attach
+  builds `N` in its place, never the pre-clear `A`.
+- **`--continue` with no argument right after `/clear`** continues the latest saved conversation, which is
+  the pre-clear `A` (`N` has no journal until its first turn, and the cleared actor no longer holds `A`):
+  it opens a second actor on `A` rather than reattaching to the cleared one.
+- **Known residual:** after `/clear` → resume `A` → `daemon reload`, both actors come back under their
+  journal ids (`N` and `A`). A client of the cleared actor that reconnects with `Attach::Existing{A}` gets
+  conversation `A`, not `N` (the live `A` is found before the reload alias). It should reconnect by the
+  journal id `Cleared{session_id}` gave it. Pinned by
+  `q11_reconnecting_by_a_cleared_actor_id_after_a_reload_finds_the_resumed_conversation`.
+
+Tested in `crates/agent-engine/tests/session_conversation_identity.rs`, the `live_match_tests` in
+`host.rs`, and `tests/daemon_reload.rs` (`supersedes_and_the_start_survive_a_reload`).
 
 ### Tool activations across a reload or a park
 
@@ -1048,16 +1244,12 @@ note: $GH_TOKEN was stripped from the session env as a secret; reattach from a s
 
 Honest list of behaviour changes on this branch on the plain in-process path (`synaps`, `synaps chat` — no `--attach`):
 
-1. **`synaps chat` runs on `SessionActor`** (`LocalTransport`, in-process). The differential test
-   (`tests/session_actor_differential.rs`) compares the actor against a *frozen re-derivation* of the
-   inline engine halves (not a verbatim copy; it has no abort/prompt/save) on **three scenarios only**:
-   plain turn, provider error repairing history, idle auto-turn to cap. **Tool loop, steer-mid-stream,
-   queue-while-busy, cancel (history + marker), secret-prompt round-trip are asserted by actor unit
-   tests, not by the differential.** `tests/chat_stdin.rs` is unchanged and green but never runs a turn through a
-   stub. The kill-switch `SYNAPS_CHAT_INLINE=1` only exists in a `--features legacy_inline` build.
-   Cancel diverges from the frozen oracle by design: the oracle folds an `ABORT CONTEXT` recap into the
-   next user message; the actor keeps the interrupted turn as history plus an interruption marker
-   (`cancel_keeps_real_history_where_the_oracle_folded_a_recap` pins both sides).
+1. **`synaps chat` runs on `SessionActor`** (`LocalTransport`, in-process). The actor's turn
+   scenarios are asserted directly (`tests/session_actor_scenarios.rs` and
+   `crates/agent-engine/tests/session_actor*.rs`); the frozen-reference differential that compared it
+   with the pre-actor inline loop was removed in 0.12.0, with the inline loop and its kill-switch
+   (`SYNAPS_CHAT_INLINE=1`, `--features legacy_inline`). Cancel keeps the interrupted turn as history
+   plus an interruption marker (`session_actor_interrupt.rs`).
 2. **MCP descriptor cache write-back is ON by default, in-process too** (`docs/mcp.md`): after the first
    `tools/list` on an exact lease the listing is written to `~/.synaps-cli/mcp-descriptors.json`, so the
    *next* boot registers dormant MCP tools it did not know before → tool list, system prompt and the
@@ -1123,9 +1315,8 @@ compiles that grammar's regexes → **≈ 13.7 MB** idle until the syntect idle 
 dump bytes, not heap. On `[madvise]`/`[never]` kernels the re-exec is skipped (nothing is
 huge-mapped before `main`); the remaining knobs are applied in-process.
 
-The socket differential (`SYNAPS_TUI_E2E_SOCKET=1 scripts/tui-e2e/differential.sh`) compares
-**content order**, not layout: its normaliser drops blank rows, `█` cursor rows and the
-`│Extensions` line before diffing L against S.
+The socket differential (`SYNAPS_TUI_E2E_SOCKET=1 scripts/tui-e2e/differential.sh`, removed in
+0.12.0 with the reference-binary differential it extended) compared **content order**, not layout.
 
 ### Fix round: daemon-tree RssAnon column (§9 of the phase-2 review)
 

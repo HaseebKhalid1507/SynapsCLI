@@ -34,7 +34,6 @@ mod run_setup;
 mod session_link;
 mod sessions;
 mod settings;
-mod sidecar;
 mod signals;
 mod stream_handler;
 mod subagent_tray;
@@ -260,21 +259,6 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
             // ── Live MXC palettes (myx theme) — UI-thread apply, same path as /theme ──
             Some(myx_theme) = app.myx_theme_rx.recv() => {
                 loop_arms::handle_myx_theme_arm(&mut app, myx_theme);
-            }
-
-            // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
-            sidecar_event = self::sidecar::next_event(&mut app.sidecars) => {
-                let (pid, event) = sidecar_event;
-                self::sidecar::handle_event(&mut app, &pid, event);
-                app.request_redraw();
-            }
-
-            // ── Sidecar non-blocking startup completion (G3, in-process only) ──
-            // Socket path: the TUI does not own a SidecarManager (G Q1);
-            // sidecar_starts is always empty under Socket, so this arm pends.
-            (pid, result) = self::sidecar::next_startup(&mut app.sidecar_starts) => {
-                self::sidecar::finish_startup(&mut app, &registry, pid, result);
-                app.request_redraw();
             }
 
             // ── Secret-prompt answers from the pane (PromptBridge) → Answer ──

@@ -101,6 +101,9 @@ pub(crate) enum WorkBlock {
     /// This session's `on_session_start` has not run yet: a request sent
     /// now would lack its injection.
     SessionStartPending,
+    /// An owned session a reload restored, its owner not back yet: no turn
+    /// may run without the owner (and the secrets it forwards again).
+    AwaitingOwner,
 }
 
 /// A source of autonomous work in the actor's loop: work nobody asked for
@@ -469,6 +472,11 @@ pub const PIN_OFF_NOTICE: &str = "unpinned: this session parks again when idle a
 
 /// The engine command behind `/close` (`SessionActor::close_command`).
 pub(crate) const CLOSE_COMMAND: &str = "close";
+/// Host-only `close` argument: end the session only if no client is
+/// attached, decided by the actor itself so an attach queued ahead of the
+/// close is never closed under (`synaps daemon close` without `--attached`,
+/// an owned create adopting a live session's journal).
+pub(crate) const CLOSE_UNATTACHED_ARG: &str = "unattached";
 
 fn is_close_command(cmd: &SessionCommand) -> bool {
     matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND)
@@ -483,7 +491,7 @@ fn is_rename_command(cmd: &SessionCommand) -> bool {
     matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND)
 }
 
-fn command_name(cmd: &SessionCommand) -> &'static str {
+pub(crate) fn command_name(cmd: &SessionCommand) -> &'static str {
     match cmd {
         SessionCommand::Submit { .. } => "submit",
         SessionCommand::SubmitPrepared { .. } => "submit_prepared",
@@ -510,6 +518,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::TakeInput => "take_input",
         SessionCommand::Park => "park",
         SessionCommand::AdoptWorkers { .. } => "adopt_workers",
+        SessionCommand::ArmOwnerRebind => "arm_owner_rebind",
         SessionCommand::RestoreToolActivations { .. } => "restore_tool_activations",
         SessionCommand::ReloadAborted => "reload_aborted",
         SessionCommand::ArmPark => "arm_park",
@@ -637,8 +646,9 @@ pub struct SessionActor {
     pub(crate) turn_worker_generation: u64,
     /// Mirrors `handle.lifecycle()` (B3 writes Parking/Parked).
     pub(crate) lifecycle: Arc<std::sync::atomic::AtomicU8>,
-    /// Mirrors `handle.journal_id()` (B2 stores the successor id).
-    pub(crate) journal_id: Arc<arc_swap::ArcSwap<String>>,
+    /// Mirrors `handle.journal()`: the journal id (B2 stores the successor
+    /// id), what it superseded, the conversation's start.
+    pub(crate) journal: super::handle::JournalSlot,
     /// Mirrors `handle.presence()` (clients / owner / pending prompts).
     pub(crate) presence: Arc<arc_swap::ArcSwap<super::handle::Presence>>,
     /// Mirrors `handle.name()`; `sync_name` after any rename.
@@ -660,13 +670,8 @@ pub struct SessionActor {
     /// Set by a reload checkpoint until the `execv` (or until the daemon
     /// reports it failed): see [`ReloadFence`].
     pub(crate) reload_fence: Option<ReloadFence>,
-    /// Shared with the handle: `config.memory_mode`, readable by a reload
-    /// that gets no checkpoint reply.
-    pub(crate) memory_mode_slot: super::handle::MemoryModeSlot,
-    /// This runtime's memory has been seen active (a grant took effect).
-    /// Only then does "memory is off" mean consent was revoked; see
-    /// `effective_memory_mode`. Reset whenever the runtime is rebuilt.
-    pub(crate) memory_seen_active: bool,
+    /// Owned sessions only (`SessionConfig::owned`): see `session::owned`.
+    pub(crate) owned: Option<super::owned::OwnedState>,
     /// While parked: the exact tool activations the dropped runtime held,
     /// handed to the runtime the unpark builds (and to a reload record
     /// written while parked). Empty while live.
@@ -694,6 +699,13 @@ fn release_fresh_lock(lock: Option<agent_core::session_lock::SessionLock>, conti
     }
 }
 
+/// The chat's folder as an unpark rebuilds it: the rule of a reload and of
+/// a pinned session ([`crate::daemon::reload::restorable_folder`]), so that
+/// the three ways a chat comes back agree on what a gone folder is.
+fn live_folder(cwd: Option<std::path::PathBuf>, chat: &str) -> Option<std::path::PathBuf> {
+    crate::daemon::reload::restorable_folder(cwd, chat)
+}
+
 impl SessionActor {
     /// = today's `setup::boot()` per session (foreground_runtime →
     /// resolve_session_and_prompt → journal lock → set_cwd → model override →
@@ -705,14 +717,7 @@ impl SessionActor {
     ) -> Result<(SessionHandle, SessionTask)> {
         // cwd goes in BEFORE apply_config (inside foreground_runtime_for) so the
         // one-shot memory binding scopes to the session's project (§4).
-        // A session that made its own `/memory` choice (carried by a reload)
-        // gets that, not the operator default.
-        let mut runtime = host
-            .foreground_runtime_with(cfg.cwd.clone(), cfg.memory_mode.is_none())
-            .await?;
-        if let Some(mode) = cfg.memory_mode {
-            runtime.restore_session_memory_mode(mode);
-        }
+        let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
         let config: crate::SynapsConfig = (**host.config()).clone();
         let client_input = cfg.client_input.unwrap_or(config.client_input);
 
@@ -750,19 +755,13 @@ impl SessionActor {
                 }
             }
         } else {
-            // Fresh session — best-effort lock.
-            let dir = agent_core::session_lock::sessions_dir();
+            // Fresh session: a taken id (another fresh session drew it) is
+            // never its own, so it draws another; never runs unlocked on it.
             let holder = agent_core::session_lock::LockHolder {
                 pid: std::process::id(),
                 kind: lock_kind.to_string(),
             };
-            match agent_core::session_lock::SessionLock::try_acquire(&dir, &sb.session.id, holder) {
-                Ok(lock) => Some(lock),
-                Err(e) => {
-                    tracing::warn!(session = %sb.session.id, "session lock: {e}");
-                    None
-                }
-            }
+            super::fresh_id::lock_fresh_session(&mut runtime, &mut sb, holder)?
         };
 
         // `--name` at create: apply BEFORE the registry entry is written so
@@ -852,17 +851,35 @@ impl SessionActor {
                     "extensions_ready timed out — on_session_start may miss late extensions"
                 );
             }
-            super::session_start::run_at_create(host, runtime.hook_bus(), &sb.session.id).await;
+            super::session_start::run_at_create(
+                host,
+                runtime.hook_bus(),
+                &sb.session.id,
+                cfg.cwd.as_deref(),
+            )
+            .await;
         }
 
-        let id = SessionId::from(sb.session.id.clone());
+        // The journal id, unless a live actor already has it as its id (a
+        // `/clear`ed actor keeps its id while its old conversation is
+        // resumed here): then a minted one. `create_session` holds the
+        // create lock, so no other create can take it meanwhile.
+        let id = host.actor_id_for(&sb.session.id);
+        // A reload hands back what the old image's actor held besides its
+        // journal; only for that same journal (a fresh fallback is not it).
+        let restored = cfg
+            .restore_conversation
+            .take()
+            .filter(|r| r.journal_id == sb.session.id);
 
         let meta = SessionMeta {
             id: id.clone(),
             name: sb.session.name.clone(),
             model: runtime.model().to_string(),
             cwd: cfg.cwd.clone(),
-            created_at: sb.session.created_at,
+            created_at: restored
+                .as_ref()
+                .map_or(sb.session.created_at, |r| r.created_at),
             continued: sb.continued,
             continue_info: sb.continue_info.as_ref().map(ContinueInfoWire::from),
             host_pid: std::process::id(),
@@ -911,14 +928,22 @@ impl SessionActor {
                 events,
                 view,
                 lifecycle,
-                journal_id,
+                journal,
                 presence,
                 name,
                 keep_warm: keep_warm_cell,
                 cache_keepwarm,
-                memory_mode,
             },
         ) = SessionHandle::new(meta.clone(), view);
+        if let Some(r) = restored {
+            journal.store(Arc::new(super::handle::JournalCell {
+                journal_id: r.journal_id,
+                supersedes: r.supersedes,
+                created_at: r.created_at,
+            }));
+        }
+        let handle = handle.with_owner_token(cfg.owned.as_ref().map(|o| o.token.clone()));
+        let owned = cfg.owned.clone().map(super::owned::OwnedState::new);
         // The mode is fixed for the session: seed the listing with it now.
         // Otherwise only a presence publish (attach, detach, input) carries
         // it, so a session restored at reload, with no client back yet,
@@ -928,7 +953,6 @@ impl SessionActor {
             client_input: Some(client_input),
             ..Default::default()
         }));
-        *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
         let session_start = if cfg.await_extensions {
             super::session_start::SessionStart::Done
@@ -939,12 +963,13 @@ impl SessionActor {
             super::session_start::SessionStart::queue(
                 host,
                 Arc::clone(&hook_bus),
-                Arc::clone(&journal_id),
+                Arc::clone(&journal),
+                cfg.cwd.clone(),
                 ext_ready_timeout,
             )
         };
 
-        let mut actor = SessionActor {
+        let actor = SessionActor {
             id,
             meta,
             config: cfg,
@@ -960,6 +985,7 @@ impl SessionActor {
                 config.cache_keepwarm_auto_max_hours,
                 config.cache_keepwarm_headless,
                 cache_keepwarm,
+                owned.is_some(),
             ),
             park_deadline: None,
             park_recheck_at: None,
@@ -1002,7 +1028,7 @@ impl SessionActor {
             subagent_tick: None,
             turn_worker_generation: 0,
             lifecycle,
-            journal_id,
+            journal,
             presence,
             name,
             keep_warm_cell,
@@ -1017,12 +1043,9 @@ impl SessionActor {
                 interval
             },
             reload_fence: None,
-            memory_mode_slot: memory_mode,
-            memory_seen_active: false,
+            owned,
             parked_tool_activations: Vec::new(),
         };
-        // Whether the build's grant (default or restored choice) took.
-        actor.observe_memory();
         if actor.keep_warm {
             actor.note_pin();
         }
@@ -1036,7 +1059,7 @@ impl SessionActor {
     /// in-process): the entry is added while pinned, dropped otherwise.
     pub(crate) fn note_pin(&self) {
         let Some(sink) = self.host.pin_sink() else { return };
-        let journal = (**self.journal_id.load()).clone();
+        let journal = self.journal_id_now();
         if self.keep_warm {
             let kw = self.cache_keepwarm.override_mode.map(|m| m.to_string());
             sink.pinned(self.id.as_str(), &journal, self.conv.session.name.as_deref(), self.config.cwd.as_deref(), kw.as_deref());
@@ -1045,12 +1068,23 @@ impl SessionActor {
         }
     }
 
+    /// The journal id as last published.
+    pub(crate) fn journal_id_now(&self) -> String {
+        self.journal.load().journal_id.clone()
+    }
+
     /// Publish a new journal id; a pinned session's book entry follows it.
-    pub(crate) fn set_journal_id(&mut self, new_id: String) {
-        let old = self.journal_id.swap(Arc::new(new_id.clone()));
-        if self.keep_warm && *old != new_id {
+    /// `why` decides what the actor still holds (`JournalCell::moved`): a
+    /// compaction keeps the old id, a `/clear` or a resume lets it go and
+    /// dates the conversation from `conv.session.created_at`.
+    pub(crate) fn set_journal_id(&mut self, new_id: String, why: super::handle::JournalMove) {
+        let created_at = self.conv.session.created_at;
+        let old = self.journal.load_full();
+        self.journal
+            .store(Arc::new(old.moved(new_id.clone(), why, created_at)));
+        if self.keep_warm && old.journal_id != new_id {
             if let Some(sink) = self.host.pin_sink() {
-                sink.moved(&old, &new_id);
+                sink.moved(&old.journal_id, &new_id);
             }
         }
     }
@@ -1068,7 +1102,7 @@ impl SessionActor {
         self.name.store(Arc::new(name.clone()));
         if self.keep_warm {
             if let Some(sink) = self.host.pin_sink() {
-                let journal = (**self.journal_id.load()).clone();
+                let journal = self.journal_id_now();
                 sink.renamed(&journal, name.as_deref());
             }
         }
@@ -1218,14 +1252,10 @@ impl SessionActor {
     /// hands off on `Idle` must never see the previous state. Per-round
     /// saves stay in the background; this waits once per turn.
     pub(crate) async fn announce_idle(&mut self) {
-        // A turn may have revoked memory consent (the `memory_context`
-        // tool): keep the handle's slot current for a reload that gets no
-        // checkpoint reply.
-        self.sync_memory_choice();
         self.flush_saves().await;
         // Before `Idle`, so a test that saw `Idle` knows the hook is in line.
         #[cfg(any(test, feature = "testing"))]
-        if super::session_start::testing::take_requeue(&self.journal_id.load()) {
+        if super::session_start::testing::take_requeue(&self.journal_id_now()) {
             self.queue_session_start();
         }
         self.emit(SessionEventWire::Idle);
@@ -1296,11 +1326,7 @@ impl SessionActor {
     pub(crate) fn reload_record(&self) -> SessionReloadRecord {
         let view = self.view.load();
         SessionReloadRecord {
-            // A consent revocation since the last record counts.
-            config: SessionConfig {
-                memory_mode: self.effective_memory_mode(),
-                ..self.config.clone()
-            },
+            config: self.config.clone(),
             keep_warm: self.keep_warm,
             lifecycle: SessionLifecycle::from_u8(
                 self.lifecycle.load(std::sync::atomic::Ordering::Acquire),
@@ -1385,6 +1411,7 @@ impl SessionActor {
             title,
             cost_usd,
             messages,
+            owning_client: self.owned.as_ref().and_then(|o| o.client),
         }));
     }
 
@@ -1513,6 +1540,8 @@ impl SessionActor {
             && !self.keep_warm
             && self.config.persist
             && !self.is_parked()
+            // Ends with its owner instead.
+            && self.owned.is_none()
             && self.driver.is_none()
     }
 
@@ -1543,7 +1572,8 @@ impl SessionActor {
     }
 
     /// `<sessions>/<id>.json` — written by both persistence modes.
-    fn journal_exists(&self) -> bool {        let id = (**self.journal_id.load()).clone();
+    fn journal_exists(&self) -> bool {
+        let id = self.journal_id_now();
         crate::config::resolve_write_path("sessions")
             .join(format!("{id}.json"))
             .is_file()
@@ -1799,6 +1829,8 @@ impl SessionActor {
     pub(crate) fn autonomous_work_blocked(&self) -> Option<WorkBlock> {
         if self.reload_fence.is_some() {
             Some(WorkBlock::Fenced)
+        } else if self.owned.as_ref().is_some_and(|o| o.awaiting_owner) {
+            Some(WorkBlock::AwaitingOwner)
         } else if !self.session_start.is_done() {
             Some(WorkBlock::SessionStartPending)
         } else {
@@ -1811,7 +1843,7 @@ impl SessionActor {
     pub(crate) fn holds(&self, source: WorkSource) -> bool {
         match self.autonomous_work_blocked() {
             None => false,
-            Some(WorkBlock::Fenced) => true,
+            Some(WorkBlock::Fenced | WorkBlock::AwaitingOwner) => true,
             Some(WorkBlock::SessionStartPending) => matches!(source, WorkSource::KeepWarmTimer),
         }
     }
@@ -1829,6 +1861,7 @@ impl SessionActor {
         }
         match self.autonomous_work_blocked() {
             Some(WorkBlock::Fenced) => return Some("daemon reloading"),
+            Some(WorkBlock::AwaitingOwner) => return Some("waiting for the session's owner to reconnect"),
             Some(WorkBlock::SessionStartPending) => return Some("extensions loading or reloading"),
             None => {}
         }
@@ -2386,6 +2419,8 @@ impl SessionActor {
             // detaches, killing the run mid-arm). `can_park` already guards.
             && self.driver.is_none()
             && self.driver_pending.is_none()
+            // Ends with its owner (or its re-bind grace) instead.
+            && self.owned.is_none()
     }
 
     pub(crate) fn rearm_park(&mut self) {
@@ -2572,9 +2607,6 @@ impl SessionActor {
         }
         self.runtime.session_manager().shutdown_all();
         self.turn_replay.clear();
-        // The unparked runtime is built from `config.memory_mode`: a
-        // revocation made without `/memory` must be recorded first.
-        self.sync_memory_choice();
         // The runtime's exact tool activations outlive it: the unparked
         // runtime restores them, so the tools array (the start of the cached
         // prompt prefix) and the model's tools are what they were.
@@ -2615,7 +2647,7 @@ impl SessionActor {
         let started = std::time::Instant::now();
         // Somebody came back: the eviction deadline armed by `park()` is void.
         self.park_deadline = None;
-        let journal_id = (**self.journal_id.load()).clone();
+        let journal_id = self.journal_id_now();
 
         // F10: re-acquire the journal lock before rebuilding the runtime.
         // If an in-process --continue took over while we were parked, fail
@@ -2641,6 +2673,10 @@ impl SessionActor {
             }
         }
 
+        // A folder deleted while the chat was parked is dropped, as reload
+        // drops it: the chat wakes in the daemon's folder and its project,
+        // not with a dead path that has no project at all.
+        self.config.cwd = live_folder(self.config.cwd.take(), &journal_id);
         let host = Arc::clone(&self.host);
         let cfg = self.config.clone();
         let queue = Arc::clone(&self.event_queue);
@@ -2649,14 +2685,8 @@ impl SessionActor {
         let view = self.view.load_full();
         let build = async move {
             let config: crate::SynapsConfig = (**host.config()).clone();
-            // §4: cwd before apply_config — see `create`. The session's own
-            // `/memory` choice, if it made one, instead of the default.
-            let mut runtime = host
-                .foreground_runtime_with(cfg.cwd.clone(), cfg.memory_mode.is_none())
-                .await?;
-            if let Some(mode) = cfg.memory_mode {
-                runtime.restore_session_memory_mode(mode);
-            }
+            // §4: cwd before apply_config — see `create`.
+            let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
             runtime.set_event_queue(queue);
             let mut sb = if journal_present {
                 crate::engine::setup::resolve_session_and_prompt(
@@ -2734,9 +2764,6 @@ impl SessionActor {
             let name = self.conv.session.name.clone();
             self.mirror_name(name);
         }
-        // A fresh runtime: whether its grant took effect is its own.
-        self.memory_seen_active = false;
-        self.observe_memory();
         self.publish_view().await;
         self.state = AttachState::Detached { running: false };
         self.set_lifecycle(SessionLifecycle::Live);
@@ -2902,7 +2929,8 @@ impl SessionActor {
         self.session_start = super::session_start::SessionStart::queue(
             &self.host,
             Arc::clone(&self.hook_bus),
-            Arc::clone(&self.journal_id),
+            Arc::clone(&self.journal),
+            self.config.cwd.clone(),
             extensions_ready_timeout(&self.host.config()),
         );
     }
@@ -2974,9 +3002,6 @@ impl SessionActor {
         // any foreground turn that starts while armed.)
         let auto_approve = self.config.auto_approve_confirms && self.driver.is_none();
         // Stamp this turn's worker launches before the stream can start any.
-        // A grant made since the last turn (e.g. while the session was
-        // being rebuilt) is seen before this turn can revoke it.
-        self.observe_memory();
         self.turn_worker_generation = self
             .runtime
             .subagent_registry()
@@ -3500,7 +3525,7 @@ impl SessionActor {
     /// token is: its canceled tool results say so ("Canceled by user" only
     /// for the user). First cause wins, so a teardown that revokes a driver
     /// and then cancels notes its own cause first.
-    fn note_cancel_cause(&self, reason: crate::engine::interrupt::InterruptReason) {
+    pub(crate) fn note_cancel_cause(&self, reason: crate::engine::interrupt::InterruptReason) {
         if !self.streaming {
             return;
         }
@@ -4272,7 +4297,7 @@ impl SessionActor {
                         }
                         let new_id = self.conv.session.id.clone();
                         self.runtime.set_session_id(Some(new_id.clone()));
-                        self.set_journal_id(new_id.clone());
+                        self.set_journal_id(new_id.clone(), super::handle::JournalMove::Compaction);
                         // F10: lock follows the new journal id.
                         self.reacquire_session_lock(&new_id);
                         // Wall 1: reset continuation state for the new session id
@@ -4586,7 +4611,7 @@ impl SessionActor {
         if self.is_parked() {
             let value = match query {
                 SessionQuery::Status => serde_json::json!({
-                    "session": (**self.journal_id.load()).clone(),
+                    "session": self.journal_id_now(),
                     "model": self.view.load().model,
                     "lifecycle": SessionLifecycle::Parked,
                     "streaming": false,
@@ -4746,7 +4771,12 @@ impl SessionActor {
     /// (else read-only + notice); `Takeover` steals with
     /// `InputOwnerChanged{reason: Takeover}` to everyone (the old owner's
     /// client renders the toast).
-    async fn attach(&mut self, client: ClientMeta, mode: AttachMode) {
+    async fn attach(&mut self, client: ClientMeta, mode: AttachMode, owner: Option<super::types::OwnerBind>) {
+        // An owner claim whose connection already gave up: nobody to attach,
+        // nothing binds, nothing held is released.
+        if owner.as_ref().is_some_and(|b| self.drop_dead_claim(b)) {
+            return;
+        }
         if let Err(e) = self.ensure_live().await {
             self.emit(SessionEventWire::AttachRefused { message: e });
             return;
@@ -4766,6 +4796,14 @@ impl SessionActor {
             cid,
             AttachedClient { meta: client, mode, name: name.clone(), attached_at_ms, last_input: 0 },
         );
+        // Before the presence publish below: the daemon reads the binding
+        // from it once `Attached` arrives.
+        let awaiting_owner = self.owned.as_ref().is_some_and(|o| o.awaiting_owner);
+        if let Some(bind) = owner {
+            self.bind_owner(cid, bind);
+        }
+        // A restored owned session's owner is back: what it held may run.
+        let resumed = awaiting_owner && self.owned.as_ref().is_some_and(|o| !o.awaiting_owner);
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
         match mode {
@@ -4787,6 +4825,11 @@ impl SessionActor {
                 owner_change = Some((self.input_owner, reason));
             }
         }
+        // An owned session's input is its owner's alone (the daemon refuses
+        // a non-owner's takeover attach before it gets here).
+        if self.watches_owned(cid) {
+            owner_change = None;
+        }
         if let Some((from, reason)) = owner_change {
             self.input_owner = Some(cid);
             self.emit(SessionEventWire::InputOwnerChanged {
@@ -4802,6 +4845,9 @@ impl SessionActor {
             snapshot,
         });
         self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode });
+        if resumed && !self.event_queue.is_empty() {
+            self.on_queue_wake().await;
+        }
     }
 
     /// B1 `/takeover`: the sending client takes input in place, as an
@@ -4840,7 +4886,7 @@ impl SessionActor {
     /// Never touches `stream`/`cancel`: the turn keeps running and its
     /// events buffer in the broadcast (§8 detach-without-abort). The owner
     /// leaving passes input to the oldest attached non-`Observe` client.
-    fn detach(&mut self, client: ClientId) {
+    pub(crate) fn detach(&mut self, client: ClientId) {
         if self.attached.remove(&client).is_none() {
             return;
         }
@@ -4850,11 +4896,12 @@ impl SessionActor {
             // `shared`: back to whoever typed last (a script that sent one
             // prompt and left hands input back to the tab in use);
             // `exclusive`: the lowest id, as before. Ties: the lowest id.
+            // An owned session: nobody (only its owner ever holds input).
             let shared = self.client_input == ClientInput::Shared;
             let next = self
                 .attached
                 .iter()
-                .filter(|(_, a)| a.mode != AttachMode::Observe)
+                .filter(|(_, a)| a.mode != AttachMode::Observe && self.owned.is_none())
                 .max_by_key(|(c, a)| (if shared { a.last_input } else { 0 }, std::cmp::Reverse(c.0)))
                 .map(|(c, _)| *c);
             self.input_owner = next;
@@ -5145,7 +5192,9 @@ impl SessionActor {
         tracing::info!(session = %self.id, "reload did not exec: fence lifted");
         self.adopt_carried_workers(workers, true);
         self.rearm_park();
-        if !self.event_queue.is_empty() {
+        // An owned session whose owner left for the reload holds them until
+        // it re-binds (`attach` wakes the queue then).
+        if !self.event_queue.is_empty() && !self.holds(WorkSource::QueueWake) {
             self.on_queue_wake().await;
         }
     }
@@ -5197,6 +5246,15 @@ impl SessionActor {
                     client: c,
                     command: command_name(&cmd).to_string(),
                     reason: "checkpoint(reload) is host-only; use `synaps daemon reload`".into(),
+                });
+                return ControlFlow::Continue(());
+            }
+            // An owned session: only its owner drives it.
+            if let Some(reason) = self.owned_refusal(c, &cmd) {
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason,
                 });
                 return ControlFlow::Continue(());
             }
@@ -5361,9 +5419,19 @@ impl SessionActor {
                 self.conv.clear(&self.runtime).await;
                 self.runtime
                     .begin_conversation(Some(self.conv.session.id.clone()));
-                self.set_journal_id(self.conv.session.id.clone());
+                // A new conversation: the old one is no longer held here
+                // (resuming it builds another actor), and the listing dates
+                // from the fresh session.
+                self.set_journal_id(
+                    self.conv.session.id.clone(),
+                    super::handle::JournalMove::Clear,
+                );
                 // F10: lock follows the new session id.
                 self.reacquire_session_lock(&self.conv.session.id.clone());
+                // The fresh session has no name: the old one must stop
+                // resolving to this actor. Title, cost and messages restart.
+                self.sync_name();
+                self.publish_presence();
                 self.emit(SessionEventWire::Cleared {
                     session_id: self.conv.session.id.clone(),
                 });
@@ -5375,16 +5443,19 @@ impl SessionActor {
             SessionCommand::Query { id, query } => self.query(id, query).await,
             // `/close` ends the session, which no other engine command can.
             SessionCommand::EngineCommand { id, name, arg } if name == CLOSE_COMMAND => {
-                if let Some(reason) = self.close_command(id, &arg) {
+                if let Some(reason) = self.close_command(id, &arg, from.is_none()) {
                     return ControlFlow::Break(reason);
                 }
             }
             SessionCommand::EngineCommand { id, name, arg } => {
                 self.engine_command(id, name, arg).await
             }
-            SessionCommand::Attach { client, mode } => self.attach(client, mode).await,
+            SessionCommand::Attach { client, mode, owner } => self.attach(client, mode, owner).await,
             SessionCommand::Detach { client } => {
-                self.detach(client);
+                // An owned session ends with its owner.
+                if let Some(reason) = self.detach_client(client) {
+                    return ControlFlow::Break(reason);
+                }
                 // Nobody left to notice a stale period: confirm the prefix
                 // now rather than at the next ping, so a session whose next
                 // request already changed is free to park.
@@ -5396,7 +5467,7 @@ impl SessionActor {
                 // `finish` cancels a running turn for this reason; note it
                 // before the revoke below cancels a driver turn first.
                 self.note_cancel_cause(match reason {
-                    EndReason::ClientQuit => crate::engine::interrupt::InterruptReason::User,
+                    EndReason::ClientQuit | EndReason::OwnerGone => crate::engine::interrupt::InterruptReason::User,
                     _ => crate::engine::interrupt::InterruptReason::Host,
                 });
                 if self.driver.is_some() {
@@ -5436,6 +5507,8 @@ impl SessionActor {
                 }
             }
             SessionCommand::TakeInput => self.take_input(from),
+            SessionCommand::KeepWarm { on: true } if self.owned.is_some() => self.refuse_owned_pin(from),
+            SessionCommand::ArmOwnerRebind => self.arm_owner_rebind(),
             SessionCommand::KeepWarm { on } => {
                 self.keep_warm = on;
                 self.meta.pinned = on; // the attach snapshot's copy
@@ -5490,10 +5563,11 @@ impl SessionActor {
             SessionLifecycle::Ending as u8,
             std::sync::atomic::Ordering::Release,
         );
-        // Quitting the client mid-turn is the user's interruption; every
+        // Quitting the client mid-turn is the user's interruption (so is
+        // an owned session's owner going away: `Cancel`'s marker); every
         // other end reason is the host's.
         let interrupt = match reason {
-            EndReason::ClientQuit => crate::engine::interrupt::InterruptReason::User,
+            EndReason::ClientQuit | EndReason::OwnerGone => crate::engine::interrupt::InterruptReason::User,
             _ => crate::engine::interrupt::InterruptReason::Host,
         };
         // Before the revoke below cancels a driver turn.
@@ -5513,7 +5587,7 @@ impl SessionActor {
         }
 
         let parked = !self.conv.is_live();
-        let session_id = (**self.journal_id.load()).clone();
+        let session_id = self.journal_id_now();
         let api_messages = if parked {
             None
         } else {
@@ -5557,6 +5631,7 @@ impl SessionActor {
         crate::extensions::loader::emit_session_end(
             &hook_bus,
             &session_id,
+            self.config.cwd.as_deref(),
             api_messages,
             budgets::HOOKS_TIMEOUT,
         )
@@ -5582,6 +5657,11 @@ impl SessionActor {
 
         // Inbox watcher, per-session UDS, registry entry, keyed injection.
         self.background.shutdown();
+        // The journal is final: release its lock now, before the command
+        // channel closes (`cmd_rx` drops ahead of `session_lock`), so whoever
+        // waited for `SessionHandle::closed` (a `daemon close`, an owned
+        // continue adopting this journal) can take it.
+        self.session_lock = None;
         self.emit(SessionEventWire::Ended { reason });
     }
 
@@ -5736,8 +5816,8 @@ impl SessionTask {
     }
 
     /// Test seam: a clone of this session's runtime. Clones share the
-    /// memory-consent state, so a harness can revoke consent the way the
-    /// `memory_context` tool's capability does (`memory_context_disable`).
+    /// session's state (continuation, tool set), so a harness can change a
+    /// setting on it before the task runs.
     #[cfg(any(test, feature = "testing"))]
     pub fn runtime_for_harness(&self) -> crate::Runtime {
         (*self.0.runtime).clone()
@@ -5795,6 +5875,16 @@ impl SessionTask {
                 }
                 _ = reload_fence_timer(actor.reload_fence.as_ref().map(|f| f.deadline)) => {
                     actor.reload_fence_expired().await;
+                }
+                _ = super::owned::rebind_timer(actor.owned.as_ref().and_then(|o| o.rebind_deadline)) => {
+                    if let Some(reason) = actor.owner_rebind_expired() {
+                        break reason;
+                    }
+                }
+                _ = super::owned::lease_closed(actor.owned.as_ref().and_then(|o| o.lease())) => {
+                    if let Some(reason) = actor.owner_lease_closed() {
+                        break reason;
+                    }
                 }
                 _ = revoked_turn_timer(actor.revoked_turn_deadline) => {
                     actor.finish_revoked_turn(false).await;
@@ -5881,6 +5971,44 @@ async fn await_stopped_workers(
         .filter(|(_, s)| s.read().unwrap_or_else(|p| p.into_inner()).stopped_by_reload)
         .map(|(id, _)| id.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod live_folder_tests {
+    use super::live_folder;
+
+    #[test]
+    fn only_a_missing_folder_or_a_file_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("chat");
+        std::fs::create_dir(&folder).unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(live_folder(None, "chat"), None);
+        assert_eq!(live_folder(Some(folder.clone()), "chat"), Some(folder.clone()));
+        assert_eq!(live_folder(Some(file.clone()), "chat"), None, "not a folder");
+        assert_eq!(live_folder(Some(file.join("below")), "chat"), None, "below a file");
+        assert_eq!(live_folder(Some(tmp.path().join("gone")), "chat"), None, "absent");
+    }
+
+    /// A folder that cannot be looked at now (here: a parent without
+    /// search permission) may be back later: it is kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_checked_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let locked = tmp.path().join("locked");
+        let folder = locked.join("chat");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::metadata(&folder).is_err();
+        let kept = live_folder(Some(folder.clone()), "chat");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if denied {
+            assert_eq!(kept, Some(folder));
+        }
+    }
 }
 
 #[cfg(test)]

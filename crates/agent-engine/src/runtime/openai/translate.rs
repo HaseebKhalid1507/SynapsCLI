@@ -134,11 +134,7 @@ pub fn tools_to_oai(schema: &[Value]) -> (Vec<ToolDefinition>, ToolNameMap) {
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?.to_string();
             // Skip empty names and internal-only tools
-            if name.is_empty()
-                || name == "respond"
-                || name == "send_channel"
-                || name == "watcher_exit"
-            {
+            if name.is_empty() || name == "respond" || name == "send_channel" {
                 return None;
             }
             let mut oai_name = sanitize_oai_tool_name(&name);
@@ -877,18 +873,16 @@ mod tests {
 
     #[test]
     fn responses_opt_out_of_implicit_strict_without_promoting_optional_fields() {
-        use crate::tools::{
-            forum::{ForumForgetTool, ForumPostTool, ForumReadTool},
-            Tool,
-        };
-        let mut schemas = vec![];
-        for tool in [
-            &ForumPostTool as &dyn Tool,
-            &ForumReadTool,
-            &ForumForgetTool,
-        ] {
-            schemas.push(json!({"name":tool.name(),"description":tool.description(),"input_schema":tool.parameters()}));
-        }
+        // Optional fields that a provider may send as null, as an
+        // extension's read tool declares them.
+        let mut schemas = vec![json!({"name":"ext:nullable","description":"reads","input_schema":{
+            "type":"object",
+            "properties":{
+                "thread_id":{"type":["string","null"]},
+                "after":{"type":["object","null"],"properties":{"timestamp_ms":{"type":"integer"},"id":{"type":"string"}},"required":["timestamp_ms","id"]}
+            },
+            "required":[]
+        }})];
         schemas.push(json!({"name":"ext:optional","input_schema":{"type":"object","properties":{"required_value":{"type":"string"},"optional_value":{"type":"string"}},"required":["required_value"]}}));
         let (responses, names) = tools_to_responses(&schemas);
         let (chat, _) = tools_to_oai(&schemas);
@@ -901,7 +895,7 @@ mod tests {
                 .is_none());
         }
         assert_eq!(names.to_original("ext_optional"), "ext:optional");
-        let p = &responses[1]["parameters"];
+        let p = &responses[0]["parameters"];
         assert_eq!(p["required"], json!([]));
         assert_eq!(
             p["properties"]["thread_id"]["type"],

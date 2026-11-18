@@ -36,6 +36,7 @@
 #
 # Usage:    python3 bench_memory.py --sessions 1 10 --reps 3 --tools synaps jcode
 #           SYNAPS_BIN=/path/to/synaps python3 bench_memory.py --sessions 10
+#           python3 bench_memory.py --sessions 1000 --launch-wait 0.1   # scaling
 
 from __future__ import annotations
 
@@ -44,6 +45,7 @@ import json
 import os
 import pty
 import re
+import resource
 import select
 import shutil
 import signal
@@ -237,6 +239,8 @@ def launch(argv: list[str], env: dict[str, str], timeout_s: float, settle_s: flo
                 chunk = os.read(master, 65536)
             except BlockingIOError:
                 chunk = b""
+            except OSError:  # EIO: the client exited and its side of the PTY is closed
+                break
             if chunk:
                 buf = answer_caps(master, buf + chunk)
                 plain = ANSI_RE.sub("", buf.decode("utf-8", "replace"))
@@ -255,7 +259,9 @@ def launch(argv: list[str], env: dict[str, str], timeout_s: float, settle_s: flo
             break
     if ready:
         time.sleep(settle_s)
-    return Launch(proc.pid, os.getpgid(proc.pid), master, ready, excerpt)
+    # preexec_fn=os.setsid makes pgid == pid. os.getpgid() would raise
+    # ProcessLookupError for a client that exited (and was reaped) during launch.
+    return Launch(proc.pid, proc.pid, master, ready, excerpt)
 
 
 def proc_map() -> dict[int, tuple[int, int]]:
@@ -462,7 +468,17 @@ def drain(launches: list[Launch], seconds: float) -> None:
                 fds.discard(fd)
 
 
-def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float, hold_s: float = 0.0) -> dict:
+def exited(pid: int) -> bool:
+    """True once a launched process is gone or a zombie."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return True
+    return stat[stat.rfind(")") + 2:].startswith("Z")
+
+
+def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float, hold_s: float = 0.0,
+             launch_wait: float = 4.0) -> dict:
     tag = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
     env = os.environ.copy()
     env.update(spec.env)
@@ -487,7 +503,7 @@ def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float, h
             # keep-warm attach clients (thin clients don't paint a detectable
             # banner; short launch timeout + explicit settle below)
             for _ in range(sessions):
-                lc = launch([bin_, "--attach", "--new", "--keep-warm"], env, min(timeout_s, 4.0), settle_s)
+                lc = launch([bin_, "--attach", "--new", "--keep-warm"], env, min(timeout_s, launch_wait), settle_s)
                 launches.append(lc)
                 cleanup.append(lc.pgid)
             time.sleep(max(settle_s, 3.0))
@@ -527,6 +543,12 @@ def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float, h
                 launches.append(lc)
                 cleanup.append(lc.pgid)
             roots = [l.pid for l in launches]
+        dead = [l for l in launches if exited(l.pid)]
+        gone = len(dead)
+        if dead:
+            said = next((l.excerpt for l in dead if l.excerpt), None)
+            print(f"  WARNING: {gone}/{sessions} launched session(s) exited before the sample; "
+                  f"the total undercounts. First one said: {said}", flush=True)
         at_launch = sum_tree_pss(roots, cleanup, tag)
         res = at_launch
         if hold_s > 0:
@@ -537,6 +559,7 @@ def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float, h
         res["hold_s"] = hold_s
         res.update({"tool": spec.name, "sessions": sessions,
                     "ready": sum(l.ready for l in launches),
+                    "exited_early": gone,
                     "excerpt": next((l.excerpt for l in launches if l.excerpt), None)})
         return res
     finally:
@@ -578,6 +601,11 @@ def main() -> int:
                     help="max memory PSI some-avg10 (%%) before/after a sample")
     ap.add_argument("--quiet-wait", type=float, default=900.0,
                     help="seconds to wait for memory pressure to drop before each sample")
+    ap.add_argument("--launch-wait", type=float, default=4.0,
+                    help="synaps only: seconds each attach client gets before the next launch "
+                         "(thin clients paint no detectable frame, so this is a fixed wait). "
+                         "0.1 makes a 1000-session run take minutes; the sample is still "
+                         "taken --settle s after the last launch")
     ap.add_argument("--max-attempts", type=int, default=3,
                     help="retries of a repetition that saw memory pressure (last one is kept, flagged)")
     args = ap.parse_args()
@@ -600,9 +628,26 @@ def main() -> int:
     print(f"pre-existing synaps daemons (must survive): {sorted(live) or 'none'}", flush=True)
     if "synaps" in args.tools:
         print(f"synaps base dir (isolated): {bench_base_dir()}", flush=True)
+    # The synaps daemon (spawned from here, so it inherits this limit) holds
+    # ~5 fds per session and this process one PTY per launch. At the usual
+    # soft limit of 1024 the daemon refuses new sessions past ~170-200
+    # ("Too many open files"): raise the soft limit for large runs, and say so.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    need = 6 * max(args.sessions) + 128
+    if "synaps" in args.tools and soft != resource.RLIM_INFINITY and soft < need:
+        new = need if hard == resource.RLIM_INFINITY else min(need, hard)
+        if new > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (new, hard))
+            print(f"RLIMIT_NOFILE soft {soft} -> {new} for {max(args.sessions)} sessions "
+                  f"(a daemon started from a default shell keeps {soft})", flush=True)
+            soft = new
+        if new < need:
+            print(f"WARNING: RLIMIT_NOFILE hard limit {hard} is below the ~{need} fds "
+                  f"{max(args.sessions)} sessions need; expect the daemon to refuse sessions "
+                  f"past ~{max(0, (new - 16) // 6)}", flush=True)
     payload = {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "machine": machine_info(), "args": vars(args), "versions": {},
-               "live_daemons_before": live, "summary": [], "runs": []}
+               "live_daemons_before": live, "rlimit_nofile": [soft, hard], "summary": [], "runs": []}
     for name in args.tools:
         spec = specs.get(name)
         if not spec:
@@ -616,7 +661,7 @@ def main() -> int:
                 for attempt in range(1, args.max_attempts + 1):
                     before = wait_quiet(args.max_psi, args.quiet_wait)
                     check_live_daemons(live)
-                    res = run_tool(spec, n, args.timeout, args.settle, args.hold)
+                    res = run_tool(spec, n, args.timeout, args.settle, args.hold, args.launch_wait)
                     check_live_daemons(live)
                     after = mem_pressure()
                     res.update({"pressure_before": before, "pressure_after": after, "attempt": attempt})

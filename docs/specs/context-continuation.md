@@ -188,12 +188,16 @@ than silently behaving differently; the TUI/chat streaming engine supports it.
    summarized away: dropped turns stay archived and indexed. See `context-rollover-recovery.md`.
 4. Seal the old eligible source projection and working note to a private archive,
    with data/directory sync and retry deduplication. Verify the note before commit.
+   With the file store a window over the limits of one archive is sealed as
+   several archives instead of failing (see "A window over the limits of one
+   archive" below).
 5. Request a frontend durable-head checkpoint. The frontend validates the logical
    session ID, preserves host metadata/accounting and saves a full snapshot in
    either persistence mode. Only a successful durable acknowledgement permits
    the runtime to publish the new window and dispatch another provider round.
-   A private message marker identifies the window/archive for resume; it is
-   removed before provider wire serialization.
+   A private message marker identifies the window/archive for resume (and
+   lists the archives of a window sealed as several); it is removed before
+   provider wire serialization.
 6. Continue with the same turn meter, authority, tools and runtime state.
 
 Archive retry deduplication is bound to the persisted session ID, while retrieval
@@ -208,6 +212,185 @@ restricted/sensitive content and binary blocks. Ordinary text and eligible tool
 evidence are screened/redacted, not summarized. User-authored images remain in
 active context; the archive does not claim to preserve every original byte.
 Redaction is defense-in-depth, not a universal secret detector.
+
+### A window over the limits of one archive
+
+One archive holds at most 4,096 source messages, 16 MiB of eligible input,
+65,536 visited input nodes at depth 32 or less, and 16 MiB once serialized.
+A window over any of these used to fail the seal with "archive commit failed;
+history retained", so the rollover failed, the turn ended, and the same window
+failed again on every later attempt.
+
+Such a window is now sealed as
+several consecutive archives, "parts". The store fills the window part by
+part from its start: a part runs from where the one before ended until the
+next message would take it over a limit (moved back so that the next part does
+not begin with tool results, where it can), and a part that is only found too
+large once written is tried again at the largest power of two messages below
+its length. Where a part ends therefore depends on the messages before its
+end and not on how many follow. The limits are unchanged; every part is an
+ordinary archive, fetched by its own id. Together the parts hold each archivable message of the
+window once, in order. The working note is stored with the last part. A window
+within the limits is one archive, and everything about it is as before: the
+same archive, the same continuation message, the same marker, the same hook
+event.
+
+Only a single message that is over a limit by itself cannot be cut out. It is
+stored as a part of its own in reduced form, by as little as makes it fit:
+first without the tool inputs that are too large, then without any tool input,
+then with long strings and block lists cut short. Each omission is marked in
+place with its size and the stored message carries `_archive_reduced`. This is
+the one case where the archive is not exact, and the continuation message says
+so.
+
+**The continuation message.** For one archive it reads as it always has:
+
+```text
+Earlier eligible source evidence: ctx-<id> (212 messages), available via memory_search(source=history) and memory_fetch if a specific needed fact is missing.
+```
+
+For several parts it lists every part in source order, each with the range of
+the window's source messages it covers and the number of messages stored
+(fewer than the range when system messages or restricted content were left
+out), marks a part that holds a reduced message, and says how to read the
+indices:
+
+```text
+Earlier eligible source evidence, in source order: ctx-<id A> (source messages #0-#2499, 2431 archived), ctx-<id B> (#2500-#2500, 1 archived, 1 reduced), ctx-<id C> (#2501-#4999, 2402 archived), available via memory_search(source=history) and memory_fetch if a specific needed fact is missing; within each archive memory_fetch's source_index starts again at 0: source message #i is the row whose source_index is i minus the first number of its range, and since start counts archived messages it is at that start or a lower one. 1 message was too large for one archive and is stored with its oversized payloads omitted, each marked in place.
+```
+
+- `memory_fetch(ids=["ctx-<id>"], start, limit)` works on each part by itself;
+  `start` counts that part's stored messages from 0.
+- A `#i` in the list of dropped requests is an index in the window. The part
+  whose range contains `i` holds that message, as `source_index = i - first`.
+  That is not the `start` to fetch it with: `start` counts stored messages,
+  and a part stores no more messages than it covers, so the row is at
+  `start = i - first` only when nothing before it in the part was left out,
+  and otherwise at a lower `start`. The message says so, because a model
+  that passes `i - first` as `start` reads a later message or none.
+- Two parts with identical content are one archive, listed once per range.
+- At most 32 parts are listed by id, always the last ones, which hold the
+  newest messages. Earlier parts are counted with the range they cover (`5
+  earlier archives not listed here (source messages #0-#49), ctx-<id>
+  (#50-#59, 10 archived), ...`) and are found with
+  `memory_search(source=history)`.
+- Fewer are listed when naming them all would fail a check. The new window's
+  size is estimated before the seal, when the parts are not known, and the
+  estimate assumes as many parts as the message limit alone implies: one for
+  a window of up to 4,096 messages. Both checks (does the rollover make the
+  window more than 1,024 tokens smaller, is the new window under the request
+  budget) are made on that estimate. After the seal both are made again on
+  the real message, and while it fails one, a part is taken off the list,
+  earliest first, down to one. A listed part costs about 30 tokens. Nothing
+  is sealed again, and every part stays in the marker (below).
+- With one part listed the list cannot get shorter. A window that was taken
+  for one archive and sealed as several is then still longer than the
+  estimate, by the wording of the longer sentence: under 200 tokens whatever
+  the number of parts. The 1,024 tokens of the first check are a margin, and
+  a rollover that saves that little less is still made. The request budget
+  is a limit, and it is held before the seal: a rollover whose message
+  could be at or over it with one part listed is refused there, with the
+  history kept and nothing written ("Refused before the seal", below).
+- A stub for a first request too large to keep names the part that holds it.
+
+**The marker.** `_synaps_context.archive` is the id of the last part, the one
+that holds the note, so resume reads one id whether the window was one archive
+or several. For a window sealed as several parts, or with a reduced message,
+the marker also has `archives`, every part in order (never capped):
+
+```json
+"archives": [
+  {"id": "<id A>", "first": 0,    "count": 2500, "messages": 2431},
+  {"id": "<id B>", "first": 2500, "count": 1,    "messages": 1, "reduced": 1},
+  {"id": "<id C>", "first": 2501, "count": 2499, "messages": 2402}
+]
+```
+
+`first` is the index in the window of the part's first source message, `count`
+the source messages it covers, `messages` the messages stored, `reduced` (only
+when not 0) those stored reduced. The archive files record nothing about each
+other, so this list, saved with the session head, and the per-part
+`on_context_archived` events are the only record of how a window was cut.
+Resume reads `archives` back only to check it (below); nothing is rebuilt from
+it. Like `archive`, it describes the window just archived and is replaced at
+the next rollover, after which those parts are ordinary archives found by
+search.
+
+**Resume.** A chat that rolled over in parts restores exactly as one that
+rolled over into a single archive: the window number and the last part's id,
+once that archive is found. (So forgetting the last part of a window with
+`memory_forget` has the effect forgetting the single archive has: the window
+count is not restored. Forgetting another part does not.)
+
+The archive is looked for in the store of the project the chat is resumed in.
+That is where the rollover wrote it when the chat comes back in the same
+project: a daemon reload or restart, a parked chat woken, `--continue` from a
+folder of that project. A chat continued from a folder of another project
+takes that folder's project, where the archive is not, and goes on at window 1
+without an archive link.
+
+- **Not found** settles it, and is logged: a warning names the archive and the
+  project whose store was searched and says which it was, the chat has no
+  project, the project has no archive store, or the store does not hold the
+  archive (missing, forgotten, or sealed in another project).
+- **A lookup that failed** for any other reason (the store is busy, something
+  in it cannot be read) settles nothing. It is logged, the chat goes on, and
+  the lookup is made again at the next request, once, until it finds the
+  archive, finds that it is not there, or the chat rolls over: a committed
+  rollover settles the state with the window it made, numbered from window 1.
+- **The other parts.** For a head that lists several parts, each listed id is
+  looked up as well, in the background, and the log names every one the store
+  cannot give back. This is a warning only: the continuation message still
+  lists the part, and the resume neither waits for the check nor depends on
+  it. At most 64 ids are looked up, the first of the list, each once; the
+  rest are logged as one count.
+- **Only an id is used.** The marker comes from a session file. A value in
+  `archive` or in an `archives[].id` that is not 32 lowercase hex characters
+  is not fetched and not written to the log: a marker whose `archive` is not
+  an id counts as "not found" and the log gives its length, and such
+  entries of `archives` are counted.
+
+The lookup reads a file and can wait for a busy store; the continuation state
+is not locked while it does.
+
+**Interrupted between parts.** Each part is written and synced by itself. If
+sealing stops after some parts (a full disk, a store locked by another process
+for more than five seconds, a cancelled turn), the rollover fails with the
+history kept, exactly as a failed single seal does: no new window, no marker,
+no hook event, so a partial window is never recorded or announced as a whole
+one. The parts already written stay on disk as ordinary archives that no chat
+refers to; they are searchable and are not cleaned up. The next attempt seals
+the window as it then is. A part whose content is already on disk is found
+there and not written again, so an attempt on the same window writes only what
+is missing and returns the list the first one would have returned. After a
+failed turn the window has usually grown, by the user's message at least.
+Because a window is filled from its start, the new attempt's parts are the
+earlier ones up to the last: every part that was full is found on disk and
+not written again. Only the earlier attempt's last part, which ended where
+the window then ended, is not come to again: its messages are stored once
+more in the new last part or parts, and it stays on disk unreferenced. Only
+the list of the attempt that completes is recorded and announced.
+
+**Refused before the seal.** A rollover whose new window would not be under
+the request budget is refused before anything is written. The seal decides
+the parts, so the check is made on an upper bound: the message with one part
+named (the shortest it can be made after the seal) and every number in its
+sentence as wide as it can be for a window of that length. That is up to
+about 200 tokens more than the message of a window sealed as one archive, so
+a rollover is refused that much below the budget whether or not the window
+turns out to be split. The same check after the seal stays as a last line.
+It can still refuse in one case: the message carries the note the store
+returns, which is the note after the store's redaction, or, when the last
+part's content was already sealed, the note stored with it then; a returned
+note longer than the one given is not known before the seal. The error then
+says that the window's archives were already written.
+
+Extensions are told of a window's archives (`on_context_archived`, one event
+per part) only when the rollover is committed: every part is on disk, the new
+head is saved and acknowledged, and the engine has moved to it. A rollover
+given up before that announces nothing. If the process dies after the save and
+before the events are sent, the saved head names archives no extension was
+told of, and nothing sends the events later.
 
 Cancellation before head publication preserves active history. An already-running
 atomic archive write can finish after cancellation, leaving an unreferenced
@@ -255,7 +438,13 @@ memory_fetch(ids=["ctx-<exact-returned-id>"], start=0, limit=8)
 ```
 
 `source=notes` (default) retains the existing note-store semantics. History
-results contain opaque IDs and bounded snippets. Fetch returns source indices;
+results contain opaque IDs and bounded snippets, newest archive first. When the
+file store's scan budget (below) stops a search before the oldest archive, the
+result ends with one line saying so, with the number actually read, for example
+`(searched the 1024 most recent archives; older ones were not scanned)`, so
+that an empty result is not read as "nothing older exists". Fetch returns
+source indices (within the fetched archive: for a part of a window sealed as
+several, counted from that part's first message);
 large messages support `offset_bytes` within the message at `start`, with a
 continuation hint. Output is bounded to about 24 KiB. Existing note IDs remain
 unchanged. Fetch/search failures are not replaced with made-up history.
@@ -268,38 +457,79 @@ projection may still contain duplicated material. This is exact-projection
 suppression, not content-wide erasure.
 
 Archives live under the private `context-archives/<scope-hash>/` directory,
-separate from ordinary session-retention cleanup. Limits: 128 slots including
-tombstones, 16 MiB eligible input/serialized segment, 256 MiB per project,
-4,096 source messages, 65,536 visited input nodes and depth 32. Excluded message
+separate from ordinary session-retention cleanup. That directory holds numbered shelves, `s000001/`,
+`s000002/` and so on, each with at most 128 archives, one `<archive id>.json`
+per archive. A full shelf is followed by a new one. The store has no limit on
+how many archives a project holds or on their total size, and sealing never
+deletes, moves or replaces an older archive: only `memory_forget` rewrites a
+file, the one it names, and a forgotten archive keeps its place as a tombstone.
+An archive's id is 32 hex characters, one half of its digest: the first half,
+or the second when something else already has the first as its name. Nothing
+may work an id out from a digest or the other way round; the id an archive has
+is the one its seal returned, and that is the name of its file. Fetching by id
+opens one file and never scans the store.
+
+A directory written by an earlier version keeps its `000.json` to `127.json`
+slot files. They are read and tombstoned where they are, with no migration
+step, and nothing is added to them. An earlier version pointed at the same
+directory sees only those slot files, not the shelves.
+
+Limits on one archive: 16 MiB eligible input/serialized segment, 4,096 source
+messages, 65,536 visited input nodes and depth 32. Excluded message
 and media payloads and ignored metadata do not consume eligible byte budget;
 their opaque descendants are not traversed. Admitted tool arguments/results
-still count, and genuinely oversized eligible evidence fails without truncation.
+still count. A window over these limits is sealed as several archives by the
+file store (above); only a message over a limit by itself is stored reduced,
+and marked.
 See [eligible-input budgeting](archive-eligible-input-budget.md).
-Storage exhaustion stops rollover; no automatic source eviction or tombstoning.
-The index is currently a bounded scan, not a large-corpus search engine.
+A full disk, a permission error or an archive that another process keeps locked
+for more than five seconds still
+stops rollover with history retained; there is no automatic source eviction or
+tombstoning. History search is a bounded scan, not a large-corpus search
+engine: it reads archives newest first and stops after 1,024 archives or
+256 MiB. The files-to-Axel migration carries at most 128 archives / 256 MiB
+and refuses a larger store rather than importing part of it.
 Non-Unix archive operations fail explicitly; enabling via the command is refused.
 
-Concurrency: operations on one project's archive (rollover seals, parallel
-history tool calls, subagents in the same process) wait for each other
+Concurrency: seals and forgets on one project's archive (rollover seals,
+`memory_forget`, subagents in the same process) wait for each other
 in-process (not in FIFO order) and fail as busy if not admitted within 30
-seconds; a seal and its stored note are one operation. Another process holding
-the archive lock still fails closed without waiting for it ("archive busy";
-history retained). The lock is released explicitly, so a child process forked
-concurrently by another thread cannot keep it held. A caller canceled before
-its operation is admitted reads and writes no records (opening the store may
-already have happened); an admitted operation completes.
+seconds; a seal and its stored note are one operation. A lock held by another
+process is tried again for up to 5 seconds; only after that does the operation
+fail closed ("archive busy"; history retained). The lock is released
+explicitly, so a child process forked concurrently by another thread cannot
+keep it held. A caller canceled before its operation holds both locks reads and
+writes no records (opening the store may already have happened); after that the
+operation completes.
+
+Fetch and search take no lock for archives on shelves, so they are never busy
+and never wait behind a seal. That is safe because of how the files are
+written: an archive is written to a temporary file and renamed onto its name
+only when it is complete, a live archive is never modified, and forget renames
+a complete tombstone over it. A read that overlaps a forget of the same archive
+therefore returns the whole archive (the read came first) or "not found" (the
+forget came first), never part of one; once forget has returned, every read is
+"not found". These reads change nothing on disk, so a file or directory whose
+mode was loosened by hand stays that way until the next seal or forget touches
+it. The old `000.json` to `127.json` slot files are still read under the lock,
+with the same 5 second wait: a fetch of an id that is on no shelf, and a search
+that the shelves did not fill, take it when such files exist.
 
 ## Axel integration: one selected memory authority
+
+**Removed in 0.12.0.** The memory backend switch is gone: the file store is
+the only archive store, `memory.backend` and the keys beside it are removed
+keys that a config may still hold (one warning per start), and Axel is an
+extension. What follows describes the removed design and is kept as history.
 
 **Shared-repository update:** the host now uses one shared brain with durable Git
 repository scopes. Worktrees share repository memory; migration of existing path
 scopes is explicit. Context-head durability and capture consent remain independent.
-See [shared Axel repositories](shared-axel-repositories.md).
 
 
 The unified host service now covers explicit notes, eligible source archives,
 consented capture/recall, prior-session import, atomic legacy migration and memory
-retention. See [unified Axel backend](axel-host-backend.md). In Axel mode rollover
+retention. In Axel mode rollover
 projects source in memory and persists it directly in the same `.r8` database;
 short history tools never fall back to the legacy archive. The durable frontend
 head acknowledgement still gates further inference. Independent plugin/MCP memory
@@ -392,9 +622,7 @@ persistence and no second request at all after a failed save. This is not a new
 large live-context or cost/quality benchmark.
 
 The subsequent full backend integration resolves the independent notes/history/
-capture routing gaps; see [unified Axel backend](axel-host-backend.md). The earlier
-[source audit](../reviews/context-resume-axel-boundary.md) is historical, not the
-current implementation status. No global
+capture routing gaps. No global
 configuration, installed binary, plugin, external checkout or stored memories
 were migrated by this follow-up.
 

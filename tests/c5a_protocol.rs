@@ -122,8 +122,10 @@ fn events_config_parse_auto_turn_true() {
 
 #[test]
 fn events_config_parse_auto_turn_false_explicit() {
-    let cfg = load_config_from_str("events.auto_turn = false\n");
-    assert!(!cfg.events.auto_turn);
+    for off in ["false", "0", "no"] {
+        let cfg = load_config_from_str(&format!("events.auto_turn = {off}\n"));
+        assert!(!cfg.events.auto_turn, "events.auto_turn = {off} must opt out");
+    }
 }
 
 // ─── 6. reactor event_payload_from_drained ───────────────────────────────────

@@ -17,6 +17,15 @@ pub(super) struct McpConnection {
     next_id: u64,
 }
 
+/// Why a `tools/call` gave no result text.
+#[derive(Debug)]
+pub(super) enum CallError {
+    /// The server answered `isError: true`: the tool said no (its text).
+    Tool(String),
+    /// The call itself failed: write/read, EOF, bound, timeout, JSON-RPC error.
+    Transport(String),
+}
+
 impl McpConnection {
     /// Spawn and initialize an MCP server.
     pub(super) async fn start(
@@ -365,12 +374,12 @@ impl McpConnection {
         Ok(defs)
     }
 
-    /// Call a tool on the server.
+    /// Call a tool on the server; an `isError` result is [`CallError::Tool`].
     pub(super) async fn call_tool(
         &mut self,
         name: &str,
         arguments: Value,
-    ) -> std::result::Result<String, String> {
+    ) -> std::result::Result<String, CallError> {
         let result = self
             .request(
                 "tools/call",
@@ -379,7 +388,8 @@ impl McpConnection {
                     "arguments": arguments
                 }),
             )
-            .await?;
+            .await
+            .map_err(CallError::Transport)?;
 
         // Extract text content from the result
         let content = result.get("content").and_then(|c| c.as_array());
@@ -419,7 +429,7 @@ impl McpConnection {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
                 {
-                    Err(output)
+                    Err(CallError::Tool(output))
                 } else {
                     Ok(output)
                 }

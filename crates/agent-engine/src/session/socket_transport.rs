@@ -503,6 +503,10 @@ pub struct SocketTransport {
     /// What we asked for in `Hello` (phase 4 §2.3).
     history: HistoryMode,
     buf: FrameBuf,
+    /// Owned sessions: this connection is the owner. The token the daemon
+    /// minted, plus the secrets forwarded at create, sent again on a
+    /// re-bind after a reload (`reconnect`).
+    owner: Option<OwnerClaim>,
 }
 
 impl SocketTransport {
@@ -525,6 +529,22 @@ impl SocketTransport {
             ),
             Attach::Create { mode, .. } => (*mode, false),
         };
+        // Owned: an older daemon would ignore the request and hand back a
+        // session that outlives us. Never ask one that does not say it can.
+        let owned_create = match &attach {
+            Attach::Create { owned: Some(o), .. } => Some(o.forward_secrets.clone()),
+            _ => None,
+        };
+        if owned_create.is_some() && !conn.welcome.supports(FEATURE_OWNED_SESSIONS) {
+            let daemon_version = conn.welcome.daemon_version.clone();
+            conn.bye().await;
+            return Err(TransportError::DaemonTooOld { daemon_version, request: "owned sessions" });
+        }
+        // The owner re-binding after a reload (`reconnect`).
+        let rebind = match &attach {
+            Attach::Existing { .. } => conn.hello.reconnect_of.as_ref().and_then(|r| r.owner.clone()),
+            Attach::Create { .. } => None,
+        };
         conn.writer
             .send(ClientFrame::Attach(attach))
             .await
@@ -546,6 +566,15 @@ impl SocketTransport {
                 Some(DaemonFrame::Bye { .. }) | None => return Err(TransportError::Closed),
                 Some(other) => return Err(TransportError::Protocol(format!("expected attached, got {other:?}"))),
             }
+        };
+        let owner = match (owned_create, rebind) {
+            (None, None) => None,
+            (Some(forward_secrets), _) => match attached.owner_token.clone() {
+                Some(token) => Some(OwnerClaim { token, forward_secrets }),
+                None => return Err(TransportError::Refused("daemon did not grant an owned session".into())),
+            },
+            (None, Some(claim)) if attached.owner_token.as_ref() == Some(&claim.token) => Some(claim),
+            (None, Some(_)) => return Err(TransportError::Refused("daemon did not re-bind the owned session".into())),
         };
         let (client, snapshot) = attached.into_snapshot();
         let meta = snapshot.meta.clone();
@@ -578,14 +607,59 @@ impl SocketTransport {
                 pending_digest: None,
                 history,
                 buf: conn.buf,
+                owner,
             },
             snapshot,
         ))
     }
 
+    /// Whether this connection owns its session (an owned create, or a
+    /// re-bind): the session ends when this connection goes away.
+    pub fn is_session_owner(&self) -> bool {
+        self.owner.is_some()
+    }
+
+    /// Connect and create an OWNED session in one call (headless clients:
+    /// `synaps rpc`, `synaps chat`): the session ends, its turn cancelled,
+    /// when this transport is dropped, detaches, or its process dies.
+    /// `forward_secrets` also hands the daemon this process's secret env
+    /// vars (the ones `Hello` strips) for the session's tools, in memory
+    /// only. Fails with `DaemonTooOld` against a daemon without the
+    /// feature; never falls back to an unowned session.
+    pub async fn create_owned(
+        path: &Path,
+        hello: Hello,
+        config: SessionConfig,
+        mode: AttachMode,
+        forward_secrets: bool,
+    ) -> Result<(Self, AttachSnapshot), TransportError> {
+        let conn = Connected::connect(path, hello).await?;
+        Self::attach(conn, Attach::create_owned(config, mode, forward_secrets)).await
+    }
+
     /// Why the last `next_event` returned `None` (if it was not a plain end).
     pub fn last_error(&self) -> Option<&TransportError> {
         self.last_error.as_ref()
+    }
+
+    /// The daemon cut this owner for lagging (`Bye{owner_lagged}`): events
+    /// were lost, so there is nothing to reconnect to. Wins over a reload.
+    fn owner_lagged(&self) -> Option<u64> {
+        match self.last_error {
+            Some(TransportError::OwnerLagged { dropped }) => Some(dropped),
+            _ => None,
+        }
+    }
+
+    /// The stream ended: after a `Reloading`, that is the reload (unless
+    /// the owner lagged, which stays the error).
+    fn note_reload_end(&mut self) {
+        if self.owner_lagged().is_some() {
+            return;
+        }
+        if let Some(generation) = self.reload_pending {
+            self.last_error = Some(TransportError::Reloading { generation });
+        }
     }
 
     /// `true` if the daemon announced a reload before EOF (graceful); `false`
@@ -612,6 +686,9 @@ impl SocketTransport {
     /// `self` and returns the snapshot. On `Refused` / `Version` the error is
     /// terminal (caller should stop retrying). Other errors are transient.
     pub async fn reconnect_once(&mut self, mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
+        if let Some(dropped) = self.owner_lagged() {
+            return Err(TransportError::OwnerLagged { dropped });
+        }
         let was_owner = self.input_owner == Some(self.client);
         let generation = self.reload_pending.unwrap_or(self.welcome.generation);
         let mut hello = self.hello.clone();
@@ -620,6 +697,7 @@ impl SocketTransport {
             session_id: self.session.clone(),
             was_owner,
             generation,
+            owner: self.owner.clone(),
         });
         let mode = if was_owner { AttachMode::Takeover } else { mode };
         match Connected::connect(&self.path, hello).await {
@@ -888,20 +966,23 @@ impl ClientTransport for SocketTransport {
                 }
                 Ok(Some(DaemonFrame::Error { message, .. })) => return Some(self.notice(message)),
                 Ok(Some(DaemonFrame::Bye { reason })) => {
-                    if let Some(ByeReason::Reloading { generation, .. }) = reason {
-                        self.reload_pending = Some(generation);
+                    match reason {
+                        Some(ByeReason::Reloading { generation, .. }) => self.reload_pending = Some(generation),
+                        // Events were lost: final, whatever came first (a
+                        // `Reloading` included). Not a reload to ride out.
+                        Some(ByeReason::OwnerLagged { dropped }) => {
+                            self.reload_pending = None;
+                            self.last_error = Some(TransportError::OwnerLagged { dropped });
+                        }
+                        _ => {}
                     }
                     self.ended = true;
-                    if let Some(generation) = self.reload_pending {
-                        self.last_error = Some(TransportError::Reloading { generation });
-                    }
+                    self.note_reload_end();
                     return None;
                 }
                 Ok(None) => {
                     self.ended = true;
-                    if let Some(generation) = self.reload_pending {
-                        self.last_error = Some(TransportError::Reloading { generation });
-                    }
+                    self.note_reload_end();
                     return None;
                 }
                 Ok(Some(other)) => {
@@ -948,6 +1029,9 @@ impl ClientTransport for SocketTransport {
     /// cannot both take over). On success `self` IS the new connection; the
     /// returned snapshot is a full re-mirror.
     async fn reconnect(&mut self, mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
+        if let Some(dropped) = self.owner_lagged() {
+            return Err(TransportError::OwnerLagged { dropped });
+        }
         let was_owner = self.input_owner == Some(self.client);
         let generation = self.reload_pending.unwrap_or(self.welcome.generation);
         let mut hello = self.hello.clone();
@@ -956,13 +1040,13 @@ impl ClientTransport for SocketTransport {
             session_id: self.session.clone(),
             was_owner,
             generation,
+            owner: self.owner.clone(),
         });
         let mode = if was_owner { AttachMode::Takeover } else { mode };
-        let total = std::env::var("SYNAPS_TUI_ATTACH_RECONNECT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(60));
+        // An owner too: a re-bind after its session ended is refused
+        // ("unknown session"), which stops the loop; capping the budget at
+        // the grace would give up while a slow restore is still running.
+        let total = Self::reconnect_budget();
         let deadline = tokio::time::Instant::now() + total;
         let mut backoff = Duration::from_millis(100);
         let mut last;
@@ -1053,6 +1137,7 @@ mod tests {
                         progressive_tool_disclosure: true,
                         generation: 1,
                         daemon_build: String::new(),
+                        features: Vec::new(),
                     })
                 }
                 ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
@@ -1072,6 +1157,20 @@ mod tests {
                         display_tail: None,
                     },
                 )),
+                // A reload announced, then the owner cut for lagging.
+                ClientFrame::Cmd { cmd: SessionCommand::Submit { text, .. }, .. } if text == "lag-after-reload" => {
+                    seq += 1;
+                    let ev = DaemonFrame::Event(WireEnvelope {
+                        session_id: sid.clone(),
+                        seq,
+                        ts: chrono::Utc::now(),
+                        event: WireSessionEvent::Reloading { generation: 2, retry_after_ms: 500 },
+                    });
+                    w.write_all(encode_line(&ev).unwrap().as_bytes()).await.unwrap();
+                    let bye = DaemonFrame::Bye { reason: Some(ByeReason::OwnerLagged { dropped: 3 }) };
+                    w.write_all(encode_line(&bye).unwrap().as_bytes()).await.unwrap();
+                    break;
+                }
                 ClientFrame::Cmd { cmd: SessionCommand::Submit { text, .. }, .. } => {
                     seq += 1;
                     DaemonFrame::Event(WireEnvelope {
@@ -1355,6 +1454,35 @@ mod tests {
         assert!(r.is_err());
     }
 
+    /// A reload announced, then the owner cut for lagging: events were
+    /// lost, so `OwnerLagged` wins. No reload pending, and a reconnect
+    /// refuses without dialling.
+    #[tokio::test]
+    async fn owner_lagged_after_a_reload_announce_is_final() {
+        let (_d, path) = sock();
+        let l = Listener::bind(&path).unwrap();
+        let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
+            .await
+            .unwrap();
+        t.send(SessionCommand::Submit { text: "lag-after-reload".into(), attachments: vec![] }).await.unwrap();
+        let e = t.next_event().await.unwrap();
+        assert!(matches!(e.event, SessionEventWire::Reloading { generation: 2, .. }));
+        assert!(t.is_reload_pending());
+        assert!(t.next_event().await.is_none());
+        assert!(matches!(t.last_error(), Some(TransportError::OwnerLagged { dropped: 3 })), "{:?}", t.last_error());
+        assert!(!t.is_reload_pending(), "not a reload to ride out");
+        assert!(t.next_event().await.is_none());
+        assert!(matches!(t.last_error(), Some(TransportError::OwnerLagged { dropped: 3 })));
+        srv.await.unwrap();
+        assert!(matches!(t.reconnect_once(AttachMode::Mirror).await, Err(TransportError::OwnerLagged { dropped: 3 })));
+        assert!(matches!(
+            ClientTransport::reconnect(&mut t, AttachMode::Mirror).await,
+            Err(TransportError::OwnerLagged { dropped: 3 })
+        ));
+    }
+
     #[tokio::test]
     async fn attach_error_frame_is_refused() {
         let (_d, path) = sock();
@@ -1375,6 +1503,7 @@ mod tests {
                 progressive_tool_disclosure: true,
                 generation: 1,
                 daemon_build: String::new(),
+                features: Vec::new(),
             });
             w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
             line.clear();
@@ -1389,6 +1518,96 @@ mod tests {
             .unwrap();
         assert!(matches!(err, TransportError::Refused(ref m) if m == "unknown session"), "{err}");
         srv.await.unwrap();
+    }
+
+    /// A daemon welcoming with `features` and answering the Attach with an
+    /// `Attached` that carries no owner token; returns the frame types the
+    /// client sent after `Hello`.
+    async fn owned_fake_daemon(mut l: Listener, features: Vec<String>) -> Vec<String> {
+        let stream = l.accept().await.unwrap();
+        let (r, mut w) = crate::ipc::split_server(stream);
+        let mut reader = BufReader::new(r);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let welcome = DaemonFrame::Welcome(Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "0.0.1-old".into(),
+            pid: 1,
+            profile: None,
+            sessions: vec![],
+            progressive_tool_disclosure: true,
+            generation: 1,
+            daemon_build: String::new(),
+            features,
+        });
+        w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
+        let mut sent = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return sent;
+            }
+            let frame: ClientFrame = decode_line(line.trim_end()).unwrap();
+            sent.push(format!("{frame:?}").split(['(', ' ', '{']).next().unwrap().to_string());
+            if let ClientFrame::Attach(_) = frame {
+                let sid = SessionId::from("fake-1");
+                let reply = DaemonFrame::Attached(AttachedWire::new(
+                    ClientId(7),
+                    AttachSnapshot {
+                        meta: crate::session::handle::echo::meta_for(&sid),
+                        view: crate::session::handle::echo::view_for(),
+                        conversation: ConversationSnapshot::default(),
+                        streaming: false,
+                        replay: vec![],
+                        pending_prompts: vec![],
+                        clients: vec![],
+                        roster: Vec::new(),
+                        client_input: ClientInput::wire_default(),
+                        input_owner: Some(ClientId(7)),
+                        display_tail: None,
+                    },
+                ));
+                w.write_all(encode_line(&reply).unwrap().as_bytes()).await.unwrap();
+            }
+        }
+    }
+
+    /// An older daemon would ignore `owned` and hand back a session that
+    /// outlives the client: the client never sends the request to a daemon
+    /// that does not advertise the feature, and says why.
+    #[tokio::test]
+    async fn owned_create_against_a_daemon_without_the_feature_fails_loudly() {
+        let (_d, path) = sock();
+        let l = Listener::bind(&path).unwrap();
+        let srv = tokio::spawn(owned_fake_daemon(l, Vec::new()));
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        assert!(!conn.welcome.supports(FEATURE_OWNED_SESSIONS));
+        let err = SocketTransport::attach(conn, Attach::create_owned(SessionConfig::default(), AttachMode::Mirror, false))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, TransportError::DaemonTooOld { request: "owned sessions", ref daemon_version } if daemon_version == "0.0.1-old"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("daemon reload"), "{err}");
+        assert_eq!(srv.await.unwrap(), vec!["Bye".to_string()], "no Attach ever reached the daemon");
+    }
+
+    /// A daemon that advertises the feature but grants no owner token: the
+    /// client refuses the session rather than run unowned.
+    #[tokio::test]
+    async fn owned_create_without_a_token_in_the_reply_is_refused() {
+        let (_d, path) = sock();
+        let l = Listener::bind(&path).unwrap();
+        let srv = tokio::spawn(owned_fake_daemon(l, vec![FEATURE_OWNED_SESSIONS.into()]));
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        let err = SocketTransport::attach(conn, Attach::create_owned(SessionConfig::default(), AttachMode::Mirror, false))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, TransportError::Refused(ref m) if m.contains("did not grant an owned session")), "{err}");
+        drop(srv);
     }
 
     #[tokio::test]

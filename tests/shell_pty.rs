@@ -23,6 +23,7 @@ fn default_opts() -> SessionOpts {
     SessionOpts {
         command: None,
         working_directory: None,
+        base_env: None,
         env: child_env(),
         rows: None,
         cols: None,

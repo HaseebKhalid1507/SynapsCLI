@@ -83,7 +83,7 @@ async fn socket_roundtrip_real_uds() {
     assert_eq!(conn.welcome.pid, std::process::id());
     let (mut t, snap) = SocketTransport::attach(
         conn,
-        Attach::Create { config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, mode: AttachMode::Mirror },
+        Attach::create(SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, AttachMode::Mirror),
     )
     .await
     .unwrap();
@@ -174,7 +174,7 @@ async fn attach_to_session_with_history_over_1mib() {
     let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
     let (mut t, _) = SocketTransport::attach(
         conn,
-        Attach::Create { config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, mode: AttachMode::Mirror },
+        Attach::create(SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, AttachMode::Mirror),
     )
     .await
     .unwrap();
@@ -240,7 +240,7 @@ async fn client_commands_are_whitelisted() {
     let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
     let (mut a, _) = SocketTransport::attach(
         conn,
-        Attach::Create { config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, mode: AttachMode::Mirror },
+        Attach::create(SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, AttachMode::Mirror),
     )
     .await
     .unwrap();
@@ -266,7 +266,7 @@ async fn client_commands_are_whitelisted() {
     assert!(refused(&mut b).await.contains("not your client id"));
     b.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
     assert!(refused(&mut b).await.contains("end:"));
-    b.send(SessionCommand::Attach { client: ClientMeta::new(ClientKind::Test), mode: AttachMode::Mirror }).await.unwrap();
+    b.send(SessionCommand::Attach { client: ClientMeta::new(ClientKind::Test), mode: AttachMode::Mirror, owner: None }).await.unwrap();
     assert!(refused(&mut b).await.contains("attach:"));
     b.send(SessionCommand::Resync { client: other, since_seq: 0 }).await.unwrap();
     assert!(refused(&mut b).await.contains("resync:"));
@@ -385,7 +385,7 @@ async fn idle_exit_counts_clientless_idle_sessions_and_never_a_running_turn() {
     let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
     let (mut t, _) = SocketTransport::attach(
         conn,
-        Attach::Create { config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, mode: AttachMode::Mirror },
+        Attach::create(SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, AttachMode::Mirror),
     )
     .await
     .unwrap();
@@ -432,7 +432,7 @@ async fn digest_client_never_receives_message_history() {
     let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
     let (mut full, _) = SocketTransport::attach(
         conn,
-        Attach::Create { config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, mode: AttachMode::Mirror },
+        Attach::create(SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, AttachMode::Mirror),
     )
     .await
     .unwrap();
@@ -503,7 +503,7 @@ async fn digest_attach_over_20mib_frame_is_small() {
     let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
     let (mut full, _) = SocketTransport::attach(
         conn,
-        Attach::Create { config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, mode: AttachMode::Mirror },
+        Attach::create(SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, AttachMode::Mirror),
     )
     .await
     .unwrap();

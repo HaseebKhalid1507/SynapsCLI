@@ -159,6 +159,31 @@ async fn drive_stream_full(
     tx: mpsc::UnboundedSender<StreamEvent>,
     level: TelemetryLevel,
 ) -> crate::error::Result<serde_json::Value> {
+    drive_stream_as(
+        options,
+        max_retries,
+        cancel,
+        tx,
+        level,
+        "claude-haiku-4-5",
+        0,
+        agent_core::reasoning::ReasoningLevel::Adaptive,
+    )
+    .await
+}
+
+/// `drive_stream_full` for a given model and thinking level.
+#[allow(clippy::too_many_arguments)]
+async fn drive_stream_as(
+    options: &ApiOptions,
+    max_retries: u32,
+    cancel: &CancellationToken,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+    level: TelemetryLevel,
+    model: &str,
+    thinking_budget: u32,
+    reasoning: agent_core::reasoning::ReasoningLevel,
+) -> crate::error::Result<serde_json::Value> {
     let client = Client::new();
     let tools = ToolRegistry::new();
     let messages = vec![Arc::new(json!({
@@ -168,11 +193,11 @@ async fn drive_stream_full(
     ApiMethods::call_api_stream_inner(
         &auth(),
         &client,
-        "claude-haiku-4-5",
+        model,
         &tools,
         &Some(format!("system {SENTINEL}")),
-        0,
-        agent_core::reasoning::ReasoningLevel::Adaptive,
+        thinking_budget,
+        reasoning,
         &messages,
         tx,
         cancel,
@@ -320,6 +345,29 @@ async fn retry_emits_one_record_per_attempt_with_shared_request_id() {
         assert_eq!(wire.byte_len, received[0].len() as u64);
         assert_eq!(wire.digest, expected_wire_digest(&h.key_path, &received[0]));
     }
+}
+
+/// A Cloudflare 520 (seen live, failed for good before) retries like a 5xx
+/// and succeeds on the next attempt, classed as a server error.
+#[tokio::test]
+async fn cloudflare_520_is_retried_and_the_next_attempt_succeeds() {
+    let (url, _bodies, hits) = spawn_stub(vec![520]).await;
+    let h = harness(url);
+
+    drive_stream(&h.options, 2, &CancellationToken::new())
+        .await
+        .expect("a 520 must be retried");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "one 520, then success");
+
+    let records = h.sink.records();
+    assert_eq!(records.len(), 2, "one record per actual attempt");
+    assert_eq!(records[0].outcome.http_status, Some(520));
+    assert_eq!(records[1].outcome.retries.len(), 1);
+    assert_eq!(
+        records[1].outcome.retries[0].class,
+        super::RetryClass::ServerError
+    );
+    assert_eq!(records[1].outcome.terminal, TurnOutcome::Completed);
 }
 
 // ─── Cancellation ───────────────────────────────────────────────────────────
@@ -543,80 +591,6 @@ async fn key_failure_degrades_trace_but_never_the_request() {
     assert!(trace.degraded_records() >= 1, "degradation is counted");
 }
 
-// ─── Sync (non-streaming) path: call_api ────────────────────────────────────
-
-#[tokio::test]
-async fn sync_call_api_emits_one_record_from_exact_bytes() {
-    let bodies: CapturedBodies = Arc::new(Mutex::new(Vec::new()));
-    let bodies_c = Arc::clone(&bodies);
-    let app = Router::new().route(
-        "/v1/messages",
-        axum_post(move |body: Bytes| {
-            let bodies = Arc::clone(&bodies_c);
-            async move {
-                bodies.lock().unwrap().push(body.to_vec());
-                (
-                    StatusCode::OK,
-                    [
-                        ("content-type", "application/json"),
-                        ("request-id", "req_sync_1"),
-                    ],
-                    json!({
-                        "content": [{"type": "text", "text": "ok"}],
-                        "stop_reason": "end_turn",
-                        "usage": {"input_tokens": 7, "output_tokens": 2}
-                    })
-                    .to_string(),
-                )
-            }
-        }),
-    );
-    let url = serve(app).await;
-    let h = harness(url);
-
-    let client = Client::new();
-    let tools = ToolRegistry::new();
-    let messages = vec![Arc::new(json!({
-        "role": "user",
-        "content": format!("{SENTINEL} sync"),
-    }))];
-    ApiMethods::call_api(
-        &auth(),
-        &client,
-        "claude-haiku-4-5",
-        &tools,
-        &Some(format!("system {SENTINEL}")),
-        0,
-        agent_core::reasoning::ReasoningLevel::Adaptive,
-        &messages,
-        0,
-        &h.options,
-    )
-    .await
-    .expect("sync call must succeed");
-
-    let records = h.sink.records();
-    assert_eq!(records.len(), 1);
-    assert_schema_valid_and_content_free(&records);
-    let r = &records[0];
-    assert_eq!(r.outcome.terminal, TurnOutcome::Completed);
-    assert_eq!(r.outcome.http_status, Some(200));
-    assert_eq!(r.outcome.stop_reason, Some(StopReason::EndTurn));
-    assert_eq!(
-        r.outcome.usage.and_then(|u| u.input_tokens),
-        Some(7),
-        "usage from the provider JSON body"
-    );
-    assert_eq!(
-        r.outcome.provider_request_id.as_ref().map(|id| id.as_str()),
-        Some("req_sync_1")
-    );
-    let received = bodies.lock().unwrap();
-    let wire = r.wire.as_ref().expect("wire populated");
-    assert_eq!(wire.byte_len, received[0].len() as u64);
-    assert_eq!(wire.digest, expected_wire_digest(&h.key_path, &received[0]));
-}
-
 // ─── Compaction path: call_api_simple ───────────────────────────────────────
 
 #[tokio::test]
@@ -775,6 +749,83 @@ async fn api_log_marks_worker_requests() {
     assert_eq!(records.len(), 2, "one record per request");
     assert!(records[0].get("worker").is_none(), "{}", records[0]);
     assert_eq!(records[1]["worker"], json!(true), "{}", records[1]);
+}
+
+// ─── api-log.jsonl: the thinking level of a request ─────────────────────────
+
+/// A record names the thinking level the request was made at, and the
+/// `effort` it carried: read from the body that went out, so the log cannot
+/// say one thing while the wire carried another. A request that carries no
+/// effort (adaptive, or a model that takes a token budget) has no `effort`
+/// key; the level is still recorded.
+#[tokio::test]
+async fn api_log_records_the_thinking_level_and_the_effort_sent() {
+    use crate::runtime::telemetry::{TelemetryWriter, WriterOptions};
+    use agent_core::reasoning::ReasoningLevel;
+
+    let (url, bodies, _hits) = spawn_stub(vec![]).await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let log = tmp.path().join("synaps/api-log.jsonl");
+    let writer = TelemetryWriter::new(WriterOptions {
+        telemetry_path: Some(log.clone()),
+        trace_path: Some(tmp.path().join("synaps/request-trace.jsonl")),
+        ..WriterOptions::default()
+    });
+    let options = ApiOptions {
+        anthropic_base_url: Some(url),
+        telemetry: Some(writer.clone()),
+        ..Default::default()
+    };
+    // (model, legacy budget, level, effort expected on the wire)
+    let cases = [
+        ("claude-opus-4-7", 4096, ReasoningLevel::High, Some("high")),
+        ("claude-opus-4-7", 0, ReasoningLevel::Adaptive, None),
+        ("claude-sonnet-4-6", 4096, ReasoningLevel::Medium, None),
+    ];
+    for (model, budget, level, _) in cases {
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        drive_stream_as(
+            &options,
+            0,
+            &CancellationToken::new(),
+            tx,
+            TelemetryLevel::Basic,
+            model,
+            budget,
+            level,
+        )
+        .await
+        .expect("stub stream succeeds");
+    }
+    assert!(writer.shutdown(Duration::from_secs(10)).is_flushed());
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let sent: Vec<serde_json::Value> = bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    assert_eq!(records.len(), cases.len(), "one record per request");
+    assert_eq!(sent.len(), cases.len());
+    for (i, (model, _, level, effort)) in cases.iter().enumerate() {
+        let (record, body) = (&records[i], &sent[i]);
+        assert_eq!(record["thinking"], json!(level.as_str()), "{model}: {record}");
+        assert_eq!(
+            record.get("effort").and_then(|v| v.as_str()),
+            *effort,
+            "{model} at {level}: {record}"
+        );
+        assert_eq!(
+            record.get("effort"),
+            body.get("output_config").and_then(|c| c.get("effort")),
+            "the record's effort is the body's: {record}"
+        );
+    }
 }
 
 // ─── api-log.jsonl: TTFT, correlation ids and cost ───────────────────────────

@@ -59,6 +59,10 @@ pub enum SessionStatus {
 pub struct SessionOpts {
     pub command: Option<String>,
     pub working_directory: Option<String>,
+    /// The session's env, as its other tools spawn with it (forwarded
+    /// secrets merged in): the base `env` overrides. `None` = this
+    /// process's env (in-process).
+    pub base_env: Option<Vec<(String, String)>>,
     pub env: HashMap<String, String>,
     pub rows: Option<u16>,
     pub cols: Option<u16>,
@@ -357,9 +361,10 @@ impl SessionManager {
         }
         let probe_cwd = opts.working_directory.clone();
         let probe_env = opts.env;
+        let base_env = opts.base_env;
         // The worker prepares only the probe; it never spawns a PTY command.
         let probe = tokio::task::spawn_blocking(move ||
-            PtyHandle::prepare_scope(probe_cwd.as_deref(), &probe_env));
+            PtyHandle::prepare_scope(probe_cwd.as_deref(), base_env.as_deref(), &probe_env));
         let prepared = if let Some(cancel) = cancel {
             tokio::select! {
                 biased;
@@ -668,6 +673,7 @@ mod tests {
         SessionOpts {
             command: Some(command.to_string()),
             working_directory: None,
+            base_env: None,
             // An interactive bash saves its history to $HOME/.bash_history on
             // exit: the developer's real one, unless the test says otherwise.
             env: HashMap::from([("HISTFILE".to_string(), "/dev/null".to_string())]),

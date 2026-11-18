@@ -181,6 +181,71 @@ fn append_bounded(output: &mut String, text: &str, max_output: usize) -> bool {
     }
 }
 
+/// Ends the result of a command whose output passed `max_output`. The
+/// command is killed there, so this is not a display cut: it never finished
+/// and its exit status is unknown. Keeps the old `[output truncated at N`
+/// prefix, so whatever counts these stops still matches.
+fn output_limit_notice(max_output: usize) -> String {
+    format!(
+        "\n\n[output truncated at {max_output} bytes: the command was stopped at this limit \
+         before it finished, so its exit status is unknown. Redirect large output to a file \
+         (e.g. cmd > out.log 2>&1) and read only the parts you need.]"
+    )
+}
+
+/// The result of a command the timeout stopped. The first line still starts
+/// `Command timed out after`; what the command printed before the timeout
+/// follows, already sanitized and redacted like any result, and cut to its
+/// last `max_output` bytes if it must be: a hang shows at the end.
+/// `requested_secs` is the timeout the model passed, if it passed one: a
+/// configured default above `bash_max_timeout` was never asked for.
+fn timed_out_message(
+    timeout_secs: u64,
+    requested_secs: Option<u64>,
+    output: &str,
+    max_output: usize,
+) -> String {
+    let mut message = format!("Command timed out after {timeout_secs}s and was stopped");
+    if let Some(requested_secs) = requested_secs.filter(|&secs| secs > timeout_secs) {
+        message.push_str(&format!(
+            " ({requested_secs}s was requested; the maximum is {timeout_secs}s)"
+        ));
+    }
+    message.push('.');
+    if output.is_empty() {
+        message.push_str(
+            " No output was captured before the timeout; \
+             output the program had buffered but not flushed is lost.",
+        );
+        return message;
+    }
+    let tail = tail_on_char_boundary(output, max_output);
+    if tail.len() == output.len() {
+        message.push_str(" Output before the timeout:\n");
+    } else {
+        message.push_str(&format!(
+            " Output before the timeout (last {} of {} bytes):\n",
+            tail.len(),
+            output.len()
+        ));
+    }
+    message.push_str(tail);
+    message
+}
+
+/// The longest suffix of `text` that fits in `max_bytes` and starts on a
+/// character boundary.
+fn tail_on_char_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
 /// Resolve the bash executable for the bash tool.
 ///
 /// Unix: `bash` from PATH, as always. Windows: bash is usually NOT on PATH —
@@ -403,6 +468,28 @@ pub(crate) enum ShellSpec {
 }
 
 impl ShellSpec {
+    /// The program and argv that run `script`.
+    ///
+    /// PowerShell gets `-ExecutionPolicy Bypass`: a stock Windows client has
+    /// the `Restricted` policy, so `.\script.ps1` failed with "running
+    /// scripts is disabled on this system". The flag is process-scoped, and
+    /// PowerShells the command starts inherit it (through
+    /// `PSExecutionPolicyPreference`). A policy set by Group Policy still
+    /// wins. The policy is not a security boundary: the tool already runs any
+    /// command as the user.
+    fn invocation(self, script: &str) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+        match self {
+            ShellSpec::Bash => (bash_program(), vec!["-c".into(), script.into()]),
+            ShellSpec::PowerShell => (
+                powershell_program(),
+                ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            ),
+        }
+    }
+
     /// Names the command's systemd scope (`systemctl --user list-units --type=scope`).
     fn scope_description(self) -> &'static str {
         match self {
@@ -426,25 +513,19 @@ pub(crate) async fn run_shell_command(
     askpass: Option<Askpass>,
 ) -> Result<String> {
     {
-        let requested_timeout = requested_timeout.unwrap_or(ctx.limits.bash_timeout);
+        let timeout_secs = requested_timeout.unwrap_or(ctx.limits.bash_timeout);
         // H5: enforce bash_max_timeout cap — prevent DoS via prompt injection
         // requesting unbounded timeouts (e.g. timeout:2592000 + infinite loop).
         let timeout_secs = if ctx.limits.bash_max_timeout > 0 {
-            requested_timeout.min(ctx.limits.bash_max_timeout)
+            timeout_secs.min(ctx.limits.bash_max_timeout)
         } else {
-            requested_timeout
+            timeout_secs
         };
         let max_output = ctx.limits.max_tool_buffer;
 
-        let (program, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = match spec {
-            ShellSpec::Bash => (bash_program(), vec!["-c".into(), script.into()]),
-            ShellSpec::PowerShell => (
-                powershell_program(),
-                vec!["-NoProfile".into(), "-Command".into(), script.into()],
-            ),
-        };
+        let (program, args) = spec.invocation(script);
         let effective_env = ctx.capabilities.env.as_ref()
-            .map(|env| env.iter().map(|(k, v)| (k.into(), v.into())).collect())
+            .map(|env| env.spawn_vars().map(|(k, v)| (k.into(), v.into())).collect())
             .unwrap_or_else(crate::process_scope::inherited_env);
         let probe_env = effective_env.clone();
         let probe_cwd = ctx.capabilities.cwd.clone();
@@ -544,8 +625,10 @@ pub(crate) async fn run_shell_command(
 
         drop(tx_inter);
 
+        // Outside the timed future: a timeout drops that future, and what
+        // the command printed before it must outlive it.
+        let mut full_output = String::new();
         let result = tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), async {
-            let mut full_output = String::new();
             let mut truncated = false;
             let mut streamed_bytes = 0usize;
 
@@ -577,15 +660,15 @@ pub(crate) async fn run_shell_command(
                     continue;
                 }
 
+                let kept_from = full_output.len();
                 let added_all = append_bounded(&mut full_output, &msg, max_output);
                 if let Some(ref txd) = ctx.channels.tx_delta {
                     if streamed_bytes < MAX_STREAMED_DELTA_BYTES {
+                        // Stream only what the result keeps, never the
+                        // bytes past the cap.
+                        let kept = &full_output[kept_from..];
                         let remaining = MAX_STREAMED_DELTA_BYTES - streamed_bytes;
-                        let delta = if msg.len() <= remaining {
-                            msg.clone()
-                        } else {
-                            crate::truncate_str(&msg, remaining).to_string()
-                        };
+                        let delta = crate::truncate_str(kept, remaining).to_string();
                         streamed_bytes += delta.len();
                         if !delta.is_empty() {
                             txd.send(delta);
@@ -594,9 +677,12 @@ pub(crate) async fn run_shell_command(
                 }
 
                 if !added_all {
-                    full_output.push_str(&format!("\n\n[output truncated at {}]", max_output));
+                    // The command is stopped, not its output shortened for
+                    // display: say so, in the result and the stream alike.
+                    let notice = output_limit_notice(max_output);
+                    full_output.push_str(&notice);
                     if let Some(ref txd) = ctx.channels.tx_delta {
-                        txd.send(format!("\n\n[output truncated at {}]", max_output));
+                        txd.send(notice);
                     }
                     truncated = true;
                     group.kill_now();
@@ -612,7 +698,7 @@ pub(crate) async fn run_shell_command(
             // the background (`server &`) running, as before.
             // Drop (and so zeroize) the passwords now the command is done.
             redactions.lock().unwrap_or_else(|p| p.into_inner()).clear();
-            Ok::<_, RuntimeError>((status, full_output, truncated))
+            Ok::<_, RuntimeError>((status, std::mem::take(&mut full_output), truncated))
         })
         .await;
 
@@ -621,28 +707,11 @@ pub(crate) async fn run_shell_command(
                 if status.success() || was_truncated {
                     Ok(output)
                 } else {
-                    let mut notice = String::new();
                     // T5: when a command fails and references a stripped secret,
-                    // append a notice (once per name per session).
-                    if !ctx.capabilities.env_stripped.is_empty() {
-                        let mut warned = ctx.capabilities.env_warned.lock().unwrap_or_else(|p| p.into_inner());
-                        for name in &ctx.capabilities.env_stripped {
-                            if warned.contains(name) {
-                                continue;
-                            }
-                            // Word-boundary match: covers $NAME, ${NAME},
-                            // ${NAME:?}, ${NAME:-x}, $env:NAME and NAME=…
-                            if references_env_name(script, name) {
-                                notice.push_str(&format!(
-                                    "\nnote: ${name} was stripped from the session env as a secret; \
-                                     reattach from a shell that has it \
-                                     (synaps --system … from that shell) \
-                                     — the daemon never receives credentials."
-                                ));
-                                warned.insert(name.clone());
-                            }
-                        }
-                    }
+                    // append a notice (once per name per session). Word-boundary
+                    // match: covers $NAME, ${NAME}, ${NAME:?}, ${NAME:-x},
+                    // $env:NAME and NAME=…
+                    let notice = ctx.capabilities.stripped_env_notices(|name| references_env_name(script, name));
                     Err(RuntimeError::Tool(format!(
                         "Command failed (exit {}):\n{}{notice}",
                         status.code().unwrap_or(-1),
@@ -654,9 +723,14 @@ pub(crate) async fn run_shell_command(
                 "Failed to execute command: {}",
                 e
             ))),
-            Err(_) => Err(RuntimeError::Tool(format!(
-                "Command timed out after {}s",
-                timeout_secs
+            // The group is still armed: `group` drops on this return and
+            // kills it (Unix), exactly as before. Elsewhere only the shell
+            // is killed, by `kill_on_drop`.
+            Err(_) => Err(RuntimeError::Tool(timed_out_message(
+                timeout_secs,
+                requested_timeout,
+                &full_output,
+                max_output,
             ))),
         }
     }
@@ -685,6 +759,18 @@ fn references_env_name(script: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stock Windows client has the `Restricted` execution policy: without
+    /// Bypass the powershell tool could not run `.\script.ps1`. The script is
+    /// the last argument, after `-Command`, exactly as given.
+    #[test]
+    fn powershell_runs_with_execution_policy_bypass() {
+        let (_, args) = ShellSpec::PowerShell.invocation(r".\test.ps1");
+        let args: Vec<_> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", r".\test.ps1"]);
+        let (_, args) = ShellSpec::Bash.invocation("echo hi");
+        assert_eq!(args, [std::ffi::OsString::from("-c"), "echo hi".into()]);
+    }
 
     #[test]
     fn explicit_child_kills_signal_and_disarm_group_before_reaping() {
@@ -774,7 +860,7 @@ mod tests {
         let mut env = fake_env(&fake);
         env.push(("PATH".to_string(), std::env::var("PATH").unwrap_or_default()));
         let mut ctx = create_tool_context();
-        ctx.capabilities.env = Some(env);
+        ctx.capabilities.env = Some(env.into());
         let out = BashTool
             .execute(json!({ "command": "echo scoped-run", "timeout": 30 }), ctx)
             .await
@@ -792,10 +878,9 @@ mod tests {
     #[tokio::test]
     async fn bash_command_with_a_rebuilt_env_lacking_the_user_bus_runs_unwrapped() {
         let mut ctx = create_tool_context();
-        ctx.capabilities.env = Some(vec![(
-            "PATH".to_string(),
-            std::env::var("PATH").unwrap_or_default(),
-        )]);
+        ctx.capabilities.env = Some(
+            vec![("PATH".to_string(), std::env::var("PATH").unwrap_or_default())].into(),
+        );
         let out = BashTool
             .execute(
                 json!({ "command": "cat /proc/self/cgroup", "timeout": 30 }),
@@ -896,7 +981,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.contains("output truncated"));
+        // Stopped at the cap: the result is the cap's worth of output and
+        // the notice saying so, nothing more (the memory bound holds).
+        let notice = output_limit_notice(64 * 1024);
+        assert!(result.ends_with(&notice));
+        assert_eq!(result.len(), 64 * 1024 + notice.len());
 
         // The counters are process-global and sibling tests run bash
         // concurrently, so a before/after delta is skewed by whatever a
@@ -981,11 +1070,33 @@ mod tests {
             "timeout": 10
         });
 
-        let result = tool.execute(params, ctx).await;
+        let error = tool_error(tool.execute(params, ctx).await);
         assert!(
-            result.unwrap_err().to_string().contains("timed out"),
+            error.contains("timed out"),
             "requested timeout MUST be clamped by bash_max_timeout"
         );
+        // The model is told it got less time than it asked for.
+        assert!(
+            error.starts_with(
+                "Tool execution failed: Command timed out after 1s and was stopped \
+                 (10s was requested; the maximum is 1s)."
+            ),
+            "{error}"
+        );
+    }
+
+    /// The configured default above `bash_max_timeout` is cut too, but the
+    /// model asked for nothing, so the error does not say it did.
+    #[tokio::test]
+    async fn a_default_timeout_cut_by_the_maximum_is_not_called_requested() {
+        let mut ctx = create_tool_context();
+        ctx.limits.bash_timeout = 10;
+        ctx.limits.bash_max_timeout = 1;
+
+        let error = tool_error(BashTool.execute(json!({"command": "sleep 5"}), ctx).await);
+        let head = "Tool execution failed: Command timed out after 1s and was stopped. ";
+        assert!(error.starts_with(head), "{error}");
+        assert!(!error.contains("requested"), "{error}");
     }
 
     fn prompt_channel() -> (
@@ -1079,7 +1190,9 @@ if read -r got; then echo "stdin gave: $got"; else echo stdin-eof; fi"#;
             streamed.push_str(&delta);
         }
 
-        assert!(result.contains("[output truncated at 256]"));
+        assert!(result.ends_with(&output_limit_notice(256)), "{result}");
+        // The stream carries exactly what the result keeps, notice included.
+        assert_eq!(streamed, result);
         assert!(!result.contains('\u{1b}'));
         assert!(!result.contains('\0'));
         assert!(!streamed.contains('\u{1b}'));
@@ -1117,12 +1230,15 @@ if read -r got; then echo "stdin gave: $got"; else echo stdin-eof; fi"#;
             "timeout": 1
         });
 
-        let result = tool.execute(params, ctx).await;
-
-        // Should timeout and return error
-        assert!(result.is_err());
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("timed out"));
+        let error = tool_error(tool.execute(params, ctx).await);
+        // Still an error starting `Command timed out after`; a command that
+        // printed nothing says so instead of showing an empty section.
+        assert_eq!(
+            error,
+            "Tool execution failed: Command timed out after 1s and was stopped. \
+             No output was captured before the timeout; \
+             output the program had buffered but not flushed is lost."
+        );
     }
 
     #[tokio::test]
@@ -1140,6 +1256,359 @@ if read -r got; then echo "stdin gave: $got"; else echo stdin-eof; fi"#;
         assert!(result.is_err());
         let error = result.unwrap_err().to_string();
         assert!(error.contains("failed") || error.contains("exit"));
+    }
+
+    /// The text the model reads for a failed call.
+    fn tool_error(result: crate::Result<String>) -> String {
+        match result {
+            Ok(out) => panic!("expected an error, got: {out}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The exact words the model reads when the output cap stops a command.
+    #[test]
+    fn the_output_limit_notice_says_the_command_was_stopped() {
+        assert_eq!(
+            output_limit_notice(256),
+            "\n\n[output truncated at 256 bytes: the command was stopped at this limit \
+             before it finished, so its exit status is unknown. Redirect large output \
+             to a file (e.g. cmd > out.log 2>&1) and read only the parts you need.]"
+        );
+    }
+
+    /// Past the cap the command is killed and the result says so: the cap's
+    /// worth of output, then the notice, in the result, the stream and the
+    /// history the stream feeds alike. Still a success result (unchanged),
+    /// and back at once, not at the end of the command or the timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_output_cap_stops_the_command_and_says_its_status_is_unknown() {
+        let channel = crate::tools::output::delta_channel();
+        let history = channel.output_handle();
+        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
+        let mut ctx = create_tool_context();
+        ctx.channels.tx_delta = Some(delta_tx);
+        ctx.limits.max_tool_buffer = 256;
+        let started = std::time::Instant::now();
+        let result = BashTool
+            .execute(
+                json!({"command": "printf 'x%.0s' {1..2000}; sleep 30; echo finished", "timeout": 30}),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "stopped at the cap"
+        );
+        assert_eq!(result, "x".repeat(256) + &output_limit_notice(256));
+        assert!(result.contains("the command was stopped"), "{result}");
+        assert!(result.contains("its exit status is unknown"), "{result}");
+        let mut streamed = String::new();
+        while let Some(delta) = delta_rx.try_drain() {
+            streamed.push_str(&delta);
+        }
+        assert_eq!(streamed, result);
+        assert_eq!(history.model_history().text, result);
+    }
+
+    /// Output up to the cap, the cap exactly included, comes back whole and
+    /// unmarked; one byte more stops the command.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_up_to_the_cap_is_unchanged_and_one_byte_more_is_stopped() {
+        for (bytes, expected) in [
+            (255, "y".repeat(255)),
+            (256, "y".repeat(256)),
+            (257, "y".repeat(256) + &output_limit_notice(256)),
+        ] {
+            let mut ctx = create_tool_context();
+            ctx.limits.max_tool_buffer = 256;
+            let command = format!("printf 'y%.0s' {{1..{bytes}}}");
+            let result = BashTool
+                .execute(json!({"command": command, "timeout": 30}), ctx)
+                .await
+                .unwrap();
+            assert_eq!(result, expected, "{bytes} bytes");
+        }
+    }
+
+    /// A command that fails after a little output is still a failure with
+    /// its exit status: the cap only speaks when it stopped something.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_nonzero_exit_under_the_cap_is_still_a_failure() {
+        let mut ctx = create_tool_context();
+        ctx.limits.max_tool_buffer = 256;
+        let error = tool_error(
+            BashTool
+                .execute(
+                    json!({"command": "printf partial; exit 3", "timeout": 30}),
+                    ctx,
+                )
+                .await,
+        );
+        assert_eq!(
+            error,
+            "Tool execution failed: Command failed (exit 3):\npartial"
+        );
+    }
+
+    #[test]
+    fn the_timeout_message_names_the_stop_and_keeps_the_output() {
+        assert_eq!(
+            timed_out_message(30, None, "", 256),
+            "Command timed out after 30s and was stopped. No output was captured before \
+             the timeout; output the program had buffered but not flushed is lost."
+        );
+        assert_eq!(
+            timed_out_message(30, Some(30), "step 1\nstep 2\n", 256),
+            "Command timed out after 30s and was stopped. Output before the timeout:\n\
+             step 1\nstep 2\n"
+        );
+        assert_eq!(
+            timed_out_message(300, Some(600), "x", 256),
+            "Command timed out after 300s and was stopped (600s was requested; \
+             the maximum is 300s). Output before the timeout:\nx"
+        );
+        // No timeout from the model: a default the maximum cut was never
+        // requested, so the message does not say it was.
+        assert_eq!(
+            timed_out_message(300, None, "x", 256),
+            "Command timed out after 300s and was stopped. Output before the timeout:\nx"
+        );
+        let long = format!("{}END", "a".repeat(1000));
+        assert_eq!(
+            timed_out_message(1, Some(1), &long, 10),
+            "Command timed out after 1s and was stopped. \
+             Output before the timeout (last 10 of 1003 bytes):\naaaaaaaEND"
+        );
+    }
+
+    /// The kept tail starts on a character boundary for every budget, and is
+    /// the longest one that fits.
+    #[test]
+    fn the_timeout_tail_is_cut_on_a_character_boundary() {
+        let text = "ab▀é😀c▀";
+        for max in 0..=text.len() + 1 {
+            let tail = tail_on_char_boundary(text, max);
+            assert!(
+                text.ends_with(tail) && tail.len() <= max,
+                "max {max}: {tail:?}"
+            );
+            let before = &text[..text.len() - tail.len()];
+            let next = before.chars().next_back().map_or(0, char::len_utf8);
+            assert!(
+                before.is_empty() || tail.len() + next > max,
+                "max {max}: {tail:?}"
+            );
+        }
+        assert_eq!(
+            timed_out_message(1, None, "▀▀▀", 4),
+            "Command timed out after 1s and was stopped. \
+             Output before the timeout (last 3 of 9 bytes):\n▀"
+        );
+    }
+
+    /// A timed-out command's error carries what it printed before the
+    /// timeout, stdout and stderr, exactly as it was streamed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_keeps_the_output_printed_before_it() {
+        let channel = crate::tools::output::delta_channel();
+        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
+        let mut ctx = create_tool_context();
+        ctx.channels.tx_delta = Some(delta_tx);
+        let error = tool_error(
+            BashTool
+                .execute(
+                    json!({"command": "echo out-before; echo err-before >&2; sleep 30", "timeout": 1}),
+                    ctx,
+                )
+                .await,
+        );
+        let head = "Tool execution failed: Command timed out after 1s and was stopped. \
+                    Output before the timeout:\n";
+        assert!(error.starts_with(head), "{error}");
+        let output = &error[head.len()..];
+        assert!(
+            output.contains("out-before\n") && output.contains("err-before\n"),
+            "{error}"
+        );
+        assert_eq!(output.len(), "out-before\nerr-before\n".len(), "{error}");
+        let mut streamed = String::new();
+        while let Some(delta) = delta_rx.try_drain() {
+            streamed.push_str(&delta);
+        }
+        assert_eq!(output, streamed);
+    }
+
+    /// The cap kills the command's group, but a process that left the group
+    /// (setsid) still holds the pipes, so the call ends at the timeout. The
+    /// error stays within `max_output`: the tail of what was captured, the
+    /// cap's notice included, cut inside a 3-byte character and moved to
+    /// the next whole one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_after_a_flood_keeps_a_bounded_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("holder.pid");
+        let command = format!(
+            r#"python3 -c "import os, sys, time; os.setsid(); open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)" '{pid}' &
+while [ ! -s '{pid}' ]; do sleep 0.02; done
+python3 -c "import sys; sys.stdout.buffer.write('▀'.encode() * 100000)"
+wait"#,
+            pid = pid_file.display()
+        );
+        let mut ctx = create_tool_context();
+        ctx.limits.max_tool_buffer = 256;
+        let error = tool_error(
+            BashTool
+                .execute(json!({"command": command, "timeout": 5}), ctx)
+                .await,
+        );
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|p| p.trim().parse::<libc::pid_t>().ok())
+        {
+            // SAFETY: kills the holder this test started.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let notice = output_limit_notice(256);
+        let (head, tail) = error.split_once('\n').unwrap_or_else(|| panic!("{error}"));
+        // 85 whole characters (255 bytes) fit under the cap, then the notice.
+        let captured = 255 + notice.len();
+        assert_eq!(
+            head,
+            format!(
+                "Tool execution failed: Command timed out after 5s and was stopped. \
+                 Output before the timeout (last {} of {captured} bytes):",
+                tail.len()
+            ),
+        );
+        assert!(
+            tail.len() <= 256 && tail.len() > 256 - '▀'.len_utf8(),
+            "{}",
+            tail.len()
+        );
+        assert!(tail.ends_with(&notice), "{error}");
+        let chars = &tail[..tail.len() - notice.len()];
+        assert!(
+            !chars.is_empty() && chars.chars().all(|c| c == '▀'),
+            "{chars:?}"
+        );
+    }
+
+    /// What a timed-out command printed goes through the same redaction as
+    /// any result: a sudo password it echoed is never shown.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timeout_redacts_a_password_in_the_output_before_it() {
+        let bin = tempfile::tempdir().unwrap();
+        let helper = crate::tools::sudo_askpass::testing::write_fixtures(bin.path()).unwrap();
+        let (handle, mut prompts) = prompt_channel();
+        let user = tokio::spawn(async move {
+            let request = prompts.recv().await.expect("sudo asks for the password");
+            let _ = request.response_tx.send(Some("swordfish".to_string()));
+        });
+        let mut ctx = create_tool_context();
+        ctx.capabilities.secret_prompt = Some(handle);
+        let command = format!(
+            "export PATH=\"{}:$PATH\"\nFAKE_SUDO_ECHO=1 sudo true; echo done; sleep 30",
+            bin.path().display()
+        );
+        let error = tool_error(
+            crate::tools::sudo_askpass::testing::run_bash_with_test_askpass(
+                &command,
+                Some(5),
+                ctx,
+                &helper,
+            )
+            .await,
+        );
+        user.await.unwrap();
+        assert!(
+            error.starts_with(
+                "Tool execution failed: Command timed out after 5s and was stopped. \
+                 Output before the timeout:\n"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("sudo got: [redacted]\n") && error.contains("done\n"),
+            "{error}"
+        );
+        assert!(!error.contains("swordfish"), "{error}");
+    }
+
+    /// Is `pid` still running? One that was killed but not yet reaped by its
+    /// new parent (a zombie) is not.
+    #[cfg(unix)]
+    fn process_running(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .map(|(_, rest)| rest.trim_start().to_string())
+            });
+        #[cfg(not(target_os = "linux"))]
+        let state = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+        state.is_some_and(|s| !s.is_empty() && !s.starts_with('Z'))
+    }
+
+    /// After a timeout nothing the command started is left running: a child
+    /// that records its pid and sleeps is gone, not just the shell.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_leaves_no_process_of_the_command_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let command = format!(
+            "sleep 300 & echo $! > '{}'; echo started; wait",
+            pid_file.display()
+        );
+        let error = tool_error(
+            BashTool
+                .execute(
+                    json!({"command": command, "timeout": 1}),
+                    create_tool_context(),
+                )
+                .await,
+        );
+        assert_eq!(
+            error,
+            "Tool execution failed: Command timed out after 1s and was stopped. \
+             Output before the timeout:\nstarted\n"
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_running(pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let survived = process_running(pid);
+        if survived {
+            // SAFETY: kills the child this test's command started.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(!survived, "the command's child {pid} outlived the timeout");
     }
 
     #[cfg(unix)]

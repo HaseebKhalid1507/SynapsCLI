@@ -88,14 +88,14 @@ async fn attach_create(paths: &registry::DaemonPaths, cwd: &Path) -> (SocketTran
     let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
     SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(cwd.to_path_buf()),
                 model_override: Some("claude-sonnet-4-5".into()),
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .unwrap()
@@ -267,6 +267,151 @@ async fn reload_lock_held_keeps_same_id_parked_and_refuses_attach() {
 
     // Cleanup.
     SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
+    let t0 = std::time::Instant::now();
+    while registry::is_alive(&d.paths) && t0.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// After `/clear` the actor's id (`A`) is not its conversation (`N`). A
+/// reload that finds `N` locked registers the placeholder holding `N`
+/// under `N`'s id, with the alias `A → N`. An attach by `A` once the lock
+/// is free gets `N` back, never the pre-clear conversation `A`, and so
+/// does a later reconnect by `A`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn reload_lock_held_after_clear_retries_the_cleared_conversation() {
+    let guard = HomeGuard::new();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon(&guard, &url).await;
+
+    let (mut t, _snap) = attach_create(&d.paths, guard.home.path()).await;
+    let a = t.session_id().clone();
+    one_turn(&mut t, "conversation A").await;
+    t.send_from_self(SessionCommand::NewSession).await.unwrap();
+    let n = loop {
+        let env = tokio::time::timeout(Duration::from_secs(20), t.next_event())
+            .await
+            .expect("cleared")
+            .expect("alive");
+        if let SessionEventWire::Cleared { session_id } = env.event {
+            break session_id;
+        }
+    };
+    assert_ne!(n, a.as_str());
+    // `N` is on disk from its first turn.
+    assert_eq!(one_turn(&mut t, "conversation N").await.len(), 2);
+    t.detach().await;
+    assert!(
+        wait_lifecycle(
+            &d.paths,
+            &a,
+            SessionLifecycle::Parked,
+            Duration::from_secs(10)
+        )
+        .await,
+        "session must park"
+    );
+
+    let held = SessionLock::try_acquire(
+        &guard.base_dir().join("sessions"),
+        &n,
+        LockHolder {
+            pid: std::process::id(),
+            kind: "test".to_string(),
+        },
+    )
+    .expect("parked: N's lock is free");
+    assert_eq!(
+        SocketTransport::reload(&d.paths.sock, true, None, None)
+            .await
+            .expect("reload accepted"),
+        2
+    );
+    let t0 = std::time::Instant::now();
+    loop {
+        if registry::read_daemon_json(&d.paths).is_some_and(|i| i.generation == 2)
+            && SocketTransport::ping(&d.paths.sock).await.is_ok()
+        {
+            break;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "new image never answered"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let metas = SocketTransport::sessions(&d.paths.sock)
+        .await
+        .expect("sessions");
+    let row = metas
+        .iter()
+        .find(|m| m.journal_id == n)
+        .expect("the placeholder holds the cleared conversation");
+    assert!(row.locked_by.is_some(), "{row:?}");
+    assert_eq!(row.id.as_str(), n, "under the id its real session takes");
+    assert!(
+        metas.iter().all(|m| m.journal_id != a.as_str()),
+        "nothing holds the pre-clear conversation: {metas:?}"
+    );
+
+    drop(held);
+    let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test))
+        .await
+        .unwrap();
+    let (t2, snap) = SocketTransport::attach(
+        conn,
+        Attach::Existing {
+            session_id: a.clone(),
+            mode: AttachMode::Mirror,
+        },
+    )
+    .await
+    .expect("attach after the lock is free");
+    assert!(
+        snap.meta.locked_by.is_none(),
+        "the real session: {:?}",
+        snap.meta
+    );
+    assert_eq!(
+        snap.meta.journal_id, n,
+        "conversation N, not the pre-clear A"
+    );
+    let history = serde_json::to_string(&snap.conversation.api_messages).unwrap();
+    assert!(
+        history.contains("conversation N") && !history.contains("conversation A"),
+        "{history}"
+    );
+    let metas = SocketTransport::sessions(&d.paths.sock).await.unwrap();
+    assert_eq!(metas.len(), 1, "{metas:?}");
+    assert!(
+        metas[0].locked_by.is_none() && metas[0].journal_id == n,
+        "{metas:?}"
+    );
+    let _ = t2.detach().await;
+
+    let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test))
+        .await
+        .unwrap();
+    let (t3, again) = SocketTransport::attach(
+        conn,
+        Attach::Existing {
+            session_id: a.clone(),
+            mode: AttachMode::Mirror,
+        },
+    )
+    .await
+    .expect("a reconnect by the actor id");
+    assert_eq!(
+        (&again.meta.id, &again.meta.journal_id),
+        (&snap.meta.id, &n)
+    );
+    let _ = t3.detach().await;
+
+    SocketTransport::shutdown(&d.paths.sock, true)
+        .await
+        .unwrap();
     let t0 = std::time::Instant::now();
     while registry::is_alive(&d.paths) && t0.elapsed() < Duration::from_secs(10) {
         tokio::time::sleep(Duration::from_millis(100)).await;

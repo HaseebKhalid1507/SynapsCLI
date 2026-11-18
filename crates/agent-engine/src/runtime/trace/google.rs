@@ -38,7 +38,7 @@ use serde_json::Value;
 /// Tool names the Gemini adapter drops as internal-only (never sent on the
 /// Code Assist wire). Shared with `runtime::google_gemini::runtime`'s wire
 /// filter so the trace report can never drift from the actual translation.
-pub const GEMINI_INTERNAL_TOOLS: [&str; 3] = ["respond", "send_channel", "watcher_exit"];
+pub const GEMINI_INTERNAL_TOOLS: [&str; 2] = ["respond", "send_channel"];
 
 /// Normalize a Gemini `finishReason` into the trace enum. Unknown values
 /// collapse to `Other` — the raw string is never stored.

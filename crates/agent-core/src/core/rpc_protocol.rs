@@ -73,8 +73,6 @@ pub struct RpcAttachment {
 }
 
 /// Canonical runtime event payload carried by `RpcEvent::Event`.
-/// Server mode internalizes the same formatted event into its owning conversation
-/// rather than exposing a raw transport frame.
 ///
 /// All string fields are UTF-8; `formatted` is the full XML-tagged payload
 /// already safe for injection into the agent context (prompt-injection
