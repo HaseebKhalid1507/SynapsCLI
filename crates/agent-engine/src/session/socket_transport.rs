@@ -21,7 +21,16 @@ use super::view::RuntimeView;
 use super::wire::*;
 use crate::ipc::{ClientReadHalf, ClientWriteHalf};
 
+/// Bound on reaching the daemon's endpoint. Unix: a connect to a listening
+/// socket completes at once (kernel backlog), so this only guards a wedge.
+#[cfg(unix)]
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Windows: a named pipe has no backlog; `ipc::connect` retries
+/// `ERROR_PIPE_BUSY` for [`crate::ipc::BUSY_RETRY`] while a live daemon
+/// creates its next instance. A shorter bound here cut that retry to 500 ms
+/// and failed concurrent first clients with "connect timed out".
+#[cfg(windows)]
+pub const CONNECT_TIMEOUT: Duration = crate::ipc::BUSY_RETRY.saturating_add(Duration::from_millis(500));
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long `close` waits for the daemon's answer: its queue retry, the
 /// actor's reply and the session's end (`daemon/close.rs` budgets), plus a

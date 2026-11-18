@@ -5751,8 +5751,6 @@ async fn next_stream_event(stream: &mut Option<ActiveStream>) -> Option<StreamEv
     }
 }
 
-/// The conversation's title for listings: the saved title, else what
-/// `Session::auto_title` will make of the first user message.
 /// The listing title (`listing_title`): the same text a saved row of this
 /// conversation shows, so a row's title does not change when it turns saved.
 fn conversation_title(conv: &ConversationState) -> Option<String> {

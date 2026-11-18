@@ -107,11 +107,19 @@ impl<'de> Visitor<'de> for Top<'_> {
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
         let Top { f, count } = self;
+        // `_hooked` precedes `api_messages` (session_journal): each message
+        // gets its `before_message` count back before `f` sees it, so the
+        // user's words are told apart from extension output (#414).
+        let mut hooked = std::collections::HashMap::new();
         while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-            if key == "api_messages" {
+            if key == "_hooked" {
+                let value: Value = map.next_value()?;
+                hooked = crate::core::session_journal::stored_hooked(value).into_iter().collect();
+            } else if key == "api_messages" {
                 map.next_value_seed(Msgs {
                     f: &mut *f,
                     count: &mut *count,
+                    hooked: &hooked,
                 })?;
             } else {
                 map.next_value::<IgnoredAny>()?;
@@ -124,6 +132,7 @@ impl<'de> Visitor<'de> for Top<'_> {
 struct Msgs<'a> {
     f: &'a mut dyn FnMut(&Value) -> bool,
     count: &'a mut usize,
+    hooked: &'a std::collections::HashMap<usize, usize>,
 }
 
 impl<'de> DeserializeSeed<'de> for Msgs<'_> {
@@ -139,12 +148,46 @@ impl<'de> Visitor<'de> for Msgs<'_> {
         f.write_str("an api_messages array")
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        while let Some(v) = seq.next_element::<Value>()? {
+        while let Some(mut v) = seq.next_element::<Value>()? {
+            if let Some(&n) = self.hooked.get(&*self.count) {
+                crate::core::extension_context::set_hooked(&mut v, n);
+            }
             *self.count += 1;
             if !(self.f)(&v) {
                 return Err(de::Error::custom(STOP));
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::extension_context as ec;
+    use crate::core::session_journal::{save_session_in_dir, SessionPersistence};
+
+    /// #414 review: a streaming walk of a snapshot gives each message its
+    /// `before_message` count back, so previews and deep search see the
+    /// user's words, not extension context saved on them.
+    #[test]
+    fn a_snapshot_walk_restores_before_message_counts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = crate::core::session::Session::new("m", "low", None);
+        let mut prompt = serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": "go"},
+            {"type": "text", "text": ec::saved_block_text("axel", "CTX")},
+        ]});
+        ec::set_hooked(&mut prompt, 1);
+        s.api_messages.push(std::sync::Arc::new(prompt));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Json).unwrap();
+        let bytes = std::fs::read(tmp.path().join(format!("{}.json", s.id))).unwrap();
+        let mut seen = Vec::new();
+        walk_snapshot(&bytes, &mut |m| {
+            seen.push(crate::core::session::user_message_for_display(m));
+            true
+        })
+        .unwrap();
+        assert_eq!(seen, [Some("go".to_string())]);
     }
 }

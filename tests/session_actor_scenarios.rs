@@ -316,7 +316,7 @@ impl Drop for SaveSampler {
 
 /// Without the host-only message times (`_synaps_at`).
 fn msgs_json(m: &serde_json::Value) -> String {
-    let re = regex::Regex::new(r#""_synaps_at":"[^"]*",?"#).unwrap();
+    let re = regex::Regex::new(r#""_synaps_(at":"[^"]*"|hooked":\d+),?"#).unwrap();
     re.replace_all(&serde_json::to_string(m).unwrap(), "").into_owned()
 }
 
@@ -618,6 +618,54 @@ async fn tool_loop_saves_at_most_once_per_history_and_journals_the_turn() {
     assert_eq!(j["session_cost"].as_f64(), Some(a.cost));
     assert!(j["abort_context"].is_null());
     assert!(a.abort_context.is_none());
+    a.end().await;
+}
+
+/// #414, through the session actor in journal mode
+/// (`session_persistence = journal`): the engine marks the prompt hooked
+/// (count 0, no handler) in its first publish. The snapshot is written once,
+/// at the first save; every later save appends (an edit of the saved
+/// prompt, if the actor saved it before the mark, is one amend record);
+/// replay gives the final history, mark included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn journal_mode_tool_loop_keeps_the_hooked_prompt_and_never_resnapshots() {
+    let guard = HomeGuard::new();
+    std::fs::write(guard.base_dir().join("config"), "session_persistence = journal\n").unwrap();
+    let tool = sse_tool_call("echo_fixture", "toolu_scn1");
+    let bodies: &'static [&'static str] = Box::leak(Box::new([tool, ANTHROPIC_SSE]));
+    let (url, hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host_with_echo_tool().await;
+
+    let mut a = Run::with(&host, true).await;
+    let path = a.journal_path(&guard);
+    let sampler = SaveSampler::watch(path.clone());
+    a.submit("call the tool").await;
+    a.drive_to_idle().await;
+    a.flushed().await;
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "tool round + final round");
+    sampler.assert_at_most(&path, 1, "journal-mode tool loop snapshots");
+
+    let journal = std::fs::read_to_string(path.with_extension("journal")).expect("a journal");
+    let records: Vec<serde_json::Value> =
+        journal.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(records.iter().skip(1).all(|r| r["k"] != "open"), "one generation: {journal}");
+    for amend in records.iter().filter(|r| r["amend"] == true) {
+        assert_eq!((amend["i"].as_u64(), amend["h"].as_u64()), (Some(0), Some(0)), "{journal}");
+        assert_eq!(amend["m"]["content"], "call the tool");
+    }
+    assert!(journal.len() < 8_000, "O(message) records: {} bytes", journal.len());
+
+    let id = a.handle.journal_id();
+    let loaded =
+        synaps_cli::core::session_journal::load_session_in_dir(&guard.base_dir().join("sessions"), &id)
+            .unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.api_messages).unwrap(),
+        serde_json::to_value(&a.api_messages).unwrap()
+    );
+    assert_eq!(loaded.api_messages[0]["_synaps_hooked"], 0);
     a.end().await;
 }
 

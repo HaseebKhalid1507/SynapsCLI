@@ -117,8 +117,14 @@ mod imp {
     }
 
     /// How long `connect` keeps retrying `ERROR_PIPE_BUSY` (every instance
-    /// is between an accept and the next instance's creation).
-    const BUSY_RETRY: Duration = Duration::from_secs(2);
+    /// is between an accept and the next instance's creation). A pipe has no
+    /// backlog: a burst of first clients (concurrent auto-spawn losers) is
+    /// served one accept-loop turn at a time, and a daemon busy creating
+    /// their sessions on a loaded machine can take seconds per turn. Only a
+    /// live, serving daemon reaches this wait (no server → `NotFound` at
+    /// once). Callers' own timeouts must not cut it short
+    /// (`session::socket_transport::CONNECT_TIMEOUT`).
+    pub const BUSY_RETRY: Duration = Duration::from_secs(5);
 
     /// Open the daemon's pipe and check that its server runs as this user.
     /// `NotFound` when nobody serves the endpoint (the `ECONNREFUSED` /
@@ -456,6 +462,25 @@ mod tests {
             r.read_exact(&mut b).await.unwrap();
         }
         srv.await.unwrap();
+    }
+
+    /// The daemon's single listening instance is taken and its accept loop
+    /// is slow to make the next one (a burst of first clients on a loaded
+    /// machine): a client waits it out within the transport's connect
+    /// bound instead of failing with "connect timed out" after 500 ms.
+    #[tokio::test]
+    async fn a_client_waits_out_a_slow_accept_within_the_transport_bound() {
+        let (_d, path) = endpoint();
+        let mut l = Listener::bind(&path).unwrap();
+        let _first = connect(&path).await.unwrap();
+        let p = path.clone();
+        let second = tokio::spawn(async move {
+            tokio::time::timeout(crate::session::socket_transport::CONNECT_TIMEOUT, connect(&p)).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _s1 = l.accept().await.unwrap();
+        let r = second.await.unwrap();
+        assert!(matches!(r, Ok(Ok(_))), "second client: {r:?}");
     }
 
     #[tokio::test]

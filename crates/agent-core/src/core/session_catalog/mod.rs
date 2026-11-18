@@ -77,7 +77,7 @@ pub fn typed_user_text(m: &serde_json::Value) -> Option<String> {
     if m["role"] != "user" || body::is_context_note(m) {
         return None;
     }
-    crate::core::session::user_content_for_display(&m["content"])
+    crate::core::session::user_message_for_display(m)
         .filter(|t| !body::is_host_injected(t) && !t.trim().is_empty())
 }
 

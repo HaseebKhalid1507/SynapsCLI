@@ -2,9 +2,10 @@
 //! count per session, keyed by id and stamped with (mtime, bytes) so a
 //! refresh only re-reads sessions whose files changed.
 //!
-//! User text goes through [`user_content_for_display`](crate::core::session::user_content_for_display) — the same projection
-//! titles use — so tool results and attachment bodies never leak into the
-//! preview or the search haystack. Host-injected user-role text (event
+//! User text goes through [`typed_user_text`](super::typed_user_text) —
+//! the same projection titles use — so tool results, attachment bodies and
+//! saved extension context never leak into the preview or the search
+//! haystack. Host-injected user-role text (event
 //! deliveries, abort/interrupt markers) is skipped too: "last" means the
 //! last thing the human typed.
 

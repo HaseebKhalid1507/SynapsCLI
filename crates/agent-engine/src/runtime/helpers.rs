@@ -963,8 +963,8 @@ mod tests {
         let ttl = CacheTtl::FiveMinutes;
         let context = format!(
             "{}\nambient\n{}",
-            super::super::stream::EXTENSION_CONTEXT_OPEN,
-            super::super::stream::EXTENSION_CONTEXT_CLOSE
+            agent_core::core::extension_context::TURN_OPEN,
+            agent_core::core::extension_context::CLOSE
         );
         let mut out: Vec<SharedMessage> = vec![
             Arc::new(json!({"role":"user","content":[

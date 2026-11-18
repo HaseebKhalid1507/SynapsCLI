@@ -115,6 +115,43 @@ All notable changes to this project will be documented in this file.
   it**, with its keys in alphabetical order. Fields a newer daemon adds are
   kept, and an older daemon's missing fields are left out, not defaulted.
 
+- **Behaviour change for extensions: `before_message` inject is saved by
+  default (#414).** Injected content used to be shown for one request and
+  never kept, so the model disowned answers it had given from it and lost
+  it after its first tool call. Now each part is written once into the
+  stored conversation on the user message the hook ran for, fenced with the
+  extension id, and is ordinary history from then on (later requests,
+  sessions, rollover archives, compaction). `"forget": true` shows content
+  at the tail of every request of the turn instead, never stored, and saves
+  a marker `[<extension id> context was shown here for one turn and not
+  kept]`; `parts` mixes both in one result. A saved part over 16 KiB is
+  handled as `forget`. Hosts announce this with `features:
+  ["inject.forget"]` in the `initialize` params; extension protocol stays
+  1 and `content` remains required, so older hosts keep working. The hook
+  now runs once per new user message of a turn (prompt, steer, event
+  message), and its `message`, titles, previews and search never include
+  saved extension context. Clients see saved blocks and markers in history
+  (display tails show them as extra user-role items; the TUI renders them
+  dimmed under the user message with their source). Daemon protocol is
+  unchanged. A message is hooked once, ever: the host records every new
+  user message (also with no `before_message` handler, count 0) and how
+  many trailing blocks it added (`_synaps_hooked`, beside the message, never
+  sent to a provider), so a resend or resumed turn never re-runs the hook
+  and forget content is not shown again. Titles, previews, display and
+  compaction go by that count, never by the text, so a user's own text that
+  looks like a fence stays theirs. Framing look-alikes in extension content
+  are escaped with a `\` before their `[`, anywhere in a line and after any
+  line break (`\r`, `\n`, U+0085, U+2028, U+2029). In journal mode the
+  hook's edit of a prompt the frontend already saved is one append-only
+  amend record (O(message)) instead of a full snapshot; only that edit
+  amends, any other change still snapshots. Builds without amends keep their
+  copy of that message (they lose the saved context, not the history);
+  after a downgrade a snapshot loses the counts, so saved blocks read as the
+  user's text and an unanswered last message can be hooked again.
+  Rollover archives keep `_synaps_hooked` on stored user messages (an
+  optional key, counted over the stored blocks).
+  Migration: `docs/extensions/protocol.md` §`inject`.
+
 ### Fixed
 
 - **Releases carry the `.deb` again.** The `.deb` was uploaded after the

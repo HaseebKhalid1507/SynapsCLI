@@ -253,6 +253,7 @@ field in the record, in `body`, or in an entry of `messages`, and
 | `role` | string | `user` or `assistant`. |
 | `content` | string, or array of blocks | The text of the message, or its content blocks. |
 | `_archive_reduced` | string, usually absent | Present when the message was over a limit by itself and is not stored exactly as it was. See [Reduced messages](#reduced-messages). |
+| `_synaps_hooked` | integer, usually absent | On a `user` message the `before_message` hook ran for: how many of its trailing stored blocks are blocks the hook added (saved extension context, then markers), counted over the stored blocks and only over those stored intact; `0` when none. Absent: every block is the user's. See [`protocol.md`](./protocol.md) §"Transcripts and history" for the block grammar. Optional: a reader that ignores it reads the message as before. |
 
 A block is an object with a `type`:
 
