@@ -397,6 +397,31 @@ mod tests {
         std::fs::write(&target, b"x").unwrap();
     }
 
+    /// A ruleset the kernel refuses to restrict with: its descriptor is not a
+    /// Landlock ruleset at all. Works on a host with no Landlock too.
+    fn unusable_ruleset() -> Ruleset {
+        let fd = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        Ruleset { fd, abi: MIN_ABI, handled: WRITE_RIGHTS, rules: 0 }
+    }
+
+    #[test]
+    fn a_failed_restrict_runs_nothing_and_spawns_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ruleset = unusable_ruleset();
+        let ran = AtomicBool::new(false);
+        let result = run_confined(&ruleset, || ran.store(true, Ordering::SeqCst));
+        assert!(result.is_err(), "the restrict failed, so must the call");
+        assert!(!ran.load(Ordering::SeqCst), "the closure must not run unrestricted");
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("touch {}", marker.display()));
+        confine_command(&mut cmd, &ruleset).unwrap();
+        assert!(cmd.status().is_err(), "the child never starts");
+        assert!(!marker.exists(), "and nothing was exec'd in its place");
+    }
+
     #[test]
     fn the_handled_set_is_exactly_the_write_rights_of_abi_1_to_3() {
         // The kernel's own numbering: write_file (1), remove_dir through

@@ -1572,6 +1572,13 @@ mod codex_ultra_worker_tests {
                 (SessionSandbox::Unresolved, SessionSandbox::Unresolved) | (SessionSandbox::Off, SessionSandbox::Off) => {}
                 (got, want) => panic!("{what}: the worker got {got:?}, its parent has {want:?}"),
             }
+            // No engine host is installed in a unit test, so the provider
+            // cannot be asked about a confined parent's worker: it is
+            // refused, never started on a guess.
+            if matches!(sandbox, SessionSandbox::Confined(_)) {
+                let why = super::confine_worker(&mut runtime, &ws, 1).await.expect_err("the worker needs its own answer");
+                assert!(why.starts_with("sandbox: "), "{what}: {why}");
+            }
             // Asking the provider about the worker changes nothing when the
             // parent is not confined by a policy.
             if !matches!(sandbox, SessionSandbox::Confined(_)) {
@@ -1579,6 +1586,21 @@ mod codex_ultra_worker_tests {
                 assert_eq!(format!("{:?}", runtime.sandbox()), format!("{sandbox:?}"), "{what}");
             }
         }
+    }
+
+    /// The answer the provider gives for a worker is what its runtime runs
+    /// with. A host cannot be installed in a unit test, so the line that does
+    /// it is pinned by position: asked first, applied after.
+    #[test]
+    fn a_workers_resolved_sandbox_is_applied_to_its_runtime() {
+        let source = include_str!("mod.rs");
+        let start = source.find("pub(crate) async fn confine_worker(").expect("confine_worker");
+        let end = start + source[start..].find("\n}\n").expect("the end of the function");
+        let body = &source[start..end];
+        let asked = body.find("host.confine_worker(").expect("the provider is asked through the host");
+        let applied = body.find("runtime.set_sandbox(sandbox);").expect("the answer is applied to the runtime");
+        assert!(asked < applied, "asked {asked}, applied {applied}");
+        assert!(body.contains(".map_err(|refused| refused.to_string())?"), "a refusal leaves before the apply");
     }
 
     #[test]

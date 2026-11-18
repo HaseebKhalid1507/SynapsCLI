@@ -384,11 +384,69 @@ mod tests {
                 swapped = true;
             });
             assert!(swapped, "{what}: the swap ran between the check and the open");
-            assert!(result.is_err(), "{what}: the open must not follow the swapped link");
+            // Refused by the open itself (`O_NOFOLLOW`), not only by the check
+            // after the walk that compares the opened directory with the path.
+            assert!(
+                matches!(result, Err(WriteError::Io(_))),
+                "{what}: the open must not follow the swapped link: {result:?}"
+            );
             assert!(!elsewhere.join("swap.txt").exists(), "{what}: nothing landed through the link");
             std::fs::remove_file(&src).unwrap();
             std::fs::rename(&parked, &src).unwrap();
         }
+    }
+
+    #[test]
+    fn a_temp_name_that_is_a_link_or_exists_is_never_written_through() {
+        use std::os::unix::fs::symlink;
+        let t = Tree::new();
+        let c = t.confinement(vec![], vec![]);
+        let victim = t.home.join("victim.txt");
+        std::fs::write(&victim, "keep").unwrap();
+        let target = open_target(&c, &t.ws.join("src/out.txt"), false).unwrap();
+        // A link planted at the temporary name is not followed.
+        let tmp = t.ws.join("src/.planted.tmp");
+        symlink(&victim, &tmp).unwrap();
+        assert!(target.replace(".planted.tmp", b"no", None).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(!t.ws.join("src/out.txt").exists());
+        std::fs::remove_file(&tmp).unwrap();
+        // A file already there is not reused either.
+        std::fs::write(&tmp, "mine").unwrap();
+        assert!(target.replace(".planted.tmp", b"no", None).is_err());
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "mine");
+        std::fs::remove_file(&tmp).unwrap();
+        // The name is one plain component.
+        for bad in ["", "a/b", "../x", "a\0b"] {
+            let err = target.replace(bad, b"no", None).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        assert!(!t.ws.join("src/out.txt").exists());
+        // Control: a plain name works.
+        target.replace(".planted.tmp", b"yes", None).unwrap();
+        assert_eq!(std::fs::read_to_string(t.ws.join("src/out.txt")).unwrap(), "yes");
+    }
+
+    #[test]
+    fn a_guarded_read_never_follows_the_final_name() {
+        use std::os::unix::fs::symlink;
+        let t = Tree::new();
+        let c = t.confinement(vec![], vec![]);
+        let file = t.ws.join("src/read.txt");
+        std::fs::write(&file, "mine").unwrap();
+        let target = open_target(&c, &file, false).unwrap();
+        assert_eq!(target.read_to_string().unwrap(), "mine", "control: a regular file reads");
+        // The name is swapped for a link after the target was opened.
+        let secret = t.home.join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        std::fs::remove_file(&file).unwrap();
+        symlink(&secret, &file).unwrap();
+        let read = target.read_to_string();
+        assert!(read.is_err(), "the link was followed: {read:?}");
+        // Nor is anything but a regular file read.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(target.read_to_string().is_err());
     }
 
     #[test]
