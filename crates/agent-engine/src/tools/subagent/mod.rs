@@ -1550,6 +1550,37 @@ mod codex_ultra_worker_tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_workers_runtime_starts_with_its_parents_sandbox_never_a_weaker_one() {
+        use crate::sandbox::testkit::Tree;
+        use crate::sandbox::SessionSandbox;
+        let t = Tree::new();
+        let parent = t.session(vec![], vec![]);
+        for (what, sandbox) in [
+            ("confined", parent.clone()),
+            ("no resolved policy", SessionSandbox::Unresolved),
+            ("off", SessionSandbox::Off),
+        ] {
+            let caps = crate::tools::ToolCapabilities { sandbox: sandbox.clone(), ..Default::default() };
+            let ws = super::WorkerWorkspace::from_capabilities(&caps);
+            let mut runtime = crate::Runtime::new_headless();
+            super::apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None, &ws);
+            match (runtime.sandbox(), &sandbox) {
+                (SessionSandbox::Confined(a), SessionSandbox::Confined(b)) => {
+                    assert!(std::sync::Arc::ptr_eq(a, b), "{what}: the worker holds the parent's own policy")
+                }
+                (SessionSandbox::Unresolved, SessionSandbox::Unresolved) | (SessionSandbox::Off, SessionSandbox::Off) => {}
+                (got, want) => panic!("{what}: the worker got {got:?}, its parent has {want:?}"),
+            }
+            // Asking the provider about the worker changes nothing when the
+            // parent is not confined by a policy.
+            if !matches!(sandbox, SessionSandbox::Confined(_)) {
+                super::confine_worker(&mut runtime, &ws, 1).await.expect("nothing to resolve");
+                assert_eq!(format!("{:?}", runtime.sandbox()), format!("{sandbox:?}"), "{what}");
+            }
+        }
+    }
+
     #[test]
     fn all_spawn_paths_apply_codex_worker_reasoning_after_model_selection() {
         for (name, source) in [

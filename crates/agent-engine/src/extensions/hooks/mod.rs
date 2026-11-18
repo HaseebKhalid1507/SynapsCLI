@@ -1506,6 +1506,44 @@ mod tests {
         set
     }
 
+    /// The sandbox policy question reaches one handler: the extension the
+    /// owner named, subscribed to the hook, holding the permission, on the
+    /// host bus. The permission is checked again at lookup, not only at
+    /// subscribe time, so a registration that got in without it still is
+    /// not asked.
+    #[tokio::test]
+    async fn the_sandbox_policy_handler_needs_the_name_the_hook_the_permission_and_the_host_bus() {
+        let handler = TestHandler::new("guard", HookResult::Continue);
+        let granted = perms_with(&[Permission::SandboxPolicy]);
+
+        let bus = Arc::new(HookBus::new());
+        assert!(bus.sandbox_policy_handler("guard").await.is_none(), "nothing subscribed");
+        bus.subscribe(HookKind::SandboxPolicy, handler.clone(), None, None, granted.clone()).await.unwrap();
+        assert_eq!(bus.sandbox_policy_handler("guard").await.map(|h| h.id().to_string()).as_deref(), Some("guard"));
+        assert!(bus.sandbox_policy_handler("other").await.is_none(), "only the named extension");
+        let worker = HookBus::worker_transforms(&bus);
+        assert!(worker.sandbox_policy_handler("guard").await.is_none(), "a worker's view has none");
+
+        // The hook subscribed under another kind is not the sandbox hook.
+        let wrong_kind = Arc::new(HookBus::new());
+        wrong_kind.subscribe(HookKind::OnSessionStart, handler.clone(), None, None, perms_with(&[Permission::SessionLifecycle]))
+            .await
+            .unwrap();
+        assert!(wrong_kind.sandbox_policy_handler("guard").await.is_none());
+
+        // A registration without the permission, as if the subscribe gate
+        // had been bypassed: still not asked.
+        let bypassed = HookBus::new();
+        bypassed.handlers.write().await.entry(HookKind::SandboxPolicy).or_default().push(HandlerRegistration {
+            handler: handler.clone(),
+            tool_filter: None,
+            matcher: None,
+            permissions: PermissionSet::new(),
+            on_failure: HookFailurePolicy::Continue,
+        });
+        assert!(bypassed.sandbox_policy_handler("guard").await.is_none(), "the permission is checked at lookup too");
+    }
+
     /// emit_after_tool_call returns the substituted output when an
     /// after_tool_call handler returns Replace — this is the seam that lets an
     /// extension compress/redact tool output before it enters history.

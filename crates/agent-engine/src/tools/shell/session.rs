@@ -694,6 +694,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_that_cannot_confine_a_shell_starts_nothing() {
+        use crate::sandbox::{testkit, SessionSandbox};
+        let t = testkit::Tree::new();
+        // The command is split on whitespace and run directly, with no shell
+        // to unquote it: the marker's path must hold no space or quote.
+        let marker = t.root.join("shell-ran");
+        assert!(!marker.to_string_lossy().contains(char::is_whitespace));
+        for (what, sandbox) in [
+            ("no resolved policy", SessionSandbox::Unresolved),
+            ("a ruleset that cannot be built", t.session_that_cannot_spawn()),
+        ] {
+            let mgr = default_manager();
+            let mut opts = opts_for(&format!("touch {}", marker.display()));
+            opts.sandbox = sandbox;
+            let error = mgr.create_session(opts, None, 256 * 1024).await.unwrap_err().to_string();
+            assert!(error.contains("sandbox"), "{what}: {error}");
+            assert!(mgr.sessions.lock().unwrap().is_empty(), "{what}: a session was registered");
+            assert!(!marker.exists(), "{what}: the shell ran anyway");
+        }
+        // Undo: with confinement off the same command runs.
+        let mgr = default_manager();
+        let mut opts = opts_for(&format!("touch {}", marker.display()));
+        opts.sandbox = SessionSandbox::Off;
+        mgr.create_session(opts, None, 256 * 1024).await.expect("control: the shell starts when confinement is off");
+        assert!(testkit::appears(&marker).await, "control: the shell ran");
+    }
+
+    /// The refusal comes before the environment probe, which itself starts a
+    /// process: a session that may not spawn must not even get that far
+    /// (the PTY refuses again later; this is the first line, pinned by
+    /// position because the second hides its removal).
+    #[test]
+    fn a_shell_that_may_not_spawn_is_refused_before_the_probe_starts() {
+        let source = include_str!("session.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let decide = production.find("opts.sandbox.for_spawn()").expect("the spawn is decided per call");
+        let refuse = production.find("SpawnSandbox::Refuse(why)").expect("a refusal is returned");
+        let probe = production.find("PtyHandle::prepare_scope(").expect("the probe");
+        assert!(decide < refuse && refuse < probe, "decide {decide}, refuse {refuse}, probe {probe}");
+        let between = &production[refuse..probe];
+        assert!(between.contains("return Err("), "the refusal must leave before the probe");
+    }
+
+    #[tokio::test]
     async fn canceled_creation_never_spawns_or_registers_a_shell() {
         let mgr = default_manager();
         let token = crate::CancellationToken::new();

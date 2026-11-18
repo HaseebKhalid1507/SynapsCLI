@@ -397,6 +397,43 @@ mod tests {
         std::fs::write(&target, b"x").unwrap();
     }
 
+    #[test]
+    fn the_handled_set_is_exactly_the_write_rights_of_abi_1_to_3() {
+        // The kernel's own numbering: write_file (1), remove_dir through
+        // make_sym (4 to 12), refer (13), truncate (14). Execute (0),
+        // read_file (2) and read_dir (3) stay unhandled, so reads and exec
+        // are never confined.
+        let kernel = (1u64 << 1) | (0x1FFu64 << 4) | (1u64 << 13) | (1u64 << 14);
+        assert_eq!(WRITE_RIGHTS, kernel);
+        assert_eq!(ACCESS_FS_REFER, 1 << 13);
+        assert_eq!(ACCESS_FS_TRUNCATE, 1 << 14);
+    }
+
+    #[test]
+    fn a_confined_thread_cannot_truncate_a_file_outside_its_grant() {
+        if usable_abi().is_err() {
+            eprintln!("skipped: no usable Landlock on this host");
+            return;
+        }
+        let inside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("keep.txt");
+        let mine = inside.path().join("mine.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::fs::write(&mine, b"mine").unwrap();
+        let mut rs = Ruleset::new().unwrap();
+        assert!(rs.allow(inside.path()).unwrap());
+        let victim_c = std::ffi::CString::new(victim.to_str().unwrap()).unwrap();
+        let mine_c = std::ffi::CString::new(mine.to_str().unwrap()).unwrap();
+        // truncate(2) needs the truncate right, not the write right.
+        let outside_rc = run_confined(&rs, || unsafe { libc::truncate(victim_c.as_ptr(), 0) }).unwrap();
+        let inside_rc = run_confined(&rs, || unsafe { libc::truncate(mine_c.as_ptr(), 0) }).unwrap();
+        assert_eq!(outside_rc, -1, "a file outside the grant must not be truncated");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(inside_rc, 0, "control: inside the grant it can be");
+        assert!(std::fs::read(&mine).unwrap().is_empty());
+    }
+
     /// Prints what this host's kernel offers, so a run with `--nocapture`
     /// records the Landlock ABI the real-kernel tests ran against. Never
     /// fails: a host without usable Landlock is reported, not faked.

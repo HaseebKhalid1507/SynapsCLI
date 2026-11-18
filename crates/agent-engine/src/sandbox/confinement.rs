@@ -804,6 +804,147 @@ mod tests {
     }
 
     #[test]
+    fn a_dot_git_directory_that_is_not_a_repository_is_unusable() {
+        let f = fixture();
+        std::fs::create_dir_all(f.ws.join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(f.ws.join("src")).unwrap();
+        let layout = detect_git(&f.ws).expect("a .git entry");
+        assert_eq!(layout.kind, GitKind::Unusable);
+        assert!(layout.grants.is_empty());
+        let c = confine(&f, vec![], vec![]);
+        let (grants, plan) = ws_plan(&c, &f.ws);
+        assert!(grants.iter().all(|g| !g.starts_with(f.ws.join(".git"))), "{grants:?}");
+        assert!(plan.left_out.iter().any(|h| h.path == f.ws.join(".git")));
+        assert!(c.allows_write(&f.ws.join(".git/hooks/pre-commit")).is_err());
+        assert!(c.allows_write(&f.ws.join("src/lib.rs")).is_ok());
+    }
+
+    #[test]
+    fn a_linked_checkout_whose_common_dir_is_not_one_is_unusable() {
+        let f = fixture();
+        let (repo, wt) = make_linked(&f.root);
+        assert_eq!(detect_git(&wt).unwrap().kind, GitKind::Linked, "control: the layout is good");
+        std::fs::remove_file(repo.join(".git/HEAD")).unwrap();
+        let layout = detect_git(&wt).unwrap();
+        assert_eq!(layout.kind, GitKind::Unusable);
+        assert!(layout.grants.is_empty(), "nothing of a layout that does not check out is granted");
+        let mut c = confine(&f, vec![], vec![]);
+        c.roots = vec![wt.clone()];
+        c.project_dirs = vec![wt.clone()];
+        let plan = c.plan().unwrap();
+        assert!(granted(&plan).iter().all(|g| !g.starts_with(repo.join(".git")) && *g != wt.join(".git")));
+        assert!(c.allows_write(&wt.join(".git")).is_err());
+        assert!(c.allows_write(&repo.join(".git/hooks/pre-commit")).is_err());
+        assert!(c.allows_write(&repo.join(".git/refs/heads/x")).is_err(), "no git grant at all: {:?}", granted(&plan));
+    }
+
+    #[test]
+    fn a_linked_checkout_that_the_admin_dir_does_not_point_back_at_is_unusable() {
+        let f = fixture();
+        let (repo, wt) = make_linked(&f.root);
+        assert_eq!(detect_git(&wt).unwrap().kind, GitKind::Linked, "control");
+        // The admin dir names some other checkout: this `.git` file is a claim, not a link.
+        std::fs::write(repo.join(".git/worktrees/wt/gitdir"), format!("{}\n", f.root.join("other/.git").display()))
+            .unwrap();
+        let layout = detect_git(&wt).unwrap();
+        assert_eq!(layout.kind, GitKind::Unusable);
+        assert!(layout.grants.is_empty());
+        // A `.git` file that is not a `gitdir:` line, or leads nowhere, is no layout either.
+        std::fs::write(wt.join(".git"), "nonsense\n").unwrap();
+        assert_eq!(detect_git(&wt).unwrap().kind, GitKind::Unusable);
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", f.root.join("gone").display())).unwrap();
+        assert_eq!(detect_git(&wt).unwrap().kind, GitKind::Unusable);
+    }
+
+    #[test]
+    fn a_link_on_the_way_to_a_protected_path_is_neither_followed_nor_granted() {
+        let f = fixture();
+        let elsewhere = f.root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("plugins")).unwrap();
+        std::fs::create_dir_all(elsewhere.join("notes")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, f.ws.join(".synaps")).unwrap();
+        std::fs::create_dir_all(f.ws.join("src")).unwrap();
+        let c = confine(&f, vec![], vec![]);
+        let (grants, plan) = ws_plan(&c, &f.ws);
+        assert!(grants.iter().all(|g| !g.starts_with(f.ws.join(".synaps"))), "a link was split: {grants:?}");
+        assert!(grants.contains(&f.ws.join("src")));
+        assert!(plan.left_out.iter().any(|h| h.path == f.ws.join(".synaps/plugins")));
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_read_refuses_with_the_inner_path() {
+        let f = fixture();
+        let c = confine(&f, vec![f.ws.join("bin")], vec![]);
+        std::fs::remove_dir_all(&f.ws).unwrap();
+        let err = c.plan().expect_err("the root cannot be listed, so it cannot be split");
+        assert_eq!(err.path, f.ws.join("bin"));
+    }
+
+    #[test]
+    fn a_write_existing_root_stays_write_existing_and_is_not_a_place_the_tools_write() {
+        let f = fixture();
+        let procfs = f.root.join("procfs-like");
+        std::fs::create_dir_all(&procfs).unwrap();
+        let mut c = confine(&f, vec![], vec![]);
+        c.existing_only = vec![procfs.clone()];
+        c.roots.push(procfs.clone());
+        let plan = c.plan().unwrap();
+        let grant = plan.grants.iter().find(|g| g.path == procfs).expect("granted");
+        assert!(grant.existing_only, "files can be written there, never created, removed or renamed");
+        assert!(
+            plan.grants.iter().filter(|g| g.path != procfs && g.path != Path::new("/proc")).all(|g| !g.existing_only),
+            "only the write-existing roots carry the flag"
+        );
+        assert!(c.allows_write(&procfs.join("fd/1")).is_err());
+        assert!(c.allows_write(&f.ws.join("src/lib.rs")).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_existing_grant_gets_file_rights_only_in_the_ruleset() {
+        if crate::sandbox::landlock::usable_abi().is_err() {
+            eprintln!("skipped: no usable Landlock on this host");
+            return;
+        }
+        let f = fixture();
+        let dir = f.root.join("only-existing");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.txt"), "old\n").unwrap();
+        let mut c = confine(&f, vec![], vec![]);
+        c.existing_only = vec![dir.clone()];
+        c.roots = vec![dir.clone()];
+        let ruleset = c.build_ruleset().expect("ruleset");
+        let run = |script: String| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(script);
+            crate::sandbox::landlock::confine_command(&mut cmd, &ruleset).unwrap();
+            cmd.output().unwrap().status.success()
+        };
+        assert!(run(format!("printf new > '{}'", dir.join("old.txt").display())), "an existing file can be written");
+        assert!(!run(format!("printf x > '{}'", dir.join("fresh.txt").display())), "a new file cannot be made");
+        assert!(!run(format!("rm '{}'", dir.join("old.txt").display())), "an existing file cannot be removed");
+        assert!(dir.join("old.txt").exists() && !dir.join("fresh.txt").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_grant_that_turned_protected_after_validation_is_dropped_and_named() {
+        let f = fixture();
+        let ssh = f.home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let c = confine(&f, vec![], vec![]);
+        let plan = Plan {
+            grants: vec![GrantPath { path: ssh.clone(), explicit: true, existing_only: false }],
+            ..Plan::default()
+        };
+        let opened = c.open_grants(&plan, &mut || {}).unwrap();
+        assert!(opened.grants.is_empty(), "a protected path is never given to a rule");
+        let d = opened.dropped.iter().find(|d| d.path == ssh).expect("named");
+        assert!(d.reason.contains("credentials"), "{}", d.reason);
+        assert_eq!(c.late_dropped().len(), 1);
+    }
+
+    #[test]
     fn a_project_plugin_folder_is_left_out() {
         let f = fixture();
         std::fs::create_dir_all(f.ws.join(".synaps/plugins/p")).unwrap();

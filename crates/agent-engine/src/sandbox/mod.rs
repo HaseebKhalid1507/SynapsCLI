@@ -321,4 +321,64 @@ mod tests {
         assert!(s.check_can_spawn().is_err());
         assert!(matches!(s.guard_write(Path::new("/tmp/x"), false), Err(WriteError::Refused(_))));
     }
+
+    #[test]
+    fn the_checks_of_the_in_process_write_tools_fail_closed() {
+        use crate::sandbox::testkit::Tree;
+        let t = Tree::new();
+        let off = SessionSandbox::Off;
+        let unresolved = SessionSandbox::Unresolved;
+        let confined = t.session(vec![], vec![]);
+        let inside = t.ws.join("src/a.txt");
+        let outside = t.home.join("out.txt");
+
+        // Which target a write may land on.
+        assert!(off.check_write_target(&outside).is_ok());
+        assert!(unresolved.check_write_target(&inside).is_err());
+        assert!(confined.check_write_target(&inside).is_ok());
+        assert!(confined.check_write_target(&outside).is_err());
+        assert!(confined.check_write_target(&t.base.join("config")).is_err());
+
+        // The directory the kernel opened must be the one that was checked.
+        let parent = inside.parent().unwrap().to_path_buf();
+        assert!(off.check_opened_parent(Ok(t.home.clone()), &inside).is_ok(), "off checks nothing");
+        assert!(confined.check_opened_parent(Ok(parent), &inside).is_ok());
+        let why = confined.check_opened_parent(Ok(t.home.clone()), &inside).unwrap_err();
+        assert!(why.contains("changed while it was being opened"), "{why}");
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let why = confined.check_opened_parent(Err(gone), &inside).unwrap_err();
+        assert!(why.contains("cannot verify"), "{why}");
+
+        // Whether a command may start at all.
+        assert!(off.check_can_spawn().is_ok());
+        assert!(confined.check_can_spawn().is_ok());
+        assert!(unresolved.check_can_spawn().is_err());
+    }
+
+    /// The state a fresh runtime starts in is decided by the owner's config
+    /// alone, and every doubt means "refuse until a policy is installed".
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_fresh_runtime_is_off_without_the_switch_and_refusing_with_it_or_when_it_cannot_be_read() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let config = base.path().join("config");
+
+        assert!(SessionSandbox::from_settings().is_off(), "no config file: off");
+        assert!(crate::Runtime::new().await.unwrap().sandbox().is_off());
+
+        std::fs::write(&config, "sandbox.confine = enforce\n").unwrap();
+        assert!(matches!(SessionSandbox::from_settings(), SessionSandbox::Unresolved));
+        let rt = crate::Runtime::new().await.unwrap();
+        assert!(matches!(rt.sandbox(), SessionSandbox::Unresolved), "a runtime nobody configured refuses everything");
+        assert!(rt.sandbox().check_can_spawn().is_err());
+
+        std::fs::write(&config, "sandbox.confine = off\n").unwrap();
+        assert!(SessionSandbox::from_settings().is_off());
+
+        // A config that exists but cannot be read as a file: the switch is
+        // unknown, so confinement stays on.
+        std::fs::remove_file(&config).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        assert!(matches!(SessionSandbox::from_settings(), SessionSandbox::Unresolved));
+    }
 }

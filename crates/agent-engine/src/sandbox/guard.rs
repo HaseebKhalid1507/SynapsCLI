@@ -392,6 +392,29 @@ mod tests {
     }
 
     #[test]
+    fn a_chain_of_links_is_followed_up_to_the_bound_and_no_further() {
+        use std::os::unix::fs::symlink;
+        let t = Tree::new();
+        let c = t.confinement(vec![], vec![]);
+        let real = t.ws.join("src/real.txt");
+        std::fs::write(&real, "old").unwrap();
+        let chain = |n: usize| -> PathBuf {
+            let mut prev = real.clone();
+            for i in 0..n {
+                let link = t.ws.join(format!("src/chain-{n}-{i}"));
+                symlink(&prev, &link).unwrap();
+                prev = link;
+            }
+            prev
+        };
+        write(&c, &chain(MAX_LINK_HOPS), "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new", "{MAX_LINK_HOPS} links are followed");
+        let why = refused(write(&c, &chain(MAX_LINK_HOPS + 1), "no"));
+        assert!(why.contains("too many symbolic links"), "{why}");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new", "one link too many writes nothing");
+    }
+
+    #[test]
     fn parents_are_made_only_when_the_whole_path_is_allowed() {
         let t = Tree::new();
         let c = t.confinement(vec![], vec![]);
