@@ -1137,6 +1137,25 @@ mod tests {
         assert!(ev.message.is_none());
     }
 
+    /// #414 review: the `on_session_end` transcript is what the model saw:
+    /// saved blocks and markers stay, and each hooked message carries the
+    /// host's count (`_synaps_hooked`) so an extension can tell them from
+    /// what the user typed (protocol.md, "Transcripts and history").
+    #[test]
+    fn session_end_transcript_carries_saved_blocks_and_the_count() {
+        use agent_core::core::extension_context as ec;
+        let mut prompt = json!({"role": "user", "content": [
+            {"type": "text", "text": "go"},
+            {"type": "text", "text": ec::marker_text("axel")},
+        ]});
+        ec::set_hooked(&mut prompt, 1);
+        let ev = HookEvent::on_session_end("s", Some(vec![std::sync::Arc::new(prompt)]));
+        let wire = serde_json::to_value(&ev).unwrap();
+        let sent = &wire["transcript"][0];
+        assert_eq!(sent[ec::HOOKED_KEY], 1);
+        assert_eq!(sent["content"][1]["text"], ec::marker_text("axel"));
+    }
+
     /// HookEvent is round-trippable through JSON without loss.
     #[test]
     fn hook_event_serde_roundtrip() {

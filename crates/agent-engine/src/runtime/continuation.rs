@@ -5975,6 +5975,89 @@ mod calibration_transport_tests {
         );
     }
 
+    /// #414 review: a rollover while the turn's forget set is live. The
+    /// archive and every durable head hold the marker, never the content;
+    /// the hooked prompt crosses into the new window byte for byte, is not
+    /// hooked again, and the tail rides the new window's requests.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_rollover_with_a_live_forget_set_archives_only_the_marker() {
+        use agent_core::core::extension_context as ec;
+        struct Forget(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl crate::extensions::runtime::ExtensionHandler for Forget {
+            fn id(&self) -> &str {
+                "axel"
+            }
+            async fn handle(
+                &self,
+                _event: &crate::extensions::hooks::events::HookEvent,
+            ) -> crate::extensions::hooks::events::HookResult {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                serde_json::from_value(json!({"action":"inject","content":"",
+                    "parts":[{"content":"SAVED-ROLL"},{"content":"FORGET-ROLL","forget":true}]}))
+                .unwrap()
+            }
+            async fn shutdown(&self) {}
+        }
+        let base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn(Arc::new(|_, _| (200, None))).await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = runtime();
+        low_thresholds(&rt);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut perms = crate::extensions::permissions::PermissionSet::new();
+        perms.grant(crate::extensions::hooks::events::HookKind::BeforeMessage.required_permission());
+        rt.hook_bus()
+            .subscribe(
+                crate::extensions::hooks::events::HookKind::BeforeMessage,
+                Arc::new(Forget(calls.clone())),
+                None,
+                None,
+                perms,
+            )
+            .await
+            .unwrap();
+        let out = turn_with(&rt, big_history(), Default::default()).await;
+        assert_eq!(out.heads.len(), 1, "rolled over");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "hooked once, not again after the rollover");
+        let prompt = out.heads[0].last().expect("the prompt leads the new window's tail");
+        assert_eq!(ec::hooked(prompt), Some(2));
+        assert_eq!(
+            prompt["content"],
+            json!([{"type":"text","text":"next"},
+                {"type":"text","text":ec::saved_block_text("axel","SAVED-ROLL")},
+                {"type":"text","text":ec::marker_text("axel")}])
+        );
+        for head in &out.heads {
+            assert!(!serde_json::to_string(head).unwrap().contains("FORGET-ROLL"));
+        }
+        assert!(!serde_json::to_string(&out.history).unwrap().contains("FORGET-ROLL"));
+        // Nothing under the base dir (archives, sessions) holds the content;
+        // the archive keeps the marker.
+        let mut saw_marker = false;
+        let mut stack = vec![base.path().to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let bytes = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+                    assert!(!bytes.contains("FORGET-ROLL"), "{} holds forget content", path.display());
+                    saw_marker |= bytes.contains("axel context was shown here for one turn and not kept");
+                }
+            }
+        }
+        assert!(saw_marker, "the archive keeps the marker");
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert!(!bodies.is_empty());
+        for body in &bodies {
+            assert!(body.contains("FORGET-ROLL"), "the tail rides every request of the turn");
+            assert!(body.contains("SAVED-ROLL"));
+        }
+    }
+
     /// The provider's count of a request whose fixed part (everything but
     /// `messages`) it reads 1:1 with the conservative estimate and whose
     /// messages it reads at 1/1.35 of it — the live shape.

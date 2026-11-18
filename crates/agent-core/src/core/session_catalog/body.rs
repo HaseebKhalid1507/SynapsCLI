@@ -160,3 +160,34 @@ impl<'de> Visitor<'de> for Msgs<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::extension_context as ec;
+    use crate::core::session_journal::{save_session_in_dir, SessionPersistence};
+
+    /// #414 review: a streaming walk of a snapshot gives each message its
+    /// `before_message` count back, so previews and deep search see the
+    /// user's words, not extension context saved on them.
+    #[test]
+    fn a_snapshot_walk_restores_before_message_counts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = crate::core::session::Session::new("m", "low", None);
+        let mut prompt = serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": "go"},
+            {"type": "text", "text": ec::saved_block_text("axel", "CTX")},
+        ]});
+        ec::set_hooked(&mut prompt, 1);
+        s.api_messages.push(std::sync::Arc::new(prompt));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Json).unwrap();
+        let bytes = std::fs::read(tmp.path().join(format!("{}.json", s.id))).unwrap();
+        let mut seen = Vec::new();
+        walk_snapshot(&bytes, &mut |m| {
+            seen.push(crate::core::session::user_message_for_display(m));
+            true
+        })
+        .unwrap();
+        assert_eq!(seen, [Some("go".to_string())]);
+    }
+}
