@@ -5653,7 +5653,7 @@ fn conversation_title(conv: &ConversationState) -> Option<String> {
     conv.api_messages
         .iter()
         .filter(|m| m["role"].as_str() == Some("user"))
-        .find_map(|m| agent_core::core::session::user_content_for_display(&m["content"]))
+        .find_map(|m| agent_core::core::session::user_message_for_display(m))
         .map(|t| t.chars().take(80).collect())
 }
 

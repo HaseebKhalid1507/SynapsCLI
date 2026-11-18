@@ -1256,7 +1256,14 @@ impl StreamMethods {
             // before the turn). Rounds after tool calls, rollovers and
             // host-made user messages (e.g. the preamble nudge) do not re-run
             // it; the turn's forget set rides their requests instead.
-            if std::mem::take(&mut hook_pending) {
+            // A message is marked hooked once a handler could see it, also
+            // when none answered with content; with no handler it is left
+            // as it was (nothing to save, no edit to persist).
+            if std::mem::take(&mut hook_pending)
+                && hook_bus
+                    .has_handlers(crate::extensions::hooks::events::HookKind::BeforeMessage)
+                    .await
+            {
                 if let Some(text) =
                     messages.last().and_then(|m| super::turn_inject::hook_target_text(m))
                 {
@@ -1264,7 +1271,7 @@ impl StreamMethods {
                         .with_session(session_id.as_deref())
                         .with_cwd(cwd.as_deref());
                     let parts = hook_bus.emit(&hook_event).await.inject_parts();
-                    if let Some(target) = messages.last_mut().filter(|_| !parts.is_empty()) {
+                    if let Some(target) = messages.last_mut() {
                         turn_injection.absorb(target, parts);
                     }
                 }
@@ -9810,7 +9817,7 @@ mod rich_output_tests {
             let loaded = agent_core::session_journal::load_session_in_dir(dir.path(), &session.id).unwrap();
             assert_eq!(texts(&loaded.api_messages[0]["content"])[1], saved);
             assert_eq!(
-                agent_core::session::user_content_for_display(&loaded.api_messages[0]["content"])
+                agent_core::session::user_message_for_display(&loaded.api_messages[0])
                     .as_deref(),
                 Some("go"),
                 "titles and previews see the user's words only"
@@ -10017,7 +10024,8 @@ mod rich_output_tests {
             let run = turn(vec![user("go")], 1, false, bus(&[&axel]).await).await;
             assert_eq!(run.history[0]["content"], "go");
             for body in &run.bodies {
-                assert!(!ec::is_extension_block(&tail_block(body)));
+                let text = tail_block(body)["text"].as_str().unwrap_or("").to_string();
+                assert!(!ec::is_turn_only_text(&text) && ec::parse_saved(&text).is_none());
             }
         }
     }

@@ -2,7 +2,7 @@
 //! count per session, keyed by id and stamped with (mtime, bytes) so a
 //! refresh only re-reads sessions whose files changed.
 //!
-//! User text goes through [`user_content_for_display`] — the same projection
+//! User text goes through [`user_message_for_display`] — the same projection
 //! titles use — so tool results and attachment bodies never leak into the
 //! preview or the search haystack. Host-injected user-role text (event
 //! deliveries, abort/interrupt markers) is skipped too: "last" means the
@@ -10,7 +10,7 @@
 
 use super::body::{is_context_note, is_host_injected, walk_session};
 use super::CatalogEntry;
-use crate::core::session::user_content_for_display;
+use crate::core::session::user_message_for_display;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -205,7 +205,7 @@ fn scan_preview(dir: &Path, e: &CatalogEntry) -> std::io::Result<Preview> {
     let (count, _) = walk_session(dir, &e.id, e.has_journal, &mut |m| {
         if m["role"] == "user" && !is_context_note(m) {
             if let Some(text) =
-                user_content_for_display(&m["content"]).filter(|t| !is_host_injected(t))
+                user_message_for_display(m).filter(|t| !is_host_injected(t))
             {
                 let t = clip(&text);
                 if !t.is_empty() {

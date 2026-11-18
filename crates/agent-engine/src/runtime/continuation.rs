@@ -532,14 +532,14 @@ fn has_attachment(message: &Value) -> bool {
 /// on it (#414): a pushed event stays an event, and a preview shows the
 /// request's own words.
 fn is_event(message: &Value) -> bool {
-    agent_core::core::extension_context::user_content(&message["content"])
+    agent_core::core::extension_context::user_content(message)
         .as_str()
         .is_some_and(|c| c.trim_start().starts_with("<event"))
 }
 
 /// Single-line, tag-neutral preview of a request's own text.
 fn preview(message: &Value, chars: usize) -> String {
-    let content = agent_core::core::extension_context::user_content(&message["content"]);
+    let content = agent_core::core::extension_context::user_content(message);
     let text = match content.as_ref() {
         Value::String(s) => s.clone(),
         Value::Array(blocks) => blocks
@@ -2063,14 +2063,19 @@ mod tests {
         let ctx = json!({"type": "text", "text": saved_block_text("axel", "CTX-BODY")});
         let mark = json!({"type": "text", "text": marker_text("comms")});
         let event = json!({"role": "user", "content": [
-            {"type": "text", "text": "<event id=\"e1\" type=\"message\">hi</event>"}, ctx.clone(), mark.clone()]});
+            {"type": "text", "text": "<event id=\"e1\" type=\"message\">hi</event>"}, ctx.clone(), mark.clone()],
+            "_synaps_hooked": 2});
         let request = json!({"role": "user", "content": [
-            {"type": "text", "text": "do it"}, ctx, mark]});
+            {"type": "text", "text": "do it"}, ctx.clone(), mark.clone()], "_synaps_hooked": 2});
         assert!(is_event(&event));
         assert!(!starts_turn(&event));
         assert!(starts_turn(&request));
         let shown = preview(&request, 80);
         assert_eq!(shown, "do it");
+        // Without the host's count the blocks are the request's own words.
+        let typed = json!({"role": "user", "content": [
+            {"type": "image", "source": {}}, {"type": "text", "text": "do it"}, mark]});
+        assert!(preview(&typed, 400).contains("context was shown here for one turn"));
     }
     use crate::test_env::BaseDirGuard;
     fn history() -> Vec<SharedMessage> {

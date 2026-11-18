@@ -937,6 +937,18 @@ impl HookBus {
         handlers.values().map(|v| v.len()).sum()
     }
 
+    /// Whether any handler is registered for `kind` (its matchers and tool
+    /// filters aside): whether an `emit` of it can reach an extension.
+    pub async fn has_handlers(&self, kind: HookKind) -> bool {
+        match &self.transforms_of {
+            Some(host) => host
+                .worker_transform_registrations(kind)
+                .await
+                .is_some_and(|regs| !regs.is_empty()),
+            None => self.handlers.read().await.get(&kind).is_some_and(|regs| !regs.is_empty()),
+        }
+    }
+
     /// Check if any handlers are registered (for fast-path decisions).
     pub async fn is_empty(&self) -> bool {
         if self.is_worker_view() {

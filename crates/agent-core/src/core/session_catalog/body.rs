@@ -107,11 +107,19 @@ impl<'de> Visitor<'de> for Top<'_> {
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
         let Top { f, count } = self;
+        // `_hooked` precedes `api_messages` (session_journal): each message
+        // gets its `before_message` count back before `f` sees it, so the
+        // user's words are told apart from extension output (#414).
+        let mut hooked = std::collections::HashMap::new();
         while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-            if key == "api_messages" {
+            if key == "_hooked" {
+                let value: Value = map.next_value()?;
+                hooked = crate::core::session_journal::stored_hooked(value).into_iter().collect();
+            } else if key == "api_messages" {
                 map.next_value_seed(Msgs {
                     f: &mut *f,
                     count: &mut *count,
+                    hooked: &hooked,
                 })?;
             } else {
                 map.next_value::<IgnoredAny>()?;
@@ -124,6 +132,7 @@ impl<'de> Visitor<'de> for Top<'_> {
 struct Msgs<'a> {
     f: &'a mut dyn FnMut(&Value) -> bool,
     count: &'a mut usize,
+    hooked: &'a std::collections::HashMap<usize, usize>,
 }
 
 impl<'de> DeserializeSeed<'de> for Msgs<'_> {
@@ -139,7 +148,10 @@ impl<'de> Visitor<'de> for Msgs<'_> {
         f.write_str("an api_messages array")
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        while let Some(v) = seq.next_element::<Value>()? {
+        while let Some(mut v) = seq.next_element::<Value>()? {
+            if let Some(&n) = self.hooked.get(&*self.count) {
+                crate::core::extension_context::set_hooked(&mut v, n);
+            }
             *self.count += 1;
             if !(self.f)(&v) {
                 return Err(de::Error::custom(STOP));

@@ -558,7 +558,7 @@ mod tests {
                 {"type": "text", "text": saved_block_text("axel", "first line\nsecond\n\nthird")},
                 {"type": "text", "text": saved_block_text("clock", "22:15")},
                 {"type": "text", "text": marker_text("agent-comms")},
-            ]})),
+            ], "_synaps_hooked": 3})),
             j(json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})),
         ];
         rebuild_display_messages(&history, &mut app);

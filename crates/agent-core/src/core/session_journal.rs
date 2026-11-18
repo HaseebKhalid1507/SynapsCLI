@@ -387,6 +387,9 @@ enum JournalRecord {
         /// [`times_hash`] of the same prefix; absent = no message times.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         times_hash: Option<String>,
+        /// [`hooked_hash`] of the same prefix; absent = no hooked message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hooked_hash: Option<String>,
     },
     /// Message at ABSOLUTE history index `i`; `t` is its turn id and `at`
     /// its recorded time, both kept beside the message (see
@@ -402,6 +405,10 @@ enum JournalRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         /// Any JSON on read: a malformed time is dropped, never fatal.
         at: Option<serde_json::Value>,
+        /// Its `before_message` count ([`HOOKED_KEY`]), beside it too. Any
+        /// JSON on read: a malformed count is dropped, never fatal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        h: Option<serde_json::Value>,
     },
     /// Full session metadata (the `Session` object minus `api_messages`).
     #[serde(rename = "meta")]
@@ -414,6 +421,8 @@ enum JournalRecord {
         turns_hash: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         times_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hooked_hash: Option<String>,
     },
 }
 
@@ -421,8 +430,13 @@ fn message_turn_id(message: &serde_json::Value) -> Option<&str> {
     message.get(MESSAGE_TURN_KEY)?.get("id")?.as_str()
 }
 
+/// The `before_message` count of a message (#414), persisted beside it like
+/// the turn id and time (`h` on journal `msg` records, `_hooked` in the
+/// snapshot).
+use crate::core::extension_context::HOOKED_KEY;
+
 /// In-memory host keys that are persisted beside a message, never inside.
-const SIBLING_KEYS: [&str; 2] = [MESSAGE_TURN_KEY, MESSAGE_AT_KEY];
+const SIBLING_KEYS: [&str; 3] = [MESSAGE_TURN_KEY, MESSAGE_AT_KEY, HOOKED_KEY];
 
 fn has_sibling_key(object: &serde_json::Map<String, serde_json::Value>) -> bool {
     SIBLING_KEYS.iter().any(|k| object.contains_key(*k))
@@ -507,6 +521,61 @@ fn times_hash(messages: &[SharedMessage]) -> std::io::Result<Option<String>> {
     }
     let bytes = serde_json::to_vec(&times).map_err(std::io::Error::other)?;
     Ok(Some(format!("{:x}", Sha256::digest(&bytes))))
+}
+
+/// `(index, count)` of every hooked message, in order.
+fn hooked_counts(messages: &[SharedMessage]) -> Vec<(usize, usize)> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| crate::core::extension_context::hooked(m).map(|n| (i, n)))
+        .collect()
+}
+
+/// Like [`turns_hash`], for `before_message` counts: marking an
+/// already-saved message hooked is an edit the history hash cannot see.
+/// `None` = no hooked message.
+fn hooked_hash(messages: &[SharedMessage]) -> std::io::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let counts = hooked_counts(messages);
+    if counts.is_empty() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(&counts).map_err(std::io::Error::other)?;
+    Ok(Some(format!("{:x}", Sha256::digest(&bytes))))
+}
+
+/// Well-formed `[index, count]` entries of a snapshot's `_hooked`. Anything
+/// else is dropped with a warning: the message then reads as never hooked
+/// (its blocks as the user's text, hooked again if it is resent).
+pub(crate) fn stored_hooked(value: serde_json::Value) -> Vec<(usize, usize)> {
+    let entries = match value {
+        serde_json::Value::Null => return Vec::new(),
+        serde_json::Value::Array(entries) => entries,
+        _ => {
+            tracing::warn!("session snapshot has a malformed _hooked; counts dropped");
+            return Vec::new();
+        }
+    };
+    let total = entries.len();
+    let counts: Vec<(usize, usize)> = entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect();
+    if counts.len() != total {
+        tracing::warn!(dropped = total - counts.len(), "malformed _hooked entries dropped");
+    }
+    counts
+}
+
+/// A journal `h`: kept only when it is a non-negative integer.
+fn journal_hooked(h: Option<serde_json::Value>) -> Option<usize> {
+    let h = h?;
+    let n = h.as_u64().and_then(|n| usize::try_from(n).ok());
+    if n.is_none() {
+        tracing::warn!("malformed journal before_message count dropped");
+    }
+    n
 }
 
 fn set_message_time(message: &mut serde_json::Value, ts: String) {
@@ -645,6 +714,11 @@ struct SnapshotBinding {
     /// Same placement and leniency as `_turn_ids` ([`stored_message_times`]).
     #[serde(default, rename = "_message_times")]
     message_times: serde_json::Value,
+    /// BEFORE `api_messages` (unlike the two above), so a streaming body
+    /// walk knows each message's count when it reaches it
+    /// (`session_catalog::body`). Lenient: [`stored_hooked`].
+    #[serde(default, rename = "_hooked")]
+    hooked: serde_json::Value,
 }
 
 /// Well-formed `[index, RFC 3339 time]` entries of a snapshot's
@@ -761,6 +835,7 @@ struct JournalState {
     history_hash: String,
     turns_hash: Option<String>,
     times_hash: Option<String>,
+    hooked_hash: Option<String>,
     bytes: u64,
 }
 
@@ -793,6 +868,7 @@ fn read_journal_state(
         history_hash: Some(mut hash),
         turns_hash: mut turns,
         times_hash: mut times,
+        hooked_hash: mut hooked,
         ..
     } = open
     else {
@@ -813,6 +889,7 @@ fn read_journal_state(
                 history_hash: Some(next_hash),
                 turns_hash: next_turns,
                 times_hash: next_times,
+                hooked_hash: next_hooked,
             }) if v == JOURNAL_SCHEMA_VERSION
                 && meta.id == id
                 && meta.message_count == Some(durable_len) =>
@@ -820,6 +897,7 @@ fn read_journal_state(
                 hash = next_hash;
                 turns = next_turns;
                 times = next_times;
+                hooked = next_hooked;
                 hashed_len = durable_len;
             }
             _ => return Ok(None),
@@ -833,6 +911,7 @@ fn read_journal_state(
         history_hash: hash,
         turns_hash: turns,
         times_hash: times,
+        hooked_hash: hooked,
         bytes: raw.len() as u64,
     }))
 }
@@ -913,6 +992,7 @@ fn save_journal_mode(
         || history_hash(&session.api_messages[..state.durable_len])? != state.history_hash
         || turns_hash(&session.api_messages[..state.durable_len])? != state.turns_hash
         || times_hash(&session.api_messages[..state.durable_len])? != state.times_hash
+        || hooked_hash(&session.api_messages[..state.durable_len])? != state.hooked_hash
     {
         return full_snapshot_reset(handle, session);
     }
@@ -926,6 +1006,7 @@ fn save_journal_mode(
             m: stored_value(msg),
             t: message_turn_id(msg).map(serde_json::Value::from),
             at: message_time(msg).map(serde_json::Value::from),
+            h: crate::core::extension_context::hooked(msg).map(serde_json::Value::from),
         };
         serde_json::to_writer(&mut buf, &record).map_err(std::io::Error::other)?;
         buf.push(b'\n');
@@ -936,6 +1017,7 @@ fn save_journal_mode(
         history_hash: Some(history_hash(&session.api_messages)?),
         turns_hash: turns_hash(&session.api_messages)?,
         times_hash: times_hash(&session.api_messages)?,
+        hooked_hash: hooked_hash(&session.api_messages)?,
     };
     serde_json::to_writer(&mut buf, &meta).map_err(std::io::Error::other)?;
     buf.push(b'\n');
@@ -1006,6 +1088,11 @@ struct SessionSnapshotRef<'a> {
     env: Option<Vec<(String, String)>>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     env_stripped: &'a [String],
+    /// Storage-only: each hooked message's `before_message` count. Before
+    /// `api_messages` so a streaming walk has it first (see
+    /// [`SnapshotBinding`]).
+    #[serde(rename = "_hooked", skip_serializing_if = "Vec::is_empty")]
+    hooked: Vec<(usize, usize)>,
     api_messages: StoredMessages<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     abort_context: &'a Option<String>,
@@ -1045,6 +1132,7 @@ impl<'a> SessionSnapshotRef<'a> {
             compacted_into: &s.compacted_into,
             env: scrub_secret_env(s.env.as_ref()),
             env_stripped: &s.env_stripped,
+            hooked: hooked_counts(&s.api_messages),
             api_messages: StoredMessages(&s.api_messages),
             abort_context: &s.abort_context,
             prompt_provenance: &s.prompt_provenance,
@@ -1103,6 +1191,7 @@ fn publish_snapshot(
             history_hash: Some(history_hash(&session.api_messages)?),
             turns_hash: turns_hash(&session.api_messages)?,
             times_hash: times_hash(&session.api_messages)?,
+            hooked_hash: hooked_hash(&session.api_messages)?,
         };
         serde_json::to_writer(&mut journal, &open).map_err(std::io::Error::other)?;
         journal.push(b'\n');
@@ -1185,6 +1274,11 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             set_message_time(std::sync::Arc::make_mut(message), ts);
         }
     }
+    for (i, n) in stored_hooked(binding.hooked) {
+        if let Some(message) = session.api_messages.get_mut(i) {
+            crate::core::extension_context::set_hooked(std::sync::Arc::make_mut(message), n);
+        }
+    }
 
     let Some(raw) = read_artifact_bytes(&handle, &format!("{id}.journal"))? else {
         return Ok(session);
@@ -1207,13 +1301,16 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             {
                 break;
             }
-            Ok(JournalRecord::Msg { i, mut m, t, at, .. }) => {
+            Ok(JournalRecord::Msg { i, mut m, t, at, h, .. }) => {
                 if i == session.api_messages.len() {
                     if let Some(serde_json::Value::String(id)) = t {
                         set_turn_id(&mut m, id);
                     }
                     if let Some(ts) = journal_time(at) {
                         set_message_time(&mut m, ts);
+                    }
+                    if let Some(n) = journal_hooked(h) {
+                        crate::core::extension_context::set_hooked(&mut m, n);
                     }
                     session.api_messages.push(std::sync::Arc::new(m));
                 } else if i > session.api_messages.len() {
@@ -1630,6 +1727,7 @@ mod tests {
             history_hash: None,
             turns_hash: None,
             times_hash: None,
+            hooked_hash: None,
         }];
         for i in 1..5 {
             push_message(&mut s, "legacy delta");
@@ -1639,6 +1737,7 @@ mod tests {
                 m: s.api_messages[i].as_ref().clone(),
                 t: None,
                 at: None,
+                h: None,
             });
         }
         s.title = "legacy title".into();
@@ -1649,6 +1748,7 @@ mod tests {
             history_hash: None,
             turns_hash: None,
             times_hash: None,
+            hooked_hash: None,
         });
         let mut bytes = Vec::new();
         for record in legacy {

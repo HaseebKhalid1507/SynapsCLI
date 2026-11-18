@@ -46,6 +46,9 @@ impl TurnInjection {
     /// ran for, which no request has carried yet. Saved parts, then one
     /// marker per extension that gave forget content, are appended to it;
     /// forget parts join the turn set in arrival order (earlier ones stay).
+    /// The message is marked hooked (`ec::HOOKED_KEY`) with the number of
+    /// blocks added, also when there were none (a `Continue`, a timeout):
+    /// it is never hooked again.
     pub(super) fn absorb(&mut self, message: &mut SharedMessage, parts: Vec<InjectPart>) {
         let mut saved = Vec::new();
         let mut marked: Vec<String> = Vec::new();
@@ -79,9 +82,8 @@ impl TurnInjection {
             .into_iter()
             .chain(marked.iter().map(|s| ec::marker_text(s)))
             .collect();
-        if !blocks.is_empty() {
-            append_text_blocks(message, blocks);
-        }
+        let added = if blocks.is_empty() { 0 } else { append_text_blocks(message, blocks) };
+        ec::set_hooked(Arc::make_mut(message), added);
         if forgot {
             self.tail = Some(ec::guard_turn(&self.forget.join("\n\n")));
         }
@@ -90,9 +92,10 @@ impl TurnInjection {
 
 /// The user's text the hook is given for `message`, when the hook should run
 /// for it: a user message with text of its own (string content, or its
-/// first non-extension text block) that carries no saved block or marker
-/// yet. One that already does was hooked when it was first sent (a retried
-/// or resumed turn); hooking it again would add to bytes already sent.
+/// first text block) that was never hooked (`ec::HOOKED_KEY`). One that was
+/// is never hooked again, whatever the hook returned then: a retried,
+/// resent or resumed turn would otherwise add to bytes already sent. Its
+/// forget content is not shown again either; the marker stays.
 ///
 /// Host-made user messages (interruption markers, tool-in-flight notes, the
 /// rollover continuation marker) are never targets: saving onto them would
@@ -102,7 +105,7 @@ impl TurnInjection {
 pub(super) fn hook_target_text(message: &Value) -> Option<String> {
     if message["role"].as_str() != Some("user")
         || message.get("_synaps_context").is_some()
-        || ec::has_saved_blocks(&message["content"])
+        || ec::hooked(message).is_some()
         || agent_core::core::host_note::is_tool_in_flight_note(message)
     {
         return None;
@@ -112,7 +115,6 @@ pub(super) fn hook_target_text(message: &Value) -> Option<String> {
         Value::String(text) => Some(text.clone()),
         Value::Array(blocks) => blocks
             .iter()
-            .filter(|b| !ec::is_extension_block(b))
             .find(|b| b["type"].as_str() == Some("text"))
             .and_then(|b| b["text"].as_str())
             .map(str::to_owned),
@@ -122,7 +124,8 @@ pub(super) fn hook_target_text(message: &Value) -> Option<String> {
 
 /// Append `texts` as text blocks, coercing string content to blocks first
 /// (an empty string to none: an empty text block is an Anthropic 400).
-fn append_text_blocks(message: &mut SharedMessage, texts: Vec<String>) {
+/// Returns how many were appended.
+fn append_text_blocks(message: &mut SharedMessage, texts: Vec<String>) -> usize {
     let msg = Arc::make_mut(message);
     if let Some(text) = msg["content"].as_str().map(str::to_owned) {
         msg["content"] = if text.is_empty() {
@@ -133,11 +136,16 @@ fn append_text_blocks(message: &mut SharedMessage, texts: Vec<String>) {
     }
     match msg["content"].as_array_mut() {
         Some(blocks) => {
-            blocks.extend(texts.into_iter().map(|text| json!({"type": "text", "text": text})))
+            let n = texts.len();
+            blocks.extend(texts.into_iter().map(|text| json!({"type": "text", "text": text})));
+            n
         }
-        None => tracing::warn!(
-            "before_message saved context dropped: user message content is neither string nor array"
-        ),
+        None => {
+            tracing::warn!(
+                "before_message saved context dropped: user message content is neither string nor array"
+            );
+            0
+        }
     }
 }
 
@@ -191,8 +199,9 @@ mod tests {
             &mut msg,
             vec![InjectPart::saved("  \n"), InjectPart::forget(""), InjectPart::saved("")],
         );
-        assert_eq!(msg, before);
-        assert!(Arc::ptr_eq(&msg, &before), "nothing to save: the message is not even cloned");
+        assert_eq!(msg["content"], before["content"], "nothing saved");
+        assert_eq!(ec::hooked(&msg), Some(0), "but it was hooked");
+        assert_eq!(hook_target_text(&msg), None, "and never is again");
         assert_eq!(turn.tail(), None);
     }
 
@@ -237,9 +246,16 @@ mod tests {
         assert_eq!(hook_target_text(&image).as_deref(), Some("look"));
         let assistant = Arc::new(json!({"role": "assistant", "content": "x"}));
         assert_eq!(hook_target_text(&assistant), None);
-        // Already hooked (saved block or marker present): never again.
+        // Already hooked: never again, whatever it added.
         let mut hooked = user(json!("go"));
         TurnInjection::default().absorb(&mut hooked, vec![InjectPart::forget("f").from_source("a")]);
+        assert_eq!(ec::hooked(&hooked), Some(1));
         assert_eq!(hook_target_text(&hooked), None);
+        let mut nothing = user(json!("go"));
+        TurnInjection::default().absorb(&mut nothing, Vec::new());
+        assert_eq!(hook_target_text(&nothing), None);
+        // Text that only looks like extension output is the user's.
+        let look_alike = user(json!([{"type": "image"}, {"type": "text", "text": ec::marker_text("axel")}]));
+        assert_eq!(hook_target_text(&look_alike).as_deref(), Some(ec::marker_text("axel").as_str()));
     }
 }

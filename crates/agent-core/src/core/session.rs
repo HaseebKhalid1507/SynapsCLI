@@ -98,6 +98,14 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
+/// [`user_content_for_display`] of a user MESSAGE as the user wrote it:
+/// extension context the host saved on it (#414, told apart by the host's
+/// count, `extension_context::HOOKED_KEY`) is never a title, preview or
+/// search hit as theirs.
+pub fn user_message_for_display(message: &serde_json::Value) -> Option<String> {
+    user_content_for_display(&crate::core::extension_context::user_content(message))
+}
+
 /// Project canonical user content for display/title/compaction, never for inference.
 /// Only top-level text and attachment labels are visible; in particular, tool
 /// results are NOT user prompts and their nested content is never traversed.
@@ -110,9 +118,6 @@ pub fn user_content_for_display(content: &serde_json::Value) -> Option<String> {
         .as_array()?
         .iter()
         .filter_map(|block| match block["type"].as_str() {
-            // Extension context saved on the message (#414) is not what
-            // the user typed: never a title, preview or search hit as theirs.
-            Some("text") if crate::core::extension_context::is_extension_block(block) => None,
             Some("text") => block["text"].as_str().map(str::to_string),
             Some("image") => Some("[attached image]".to_string()),
             Some("document") => {
@@ -288,7 +293,7 @@ impl Session {
         }
         for msg in &self.api_messages {
             if msg["role"].as_str() == Some("user") {
-                if let Some(content) = user_content_for_display(&msg["content"]) {
+                if let Some(content) = user_message_for_display(msg) {
                     self.title = content.chars().take(80).collect();
                     return;
                 }

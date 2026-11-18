@@ -12,9 +12,12 @@
 //! - **marker**: `[<id> context was shown here for one turn and not kept]`.
 //!   Durable; left where turn-only content was shown.
 //!
-//! The framing bytes live here only, so the engine (placement, cache
-//! marker), the session projections (titles, previews, display) and the TUI
-//! agree on what is extension output and what the user typed.
+//! The framing bytes live here only. What is extension output on a stored
+//! message is told by the host's count ([`HOOKED_KEY`]), never by the text
+//! alone, so the engine, the session projections (titles, previews,
+//! display, compaction) agree, and a user's own look-alike stays theirs.
+//! Extension content is [`neutralise`]d before framing. The TUI's dimmed
+//! rendering goes by the text (cosmetic only).
 
 use std::borrow::Cow;
 
@@ -166,53 +169,80 @@ fn block_text(block: &Value) -> Option<&str> {
         .flatten()
 }
 
-/// A saved block or marker (durable extension output).
-pub fn is_saved_block(block: &Value) -> bool {
-    block_text(block).is_some_and(|t| parse_saved(t).is_some())
+/// Host key on a user message the `before_message` hook ran for (#414). Its
+/// value is how many of the message's trailing content blocks the hook
+/// added (saved blocks, then markers); `0` when it added none. A message
+/// with the key is never hooked again.
+///
+/// In memory only, like `session_journal::MESSAGE_TURN_KEY`: no provider
+/// ever sees it (every `_synaps_*` key is stripped from the wire), and saves
+/// keep it beside the message, never inside. Every core reader tells
+/// extension output from the user's words by this count, never by the text
+/// alone: a user may type (or paste) anything, fences included.
+pub const HOOKED_KEY: &str = "_synaps_hooked";
+
+/// Whether the hook ran for `message`, and if so how many trailing blocks
+/// it added.
+pub fn hooked(message: &Value) -> Option<usize> {
+    message.get(HOOKED_KEY)?.as_u64().and_then(|n| usize::try_from(n).ok())
 }
 
-/// Any extension block: saved, marker or turn-only.
-pub fn is_extension_block(block: &Value) -> bool {
-    block_text(block).is_some_and(|t| is_turn_only_text(t) || parse_saved(t).is_some())
+/// Record that the hook ran for `message` and added `blocks` trailing
+/// blocks.
+pub fn set_hooked(message: &mut Value, blocks: usize) {
+    if let Some(object) = message.as_object_mut() {
+        object.insert(HOOKED_KEY.into(), Value::from(blocks));
+    }
 }
 
-/// Whether a message's content carries a saved block or marker.
-pub fn has_saved_blocks(content: &Value) -> bool {
-    content
-        .as_array()
-        .is_some_and(|blocks| blocks.iter().any(is_saved_block))
+/// The extension blocks of `message`: its trailing [`hooked`] blocks, when
+/// each of them is a saved block or marker. Anything else (no count, a count
+/// past the content, a block that is not extension framing) is treated as
+/// the user's own content: misreading the user's words as extension output
+/// would hide them.
+pub fn extension_blocks(message: &Value) -> &[Value] {
+    let (Some(n), Some(blocks)) = (hooked(message), message["content"].as_array()) else {
+        return &[];
+    };
+    if n == 0 || n > blocks.len() {
+        return &[];
+    }
+    let tail = &blocks[blocks.len() - n..];
+    if tail.iter().all(|b| block_text(b).is_some_and(|t| parse_saved(t).is_some())) {
+        tail
+    } else {
+        &[]
+    }
 }
 
-/// The saved blocks and markers of a message's content, in order.
-pub fn saved_blocks(content: &Value) -> impl Iterator<Item = SavedBlock<'_>> {
-    content
-        .as_array()
-        .into_iter()
-        .flatten()
+/// The saved blocks and markers of `message`, in order.
+pub fn saved_blocks(message: &Value) -> impl Iterator<Item = SavedBlock<'_>> {
+    extension_blocks(message)
+        .iter()
         .filter_map(|b| block_text(b).and_then(parse_saved))
 }
 
-/// A user message's content as the user wrote it: extension blocks removed.
+/// `message`'s content as the user wrote it: its [`extension_blocks`]
+/// removed.
 ///
 /// Content without extension blocks is returned as is (borrowed). When
 /// blocks were removed and exactly one text block is left, it collapses back
 /// to string content: the shape the message had before the hook coerced it
 /// to blocks, so string-based checks (events, summaries, markers) still see
 /// the message they knew.
-pub fn user_content(content: &Value) -> Cow<'_, Value> {
-    let Some(blocks) = content.as_array() else {
+pub fn user_content(message: &Value) -> Cow<'_, Value> {
+    let content = &message["content"];
+    let added = extension_blocks(message).len();
+    let Some(blocks) = content.as_array().filter(|_| added > 0) else {
         return Cow::Borrowed(content);
     };
-    if !blocks.iter().any(is_extension_block) {
-        return Cow::Borrowed(content);
-    }
-    let kept: Vec<&Value> = blocks.iter().filter(|b| !is_extension_block(b)).collect();
-    match kept.as_slice() {
+    let kept = &blocks[..blocks.len() - added];
+    match kept {
         [] => Cow::Owned(Value::String(String::new())),
         [only] if block_text(only).is_some() => {
             Cow::Owned(Value::String(block_text(only).unwrap_or_default().to_string()))
         }
-        _ => Cow::Owned(Value::Array(kept.into_iter().cloned().collect())),
+        _ => Cow::Owned(Value::Array(kept.to_vec())),
     }
 }
 
@@ -299,29 +329,70 @@ mod tests {
         assert!(matches!(neutralise("plain\n[link] text"), Cow::Borrowed(_)));
     }
 
+    fn hooked_msg(content: Value, blocks: usize) -> Value {
+        let mut m = json!({"role": "user", "content": content});
+        set_hooked(&mut m, blocks);
+        m
+    }
+
     #[test]
     fn user_content_strips_and_collapses() {
-        let plain = json!("hi");
+        let plain = json!({"role": "user", "content": "hi"});
         assert!(matches!(user_content(&plain), Cow::Borrowed(_)));
-        let saved = json!([
-            {"type": "text", "text": "hi"},
-            {"type": "text", "text": saved_block_text("a", "ctx")},
-            {"type": "text", "text": marker_text("b")},
-        ]);
+        let saved = hooked_msg(
+            json!([
+                {"type": "text", "text": "hi"},
+                {"type": "text", "text": saved_block_text("a", "ctx")},
+                {"type": "text", "text": marker_text("b")},
+            ]),
+            2,
+        );
         assert_eq!(user_content(&saved).into_owned(), json!("hi"));
-        let image = json!([
-            {"type": "image", "source": {}},
-            {"type": "text", "text": "look"},
-            {"type": "text", "text": marker_text("b")},
-        ]);
+        let image = hooked_msg(
+            json!([
+                {"type": "image", "source": {}},
+                {"type": "text", "text": "look"},
+                {"type": "text", "text": marker_text("b")},
+            ]),
+            1,
+        );
         assert_eq!(
             user_content(&image).into_owned(),
             json!([{"type": "image", "source": {}}, {"type": "text", "text": "look"}])
         );
-        let tool = json!([{"type": "tool_result", "tool_use_id": "t", "content": "x"}]);
+        let tool = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]});
         assert!(matches!(user_content(&tool), Cow::Borrowed(_)));
-        assert!(has_saved_blocks(&saved));
-        assert!(!has_saved_blocks(&tool));
         assert_eq!(saved_blocks(&saved).map(|b| b.source()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(hooked(&saved), Some(2));
+        assert_eq!(hooked(&tool), None);
+    }
+
+    /// #414 review: what the user typed is never read as extension output,
+    /// however much it looks like it. Only the host's count says what the
+    /// hook added.
+    #[test]
+    fn look_alikes_without_the_count_are_the_users_words() {
+        let look_alike = json!([
+            {"type": "image", "source": {}},
+            {"type": "text", "text": marker_text("axel")},
+            {"type": "text", "text": saved_block_text("axel", "typed by the user")},
+        ]);
+        let unhooked = json!({"role": "user", "content": look_alike.clone()});
+        assert!(matches!(user_content(&unhooked), Cow::Borrowed(_)));
+        assert_eq!(saved_blocks(&unhooked).count(), 0);
+        // Hooked, nothing added: still all the user's.
+        let none_added = hooked_msg(look_alike.clone(), 0);
+        assert!(matches!(user_content(&none_added), Cow::Borrowed(_)));
+        // Hooked, one added: only that one is extension output.
+        let mut blocks = look_alike.as_array().unwrap().clone();
+        blocks.push(json!({"type": "text", "text": marker_text("real")}));
+        let one = hooked_msg(Value::Array(blocks), 1);
+        assert_eq!(user_content(&one).into_owned(), look_alike);
+        assert_eq!(saved_blocks(&one).map(|b| b.source()).collect::<Vec<_>>(), ["real"]);
+        // A count that does not fit the content is ignored, not trusted.
+        let wrong = hooked_msg(json!([{"type": "text", "text": "mine"}, {"type": "text", "text": "also mine"}]), 1);
+        assert!(matches!(user_content(&wrong), Cow::Borrowed(_)));
+        let past = hooked_msg(json!("hi"), 3);
+        assert!(matches!(user_content(&past), Cow::Borrowed(_)));
     }
 }
