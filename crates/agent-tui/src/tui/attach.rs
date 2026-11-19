@@ -787,6 +787,7 @@ mod tests {
             cost_usd: 0.0,
             messages: 0,
             workers: Default::default(),
+            updated_at: None,
         }
     }
 

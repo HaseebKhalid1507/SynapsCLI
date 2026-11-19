@@ -56,6 +56,17 @@ pub const RENAME_TIMEOUT: Duration = Duration::from_secs(
 /// timeouts, around 15 s together). Generous, because giving up early only
 /// hides the answer: the daemon finishes the reload either way.
 pub const RELOAD_EXTENSION_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long `catalog_page` waits: a cold read of a few thousand session
+/// headers on one thread, plus a margin.
+pub const CATALOG_PAGE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// One `CatalogPage` reply: saved rows (`lifecycle: saved`), newest first,
+/// and the cursor for the next page (`None`: the last page).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedPage {
+    pub sessions: Vec<SessionMeta>,
+    pub next: Option<CatalogCursor>,
+}
 
 /// A connection past `Hello`/`Welcome`, before `Attach`.
 pub struct Connected {
@@ -67,6 +78,8 @@ pub struct Connected {
     path: PathBuf,
     hello: Hello,
     buf: FrameBuf,
+    /// The last `req` sent (`CatalogPage`).
+    req: u64,
 }
 
 pub struct Pong {
@@ -210,7 +223,7 @@ impl Connected {
                 if welcome.protocol_version != client_version {
                     return Err(TransportError::Version { client: client_version, daemon: welcome.protocol_version });
                 }
-                Ok(Self { reader, writer, writer_task, welcome, path: path.to_path_buf(), hello: hello_copy, buf })
+                Ok(Self { reader, writer, writer_task, welcome, path: path.to_path_buf(), hello: hello_copy, buf, req: 0 })
             }
             Some(DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version, .. }, .. }) => {
                 Err(TransportError::Version { client: client_version, daemon: daemon_version })
@@ -386,6 +399,49 @@ impl Connected {
             .await
             .map_err(|_| TransportError::Protocol("extension reload reply timed out".into()))??;
         reload_extension_reply(frame, &self.welcome.daemon_version)
+    }
+
+    /// `CatalogPage{before, limit, named_only}`: one page of the saved
+    /// sessions (see `ClientFrame::CatalogPage`). Strictly request/reply:
+    /// the reply must carry this request's `req`. A daemon that does not
+    /// list [`FEATURE_SESSION_PAGE`] is `DaemonTooOld`, and the frame is
+    /// never sent to it; the reply's `error` is `Protocol`.
+    pub async fn catalog_page(
+        &mut self,
+        before: Option<CatalogCursor>,
+        limit: Option<u32>,
+        named_only: bool,
+    ) -> Result<SavedPage, TransportError> {
+        if !self.welcome.supports(FEATURE_SESSION_PAGE) {
+            return Err(TransportError::DaemonTooOld {
+                daemon_version: self.welcome.daemon_version.clone(),
+                request: "saved sessions",
+            });
+        }
+        self.req += 1;
+        let req = self.req;
+        self.writer
+            .send(ClientFrame::CatalogPage { req, before, limit, named_only })
+            .await
+            .map_err(|_| TransportError::Closed)?;
+        // A page an earlier call gave up on (timed out, or its future was
+        // dropped) may still answer first: skip it, within this deadline.
+        let deadline = tokio::time::Instant::now() + CATALOG_PAGE_TIMEOUT;
+        let frame = loop {
+            let frame = tokio::time::timeout_at(deadline, read_frame(&mut self.reader, &mut self.buf))
+                .await
+                .map_err(|_| TransportError::Protocol("catalog page reply timed out".into()))??;
+            match frame {
+                Some(DaemonFrame::CatalogPage { req: r, .. }) if r < req => continue,
+                f => break f,
+            }
+        };
+        match frame.ok_or(TransportError::Closed)? {
+            DaemonFrame::CatalogPage { req: r, error: Some(e), .. } if r == req => Err(TransportError::Protocol(e)),
+            DaemonFrame::CatalogPage { req: r, sessions, next, .. } if r == req => Ok(SavedPage { sessions, next }),
+            DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
+            other => Err(TransportError::Protocol(format!("expected catalog page {req}, got {other:?}"))),
+        }
     }
 
     /// Say goodbye and drop the connection.
@@ -786,6 +842,20 @@ impl SocketTransport {
     pub async fn shutdown(path: &Path, force: bool) -> Result<(), TransportError> {
         let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
         c.shutdown(force).await
+    }
+
+    /// `CatalogPage` on a fresh control connection (see
+    /// [`Connected::catalog_page`]).
+    pub async fn catalog_page(
+        path: &Path,
+        before: Option<CatalogCursor>,
+        limit: Option<u32>,
+        named_only: bool,
+    ) -> Result<SavedPage, TransportError> {
+        let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
+        let r = c.catalog_page(before, limit, named_only).await;
+        c.bye().await;
+        r
     }
 
     pub async fn purge(path: &Path) -> Result<Pong, TransportError> {
@@ -1694,6 +1764,24 @@ mod tests {
         );
         assert!(err.to_string().contains("daemon reload"), "{err}");
         assert_eq!(srv.await.unwrap(), vec!["Bye".to_string()], "no Attach ever reached the daemon");
+    }
+
+    /// A daemon without `session_page` in `Welcome.features` would answer
+    /// "unknown variant": the client never asks it, and says why.
+    #[tokio::test]
+    async fn catalog_page_against_a_daemon_without_the_feature_is_too_old() {
+        let (_d, path) = sock();
+        let l = Listener::bind(&path).unwrap();
+        let srv = tokio::spawn(owned_fake_daemon(l, vec![FEATURE_OWNED_SESSIONS.into()]));
+        let mut conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        assert!(!conn.welcome.supports(FEATURE_SESSION_PAGE));
+        let err = conn.catalog_page(None, None, false).await.unwrap_err();
+        assert!(
+            matches!(err, TransportError::DaemonTooOld { request: "saved sessions", ref daemon_version } if daemon_version == "0.0.1-old"),
+            "{err}"
+        );
+        conn.bye().await;
+        assert_eq!(srv.await.unwrap(), vec!["Bye".to_string()], "no CatalogPage ever reached the daemon");
     }
 
     /// A daemon that advertises the feature but grants no owner token: the

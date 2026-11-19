@@ -823,6 +823,7 @@ fn state_phrase(m: &SessionMeta, now: chrono::DateTime<chrono::Utc>) -> String {
         SessionLifecycle::Parked => "parked",
         SessionLifecycle::Parking => "parking",
         SessionLifecycle::Ending => "ending",
+        SessionLifecycle::Saved => "saved",
         SessionLifecycle::Unknown => "unknown",
         SessionLifecycle::Live if m.awaiting_input > 0 => "waiting",
         SessionLifecycle::Live if m.busy => "streaming",

@@ -71,8 +71,12 @@ impl RowState {
     pub(crate) fn of(m: &SessionMeta) -> Self {
         match m.lifecycle {
             SessionLifecycle::Parked => Self::Parked,
-            // A lifecycle from a newer daemon: listed with the transient ones.
-            SessionLifecycle::Parking | SessionLifecycle::Ending | SessionLifecycle::Unknown => {
+            // A lifecycle from a newer daemon (or `Saved`, which no listing
+            // carries): listed with the transient ones.
+            SessionLifecycle::Parking
+            | SessionLifecycle::Ending
+            | SessionLifecycle::Saved
+            | SessionLifecycle::Unknown => {
                 Self::Transient
             }
             SessionLifecycle::Live if m.awaiting_input > 0 => Self::Waiting,

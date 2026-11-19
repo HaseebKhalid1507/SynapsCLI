@@ -523,6 +523,10 @@ pub struct SessionMeta {
     /// attach. `busy` stays a turn or a compaction: clients combine the two.
     #[serde(default, skip_serializing_if = "SessionWorkers::is_empty")]
     pub workers: SessionWorkers,
+    /// Saved rows only (`lifecycle: saved`, `CatalogPage`): the head
+    /// journal's `updated_at`. Absent on held rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl SessionMeta {
@@ -610,6 +614,11 @@ pub enum SessionLifecycle {
     Parking = 1,
     Parked = 2,
     Ending = 3,
+    /// A conversation on disk that this daemon does not hold. Sent only in
+    /// `CatalogPage` replies (feature `session_page`); never in
+    /// `Welcome.sessions`, `SessionList` or `Attached.meta`, whose 0.12.0
+    /// readers have no fallback variant. Never stored by an actor.
+    Saved = 4,
     /// A lifecycle this build does not know (from a newer daemon). Never
     /// stored by an actor, never sent.
     #[serde(other)]
@@ -617,6 +626,8 @@ pub enum SessionLifecycle {
 }
 
 impl SessionLifecycle {
+    /// The handle's lifecycle cell. Never [`Self::Saved`]: a held session
+    /// is not saved, so a listing built from handles cannot carry it.
     pub fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Parking,
@@ -2227,6 +2238,9 @@ mod tests {
         ] {
             assert_eq!(SessionLifecycle::from_u8(l as u8), l);
         }
+        // No lifecycle cell value reads as `Saved`: a listing built from
+        // handles (`meta_live`) never carries it.
+        assert!((0..=u8::MAX).all(|v| SessionLifecycle::from_u8(v) != SessionLifecycle::Saved));
         assert_eq!(serde_json::to_string(&SessionLifecycle::Parked).unwrap(), r#""parked""#);
     }
 

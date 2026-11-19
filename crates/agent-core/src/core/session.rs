@@ -300,18 +300,14 @@ impl Session {
         }
     }
 
-    /// Set title from the first user message if not already set
+    /// Set title from the first message a person typed if not already set
+    /// (never an injected event or a context note: `typed_user_text`).
     pub fn auto_title(&mut self) {
         if !self.title.is_empty() {
             return;
         }
-        for msg in &self.api_messages {
-            if msg["role"].as_str() == Some("user") {
-                if let Some(content) = user_message_for_display(msg) {
-                    self.title = content.chars().take(80).collect();
-                    return;
-                }
-            }
+        if let Some(text) = self.api_messages.iter().find_map(|m| crate::session_catalog::typed_user_text(m)) {
+            self.title = text.chars().take(80).collect();
         }
     }
 

@@ -22,6 +22,7 @@ pub mod pins;
 pub mod registry;
 pub mod reload;
 pub mod rename;
+pub mod saved;
 #[cfg(windows)]
 pub(crate) mod win;
 
@@ -236,6 +237,9 @@ pub struct DaemonState {
     pub pins: Arc<pins::PinBook>,
     /// A cold start's pin restore is running (holds the idle exit).
     pub restoring: AtomicBool,
+    /// `CatalogPage`: one catalog load at a time, shared by the requests
+    /// that arrive before it starts.
+    pub saved: saved::SavedLoader,
 }
 
 impl DaemonState {
@@ -496,6 +500,7 @@ impl Daemon {
             meta,
             pins: Arc::new(pins::PinBook::for_active_profile()),
             restoring: AtomicBool::new(false),
+            saved: saved::SavedLoader::default(),
         });
         state.host.set_pin_sink(Arc::clone(&state.pins) as Arc<dyn crate::session::PinSink>);
 

@@ -4,6 +4,8 @@
 //!       <sessions_dir> <index.jsonl> [deep phrase]
 //!
 //! Never writes to the sessions dir: the preview cache goes to a temp dir.
+//! `BENCH_THREADS=1` reads the headers on one thread, as the daemon does
+//! (`load_catalog_with`); the default is `load_catalog`'s 8.
 
 use agent_core::session_catalog::*;
 use std::sync::atomic::AtomicBool;
@@ -22,10 +24,14 @@ fn main() {
     };
     let clock = Clock::local_now();
 
+    let threads: usize = std::env::var("BENCH_THREADS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(8);
     let t = Instant::now();
-    let mut cat = load_catalog(&paths).expect("load");
+    let mut cat = load_catalog_with(&paths, threads).expect("load");
     println!(
-        "load: {} entries ({} unreadable) in {:?}",
+        "load ({threads} threads): {} entries ({} unreadable) in {:?}",
         cat.entries.len(),
         cat.unreadable,
         t.elapsed()

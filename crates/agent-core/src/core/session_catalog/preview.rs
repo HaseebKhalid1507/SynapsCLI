@@ -2,15 +2,15 @@
 //! count per session, keyed by id and stamped with (mtime, bytes) so a
 //! refresh only re-reads sessions whose files changed.
 //!
-//! User text goes through [`user_message_for_display`] — the same projection
-//! titles use — so tool results and attachment bodies never leak into the
-//! preview or the search haystack. Host-injected user-role text (event
+//! User text goes through [`typed_user_text`](super::typed_user_text) —
+//! the same projection titles use — so tool results, attachment bodies and
+//! saved extension context never leak into the preview or the search
+//! haystack. Host-injected user-role text (event
 //! deliveries, abort/interrupt markers) is skipped too: "last" means the
 //! last thing the human typed.
 
-use super::body::{is_context_note, is_host_injected, walk_session};
+use super::body::walk_session;
 use super::CatalogEntry;
-use crate::core::session::user_message_for_display;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -203,17 +203,13 @@ fn scan_preview(dir: &Path, e: &CatalogEntry) -> std::io::Result<Preview> {
     let mut first: Option<String> = None;
     let mut last: Option<String> = None;
     let (count, _) = walk_session(dir, &e.id, e.has_journal, &mut |m| {
-        if m["role"] == "user" && !is_context_note(m) {
-            if let Some(text) =
-                user_message_for_display(m).filter(|t| !is_host_injected(t))
-            {
-                let t = clip(&text);
-                if !t.is_empty() {
-                    if first.is_none() {
-                        first = Some(t.clone());
-                    }
-                    last = Some(t);
+        if let Some(text) = super::typed_user_text(m) {
+            let t = clip(&text);
+            if !t.is_empty() {
+                if first.is_none() {
+                    first = Some(t.clone());
                 }
+                last = Some(t);
             }
         }
         true

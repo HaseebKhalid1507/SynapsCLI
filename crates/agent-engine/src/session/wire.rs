@@ -47,7 +47,9 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// added, with `#[serde(default)]`, and an existing one never changes
 /// name or type (one unreadable row fails a Rust client's whole listing).
 /// `ReloadExtension` and its two replies (`ExtensionReloaded`,
-/// `ExtensionReloadFailed`) follow it too.
+/// `ExtensionReloadFailed`) follow it too, and so does `CatalogPage`
+/// (gated on [`FEATURE_SESSION_PAGE`]; the reply and `lifecycle: saved`
+/// reach only a client that sent it).
 /// Owned sessions (`Attach::Create{owned}`) are additive as well, but an
 /// older daemon would IGNORE the unknown field and hand back an unowned
 /// session, so they are gated on [`FEATURE_OWNED_SESSIONS`] in
@@ -64,11 +66,33 @@ pub const FEATURE_OWNED_SESSIONS: &str = "owned_sessions";
 /// that hold each session's park). Without it the block is always empty.
 pub const FEATURE_SESSION_WORKERS: &str = "session_workers";
 
+/// `Welcome.features` entry: this daemon answers `ClientFrame::CatalogPage`
+/// with `DaemonFrame::CatalogPage` (saved sessions, `lifecycle: saved`). An
+/// older daemon answers that frame with `Error{"malformed frame: unknown
+/// variant `catalog_page`…"}`, so a client checks this first.
+/// PR 3: with `session_watch` it also grants `Watch{saved: true}` (a
+/// session that leaves the held set is pushed as its saved row).
+pub const FEATURE_SESSION_PAGE: &str = "session_page";
+
+/// `CatalogPage.limit` when absent, and its ceiling.
+pub const CATALOG_PAGE_DEFAULT_LIMIT: u32 = 50;
+pub const CATALOG_PAGE_MAX_LIMIT: u32 = 200;
+
+/// A position in the saved-session order (`updated_at` descending, then
+/// `id` descending). `CatalogPage.before` is exclusive; a reply's `next` is
+/// its last row's cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogCursor {
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub id: String,
+}
+
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
     vec![
         FEATURE_OWNED_SESSIONS.to_string(),
         FEATURE_SESSION_WORKERS.to_string(),
+        FEATURE_SESSION_PAGE.to_string(),
     ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
@@ -217,6 +241,25 @@ pub enum ClientFrame {
     ReloadExtension {
         extension: String,
     },
+    /// Control fast path (no session): one page of the SAVED sessions, the
+    /// conversations on disk this daemon does not hold, one row per
+    /// conversation (a compacted chain is its head), newest `updated_at`
+    /// first. Reply: `DaemonFrame::CatalogPage` with the same `req`. Rows
+    /// are `SessionMeta` with `lifecycle: saved`; resume one with
+    /// `Attach::Create{config.continue_session: Some(Some(journal_id))}`.
+    /// `before` (exclusive) continues from a reply's `next`; `limit` is 50
+    /// when absent, at most 200. Gated on [`FEATURE_SESSION_PAGE`]. Not
+    /// accepted on an attached connection.
+    CatalogPage {
+        #[serde(default)]
+        req: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<CatalogCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        named_only: bool,
+    },
     Bye,
 }
 
@@ -261,6 +304,13 @@ impl std::fmt::Debug for ClientFrame {
             Self::ReloadExtension { extension } => f
                 .debug_struct("ReloadExtension")
                 .field("extension", extension)
+                .finish(),
+            Self::CatalogPage { req, before, limit, named_only } => f
+                .debug_struct("CatalogPage")
+                .field("req", req)
+                .field("before", before)
+                .field("limit", limit)
+                .field("named_only", named_only)
                 .finish(),
             Self::Bye => f.write_str("Bye"),
         }
@@ -480,6 +530,23 @@ pub enum DaemonFrame {
     /// never token material, emails, account ids or identity hashes.
     AuthState {
         report: agent_core::auth::AuthStateReport,
+    },
+    /// Reply to `ClientFrame::CatalogPage` (same `req`). `sessions`: saved
+    /// rows (`lifecycle: saved`, `updated_at` set), newest first. `next`:
+    /// the cursor for the following page, absent at the end. `error`: the
+    /// page could not be served (the sessions dir is unreadable, or too
+    /// many pages are in flight on this connection); `sessions` is empty.
+    /// On a plain control connection a pipelining client matches this by
+    /// type and `req`: a later request can be answered first.
+    CatalogPage {
+        #[serde(default)]
+        req: u64,
+        #[serde(default)]
+        sessions: Vec<SessionMeta>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<CatalogCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 
@@ -2022,6 +2089,13 @@ mod tests {
                 clear: true,
             }),
             ClientFrame::ReloadExtension { extension: "subconscious".into() },
+            ClientFrame::CatalogPage { req: 7, before: None, limit: None, named_only: false },
+            ClientFrame::CatalogPage {
+                req: 8,
+                before: Some(CatalogCursor { updated_at: chrono::Utc::now(), id: "x".into() }),
+                limit: Some(50),
+                named_only: true,
+            },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -2098,6 +2172,13 @@ mod tests {
             DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
             DaemonFrame::AuthState { report: auth_state_report() },
+            DaemonFrame::CatalogPage { req: 7, sessions: vec![meta()], next: None, error: None },
+            DaemonFrame::CatalogPage {
+                req: 8,
+                sessions: vec![],
+                next: Some(CatalogCursor { updated_at: chrono::Utc::now(), id: "x".into() }),
+                error: Some("e".into()),
+            },
         ];
         for f in frames {
             let line = encode_line(&f).unwrap();
@@ -2285,13 +2366,14 @@ mod tests {
     /// the known ones are unchanged.
     #[test]
     fn an_unknown_lifecycle_decodes_as_unknown() {
-        let l: SessionLifecycle = serde_json::from_str("\"saved\"").unwrap();
+        let l: SessionLifecycle = serde_json::from_str("\"archived\"").unwrap();
         assert_eq!(l, SessionLifecycle::Unknown);
         for (s, l) in [
             ("live", SessionLifecycle::Live),
             ("parking", SessionLifecycle::Parking),
             ("parked", SessionLifecycle::Parked),
             ("ending", SessionLifecycle::Ending),
+            ("saved", SessionLifecycle::Saved),
         ] {
             assert_eq!(
                 serde_json::from_str::<SessionLifecycle>(&format!("\"{s}\"")).unwrap(),
@@ -2300,7 +2382,7 @@ mod tests {
             assert_eq!(serde_json::to_string(&l).unwrap(), format!("\"{s}\""));
         }
         let mut v = serde_json::to_value(meta()).unwrap();
-        v["lifecycle"] = "saved".into();
+        v["lifecycle"] = "archived".into();
         let m: SessionMeta = serde_json::from_value(v).unwrap();
         assert_eq!(m.lifecycle, SessionLifecycle::Unknown);
     }
@@ -2492,5 +2574,153 @@ mod float_roundtrip_tests {
         let back: ConversationDigest = decode_line(line.trim_end()).unwrap();
         assert_eq!(back.cost.to_bits(), cost.to_bits(), "{line}");
         assert_eq!(format!("{:.4}", back.cost), format!("{:.4}", cost));
+    }
+}
+
+#[cfg(test)]
+mod catalog_page_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(d: u32, h: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(2026, 11, d, h, 0, 0).unwrap()
+    }
+
+    fn saved_meta() -> SessionMeta {
+        let id = "20261110-202033-64fb";
+        let mut m = crate::session::handle::echo::meta_for(&SessionId::from(id));
+        m.journal_id = id.into();
+        m.lifecycle = SessionLifecycle::Saved;
+        m.name = Some("axel".into());
+        m.model = "claude-opus-4-6".into();
+        m.cwd = Some(PathBuf::from("/home/u/Projects/x"));
+        m.created_at = at(10, 20);
+        m.updated_at = Some(at(12, 4));
+        m.host_pid = 0;
+        m.state_since = None;
+        m.title = Some("wire the desktop app".into());
+        m.cost_usd = 4.5;
+        m.messages = 40;
+        m
+    }
+
+    /// The thin-client contract (synaps-desktop decodes these shapes).
+    #[test]
+    fn catalog_page_frames_have_the_pinned_shape() {
+        assert_eq!(FEATURE_SESSION_PAGE, "session_page");
+        assert!(daemon_features().iter().any(|f| f == FEATURE_SESSION_PAGE), "advertised");
+        let req = ClientFrame::CatalogPage {
+            req: 7,
+            before: Some(CatalogCursor { updated_at: at(12, 4), id: "20261110-202033-64fb".into() }),
+            limit: Some(50),
+            named_only: false,
+        };
+        assert_eq!(
+            encode_line(&req).unwrap().trim_end(),
+            r#"{"type":"catalog_page","req":7,"before":{"updated_at":"2026-11-12T04:00:00Z","id":"20261110-202033-64fb"},"limit":50}"#
+        );
+        match decode_line::<ClientFrame>(r#"{"type":"catalog_page"}"#).unwrap() {
+            ClientFrame::CatalogPage { req: 0, before: None, limit: None, named_only: false } => {}
+            other => panic!("{other:?}"),
+        }
+        let dbg = format!("{:?}", ClientFrame::CatalogPage { req: 1, before: None, limit: Some(5), named_only: true });
+        assert_eq!(dbg, "CatalogPage { req: 1, before: None, limit: Some(5), named_only: true }");
+
+        let reply = DaemonFrame::CatalogPage {
+            req: 7,
+            sessions: vec![saved_meta()],
+            next: Some(CatalogCursor { updated_at: at(12, 4), id: "20261110-202033-64fb".into() }),
+            error: None,
+        };
+        assert_eq!(
+            encode_line(&reply).unwrap().trim_end(),
+            concat!(
+                r#"{"type":"catalog_page","req":7,"sessions":[{"id":"20261110-202033-64fb","name":"axel","#,
+                r#""model":"claude-opus-4-6","cwd":"/home/u/Projects/x","created_at":"2026-11-10T20:00:00Z","#,
+                r#""continued":false,"continue_info":null,"host_pid":0,"lifecycle":"saved","clients":0,"#,
+                r#""input_owner":null,"awaiting_input":0,"journal_id":"20261110-202033-64fb","pinned":false,"#,
+                r#""busy":false,"state_since":null,"park_due":null,"evict_due":null,"#,
+                r#""title":"wire the desktop app","cost_usd":4.5,"messages":40,"#,
+                r#""updated_at":"2026-11-12T04:00:00Z"}],"#,
+                r#""next":{"updated_at":"2026-11-12T04:00:00Z","id":"20261110-202033-64fb"}}"#,
+            )
+        );
+        let err = DaemonFrame::CatalogPage { req: 3, sessions: vec![], next: None, error: Some("busy".into()) };
+        assert_eq!(
+            encode_line(&err).unwrap().trim_end(),
+            r#"{"type":"catalog_page","req":3,"sessions":[],"error":"busy"}"#
+        );
+        match decode_line::<DaemonFrame>(r#"{"type":"catalog_page","req":9}"#).unwrap() {
+            DaemonFrame::CatalogPage { req: 9, sessions, next: None, error: None } => assert!(sessions.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `updated_at` is additive: omitted on held rows; an older meta decodes.
+    #[test]
+    fn updated_at_is_additive() {
+        let held = crate::session::handle::echo::meta_for(&SessionId::from("h"));
+        assert!(!serde_json::to_string(&held).unwrap().contains("updated_at"));
+        let v = serde_json::to_value(saved_meta()).unwrap();
+        assert_eq!(v["updated_at"], "2026-11-12T04:00:00Z");
+        let mut old = v;
+        old.as_object_mut().unwrap().remove("updated_at");
+        let m: SessionMeta = serde_json::from_value(old).unwrap();
+        assert_eq!(m.updated_at, None);
+    }
+
+    /// 0.12.0's `SessionLifecycle`: no `saved`, no fallback variant.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum OldLifecycle {
+        Live,
+        Parking,
+        Parked,
+        Ending,
+    }
+
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    struct OldMeta {
+        lifecycle: OldLifecycle,
+    }
+
+    /// `saved` never reaches a listing an old client decodes: `Welcome`,
+    /// `SessionList` and `Attached.meta` are built from handles, whose
+    /// lifecycle cell never reads as `Saved`, whatever it holds.
+    #[tokio::test]
+    async fn saved_never_encodes_into_listings_or_attached_meta() {
+        assert!(serde_json::from_value::<OldMeta>(serde_json::json!({"lifecycle": "saved"})).is_err());
+        for v in 0..=u8::MAX {
+            let mut m = crate::session::handle::echo::meta_for(&SessionId::from("h"));
+            m.lifecycle = SessionLifecycle::from_u8(v);
+            if m.lifecycle == SessionLifecycle::Unknown {
+                // Never stored by an actor (wire.rs PR 2); not a listing value.
+                continue;
+            }
+            let list = serde_json::to_value(DaemonFrame::SessionList { sessions: vec![m.clone()] }).unwrap();
+            let welcome = serde_json::to_value(Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "v".into(),
+                pid: 1,
+                profile: None,
+                sessions: vec![m.clone()],
+                progressive_tool_disclosure: false,
+                generation: 1,
+                daemon_build: String::new(),
+                features: daemon_features(),
+                boot_id: String::new(),
+            })
+            .unwrap();
+            for row in [&list["sessions"][0], &welcome["sessions"][0], &serde_json::to_value(&m).unwrap()] {
+                assert_ne!(row["lifecycle"], "saved", "cell {v}");
+                serde_json::from_value::<OldMeta>(row.clone()).unwrap_or_else(|e| panic!("cell {v}: {e}"));
+            }
+        }
+        // The frozen create-time meta (`Attached.meta`) starts `live`.
+        let (h, _task) = crate::session::SessionHandle::echo_for_test(SessionId::from("h"));
+        assert_eq!(h.meta().lifecycle, SessionLifecycle::Live);
+        assert_eq!(h.meta_live().lifecycle, SessionLifecycle::Live);
     }
 }

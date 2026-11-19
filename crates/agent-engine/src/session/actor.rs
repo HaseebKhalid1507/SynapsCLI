@@ -907,6 +907,7 @@ impl SessionActor {
             cost_usd: 0.0,
             messages: 0,
             workers: Default::default(),
+            updated_at: None,
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
@@ -5692,6 +5693,8 @@ impl SessionActor {
                 "session save timed out — data may be incomplete"
             );
         }
+        // PR 3: publish here, after the last save, so the saved facts the
+        // hub retires this session with (`saved::saved_row`) are final.
 
         // STEP 2 (C2): on_session_end — per session, concurrent, fail-open,
         // own budget; clears this session's keyed injection.
@@ -5748,17 +5751,16 @@ async fn next_stream_event(stream: &mut Option<ActiveStream>) -> Option<StreamEv
     }
 }
 
-/// The conversation's title for listings: the saved title, else what
-/// `Session::auto_title` will make of the first user message.
+/// The listing title (`listing_title`): the same text a saved row of this
+/// conversation shows, so a row's title does not change when it turns saved.
 fn conversation_title(conv: &ConversationState) -> Option<String> {
-    if !conv.session.title.is_empty() {
-        return Some(conv.session.title.clone());
-    }
-    conv.api_messages
-        .iter()
-        .filter(|m| m["role"].as_str() == Some("user"))
-        .find_map(|m| agent_core::core::session::user_message_for_display(m))
-        .map(|t| t.chars().take(80).collect())
+    let first_user = || conv.api_messages.iter().find_map(|m| agent_core::session_catalog::typed_user_text(m));
+    let title = if conv.session.title.trim().is_empty() {
+        agent_core::session_catalog::listing_title("", first_user().as_deref())
+    } else {
+        agent_core::session_catalog::listing_title(&conv.session.title, None)
+    };
+    Some(title).filter(|t| !t.is_empty())
 }
 
 /// Whether the 1 Hz `SubagentRows` tick keeps running: always during a turn,
@@ -6170,5 +6172,68 @@ mod parked_evict_tests {
         assert_eq!(prompt_abandon_timeout_from(None, 42), Some(Duration::from_secs(42)));
         assert_eq!(prompt_abandon_timeout_from(None, 0), None);
         assert_eq!(prompt_abandon_timeout_from(Some("7"), 42), Some(Duration::from_secs(7)));
+    }
+}
+
+#[cfg(test)]
+mod conversation_title_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn conv(title: &str, messages: &[serde_json::Value]) -> ConversationState {
+        let mut c = ConversationState::new(agent_core::core::session::Session::new("m", "low", None));
+        c.session.title = title.into();
+        c.api_messages = messages.iter().cloned().map(Arc::new).collect();
+        c
+    }
+
+    /// A held row's title is the one its saved row will show
+    /// (`listing_title` over what a person typed).
+    #[test]
+    fn the_title_is_the_listing_title() {
+        let typed = serde_json::json!({"role": "user", "content": "fix the\n  build"});
+        let event = serde_json::json!({"role": "user", "content": "<event id=\"1\">ping</event>"});
+        assert_eq!(conversation_title(&conv("", &[event.clone(), typed.clone()])).as_deref(), Some("fix the build"));
+        assert_eq!(conversation_title(&conv("Named\ttitle", &[typed])).as_deref(), Some("Named title"));
+        assert_eq!(conversation_title(&conv("  ", &[event])), None);
+        let long = conversation_title(&conv(&"word ".repeat(100), &[])).unwrap();
+        assert_eq!(long.chars().count(), agent_core::session_catalog::LISTING_TITLE_CHARS);
+    }
+
+    /// A session an event started: after its first save the held title and
+    /// the saved row's title agree, and both are what the person typed.
+    #[test]
+    fn an_event_first_session_is_titled_by_its_typed_text_held_and_saved() {
+        let msgs = [
+            serde_json::json!({"role": "user", "content": "<event id=\"1\">ping</event>"}),
+            serde_json::json!({"role": "assistant", "content": "pong"}),
+            serde_json::json!({"role": "user", "content": "fix the build"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        let mut c = conv("", &msgs);
+        c.session.api_messages = c.api_messages.clone();
+        c.session.auto_title(); // what every save runs
+        assert_eq!(c.session.title, "fix the build");
+        let held = conversation_title(&c);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        agent_core::core::session_journal::save_session_in_dir(
+            &sessions_dir,
+            &c.session,
+            agent_core::core::session_journal::SessionPersistence::Json,
+        )
+        .unwrap();
+        let paths = agent_core::session_catalog::CatalogPaths {
+            index_path: sessions_dir.join("index.jsonl"),
+            cache_path: root.join("catalog").join("session-previews.json"),
+            sessions_dir,
+        };
+        let facts = crate::daemon::saved::fold(&crate::daemon::saved::load(&paths).unwrap());
+        let saved = crate::daemon::saved::saved_row(&facts[0], false).expect("listed");
+        assert_eq!(held.as_deref(), Some("fix the build"));
+        assert_eq!(saved.title, held);
     }
 }
