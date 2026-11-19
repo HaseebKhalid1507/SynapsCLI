@@ -202,7 +202,7 @@ fn credentials_from_token(
     })
 }
 
-fn build_auth_url(challenge: &str, state: &str) -> std::result::Result<String, String> {
+pub(super) fn build_auth_url(challenge: &str, state: &str) -> std::result::Result<String, String> {
     let mut url = url::Url::parse(AUTHORIZE_URL).map_err(|e| e.to_string())?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
