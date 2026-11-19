@@ -40,9 +40,18 @@ libc = "0.2"
 
 # `core::lock_file`: a lock on a byte past the holder's body, which Windows'
 # mandatory whole-file lock would make unreadable. Same version as
-# synaps-engine's, so no second copy is built.
+# synaps-engine's, so no second copy is built. `core::auth::browser` opens
+# sign-in URLs with `ShellExecuteW` (Com: the shell wants COM initialised;
+# UI_WindowsAndMessaging: `ShellExecuteW` and `SW_SHOWNORMAL` live behind it).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # Gated identically to the jemalloc allocator in the synaps binary
 # (src/main.rs): stats + manual arena purge for `memstat` (§3.7).

@@ -247,7 +247,13 @@ pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, S
     )?;
     let (rx, handle) =
         start_callback_server_at(state.clone(), "127.0.0.1", CALLBACK_PORT, "/callback").await?;
-    let _ = open_browser(&url);
+    if let Err(e) = open_browser(&url) {
+        eprintln!("Could not open browser automatically: {}", e);
+    }
+    // Printed like the other providers' sign-ins, so a user (or a GUI client
+    // reading stderr) can open the page by hand when the auto-open fails.
+    eprintln!("\x1b[2mIf the browser didn't open, visit this URL:\x1b[0m");
+    eprintln!("\x1b[36m{}\x1b[0m\n", url);
     eprintln!("Complete xAI sign-in in your browser. If the callback cannot connect, paste the full callback URL here.");
     let outcome =
         wait_for_callback(rx, tokio::io::BufReader::new(tokio::io::stdin()), &state).await;
