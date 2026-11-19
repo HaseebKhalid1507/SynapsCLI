@@ -280,12 +280,14 @@ pub async fn login_into(
 
     eprintln!("\n\x1b[1mOpening browser to sign in...\x1b[0m\n");
 
+    // Print the URL first: `open_browser` can block on a slow handler, and the
+    // fallback must be on screen by then.
+    eprintln!("\x1b[2mIf the browser didn't open, visit this URL:\x1b[0m");
+    eprintln!("\x1b[36m{}\x1b[0m\n", auth_url);
+
     if let Err(e) = open_browser(&auth_url) {
         eprintln!("Could not open browser automatically: {}", e);
     }
-
-    eprintln!("\x1b[2mIf the browser didn't open, visit this URL:\x1b[0m");
-    eprintln!("\x1b[36m{}\x1b[0m\n", auth_url);
 
     // Also provide manual paste option
     let (manual_tx, manual_rx) = oneshot::channel::<CallbackResult>();
