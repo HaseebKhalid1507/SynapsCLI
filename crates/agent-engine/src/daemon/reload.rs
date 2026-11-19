@@ -186,6 +186,11 @@ pub struct ReloadState {
     /// (the next image mints one).
     #[serde(default)]
     pub boot_id: String,
+    /// The owner claim's registrant (`daemon::owner_claim`), absent when
+    /// Vacant. An older image ignores it (its claim starts Vacant); a state
+    /// without it restores Vacant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<super::owner_claim::OwnerCarry>,
 }
 
 impl ReloadState {
@@ -511,6 +516,7 @@ pub async fn prepare(
         // After every checkpoint: no session can launch a worker any more.
         next_subagent_id: crate::tools::peek_next_subagent_id(),
         boot_id: state.boot_id.clone(),
+        owner: state.owner.carry(),
     };
     let rs_path = reload_state_path(paths);
     // If either write fails we early-return WITHOUT reaching exec() (which is the
@@ -645,6 +651,11 @@ fn exec_self(exe: &Path, rs_path: &Path, state: &DaemonState) -> String {
         .env(LOCK_FD_ENV, lock_fd.to_string())
         .env(RELOAD_STATE_ENV, rs_path)
         .env(SUBAGENT_ID_FLOOR_ENV, crate::tools::peek_next_subagent_id().to_string());
+    // The owner app path left this image's environment at its start; the
+    // next image takes it the same way.
+    if let Some(app) = state.owner.env_exe() {
+        cmd.env(super::owner_claim::APP_EXE_ENV, app);
+    }
     let e = cmd.exec();
     // Only reached on failure: restore CLOEXEC.
     // SAFETY: as above.
@@ -681,6 +692,10 @@ async fn exec_successor(exe: &Path, rs_path: &Path, state: &DaemonState) -> Stri
     crate::process_scope::set_env(&mut env, HANDOFF_EVENT_ENV, armed.name());
     crate::process_scope::set_env(&mut env, HANDOFF_PID_ENV, std::process::id().to_string());
     crate::process_scope::set_env(&mut env, SUBAGENT_ID_FLOOR_ENV, crate::tools::peek_next_subagent_id().to_string());
+    // As `exec_self`.
+    if let Some(app) = state.owner.env_exe() {
+        crate::process_scope::set_env(&mut env, super::owner_claim::APP_EXE_ENV, app);
+    }
     let child = match win::spawn_detached(exe, &args, &env) {
         Ok(c) => c,
         Err(e) => return format!("cannot start {}: {e}", exe.display()),
@@ -1248,6 +1263,7 @@ mod tests {
             expected_clients: 0,
             next_subagent_id: 0,
             boot_id: String::new(),
+            owner: None,
         };
         assert_eq!(rs.subagent_id_floor(), 289);
         rs.next_subagent_id = 300;

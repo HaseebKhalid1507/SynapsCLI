@@ -16,9 +16,11 @@
 //! `SocketTransport` rebuilds the snapshot from its local mirror
 //! (`Attached` + `Stream(MessageHistory)`) and re-queries on a hash miss.
 //!
-//! Security: nothing in here carries a credential. `Welcome`/`Attached` are
-//! summaries; `ClientFrame`'s `Debug` redacts `Answer.value` and
-//! `Submit.text` so a frame can be traced by *type* without leaking bodies.
+//! Security: nothing in here carries a credential but `ClaimOwner`'s
+//! [`OwnerKey`], which wipes itself and is hashed and wiped on receipt.
+//! `Welcome`/`Attached` are summaries; `ClientFrame`'s `Debug` redacts
+//! `Answer.value`, `Submit.text` and the owner key so a frame can be traced
+//! by *type* without leaking bodies.
 
 use std::path::PathBuf;
 
@@ -94,6 +96,14 @@ pub struct CatalogCursor {
 /// mark.
 pub const FEATURE_TURN_ORIGIN: &str = "turn_origin";
 
+/// `Welcome.features` entry: this daemon takes `claim_owner` (answered
+/// `owner_claim`, see `daemon::owner_claim`) and `owner_reset`, and a marked
+/// turn in a session without an owner counts from the owner app's bound
+/// link. Listed whenever the build has the claim, configured or not: with
+/// no owner app path set a claim is answered
+/// `owner_claim {owner_bound: false, reason: "unsupported"}`.
+pub const FEATURE_TURN_ORIGIN_OWNER: &str = "turn_origin_owner";
+
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
     vec![
@@ -101,6 +111,7 @@ pub fn daemon_features() -> Vec<String> {
         FEATURE_SESSION_WORKERS.to_string(),
         FEATURE_SESSION_PAGE.to_string(),
         FEATURE_TURN_ORIGIN.to_string(),
+        FEATURE_TURN_ORIGIN_OWNER.to_string(),
     ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
@@ -268,6 +279,17 @@ pub enum ClientFrame {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         named_only: bool,
     },
+    /// The owner claim (`daemon::owner_claim`): after `Welcome`, once per
+    /// link, again only after a pushed unbind. Reply: `OwnerClaim`. A key
+    /// that is not 64 lower-case hex fails the frame's decode (a
+    /// non-terminal `Error`). Gated on [`FEATURE_TURN_ORIGIN_OWNER`].
+    ClaimOwner {
+        key: OwnerKey,
+    },
+    /// `synaps daemon owner reset` (denial only: the claim goes Vacant and
+    /// never binds by itself). Reply: `OwnerClaim{false, reset}`. Not
+    /// accepted on an attached connection.
+    OwnerReset,
     Bye,
 }
 
@@ -320,6 +342,8 @@ impl std::fmt::Debug for ClientFrame {
                 .field("limit", limit)
                 .field("named_only", named_only)
                 .finish(),
+            Self::ClaimOwner { key } => f.debug_struct("ClaimOwner").field("key", key).finish(),
+            Self::OwnerReset => f.write_str("OwnerReset"),
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -586,6 +610,152 @@ pub enum DaemonFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// The answer to `ClaimOwner` (and `OwnerReset`), and a push when the
+    /// link's binding changes (bound after the settle window, contested,
+    /// reset). Non-terminal. Only ever sent to a link that sent
+    /// `claim_owner` (or `owner_reset`): an older client's `DaemonFrame` is
+    /// closed and drops the link on an unknown type.
+    OwnerClaim {
+        owner_bound: bool,
+        /// Absent when bound.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<OwnerClaimReason>,
+    },
+}
+
+// ── the owner claim ──
+
+/// The owner claim's key, 32 bytes sent as 64 lower-case hex digits.
+/// Decoded straight from the frame's string into a buffer that wipes on
+/// drop ([`zeroize::Zeroizing`]); [`Self::digest_and_wipe`] hashes it and
+/// wipes it at once, so the daemon keeps only the SHA-256. `Debug` redacts
+/// it. Upper-case or any other spelling fails the decode.
+///
+/// The 32 bytes live on the heap, boxed inside the wiping wrapper, so
+/// moving an `OwnerKey` (out of the decoder, into a frame) moves only the
+/// pointer and leaves no unwiped copy of the key behind. (`Box<[u8]>` of
+/// length 32: zeroize 1.8 wipes a `Box<[u8]>` in place but has no
+/// `Zeroize` for `Box<[u8; 32]>`.)
+#[derive(Clone)]
+pub struct OwnerKey(zeroize::Zeroizing<Box<[u8]>>);
+
+impl OwnerKey {
+    const LEN: usize = 32;
+
+    fn zeroed() -> Self {
+        Self(zeroize::Zeroizing::new(vec![0u8; Self::LEN].into_boxed_slice()))
+    }
+
+    /// The key from `bytes` (that copy of it is wiped here).
+    pub fn from_bytes(mut bytes: [u8; 32]) -> Self {
+        let mut key = Self::zeroed();
+        key.0.copy_from_slice(&bytes);
+        zeroize::Zeroize::zeroize(&mut bytes);
+        key
+    }
+
+    /// The key as it is sent: 64 lower-case hex digits (a client's side).
+    pub fn to_hex(&self) -> zeroize::Zeroizing<String> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = zeroize::Zeroizing::new(String::with_capacity(64));
+        for b in self.0.iter() {
+            out.push(HEX[usize::from(b >> 4)] as char);
+            out.push(HEX[usize::from(b & 0xf)] as char);
+        }
+        out
+    }
+
+    /// The key's SHA-256; the key bytes are zeroed before this returns.
+    pub fn digest_and_wipe(&mut self) -> [u8; 32] {
+        use sha2::Digest;
+        let digest: [u8; 32] = sha2::Sha256::digest(&self.0[..]).into();
+        zeroize::Zeroize::zeroize(&mut *self.0);
+        digest
+    }
+
+    /// The bytes held now (all zero after [`Self::digest_and_wipe`]), where
+    /// they are held.
+    pub fn held(&self) -> &[u8] {
+        &self.0[..]
+    }
+
+    /// 64 lower-case hex digits, else `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        let raw = text.as_bytes();
+        if raw.len() != 64 {
+            return None;
+        }
+        let nibble = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        };
+        let mut key = Self::zeroed();
+        for (i, pair) in raw.chunks_exact(2).enumerate() {
+            key.0[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+        }
+        Some(key)
+    }
+}
+
+impl std::fmt::Debug for OwnerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnerKey([redacted])")
+    }
+}
+
+impl Serialize for OwnerKey {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for OwnerKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Hex;
+        impl serde::de::Visitor<'_> for Hex {
+            type Value = OwnerKey;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an owner key: 64 lower-case hex digits")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<OwnerKey, E> {
+                OwnerKey::parse(v).ok_or_else(|| E::custom("claim_owner key must be 64 lower-case hex digits"))
+            }
+        }
+        d.deserialize_str(Hex)
+    }
+}
+
+/// Why a link is not (or no longer) the owner app's bound link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerClaimReason {
+    /// Registered; bound once the settle window ends (a push says so).
+    Settling,
+    /// A second key arrived: nobody is bound until a cold start or reset.
+    Contested,
+    /// The claimant's image is not the configured app's (or unreadable).
+    NotTheApp,
+    /// The right key from a process that is not the registrant.
+    NotTheRegistrant,
+    /// `synaps daemon owner reset`.
+    Reset,
+    /// No owner app is configured, or this platform has no claim.
+    Unsupported,
+}
+
+impl OwnerClaimReason {
+    /// The wire name (`settling`, `not_the_app`, ...).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Settling => "settling",
+            Self::Contested => "contested",
+            Self::NotTheApp => "not_the_app",
+            Self::NotTheRegistrant => "not_the_registrant",
+            Self::Reset => "reset",
+            Self::Unsupported => "unsupported",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -779,12 +949,18 @@ pub struct AttachedWire {
     /// to another client. `None` otherwise and from an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_token: Option<OwnerToken>,
+    /// Whether this link is the owner app's bound link (`daemon::owner_claim`),
+    /// set only in the `Attached` the daemon sends a link that sent
+    /// `claim_owner` (absent = false; never on any other link).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_bound: Option<bool>,
 }
 
 impl AttachedWire {
     pub fn new(client: ClientId, s: AttachSnapshot) -> Self {
         Self {
             owner_token: None,
+            owner_bound: None,
             client,
             meta: s.meta,
             view: s.view,
@@ -2695,6 +2871,11 @@ mod tests {
         assert!(new.supports(FEATURE_OWNED_SESSIONS));
         assert!(new.supports(FEATURE_TURN_ORIGIN));
         assert!(daemon_features().iter().any(|f| f == "turn_origin"));
+        // Listed whenever the build has the claim, configured or not.
+        assert!(!old.supports(FEATURE_TURN_ORIGIN_OWNER));
+        assert!(new.supports(FEATURE_TURN_ORIGIN_OWNER));
+        assert_eq!(FEATURE_TURN_ORIGIN_OWNER, "turn_origin_owner");
+        assert_eq!(daemon_features().iter().filter(|f| *f == "turn_origin_owner").count(), 1);
     }
 }
 

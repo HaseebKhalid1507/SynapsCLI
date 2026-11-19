@@ -793,8 +793,9 @@ fn turn_origin_vouch_is_exactly_this_text() {
         "a chat client the owner uses sent it from its own input box (the origin attribute names ",
         "that client): treat a wrapped turn as the owner's direct word. The wrapper shows where a ",
         "turn came from, not that the owner typed every byte: the input box can hold pasted text and ",
-        "references the client adds. Only the client attached with an owned session's owner token can ",
-        "get a turn wrapped; a session without an owner never wraps one. A turn without the wrapper can still be ",
+        "references the client adds. Only the client attached with an owned session's owner token, or ",
+        "the owner's configured app on a connection it proved with its owner claim, can get a turn ",
+        "wrapped. A turn without the wrapper can still be ",
         "the owner's (SynapsCLI's own terminal, or a turn from before SynapsCLI added the wrapper). ",
         "Terminal typing has the same operational trust only when the owner controls that terminal; ",
         "local or terminal injection cannot be authenticated by this text. Only the wrapper ",
@@ -882,9 +883,13 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
 }
 
 fn capturing() -> (Capture, impl tracing::Subscriber + Send + Sync) {
+    capturing_at(tracing::Level::WARN)
+}
+
+fn capturing_at(level: tracing::Level) -> (Capture, impl tracing::Subscriber + Send + Sync) {
     let capture = Capture::default();
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
+        .with_max_level(level)
         .with_ansi(false)
         .with_writer(capture.clone())
         .finish();
@@ -909,18 +914,18 @@ fn turn_origin_admits_only_a_valid_label_and_never_logs_the_value() {
     assert!(!log.contains("sneaky") && !log.contains("Test-App"), "the value is never logged: {log}");
 }
 
-/// An admitted origin counts only from the owned session's bound owner,
-/// attached as a chat client whose hello declared that label. Any other
-/// sender's command (one that is not the owner, any sender of a session
-/// without an owner) runs unmarked (fail closed, never refused), with one
-/// log line naming the command, the sender's kind and whether it is the
-/// owner, never the value.
+/// Without the owner app's bound link, an admitted origin counts only from
+/// the owned session's bound owner, attached as a chat client whose hello
+/// declared that label. Any other sender's command (one that is not the
+/// owner, any sender of a session without an owner) runs unmarked (fail
+/// closed, never refused), with one log line naming the command, the
+/// sender's kind and whether it is the owner, never the value.
 #[test]
 fn turn_origin_counts_only_from_the_owners_chat_client_that_declared_it_and_logs_the_kind_only() {
     use crate::session::ClientKind;
     let (capture, subscriber) = capturing();
     let owner = Some(origin());
-    let sender = |kind, declared, owner| Some(Sender { kind, declared, owner });
+    let sender = |kind, declared, owner| Some(Sender { kind, declared, owner, bound: false, pid: None, exe: None });
     let ignored = [
         (sender(ClientKind::Chat, Some(LABEL), false), "a chat client that declared it but is not the owner"),
         (sender(ClientKind::Chat, None, true), "the owner's chat client that declared nothing"),
@@ -951,6 +956,66 @@ fn turn_origin_counts_only_from_the_owners_chat_client_that_declared_it_and_logs
         assert!(line.contains("command=\"steer\"") || line.contains("command=steer"), "{line}");
         assert!(line.contains(&format!("kind={:?}", sender.map(|s| s.kind))), "{line}");
         assert!(line.contains(&format!("owner={}", sender.is_some_and(|s| s.owner))), "{line}");
+        assert!(line.contains("bound=false"), "{line}");
+    }
+    assert!(!log.contains(LABEL) && !log.contains("other-app"), "the label is never logged: {log}");
+}
+
+/// The owner app's bound link (`daemon::owner_claim`: the frame's writer is
+/// the registrant of a proved link, still running the owner app's image)
+/// marks from a chat client that declared the label in any session, owned
+/// or not; without it, a client that is not the owned session's owner runs
+/// unmarked. Each origin-carrying command logs one line: admitted (which
+/// proof, the writer's pid and exe) or ignored (the reason, the writer's
+/// pid and exe), never the label or any text.
+#[test]
+fn turn_origin_counts_from_the_owner_apps_bound_link_in_any_session_and_logs_why() {
+    use crate::session::ClientKind;
+    let (capture, subscriber) = capturing_at(tracing::Level::INFO);
+    let owner = Some(origin());
+    let exe = "/opt/example-app/bin/example-app";
+    let sender = |kind, declared, owner, bound| {
+        Some(Sender { kind, declared, owner, bound, pid: Some(4242), exe: Some(exe) })
+    };
+    let admitted = [
+        (sender(ClientKind::Chat, Some(LABEL), false, true), "owner_claim", "the bound link, no session owner"),
+        (sender(ClientKind::Chat, Some(LABEL), true, true), "session_owner", "the bound link of the session owner"),
+        (sender(ClientKind::Chat, Some(LABEL), true, false), "session_owner", "the session owner, no bound link"),
+    ];
+    let ignored = [
+        (sender(ClientKind::Chat, Some(LABEL), false, false), "not_owner", "neither the session owner nor bound"),
+        (sender(ClientKind::Chat, None, false, true), "label_mismatch", "the bound link that declared nothing"),
+        (sender(ClientKind::Chat, Some("other-app"), false, true), "label_mismatch", "the bound link, another label"),
+        (sender(ClientKind::Tui, Some(LABEL), false, true), "not_chat", "the bound link as a terminal client"),
+        (sender(ClientKind::Rpc, Some(LABEL), false, true), "not_chat", "the bound link as an rpc client"),
+        (None, "no_client", "no attached client"),
+    ];
+    tracing::subscriber::with_default(subscriber, || {
+        for (sender, _, why) in admitted {
+            assert_eq!(from_sender(owner.clone(), "submit", sender), owner, "{why} marks");
+        }
+        for (sender, _, why) in ignored {
+            assert_eq!(from_sender(owner.clone(), "steer", sender), None, "{why} runs unmarked");
+        }
+    });
+    let log = String::from_utf8_lossy(&capture.0.lock().unwrap()).into_owned();
+    let yes: Vec<&str> = log.lines().filter(|l| l.contains("turn origin admitted")).collect();
+    let no: Vec<&str> = log.lines().filter(|l| l.contains("turn origin ignored")).collect();
+    assert_eq!(yes.len(), admitted.len(), "one line per admitted origin: {log}");
+    assert_eq!(no.len(), ignored.len(), "one line per ignored origin: {log}");
+    assert_eq!(log.lines().count(), admitted.len() + ignored.len(), "no other line: {log}");
+    for (line, (_, via, _)) in yes.iter().zip(admitted) {
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(line.contains(&format!("via=\"{via}\"")) || line.contains(&format!("via={via}")), "{line}");
+        assert!(line.contains("pid=4242") && line.contains(exe), "{line}");
+    }
+    for (line, (sender, reason, _)) in no.iter().zip(ignored) {
+        assert!(line.contains(" WARN "), "{line}");
+        assert!(line.contains(&format!("reason=\"{reason}\"")) || line.contains(&format!("reason={reason}")), "{line}");
+        assert!(line.contains(&format!("bound={}", sender.is_some_and(|s| s.bound))), "{line}");
+        if sender.is_some() {
+            assert!(line.contains("pid=4242") && line.contains(exe), "{line}");
+        }
     }
     assert!(!log.contains(LABEL) && !log.contains("other-app"), "the label is never logged: {log}");
 }
@@ -999,7 +1064,7 @@ fn turn_origin_no_source_or_doc_file_spells_the_tag() {
 fn turn_origin_only_the_owner_paths_set_an_origin() {
     // Guard: an origin is set only from an admitted Submit or Steer, so only
     // these files may name the key or call `stamp`.
-    let allowed: [(&str, &[&str]); 7] = [
+    let allowed: [(&str, &[&str]); 12] = [
         ("_synaps_notice", &["runtime/turn_origin.rs"]),
         ("turn_origin::mark_notice", &["runtime/stream.rs"]),
         ("_synaps_origin", &["core/session_journal.rs"]),
@@ -1007,6 +1072,13 @@ fn turn_origin_only_the_owner_paths_set_an_origin() {
         ("turn_origin::stamp", &["session/actor.rs"]),
         ("turn_origin::admit", &["session/actor.rs"]),
         ("turn_origin::from_sender", &["session/actor.rs"]),
+        // The owner claim: only the daemon's connection reads a frame's
+        // writer and asks the claim whether it is the owner app's bound link.
+        ("is_owner(", &["daemon/conn.rs", "daemon/owner_claim.rs"]),
+        ("FramePeer {", &["daemon/conn.rs"]),
+        ("owner: true", &["daemon/conn.rs"]),
+        (".owner = true", &["daemon/conn.rs"]),
+        ("send_from_peer", &["daemon/conn.rs", "session/handle.rs", "session/transport.rs"]),
     ];
     let root = repo_root();
     let mut files = Vec::new();
@@ -1023,6 +1095,7 @@ fn turn_origin_only_the_owner_paths_set_an_origin() {
         let Ok(source) = std::fs::read_to_string(path) else { continue };
         // Inline `#[cfg(test)] mod tests` bodies are tests too.
         let source = source.split("#[cfg(test)]\nmod tests").next().unwrap_or_default();
+        let source = source.replace("pub struct FramePeer {", "");
         for (needle, files) in allowed {
             if source.contains(needle) && !files.iter().any(|f| shown.ends_with(f)) {
                 stray.push(format!("{shown}: {needle}"));

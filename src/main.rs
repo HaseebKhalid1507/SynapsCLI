@@ -763,6 +763,11 @@ fn main() -> anyhow::Result<()> {
         agent_core::core::memstat::ladder("main", &"");
         tui::client_diet::tune_allocator();
     }
+    // The owner app path leaves the environment here, while this process has
+    // one thread (no runtime yet), so the `remove_var` races no `getenv`; the
+    // daemon's start takes it from the stash, and a client that starts a
+    // daemon hands it on.
+    agent_engine::daemon::owner_claim::stash_app_exe_env();
     let rt = if thin {
         tokio::runtime::Builder::new_current_thread().enable_all().thread_name("synaps-rt").build()?
     } else {

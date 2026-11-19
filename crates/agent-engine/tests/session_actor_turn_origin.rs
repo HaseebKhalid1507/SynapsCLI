@@ -5,9 +5,12 @@
 //! `SubmitPrepared` never carries one, and a reloaded session renders the
 //! same. The origin counts only from an owned session's owner, bound with
 //! its token and attached as a chat client whose hello declared that very
-//! label: the harness attaches as one. Any other sender's marked command
-//! runs unmarked (in a session without an owner, every sender's), and a
-//! client that is not the owner may not send one into an owned session.
+//! label: the harness attaches as one. In a session without an owner it
+//! counts from such a chat client only on the owner app's bound link
+//! (`daemon::owner_claim`): the harness sends those commands as
+//! `daemon::conn` does for a frame from the bound link's registrant. Any
+//! other sender's marked command runs unmarked, and a client that is not
+//! the owner may not send one into an owned session.
 //!
 //! No line here spells the wrapper's tag: `\x3C` is the opener.
 
@@ -19,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_engine::session::{
-    AttachMode, ClientKind, ClientMeta, ClientTransport, LocalTransport, OwnedConfig, OwnerBind,
-    OwnerClaim, OwnerToken, SessionCommand, SessionConfig, SessionEventWire, SessionHandle,
+    AttachMode, ClientKind, ClientMeta, ClientTransport, FramePeer, LocalTransport, OwnedConfig,
+    OwnerBind, OwnerClaim, OwnerToken, SessionCommand, SessionConfig, SessionEventWire, SessionHandle,
 };
 use axum::response::IntoResponse;
 use serde_json::{json, Value};
@@ -169,6 +172,17 @@ async fn attach_as(
         .await
         .unwrap();
     t
+}
+
+/// What the daemon connection sees of a frame from the owner app's bound
+/// link, written by the link's registrant.
+fn bound() -> FramePeer {
+    FramePeer { owner: true, pid: Some(std::process::id()), exe: None }
+}
+
+/// A frame from a link that never claimed, or that is not bound.
+fn unbound() -> FramePeer {
+    FramePeer { owner: false, pid: Some(std::process::id()), exe: None }
 }
 
 /// An owned session made from `config`, its owner attached.
@@ -362,7 +376,8 @@ async fn turn_origin_an_invalid_origin_is_refused_and_nothing_is_pushed() {
 /// A sender that is not the owner attached as a chat client that declared
 /// the label (the owner as the TUI or an rpc bridge, or as a chat client
 /// that declared none or another label; in a session without an owner,
-/// ANY sender, even a chat client that declared this very label) may name
+/// ANY sender not on the owner app's bound link, even a chat client that
+/// declared this very label) may name
 /// the origin, but it does not count: the command is not refused and runs
 /// as one without an origin, so its text is stored and sent unmarked
 /// (Submit, a Steer into the running turn, a Steer while idle); one log
@@ -519,6 +534,81 @@ async fn turn_origin_a_non_owner_cannot_mark_a_turn_in_an_owned_session() {
     assert_eq!(wrapper_tags(body), (1, 1), "{body}");
     assert!(!body.to_string().contains("NOT-THE-OWNER"), "{body}");
     end(&mut owner).await;
+}
+
+/// In a session without an owner, a chat client that declared the label
+/// marks a turn only with a frame from the owner app's bound link: wrapped,
+/// in every session that link attaches. The same command with no link
+/// behind it (`send_from_self`), from a link that is not bound, or from the
+/// bound link of a chat client whose hello declared no label goes in plain
+/// and stored unmarked, with one log line naming the reason and the frame's
+/// writer, never the text or the value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn turn_origin_in_a_session_without_an_owner_counts_only_from_the_bound_link() {
+    let _h = Home::new();
+    let logs = logs();
+    let from = logs.at();
+    let stub = Stub::spawn(vec![SSE_HI.into()], false).await;
+    let host = host().await;
+
+    let first = host.create_session(cfg()).await.unwrap();
+    let mut t = attach_as(&first, ClientKind::Chat, Some(COMPOSER), None).await;
+    t.send_from_self(marked_submit("NO-LINK-TEXT")).await.unwrap();
+    idle(&mut t).await;
+    t.send_from_peer(marked_submit("UNBOUND-TEXT"), unbound()).await.unwrap();
+    idle(&mut t).await;
+    t.send_from_peer(marked_submit("BOUND-ONE"), bound()).await.unwrap();
+    idle(&mut t).await;
+    let stored = history(&first).await;
+    let marked = |text: &str| stored.iter().find(|m| m["content"] == text).map(|m| m.get(MARK_KEY).is_some());
+    assert_eq!(marked("NO-LINK-TEXT"), Some(false), "{stored:#?}");
+    assert_eq!(marked("UNBOUND-TEXT"), Some(false), "{stored:#?}");
+    assert_eq!(marked("BOUND-ONE"), Some(true), "{stored:#?}");
+    end(&mut t).await;
+
+    let second = host.create_session(cfg()).await.unwrap();
+    let mut t = attach_as(&second, ClientKind::Chat, Some(COMPOSER), None).await;
+    t.send_from_peer(marked_submit("BOUND-TWO"), bound()).await.unwrap();
+    idle(&mut t).await;
+    end(&mut t).await;
+
+    let third = host.create_session(cfg()).await.unwrap();
+    let mut t = attach_as(&third, ClientKind::Chat, None, None).await;
+    t.send_from_peer(marked_submit("NO-LABEL-TEXT"), bound()).await.unwrap();
+    idle(&mut t).await;
+    end(&mut t).await;
+
+    let bodies = stub.bodies();
+    assert_eq!(bodies.len(), 5, "{bodies:#?}");
+    assert_eq!(user_texts(&bodies[0]), ["NO-LINK-TEXT"]);
+    assert_eq!(user_texts(&bodies[1]), ["NO-LINK-TEXT", "UNBOUND-TEXT"]);
+    assert_eq!(user_texts(&bodies[2]).last(), Some(&wrapped("BOUND-ONE")));
+    assert_eq!(wrapper_tags(&bodies[2]), (1, 1), "{}", bodies[2]);
+    assert_eq!(user_texts(&bodies[3]), [wrapped("BOUND-TWO")], "the bound link marks in a second session");
+    assert_eq!(wrapper_tags(&bodies[3]), (1, 1), "{}", bodies[3]);
+    assert_eq!(user_texts(&bodies[4]), ["NO-LABEL-TEXT"], "no label");
+    for i in [0, 1, 4] {
+        assert_eq!(wrapper_tags(&bodies[i]), (0, 0), "{}", bodies[i]);
+    }
+
+    let field = |line: &str, name: &str, value: &str| {
+        line.contains(&format!("{name}=\"{value}\"")) || line.contains(&format!("{name}={value} "))
+    };
+    let pid = format!("pid={} ", std::process::id());
+    let log = logs.since(from);
+    let lines: Vec<&str> = log.lines().filter(|l| l.contains(IGNORED)).collect();
+    assert_eq!(lines.len(), 3, "{log}");
+    assert!(lines.iter().all(|l| names(l, "submit") && l.contains("kind=Some(Chat)")), "{log}");
+    assert!(field(lines[0], "reason", "not_owner") && lines[0].contains("bound=false"), "{log}");
+    assert!(!lines[0].contains("pid="), "no frame, no writer: {log}");
+    assert!(field(lines[1], "reason", "not_owner") && lines[1].contains("bound=false"), "{log}");
+    assert!(lines[1].contains(&pid), "{log}");
+    assert!(field(lines[2], "reason", "label_mismatch") && lines[2].contains("bound=true"), "{log}");
+    assert!(lines[2].contains(&pid), "{log}");
+    for text in ["NO-LINK-TEXT", "UNBOUND-TEXT", "BOUND-ONE", "BOUND-TWO", "NO-LABEL-TEXT", COMPOSER] {
+        assert!(!log.contains(text), "no log line holds the text or the value: {log}");
+    }
 }
 
 /// The owner's marked Submit with no typed text and a text attachment

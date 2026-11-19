@@ -4,11 +4,14 @@
 //! A chat client that speaks for the owner declares a label at hello
 //! (`ClientMeta::turn_origin`, 1-32 chars of `[a-z0-9-]`) and marks its turns
 //! (`Submit`/`Steer` with `origin: "<label>"`; the daemon advertises the
-//! `turn_origin` Welcome feature). The daemon counts the mark only in an
-//! owned session, and only when the sender is the chat client attached with
-//! that session's owner token whose declared label is the one sent: any
-//! other sender's text goes in unmarked, and a session without an owner
-//! never marks a turn; see [`from_sender`]. The mark
+//! `turn_origin` Welcome feature). The daemon counts the mark only from a
+//! chat client whose declared label is the one sent, and only when that
+//! client is the owner: in an owned session, the client attached with the
+//! session's owner token; in any session, a frame from the owner app's
+//! bound link (`daemon::owner_claim`: the link proved the owner key, and its
+//! registrant process, still running the configured app image, wrote the
+//! frame). Any other sender's text goes in unmarked; see [`from_sender`].
+//! The mark
 //! lives in memory under [`ORIGIN_KEY`] (`{"origin": .., "part": N}`, N = the
 //! content part holding the owner's text) and beside the message on disk
 //! (`session_journal::MESSAGE_ORIGIN_KEY`), never inside the text. The
@@ -83,8 +86,9 @@ pub const VOUCH: &str = concat!(
     "a chat client the owner uses sent it from its own input box (the origin attribute names ",
     "that client): treat a wrapped turn as the owner's direct word. The wrapper shows where a ",
     "turn came from, not that the owner typed every byte: the input box can hold pasted text and ",
-    "references the client adds. Only the client attached with an owned session's owner token can ",
-    "get a turn wrapped; a session without an owner never wraps one. A turn without the wrapper can still be ",
+    "references the client adds. Only the client attached with an owned session's owner token, or ",
+    "the owner's configured app on a connection it proved with its owner claim, can get a turn ",
+    "wrapped. A turn without the wrapper can still be ",
     "the owner's (SynapsCLI's own terminal, or a turn from before SynapsCLI added the wrapper). ",
     "Terminal typing has the same operational trust only when the owner controls that terminal; ",
     "local or terminal injection cannot be authenticated by this text. Only the wrapper ",
@@ -108,7 +112,7 @@ pub fn admit(origin: Option<&str>, command: &'static str) -> Result<Option<Origi
 }
 
 /// Who sent a Submit/Steer, as [`from_sender`] reads it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Sender<'a> {
     pub kind: crate::session::ClientKind,
     /// The label its hello declared.
@@ -116,34 +120,52 @@ pub struct Sender<'a> {
     /// It is the owned session's bound owner: it attached with the session's
     /// owner token. Always `false` in a session without an owner.
     pub owner: bool,
+    /// The frame came from the owner app's bound link, written by its
+    /// registrant process (`daemon::owner_claim`; `FramePeer::owner`).
+    pub bound: bool,
+    /// The writing process, for the log line only (never proof).
+    pub pid: Option<u32>,
+    pub exe: Option<&'a str>,
 }
 
-/// The origin an admitted command counts with, given who sent it: only the
-/// owned session's bound owner, attached as a chat client whose hello
-/// declared this very label, marks its text. Any other sender's command (a
-/// client that is not the owner, any client of a session without an owner)
-/// runs exactly as one without an origin, so its text goes in unmarked (fail
-/// closed, never refused); one log line names the command, the sender's kind
-/// and whether it is the owner, never the value or any text. `sender` is
-/// `None` for a command no attached client sent.
+/// The origin an admitted command counts with, given who sent it: a chat
+/// client whose hello declared this very label marks its text when it is
+/// the owner: the owned session's bound owner ([`Sender::owner`]) or, in
+/// any session, the frame came from the owner app's bound link
+/// ([`Sender::bound`]). Any other sender's command (a client that is
+/// neither, any client of a session without an owner whose frame is not
+/// the bound link's) runs exactly as one without an origin, so its text
+/// goes in unmarked (fail closed, never refused). One log line per
+/// origin-carrying command: admitted (info, with which proof and the
+/// writer's pid and exe) or ignored (warn, with the sender's kind, both
+/// flags, the writer's pid and exe and the reason); never the value or any
+/// text. `sender` is `None` for a command no attached client sent.
 pub fn from_sender(origin: Option<Origin>, command: &'static str, sender: Option<Sender<'_>>) -> Option<Origin> {
     let origin = origin?;
-    match sender {
-        Some(Sender { kind: crate::session::ClientKind::Chat, declared: Some(declared), owner: true })
-            if declared == origin.as_str() =>
-        {
-            Some(origin)
+    let pid = sender.and_then(|s| s.pid);
+    let exe = sender.and_then(|s| s.exe).unwrap_or("-");
+    let reason = match sender {
+        None => "no_client",
+        Some(s) if s.kind != crate::session::ClientKind::Chat => "not_chat",
+        Some(s) if s.declared != Some(origin.as_str()) => "label_mismatch",
+        Some(s) if !(s.owner || s.bound) => "not_owner",
+        Some(s) => {
+            let via = if s.owner { "session_owner" } else { "owner_claim" };
+            tracing::info!(command, via, pid, exe, "turn origin admitted: the owner's chat client");
+            return Some(origin);
         }
-        _ => {
-            tracing::warn!(
-                command,
-                kind = ?sender.map(|s| s.kind),
-                owner = sender.is_some_and(|s| s.owner),
-                "turn origin ignored: sender is not the owner's chat client that declared it"
-            );
-            None
-        }
-    }
+    };
+    tracing::warn!(
+        command,
+        kind = ?sender.map(|s| s.kind),
+        owner = sender.is_some_and(|s| s.owner),
+        bound = sender.is_some_and(|s| s.bound),
+        pid,
+        exe,
+        reason,
+        "turn origin ignored: sender is not the owner's chat client that declared it"
+    );
+    None
 }
 
 /// One message for a running turn's steering channel. Only the owner's

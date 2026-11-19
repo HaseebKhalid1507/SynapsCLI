@@ -308,6 +308,21 @@ impl Connected {
         }
     }
 
+    /// `OwnerReset` (`synaps daemon owner reset`): the daemon's owner claim
+    /// goes vacant and nothing binds by itself. A daemon without the claim
+    /// (no `turn_origin_owner` in its Welcome) is an error, and the frame is
+    /// never sent to it.
+    pub async fn owner_reset(&mut self) -> Result<(), TransportError> {
+        if !self.welcome.supports(FEATURE_TURN_ORIGIN_OWNER) {
+            return Err(TransportError::Protocol("this daemon has no owner claim (no turn_origin_owner feature)".into()));
+        }
+        match self.request(ClientFrame::OwnerReset).await? {
+            DaemonFrame::OwnerClaim { owner_bound: false, reason: Some(OwnerClaimReason::Reset) } => Ok(()),
+            DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
+            other => Err(TransportError::Protocol(format!("expected owner_claim, got {other:?}"))),
+        }
+    }
+
     /// `AuthState` → the daemon broker's in-memory account state. A daemon
     /// that predates the frame is [`AuthStateReply::DaemonPredates`]; any
     /// other error is returned as itself.
@@ -881,6 +896,15 @@ impl SocketTransport {
         let p = c.purge().await;
         c.bye().await;
         p
+    }
+
+    /// `OwnerReset` on a fresh control connection (see
+    /// [`Connected::owner_reset`]).
+    pub async fn owner_reset(path: &Path) -> Result<(), TransportError> {
+        let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
+        let r = c.owner_reset().await;
+        c.bye().await;
+        r
     }
 
     /// `Close{id, force, attached}` on a fresh control connection (see

@@ -296,13 +296,25 @@ impl SessionHandle {
     /// the queue is full (never drop silently); `Closed` once the actor is
     /// gone.
     pub async fn send(&self, cmd: SessionCommand) -> Result<(), TransportError> {
-        self.send_addressed(Addressed { from: None, cmd })
+        self.send_addressed(Addressed { from: None, cmd, peer: None })
     }
 
     /// Send on behalf of an attached client (ownership is enforced by the
     /// actor, B1).
     pub async fn send_from(&self, from: ClientId, cmd: SessionCommand) -> Result<(), TransportError> {
-        self.send_addressed(Addressed { from: Some(from), cmd })
+        self.send_addressed(Addressed { from: Some(from), cmd, peer: None })
+    }
+
+    /// [`Self::send_from`] with what the daemon saw of the frame's writer
+    /// (whether a marked turn counts as the owner app's, see
+    /// `daemon::owner_claim`).
+    pub async fn send_from_peer(
+        &self,
+        from: ClientId,
+        cmd: SessionCommand,
+        peer: super::types::FramePeer,
+    ) -> Result<(), TransportError> {
+        self.send_addressed(Addressed { from: Some(from), cmd, peer: Some(peer) })
     }
 
     fn send_addressed(&self, cmd: Addressed) -> Result<(), TransportError> {
@@ -732,7 +744,12 @@ pub mod echo {
             clients: HashMap::new(),
             conv: ConversationSnapshot::default(),
         };
-        while let Some(Addressed { cmd, .. }) = ep.cmd_rx.recv().await {
+        while let Some(Addressed { cmd, peer, .. }) = ep.cmd_rx.recv().await {
+            // What the daemon told of an origin-carrying frame's writer, for
+            // the socket tests (tests/daemon_owner_claim.rs).
+            if let Some(peer) = peer {
+                echo.emit(SessionEventWire::SystemNotice(format!("echo: frame peer owner={}", peer.owner)));
+            }
             if !echo.handle(cmd) {
                 break;
             }

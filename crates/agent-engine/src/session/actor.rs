@@ -3261,15 +3261,16 @@ impl SessionActor {
     /// The turn origin a Submit/Steer counts with. `None`: the command is
     /// refused (the origin is not a valid label; refused to its sender, a
     /// notice when no attached client sent it). `Some(None)`: no origin, or
-    /// the sender is not this owned session's bound owner attached as a
-    /// chat client that declared this label at hello (any sender in a
-    /// session without an owner; `turn_origin::from_sender`): the text goes
-    /// in unmarked.
+    /// the sender is not a chat client that declared this label at hello
+    /// and is the owner: this owned session's bound owner, or (`peer`, any
+    /// session) the owner app's bound link as the daemon saw the frame
+    /// (`turn_origin::from_sender`): the text goes in unmarked.
     fn admitted_origin(
         &mut self,
         origin: Option<String>,
         command: &'static str,
         from: Option<ClientId>,
+        peer: Option<&FramePeer>,
     ) -> Option<Option<Origin>> {
         let origin = match turn_origin::admit(origin.as_deref(), command) {
             Ok(origin) => origin,
@@ -3291,6 +3292,9 @@ impl SessionActor {
                 kind: attached.meta.kind,
                 declared: attached.meta.turn_origin.as_deref(),
                 owner: self.is_session_owner(client),
+                bound: peer.is_some_and(|p| p.owner),
+                pid: peer.and_then(|p| p.pid),
+                exe: peer.and_then(|p| p.exe.as_deref()),
             })
         });
         Some(turn_origin::from_sender(origin, command, sender))
@@ -5359,7 +5363,7 @@ impl SessionActor {
     /// `Refused` with no side effect; `from: None` (host) bypasses.
     async fn handle(&mut self, addressed: Addressed) -> std::ops::ControlFlow<EndReason> {
         use std::ops::ControlFlow;
-        let Addressed { from, cmd } = addressed;
+        let Addressed { from, cmd, peer } = addressed;
         if let Some(c) = from {
             // `rename` is the daemon's control-connection rename; an
             // attached client has `/saveas` (owner only).
@@ -5505,13 +5509,13 @@ impl SessionActor {
         }
         match cmd {
             SessionCommand::Submit { text, attachments, origin } => {
-                let Some(origin) = self.admitted_origin(origin, "submit", from) else {
+                let Some(origin) = self.admitted_origin(origin, "submit", from, peer.as_ref()) else {
                     return ControlFlow::Continue(());
                 };
                 self.submit(text, attachments, origin, from).await
             }
             SessionCommand::Steer { text, origin } => {
-                let Some(origin) = self.admitted_origin(origin, "steer", from) else {
+                let Some(origin) = self.admitted_origin(origin, "steer", from, peer.as_ref()) else {
                     return ControlFlow::Continue(());
                 };
                 if self.streaming {
