@@ -121,6 +121,7 @@ fn test_context() -> ToolContext {
             session_id: None,
             hook_bus: None,
             continuation: None,
+            sandbox: Default::default(),
         },
         limits: synaps_cli::tools::ToolLimits {
             max_tool_output: 1000,

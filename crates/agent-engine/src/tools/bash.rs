@@ -382,7 +382,10 @@ impl Tool for BashTool {
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
-        run_bash(command, params["timeout"].as_u64(), ctx, prepare_askpass()).await
+        // A confined command can't use sudo (no_new_privs), so no prompt
+        // broker is prepared for it.
+        let askpass = if ctx.capabilities.sandbox.is_off() { prepare_askpass() } else { None };
+        run_bash(command, params["timeout"].as_u64(), ctx, askpass).await
     }
 }
 
@@ -412,6 +415,7 @@ pub(crate) async fn run_bash(
     ctx: ToolContext,
     askpass: Option<Askpass>,
 ) -> Result<String> {
+    let askpass = if ctx.capabilities.sandbox.is_off() { askpass } else { None };
     let script = bash_script_with_secure_sudo(command, askpass.is_some());
     run_shell_command(&script, ShellSpec::Bash, timeout, ctx, askpass).await
 }
@@ -523,6 +527,13 @@ pub(crate) async fn run_shell_command(
         };
         let max_output = ctx.limits.max_tool_buffer;
 
+        // The session's write confinement, decided before anything starts:
+        // a session that is confined only by name (no resolved policy) runs
+        // nothing.
+        let spawn_sandbox = ctx.capabilities.sandbox.for_spawn();
+        if let crate::sandbox::SpawnSandbox::Refuse(why) = &spawn_sandbox {
+            return Err(RuntimeError::Tool(why.clone()));
+        }
         let (program, args) = spec.invocation(script);
         let effective_env = ctx.capabilities.env.as_ref()
             .map(|env| env.spawn_vars().map(|(k, v)| (k.into(), v.into())).collect())
@@ -580,6 +591,14 @@ pub(crate) async fn run_shell_command(
                 libc::setsid();
                 Ok(())
             });
+        }
+
+        // Landlock goes on in the child last (after setsid), so it covers
+        // exactly the command and everything it starts, and a failure to
+        // apply it fails the spawn: the command never runs unconfined.
+        if let crate::sandbox::SpawnSandbox::Apply(plan) = &spawn_sandbox {
+            plan.install(cmd.as_std_mut())
+                .map_err(|e| RuntimeError::Tool(format!("sandbox: cannot confine this command: {e}")))?;
         }
 
         if ctx.capabilities.launch_cancel.as_ref().is_some_and(|c| c.is_cancelled()) {

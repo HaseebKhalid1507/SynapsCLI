@@ -125,7 +125,10 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
                     FEATURE_TURN_ORIGIN,
                     FEATURE_TURN_ORIGIN_OWNER,
                     FEATURE_CAPTURE_SCRUB,
-                ],
+                ]
+                .into_iter()
+                .chain(cfg!(target_os = "linux").then_some(FEATURE_SANDBOX_POLICY_V1))
+                .collect::<Vec<_>>(),
                 "every feature this daemon serves"
             );
         }

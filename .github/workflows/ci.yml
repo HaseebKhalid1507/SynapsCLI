@@ -51,6 +51,10 @@ jobs:
   # the write check runs over every binary even after a failure.
   test:
     runs-on: ubuntu-24.04
+    # The sandbox's real-kernel tests fail here instead of skipping when the
+    # runner's kernel has no usable Landlock.
+    env:
+      SYNAPS_REQUIRE_LANDLOCK: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0

@@ -184,7 +184,7 @@ impl PtyHandle {
         cols: u16,
     ) -> Result<Self> {
         let prepared = Self::prepare_scope(working_dir, None, &env);
-        Self::spawn_prepared(command, working_dir, rows, cols, prepared)
+        Self::spawn_prepared(command, working_dir, rows, cols, prepared, crate::sandbox::SpawnSandbox::None)
     }
 
     /// `base`: the session's env (`None` = this process's).
@@ -211,8 +211,12 @@ impl PtyHandle {
 
     pub(crate) fn spawn_prepared(
         command: &str, working_dir: Option<&str>, rows: u16, cols: u16,
-        prepared: PreparedScope,
+        prepared: PreparedScope, sandbox: crate::sandbox::SpawnSandbox,
     ) -> Result<Self> {
+        // Decided before a PTY is even opened.
+        if let crate::sandbox::SpawnSandbox::Refuse(why) = &sandbox {
+            return Err(RuntimeError::Tool(why.clone()));
+        }
         // 1. Open a PTY pair with the requested size.
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -255,15 +259,32 @@ impl PtyHandle {
 
         cmd.env_clear();
         for (k, v) in &effective_env { cmd.env(k, v); }
+        // A confined command's temporary files go to its session's own folder.
+        if let crate::sandbox::SpawnSandbox::Apply(plan) = &sandbox {
+            cmd.env("TMPDIR", plan.tmp_dir());
+        }
 
-        // 3. Spawn the child on the slave side.
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| RuntimeError::Tool(format!("Failed to spawn command: {e}")))?;
+        // 3. Spawn the child on the slave side. Under a write sandbox the
+        //    spawn runs on a dedicated thread that is under the Landlock
+        //    domain, so the child (and what it starts) inherits it while no
+        //    other thread is restricted. If the domain can't be applied,
+        //    nothing is spawned.
+        let slave = pair.slave;
+        let spawn = move || {
+            let child = slave.spawn_command(cmd);
+            (child, slave)
+        };
+        let (child, slave) = match &sandbox {
+            crate::sandbox::SpawnSandbox::Apply(plan) => plan
+                .run(spawn)
+                .map_err(|e| RuntimeError::Tool(format!("sandbox: cannot confine this command: {e}")))?,
+            crate::sandbox::SpawnSandbox::Refuse(why) => return Err(RuntimeError::Tool(why.clone())),
+            crate::sandbox::SpawnSandbox::None => spawn(),
+        };
+        let child = child.map_err(|e| RuntimeError::Tool(format!("Failed to spawn command: {e}")))?;
 
         // Drop the slave — the child process owns its end now.
-        drop(pair.slave);
+        drop(slave);
 
         // 4. Obtain writer and reader from the master.
         let writer = pair

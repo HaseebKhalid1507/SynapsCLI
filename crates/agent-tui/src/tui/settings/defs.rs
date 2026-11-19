@@ -43,6 +43,8 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("tool_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
     ("daemon_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
     ("daemon.owner_app_exe", "the owner app's path for the owner claim, set in the daemon's environment or in the config file"),
+    ("sandbox.confine", "owner-set write sandbox switch, set by hand in the config file; never written by the app or an agent"),
+    ("sandbox.policy_provider", "owner-set write sandbox policy plugin, set by hand in the config file; never written by the app or an agent"),
     ("provider.*", "owned by the Providers tab (API keys)"),
     ("keybind.*", "keybind family (keybind registry), not a single setting"),
 ];

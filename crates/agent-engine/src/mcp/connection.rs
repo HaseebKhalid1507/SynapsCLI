@@ -31,6 +31,7 @@ impl McpConnection {
     pub(super) async fn start(
         server: &str,
         config: &super::McpServerConfig,
+        sandbox: &crate::sandbox::SessionSandbox,
     ) -> std::result::Result<Self, String> {
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args);
@@ -77,6 +78,14 @@ impl McpConnection {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+
+        // A confined session's server starts inside the session's write
+        // confinement (applied in the child before exec, so it covers every
+        // process the server starts); if that can't be set up the server
+        // doesn't start.
+        sandbox
+            .confine_tokio(&mut cmd)
+            .map_err(|why| format!("MCP server not started: {why}"))?;
 
         let mut child = cmd.spawn().map_err(|e| {
             // Static process metadata only: command/env values may be
@@ -439,5 +448,39 @@ impl McpConnection {
                 Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sandbox_pins {
+    use super::*;
+    use crate::sandbox::testkit::{appears, Tree};
+    use crate::sandbox::SessionSandbox;
+
+    /// A confined session whose ruleset cannot be built starts no MCP
+    /// server (no Landlock needed: the refusal comes first). The undo is the
+    /// same server with confinement off, which starts and runs its script
+    /// (and then fails the handshake, being no server).
+    #[tokio::test]
+    async fn a_server_is_not_started_when_the_sessions_ruleset_cannot_be_built() {
+        let t = Tree::new();
+        let marker = t.root.join("mcp-ran");
+        let run = t.script("mcp.sh", &format!("touch '{}'\n", marker.display()));
+        let config = crate::mcp::McpServerConfig {
+            command: "sh".to_string(),
+            args: vec![run.display().to_string()],
+            env: Default::default(),
+            shared: false,
+        };
+
+        let session = t.session_that_cannot_spawn();
+        let Err(why) = McpConnection::start("example", &config, &session).await else {
+            panic!("the server started in a session that cannot spawn");
+        };
+        assert!(why.contains("sandbox"), "{why}");
+        assert!(!marker.exists(), "the server ran anyway");
+
+        let _ = McpConnection::start("example", &config, &SessionSandbox::Off).await;
+        assert!(appears(&marker).await, "control: the server ran when confinement is off");
     }
 }

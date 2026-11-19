@@ -117,6 +117,12 @@ pub const FEATURE_TURN_ORIGIN_OWNER: &str = "turn_origin_owner";
 /// [`capture_scrub::is_active`]: crate::extensions::hooks::capture_scrub::is_active
 pub const FEATURE_CAPTURE_SCRUB: &str = "capture_scrub_v1";
 
+/// `Welcome.features` entry: this daemon can confine a session's writes to
+/// a policy a provider plugin supplies (`sandbox.confine`,
+/// `synaps sandbox check`). Listed only where Landlock is compiled in
+/// (Linux): elsewhere confinement is not available and the entry is absent.
+pub const FEATURE_SANDBOX_POLICY_V1: &str = crate::sandbox::FEATURE_SANDBOX_POLICY_V1;
+
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
     features_with(crate::extensions::hooks::capture_scrub::is_active())
@@ -134,6 +140,8 @@ fn features_with(capture_scrub_active: bool) -> Vec<String> {
     if capture_scrub_active {
         features.push(FEATURE_CAPTURE_SCRUB.to_string());
     }
+    #[cfg(target_os = "linux")]
+    features.push(FEATURE_SANDBOX_POLICY_V1.to_string());
     features
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
@@ -2930,6 +2938,16 @@ mod tests {
         w.features = features;
         assert!(json(&w).supports("capture_scrub_v1"));
         assert!(!json(&w).supports("capture_scrub"), "the feature is matched exactly");
+    }
+
+    /// Seam pin: the sandbox feature is announced as exactly
+    /// `sandbox_policy_v1`, on Linux, and not elsewhere.
+    #[test]
+    fn the_sandbox_feature_is_announced_as_sandbox_policy_v1_on_linux() {
+        assert_eq!(FEATURE_SANDBOX_POLICY_V1, "sandbox_policy_v1");
+        let features = daemon_features();
+        assert_eq!(features.iter().any(|f| f == "sandbox_policy_v1"), cfg!(target_os = "linux"));
+        assert!(features.iter().any(|f| f == "owned_sessions"));
     }
 }
 

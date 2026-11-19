@@ -45,8 +45,7 @@ impl Tool for EchoTestTool {
 }
 
 fn installed_fixture_script() -> String {
-    std::env::current_dir()
-        .unwrap()
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/installed_extension.py")
         .to_string_lossy()
         .to_string()
@@ -149,8 +148,7 @@ static BASE_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(feature = "command-exec")]
 #[tokio::test(flavor = "current_thread")]
 async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/modify_extension.py")
         .to_string_lossy()
         .to_string();
@@ -241,6 +239,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     session_id: None,
                     hook_bus: None,
                     continuation: None,
+                    sandbox: Default::default(),
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -280,8 +279,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
 /// `replace` action, and resolution inside emit_after_tool_call.
 #[tokio::test]
 async fn after_tool_call_replace_substitutes_output_via_real_extension() {
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/replace_extension.py")
         .to_string_lossy()
         .to_string();
@@ -336,8 +334,7 @@ async fn after_tool_call_replace_substitutes_output_via_real_extension() {
 
 #[tokio::test]
 async fn malformed_modify_result_blocks_instead_of_failing_open() {
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/malformed_modify_extension.py")
         .to_string_lossy()
         .to_string();
@@ -359,8 +356,7 @@ async fn malformed_modify_result_blocks_instead_of_failing_open() {
 
 #[tokio::test]
 async fn extension_tools_are_registered_in_tool_registry() {
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/register_tool_extension.py")
         .to_string_lossy()
         .to_string();
@@ -420,6 +416,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     session_id: None,
                     hook_bus: None,
                     continuation: None,
+                    sandbox: Default::default(),
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -475,6 +472,7 @@ fn whoami_ctx(session_id: Option<&str>, cwd: Option<&std::path::Path>) -> ToolCo
             session_id: session_id.map(str::to_string),
             hook_bus: None,
             continuation: None,
+            sandbox: Default::default(),
         },
         limits: synaps_cli::tools::ToolLimits {
             max_tool_output: 30_000,
@@ -491,8 +489,7 @@ async fn load_whoami_plugin() -> (
     ExtensionManager,
     Arc<tokio::sync::RwLock<synaps_cli::ToolRegistry>>,
 ) {
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/whoami_tool_extension.py")
         .to_string_lossy()
         .to_string();
@@ -606,8 +603,7 @@ async fn extension_tool_call_carries_caller_cwd() {
 
 #[tokio::test]
 async fn extension_registering_tools_requires_tools_register_permission() {
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/register_tool_extension.py")
         .to_string_lossy()
         .to_string();
@@ -663,8 +659,7 @@ async fn extension_registering_tools_requires_tools_register_permission() {
 
 #[tokio::test]
 async fn extension_tool_specs_are_validated() {
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/register_tool_extension.py")
         .to_string_lossy()
         .to_string();
@@ -709,8 +704,7 @@ async fn extension_tool_specs_are_validated() {
 
 #[tokio::test]
 async fn extension_provider_metadata_is_registered_when_permission_is_declared() {
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/register_provider_extension.py")
         .to_string_lossy()
         .to_string();
@@ -742,8 +736,7 @@ async fn extension_provider_metadata_is_registered_when_permission_is_declared()
 
 #[tokio::test]
 async fn provider_capability_specs_are_validated() {
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/register_provider_extension.py")
         .to_string_lossy()
         .to_string();
@@ -810,8 +803,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
     .unwrap();
     std::env::set_var("CONFIG_TEST_TOKEN", "secret-token");
 
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/config_seen_extension.py")
         .to_string_lossy()
         .to_string();
@@ -944,8 +936,7 @@ async fn declared_secret_env_survives_extension_restart_without_persistence() {
     config::set_base_dir_for_tests(home.path().to_path_buf());
     std::env::set_var("PRIA_AGENT_TOOL_TOKEN", "regression-secret-token");
 
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/config_seen_extension.py")
         .to_string_lossy()
         .to_string();
@@ -1024,8 +1015,7 @@ async fn extension_provider_complete_routes_to_process() {
     )
     .unwrap();
 
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/provider_extension.py")
         .to_string_lossy()
         .to_string();
@@ -1117,8 +1107,7 @@ async fn provider_disabled_in_trust_state_blocks_route() {
     .unwrap();
 
     // Use a fixture that records every invocation, so we can prove it was NOT called.
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/provider_extension.py")
         .to_string_lossy()
         .to_string();
@@ -1222,8 +1211,7 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
 
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/provider_tool_extension.py")
         .to_string_lossy()
         .to_string();
@@ -1370,8 +1358,7 @@ async fn installed_extension_receives_on_compaction_as_observe_only() {
     fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
     fs::create_dir_all(plugin_dir.join("extensions")).unwrap();
     fs::copy(
-        std::env::current_dir()
-            .unwrap()
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/compaction_extension.py"),
         plugin_dir.join("extensions/compaction_extension.py"),
     )
@@ -1438,8 +1425,7 @@ async fn installed_extension_receives_on_compaction_as_observe_only() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn on_message_complete_is_observe_only() {
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/message_complete_block_extension.py");
     let handler = ProcessExtension::spawn(
         "message-complete-block",
@@ -1530,8 +1516,7 @@ async fn installed_extension_receives_on_message_complete() {
     fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
     fs::create_dir_all(plugin_dir.join("extensions")).unwrap();
     fs::copy(
-        std::env::current_dir()
-            .unwrap()
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/message_complete_extension.py"),
         plugin_dir.join("extensions/message_complete_extension.py"),
     )
@@ -1698,6 +1683,52 @@ async fn project_local_plugins_override_user_plugins_with_same_name() {
     std::env::set_current_dir(previous_cwd).unwrap();
 }
 
+/// Under `sandbox.confine = enforce` a plugin planted in the project's
+/// `.synaps/plugins` (where a sandboxed command can write) is not loaded.
+#[tokio::test(flavor = "current_thread")]
+async fn a_planted_project_plugin_is_not_loaded_under_enforce() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    fs::write(home.path().join("config"), "sandbox.confine = enforce\n").unwrap();
+    let fixture = installed_fixture_script();
+    let plugin_dir = project.path().join(".synaps/plugins/planted-test");
+    fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
+    fs::create_dir_all(plugin_dir.join("extensions")).unwrap();
+    fs::copy(&fixture, plugin_dir.join("extensions/installed_extension.py")).unwrap();
+    fs::write(
+        plugin_dir.join(".synaps-plugin/plugin.json"),
+        r#"{
+  "name": "planted-test",
+  "version": "0.1.0",
+  "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["extensions/installed_extension.py"],
+    "permissions": ["tools.intercept"],
+    "hooks": [{"hook": "before_tool_call", "tool": "bash"}]
+  }
+}
+"#,
+    )
+    .unwrap();
+    let previous_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let (loaded, failed) = manager.discover_and_load().await;
+    std::env::set_current_dir(previous_cwd).unwrap();
+
+    assert!(failed.is_empty(), "{failed:?}");
+    assert!(loaded.is_empty(), "the planted plugin loaded: {loaded:?}");
+    let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo local"}));
+    assert!(!matches!(hook_bus.emit(&event).await, HookResult::Block { .. }));
+    assert!(!plugin_dir.join("hook-seen.json").exists(), "the planted plugin never ran");
+    manager.shutdown_all().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn audit_log_records_disabled_route() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1709,8 +1740,7 @@ async fn audit_log_records_disabled_route() {
     )
     .unwrap();
 
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/provider_extension.py")
         .to_string_lossy()
         .to_string();
@@ -1838,8 +1868,7 @@ async fn on_session_start_injection_reaches_the_session() {
     fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
     fs::create_dir_all(plugin_dir.join("extensions")).unwrap();
     fs::copy(
-        std::env::current_dir()
-            .unwrap()
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/session_start_inject_extension.py"),
         plugin_dir.join("extensions/session_start_inject_extension.py"),
     )
@@ -1924,8 +1953,7 @@ fn install_session_id_echo_plugin(home: &std::path::Path, name: &str) -> std::pa
     fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
     fs::create_dir_all(plugin_dir.join("extensions")).unwrap();
     fs::copy(
-        std::env::current_dir()
-            .unwrap()
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/session_id_echo_extension.py"),
         plugin_dir.join("extensions/session_id_echo_extension.py"),
     )
@@ -2255,8 +2283,7 @@ async fn plugin_load_in_one_session_keeps_other_sessions_activations() {
     };
 
     // Session A loads a tool-registering plugin mid-round: catalog bumps.
-    let fixture = std::env::current_dir()
-        .unwrap()
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/register_tool_extension.py")
         .to_string_lossy()
         .to_string();

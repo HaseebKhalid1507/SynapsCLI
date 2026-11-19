@@ -1,6 +1,7 @@
 //! Daemon listener: bind (a UDS with 0600 on Unix, an owner-only named pipe
 //! on Windows — see [`crate::ipc`]), accept until shutdown, one task per
-//! connection. Every connection must come from the daemon's own user.
+//! connection. Every connection must come from the daemon's own user, and
+//! one from inside a Synaps sandbox is refused ([`super::peer`]).
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -72,11 +73,23 @@ pub async fn accept_loop(state: Arc<DaemonState>, mut listener: Listener, shutdo
                     tracing::warn!("daemon: refused connection: {why}");
                     continue; // dropped unread: the peer sees EOF, no frame
                 }
+                // While the sandbox is on under this base dir (this daemon's
+                // config or any profile's says enforce, read now), a client
+                // inside a Synaps sandbox is answered `Refused` after its
+                // Hello; nothing else of it is served. Otherwise the uid
+                // check above is the whole admission.
+                #[cfg(unix)]
+                let sandboxed = {
+                    use std::os::fd::AsRawFd;
+                    super::peer::refusal(stream.as_raw_fd(), &crate::config::base_dir(), state.profile.as_deref())
+                };
+                #[cfg(not(unix))]
+                let sandboxed = None;
                 let state = Arc::clone(&state);
                 let shutdown = shutdown.clone();
                 state.connections.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    super::conn::serve(Arc::clone(&state), stream, shutdown).await;
+                    super::conn::serve(Arc::clone(&state), stream, shutdown, sandboxed).await;
                     state.connections.fetch_sub(1, Ordering::SeqCst);
                 });
             }

@@ -55,6 +55,7 @@ filters stay exact.
 | `on_session_end` | `session.lifecycle` | no | `continue` | Observe session shutdown and transcript |
 | `on_context_archived` | `privacy.llm_content` | no | `continue` | [Notify-only](#notify-only-hooks): a context window was sealed into an archive file |
 | `on_memory_forgotten` | `session.lifecycle` | no | `continue` | [Notify-only](#notify-only-hooks): `memory_forget` forgot an archive or a note |
+| `sandbox_policy` | `sandbox.policy` | no | none: the [answer](#sandbox_policy) is the result | Request/answer, asked once when a session starts under write confinement: which extra directories the session may write |
 
 Unsupported result actions are ignored fail-open and logged as warnings.
 
@@ -572,6 +573,83 @@ archive file an `on_context_archived` notice points to is not screened: the
 notice carries its path, and an extension that opens it reads the archived
 conversation as written. Screening a large payload can take up to about a
 second, during which the delivering task waits.
+
+## `sandbox_policy`
+
+`sandbox_policy` is not an observation: it is a question the host asks one
+plugin, once, when a session starts under write confinement (the owner set
+`sandbox.confine = enforce` in the config file, see
+[../sandbox.md](../sandbox.md)). It needs the `sandbox.policy` permission.
+The host asks only the plugin the owner named in `sandbox.policy_provider`,
+and only if that plugin declares this hook **and** holds the permission;
+any other plugin that names the hook is never asked. If the named plugin is
+not loaded, lacks either key, fails, times out (5 s) or answers anything
+else than the shape below, the session is **refused**: it never starts
+unconfined. The refusal reads `sandbox policy provider '<id>' <cause>`, the
+cause being `missing`, `timeout`, `error`, `bad-answer` or
+`refused: <reason>`.
+
+The request is the ordinary `hook.handle` envelope (the same fields as any
+other hook) with `kind` set to `sandbox_policy` and three fields beside it:
+
+```json
+{
+  "kind": "sandbox_policy",
+  "tool_name": null,
+  "tool_runtime_name": null,
+  "tool_input": null,
+  "tool_output": null,
+  "message": null,
+  "session_id": "20260501-120000-abcd",
+  "cwd": "/home/u/project",
+  "transcript": null,
+  "data": null,
+  "workspace": "/home/u/project",
+  "base_dir": "/home/u/.synaps-cli",
+  "parent_session_id": null
+}
+```
+
+`workspace` is the session's working folder, absolute and canonical.
+`base_dir` is the engine's base directory (config, plugins, sessions) as the
+engine itself resolves it, absolute and canonical; it is always sent, so a
+provider never has to work it out from its own environment.
+`parent_session_id` is the engine's own record of the session this one came
+from (a compaction or fork successor), `null` for a top-level session. It
+comes from the engine's session record only: nothing an agent, a worker, a
+tool argument or the configuration says can set it.
+
+The **result is the answer** (not a `HookResult`):
+
+```json
+{ "write": ["/home/u/scratch"], "read": [] }
+```
+
+or a refusal:
+
+```json
+{ "refuse": "no policy for this project" }
+```
+
+- `write` lists extra directories the session may write, each absolute and
+  already canonical (no `..`, no symlink on the way, no NUL, control, bidi
+  or zero-width character). The answer can only add: the workspace and a
+  small baseline (`/tmp`, `/dev/null`, ...) are always writable, and the
+  host's own protected set (the engine's base directory, credential stores,
+  autostart folders, shell start-up files, the folders on `$PATH`, `$HOME`)
+  never is. The host **drops** every entry that is equal to, under or above
+  a protected path, or that is a symlink, and reports each drop with its
+  reason (`synaps sandbox check` lists them). An entry that is swapped for a
+  link between validation and use is dropped too.
+- `read` is accepted and shown by `synaps sandbox check`; v1 does not
+  enforce it (`read: not enforced (v1)`).
+- `refuse` makes the session refuse with the cause `refused: <reason>`; the
+  reason is stripped of control and bidi characters and cut at 200
+  characters. A JSON-RPC error answer is the cause `error`, a timeout
+  `timeout`, and a garbage answer `bad-answer`.
+
+The host announces that it can ask this question as the `Welcome` feature
+`sandbox_policy_v1` (Linux builds).
 
 ## `cwd`: the chat's working folder
 

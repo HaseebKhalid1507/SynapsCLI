@@ -13,6 +13,7 @@ pub mod host;
 pub mod mcp;
 pub mod memory_backend;
 pub mod runtime;
+pub mod sandbox;
 pub mod session;
 pub mod skills;
 #[cfg(test)]

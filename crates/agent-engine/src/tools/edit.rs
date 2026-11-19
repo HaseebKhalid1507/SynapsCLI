@@ -86,9 +86,22 @@ impl Tool for EditTool {
 
         let path = resolve_path_in(raw_path, ctx.capabilities.cwd.as_deref());
 
-        let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
-            RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e))
-        })?;
+        // A confined session reads and rewrites the file through a directory
+        // the policy checked and opened (not through the path string).
+        let guarded = ctx
+            .capabilities
+            .sandbox
+            .guard_write(&path, false)
+            .map_err(|e| RuntimeError::Tool(e.to_string()))?;
+
+        let content = match &guarded {
+            Some(target) => target.read_to_string().map_err(|e| {
+                RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e))
+            })?,
+            None => tokio::fs::read_to_string(&path).await.map_err(|e| {
+                RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e))
+            })?,
+        };
 
         let count = content.matches(old_string).count();
 
@@ -107,6 +120,19 @@ impl Tool for EditTool {
         }
 
         let new_content = content.replacen(old_string, new_string, 1);
+
+        if let Some(target) = &guarded {
+            let tmp = super::util::guarded_tmp_name(target.real_path());
+            target
+                .replace(&tmp, new_content.as_bytes(), target.mode())
+                .map_err(|e| RuntimeError::Tool(format!("Failed to finalize edit: {}", e)))?;
+            return Ok(format!(
+                "Edited {} — replaced {} line(s) with {} line(s)",
+                path.display(),
+                old_string.lines().count(),
+                new_string.lines().count()
+            ));
+        }
 
         // Preserve original file permissions (executable bits, etc.)
         let original_perms = tokio::fs::metadata(&path)

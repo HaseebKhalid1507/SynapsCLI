@@ -529,8 +529,16 @@ async fn discover_one(
     fingerprint: String,
     opts: McpDiscoveryOpts,
 ) -> bool {
+    // Discovery lists a server's tools for the descriptor cache and calls
+    // none: it belongs to no session, so it has no session's confinement to
+    // take. With confinement on it gets the baseline only (or no server at
+    // all when the kernel can't confine it); the servers that run a
+    // session's tool calls are started by the lease manager, under that
+    // session's confinement.
+    let sandbox = crate::sandbox::provider::discovery_sandbox(&agent_core::config::read_sandbox_settings());
     let listing = tokio::time::timeout(opts.timeout, async {
-        let mut conn = connection::McpConnection::start(&name, &server).await?;
+        let sandbox = sandbox.map_err(|why| format!("sandbox: discovery is not confined, so it did not run ({why})"))?;
+        let mut conn = connection::McpConnection::start(&name, &server, &sandbox).await?;
         let result = conn.list_tools().await;
         conn.start_kill();
         result

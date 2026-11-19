@@ -106,6 +106,27 @@ All notable changes to this project will be documented in this file.
 - **`synaps daemon status`** (and the daemon's `Pong`, additively, no protocol
   bump) says `required guards configured: no|yes (n)` and shows one row per
   guard, loaded or not loaded with the cause.
+- **Write confinement for sessions (Linux, opt-in).** With
+  `sandbox.confine = enforce` (set by hand in the config file; an agent, an
+  extension or the app cannot write it) every shell command a session runs,
+  whichever way it is started, runs under a Landlock domain applied in the
+  child before `exec`, and `write`, `edit` and `multi_edit` check the same
+  policy on the opened folder, not on the path string. A session may write
+  its workspace, a small baseline (`/tmp`, `/dev/shm/<x>/<y>`, `/dev/null`,
+  `/dev/zero`, `/dev/tty`, `/dev/ptmx`, `/dev/pts`, limited `/proc`) and the
+  folders a policy plugin adds. The engine's whole base directory (profiles,
+  plugins, `sandbox/`, the socket folder), credential stores, autostart
+  folders, shell start-up files, `$PATH` folders, `.synaps`, and a
+  repository's `.git/hooks` and `.git/config` are never writable, whatever
+  the plugin says. A session that cannot be confined (kernel without
+  Landlock ABI 3, no valid policy, plugin missing, slow or wrong) is
+  refused, never started unconfined. v1 confines writes only: reads, the
+  network and macOS are not confined. `synaps sandbox check [--json]` shows
+  what a session would get. See [docs/sandbox.md](docs/sandbox.md).
+- **Extensions: `sandbox_policy` hook and `sandbox.policy` permission.** A
+  request/answer hook, asked once per confined session of the plugin named
+  in `sandbox.policy_provider`. The daemon announces it as the `Welcome`
+  feature `sandbox_policy_v1`. Additive within extension protocol 1.
 
 ### Changed
 

@@ -48,6 +48,10 @@ pub enum Permission {
     AudioInput,
     /// Can produce audio through output devices.
     AudioOutput,
+    /// Can answer the `sandbox_policy` hook: the extra directories a
+    /// confined session may write. The answer can only add directories
+    /// outside the host's protected set; it can never lift a protection.
+    SandboxPolicy,
 }
 
 impl Permission {
@@ -78,6 +82,7 @@ impl Permission {
         Self::ConfigSubscribe,
         Self::AudioInput,
         Self::AudioOutput,
+        Self::SandboxPolicy,
     ];
 
     /// Wire-format string for this permission.
@@ -98,6 +103,7 @@ impl Permission {
             Self::ConfigSubscribe => "config.subscribe",
             Self::AudioInput => "audio.input",
             Self::AudioOutput => "audio.output",
+            Self::SandboxPolicy => "sandbox.policy",
         }
     }
 
@@ -119,6 +125,7 @@ impl Permission {
             "config.subscribe" => Some(Self::ConfigSubscribe),
             "audio.input" => Some(Self::AudioInput),
             "audio.output" => Some(Self::AudioOutput),
+            "sandbox.policy" => Some(Self::SandboxPolicy),
             _ => None,
         }
     }
@@ -344,6 +351,7 @@ mod tests {
             Permission::MemoryWrite,
             Permission::AudioInput,
             Permission::AudioOutput,
+            Permission::SandboxPolicy,
         ] {
             assert_eq!(Permission::parse(perm.as_str()), Some(perm));
         }
@@ -375,12 +383,13 @@ mod tests {
                 | Permission::ConfigWrite
                 | Permission::ConfigSubscribe
                 | Permission::AudioInput
-                | Permission::AudioOutput => {}
+                | Permission::AudioOutput
+                | Permission::SandboxPolicy => {}
             }
         }
         assert_eq!(
             Permission::ALL.len(),
-            15,
+            16,
             "a Permission variant was added or removed -- update Permission::ALL \
              and docs/extensions/contract.json to match"
         );

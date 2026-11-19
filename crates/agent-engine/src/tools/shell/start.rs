@@ -105,6 +105,7 @@ impl Tool for ShellStartTool {
             cols,
             readiness_timeout_ms,
             idle_timeout,
+            sandbox: ctx.capabilities.sandbox.clone(),
         };
 
         let (session_id, output, status) = mgr

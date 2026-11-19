@@ -406,6 +406,68 @@ impl EngineHost {
         Ok(runtime)
     }
 
+    /// Resolve and install a foreground session's write confinement
+    /// ([`crate::sandbox`]). With `sandbox.confine = off` the runtime is
+    /// left unconfined. With `enforce` the call waits (at most `ext_wait`)
+    /// for extension discovery, asks the configured policy provider and
+    /// installs the resolved policy; if the kernel or the provider cannot
+    /// supply one it returns an error and the session must not start. A
+    /// runtime that never went through this stays refusing every command and
+    /// write while confinement is on.
+    pub async fn confine_session(
+        &self,
+        runtime: &mut Runtime,
+        session_id: &str,
+        parent_session_id: Option<&str>,
+        cwd: Option<&std::path::Path>,
+        ext_wait: std::time::Duration,
+    ) -> Result<()> {
+        let settings = agent_core::config::read_sandbox_settings();
+        if settings.confine == agent_core::config::SandboxConfine::Enforce
+            && tokio::time::timeout(ext_wait, self.extensions_ready()).await.is_err()
+        {
+            tracing::warn!(
+                budget_secs = ext_wait.as_secs(),
+                "extensions_ready timed out — the sandbox policy provider may not be loaded"
+            );
+        }
+        let hook_bus = Arc::clone(runtime.hook_bus());
+        // The session's commands run with its client's environment: what that
+        // names is protected along with what the engine's own names.
+        let session_env = runtime.env().cloned();
+        match crate::sandbox::provider::establish_with_env(
+            &hook_bus,
+            &settings,
+            session_id,
+            parent_session_id,
+            cwd,
+            session_env.as_deref(),
+        )
+        .await
+        {
+            Ok(sandbox) => {
+                runtime.set_sandbox(sandbox);
+                Ok(())
+            }
+            Err(refused) => Err(crate::RuntimeError::Session(refused.to_string())),
+        }
+    }
+
+    /// Resolve a worker's write confinement: the policy provider is asked
+    /// about the worker (through the host's own hook bus: a worker's view
+    /// of it carries no `sandbox_policy` handler), and the answer is held to
+    /// the write roots of the session that spawned it ([`crate::sandbox`]).
+    /// An error means the worker must not start.
+    pub async fn confine_worker(
+        &self,
+        parent: &crate::sandbox::Confinement,
+        worker_id: &str,
+        parent_session_id: Option<&str>,
+        cwd: Option<&std::path::Path>,
+    ) -> std::result::Result<crate::sandbox::SessionSandbox, crate::sandbox::provider::SandboxRefused> {
+        crate::sandbox::provider::establish_worker(&self.parts.hook_bus, parent, worker_id, parent_session_id, cwd).await
+    }
+
     /// A worker (subagent) runtime. Shares credential source and token cache
     /// (so NO broker re-install and NO cache eviction) and takes a CLONE of
     /// the cached worker registry template. Does NOT share: the HTTP client

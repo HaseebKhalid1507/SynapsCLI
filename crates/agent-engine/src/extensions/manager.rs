@@ -118,17 +118,35 @@ fn no_extension_cause(plugin_dir: &std::path::Path) -> NotLoaded {
     })
 }
 
+/// Whether a project's own plugins are skipped: `SYNAPS_DISABLE_PROJECT_PLUGINS`
+/// says so, or `sandbox.confine = enforce` (a sandboxed command can write in
+/// the workspace, and a plugin it plants there must never load).
+fn project_plugins_skipped() -> bool {
+    project_plugins_disabled()
+        || crate::config::read_sandbox_settings().confine == crate::config::SandboxConfine::Enforce
+}
+
+/// The project plugin folder discovery would read in `cwd`, when it is not
+/// the user's own `plugins/`.
+fn project_plugins_dir(cwd: &std::path::Path) -> Option<PathBuf> {
+    let dir = cwd.join(".synaps").join("plugins");
+    (dir != crate::config::base_dir().join("plugins")).then_some(dir)
+}
+
 /// The directories discovery walks, in override order: the user's
-/// `plugins/`, then the project's `.synaps/plugins/` (unless disabled). A
-/// plugin directory in a later root replaces one of the same name earlier.
+/// `plugins/`, then the project's `.synaps/plugins/` (unless skipped, see
+/// [`project_plugins_skipped`]). A plugin directory in a later root replaces
+/// one of the same name earlier.
 fn plugin_roots() -> Vec<PathBuf> {
+    plugin_roots_in(project_dir().as_deref())
+}
+
+/// [`plugin_roots`] for a given working directory.
+fn plugin_roots_in(cwd: Option<&std::path::Path>) -> Vec<PathBuf> {
     let mut roots = vec![crate::config::base_dir().join("plugins")];
-    if !project_plugins_disabled() {
-        if let Some(cwd) = project_dir() {
-            let project_plugins = cwd.join(".synaps").join("plugins");
-            if project_plugins != roots[0] {
-                roots.push(project_plugins);
-            }
+    if !project_plugins_skipped() {
+        if let Some(project_plugins) = cwd.and_then(project_plugins_dir) {
+            roots.push(project_plugins);
         }
     }
     roots
@@ -2274,6 +2292,25 @@ impl ExtensionManager {
             .register_with_handler(plugin_id, spec, Some(handler))
     }
 
+    /// Load just the extension named `name` (the way discovery would load
+    /// it: same directory choice, same `disabled_plugins` rule), and nothing
+    /// else. Used by `synaps sandbox check`, which needs the policy provider
+    /// and no other plugin. `Err` says why it could not be loaded.
+    pub async fn load_named(&mut self, name: &str) -> Result<(), String> {
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+            return Err(format!("'{name}' is not a plugin name"));
+        }
+        if crate::config::load_config().disabled_plugins.iter().any(|d| d == name) {
+            return Err(format!("plugin '{name}' is disabled"));
+        }
+        let dir = locate_plugin_dir(name).ok_or_else(|| format!("no plugin named '{name}' is installed"))?;
+        match read_extension_manifest(name, &dir) {
+            Ok(Some((manifest, _path, _json))) => self.load_with_cwd(name, &manifest, Some(dir)).await,
+            Ok(None) => Err(format!("plugin '{name}' has no extension")),
+            Err(failure) => Err(failure.concise_message()),
+        }
+    }
+
     /// Discover and load all extensions from the user and project plugin directories.
     ///
     /// Scans `~/.synaps-cli/plugins/*/.synaps-plugin/plugin.json` and
@@ -2322,6 +2359,17 @@ impl ExtensionManager {
     {
         let mut plugin_dirs: HashMap<String, PathBuf> = HashMap::new();
         let mut failed: Vec<ExtensionLoadFailure> = Vec::new();
+
+        if !project_plugins_disabled() {
+            if let Some(skipped) = std::env::current_dir().ok().and_then(|cwd| project_plugins_dir(&cwd)) {
+                if skipped.exists() && project_plugins_skipped() {
+                    tracing::warn!(
+                        path = %skipped.display(),
+                        "sandbox: enforce is on, so this project's own plugins were not loaded"
+                    );
+                }
+            }
+        }
 
         for plugins_dir in plugin_roots() {
             if !plugins_dir.exists() {
@@ -2837,6 +2885,28 @@ mod tests {
         assert!(err.contains("Failed to spawn extension"), "{err}");
         assert_eq!(mgr.count(), 0);
         assert_eq!(bus.handler_count().await, 0);
+    }
+
+    /// Under `sandbox.confine = enforce` a plugin planted in a project's
+    /// `.synaps/plugins` is not among the folders discovery reads (the same
+    /// skip `SYNAPS_DISABLE_PROJECT_PLUGINS` asks for); with confinement off
+    /// it is.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn a_projects_own_plugins_are_not_discovered_under_enforce() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let _env = crate::test_env::EnvVarGuard::remove("SYNAPS_DISABLE_PROJECT_PLUGINS");
+        let ws = tempfile::tempdir().unwrap();
+        write_installed_plugin(&ws.path().join(".synaps/plugins"), "planted");
+        let user = base.path().join("plugins");
+
+        std::fs::write(base.path().join("config"), "sandbox.confine = enforce\n").unwrap();
+        assert!(project_plugins_skipped());
+        assert_eq!(plugin_roots_in(Some(ws.path())), vec![user.clone()], "enforce skips the project's plugins");
+
+        std::fs::write(base.path().join("config"), "sandbox.confine = off\n").unwrap();
+        assert!(!project_plugins_skipped());
+        assert_eq!(plugin_roots_in(Some(ws.path())), vec![user, ws.path().join(".synaps/plugins")]);
     }
 
     #[test]

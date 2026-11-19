@@ -821,6 +821,23 @@ impl SessionActor {
             runtime.set_message_clock(clock.clone());
         }
 
+        // Confinement: this session's write policy is resolved (the policy
+        // provider asked) before anything can run. While confinement is on, a
+        // session that cannot be confined never starts.
+        if let Err(e) = host
+            .confine_session(
+                &mut runtime,
+                &sb.session.id,
+                sb.session.parent_session.as_deref(),
+                cfg.cwd.as_deref(),
+                extensions_ready_timeout(&config),
+            )
+            .await
+        {
+            release_fresh_lock(session_lock, sb.continued);
+            return Err(e);
+        }
+
         // Shared-inbox files are for whoever is at a keyboard: the gate stays
         // shut until a client owns input (`publish_presence`), so a detached,
         // parked or freshly rehydrated session is never woken by them.
@@ -2780,6 +2797,16 @@ impl SessionActor {
             runtime.set_cwd(cfg.cwd.clone());
             runtime.set_env(cfg.env.clone());
             runtime.set_env_stripped(cfg.env_stripped.clone());
+            // A parked chat is confined again as it wakes (the policy is
+            // asked afresh: the provider's answer may have changed).
+            host.confine_session(
+                &mut runtime,
+                &sb.session.id,
+                sb.session.parent_session.as_deref(),
+                cfg.cwd.as_deref(),
+                extensions_ready_timeout(&config),
+            )
+            .await?;
             // The CURRENT model/thinking (the last published view), not
             // `cfg.model_override` frozen at create: `/model` survives park.
             runtime.set_model(view.model.clone());

@@ -122,6 +122,9 @@ pub fn is_capture_class(kind: HookKind) -> bool {
         | HookKind::OnSessionEnd
         | HookKind::OnContextArchived
         | HookKind::OnMemoryForgotten => true,
+        // Never delivered by the bus: the core asks the policy provider
+        // directly (`hook_value`). Screened if it ever were.
+        HookKind::SandboxPolicy => true,
         HookKind::BeforeToolCall | HookKind::OnSessionStart => false,
     }
 }

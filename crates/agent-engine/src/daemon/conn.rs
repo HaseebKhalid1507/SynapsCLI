@@ -268,7 +268,15 @@ fn spawn_writer_with(
     (tx, task)
 }
 
-pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: CancellationToken) {
+/// Serve one connection. `sandboxed` is why its client must be refused (it
+/// runs inside a Synaps sandbox, [`super::peer`]): it is answered
+/// `Refused` after its Hello, and nothing it sends is served.
+pub async fn serve(
+    state: Arc<DaemonState>,
+    stream: ServerStream,
+    shutdown: CancellationToken,
+    sandboxed: Option<String>,
+) {
     // Before the first read, so every frame after the hello names its
     // writer.
     super::frame_creds::pass_creds(&stream);
@@ -299,6 +307,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             return;
         }
     };
+    if let Some(message) = sandboxed {
+        tracing::warn!(kind = ?hello.client.kind, "daemon: refused a client from inside a sandbox: {message}");
+        let _ = tx.send(DaemonFrame::Refused { reason: RefuseReason::Protocol, message }).await;
+        let _ = writer.await;
+        return;
+    }
     if hello.protocol_version < PROTOCOL_MIN || hello.protocol_version > PROTOCOL_MAX {
         tracing::warn!(client = hello.protocol_version, daemon = PROTOCOL_VERSION, "daemon: refusing protocol version");
         let _ = tx

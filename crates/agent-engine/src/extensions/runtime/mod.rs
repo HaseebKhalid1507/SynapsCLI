@@ -170,6 +170,16 @@ pub trait ExtensionHandler: Send + Sync {
         Ok(self.handle_fail_closed(event, no_spawn).await)
     }
 
+    /// One `hook.handle` call whose answer is the raw JSON result, not a
+    /// [`HookResult`] decision: how the host asks the `sandbox_policy`
+    /// question (`params` is the hook envelope, built by the caller). No
+    /// timeout here; the caller bounds the wait. A transport or JSON-RPC
+    /// failure is `Err`. Default: this runtime cannot be asked.
+    async fn hook_value(&self, params: Value) -> Result<Value, String> {
+        let _ = params;
+        Err("extension runtime does not support hook.handle".to_string())
+    }
+
     /// Call an extension-provided tool on behalf of a conversation. The
     /// only way to call a tool: every caller says who the call is for.
     ///

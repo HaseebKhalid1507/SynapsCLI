@@ -45,6 +45,14 @@ pub(crate) fn unique_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// A fresh sibling temp-file *name* for a write that replaces `real`
+/// through a checked directory (`sandbox::GuardedTarget::replace`).
+pub(crate) fn guarded_tmp_name(real: &Path) -> String {
+    unique_tmp_path(real)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
 
 /// Strip ANSI escape sequences from a string.
 /// Handles CSI sequences (\x1b[...X), OSC sequences (\x1b]...\x07), and simple \x1b(X) escapes.
