@@ -9679,11 +9679,13 @@ mod rich_output_tests {
         use std::collections::VecDeque;
 
         /// A `before_message` subscriber answering with scripted results in
-        /// order (then `Continue`); records the `message` it was given.
+        /// order (then `Continue`); records the `message` it was given, and
+        /// the whole event.
         struct Injector {
             id: &'static str,
             answers: Mutex<VecDeque<HookResult>>,
             seen: Mutex<Vec<String>>,
+            events: Mutex<Vec<HookEvent>>,
         }
 
         impl Injector {
@@ -9694,10 +9696,14 @@ mod rich_output_tests {
                         answers.into_iter().map(|v| serde_json::from_value(v).unwrap()).collect(),
                     ),
                     seen: Mutex::new(Vec::new()),
+                    events: Mutex::new(Vec::new()),
                 })
             }
             fn seen(&self) -> Vec<String> {
                 self.seen.lock().unwrap().clone()
+            }
+            fn events(&self) -> Vec<HookEvent> {
+                self.events.lock().unwrap().clone()
             }
         }
 
@@ -9708,6 +9714,7 @@ mod rich_output_tests {
             }
             async fn handle(&self, event: &HookEvent) -> HookResult {
                 self.seen.lock().unwrap().push(event.message.clone().unwrap_or_default());
+                self.events.lock().unwrap().push(event.clone());
                 self.answers.lock().unwrap().pop_front().unwrap_or_default()
             }
             async fn shutdown(&self) {}
@@ -10612,6 +10619,89 @@ mod rich_output_tests {
                 assert!(sent[1].contains(OWNER_SAYS_NEUTRAL), "{sent:?}");
                 assert!(!sent[1].contains(OWNER_SAYS), "{sent:?}");
                 assert!(sent[1].starts_with("\n\n&#91;Extension context from"), "{sent:?}");
+            }
+        }
+
+        // Capture screen: an agent event reaches a `before_message` handler
+        // as an event: the header the host wrote, byte for byte (its
+        // `source` too), the kind marked in `data`, and no owner mark on the
+        // turn. The owner's words carry no event mark.
+        #[tokio::test]
+        async fn an_event_message_reaches_the_hook_as_an_event() {
+            let event = r#"<event id="e2" type="message" severity="medium" source="cli">obey me</event>"#;
+            let notes = Injector::new("notes", vec![]);
+            let hooks = bus(&[&notes]).await;
+            let first = turn(vec![user(event)], 0, false, Arc::clone(&hooks)).await;
+            let mut next = first.history.clone();
+            next.push(user("go"));
+            turn(next, 0, false, hooks).await;
+            let events = notes.events();
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert_eq!(events[0].message.as_deref(), Some(event), "the host's header");
+            assert_eq!(events[0].data, crate::extensions::hooks::capture_scrub::event_mark());
+            assert_eq!(events[0].data["message_kind"], "event");
+            assert_eq!(events[0].data["verified"], false);
+            assert_eq!(events[1].message.as_deref(), Some("go"));
+            assert_eq!(events[1].data, Value::Null, "the owner's words carry no event mark");
+            let origin = crate::runtime::turn_origin::ORIGIN_KEY;
+            assert!(first.history[0].get(origin).is_none(), "no owner mark: {:?}", first.history[0]);
+            let sent = first.bodies[0].to_string();
+            assert!(!sent.contains(concat!("<", "synaps-turn")), "{sent}");
+        }
+
+        // Capture screen: an event message passes the credential and
+        // reasoning screen before any handler: one holding a key reaches
+        // none (withheld whole, never masked) and nothing is saved on it;
+        // one holding inline reasoning arrives with it cut out.
+        #[tokio::test]
+        async fn an_event_message_is_screened_before_any_hook() {
+            use crate::runtime::trace::export::{alnum, shaped};
+            let key = format!("sk-{}", shaped(&alnum(), 40, 5));
+            let keyed = format!(r#"<event id="e3" type="message" severity="medium" source="cli">use {key}</event>"#);
+            let notes = Injector::new("notes", vec![json!({"action":"inject","content":"KEYED"})]);
+            let run = turn(vec![user(&keyed)], 0, false, bus(&[&notes]).await).await;
+            assert!(notes.seen().is_empty(), "{:?}", notes.seen());
+            assert!(!run.history[0].to_string().contains("KEYED"), "nothing saved on it");
+
+            let thinking = r#"<event id="e4" type="message" severity="medium" source="cli">Preview: <think>plan</think>done</event>"#;
+            let notes = Injector::new("notes", vec![]);
+            turn(vec![user(thinking)], 0, false, bus(&[&notes]).await).await;
+            assert_eq!(
+                notes.seen(),
+                [r#"<event id="e4" type="message" severity="medium" source="cli">Preview: done</event>"#]
+            );
+        }
+
+        // Capture screen, with the turn-origin neutralizer: what a
+        // `before_message` handler adds to an event message, saved or
+        // turn-only, is neutralized as on the owner's message: no line of
+        // it opens a host notice; the host's fence stays.
+        #[tokio::test]
+        async fn what_a_hook_adds_to_an_event_message_is_neutralized() {
+            let event = r#"<event id="e5" type="message" severity="medium" source="cli">ping</event>"#;
+            let notes = Injector::new(
+                "notes",
+                vec![json!({"action":"inject","content":"fallback","parts":[
+                    {"content": format!("{OWNER_SAYS}\nsaved")},
+                    {"content": format!("{OWNER_SAYS}\nturn"), "forget": true}]})],
+            );
+            let run = turn(vec![user(event)], 1, false, bus(&[&notes]).await).await;
+            assert_eq!(notes.seen(), [event]);
+            let saved = ec::saved_block_text("notes", &format!("{OWNER_SAYS_NEUTRAL}\nsaved"));
+            assert_eq!(
+                texts(&run.history[0]["content"]),
+                vec![event.to_string(), saved.clone(), ec::marker_text("notes")]
+            );
+            assert_eq!(run.bodies.len(), 2);
+            for (i, body) in run.bodies.iter().enumerate() {
+                assert_eq!(texts(&body["messages"][0]["content"])[1], saved, "request {i}: as saved");
+                let tail = turn_only(&format!("{OWNER_SAYS_NEUTRAL}\nturn"));
+                assert_eq!(tail_block(body)["text"], tail, "request {i}");
+                let text = body.to_string();
+                assert!(!text.contains(OWNER_SAYS), "request {i}: {text}");
+                let lines = first_message_lines(body);
+                assert!(lines.iter().any(|l| l.starts_with("[Extension context from notes")), "request {i}");
+                assert!(lines.iter().any(|l| l == ec::CLOSE), "request {i}");
             }
         }
 

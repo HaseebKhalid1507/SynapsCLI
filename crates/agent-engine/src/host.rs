@@ -206,6 +206,9 @@ impl EngineHost {
         hook_bus
             .required_guards()
             .host_booting(&config.required_guards, opts.no_extensions);
+        // The operator's extra credential prefixes join the capture scrub's
+        // floor before any extension is loaded.
+        hook_bus.set_capture_scrub_prefixes(&config.capture_scrub_prefixes);
         let mut ext_mgr = crate::extensions::manager::ExtensionManager::new_with_tools(
             Arc::clone(&hook_bus),
             Arc::clone(&tools),
@@ -478,8 +481,11 @@ impl EngineHost {
     /// keep `load_config()` where they use it today.
     pub fn reload_config(&self) {
         let mtime = config_file_mtime();
-        self.config
-            .store(Arc::new(crate::config::load_config()));
+        let config = Arc::new(crate::config::load_config());
+        self.parts
+            .hook_bus
+            .set_capture_scrub_prefixes(&config.capture_scrub_prefixes);
+        self.config.store(config);
         *self.config_mtime.lock().unwrap_or_else(|e| e.into_inner()) = mtime;
     }
 

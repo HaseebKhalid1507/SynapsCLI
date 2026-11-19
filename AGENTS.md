@@ -140,6 +140,7 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── mod.rs            — crate-level re-exports
 │   ├── hooks/mod.rs      — HookBus dispatcher
 │   ├── hooks/events.rs   — HookKind, HookEvent, HookResult types
+│   ├── hooks/capture_scrub.rs — the screen every capture-class hook payload passes before any extension sees it (fail closed)
 │   ├── permissions.rs    — Permission flags and PermissionSet
 │   ├── manifest.rs       — ExtensionManifest from plugin.json
 │   ├── manager.rs        — ExtensionManager lifecycle
@@ -473,6 +474,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `subagent_context_management` | string | auto | `auto` or `off`: workers roll their context over instead of filling the window ([docs/design/subagent-rollover.md](docs/design/subagent-rollover.md)) |
 | `subagent_rollover_tokens` | int | 200000 | Estimated footprint at which a worker rolls over (at least 20000; a lower window band wins) |
 | `subagent_cold_resume_compact_tokens` | int | 100000 | `subagent_resume` of a worker whose cache has expired replays a compact context once history is at least this big; `0` = off |
+| `capture_scrub_prefixes` | comma list | — | Extra credential prefixes (3–64 bytes, at most 64) the capture screen withholds from hook payloads, for tokens of your own organisation. Add-only: no value turns off or narrows the built-in rules. A daemon announces the screen as `capture_scrub_v1` in `Welcome.features` ([docs/extensions/hooks.md](docs/extensions/hooks.md#the-capture-screen)) |
 | `subagent_transform_hooks` | bool | on | Workers run the host's `after_tool_call` output transforms on their own tool results |
 | `subagent.max_concurrent` | int | 16 | Workers running at once across the session's delegation tree |
 | `subagent.max_total` | int | 64 | Dispatched workers not yet reconciled |

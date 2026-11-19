@@ -392,8 +392,8 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 | `message`           | string \| null  | `before_message`, `on_message_complete`, `on_compaction` | User/assistant/summary message content for message hooks         |
 | `session_id`        | string \| null  | `on_compaction`, `on_session_start`, `on_session_end`, `on_context_archived`, `on_memory_forgotten` | Stable identifier for the current or newly-created session       |
 | `cwd`               | string \| null  | all                                           | The chat's working folder, as the client gave it (not canonicalised); see [hooks.md](hooks.md#cwd-the-chats-working-folder) |
-| `transcript`        | array \| null   | `on_session_end`                              | Conversation transcript delivered at session end; carries saved `before_message` context and markers as the model saw them (see [`inject`](#transcripts-and-history)) |
-| `data`              | any             | all                                           | Per-hook payload (`on_message_complete`, `on_compaction`, `on_context_archived`, `on_memory_forgotten`); `null` on the other hooks |
+| `transcript`        | array \| null   | `on_session_end`                              | Conversation transcript delivered at session end, through the capture screen ([hooks.md](hooks.md#the-capture-screen)): no saved `before_message` context, markers or `_synaps_hooked` count (see [`inject`](#transcripts-and-history)) |
+| `data`              | any             | all                                           | Per-hook payload (`on_message_complete`, `on_compaction`, `on_context_archived`, `on_memory_forgotten`; on `before_message`, `{"message_kind": "event", "verified": false}` when `message` is an agent event, see [the capture screen](hooks.md#the-capture-screen)); `null` on the other hooks |
 
 Fields that are not applicable to the current hook are always `null`, never omitted. You can safely access any field without a key-existence check.
 
@@ -740,7 +740,12 @@ The hook runs once for each new user message of a turn: the prompt, each
 steering message, and an event message (e.g. from `synaps send`) that starts
 or joins a turn. It runs before that message is first sent. Rounds after tool
 calls do not run it again. `message` is the user's own text: it never
-contains extension context saved earlier, yours or anyone's.
+contains extension context saved earlier, yours or anyone's. An event
+message is not the user's: it arrives as the event the host wrote
+(`<event …>…</event>`, header and `source` intact), through the capture
+screen, with `data` `{"message_kind": "event", "verified": false}`; on the
+user's own messages `data` is `null` (see
+[the capture screen](hooks.md#the-capture-screen)).
 
 Which messages are hooked:
 
@@ -842,14 +847,19 @@ blocks and markers may carry the cache marker; turn-only blocks never do.
 
 #### Transcripts and history
 
-What the hook saved stays in the conversation as the model saw it: the
-`on_session_end` `transcript`, stored sessions and rollover archives carry
-saved blocks and markers (never forget content). To tell them from what the
+What the hook saved stays in the conversation as the model saw it: stored
+sessions and rollover archives carry saved blocks and markers (never forget
+content). To tell them from what the
 user typed, do not go by the text (a user may paste a fence): each user
 message the hook ran for carries `"_synaps_hooked": N`, the number of its
 trailing content blocks the host added (saved blocks in order, then one
 marker per extension that sent forget content; `0` when it added none).
 A message without the key was never hooked; all its blocks are the user's.
+Capture payloads are the exception: the `on_session_end` `transcript` passes
+the capture screen ([hooks.md](hooks.md#the-capture-screen)), which leaves
+the added blocks out of each message and the `_synaps_hooked` count with
+them, so neither the blocks nor the count above is in what a capture
+handler receives.
 Grammar of an added block's `text` (it starts with a blank line):
 
 ```

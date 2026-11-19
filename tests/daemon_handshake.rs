@@ -124,6 +124,7 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
                     FEATURE_SESSION_PAGE,
                     FEATURE_TURN_ORIGIN,
                     FEATURE_TURN_ORIGIN_OWNER,
+                    FEATURE_CAPTURE_SCRUB,
                 ],
                 "every feature this daemon serves"
             );
@@ -211,6 +212,40 @@ async fn control_fast_path_allocates_no_session() {
     }
     assert!(d.state.live_sessions().is_empty());
     assert!(d.state.host.sessions().is_empty());
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
+/// A client keys on `Welcome.features`: the booted daemon lists the exact
+/// string `capture_scrub_v1` (its hook screen is compiled in and works), and
+/// the client's own view of the same fact (`Pong.capture_scrub`, which is
+/// what `synaps daemon status --json` prints) agrees. The protocol version
+/// did not move.
+#[tokio::test]
+#[serial]
+async fn welcome_announces_the_capture_scrub_screen() {
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+
+    let mut c = Raw::connect(&sock).await;
+    c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    match c.recv().await {
+        Some(DaemonFrame::Welcome(w)) => {
+            assert_eq!(w.protocol_version, 3);
+            assert!(w.features.iter().any(|f| f == "capture_scrub_v1"), "{:?}", w.features);
+            assert!(w.supports(FEATURE_CAPTURE_SCRUB));
+        }
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::Bye).await;
+
+    let mut conn = agent_engine::session::socket_transport::Connected::connect(&sock, Hello::new(ClientKind::Test))
+        .await
+        .unwrap();
+    assert!(conn.welcome.supports("capture_scrub_v1"));
+    assert!(conn.ping().await.unwrap().capture_scrub, "status reports what the daemon announced");
+
     d.shutdown_token().cancel();
     d.wait().await;
 }

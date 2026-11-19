@@ -22,6 +22,10 @@ use crate::extensions::permissions::Permission;
 /// won't rot when the constant changes.
 pub const MAX_HOOK_OUTPUT: usize = 256 * 1024; // 256 KB
 
+/// Bytes of tool output kept on each side of the [`MAX_HOOK_OUTPUT`] cut,
+/// for the capture screen only: a token the cut splits is screened whole.
+pub const CUT_CONTEXT_BYTES: usize = 4096;
+
 // ── HookKind ──────────────────────────────────────────────────────────────────
 
 /// All hook event kinds.
@@ -224,7 +228,8 @@ pub fn hook_cwd(cwd: Option<&Path>) -> Option<String> {
 /// | `on_memory_forgotten` |           |            |             |         | ✓†         | ✓   |
 ///
 /// `on_context_archived` and `on_memory_forgotten` carry their payload in
-/// `data`.
+/// `data`. A `before_message` whose `message` is an agent event is sent with
+/// `data` set by the capture screen ([`super::capture_scrub::event_mark`]).
 ///
 /// `✓*` — set via [`HookEvent::with_session`] for foreground sessions; `null`
 /// for workers (no conversation id) and when `SYNAPS_HOOK_SESSION_ID=0`. A
@@ -277,6 +282,12 @@ pub struct HookEvent {
     pub transcript: Option<Vec<crate::SharedMessage>>,
     /// Arbitrary extension-defined data, passed through without inspection.
     pub data: Value,
+    /// `after_tool_call` whose output was cut to [`MAX_HOOK_OUTPUT`]: the
+    /// original output around the cut ([`CUT_CONTEXT_BYTES`] on each side).
+    /// Never sent: the capture screen reads it, so a credential the cut
+    /// split in two is still seen whole.
+    #[serde(skip)]
+    pub(crate) cut_context: Option<String>,
 }
 
 impl HookEvent {
@@ -316,6 +327,7 @@ impl HookEvent {
             cwd: None,
             subagent_id: None,
             tool_runtime_name: None,
+            cut_context: None,
             transcript: None,
             data: Value::Null,
         }
@@ -327,16 +339,28 @@ impl HookEvent {
     /// (the OOM safety net) so transform extensions see the FULL buffered
     /// tool output and can decide what to keep — the final context-budget
     /// truncation to `max_tool_output` happens AFTER the hook in
-    /// `emit_after_tool_call` (compress-then-truncate).
+    /// `emit_after_tool_call` (compress-then-truncate). When the output is
+    /// cut, the bytes around the cut stay on the event, unsent, for the
+    /// capture screen (`cut_context`).
     pub fn after_tool_call(tool_name: &str, input: Value, output: String) -> Self {
         let bounded = agent_core::BoundedText::new(&output, MAX_HOOK_OUTPUT);
-        let truncated_output = if bounded.truncated {
-            format!(
-                "{}…[truncated, {} total bytes]",
-                bounded.text, bounded.original_bytes
+        let (truncated_output, cut_context) = if bounded.truncated {
+            let cut = bounded.retained_bytes;
+            let mut start = cut.saturating_sub(CUT_CONTEXT_BYTES);
+            while !output.is_char_boundary(start) {
+                start += 1;
+            }
+            let context = agent_core::truncate_str(&output, cut + CUT_CONTEXT_BYTES);
+            let context = context[start..].to_string();
+            (
+                format!(
+                    "{}…[truncated, {} total bytes]",
+                    bounded.text, bounded.original_bytes
+                ),
+                Some(context),
             )
         } else {
-            output
+            (output, None)
         };
         Self {
             kind: HookKind::AfterToolCall,
@@ -348,6 +372,7 @@ impl HookEvent {
             cwd: None,
             subagent_id: None,
             tool_runtime_name: None,
+            cut_context,
             transcript: None,
             data: Value::Null,
         }
@@ -365,6 +390,7 @@ impl HookEvent {
             cwd: None,
             subagent_id: None,
             tool_runtime_name: None,
+            cut_context: None,
             transcript: None,
             data: Value::Null,
         }
@@ -382,6 +408,7 @@ impl HookEvent {
             cwd: None,
             subagent_id: None,
             tool_runtime_name: None,
+            cut_context: None,
             transcript: None,
             data,
         }
@@ -422,6 +449,7 @@ impl HookEvent {
             cwd: None,
             subagent_id: None,
             tool_runtime_name: None,
+            cut_context: None,
             transcript: None,
             data,
         }
@@ -455,6 +483,7 @@ impl HookEvent {
             cwd: None,
             subagent_id: None,
             tool_runtime_name: None,
+            cut_context: None,
             transcript: None,
             data: serde_json::json!({
                 "archive_id": archive_id,
@@ -519,6 +548,7 @@ impl HookEvent {
             cwd: None,
             subagent_id: None,
             tool_runtime_name: None,
+            cut_context: None,
             transcript: None,
             data: serde_json::json!({
                 "id": id,
@@ -541,6 +571,7 @@ impl HookEvent {
             cwd: None,
             subagent_id: None,
             tool_runtime_name: None,
+            cut_context: None,
             transcript: None,
             data: Value::Null,
         }
@@ -558,6 +589,7 @@ impl HookEvent {
             cwd: None,
             subagent_id: None,
             tool_runtime_name: None,
+            cut_context: None,
             transcript,
             data: Value::Null,
         }
@@ -1208,10 +1240,11 @@ mod tests {
         assert!(ev.message.is_none());
     }
 
-    /// #414 review: the `on_session_end` transcript is what the model saw:
-    /// saved blocks and markers stay, and each hooked message carries the
-    /// host's count (`_synaps_hooked`) so an extension can tell them from
-    /// what the user typed (protocol.md, "Transcripts and history").
+    /// #414 review: the `on_session_end` event as the host builds it holds
+    /// the transcript the model saw: saved blocks and markers stay, and each
+    /// hooked message carries the host's count (`_synaps_hooked`). The
+    /// capture screen then leaves both out of what an extension is sent
+    /// (`capture_scrub`: `a_transcript_holds_no_extension_supplied_context_and_no_count`).
     #[test]
     fn session_end_transcript_carries_saved_blocks_and_the_count() {
         use agent_core::core::extension_context as ec;

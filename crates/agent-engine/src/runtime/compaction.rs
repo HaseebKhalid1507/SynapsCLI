@@ -939,13 +939,19 @@ pub async fn apply_compaction(
         }
     };
 
-    // Hooks fire only after successful persistence.
+    // Hooks fire only after successful persistence. The capture screen
+    // sends the summary to extensions only when its input held none of the
+    // model's thinking (it is model text and could restate it).
     let hook_event = crate::extensions::hooks::events::HookEvent::on_compaction(
         &current.id,
         &session.id,
         &outcome.summary_text,
         api_messages.len(),
-        json!({"source": transition.hook_source}),
+        json!({
+            "source": transition.hook_source,
+            (crate::extensions::hooks::capture_scrub::COMPACTION_THINKING_EXCLUDED):
+                summary_input_excluded_thinking(current, api_messages, outcome),
+        }),
     )
     .with_cwd(runtime.cwd());
     let _ = runtime.hook_bus().emit(&hook_event).await;
@@ -962,6 +968,30 @@ pub async fn apply_compaction(
         chains_advanced,
         policy: transition.policy,
     })
+}
+
+/// Whether the summarizer's input held none of the model's thinking: the
+/// policy withheld the thinking class, a previous summary folded in was
+/// written the same way (a summary with no record counts as written from
+/// thinking), and no message carries an inline reasoning tag (some routes
+/// put `<think>` in visible text, which the thinking class does not cover).
+fn summary_input_excluded_thinking(
+    current: &agent_core::session::Session,
+    api_messages: &[crate::SharedMessage],
+    outcome: &CompactionOutcome,
+) -> bool {
+    use agent_core::compaction::ContentClass;
+    let without_thinking = |classes: &[ContentClass]| classes.contains(&ContentClass::Thinking);
+    without_thinking(&outcome.excluded_classes)
+        && current
+            .compaction
+            .as_ref()
+            .is_none_or(|record| without_thinking(&record.excluded_classes))
+        && !api_messages.iter().any(|message| {
+            let text = message.to_string();
+            crate::extensions::hooks::capture_scrub::holds_inline_reasoning(&text)
+                || (current.compaction.is_none() && text.contains("<context-summary>"))
+        })
 }
 
 #[cfg(test)]
@@ -1433,6 +1463,122 @@ mod transition_tests {
             chat_dir.path().to_str(),
             "on_compaction reports the session's folder, not the process's"
         );
+    }
+
+    /// The `on_compaction` event a subscriber is sent for one transition of
+    /// `current` over `messages` with `outcome`.
+    async fn compaction_event_sent(
+        current: &Session,
+        messages: &[crate::SharedMessage],
+        outcome: &CompactionOutcome,
+    ) -> crate::extensions::hooks::events::HookEvent {
+        use crate::extensions::hooks::events::{HookEvent, HookKind, HookResult};
+
+        #[derive(Debug)]
+        struct Keeper(Arc<std::sync::Mutex<Vec<HookEvent>>>);
+        #[async_trait::async_trait]
+        impl crate::extensions::runtime::ExtensionHandler for Keeper {
+            fn id(&self) -> &str {
+                "compaction-keeper"
+            }
+            async fn handle(&self, event: &HookEvent) -> HookResult {
+                self.0.lock().unwrap().push(event.clone());
+                HookResult::Continue
+            }
+            async fn shutdown(&self) {}
+        }
+
+        let runtime = crate::Runtime::new_headless();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut perms = crate::extensions::permissions::PermissionSet::new();
+        perms.grant(HookKind::OnCompaction.required_permission());
+        runtime
+            .hook_bus()
+            .subscribe(
+                HookKind::OnCompaction,
+                Arc::new(Keeper(seen.clone())),
+                None,
+                None,
+                perms,
+            )
+            .await
+            .unwrap();
+        apply_compaction(
+            &runtime,
+            current,
+            messages,
+            outcome,
+            transition(CompactionPolicy::InPlace),
+        )
+        .await
+        .expect("transition");
+        let mut seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "on_compaction fires once");
+        seen.remove(0)
+    }
+
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn the_compaction_summary_reaches_extensions_only_from_an_input_without_thinking() {
+        use crate::extensions::hooks::capture_scrub::COMPACTION_THINKING_EXCLUDED;
+        let _base = BaseDirGuard::new();
+        let summary = "## Goal\nFinish the report.";
+        let plain = CompactionOutcome::new(summary.to_string(), "claude-sonnet-4-6", &["s"]);
+        let mut no_thinking = plain.clone();
+        no_thinking.excluded_classes = vec![ContentClass::Thinking];
+        let flag = |event: &crate::extensions::hooks::events::HookEvent| {
+            event.data[COMPACTION_THINKING_EXCLUDED].as_bool()
+        };
+
+        // The default input carries thinking: the summary is withheld.
+        let event = compaction_event_sent(&parent_session(), &history(), &plain).await;
+        assert_eq!(flag(&event), Some(false));
+        assert_eq!(event.message, None);
+        assert_eq!(event.data["source"], "manual", "the rest is sent");
+
+        // Thinking excluded: the summary is sent.
+        let event = compaction_event_sent(&parent_session(), &history(), &no_thinking).await;
+        assert_eq!(flag(&event), Some(true));
+        assert_eq!(event.message.as_deref(), Some(summary));
+
+        // Inline reasoning in visible text is not covered by the class.
+        let mut inline = history();
+        inline.push(Arc::new(
+            json!({"role": "assistant", "content": "<think>the plan</think>done"}),
+        ));
+        let event = compaction_event_sent(&parent_session(), &inline, &no_thinking).await;
+        assert_eq!((flag(&event), event.message), (Some(false), None));
+
+        // A previous summary written from thinking, or with no record.
+        let mut folded = parent_session();
+        let mut earlier = plain.clone();
+        earlier.summary_text = "earlier".into();
+        folded.compaction = Some(agent_core::compaction::CompactionRecord {
+            schema_version: agent_core::compaction::COMPACTION_SUMMARY_SCHEMA_VERSION,
+            source_session: "old".into(),
+            source_message_count: 2,
+            source_range_digest: String::new(),
+            summary_provider: earlier.summary_provider.clone(),
+            summary_model: earlier.summary_model.clone(),
+            created_at: chrono::Utc::now(),
+            prompt_stack_digest: earlier.prompt_stack_digest.clone(),
+            included_classes: earlier.included_classes.clone(),
+            excluded_classes: earlier.excluded_classes.clone(),
+            redaction_policy: earlier.redaction_policy,
+            prior_system_prompt: None,
+        });
+        let event = compaction_event_sent(&folded, &history(), &no_thinking).await;
+        assert_eq!((flag(&event), event.message), (Some(false), None));
+        let mut unrecorded = history();
+        unrecorded.insert(
+            0,
+            Arc::new(json!({"role": "user", "content": "<context-summary>old</context-summary>"})),
+        );
+        let event = compaction_event_sent(&parent_session(), &unrecorded, &no_thinking).await;
+        assert_eq!((flag(&event), event.message), (Some(false), None));
+        folded.compaction.as_mut().unwrap().excluded_classes = vec![ContentClass::Thinking];
+        let event = compaction_event_sent(&folded, &unrecorded, &no_thinking).await;
+        assert_eq!(event.message.as_deref(), Some(summary));
     }
 }
 

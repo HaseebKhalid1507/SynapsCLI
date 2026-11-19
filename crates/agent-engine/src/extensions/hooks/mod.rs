@@ -8,11 +8,17 @@
 //! Notify-only kinds ([`HookKind::is_notification`]) go out through
 //! [`HookBus::notify`]: the caller does not wait, and no handler can delay,
 //! fail or change what the caller is doing.
+//!
+//! Every payload of a capture-class hook ([`capture_scrub::is_capture_class`])
+//! is screened by the bus before any handler sees it ([`capture_scrub`]), and
+//! is not delivered at all when it cannot be screened.
 
+pub mod capture_scrub;
 pub mod events;
 #[cfg(test)]
 mod worker_route_tests;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +27,7 @@ use futures::future::join_all;
 use futures::FutureExt;
 use tokio::sync::RwLock;
 
+use self::capture_scrub::{CaptureScrub, Dropped};
 use self::events::{HookEvent, HookFailurePolicy, HookKind, HookResult};
 use crate::extensions::manifest::HookMatcher;
 use crate::extensions::permissions::{Permission, PermissionSet};
@@ -189,6 +196,10 @@ pub struct HookBus {
     /// One permit per [`Self::notify`] delivery in flight
     /// ([`NOTIFY_MAX_IN_FLIGHT`]).
     notify_slots: Arc<tokio::sync::Semaphore>,
+    /// The scrub stage every capture-class payload passes before delivery
+    /// ([`capture_scrub`]). `None` is a stage that is gone (its lock was
+    /// poisoned): capture-class hooks are then not delivered at all.
+    capture_scrub: std::sync::RwLock<Option<Arc<CaptureScrub>>>,
 }
 
 /// A worker's route to its caller's `before_tool_call` hooks (see
@@ -242,7 +253,9 @@ impl WorkerRoute {
 }
 
 impl HookBus {
-    /// Create an empty HookBus with no handlers.
+    /// Create an empty HookBus with no handlers. Its scrub stage is the
+    /// floor alone; the host adds the operator's extra prefixes with
+    /// [`Self::set_capture_scrub_prefixes`].
     pub fn new() -> Self {
         Self {
             handlers: RwLock::new(HashMap::new()),
@@ -252,6 +265,81 @@ impl HookBus {
             worker_route: None,
             required: RequiredGuards::process(),
             notify_slots: Arc::new(tokio::sync::Semaphore::new(NOTIFY_MAX_IN_FLIGHT)),
+            capture_scrub: std::sync::RwLock::new(Some(Arc::new(CaptureScrub::floor()))),
+        }
+    }
+
+    /// Replace the scrub stage by the floor plus `prefixes`, the operator's
+    /// extra credential prefixes (`capture_scrub_prefixes` in config). Only
+    /// adds: whatever `prefixes` holds, the floor stays, and a stage lost to
+    /// a poisoned lock is restored. Takes effect from the next delivery.
+    /// Entries it cannot use get one warning with their count, never their
+    /// values (an entry may be a real credential prefix).
+    pub fn set_capture_scrub_prefixes<I, S>(&self, prefixes: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let stage = Arc::new(CaptureScrub::floor().with_extra_prefixes(prefixes));
+        let ignored = stage.ignored_prefix_count();
+        if ignored > 0 {
+            tracing::warn!(
+                ignored,
+                "capture_scrub_prefixes: {ignored} entries ignored (each must be 3 to 64 \
+                 printable ASCII bytes with no space, at most {} in all)",
+                capture_scrub::MAX_EXTRA_PREFIXES
+            );
+        }
+        let mut slot = self
+            .capture_scrub
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(stage);
+        drop(slot);
+        self.capture_scrub.clear_poison();
+    }
+
+    /// The scrub stage in force: a worker's view uses its host's, so the
+    /// operator's extra prefixes apply to worker tool results too. `None`
+    /// when it is gone.
+    fn capture_scrub_stage(&self) -> Option<Arc<CaptureScrub>> {
+        match &self.transforms_of {
+            Some(host) => host.capture_scrub_stage(),
+            None => self.capture_scrub.read().ok()?.clone(),
+        }
+    }
+
+    /// `event` as `registrations` may be sent it: itself when it is not
+    /// capture-class or already clean, a screened copy when its reasoning or
+    /// raw blocks had to be cut out, `None` when it must not be sent at all
+    /// (logged: the hook, the extensions it was for and why, never the
+    /// content).
+    fn screened_for_delivery<'a>(
+        &self,
+        event: &'a HookEvent,
+        registrations: &[HandlerRegistration],
+    ) -> Option<Cow<'a, HookEvent>> {
+        if !capture_scrub::is_capture_class(event.kind) {
+            return Some(Cow::Borrowed(event));
+        }
+        let verdict = match self.capture_scrub_stage() {
+            Some(stage) => stage.screen(event),
+            None => Err(Dropped::Absent),
+        };
+        match verdict {
+            Ok(None) => Some(Cow::Borrowed(event)),
+            Ok(Some(screened)) => Some(Cow::Owned(screened)),
+            Err(reason) => {
+                let extensions: Vec<&str> =
+                    registrations.iter().map(|reg| reg.handler.id()).collect();
+                tracing::warn!(
+                    hook = %event.kind.as_str(),
+                    extensions = ?extensions,
+                    reason = %reason,
+                    "Capture hook payload not delivered: it could not be screened clean"
+                );
+                None
+            }
         }
     }
 
@@ -624,6 +712,13 @@ impl HookBus {
         if event.kind == HookKind::BeforeToolCall {
             registrations.sort_by_key(|reg| self.required.is_required(reg.handler.id()));
         }
+
+        // A capture-class payload goes to no handler unscreened. Past the
+        // no-handlers fast path, so a bus nobody listens on pays nothing.
+        let Some(screened) = self.screened_for_delivery(event, &registrations) else {
+            return HookResult::Continue;
+        };
+        let event: &HookEvent = &screened;
 
         // Collect injections from all handlers rather than returning on first
         let mut injections = Injections::default();
@@ -1015,6 +1110,10 @@ impl HookBus {
                 _ => return HookResult::Continue, // fast path: no handlers
             }
         };
+        let Some(screened) = self.screened_for_delivery(event, &registrations) else {
+            return HookResult::Continue;
+        };
+        let event: &HookEvent = &screened;
 
         // Dispatch all handlers simultaneously.
         let futures: Vec<_> =
@@ -1192,6 +1291,18 @@ impl HookBus {
             let handlers = self.handlers.read().await;
             handlers.get(&kind).cloned().unwrap_or_default()
         }; // lock dropped here, as in `emit`
+        if registrations.is_empty() {
+            return;
+        }
+        // Each event is screened once, for all handlers; one that cannot be
+        // screened is dropped, and the others are still sent.
+        // (Notify-only events carry ids and paths, so the copy is small.)
+        let screened: Vec<HookEvent> = events
+            .iter()
+            .filter_map(|event| self.screened_for_delivery(event, &registrations))
+            .map(Cow::into_owned)
+            .collect();
+        let events: &[HookEvent] = &screened;
         let sequences = registrations.iter().map(|reg| async move {
             let wanted = |event: &HookEvent| {
                 reg.tool_filter
@@ -3513,5 +3624,270 @@ mod notify_tests {
         settle().await;
         assert_eq!(listener.calls(), (1, 1));
         assert_eq!(listener.events()[0].data["id"], "mem-1");
+    }
+}
+
+/// The capture scrub on the bus: a capture-class payload reaches no handler
+/// unscreened, on every delivery path, and one that cannot be screened is not
+/// delivered at all.
+#[cfg(test)]
+mod capture_scrub_bus_tests {
+    use super::test_support::Listener;
+    use super::*;
+    use crate::extensions::permissions::Permission;
+    use crate::runtime::trace::export::{alnum, shaped};
+    use serde_json::json;
+
+    fn secret() -> String {
+        format!("sk-{}", shaped(&alnum(), 40, 4))
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    async fn bus_with(kind: HookKind, listener: &Arc<Listener>) -> Arc<HookBus> {
+        let bus = Arc::new(HookBus::new());
+        listener.subscribe(&bus, kind).await;
+        bus
+    }
+
+    fn poison(bus: &HookBus) {
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = bus.capture_scrub.write().unwrap();
+            panic!("poisoning the scrub stage lock on purpose");
+        }));
+        assert!(poisoned.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_secret_tool_result_reaches_no_handler_and_a_clean_one_is_sent_as_it_is() {
+        let listener = Listener::prompt("capture");
+        let bus = bus_with(HookKind::AfterToolCall, &listener).await;
+
+        let leaked = HookEvent::after_tool_call("bash", json!({"command": "env"}), format!("KEY={}", secret()));
+        assert_eq!(bus.emit(&leaked).await, HookResult::Continue);
+        let leaked_in_input = HookEvent::after_tool_call("bash", json!({"command": secret()}), "ok".into());
+        assert_eq!(bus.emit(&leaked_in_input).await, HookResult::Continue);
+        assert_eq!(listener.calls(), (0, 0), "nothing was sent for either");
+
+        let clean = HookEvent::after_tool_call("bash", json!({"command": "ls"}), "README.md".into());
+        bus.emit(&clean).await;
+        assert_eq!(listener.calls(), (1, 1));
+        let sent = &listener.events()[0];
+        assert_eq!(sent.tool_output.as_deref(), Some("README.md"));
+        assert_eq!(sent.tool_input, Some(json!({"command": "ls"})));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_reply_from_a_handler_still_applies_to_a_clean_result() {
+        // Replace writes the intercept audit: isolate the base dir.
+        let _base = crate::test_env::BaseDirGuard::new();
+        let replace = HookResult::Replace { output: "short".into() };
+        let listener = Listener::answering("squeeze", replace);
+        let bus = Arc::new(HookBus::new());
+        let mut permissions = PermissionSet::new();
+        permissions.grant(Permission::ToolsIntercept);
+        permissions.grant(Permission::ToolsTransformOutput);
+        bus.subscribe(HookKind::AfterToolCall, listener.clone(), None, None, permissions)
+            .await
+            .unwrap();
+        let clean = HookEvent::after_tool_call("bash", json!({}), "a long listing".into());
+        let answer = bus.emit(&clean).await;
+        assert!(matches!(&answer, HookResult::Replace { output } if output == "short"), "{answer:?}");
+        assert_eq!(listener.calls(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_secret_message_is_withheld_and_the_injection_of_a_clean_one_is_kept() {
+        let inject = HookResult::inject("context");
+        let listener = Listener::answering("recall", inject);
+        let bus = bus_with(HookKind::BeforeMessage, &listener).await;
+        let result = bus.emit(&HookEvent::before_message(&format!("use {}", secret()))).await;
+        assert_eq!(result, HookResult::Continue);
+        assert_eq!(listener.calls(), (0, 0));
+
+        let result = bus.emit(&HookEvent::before_message("fix the build")).await;
+        assert!(matches!(result, HookResult::Inject { .. }), "{result:?}");
+        assert_eq!(listener.events()[0].message.as_deref(), Some("fix the build"));
+    }
+
+    #[tokio::test]
+    async fn a_reply_reaches_a_handler_without_its_inline_reasoning() {
+        let listener = Listener::prompt("capture");
+        let bus = bus_with(HookKind::OnMessageComplete, &listener).await;
+        let reply = HookEvent::on_message_complete("<think>plan</think>done", json!({}));
+        bus.emit(&reply).await;
+        assert_eq!(listener.events()[0].message.as_deref(), Some("done"));
+        assert_eq!(reply.message.as_deref(), Some("<think>plan</think>done"), "the caller's event is untouched");
+
+        let with_secret = HookEvent::on_message_complete("fine", json!({"note": secret()}));
+        bus.emit(&with_secret).await;
+        assert_eq!(listener.calls(), (1, 1), "a secret in the data was withheld");
+    }
+
+    #[tokio::test]
+    async fn a_session_end_transcript_is_reduced_for_the_concurrent_path_too() {
+        let listener = Listener::prompt("archive");
+        let bus = bus_with(HookKind::OnSessionEnd, &listener).await;
+        let messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "private", "signature": "opaque"},
+                {"type": "text", "text": "hi"},
+            ]}),
+            json!({"role": "user", "content": format!("my key is {}", secret())}),
+        ];
+        let event = HookEvent::on_session_end("chat", Some(messages.into_iter().map(Arc::new).collect()));
+        assert_eq!(bus.emit_concurrent(&event).await, HookResult::Continue);
+        let sent = listener.events();
+        assert_eq!(sent.len(), 1);
+        let sent: Vec<serde_json::Value> =
+            sent[0].transcript.as_ref().unwrap().iter().map(|m| (**m).clone()).collect();
+        assert_eq!(
+            sent,
+            vec![
+                json!({"role": "user", "content": "hello"}),
+                json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]}),
+            ]
+        );
+        assert_eq!(event.transcript.as_ref().unwrap().len(), 3, "the caller's event is untouched");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_notify_only_event_that_cannot_be_screened_is_dropped_and_the_rest_are_sent() {
+        let kind = HookKind::OnMemoryForgotten;
+        let listener = Listener::prompt("indexer");
+        let bus = bus_with(kind, &listener).await;
+        let forgotten = |id: &str| HookEvent::on_memory_forgotten(Some("chat"), id, "note", "p0", "repository");
+        let events = vec![forgotten("mem-1"), forgotten(&secret()), forgotten("mem-3")];
+        bus.notify_with(kind, async move { events });
+        settle().await;
+        let sent = listener.wait_for(2).await;
+        assert_eq!(sent.iter().map(|e| e.data["id"].clone()).collect::<Vec<_>>(), [json!("mem-1"), json!("mem-3")]);
+        settle().await;
+        assert_eq!(listener.calls(), (2, 2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_archive_notice_with_an_odd_id_is_not_delivered() {
+        let kind = HookKind::OnContextArchived;
+        let listener = Listener::prompt("indexer");
+        let bus = bus_with(kind, &listener).await;
+        bus.notify(HookEvent::on_context_archived("chat", "not-an-archive-id", None, "p0", 1, 1, 1));
+        settle().await;
+        assert_eq!(listener.calls(), (0, 0));
+        bus.notify(HookEvent::on_context_archived("chat", &"b7".repeat(16), None, "p0", 1, 1, 1));
+        settle().await;
+        assert_eq!(listener.calls(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn the_decision_hook_is_not_screened() {
+        let listener = Listener::prompt("guard");
+        let bus = bus_with(HookKind::BeforeToolCall, &listener).await;
+        let call = HookEvent::before_tool_call("bash", json!({"command": secret()}));
+        bus.emit(&call).await;
+        assert_eq!(listener.calls(), (1, 1), "a guard judges the real call");
+        assert_eq!(listener.events()[0].tool_input, call.tool_input);
+    }
+
+    #[tokio::test]
+    async fn no_scrub_stage_means_no_capture_delivery_until_one_is_set() {
+        let listener = Listener::prompt("capture");
+        let bus = bus_with(HookKind::AfterToolCall, &listener).await;
+        poison(&bus);
+        let clean = HookEvent::after_tool_call("bash", json!({}), "README.md".into());
+        assert_eq!(bus.emit(&clean).await, HookResult::Continue);
+        assert_eq!(listener.calls(), (0, 0), "a payload that cannot be screened is not sent");
+
+        // Decision hooks do not depend on the stage.
+        let guard = Listener::prompt("guard");
+        guard.subscribe(&bus, HookKind::BeforeToolCall).await;
+        bus.emit(&HookEvent::before_tool_call("bash", json!({}))).await;
+        assert_eq!(guard.calls(), (1, 1));
+
+        bus.set_capture_scrub_prefixes(Vec::<String>::new());
+        bus.emit(&clean).await;
+        assert_eq!(listener.calls(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn extra_prefixes_only_add_and_a_worker_view_uses_its_hosts() {
+        let listener = Listener::prompt("squeeze");
+        let host = Arc::new(HookBus::new());
+        let mut permissions = PermissionSet::new();
+        permissions.grant(Permission::ToolsIntercept);
+        permissions.grant(Permission::ToolsTransformOutput);
+        host.subscribe(HookKind::AfterToolCall, listener.clone(), None, None, permissions)
+            .await
+            .unwrap();
+        let worker = HookBus::worker_transforms(&host);
+        let result = |text: &str| HookEvent::after_tool_call("bash", json!({}), text.into());
+        let corporate = result("use corp_tok_Ab12cd34 now");
+
+        // No extra prefix yet: that text is not a credential shape.
+        host.emit(&corporate).await;
+        assert_eq!(listener.calls(), (1, 1));
+
+        host.set_capture_scrub_prefixes(["corp_tok_"]);
+        host.emit(&corporate).await;
+        worker.emit(&corporate).await;
+        assert_eq!(listener.calls(), (1, 1), "the host and its worker view withhold it");
+        worker.emit(&result("plain output")).await;
+        assert_eq!(listener.calls(), (2, 2), "and a worker's clean result is still screened and sent");
+
+        // Whatever the operator lists, the built-in floor stays.
+        host.set_capture_scrub_prefixes(["zz", ""]);
+        host.emit(&result(&format!("KEY={}", secret()))).await;
+        assert_eq!(listener.calls(), (2, 2));
+    }
+
+    /// What `set` writes to the log at warn level and above.
+    fn warnings_of(set: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, set);
+        let bytes = sink.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn unusable_prefix_entries_get_one_warning_with_their_count_never_their_values() {
+        let bus = HookBus::new();
+        let mut entries: Vec<String> = ["zQ", "has a space", "bell\u{7}x", "\u{3a9}mega_"]
+            .map(String::from)
+            .to_vec();
+        entries.extend((0..capture_scrub::MAX_EXTRA_PREFIXES + 3).map(|i| format!("pfx{i:02}_")));
+        let text = warnings_of(|| bus.set_capture_scrub_prefixes(&entries));
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("7 entries ignored"), "{text}");
+        for value in ["zQ", "has a", "bell", "mega", "pfx"] {
+            assert!(!text.contains(value), "{value} in {text}");
+        }
+        // The usable entries still apply.
+        let stage = bus.capture_scrub_stage().expect("stage");
+        assert_eq!(stage.extra_prefix_count(), capture_scrub::MAX_EXTRA_PREFIXES);
+
+        let text = warnings_of(|| bus.set_capture_scrub_prefixes(["corp_tok_", "", "corp_tok_"]));
+        assert_eq!(text, "", "usable entries, a blank and a repeat warn of nothing");
     }
 }

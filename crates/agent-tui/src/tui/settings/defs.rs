@@ -39,6 +39,7 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("favorite_models", "owned by the model picker (/models favorites)"),
     ("disabled_plugins", "owned by the Plugins tab"),
     ("required_guards", "owner-set guard requirement, set by hand in the config file; no product path writes it (the engine does not write-protect the file)"),
+    ("capture_scrub_prefixes", "security rule list, set by hand in the config file (add-only)"),
     ("tool_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
     ("daemon_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
     ("daemon.owner_app_exe", "the owner app's path for the owner claim, set in the daemon's environment or in the config file"),
