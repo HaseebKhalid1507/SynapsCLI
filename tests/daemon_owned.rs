@@ -210,7 +210,7 @@ async fn owner_dropped_mid_turn_cancels_the_turn_and_ends_the_session() {
     let sock = d.paths.sock.clone();
     let (owner, sid, snap) = create_owned(&sock, guard.home.path(), false).await;
     let mut obs = observe(&sock, &sid).await;
-    owner.send_from_self(SessionCommand::Submit { text: "never finishes".into(), attachments: vec![] }).await.unwrap();
+    owner.send_from_self(SessionCommand::Submit { text: "never finishes".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut obs, is_text).await;
 
     drop(owner);
@@ -231,7 +231,7 @@ async fn owner_detach_ends_the_session_and_the_journal_continues_unowned() {
     let d = start_in_process(&guard, Script::Sse(ANTHROPIC_SSE), None).await;
     let sock = d.paths.sock.clone();
     let (mut owner, sid, snap) = create_owned(&sock, guard.home.path(), false).await;
-    owner.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    owner.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut owner, |e| matches!(e, SessionEventWire::Idle)).await;
 
     let leaver = observe(&sock, &sid).await;
@@ -652,7 +652,7 @@ async fn only_the_owner_drives_an_owned_session() {
         .expect("mirror");
     assert_ne!(snap.input_owner, Some(mirror.client_id()), "a mirror never gets input");
     for cmd in [
-        SessionCommand::Submit { text: "not yours".into(), attachments: vec![] },
+        SessionCommand::Submit { text: "not yours".into(), attachments: vec![], origin: None },
         SessionCommand::EngineCommand { id: 7, name: "close".into(), arg: String::new() },
         SessionCommand::TakeInput,
         SessionCommand::Cancel,
@@ -667,7 +667,7 @@ async fn only_the_owner_drives_an_owned_session() {
     }
     assert!(listed(&sock, &sid).await, "/close from a watcher ended nothing");
 
-    owner.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    owner.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut owner, |e| matches!(e, SessionEventWire::Idle)).await;
     // Not even the owner turns on cache keep-warm: spend it never sees.
     owner
@@ -703,7 +703,7 @@ async fn an_owned_continue_adopts_a_clientless_live_session_and_refuses_an_attac
     let sock = d.paths.sock.clone();
     let mut plain = create_plain_session(&sock, guard.home.path()).await;
     let sid = plain.session_id().clone();
-    plain.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    plain.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut plain, |e| matches!(e, SessionEventWire::Idle)).await;
 
     let cont = || SessionConfig { continue_session: Some(Some(sid.as_str().to_string())), ..config(guard.home.path()) };
@@ -723,7 +723,7 @@ async fn an_owned_continue_adopts_a_clientless_live_session_and_refuses_an_attac
     assert_eq!(snap.conversation.api_messages.len(), 2, "its conversation came along");
     let metas = SocketTransport::sessions(&sock).await.unwrap();
     assert_eq!(metas.len(), 1, "one session: the plain one ended {metas:?}");
-    owner.send_from_self(SessionCommand::Submit { text: "again".into(), attachments: vec![] }).await.unwrap();
+    owner.send_from_self(SessionCommand::Submit { text: "again".into(), attachments: vec![], origin: None }).await.unwrap();
     let seen = until(&mut owner, |e| matches!(e, SessionEventWire::Idle)).await;
     assert!(
         !seen.iter().any(|e| matches!(&e.event, SessionEventWire::SystemNotice(n) if n.contains("already running"))),
@@ -748,7 +748,7 @@ async fn an_owned_continue_never_closes_a_session_a_client_is_attaching_to() {
     let sock = d.paths.sock.clone();
     let mut plain = create_plain_session(&sock, guard.home.path()).await;
     let sid = plain.session_id().clone();
-    plain.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    plain.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut plain, |e| matches!(e, SessionEventWire::Idle)).await;
     plain.detach().await;
     let h = d.state.attach(&sid).expect("live");
@@ -864,7 +864,7 @@ mod forward_secrets {
 
     /// One turn running the hex tool; returns the tool's output.
     async fn secret_turn(t: &mut SocketTransport) -> String {
-        t.send_from_self(SessionCommand::Submit { text: "show the token".into(), attachments: vec![] }).await.unwrap();
+        t.send_from_self(SessionCommand::Submit { text: "show the token".into(), attachments: vec![], origin: None }).await.unwrap();
         let mut result = None;
         for e in until(t, |e| matches!(e, SessionEventWire::Idle)).await {
             if let SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolResult { result: r, .. })) = e.event {
@@ -971,7 +971,7 @@ async fn reload_lets_the_owner_rebind_within_the_grace() {
     let d = spawn_daemon(&guard, &url, &[]).await;
     let sock = d.paths.sock.clone();
     let (mut owner, sid, _) = create_owned(&sock, guard.home.path(), false).await;
-    owner.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    owner.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut owner, |e| matches!(e, SessionEventWire::Idle)).await;
 
     assert_eq!(SocketTransport::reload(&sock, true, None, None).await.expect("reload"), 2);
@@ -1003,7 +1003,7 @@ async fn reload_without_a_rebind_ends_the_session_after_the_grace() {
     let d = spawn_daemon(&guard, &url, &[("SYNAPS_DAEMON_OWNER_REBIND_SECS", "6")]).await;
     let sock = d.paths.sock.clone();
     let (mut owner, sid, snap) = create_owned(&sock, guard.home.path(), false).await;
-    owner.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    owner.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut owner, |e| matches!(e, SessionEventWire::Idle)).await;
 
     assert_eq!(SocketTransport::reload(&sock, true, None, None).await.expect("reload"), 2);

@@ -623,6 +623,7 @@ async fn submit_while_armed_idle_queues_steering() {
     actor
         .send(SessionCommand::Submit {
             text: "steer me".into(), attachments: vec![],
+            origin: None,
         })
         .await;
     let ev = actor
@@ -668,6 +669,7 @@ async fn unarmed_submit_is_a_normal_turn() {
     actor
         .send(SessionCommand::Submit {
             text: "hello".into(), attachments: vec![],
+            origin: None,
         })
         .await;
     let ev = actor
@@ -706,6 +708,7 @@ async fn steering_fifo_16_msg_cap() {
             .send(SessionCommand::Submit {
                 text: format!("msg-{i}"),
                 attachments: vec![],
+                origin: None,
             })
             .await;
         let _ = actor
@@ -717,6 +720,7 @@ async fn steering_fifo_16_msg_cap() {
     actor
         .send(SessionCommand::Submit {
             text: "overflow".into(), attachments: vec![],
+            origin: None,
         })
         .await;
     let ev = actor
@@ -747,7 +751,7 @@ async fn steering_fifo_256kib_cap_counts_utf8_bytes() {
     // Send a message just under 256 KiB.
     let big = "x".repeat(200 * 1024);
     actor
-        .send(SessionCommand::Submit { text: big, attachments: vec![] })
+        .send(SessionCommand::Submit { text: big, attachments: vec![], origin: None })
         .await;
     let _ = actor
         .until(|e| matches!(e, SessionEventWire::Steered { .. }))
@@ -756,7 +760,7 @@ async fn steering_fifo_256kib_cap_counts_utf8_bytes() {
     // Second message that crosses the 256 KiB total.
     let big2 = "y".repeat(100 * 1024);
     actor
-        .send(SessionCommand::Submit { text: big2, attachments: vec![] })
+        .send(SessionCommand::Submit { text: big2, attachments: vec![], origin: None })
         .await;
     let ev = actor
         .until(|e| matches!(e, SessionEventWire::SystemNotice(_)))
@@ -787,6 +791,7 @@ async fn revocation_restores_undelivered_steering() {
     actor
         .send(SessionCommand::Submit {
             text: "first".into(), attachments: vec![],
+            origin: None,
         })
         .await;
     let _ = actor
@@ -795,6 +800,7 @@ async fn revocation_restores_undelivered_steering() {
     actor
         .send(SessionCommand::Submit {
             text: "second".into(), attachments: vec![],
+            origin: None,
         })
         .await;
     let _ = actor
@@ -1626,7 +1632,7 @@ async fn s9_unarmed_auto_approve_bypasses_activation_gate() {
     .await;
 
     // Foreground turn (no driver): auto-approve is honoured → no host prompt.
-    a.send(SessionCommand::Submit { text: "go".into(), attachments: vec![] })
+    a.send(SessionCommand::Submit { text: "go".into(), attachments: vec![], origin: None })
         .await;
     let ev = tokio::time::timeout(
         Duration::from_secs(40),
@@ -1752,6 +1758,7 @@ async fn hook_pending_after_a_turn(
         .send(SessionCommand::Submit {
             text: "first".into(),
             attachments: vec![],
+            origin: None,
         })
         .await;
     actor.until(|e| matches!(e, SessionEventWire::Idle)).await;
@@ -1872,6 +1879,7 @@ async fn a_turn_waiting_for_on_session_start_outlasts_a_rejected_driver_start() 
         .send(SessionCommand::Submit {
             text: "second".into(),
             attachments: vec![],
+            origin: None,
         })
         .await;
     actor

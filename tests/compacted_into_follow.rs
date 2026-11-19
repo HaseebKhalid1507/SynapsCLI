@@ -114,6 +114,7 @@ async fn continue_old_follows_compacted_into() {
         t.send(SessionCommand::Submit {
             text: msg.into(),
             attachments: vec![],
+            origin: None,
         })
         .await
         .unwrap();

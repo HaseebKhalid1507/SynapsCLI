@@ -27,7 +27,7 @@ use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::engine::reactor::{
-    auto_turn_cap_reached, claim_auto_turn_with_cap, drain_event_queue, wake_action_with_cap,
+    auto_turn_cap_reached, claim_auto_turn_with_cap, drain_event_queue_typed, wake_action_with_cap,
     EventDisposition, WakeAction,
 };
 use crate::engine::session::ConversationState;
@@ -38,6 +38,7 @@ use crate::runtime::compaction::{
     apply_compaction, compact_conversation, preview_compaction_disclosure, CompactionPolicy,
     CompactionTransition,
 };
+use crate::runtime::turn_origin::{self, Origin};
 use crate::tools::{SecretPromptHandle, SecretPromptRequest};
 use crate::{
     AgentEvent, CancellationToken, EngineHost, Result, Runtime, SessionEvent,
@@ -80,7 +81,7 @@ pub(crate) struct TurnDraftState {
 /// its request waits for `on_session_start`.
 pub(crate) struct TurnStart {
     cancel: CancellationToken,
-    steer_rx: mpsc::UnboundedReceiver<String>,
+    steer_rx: mpsc::UnboundedReceiver<turn_origin::Steer>,
     auto_approve: bool,
     completion: crate::runtime::TurnCompletion,
     /// Events started this turn (nobody typed it): its stream runs under the
@@ -562,12 +563,16 @@ pub struct SessionActor {
     // ── turn machine: the run() loop locals + App fields ──
     pub(crate) stream: Option<ActiveStream>,
     pub(crate) cancel: Option<CancellationToken>,
-    pub(crate) steer_tx: Option<mpsc::UnboundedSender<String>>,
+    pub(crate) steer_tx: Option<mpsc::UnboundedSender<turn_origin::Steer>>,
     /// An event-started turn's way onto the session budget: `steer` sends
     /// the owner's message through it, and the turn's stream switches to the
     /// session budget when it delivers that message. `None` for every other
     /// turn (they already run on the session budget).
     pub(crate) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
+    /// The origin of `conv.queued_message`, bound to the exact text it
+    /// marks: a queued text that differs (replaced) goes unmarked, so the
+    /// wrapper only ever goes around text the owner sent marked.
+    pub(crate) queued_origin: Option<(Origin, String)>,
     pub(crate) streaming: bool,
     pub(crate) turn_baseline: usize,
     /// Stamps each message appended to `conv.api_messages` with its time
@@ -1004,6 +1009,7 @@ impl SessionActor {
             cancel: None,
             steer_tx: None,
             owner_steer_budget: None,
+            queued_origin: None,
             streaming: false,
             turn_baseline: 0,
             message_stamper,
@@ -2325,7 +2331,7 @@ impl SessionActor {
                                     tokio::select! {
                                         biased;
                                         _ = ct.cancelled() => super::driver::TaskResult::Started(Err("canceled during stream setup".into())),
-                                        started = runtime.run_stream_tracked(history, ct.clone(), Some(rx), Some(secret), false, completion) => super::driver::TaskResult::Started(Ok(started)),
+                                        started = runtime.run_stream_steered(history, ct.clone(), Some(turn_origin::SteeringRx::Typed(rx)), Some(secret), false, completion) => super::driver::TaskResult::Started(Ok(started)),
                                     }
                                 })),
                             });
@@ -3024,10 +3030,10 @@ impl SessionActor {
         });
         let stream = self
             .runtime
-            .run_stream_tracked(
+            .run_stream_steered(
                 self.conv.api_messages.clone(),
                 start.cancel,
-                Some(start.steer_rx),
+                Some(turn_origin::SteeringRx::Typed(start.steer_rx)),
                 Some(self.secret_prompt_handle.clone()),
                 start.auto_approve,
                 start.completion,
@@ -3046,7 +3052,7 @@ impl SessionActor {
     pub(crate) async fn start_turn(&mut self, trigger: TurnTrigger, user_text: Option<String>) {
         self.cache_keepwarm_turn_started();
         let ct = CancellationToken::new();
-        let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
+        let (s_tx, s_rx) = mpsc::unbounded_channel::<turn_origin::Steer>();
         self.streaming = true;
         // Admission: the request (and anything queued with it) gets its
         // time now, before the stream copies the history.
@@ -3252,11 +3258,50 @@ impl SessionActor {
         self.turn_draft = TurnDraftState::default();
     }
 
+    /// The turn origin a Submit/Steer counts with. `None`: the command is
+    /// refused (the origin is not a valid label; refused to its sender, a
+    /// notice when no attached client sent it). `Some(None)`: no origin, or
+    /// the sender is not this owned session's bound owner attached as a
+    /// chat client that declared this label at hello (any sender in a
+    /// session without an owner; `turn_origin::from_sender`): the text goes
+    /// in unmarked.
+    fn admitted_origin(
+        &mut self,
+        origin: Option<String>,
+        command: &'static str,
+        from: Option<ClientId>,
+    ) -> Option<Option<Origin>> {
+        let origin = match turn_origin::admit(origin.as_deref(), command) {
+            Ok(origin) => origin,
+            Err(reason) => {
+                match from {
+                    Some(client) => self.emit(SessionEventWire::Refused {
+                        client,
+                        command: command.into(),
+                        reason,
+                    }),
+                    None => self.emit(SessionEventWire::SystemNotice(reason)),
+                }
+                return None;
+            }
+        };
+        let sender = from.and_then(|client| {
+            let attached = self.attached.get(&client)?;
+            Some(turn_origin::Sender {
+                kind: attached.meta.kind,
+                declared: attached.meta.turn_origin.as_deref(),
+                owner: self.is_session_owner(client),
+            })
+        });
+        Some(turn_origin::from_sender(origin, command, sender))
+    }
+
     /// dispatch.rs Submit (:1231-1288) minus presentation.
     pub(crate) async fn submit(
         &mut self,
         text: String,
         attachments: Vec<serde_json::Value>,
+        origin: Option<Origin>,
         from: Option<ClientId>,
     ) {
         // Wall 1 defense-in-depth: a latched (unverified) context head must
@@ -3301,7 +3346,7 @@ impl SessionActor {
                 }
                 driver.steering.push_back(text.clone());
             }
-            self.steer(text);
+            self.steer(text, origin);
             return;
         }
         // P6: while the driver is armed and idle, route to steering FIFO
@@ -3336,6 +3381,7 @@ impl SessionActor {
                 text: text.clone(),
                 delivered: false,
             });
+            self.queued_origin = origin.map(|origin| (origin, text.clone()));
             self.conv.queued_message = Some(text);
             return;
         }
@@ -3344,12 +3390,21 @@ impl SessionActor {
         // For every OTHER attached client: the submitter drew its own card.
         let user_text = text.clone();
         let api_content = text;
+        // The owner's text is part 0 of the message; an empty text is no
+        // part at all (part 0 is then an attachment), so it marks nothing.
+        let origin = origin.filter(|_| !api_content.is_empty());
+        let marked = move |mut message: serde_json::Value| {
+            if let Some(origin) = &origin {
+                turn_origin::stamp(&mut message, origin, 0);
+            }
+            std::sync::Arc::new(message)
+        };
 
         if attachments.is_empty() {
             // Text-only: existing path.
-            self.conv.api_messages.push(std::sync::Arc::new(
-                serde_json::json!({"role": "user", "content": api_content}),
-            ));
+            self.conv
+                .api_messages
+                .push(marked(serde_json::json!({"role": "user", "content": api_content})));
         } else {
             // Build multipart content: text block (if non-empty) + attachment blocks.
             let mut blocks = Vec::with_capacity(attachments.len() + 1);
@@ -3357,9 +3412,7 @@ impl SessionActor {
                 blocks.push(serde_json::json!({"type": "text", "text": api_content}));
             }
             blocks.extend(attachments);
-            let candidate = std::sync::Arc::new(
-                serde_json::json!({"role": "user", "content": blocks}),
-            );
+            let candidate = marked(serde_json::json!({"role": "user", "content": blocks}));
             // Validate the complete history (including this message) for the
             // session's current model before accepting.
             let mut proposed = self.conv.api_messages.clone();
@@ -3393,8 +3446,10 @@ impl SessionActor {
     /// (`self.runtime.turn_budget()`, which a `/budget` changes) once the
     /// stream delivers it. A steer that misses the turn (its stream ended)
     /// stays queued and starts a typed turn, on that budget anyway.
-    pub(crate) fn steer(&mut self, text: String) {
-        let send = |tx: &mpsc::UnboundedSender<String>| tx.send(text.clone()).is_ok();
+    pub(crate) fn steer(&mut self, text: String, origin: Option<Origin>) {
+        let send = |tx: &mpsc::UnboundedSender<turn_origin::Steer>| {
+            tx.send(turn_origin::Steer { text: text.clone(), origin: origin.clone() }).is_ok()
+        };
         let delivered = match (self.steer_tx.as_ref(), self.owner_steer_budget.as_deref()) {
             (Some(tx), Some(lift)) => {
                 lift.send_owner_steer(self.runtime.turn_budget().clone(), || send(tx))
@@ -3406,7 +3461,14 @@ impl SessionActor {
             text: text.clone(),
             delivered,
         });
+        self.queued_origin = origin.map(|origin| (origin, text.clone()));
         self.conv.queued_message = Some(text);
+    }
+
+    /// The user message a queued text becomes when it starts a turn, still
+    /// marked when it is what a marked Submit/Steer queued.
+    fn queued_user_message(&mut self, queued: String) -> std::sync::Arc<serde_json::Value> {
+        turn_origin::queued_user_message(&mut self.queued_origin, queued)
     }
 
     /// `SubagentSteer`: hand the user's text to one of this session's running
@@ -3465,7 +3527,7 @@ impl SessionActor {
             let into_turn = self
                 .steer_tx
                 .as_ref()
-                .is_some_and(|tx| tx.send(formatted.clone()).is_ok());
+                .is_some_and(|tx| tx.send(formatted.clone().into()).is_ok());
             if into_turn {
                 self.turn_steered_events.push(formatted);
             } else {
@@ -3509,6 +3571,7 @@ impl SessionActor {
         if !self.streaming {
             if self.compact.is_some() {
                 self.abort_compaction();
+                self.queued_origin = None;
                 if let Some(q) = self.conv.queued_message.take() {
                     self.emit(SessionEventWire::Dequeued { text: q });
                 }
@@ -3627,6 +3690,7 @@ impl SessionActor {
             crate::engine::interrupt::append_marker(&mut self.conv.api_messages, reason);
         }
         // A user steer the engine never picked up was not delivered.
+        self.queued_origin = None;
         if let Some(q) = self.conv.queued_message.take() {
             self.emit(SessionEventWire::Dequeued { text: q });
         }
@@ -3840,6 +3904,7 @@ impl SessionActor {
     fn note_steering_delivered(&mut self, message: &str) {
         if self.conv.queued_message.as_deref() == Some(message) {
             self.conv.queued_message = None;
+            self.queued_origin = None;
             self.emit_conversation();
         }
         // P5/P6: pop the driver's steering FIFO on delivery ack.
@@ -3908,7 +3973,7 @@ impl SessionActor {
         }
         let busy = self.busy();
         let conv: &mut ConversationState = &mut self.conv;
-        let drained = drain_event_queue(
+        let drained = drain_event_queue_typed(
             &self.event_queue,
             &mut conv.api_messages,
             &mut conv.pending_events,
@@ -4178,9 +4243,8 @@ impl SessionActor {
                 // Auto-send the queued message (user-authored — reset counter)
                 self.consecutive_auto_turns = 0;
                 let user_text = queued.clone();
-                self.conv.api_messages.push(std::sync::Arc::new(
-                    serde_json::json!({"role": "user", "content": queued}),
-                ));
+                let message = self.queued_user_message(queued);
+                self.conv.api_messages.push(message);
                 self.start_turn(TurnTrigger::QueuedAuto, Some(user_text)).await;
             }
             After::AutoTriggerEvents => {
@@ -4348,6 +4412,9 @@ impl SessionActor {
                         self.conv.api_messages = applied.api_messages;
                         self.conv.pending_events.clear();
                         self.conv.queued_message = None;
+                        // The transition carries the queued text as an
+                        // unmarked message: it keeps no origin.
+                        self.queued_origin = None;
                         if policy == CompactionPolicy::LinkedSuccessor {
                             self.conv.total_input_tokens = 0;
                             self.conv.total_output_tokens = 0;
@@ -5437,12 +5504,20 @@ impl SessionActor {
             }
         }
         match cmd {
-            SessionCommand::Submit { text, attachments } => self.submit(text, attachments, from).await,
-            SessionCommand::Steer { text } => {
+            SessionCommand::Submit { text, attachments, origin } => {
+                let Some(origin) = self.admitted_origin(origin, "submit", from) else {
+                    return ControlFlow::Continue(());
+                };
+                self.submit(text, attachments, origin, from).await
+            }
+            SessionCommand::Steer { text, origin } => {
+                let Some(origin) = self.admitted_origin(origin, "steer", from) else {
+                    return ControlFlow::Continue(());
+                };
                 if self.streaming {
-                    self.steer(text)
+                    self.steer(text, origin)
                 } else {
-                    self.submit(text, vec![], from).await
+                    self.submit(text, vec![], origin, from).await
                 }
             }
             SessionCommand::SubagentSteer { handle_id, text } => {

@@ -1840,7 +1840,7 @@ impl crate::Runtime {
 
 /// Host-only message metadata: every `_synaps_*` key (`_synaps_context`,
 /// [`TURN_KEY`], and any later one). Never sent on any provider wire.
-const HOST_KEY_PREFIX: &str = "_synaps_";
+pub(crate) const HOST_KEY_PREFIX: &str = "_synaps_";
 
 fn has_host_key(message: &Value) -> bool {
     message

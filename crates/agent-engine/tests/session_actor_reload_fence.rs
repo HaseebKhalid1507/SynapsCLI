@@ -299,7 +299,7 @@ async fn commands_that_start_work_are_refused_while_fenced() {
     checkpoint_for_reload(&mut f).await;
 
     for cmd in [
-        SessionCommand::Steer { text: "and also".into() },
+        SessionCommand::Steer { text: "and also".into(), origin: None },
         submit("hello again"),
         SessionCommand::NewSession,
         SessionCommand::Resume { id: 3, query: "other".into() },
@@ -326,7 +326,7 @@ async fn commands_that_start_work_are_refused_while_fenced() {
 
     // Lifted: the same Steer starts its turn.
     f.handle.send(SessionCommand::ReloadAborted).await.unwrap();
-    f.client.send_from_self(SessionCommand::Steer { text: "and also".into() }).await.unwrap();
+    f.client.send_from_self(SessionCommand::Steer { text: "and also".into(), origin: None }).await.unwrap();
     until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
     until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
     end(&mut f.client).await;

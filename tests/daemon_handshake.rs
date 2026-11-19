@@ -118,7 +118,12 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
             assert_eq!(w.pid, std::process::id());
             assert_eq!(
                 w.features,
-                [FEATURE_OWNED_SESSIONS, FEATURE_SESSION_WORKERS, FEATURE_SESSION_PAGE],
+                [
+                    FEATURE_OWNED_SESSIONS,
+                    FEATURE_SESSION_WORKERS,
+                    FEATURE_SESSION_PAGE,
+                    FEATURE_TURN_ORIGIN,
+                ],
                 "every feature this daemon serves"
             );
         }
@@ -137,6 +142,46 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
     ));
     c.send(&ClientFrame::Bye).await;
     assert!(matches!(c.recv().await, Some(DaemonFrame::Bye { .. })));
+
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
+/// A chat client declares the label its owner-marked turns carry in its hello
+/// (`client.turn_origin`). The daemon advertises `turn_origin` in the Welcome
+/// and refuses, at the hello, a label it would not write into the model's
+/// wrapper tag.
+#[tokio::test]
+#[serial]
+async fn handshake_checks_a_declared_turn_origin_label_and_advertises_the_feature() {
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+
+    let too_long = "a".repeat(33);
+    for label in ["", "Test-App", "test app", "test_app", "a\"b", "a>b", "caf\u{e9}", too_long.as_str()] {
+        let mut c = Raw::connect(&sock).await;
+        c.send(&ClientFrame::Hello(Hello::new(ClientKind::Chat).with_turn_origin(Some(label.to_string())))).await;
+        assert!(
+            matches!(c.recv().await, Some(DaemonFrame::Refused { reason: RefuseReason::Protocol, .. })),
+            "{label:?} is refused at the hello"
+        );
+        assert!(c.recv().await.is_none(), "{label:?}: the daemon closes after the refusal");
+    }
+
+    let longest = "a".repeat(32);
+    for label in [None, Some("test-app"), Some("a"), Some("0-9"), Some(longest.as_str())] {
+        let mut c = Raw::connect(&sock).await;
+        c.send(&ClientFrame::Hello(Hello::new(ClientKind::Chat).with_turn_origin(label.map(str::to_string)))).await;
+        match c.recv().await {
+            Some(DaemonFrame::Welcome(w)) => {
+                assert!(w.features.iter().any(|f| f == "turn_origin"), "{label:?}: {:?}", w.features);
+            }
+            other => panic!("{label:?}: {other:?}"),
+        }
+        c.send(&ClientFrame::Bye).await;
+        assert!(matches!(c.recv().await, Some(DaemonFrame::Bye { .. })));
+    }
 
     d.shutdown_token().cancel();
     d.wait().await;

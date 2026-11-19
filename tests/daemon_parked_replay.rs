@@ -115,6 +115,7 @@ async fn attach_to_parked_session_replays_conversation() {
     t.send_from_self(SessionCommand::Submit {
         text: "hello".into(),
         attachments: vec![],
+        origin: None,
     })
     .await
     .unwrap();

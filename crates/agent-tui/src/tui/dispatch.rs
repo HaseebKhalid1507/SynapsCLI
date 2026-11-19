@@ -1131,6 +1131,7 @@ pub(crate) async fn handle_input_action(
                     .send(agent_engine::session::SessionCommand::Submit {
                         text: input,
                         attachments: Vec::new(),
+                        origin: None,
                     })
                     .await;
                 return ControlFlow::Continue(());
@@ -1165,6 +1166,7 @@ pub(crate) async fn handle_input_action(
                 .send(agent_engine::session::SessionCommand::Submit {
                     text: input,
                     attachments: attachment_blocks,
+                    origin: None,
                 })
                 .await;
         }
@@ -1192,7 +1194,7 @@ pub(crate) async fn handle_input_action(
                     // Normal text during streaming (`//text` as `/text`) —
                     // steer/queue ("→ steering:" / "queued:" on `Steered`).
                     let _ = link
-                        .send(agent_engine::session::SessionCommand::Steer { text })
+                        .send(agent_engine::session::SessionCommand::Steer { text, origin: None })
                         .await;
                 }
                 commands::StreamingSlash::Ran(action) => match action {

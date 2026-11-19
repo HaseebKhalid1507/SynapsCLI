@@ -91,9 +91,9 @@ async fn two_sessions_one_daemon_isolated() {
     assert!(matches!(next(&mut a).await.event, SessionEventWire::ClientJoined { .. }));
     assert!(matches!(next(&mut b).await.event, SessionEventWire::ClientJoined { .. }));
 
-    a.send(SessionCommand::Submit { text: "from a".into(), attachments: vec![] }).await.unwrap();
+    a.send(SessionCommand::Submit { text: "from a".into(), attachments: vec![], origin: None }).await.unwrap();
     let sa = turn(&mut a).await;
-    b.send(SessionCommand::Submit { text: "from b".into(), attachments: vec![] }).await.unwrap();
+    b.send(SessionCommand::Submit { text: "from b".into(), attachments: vec![], origin: None }).await.unwrap();
     let sb = turn(&mut b).await;
 
     for (s, who) in [(&sa, "a"), (&sb, "b")] {
@@ -262,7 +262,7 @@ async fn continue_of_live_journal_attaches_instead_of_second_actor() {
         .is_ok());
 
     // Same actor: a turn submitted via A streams to the mirrors.
-    a.send(SessionCommand::Submit { text: "from a".into(), attachments: vec![] }).await.unwrap();
+    a.send(SessionCommand::Submit { text: "from a".into(), attachments: vec![], origin: None }).await.unwrap();
     let seen_a = turn(&mut a).await;
     assert_eq!(text_of(&seen_a), "hi");
     for b in mirrors.iter_mut() {

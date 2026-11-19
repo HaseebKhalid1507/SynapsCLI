@@ -102,7 +102,7 @@ async fn attach_create(paths: &registry::DaemonPaths, cwd: &Path) -> (SocketTran
 }
 
 async fn one_turn(t: &mut SocketTransport, text: &str) -> Vec<agent_engine::SharedMessage> {
-    t.send_from_self(SessionCommand::Submit { text: text.into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(SessionCommand::Submit { text: text.into(), attachments: vec![], origin: None }).await.unwrap();
     let mut msgs = None;
     loop {
         let env = tokio::time::timeout(Duration::from_secs(20), t.next_event()).await.expect("turn hung").expect("alive");

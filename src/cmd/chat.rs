@@ -393,6 +393,7 @@ mod actor {
                     if t.send(SessionCommand::Submit {
                         text: String::new(),
                         attachments: blocks,
+                        origin: None,
                     }).await.is_err() {
                         break;
                     }
@@ -577,6 +578,7 @@ mod actor {
                 .send(SessionCommand::Submit {
                     text: trimmed.to_string(),
                     attachments: attachment_blocks,
+                    origin: None,
                 })
                 .await
                 .is_err()

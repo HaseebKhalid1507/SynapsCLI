@@ -64,7 +64,7 @@ async fn session_with_turn(sock: &Path, cwd: &Path) -> (SocketTransport, Session
     )
     .await
     .expect("attach create");
-    t.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut t, |e| matches!(e, SessionEventWire::Idle)).await;
     let sid = t.session_id().clone();
     (t, sid)

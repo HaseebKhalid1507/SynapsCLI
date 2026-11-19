@@ -1376,7 +1376,7 @@ mod tests {
                     })
                 }
                 // Steer = "the daemon's history drifted": digest for [user:text] without a MessageHistory.
-                ClientFrame::Cmd { cmd: SessionCommand::Steer { text }, .. } => {
+                ClientFrame::Cmd { cmd: SessionCommand::Steer { text, .. }, .. } => {
                     seq += 1;
                     let snap = ConversationSnapshot {
                         api_messages: vec![Arc::new(serde_json::json!({"role":"user","content":text}))],
@@ -1484,7 +1484,7 @@ mod tests {
         let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
             .await
             .unwrap();
-        t.send(SessionCommand::Submit { text: "split:hello".into(), attachments: vec![] }).await.unwrap();
+        t.send(SessionCommand::Submit { text: "split:hello".into(), attachments: vec![], origin: None }).await.unwrap();
         // First half is in; the tick wins and drops the read.
         tokio::select! {
             e = t.next_event() => panic!("frame cannot be complete yet: {e:?}"),
@@ -1520,7 +1520,7 @@ mod tests {
         assert_eq!(t.session_id().as_str(), "fake-1");
         assert_eq!(t.view().model, "echo");
 
-        t.send(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+        t.send(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
         let e = t.next_event().await.unwrap();
         match e.event {
             SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(s))) => assert_eq!(s, "hello"),
@@ -1556,7 +1556,7 @@ mod tests {
             .await
             .unwrap();
         assert!(t.messages().is_empty());
-        t.send(SessionCommand::Steer { text: "drifted".into() }).await.unwrap();
+        t.send(SessionCommand::Steer { text: "drifted".into(), origin: None }).await.unwrap();
         // The digest misses the (empty) mirror → transport re-queries → one
         // Conversation with the fetched history and the digest's cost.
         let e = t.next_event().await.unwrap();
@@ -1570,7 +1570,7 @@ mod tests {
         }
         assert_eq!(t.messages().len(), 1);
         // Same digest again now matches the mirror: no re-query, served locally.
-        t.send(SessionCommand::Steer { text: "drifted".into() }).await.unwrap();
+        t.send(SessionCommand::Steer { text: "drifted".into(), origin: None }).await.unwrap();
         let e = t.next_event().await.unwrap();
         assert!(matches!(e.event, SessionEventWire::Conversation(ref c) if c.api_messages.len() == 1));
         t.detach().await;
@@ -1614,7 +1614,7 @@ mod tests {
         let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
             .await
             .unwrap();
-        t.send(SessionCommand::Submit { text: "lag-after-reload".into(), attachments: vec![] }).await.unwrap();
+        t.send(SessionCommand::Submit { text: "lag-after-reload".into(), attachments: vec![], origin: None }).await.unwrap();
         let e = t.next_event().await.unwrap();
         assert!(matches!(e.event, SessionEventWire::Reloading { generation: 2, .. }));
         assert!(t.is_reload_pending());

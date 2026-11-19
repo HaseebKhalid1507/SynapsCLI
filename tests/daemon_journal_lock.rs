@@ -77,6 +77,7 @@ async fn in_process_continue_of_live_daemon_session_refused() {
     t.send(SessionCommand::Submit {
         text: "hello".into(),
         attachments: vec![],
+        origin: None,
     })
     .await
     .unwrap();

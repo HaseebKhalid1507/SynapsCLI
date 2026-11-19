@@ -671,6 +671,14 @@ pub struct ClientMeta {
     /// daemon ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The label a chat client that speaks for the owner declares so its
+    /// marked turns count ([`crate::runtime::turn_origin`]): 1-32 characters
+    /// of `[a-z0-9-]`. A `Submit`/`Steer` carrying this very label as its
+    /// `origin` is shown to the model as the owner's own text; any other
+    /// sender's origin is ignored. Absent = this client never marks a turn.
+    /// An older daemon ignores the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_origin: Option<String>,
 }
 
 /// Longest client name ([`validate_client_name`]).
@@ -688,6 +696,19 @@ pub fn validate_client_name(name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// A declared turn-origin label ([`ClientMeta::turn_origin`]) is 1-32
+/// characters of `[a-z0-9-]`. The client checks before connecting; the
+/// daemon checks again and refuses the handshake.
+pub fn validate_turn_origin_label(label: &str) -> Result<(), String> {
+    match crate::runtime::turn_origin::Origin::parse(label) {
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "invalid turn origin label {label:?}: use 1-{} lowercase letters, digits or '-'",
+            crate::runtime::turn_origin::LABEL_MAX
+        )),
+    }
 }
 
 /// `SYNAPS_CLIENT_NAME`, trimmed; `None` when unset or empty. Not
@@ -860,12 +881,19 @@ impl ClientMeta {
             tail_items: tail_items_from_env(),
             capabilities: ClientCapabilities::current(),
             name: None,
+            turn_origin: None,
         }
     }
 
     /// With a requested name (see [`ClientMeta::name`]).
     pub fn named(mut self, name: Option<String>) -> Self {
         self.name = name;
+        self
+    }
+
+    /// With a declared turn-origin label (see [`ClientMeta::turn_origin`]).
+    pub fn with_turn_origin(mut self, label: Option<String>) -> Self {
+        self.turn_origin = label;
         self
     }
 }
@@ -1085,10 +1113,21 @@ pub enum SessionCommand {
         /// Empty ⇔ text-only (backward compatible).
         #[serde(default)]
         attachments: Vec<serde_json::Value>,
+        /// The sending client's turn-origin label ([`ClientMeta::turn_origin`])
+        /// when the text is the owner's own, typed in that client's input
+        /// box. Counts only from a chat client that declared this very
+        /// label; from any other sender the turn runs unmarked. Anything
+        /// but a valid label refuses the command.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     /// Text typed while streaming. Actor: steer if a steer_tx is live else
-    /// queue; ALWAYS also sets queued_message.
-    Steer { text: String },
+    /// queue; ALWAYS also sets queued_message. `origin` as for `Submit`.
+    Steer {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
+    },
     /// Steer one of this session's running subagents (`sa_N`) from its watch
     /// view. Owner-only like `Steer`. The note also enters the MAIN
     /// conversation as an event (no auto-turn), so the main agent knows the
@@ -1266,7 +1305,7 @@ impl SessionCommand {
 impl std::fmt::Debug for SessionCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Submit { attachments, .. } => {
+            Self::Submit { attachments, origin, .. } => {
                 let kinds: Vec<&str> = attachments
                     .iter()
                     .filter_map(|b| b.get("type").and_then(|v| v.as_str()))
@@ -1274,11 +1313,13 @@ impl std::fmt::Debug for SessionCommand {
                 f.debug_struct("Submit")
                     .field("text", &format_args!("<redacted>"))
                     .field("attachments", &format_args!("{}:{:?}", attachments.len(), kinds))
+                    .field("origin", &origin.is_some())
                     .finish()
             }
-            Self::Steer { .. } => f
+            Self::Steer { origin, .. } => f
                 .debug_struct("Steer")
                 .field("text", &format_args!("<redacted>"))
+                .field("origin", &origin.is_some())
                 .finish(),
             Self::SubagentSteer { handle_id, .. } => f
                 .debug_struct("SubagentSteer")
@@ -2116,9 +2157,10 @@ mod tests {
 
         let submit: SessionCommand = serde_json::from_str(r#"{"cmd":"submit","text":"hi"}"#).unwrap();
         match submit {
-            SessionCommand::Submit { text, attachments } => {
+            SessionCommand::Submit { text, attachments, origin } => {
                 assert_eq!(text, "hi");
                 assert!(attachments.is_empty());
+                assert_eq!(origin, None);
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -2131,11 +2173,12 @@ mod tests {
         let submit_with = SessionCommand::Submit {
             text: "describe".into(),
             attachments: blocks.clone(),
+            origin: None,
         };
         let json = serde_json::to_string(&submit_with).unwrap();
         let back: SessionCommand = serde_json::from_str(&json).unwrap();
         match back {
-            SessionCommand::Submit { text, attachments } => {
+            SessionCommand::Submit { text, attachments, .. } => {
                 assert_eq!(text, "describe");
                 assert_eq!(attachments.len(), 2);
                 assert_eq!(attachments[0]["type"], "image");
@@ -2180,8 +2223,8 @@ mod tests {
     fn command_debug_redacts_bodies_without_lengths() {
         let secret = "hunter2-very-secret";
         let cmds = vec![
-            SessionCommand::Submit { text: secret.into(), attachments: vec![] },
-            SessionCommand::Steer { text: secret.into() },
+            SessionCommand::Submit { text: secret.into(), attachments: vec![], origin: Some("test-app".into()) },
+            SessionCommand::Steer { text: secret.into(), origin: Some("test-app".into()) },
             SessionCommand::SubagentSteer { handle_id: "sa_1".into(), text: secret.into() },
             SessionCommand::SubmitPrepared {
                 messages: vec![std::sync::Arc::new(serde_json::json!({"content": secret}))],
@@ -2197,6 +2240,8 @@ mod tests {
             assert!(d.contains("<redacted>"), "{d}");
             assert!(!d.contains("chars"), "{d}");
             assert!(!d.contains(&secret.len().to_string()), "{d}");
+            // The origin label is never printed, only whether one was sent.
+            assert!(!d.contains("test-app"), "{d}");
         }
         let d = format!("{:?}", SessionCommand::Set { id: 4, setting: SessionSetting::ReloadPrompt });
         assert_eq!(d, "Set { id: 4, setting: ReloadPrompt }");
@@ -2209,6 +2254,7 @@ mod tests {
                 serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":b64_secret}}),
                 serde_json::json!({"type":"document","title":"x.pdf","source":{"type":"base64","media_type":"application/pdf","data":"JVBER"}}),
             ],
+            origin: None,
         };
         let d = format!("{cmd:?}");
         assert!(d.contains(r#"2:["image", "document"]"#), "{d}");

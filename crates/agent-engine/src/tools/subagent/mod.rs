@@ -2357,6 +2357,11 @@ mod worker_context_window_wire_tests {
 #[path = "../../../tests/support/worker_wire.rs"]
 mod worker_wire;
 
+/// Turn origin: a worker brief that spells the tag is neutralized and never
+/// vouched.
+#[cfg(test)]
+mod turn_origin_worker_tests;
+
 /// Tool-round keep-warm (`cache_keepwarm_tools`) reaches the worker of every
 /// spawn path with no `EngineHost`: a `bash` call that outlives the cache
 /// TTL is kept warm and the request after it reads the prefix; with the key

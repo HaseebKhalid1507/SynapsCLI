@@ -301,6 +301,7 @@ async fn undelivered_steer_is_dequeued_not_slipped_into_history() {
     until(&mut a, is_text).await;
     a.send(SessionCommand::Steer {
         text: "actually do Y".into(),
+        origin: None,
     })
     .await
     .unwrap();

@@ -78,7 +78,7 @@ async fn create(sock: &Path, cwd: &Path) -> (SocketTransport, SessionId) {
 }
 
 async fn run_turn(t: &mut SocketTransport) {
-    t.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![], origin: None }).await.unwrap();
     until(t, |e| matches!(e, SessionEventWire::Idle)).await;
 }
 
@@ -153,7 +153,7 @@ async fn close_refuses_mid_turn_without_force_and_force_ends_it() {
     let (d, _hits) = boot(&guard, Script::Endless(ANTHROPIC_SSE_PREFIX), "never").await;
     let sock = d.paths.sock.clone();
     let (mut t, sid) = create(&sock, guard.home.path()).await;
-    t.send_from_self(SessionCommand::Submit { text: "go".into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(SessionCommand::Submit { text: "go".into(), attachments: vec![], origin: None }).await.unwrap();
     until(&mut t, |e| matches!(e, SessionEventWire::Stream(StreamEvent::Llm(_)))).await;
 
     match SocketTransport::close(&sock, &sid, false, true).await {
@@ -186,7 +186,7 @@ async fn concurrent_plain_and_force_closes_each_get_their_own_reply() {
     let sock = d.paths.sock.clone();
     for round in 0..3 {
         let (mut t, sid) = create(&sock, guard.home.path()).await;
-        t.send_from_self(SessionCommand::Submit { text: "go".into(), attachments: vec![] }).await.unwrap();
+        t.send_from_self(SessionCommand::Submit { text: "go".into(), attachments: vec![], origin: None }).await.unwrap();
         until(&mut t, |e| matches!(e, SessionEventWire::Stream(StreamEvent::Llm(_)))).await;
 
         let (plain, forced) =
@@ -432,7 +432,7 @@ async fn an_owner_whose_socket_is_backed_up_still_gets_ended_before_eof() {
 
     // Watch the turn in-process; the owner reads nothing from here on.
     let mut rx = d.state.attach(&sid).expect("listed").subscribe();
-    let submit = SessionCommand::Submit { text: "go".into(), attachments: vec![] };
+    let submit = SessionCommand::Submit { text: "go".into(), attachments: vec![], origin: None };
     write_frame(&mut w, &ClientFrame::Cmd { session_id: sid.clone(), cmd: submit }).await;
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
