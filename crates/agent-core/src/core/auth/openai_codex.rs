@@ -49,11 +49,13 @@ pub async fn login_into(
     let auth_url = build_auth_url(&challenge, &state)?;
 
     eprintln!("\n\x1b[1mOpening browser to sign in with ChatGPT...\x1b[0m\n");
+    // Print the URL first: `open_browser` can block on a slow handler, and the
+    // fallback must be on screen by then.
+    eprintln!("\x1b[2mIf the browser didn't open, visit this URL:\x1b[0m");
+    eprintln!("\x1b[36m{}\x1b[0m\n", auth_url);
     if let Err(e) = open_browser(&auth_url) {
         eprintln!("Could not open browser automatically: {}", e);
     }
-    eprintln!("\x1b[2mIf the browser didn't open, visit this URL:\x1b[0m");
-    eprintln!("\x1b[36m{}\x1b[0m\n", auth_url);
 
     let (manual_tx, manual_rx) = oneshot::channel::<CallbackResult>();
     let stdin_task = tokio::spawn(async move {

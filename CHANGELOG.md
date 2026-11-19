@@ -159,10 +159,12 @@ All notable changes to this project will be documented in this file.
   the Claude, ChatGPT, Gemini and Grok authorize URLs (all full of `&`)
   opened cut short, a broken page and a stray `cmd` window with it. The URL
   now goes straight to `ShellExecuteW`, unchanged, and only `http(s)` URLs
-  are opened. Linux and macOS are as before. Grok's sign-in also never
-  printed the URL, so a user, or a GUI client reading stderr, had no way to
-  open it by hand when the auto-open failed; it now prints "If the browser
-  didn't open, visit this URL:" and the URL, as the other providers do.
+  with no quote, space or control character are opened. Linux and macOS are
+  as before. Grok's sign-in also never printed the URL, so a user, or a GUI
+  client reading stderr, had no way to open it by hand when the auto-open
+  failed; it now prints "If the browser didn't open, visit this URL:" and
+  the URL, as the other providers do. Every sign-in now prints its URL
+  before it tries to open the browser.
 
 - **Releases carry the `.deb` again.** The `.deb` was uploaded after the
   GitHub release was published, and this repository has immutable releases,

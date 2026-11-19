@@ -49,8 +49,14 @@ struct ShellOpen {
 ///
 /// `ShellExecuteW` with `open` runs whatever it is given: a program path, a
 /// document, a `file:` URL. Only `http(s)` URLs are sign-in pages, so anything
-/// else (and anything with a control character, a NUL most of all) is refused
-/// instead of launched. The URL is not trimmed, quoted or escaped.
+/// else is refused instead of launched.
+///
+/// A `"`, whitespace (a space included) or control character (a NUL most of
+/// all) is refused too. Sign-in URLs percent-encode all of them, and the
+/// shell puts the URL into the browser's registered command line (`"%1"`, or
+/// a bare `%1`): there a `"` closes the quote and a space starts a new
+/// argument, so a crafted URL could pass the browser switches of its own.
+/// The URL is not trimmed, quoted or escaped.
 #[cfg(any(target_os = "windows", test))]
 fn shell_open_request(url: &str) -> Result<ShellOpen, String> {
     let is_web_url = ["http://", "https://"].iter().any(|scheme| {
@@ -60,8 +66,14 @@ fn shell_open_request(url: &str) -> Result<ShellOpen, String> {
     if !is_web_url {
         return Err("Failed to open browser: only http(s) URLs are opened".to_string());
     }
-    if url.chars().any(char::is_control) {
-        return Err("Failed to open browser: URL contains a control character".to_string());
+    if url
+        .chars()
+        .any(|c| c == '"' || c.is_whitespace() || c.is_control())
+    {
+        return Err(
+            "Failed to open browser: URL contains a quote, whitespace or control character"
+                .to_string(),
+        );
     }
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     Ok(ShellOpen {
@@ -87,6 +99,13 @@ fn shell_execute_failure(code: isize) -> String {
 /// asked to initialise COM first. Doing that here, on a thread that ends right
 /// after, leaves the calling thread (often a Tokio worker) in no apartment it
 /// never asked for.
+///
+/// This blocks until the shell returns, so the caller learns whether it
+/// worked. That is normally a few milliseconds (the shell starts the browser
+/// and does not wait for it), but a handler that shows a dialog can hold it
+/// longer. That is acceptable because every sign-in prints its URL *before*
+/// calling [`open_browser`], so the manual fallback is on screen whatever the
+/// handler does.
 #[cfg(target_os = "windows")]
 fn shell_open(url: &str) -> Result<(), String> {
     let request = shell_open_request(url)?;
@@ -245,6 +264,32 @@ mod tests {
     }
 
     #[test]
+    fn quotes_and_whitespace_are_refused() {
+        // A registered `"%1"` would see the `"` close its quote, and the space
+        // (or any other whitespace) start a new argument.
+        for bad in [
+            "https://example.com/a b",
+            "https://example.com/ ",
+            "https://example.com/?q=1 --new-window",
+            "https://example.com/\"",
+            "https://example.com/\" --user-data-dir=C:\\evil",
+            "https://example.com/a\u{a0}b",
+            "https://example.com/a\u{2028}b",
+            "https://example.com/a\u{3000}b",
+        ] {
+            assert!(shell_open_request(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn encoded_quotes_and_spaces_are_fine() {
+        // What the sign-in URLs actually carry: the same characters, encoded.
+        let url = "https://example.com/?q=a%20b%22c+d&r=e";
+        let request = shell_open_request(url).unwrap();
+        assert_eq!(decode(&request.target), url);
+    }
+
+    #[test]
     fn shell_execute_failure_names_the_code() {
         assert!(shell_execute_failure(2).contains("returned 2"));
         assert!(shell_execute_failure(31).contains("no default browser"));
@@ -254,23 +299,31 @@ mod tests {
     /// The bug this file exists to prevent: opening a URL through `cmd /c start`.
     /// Whatever the Windows path becomes, it must not go back through a command
     /// interpreter (or a PowerShell/Explorer detour that parses the URL again).
+    ///
+    /// Only the code above the test module is read, and only its code: comment
+    /// lines are dropped, so a comment can neither trip the ban nor stand in
+    /// for the `ShellExecuteW` call.
     #[test]
     fn windows_path_does_not_go_through_a_command_interpreter() {
         let source = include_str!("browser.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the production code comes first")
+        let (production, _tests) = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("the tests module follows the production code");
+        let code = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
             .to_ascii_lowercase();
         for banned in ["\"cmd", "\"/c\"", "\"start\"", "powershell", "explorer"] {
             assert!(
-                !production.contains(banned),
+                !code.contains(banned),
                 "browser.rs must not use {banned}: it would split the URL at the first `&`"
             );
         }
         assert!(
-            production.contains("shellexecutew"),
-            "the Windows path is ShellExecuteW"
+            code.contains("shellexecutew("),
+            "the Windows path must call ShellExecuteW"
         );
     }
 }
