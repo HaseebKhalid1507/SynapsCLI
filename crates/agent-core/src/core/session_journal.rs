@@ -337,6 +337,9 @@ pub enum SaveMode {
     FullSnapshot,
     /// Delta append: `messages` new history entries plus one meta record.
     Append { messages: usize },
+    /// Delta append that first amends the last saved message (O(message)),
+    /// then `messages` new entries and one meta record.
+    Amend { messages: usize },
 }
 
 /// Machine-readable receipt for benchmarks and delta-proportionality tests.
@@ -387,6 +390,13 @@ enum JournalRecord {
         /// [`times_hash`] of the same prefix; absent = no message times.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         times_hash: Option<String>,
+        /// [`hooked_hash`] of the same prefix; absent = no hooked message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hooked_hash: Option<String>,
+        /// [`head_hash`] of the same prefix: what an amend of its last
+        /// message must leave unchanged. Absent = no amend (snapshot).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_hash: Option<String>,
     },
     /// Message at ABSOLUTE history index `i`; `t` is its turn id and `at`
     /// its recorded time, both kept beside the message (see
@@ -402,6 +412,19 @@ enum JournalRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         /// Any JSON on read: a malformed time is dropped, never fatal.
         at: Option<serde_json::Value>,
+        /// Its `before_message` count ([`HOOKED_KEY`]), beside it too. Any
+        /// JSON on read: a malformed count is dropped, never fatal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        h: Option<serde_json::Value>,
+        /// An AMEND: `m` (with `t`, `at`, `h`) replaces the message at `i`,
+        /// which must be the last one so far. Written when only the newest
+        /// saved message changed (the `before_message` hook saving context
+        /// on a prompt the frontend saved before the turn, #414): O(message)
+        /// instead of a full snapshot. Builds without amends read it as a
+        /// message they already have (`i` below their length) and keep
+        /// their copy: they lose the amendment, never the history after it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        amend: bool,
     },
     /// Full session metadata (the `Session` object minus `api_messages`).
     #[serde(rename = "meta")]
@@ -414,6 +437,10 @@ enum JournalRecord {
         turns_hash: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         times_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hooked_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_hash: Option<String>,
     },
 }
 
@@ -421,8 +448,13 @@ fn message_turn_id(message: &serde_json::Value) -> Option<&str> {
     message.get(MESSAGE_TURN_KEY)?.get("id")?.as_str()
 }
 
+/// The `before_message` count of a message (#414), persisted beside it like
+/// the turn id and time (`h` on journal `msg` records, `_hooked` in the
+/// snapshot).
+use crate::core::extension_context::HOOKED_KEY;
+
 /// In-memory host keys that are persisted beside a message, never inside.
-const SIBLING_KEYS: [&str; 2] = [MESSAGE_TURN_KEY, MESSAGE_AT_KEY];
+const SIBLING_KEYS: [&str; 3] = [MESSAGE_TURN_KEY, MESSAGE_AT_KEY, HOOKED_KEY];
 
 fn has_sibling_key(object: &serde_json::Map<String, serde_json::Value>) -> bool {
     SIBLING_KEYS.iter().any(|k| object.contains_key(*k))
@@ -507,6 +539,61 @@ fn times_hash(messages: &[SharedMessage]) -> std::io::Result<Option<String>> {
     }
     let bytes = serde_json::to_vec(&times).map_err(std::io::Error::other)?;
     Ok(Some(format!("{:x}", Sha256::digest(&bytes))))
+}
+
+/// `(index, count)` of every hooked message, in order.
+fn hooked_counts(messages: &[SharedMessage]) -> Vec<(usize, usize)> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| crate::core::extension_context::hooked(m).map(|n| (i, n)))
+        .collect()
+}
+
+/// Like [`turns_hash`], for `before_message` counts: marking an
+/// already-saved message hooked is an edit the history hash cannot see.
+/// `None` = no hooked message.
+fn hooked_hash(messages: &[SharedMessage]) -> std::io::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let counts = hooked_counts(messages);
+    if counts.is_empty() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(&counts).map_err(std::io::Error::other)?;
+    Ok(Some(format!("{:x}", Sha256::digest(&bytes))))
+}
+
+/// Well-formed `[index, count]` entries of a snapshot's `_hooked`. Anything
+/// else is dropped with a warning: the message then reads as never hooked
+/// (its blocks as the user's text, hooked again if it is resent).
+pub(crate) fn stored_hooked(value: serde_json::Value) -> Vec<(usize, usize)> {
+    let entries = match value {
+        serde_json::Value::Null => return Vec::new(),
+        serde_json::Value::Array(entries) => entries,
+        _ => {
+            tracing::warn!("session snapshot has a malformed _hooked; counts dropped");
+            return Vec::new();
+        }
+    };
+    let total = entries.len();
+    let counts: Vec<(usize, usize)> = entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect();
+    if counts.len() != total {
+        tracing::warn!(dropped = total - counts.len(), "malformed _hooked entries dropped");
+    }
+    counts
+}
+
+/// A journal `h`: kept only when it is a non-negative integer.
+fn journal_hooked(h: Option<serde_json::Value>) -> Option<usize> {
+    let h = h?;
+    let n = h.as_u64().and_then(|n| usize::try_from(n).ok());
+    if n.is_none() {
+        tracing::warn!("malformed journal before_message count dropped");
+    }
+    n
 }
 
 fn set_message_time(message: &mut serde_json::Value, ts: String) {
@@ -645,6 +732,11 @@ struct SnapshotBinding {
     /// Same placement and leniency as `_turn_ids` ([`stored_message_times`]).
     #[serde(default, rename = "_message_times")]
     message_times: serde_json::Value,
+    /// BEFORE `api_messages` (unlike the two above), so a streaming body
+    /// walk knows each message's count when it reaches it
+    /// (`session_catalog::body`). Lenient: [`stored_hooked`].
+    #[serde(default, rename = "_hooked")]
+    hooked: serde_json::Value,
 }
 
 /// Well-formed `[index, RFC 3339 time]` entries of a snapshot's
@@ -737,7 +829,16 @@ fn matching_open(record: &JournalRecord, snapshot_generation: Option<&str>) -> O
 /// hashes), including all stored message fields. Unlike the
 /// old last-message tripwire this detects same-length edits anywhere, even
 /// when the journal contains only its open record. Uses the existing sha2 dep.
+#[cfg(test)]
 fn history_hash(messages: &[SharedMessage]) -> std::io::Result<String> {
+    Ok(history_hashes(messages)?.1)
+}
+
+/// `(history hash of all but the last message, history hash of all)` in
+/// one pass: the bytes hashed are exactly `serde_json::to_writer` of the
+/// stored prefix (`[` m0 `,` m1 … `]`), and the shorter prefix's state is
+/// the longer one's before its last message. `None` for an empty history.
+fn history_hashes(messages: &[SharedMessage]) -> std::io::Result<(Option<String>, String)> {
     use sha2::{Digest, Sha256};
     struct HashWriter(Sha256);
     impl Write for HashWriter {
@@ -750,8 +851,41 @@ fn history_hash(messages: &[SharedMessage]) -> std::io::Result<String> {
         }
     }
     let mut writer = HashWriter(Sha256::new());
-    serde_json::to_writer(&mut writer, &StoredMessages(messages)).map_err(std::io::Error::other)?;
-    Ok(format!("{:x}", writer.0.finalize()))
+    writer.0.update(b"[");
+    let mut head = None;
+    for (i, message) in messages.iter().enumerate() {
+        if i + 1 == messages.len() {
+            let mut prefix = writer.0.clone();
+            prefix.update(b"]");
+            head = Some(format!("{:x}", prefix.finalize()));
+        }
+        if i > 0 {
+            writer.0.update(b",");
+        }
+        serde_json::to_writer(&mut writer, &Stored(message)).map_err(std::io::Error::other)?;
+    }
+    writer.0.update(b"]");
+    Ok((head, format!("{:x}", writer.0.finalize())))
+}
+
+/// Everything persisted about `messages` but their last one (stored bytes,
+/// turn ids, times, `before_message` counts), as one digest; `head` is
+/// `history_hashes(messages).0`. A save may amend the last saved message
+/// only while this is unchanged. `None` for an empty history.
+fn head_hash(messages: &[SharedMessage], head: Option<String>) -> std::io::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let Some(head) = head else {
+        return Ok(None);
+    };
+    let prefix = &messages[..messages.len() - 1];
+    let digest = serde_json::to_vec(&(
+        head,
+        turns_hash(prefix)?,
+        times_hash(prefix)?,
+        hooked_hash(prefix)?,
+    ))
+    .map_err(std::io::Error::other)?;
+    Ok(Some(format!("{:x}", Sha256::digest(&digest))))
 }
 
 /// Only clean, generation-matched v2 journals can be appended to. Legacy
@@ -761,6 +895,8 @@ struct JournalState {
     history_hash: String,
     turns_hash: Option<String>,
     times_hash: Option<String>,
+    hooked_hash: Option<String>,
+    head_hash: Option<String>,
     bytes: u64,
 }
 
@@ -793,6 +929,8 @@ fn read_journal_state(
         history_hash: Some(mut hash),
         turns_hash: mut turns,
         times_hash: mut times,
+        hooked_hash: mut hooked,
+        head_hash: mut head,
         ..
     } = open
     else {
@@ -800,11 +938,18 @@ fn read_journal_state(
     };
     let mut durable_len = base;
     let mut hashed_len = base;
+    // An amend not yet committed by a meta record.
+    let mut amended = false;
     for line in lines {
         match serde_json::from_str::<JournalRecord>(line) {
-            Ok(JournalRecord::Msg { v, i, .. })
-                if v == JOURNAL_SCHEMA_VERSION && i == durable_len =>
-            {
+            Ok(JournalRecord::Msg {
+                v, i, amend: true, ..
+            }) if v == JOURNAL_SCHEMA_VERSION && i.checked_add(1) == Some(durable_len) => {
+                amended = true;
+            }
+            Ok(JournalRecord::Msg {
+                v, i, amend: false, ..
+            }) if v == JOURNAL_SCHEMA_VERSION && i == durable_len => {
                 durable_len += 1;
             }
             Ok(JournalRecord::Meta {
@@ -813,6 +958,8 @@ fn read_journal_state(
                 history_hash: Some(next_hash),
                 turns_hash: next_turns,
                 times_hash: next_times,
+                hooked_hash: next_hooked,
+                head_hash: next_head,
             }) if v == JOURNAL_SCHEMA_VERSION
                 && meta.id == id
                 && meta.message_count == Some(durable_len) =>
@@ -820,19 +967,24 @@ fn read_journal_state(
                 hash = next_hash;
                 turns = next_turns;
                 times = next_times;
+                hooked = next_hooked;
+                head = next_head;
+                amended = false;
                 hashed_len = durable_len;
             }
             _ => return Ok(None),
         }
     }
-    if hashed_len != durable_len {
-        return Ok(None); // messages without a complete committing meta record
+    if hashed_len != durable_len || amended {
+        return Ok(None); // records without a complete committing meta record
     }
     Ok(Some(JournalState {
         durable_len,
         history_hash: hash,
         turns_hash: turns,
         times_hash: times,
+        hooked_hash: hooked,
+        head_hash: head,
         bytes: raw.len() as u64,
     }))
 }
@@ -909,33 +1061,58 @@ fn save_journal_mode(
         return full_snapshot_reset(handle, session);
     };
 
-    if session.api_messages.len() < state.durable_len
-        || history_hash(&session.api_messages[..state.durable_len])? != state.history_hash
-        || turns_hash(&session.api_messages[..state.durable_len])? != state.turns_hash
-        || times_hash(&session.api_messages[..state.durable_len])? != state.times_hash
+    if session.api_messages.len() < state.durable_len {
+        return full_snapshot_reset(handle, session);
+    }
+    let saved = &session.api_messages[..state.durable_len];
+    let (saved_head, saved_hash) = history_hashes(saved)?;
+    let unchanged = saved_hash == state.history_hash
+        && turns_hash(saved)? == state.turns_hash
+        && times_hash(saved)? == state.times_hash
+        && hooked_hash(saved)? == state.hooked_hash;
+    // The `before_message` hook's edit of a prompt the frontend saved
+    // before the turn (#414): only the last saved message changed and it is
+    // now a hooked user message. Amend it (O(message)); any other edit
+    // snapshots as before.
+    let amend = !unchanged;
+    let hooked_user_tail = saved.last().is_some_and(|m| {
+        m["role"] == "user" && crate::core::extension_context::hooked(m).is_some()
+    });
+    if amend
+        && (!hooked_user_tail
+            || state.head_hash.is_none()
+            || head_hash(saved, saved_head)? != state.head_hash)
     {
         return full_snapshot_reset(handle, session);
     }
 
-    // Delta append: new messages (absolute indices) + one meta record.
+    // Delta append: the amend, new messages (absolute indices), one meta
+    // record.
     let mut buf = Vec::new();
-    for (offset, msg) in session.api_messages[state.durable_len..].iter().enumerate() {
+    let first = if amend { state.durable_len - 1 } else { state.durable_len };
+    for (offset, msg) in session.api_messages[first..].iter().enumerate() {
+        let i = first + offset;
         let record = JournalRecord::Msg {
             v: JOURNAL_SCHEMA_VERSION,
-            i: state.durable_len + offset,
+            i,
             m: stored_value(msg),
             t: message_turn_id(msg).map(serde_json::Value::from),
             at: message_time(msg).map(serde_json::Value::from),
+            h: crate::core::extension_context::hooked(msg).map(serde_json::Value::from),
+            amend: i < state.durable_len,
         };
         serde_json::to_writer(&mut buf, &record).map_err(std::io::Error::other)?;
         buf.push(b'\n');
     }
+    let (head, hash) = history_hashes(&session.api_messages)?;
     let meta = JournalRecord::Meta {
         v: JOURNAL_SCHEMA_VERSION,
         meta: Box::new(SessionMeta::of(session)),
-        history_hash: Some(history_hash(&session.api_messages)?),
+        history_hash: Some(hash),
         turns_hash: turns_hash(&session.api_messages)?,
         times_hash: times_hash(&session.api_messages)?,
+        hooked_hash: hooked_hash(&session.api_messages)?,
+        head_hash: head_hash(&session.api_messages, head)?,
     };
     serde_json::to_writer(&mut buf, &meta).map_err(std::io::Error::other)?;
     buf.push(b'\n');
@@ -958,7 +1135,11 @@ fn save_journal_mode(
     }
 
     Ok(SaveReceipt {
-        mode: SaveMode::Append { messages: appended },
+        mode: if amend {
+            SaveMode::Amend { messages: appended }
+        } else {
+            SaveMode::Append { messages: appended }
+        },
         bytes_written: buf.len() as u64,
     })
 }
@@ -1006,6 +1187,11 @@ struct SessionSnapshotRef<'a> {
     env: Option<Vec<(String, String)>>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     env_stripped: &'a [String],
+    /// Storage-only: each hooked message's `before_message` count. Before
+    /// `api_messages` so a streaming walk has it first (see
+    /// [`SnapshotBinding`]).
+    #[serde(rename = "_hooked", skip_serializing_if = "Vec::is_empty")]
+    hooked: Vec<(usize, usize)>,
     api_messages: StoredMessages<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     abort_context: &'a Option<String>,
@@ -1045,6 +1231,7 @@ impl<'a> SessionSnapshotRef<'a> {
             compacted_into: &s.compacted_into,
             env: scrub_secret_env(s.env.as_ref()),
             env_stripped: &s.env_stripped,
+            hooked: hooked_counts(&s.api_messages),
             api_messages: StoredMessages(&s.api_messages),
             abort_context: &s.abort_context,
             prompt_provenance: &s.prompt_provenance,
@@ -1096,13 +1283,16 @@ fn publish_snapshot(
     // Prepare all serialization BEFORE the logical commit.
     let mut journal = Vec::new();
     if mode == SessionPersistence::Journal {
+        let (head, hash) = history_hashes(&session.api_messages)?;
         let open = JournalRecord::Open {
             v: JOURNAL_SCHEMA_VERSION,
             base: session.api_messages.len(),
             generation,
-            history_hash: Some(history_hash(&session.api_messages)?),
+            history_hash: Some(hash),
             turns_hash: turns_hash(&session.api_messages)?,
             times_hash: times_hash(&session.api_messages)?,
+            hooked_hash: hooked_hash(&session.api_messages)?,
+            head_hash: head_hash(&session.api_messages, head)?,
         };
         serde_json::to_writer(&mut journal, &open).map_err(std::io::Error::other)?;
         journal.push(b'\n');
@@ -1185,6 +1375,11 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             set_message_time(std::sync::Arc::make_mut(message), ts);
         }
     }
+    for (i, n) in stored_hooked(binding.hooked) {
+        if let Some(message) = session.api_messages.get_mut(i) {
+            crate::core::extension_context::set_hooked(std::sync::Arc::make_mut(message), n);
+        }
+    }
 
     let Some(raw) = read_artifact_bytes(&handle, &format!("{id}.journal"))? else {
         return Ok(session);
@@ -1207,13 +1402,41 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             {
                 break;
             }
-            Ok(JournalRecord::Msg { i, mut m, t, at, .. }) => {
+            Ok(JournalRecord::Msg {
+                i,
+                mut m,
+                t,
+                at,
+                h,
+                amend: true,
+                ..
+            }) => {
+                // Only the last message so far can be amended; anything
+                // else is not a journal this build wrote: stop there.
+                if i.checked_add(1) != Some(session.api_messages.len()) {
+                    break;
+                }
+                if let Some(serde_json::Value::String(id)) = t {
+                    set_turn_id(&mut m, id);
+                }
+                if let Some(ts) = journal_time(at) {
+                    set_message_time(&mut m, ts);
+                }
+                if let Some(n) = journal_hooked(h) {
+                    crate::core::extension_context::set_hooked(&mut m, n);
+                }
+                session.api_messages[i] = std::sync::Arc::new(m);
+            }
+            Ok(JournalRecord::Msg { i, mut m, t, at, h, .. }) => {
                 if i == session.api_messages.len() {
                     if let Some(serde_json::Value::String(id)) = t {
                         set_turn_id(&mut m, id);
                     }
                     if let Some(ts) = journal_time(at) {
                         set_message_time(&mut m, ts);
+                    }
+                    if let Some(n) = journal_hooked(h) {
+                        crate::core::extension_context::set_hooked(&mut m, n);
                     }
                     session.api_messages.push(std::sync::Arc::new(m));
                 } else if i > session.api_messages.len() {
@@ -1496,7 +1719,7 @@ mod tests {
         ));
     }
 
-    fn assert_saved(dir: &Path, expected: &Session) {
+    pub(super) fn assert_saved(dir: &Path, expected: &Session) {
         let loaded = load_session_in_dir(dir, &expected.id).unwrap();
         let mut expected = expected.clone();
         expected.message_count = expected.api_messages.len();
@@ -1630,6 +1853,8 @@ mod tests {
             history_hash: None,
             turns_hash: None,
             times_hash: None,
+            hooked_hash: None,
+            head_hash: None,
         }];
         for i in 1..5 {
             push_message(&mut s, "legacy delta");
@@ -1639,6 +1864,8 @@ mod tests {
                 m: s.api_messages[i].as_ref().clone(),
                 t: None,
                 at: None,
+                h: None,
+                amend: false,
             });
         }
         s.title = "legacy title".into();
@@ -1649,6 +1876,8 @@ mod tests {
             history_hash: None,
             turns_hash: None,
             times_hash: None,
+            hooked_hash: None,
+            head_hash: None,
         });
         let mut bytes = Vec::new();
         for record in legacy {
@@ -1985,7 +2214,7 @@ mod save_cost_bench {
 /// readable by 0.10.1.
 #[cfg(test)]
 mod snapshot_only_fields {
-    use super::tests::{push_message, with_messages};
+    use super::tests::{assert_saved, push_message, with_messages};
     use super::*;
 
     /// Task #444: keep-warm spend persists through the snapshot in both
@@ -2583,5 +2812,291 @@ mod snapshot_only_fields {
         let loaded = load_session_in_dir(&dir, &s.id).unwrap();
         assert_eq!(loaded.api_messages.len(), 3, "replay continued past the bad time");
         assert_eq!(message_time(&loaded.api_messages[1]), None);
+    }
+
+    // ── #414 review: before_message counts and tail amends ──────────────
+
+    fn user(text: &str) -> SharedMessage {
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": text}))
+    }
+
+    /// The hook's edit of a prompt the frontend saved before the turn:
+    /// blocks added, the count set.
+    fn hook_edit(message: &mut SharedMessage, blocks: &[&str]) {
+        let m = std::sync::Arc::make_mut(message);
+        let text = m["content"].as_str().unwrap_or_default().to_string();
+        let mut content = vec![serde_json::json!({"type": "text", "text": text})];
+        content.extend(blocks.iter().map(|b| serde_json::json!({"type": "text", "text": b})));
+        m["content"] = serde_json::Value::Array(content);
+        crate::core::extension_context::set_hooked(m, blocks.len());
+    }
+
+    fn journal_lines(dir: &Path, id: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(journal_path(dir, id))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn one_pass_hashes_match_the_serialized_prefixes() {
+        for n in 0..4 {
+            let messages: Vec<SharedMessage> = (0..n).map(|i| user(&format!("m{i}"))).collect();
+            let (head, full) = history_hashes(&messages).unwrap();
+            let plain = |m: &[SharedMessage]| {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(serde_json::to_vec(&StoredMessages(m)).unwrap()))
+            };
+            assert_eq!(full, plain(&messages), "{n}");
+            assert_eq!(head, (n > 0).then(|| plain(&messages[..n - 1])), "{n}");
+        }
+    }
+
+    /// The counts persist beside the message in both formats (never inside
+    /// it), before `api_messages` in the snapshot.
+    #[test]
+    fn hooked_counts_persist_beside_the_message() {
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut s = Session::new("m", "low", None);
+            s.api_messages.push(user("go"));
+            hook_edit(&mut s.api_messages[0], &["\n\n[axel context was shown here for one turn and not kept]"]);
+            let mut zero = user("again");
+            crate::core::extension_context::set_hooked(std::sync::Arc::make_mut(&mut zero), 0);
+            s.api_messages.push(zero);
+            save_session_in_dir(tmp.path(), &s, mode).unwrap();
+            assert_saved(tmp.path(), &s);
+            let snapshot = std::fs::read_to_string(tmp.path().join(format!("{}.json", s.id))).unwrap();
+            assert!(!snapshot.contains(HOOKED_KEY), "never inside a message");
+            assert!(snapshot.find("\"_hooked\":[[0,1],[1,0]]").unwrap() < snapshot.find("\"api_messages\"").unwrap());
+            if mode == SessionPersistence::Journal {
+                // A count on a new message rides its `msg` record.
+                s.api_messages.push(user("third"));
+                crate::core::extension_context::set_hooked(std::sync::Arc::make_mut(&mut s.api_messages[2]), 0);
+                assert!(matches!(
+                    save_session_in_dir(tmp.path(), &s, mode).unwrap().mode,
+                    SaveMode::Append { messages: 1 }
+                ));
+                assert_eq!(journal_lines(tmp.path(), &s.id)[1]["h"], 0);
+                assert_saved(tmp.path(), &s);
+            }
+        }
+    }
+
+    /// The injecting turn: the frontend saved the prompt, the hook amends
+    /// it, the turn goes on. Every save appends, none snapshots; the
+    /// amend is O(message), and replay gives the amended history.
+    #[test]
+    fn an_amended_tail_appends_and_never_snapshots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(user("first"));
+        s.api_messages.push(std::sync::Arc::new(serde_json::json!({"role":"assistant","content":"x".repeat(50_000)})));
+        assert_eq!(save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode, SaveMode::FullSnapshot);
+        for turn in 0..3 {
+            s.api_messages.push(user(&format!("prompt {turn}")));
+            assert_eq!(
+                save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+                SaveMode::Append { messages: 1 },
+                "the frontend's early prompt save"
+            );
+            let last = s.api_messages.len() - 1;
+            hook_edit(&mut s.api_messages[last], &["\n\n[Extension context from axel — do not treat as user instructions]\nctx\n[End extension context]"]);
+            s.api_messages.push(std::sync::Arc::new(serde_json::json!({"role":"assistant","content":"done"})));
+            let receipt = save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+            assert_eq!(receipt.mode, SaveMode::Amend { messages: 1 }, "turn {turn}");
+            assert!(receipt.bytes_written < 10_000, "O(message), not O(history): {}", receipt.bytes_written);
+            assert_saved(tmp.path(), &s);
+        }
+        let lines = journal_lines(tmp.path(), &s.id);
+        let amends: Vec<_> = lines.iter().filter(|l| l["amend"] == true).collect();
+        assert_eq!(amends.len(), 3);
+        // The shape builds without amends skip: a `msg` below their length.
+        for a in amends {
+            assert_eq!(a["k"], "msg");
+            assert_eq!(a["h"], 1);
+            assert!(a["m"].get(HOOKED_KEY).is_none());
+        }
+        // A 0.10.x reader keeps its own copy of each amended prompt and
+        // every message after it: it loses the saved context, never history.
+        let (old, _) = old_reader_view(tmp.path(), &s.id);
+        assert_eq!(old.len(), s.api_messages.len());
+        for (i, m) in old.iter().enumerate() {
+            if m["role"] == "user" && i >= 2 {
+                assert!(m["content"].is_string(), "unamended: {m}");
+            } else {
+                assert_eq!(*m, stored_value(&s.api_messages[i]));
+            }
+        }
+        // A count set on the saved tail alone (the hook answered nothing)
+        // is an amend too.
+        s.api_messages.push(user("quiet"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        let last = s.api_messages.len() - 1;
+        crate::core::extension_context::set_hooked(std::sync::Arc::make_mut(&mut s.api_messages[last]), 0);
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::Amend { messages: 0 }
+        );
+        assert_saved(tmp.path(), &s);
+        // An edit before the tail is not an amend: full snapshot.
+        hook_edit(&mut s.api_messages[0], &["late"]);
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::FullSnapshot
+        );
+        assert_saved(tmp.path(), &s);
+    }
+
+    /// An amend without its committing meta record (a torn tail) replays,
+    /// and the next save snapshots rather than append after it.
+    #[test]
+    fn a_torn_amend_replays_and_the_next_save_snapshots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(user("go"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        hook_edit(&mut s.api_messages[0], &["\n\n[axel context was shown here for one turn and not kept]"]);
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::Amend { messages: 0 }
+        );
+        // A crash mid-write: the committing meta record is half a line.
+        let path = journal_path(tmp.path(), &s.id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let meta = text.rfind("{\"k\":\"meta\"").unwrap();
+        let torn = &text[..meta + (text.len() - meta) / 2];
+        assert!(!torn.ends_with('\n'));
+        std::fs::write(&path, torn).unwrap();
+        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        assert_eq!(loaded.api_messages[0], s.api_messages[0]);
+        s.api_messages.push(user("next"));
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::FullSnapshot
+        );
+        assert_saved(tmp.path(), &s);
+    }
+
+    /// Only the hook's edit is amended: an edit of the saved tail that does
+    /// not leave a hooked user message there snapshots as before.
+    #[test]
+    fn other_tail_edits_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(user("go"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        // A user tail edited without a count.
+        s.api_messages[0] = user("go, edited");
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::FullSnapshot
+        );
+        // A counted tail that is not a user message.
+        let mut reply = std::sync::Arc::new(serde_json::json!({"role":"assistant","content":"x"}));
+        s.api_messages.push(reply.clone());
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        crate::core::extension_context::set_hooked(std::sync::Arc::make_mut(&mut reply), 0);
+        s.api_messages[1] = reply;
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::FullSnapshot
+        );
+        assert_saved(tmp.path(), &s);
+    }
+
+    /// The count-0 amend (nothing injected) is one small record.
+    #[test]
+    fn a_count_zero_amend_is_tiny() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(std::sync::Arc::new(serde_json::json!({"role":"assistant","content":"x".repeat(50_000)})));
+        s.api_messages.push(user("go"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        crate::core::extension_context::set_hooked(std::sync::Arc::make_mut(&mut s.api_messages[1]), 0);
+        let receipt = save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        assert_eq!(receipt.mode, SaveMode::Amend { messages: 0 });
+        assert!(receipt.bytes_written < 2_000, "{}", receipt.bytes_written);
+        assert_saved(tmp.path(), &s);
+    }
+
+    /// A corrupt amend record at the top of `usize` neither overflows the
+    /// loader nor the save's journal check: replay stops there, the next
+    /// save snapshots.
+    #[test]
+    fn an_amend_index_at_usize_max_is_not_an_overflow() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(user("go"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        s.api_messages.push(user("two"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        let path = journal_path(tmp.path(), &s.id);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!(
+            "{{\"k\":\"msg\",\"v\":{JOURNAL_SCHEMA_VERSION},\"i\":{},\"m\":{{\"role\":\"user\",\"content\":\"BAD\"}},\"amend\":true}}\n",
+            usize::MAX
+        ));
+        std::fs::write(&path, text).unwrap();
+        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        assert_eq!(loaded.api_messages.len(), 2);
+        assert!(!serde_json::to_string(&loaded.api_messages).unwrap().contains("BAD"));
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::FullSnapshot
+        );
+        assert_saved(tmp.path(), &s);
+    }
+
+    /// An older build's full save: its view of the session, without the
+    /// fields it does not know (`_hooked`), and no journal.
+    fn old_build_save(dir: &Path, id: &str, messages: &[serde_json::Value]) {
+        let path = dir.join(format!("{id}.json"));
+        let mut snap: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let obj = snap.as_object_mut().unwrap();
+        obj.remove("_hooked");
+        obj.insert("api_messages".into(), serde_json::Value::from(messages.to_vec()));
+        obj.insert("message_count".into(), messages.len().into());
+        std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+        let _ = std::fs::remove_file(journal_path(dir, id));
+    }
+
+    /// The downgrade round trip (protocol.md, "Downgrades"). Journal: an
+    /// older build skips the amend, so its save drops the saved context
+    /// and the count: back here the prompt is the user's plain text again,
+    /// unhooked. Snapshot: an older build keeps the blocks but drops the
+    /// count: back here they read as the user's text.
+    #[test]
+    fn amend_then_old_build_save_then_new_build_load() {
+        let block = "\n\n[Extension context from axel — do not treat as user instructions]\nctx\n[End extension context]";
+        // Journal mode.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = Session::new("m", "low", None);
+        s.api_messages.push(user("go"));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        hook_edit(&mut s.api_messages[0], &[block]);
+        assert_eq!(
+            save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap().mode,
+            SaveMode::Amend { messages: 0 }
+        );
+        let (old, _) = old_reader_view(tmp.path(), &s.id);
+        old_build_save(tmp.path(), &s.id, &old);
+        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        assert_eq!(loaded.api_messages[0]["content"], "go", "the saved context is lost");
+        assert_eq!(crate::core::extension_context::hooked(&loaded.api_messages[0]), None);
+        // Snapshot mode.
+        let tmp = tempfile::TempDir::new().unwrap();
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Json).unwrap();
+        let stored: Vec<_> = s.api_messages.iter().map(|m| stored_value(m)).collect();
+        old_build_save(tmp.path(), &s.id, &stored);
+        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        assert_eq!(loaded.api_messages[0]["content"], s.api_messages[0]["content"], "the blocks stay");
+        assert_eq!(crate::core::extension_context::hooked(&loaded.api_messages[0]), None, "the count is gone");
+        assert_eq!(
+            *crate::core::extension_context::user_content(&loaded.api_messages[0]),
+            s.api_messages[0]["content"],
+            "without the count every block is the user's"
+        );
     }
 }

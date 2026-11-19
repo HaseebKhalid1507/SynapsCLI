@@ -150,7 +150,11 @@ async fn engine_publishes_append_only_history_at_every_round_boundary() {
         !published[0].2,
         "prompt checkpoint precedes the first response"
     );
-    assert!(Arc::ptr_eq(&published[0].0[0], &prompt));
+    // The caller's prompt, marked hooked (#414: count 0, no handler) before
+    // its first publish; nothing else about it changed.
+    let mut first = (*published[0].0[0]).clone();
+    assert_eq!(first.as_object_mut().unwrap().remove("_synaps_hooked"), Some(json!(0)));
+    assert_eq!(first, *prompt);
     // Each checkpoint extends the previous one — same Arcs, append-only.
     for w in published.windows(2) {
         let (prev, next) = (&w[0].0, &w[1].0);

@@ -45,6 +45,7 @@ mod request_encoding;
 mod sse;
 mod sse_types;
 mod stream;
+mod turn_inject;
 mod chat_tools;
 pub mod subagent;
 pub mod subagent_watch;

@@ -116,6 +116,11 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
             assert_eq!(w.protocol_version, PROTOCOL_VERSION);
             assert_eq!(w.daemon_version, binary_version());
             assert_eq!(w.pid, std::process::id());
+            assert_eq!(
+                w.features,
+                [FEATURE_OWNED_SESSIONS, FEATURE_SESSION_WORKERS, FEATURE_SESSION_PAGE],
+                "every feature this daemon serves"
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -124,6 +129,12 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
     assert!(matches!(c.recv().await, Some(DaemonFrame::Error { .. })));
     c.send(&ClientFrame::Sessions).await;
     assert!(matches!(c.recv().await, Some(DaemonFrame::SessionList { .. })));
+    // A saved-session page is a control frame too (empty HOME → no rows).
+    c.send_line(r#"{"type":"catalog_page","req":5}"#).await;
+    assert!(matches!(
+        c.recv().await,
+        Some(DaemonFrame::CatalogPage { req: 5, ref sessions, next: None, error: None }) if sessions.is_empty()
+    ));
     c.send(&ClientFrame::Bye).await;
     assert!(matches!(c.recv().await, Some(DaemonFrame::Bye { .. })));
 

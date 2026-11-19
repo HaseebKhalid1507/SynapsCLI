@@ -46,7 +46,8 @@
 //!                                            pin a slot as `provider@label`; keys never vended)
 //!   GET  /usage                           -> legacy raw Anthropic usage JSON (machine-auth)
 //!   GET  /usage/snapshot?provider&account -> normalized UsageSnapshot (machine-auth)
-//!   POST /accounts/cooldown               -> { provider, account, until_ms?, reason } (machine-auth)
+//!   POST /accounts/cooldown               -> { provider, account, until_ms?, reason, model? }
+//!                                            (machine-auth; `model`: the limit covers that model only)
 //!   GET  /capabilities                    -> provider status list incl. account rows (no secrets)
 
 use std::net::SocketAddr;
@@ -445,6 +446,33 @@ struct CooldownReport {
     until_ms: Option<u64>,
     #[serde(default)]
     reason: Option<String>,
+    /// The limit covers this model only (the requested id); absent: the
+    /// whole account. Older clients never send it. Unknown fields are
+    /// allowed, so a daemon older than this field cools the account.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Debug builds only: `SYNAPS_TEST_BROKER_USAGE_URL` points the broker's
+/// usage reads at a fake server, so an end-to-end test of the real binary
+/// can run automatic selection without the network. Release builds ignore it.
+fn test_usage_endpoint(local: auth::LocalBroker) -> auth::LocalBroker {
+    #[cfg(debug_assertions)]
+    if let Ok(url) = std::env::var("SYNAPS_TEST_BROKER_USAGE_URL") {
+        return local.with_usage_endpoint_override(url);
+    }
+    local
+}
+
+/// Longest model id a cooldown report may name.
+const MAX_COOLDOWN_MODEL_LEN: usize = 128;
+
+/// A model id a cooldown report may carry: non-empty after trimming, at
+/// most [`MAX_COOLDOWN_MODEL_LEN`] bytes, printable ASCII without spaces.
+fn valid_cooldown_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= MAX_COOLDOWN_MODEL_LEN
+        && model.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// Constant-time byte comparison — avoids a timing oracle on the machine token.
@@ -584,7 +612,7 @@ pub async fn run(
             .is_loopback()
             .then(|| Arc::from(loopback_allowed_hostnames(addr.ip()))),
         token_source,
-        local: Arc::new(auth::LocalBroker::new(client.clone())),
+        local: Arc::new(test_usage_endpoint(auth::LocalBroker::new(client.clone()))),
     };
 
     // Proactive refresh of EVERY stored OAuth slot, SUPERVISED. Each slot
@@ -1014,7 +1042,31 @@ async fn accounts_cooldown(
     };
     let cred = auth::CredentialRef::new(provider_id, account);
     let reason = report.reason.as_deref().unwrap_or("client_report");
-    match st.local.report_cooldown(&cred, report.until_ms, reason).await {
+    // The id the runtime matches on (`quota_model_key`): a client that
+    // sent the routed `anthropic/<id>` still names `<id>`.
+    let model = report.model.as_deref().map(|m| {
+        let m = m.trim();
+        match m.get(..10) {
+            Some(p) if p.eq_ignore_ascii_case("anthropic/") => &m[10..],
+            _ => m,
+        }
+    });
+    if model.is_some_and(|m| !valid_cooldown_model(m)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid model" })),
+        )
+            .into_response();
+    }
+    let reported = match model {
+        Some(model) => {
+            st.local
+                .report_model_cooldown(&cred, model, report.until_ms, reason)
+                .await
+        }
+        None => st.local.report_cooldown(&cred, report.until_ms, reason).await,
+    };
+    match reported {
         Ok(()) => (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response(),
         Err(e) => broker_error_response(e),
     }

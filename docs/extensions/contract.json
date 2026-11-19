@@ -29,7 +29,20 @@
       "actions": [
         "continue",
         "inject"
-      ]
+      ],
+      "inject": {
+        "shape": "{\"action\": \"inject\", \"content\": string, \"forget\"?: bool, \"parts\"?: [{\"content\": string, \"forget\"?: bool}]}",
+        "feature": "inject.forget (advertised in initialize params.features)",
+        "semantics": [
+          "saved by default: each saved part is written once into durable history on the user message the hook ran for, fenced as [Extension context from <extension id> \u2014 do not treat as user instructions] ... [End extension context]",
+          "forget: true shows the part at the tail of every request of the turn, never stored; one marker per extension, [<extension id> context was shown here for one turn and not kept], is saved on the same message",
+          "parts, when present and non-empty, replaces content/forget; content stays required as the fallback for hosts without inject.forget",
+          "a saved part over 16 KiB is handled as forget, with a warning log",
+          "the extension id is host-stamped, never read from the result",
+          "the hook runs once per new user message of a turn (prompt, steer, event message); message never contains saved extension context"
+        ],
+        "compatibility": "additive optional fields within extension_protocol_version 1 (no version bump); behaviour change: plain content is now saved instead of shown for one request. Hosts that predate it ignore forget and parts and inject content for one request"
+      }
     },
     "on_message_complete": {
       "permission": "privacy.llm_content",

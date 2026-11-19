@@ -87,6 +87,8 @@ impl ScriptedTransport {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            workers: Default::default(),
+            updated_at: None,
         };
         let view = Arc::new(RuntimeView::snapshot(&runtime, 0));
         Self {

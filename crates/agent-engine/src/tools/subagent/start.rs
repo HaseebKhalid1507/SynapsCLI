@@ -63,7 +63,7 @@ impl Tool for SubagentStartTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices."
+                    "description": "Omit for the session default: config `subagent_model` when set, otherwise the foreground model. Explicit values must be one of subagent_models' listed exact choices."
                 },
                 "thinking": {
                     "type": "string",
@@ -130,7 +130,11 @@ impl Tool for SubagentStartTool {
             .reserve_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref())
             .map_err(|reason| RuntimeError::Tool(format!("delegation denied: {reason}")))?;
         let decision = orchestration
-            .resolve_and_authorize(&handle_id, requested_model)
+            .resolve_and_authorize_with_default(
+                &handle_id,
+                requested_model,
+                config.subagent_model.as_deref(),
+            )
             .map_err(|error| {
                 orchestration
                     .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
@@ -152,10 +156,11 @@ impl Tool for SubagentStartTool {
         let task_full = task.clone();
 
         tracing::info!(
-            "subagent_start: dispatching '{}' (id={}) model={}",
+            "subagent_start: dispatching '{}' (id={}) model={} source={}",
             label,
             handle_id,
-            model
+            model,
+            decision.selection_source.as_str()
         );
 
         // ── Shared state ───────────────────────────────────────────────────────

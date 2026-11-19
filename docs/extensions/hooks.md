@@ -52,12 +52,24 @@ Unsupported result actions are ignored fail-open and logged as warnings.
 - `confirm` asks the runtime to get explicit user confirmation before proceeding.
   It is accepted only on `before_tool_call`. Interactive TUI streams prompt the
   user; headless/non-interactive call sites fail closed by blocking the tool call.
-- `inject` accumulates text from all matching handlers and injects it into the
-  model context. It is accepted on `before_message` (attached to the newest
-  user message as a trailing ephemeral text block, positioned after the
-  conversational cache marker — never the system prompt) and on
-  `on_session_start` (appended to the system prompt once, session-stable).
-  See `protocol.md` §`inject` for the placement contract.
+- `inject` accumulates context from all matching handlers, kept apart per
+  extension. It is accepted on `before_message` and on `on_session_start`
+  (appended to the system prompt once, session-stable). On `before_message`
+  content is **saved** by default: written once into the stored
+  conversation on the user message the hook ran for, fenced with the
+  extension id, and ordinary history from then on. `"forget": true` (or a
+  `forget` entry in `parts`) shows it at the tail of every request of the
+  turn instead, never stored, and saves a marker `[<extension id> context
+  was shown here for one turn and not kept]`. A saved part over 16 KiB is
+  handled as `forget`. A message is hooked once, ever (also when no
+  handler was registered then): a resend or resumed turn does not run the
+  hook again (forget content is not shown again; the marker stays). Only the newest user message is hooked (the last of
+  several steers; a rollover or the preamble nudge does not re-hook).
+  Framing look-alikes in content are escaped with a `\` before their `[`.
+  Hosts with this behaviour list `inject.forget` in the `initialize`
+  params' `features`. See `protocol.md` §`inject` for the placement
+  contract, the `_synaps_hooked` count that tells saved blocks from user
+  text in transcripts, and a migration note.
 - `modify` replaces the tool input before execution. It is accepted only on
   `before_tool_call`. Only `block` stops the chain: later handlers see the
   modified input. See `protocol.md` §Handler chain order.

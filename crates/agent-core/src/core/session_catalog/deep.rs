@@ -18,7 +18,7 @@ use super::body::{
     is_context_note, is_host_injected, read_snapshot_bytes, walk_session, walk_snapshot,
 };
 use super::CatalogEntry;
-use crate::core::session::user_content_for_display;
+use crate::core::session::user_message_for_display;
 use serde_json::Value;
 use std::ops::Range;
 use std::path::Path;
@@ -259,7 +259,7 @@ fn searchable(msg: &Value, tools: bool) -> Vec<(DeepRole, String)> {
     let mut out = Vec::new();
     match msg["role"].as_str() {
         Some("user") if !is_context_note(msg) => {
-            if let Some(t) = user_content_for_display(&msg["content"]) {
+            if let Some(t) = user_message_for_display(msg) {
                 if !is_host_injected(&t) {
                     out.push((DeepRole::User, t));
                 } else if tools {

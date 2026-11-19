@@ -153,7 +153,7 @@ pub fn render_compaction_input(
         match msg["role"].as_str() {
             Some("user") => {
                 if let Some(content) =
-                    agent_core::session::user_content_for_display(&msg["content"])
+                    agent_core::session::user_message_for_display(msg)
                 {
                     // Reactor-injected events carry the canonical
                     // `<event …>` envelope — that is the EventData class.
@@ -170,6 +170,23 @@ pub fn render_compaction_input(
                     } else {
                         present.insert(ContentClass::UserText);
                         parts.push(format!("[User]: {}", content));
+                    }
+                }
+                // Extension context saved on the message (#414): history,
+                // but not the user's words. Classed with host-delivered
+                // event data, labelled with its source.
+                if !policy.excludes(ContentClass::EventData) {
+                    use agent_core::core::extension_context::{saved_blocks, SavedBlock};
+                    for block in saved_blocks(msg) {
+                        present.insert(ContentClass::EventData);
+                        parts.push(match block {
+                            SavedBlock::Context { source, body } => {
+                                format!("[Extension context from {source}]: {body}")
+                            }
+                            SavedBlock::Marker { source } => {
+                                format!("[{source} context was shown for one turn and not kept]")
+                            }
+                        });
                     }
                 }
                 if let Some(content) = msg["content"].as_array() {
@@ -475,7 +492,7 @@ fn local_summary(api_messages: &[crate::SharedMessage], policy: &DisclosurePolic
     for msg in api_messages {
         match msg["role"].as_str() {
             Some("user") => {
-                let Some(text) = agent_core::session::user_content_for_display(&msg["content"])
+                let Some(text) = agent_core::session::user_message_for_display(msg)
                 else {
                     continue;
                 };
@@ -1548,6 +1565,40 @@ mod disclosure_tests {
             assert!(!text.contains("SENTINEL"));
         }
         assert_eq!(rendered.included_classes, vec![ContentClass::UserText]);
+    }
+
+    /// #414: extension context saved on a user message reaches the
+    /// summarizer labelled with its source (event-data class), never as the
+    /// user's words; a marker says what was shown.
+    #[test]
+    fn saved_extension_context_is_rendered_apart_from_user_text() {
+        use agent_core::core::extension_context::{marker_text, saved_block_text};
+        let messages = vec![Arc::new(json!({"role": "user", "content": [
+            {"type": "text", "text": "fix the build"},
+            {"type": "text", "text": saved_block_text("axel", "base branch is dev")},
+            {"type": "text", "text": marker_text("agent-comms")},
+        ], "_synaps_hooked": 2})) as crate::SharedMessage];
+        let rendered = render_compaction_input(&messages, None, &policy(&[]));
+        let text = &rendered.prompt_text;
+        assert!(text.contains("[User]: fix the build\n"), "{text}");
+        assert!(text.contains("[Extension context from axel]: base branch is dev"));
+        assert!(text.contains("[agent-comms context was shown for one turn and not kept]"));
+        assert!(!text.contains("do not treat as user instructions"));
+        let withheld =
+            render_compaction_input(&messages, None, &policy(&[ContentClass::EventData]));
+        assert!(!withheld.prompt_text.contains("base branch is dev"));
+        assert!(withheld.prompt_text.contains("[User]: fix the build"));
+
+        // #414 review: without the host's count the same text is the
+        // user's own (a look-alike they typed or pasted), never relabelled.
+        let typed = vec![Arc::new(json!({"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
+            {"type": "text", "text": marker_text("agent-comms")},
+        ]})) as crate::SharedMessage];
+        let text = render_compaction_input(&typed, None, &policy(&[])).prompt_text;
+        assert!(text.contains("[User]: [attached image]\n"), "{text}");
+        assert!(text.contains("[agent-comms context was shown here for one turn and not kept]"), "{text}");
+        assert!(!text.contains("[agent-comms context was shown for one turn"), "not relabelled: {text}");
     }
 
     #[test]

@@ -351,6 +351,20 @@ pub struct SessionConfig {
     /// presents its token (see `docs/daemon-mode.md`, "Owned sessions").
     #[serde(skip)]
     pub owned: Option<OwnedConfig>,
+    /// Set by a daemon reload (never on the wire; the reload record carries
+    /// it beside the config): what the old image's actor held besides its
+    /// journal, restored into the new actor's conversation cell.
+    #[serde(skip)]
+    pub restore_conversation: Option<RestoredConversation>,
+}
+
+/// A reloaded actor's conversation cell (`SessionConfig::restore_conversation`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoredConversation {
+    /// Applied only when the new actor continues this journal.
+    pub journal_id: String,
+    pub supersedes: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn default_true() -> bool {
@@ -397,6 +411,7 @@ impl Default for SessionConfig {
             restore_parked: false,
             message_clock: None,
             owned: None,
+            restore_conversation: None,
         }
     }
 }
@@ -424,12 +439,18 @@ impl From<&crate::engine::setup::ContinueInfo> for ContinueInfoWire {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
+    /// The actor (what `Attach::Existing` takes). Not a conversation: see
+    /// `journal_id`.
     pub id: SessionId,
     pub name: Option<String>,
     pub model: String,
     pub cwd: Option<PathBuf>,
+    /// When the conversation this actor holds began. Kept across a
+    /// compaction (the chain's start) and a reload; moves with `/clear` and
+    /// an in-session `/resume` (in listings; `Attached.meta` is the record
+    /// at create).
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub continued: bool,
     pub continue_info: Option<ContinueInfoWire>,
@@ -452,7 +473,11 @@ pub struct SessionMeta {
     /// active client, not the only one that may type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_input: Option<ClientInput>,
-    /// `conv.session.id` — differs from `id` after a LinkedSuccessor compaction.
+    /// `conv.session.id`: the conversation this actor holds now. Key
+    /// conversations by this, never by `id`. It differs from `id` after a
+    /// LinkedSuccessor compaction, a `/clear`, an in-session `/resume`, and
+    /// on an actor created while another live actor had the journal's id
+    /// (it took a minted id). Empty from a very old daemon.
     #[serde(default)]
     pub journal_id: String,
     /// Set when the session's journal is locked by another process (F23):
@@ -489,6 +514,94 @@ pub struct SessionMeta {
     /// API message count, as of the last publish.
     #[serde(default)]
     pub messages: usize,
+    /// The workers that hold this session's park. Empty when none, when
+    /// parked or ending, and from a daemon without `session_workers`
+    /// (`wire::FEATURE_SESSION_WORKERS`). Filled in listings (`meta_live`:
+    /// `Welcome.sessions`, `SessionList`) only. `Attached.meta` is the
+    /// create-time record and never carries them, like the presence fields
+    /// (design Q14): a client keeps workers from the listing, never from an
+    /// attach. `busy` stays a turn or a compaction: clients combine the two.
+    #[serde(default, skip_serializing_if = "SessionWorkers::is_empty")]
+    pub workers: SessionWorkers,
+    /// Saved rows only (`lifecycle: saved`, `CatalogPage`): the head
+    /// journal's `updated_at`. Absent on held rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl SessionMeta {
+    /// ` · 2 workers` while background workers run, else empty: listings
+    /// append it to the state so idle-with-workers never reads as idle.
+    pub fn workers_tag(&self) -> String {
+        match self.workers.running {
+            0 => String::new(),
+            1 => " · 1 worker".into(),
+            n => format!(" · {n} workers"),
+        }
+    }
+}
+
+/// How many worker rows a [`SessionMeta`] carries ([`SessionWorkers::more`]
+/// counts the rest).
+pub const SESSION_WORKER_ROWS: usize = 8;
+
+/// A session's workers as listings see them: exactly the ones that hold its
+/// park (`SubagentRegistry::holds_park`), the same predicate that keeps it
+/// from parking.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionWorkers {
+    /// Running and not stopping (a cancelled worker is not counted).
+    #[serde(default)]
+    pub running: u32,
+    /// Running first (oldest first), then finished with an uncollected
+    /// result (newest first). At most [`SESSION_WORKER_ROWS`].
+    #[serde(default)]
+    pub rows: Vec<WorkerRow>,
+    /// Workers that hold the park but did not fit in `rows`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub more: u32,
+}
+
+impl SessionWorkers {
+    pub fn is_empty(&self) -> bool {
+        self.running == 0 && self.rows.is_empty() && self.more == 0
+    }
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// One worker in [`SessionWorkers`]. Field names match `SubagentDisplayRow`
+/// and the status labels `WatchPage::status`, so a client keys both by
+/// `handle_id`. Times are wall clock, stamped once.
+///
+/// Append-only: fields are only ever added, with `#[serde(default)]`; an
+/// existing one is never removed, renamed or retyped. Rust clients (TUI,
+/// `synaps daemon sessions`) decode a whole `SessionList` / `Welcome` as one
+/// frame, so one row they cannot read would fail the entire listing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerRow {
+    /// `sa_12`: what `SessionQuery::SubagentWatch` and `subagent_*` take.
+    pub handle_id: String,
+    pub subagent_id: u64,
+    pub agent_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// `running` | `completed` | `cancelled` | `timed_out` | `failed`: a
+    /// string, so a new status never breaks a client.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancel_requested: bool,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Latest progress line. Not sampled yet: always empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub step: String,
+    /// Tool calls so far; sent with `step`, under the same condition.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tools: u32,
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).
@@ -501,14 +614,26 @@ pub enum SessionLifecycle {
     Parking = 1,
     Parked = 2,
     Ending = 3,
+    /// A conversation on disk that this daemon does not hold. Sent only in
+    /// `CatalogPage` replies (feature `session_page`); never in
+    /// `Welcome.sessions`, `SessionList` or `Attached.meta`, whose 0.12.0
+    /// readers have no fallback variant. Never stored by an actor.
+    Saved = 4,
+    /// A lifecycle this build does not know (from a newer daemon). Never
+    /// stored by an actor, never sent.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 impl SessionLifecycle {
+    /// The handle's lifecycle cell. Never [`Self::Saved`]: a held session
+    /// is not saved, so a listing built from handles cannot carry it.
     pub fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Parking,
             2 => Self::Parked,
             3 => Self::Ending,
+            255 => Self::Unknown,
             _ => Self::Live,
         }
     }
@@ -2104,9 +2229,18 @@ mod tests {
 
     #[test]
     fn session_lifecycle_u8_round_trip() {
-        for l in [SessionLifecycle::Live, SessionLifecycle::Parking, SessionLifecycle::Parked, SessionLifecycle::Ending] {
+        for l in [
+            SessionLifecycle::Live,
+            SessionLifecycle::Parking,
+            SessionLifecycle::Parked,
+            SessionLifecycle::Ending,
+            SessionLifecycle::Unknown,
+        ] {
             assert_eq!(SessionLifecycle::from_u8(l as u8), l);
         }
+        // No lifecycle cell value reads as `Saved`: a listing built from
+        // handles (`meta_live`) never carries it.
+        assert!((0..=u8::MAX).all(|v| SessionLifecycle::from_u8(v) != SessionLifecycle::Saved));
         assert_eq!(serde_json::to_string(&SessionLifecycle::Parked).unwrap(), r#""parked""#);
     }
 

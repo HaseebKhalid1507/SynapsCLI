@@ -55,7 +55,7 @@ pub async fn emit_session_start(
     cwd: Option<&Path>,
 ) -> bool {
     let event = HookEvent::on_session_start(session_id).with_cwd(cwd);
-    if let HookResult::Inject { content } = hook_bus.emit(&event).await {
+    if let HookResult::Inject { content, .. } = hook_bus.emit(&event).await {
         tracing::debug!(
             len = content.len(),
             "on_session_start injected session-scoped context"

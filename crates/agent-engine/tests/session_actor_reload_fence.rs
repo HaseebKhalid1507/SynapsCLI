@@ -144,6 +144,7 @@ fn worker_finishing_during_the_checkpoint(f: &Fixture) {
             "SA7-RESULT",
             1.0,
             None,
+            None,
         );
         queue.push(ev).unwrap();
         settle(&state);

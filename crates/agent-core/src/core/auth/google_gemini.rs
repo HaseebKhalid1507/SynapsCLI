@@ -102,11 +102,13 @@ pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, S
             eprintln!(
                 "\n\x1b[1mOpening browser for Google Gemini (Code Assist) sign-in...\x1b[0m\n"
             );
+            // Print the URL first: `open_browser` can block on a slow handler,
+            // and the fallback must be on screen by then.
+            eprintln!("\x1b[2mIf the browser didn't open, visit:\x1b[0m");
+            eprintln!("\x1b[36m{auth_url}\x1b[0m\n");
             if let Err(e) = super::open_browser(auth_url) {
                 eprintln!("Could not open browser automatically: {e}");
             }
-            eprintln!("\x1b[2mIf the browser didn't open, visit:\x1b[0m");
-            eprintln!("\x1b[36m{auth_url}\x1b[0m\n");
             Ok(())
         },
     )

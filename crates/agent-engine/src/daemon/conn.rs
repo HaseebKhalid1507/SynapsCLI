@@ -246,6 +246,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         generation: state.generation,
         daemon_build: crate::session::wire::build_id().to_string(),
         features: crate::session::wire::daemon_features(),
+        boot_id: state.boot_id.clone(),
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
@@ -253,11 +254,23 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     tracing::debug!(kind = ?hello.client.kind, "daemon: client connected");
 
     // ── control loop (no session allocated) ──
+    // `CatalogPage`s run beside the loop, one task each, so a slow catalog
+    // load never holds up a frame, a stop or a reload. Every way out of
+    // the loop aborts them first: no reply follows a `Bye`, and none
+    // reaches an attach stream.
+    let mut pages = tokio::task::JoinSet::new();
     let attach = loop {
+        while pages.try_join_next().is_some() {}
         let announce = state.announce();
         let frame = tokio::select! {
-            _ = shutdown.cancelled() => { let _ = tx.send(DaemonFrame::Bye { reason: None }).await; let _ = writer.await; return; }
+            _ = shutdown.cancelled() => {
+                pages.shutdown().await;
+                let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
+                let _ = writer.await;
+                return;
+            }
             _ = announce.cancelled() => {
+                pages.shutdown().await;
                 let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
                 let _ = writer.await;
                 return;
@@ -277,6 +290,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 tracing::info!(force, "daemon: shutdown requested over the socket");
+                pages.shutdown().await;
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 let _ = writer.await;
                 state.request_shutdown(force);
@@ -289,6 +303,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                         .await;
                     continue;
                 }
+                // A page still loading is dropped: the attach stream
+                // carries no catalog replies.
+                pages.shutdown().await;
                 break a;
             }
             Ok(Read::Frame(ClientFrame::Cmd { session_id, .. })) => {
@@ -309,6 +326,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                     }
                     Ok(prepared) => {
                         // Tell the requester, flush, close — then exec.
+                        pages.shutdown().await;
                         let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
                         drop(tx);
                         let _ = tokio::time::timeout(
@@ -364,12 +382,32 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
             }
+            // Its own task (see `pages`); the reply carries `req`. PR 3:
+            // the feed loop serves `CatalogPage` the same way, from its
+            // own `JoinSet`.
+            Ok(Read::Frame(ClientFrame::CatalogPage { req, before, limit, named_only })) => {
+                while pages.try_join_next().is_some() {}
+                if pages.len() >= super::saved::CATALOG_PAGES_IN_FLIGHT {
+                    let error = format!(
+                        "too many catalog pages in flight (at most {} per connection)",
+                        super::saved::CATALOG_PAGES_IN_FLIGHT
+                    );
+                    let _ = tx.send(super::saved::page_error(req, error)).await;
+                } else {
+                    let (state, tx) = (Arc::clone(&state), tx.clone());
+                    pages.spawn(async move {
+                        let _ = tx.send(super::saved::catalog_page(&state, req, before, limit, named_only).await).await;
+                    });
+                }
+            }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => {
+                pages.shutdown().await;
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 let _ = writer.await;
                 return;
             }
             Ok(Read::Oversize) => {
+                pages.shutdown().await;
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: frame_limit_msg() }).await;
                 drop(tx);
                 let _ = writer.await;
@@ -769,7 +807,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             | Ok(Read::Frame(ClientFrame::Pin { .. }))
             | Ok(Read::Frame(ClientFrame::Rename { .. }))
             | Ok(Read::Frame(ClientFrame::ReloadExtension { .. }))
-            | Ok(Read::Frame(ClientFrame::AuthState(_))) => {
+            | Ok(Read::Frame(ClientFrame::AuthState(_)))
+            | Ok(Read::Frame(ClientFrame::CatalogPage { .. })) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,
@@ -851,7 +890,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         let _ = handle.send(SessionCommand::Detach { client }).await;
     }
     if !handle.is_alive() {
-        state.remove(&sid);
+        state.remove(&handle);
     }
     if lagged {
         send_owner_lagged(&tx, &sid, owner_lag_dropped.load(Ordering::SeqCst)).await;
