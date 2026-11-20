@@ -145,7 +145,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
       - run: cargo test --locked --no-fail-fast --test "daemon_*"
       - run: cargo test --locked --no-fail-fast -p synaps-tui --lib
-      - run: 'cargo test --locked --no-fail-fast -p synaps-engine --lib -- events::socket ipc:: tools::unix_programs tools::search tools::grep tools::find tools::ls'
+      - run: 'cargo test --locked --no-fail-fast -p synaps-engine --lib -- events::socket ipc:: daemon::win tools::unix_programs tools::search tools::grep tools::find tools::ls'
 
   ignore-ratchet:
     runs-on: ubuntu-24.04
