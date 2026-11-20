@@ -10,6 +10,8 @@
 //! fail or change what the caller is doing.
 
 pub mod events;
+#[cfg(test)]
+mod worker_route_tests;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,9 +21,10 @@ use futures::future::join_all;
 use futures::FutureExt;
 use tokio::sync::RwLock;
 
-use self::events::{HookEvent, HookKind, HookResult};
+use self::events::{HookEvent, HookFailurePolicy, HookKind, HookResult};
 use crate::extensions::manifest::HookMatcher;
 use crate::extensions::permissions::{Permission, PermissionSet};
+use crate::extensions::required_guards::{no_answer_text, GuardPass, NoAnswer, RequiredGuards};
 
 /// Default timeout for a single hook handler call.
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -138,6 +141,8 @@ pub struct HandlerRegistration {
     pub matcher: Option<HookMatcher>,
     /// Permissions granted to this handler's extension.
     pub permissions: PermissionSet,
+    /// What the subscription answers when the handler does not.
+    pub on_failure: HookFailurePolicy,
 }
 
 impl std::fmt::Debug for HookBus {
@@ -172,9 +177,68 @@ pub struct HookBus {
     /// `Some(host)`: this bus is a subagent worker's view of `host`
     /// ([`Self::worker_transforms`]) and has no handlers of its own.
     transforms_of: Option<Arc<HookBus>>,
+    /// Set on a worker's (subagent's) bus only: where its `before_tool_call`
+    /// events go. `None` everywhere else. Independent of `transforms_of`:
+    /// a worker bus may carry both ([`Self::with_worker_transforms_of`]).
+    worker_route: Option<WorkerRoute>,
+    /// The required guards every `before_tool_call` on this bus is checked
+    /// against, before and after its chain. The process's gate
+    /// ([`RequiredGuards::process`]) for every bus made with [`Self::new`];
+    /// a worker view or route shares its host's or caller's.
+    required: Arc<RequiredGuards>,
     /// One permit per [`Self::notify`] delivery in flight
     /// ([`NOTIFY_MAX_IN_FLIGHT`]).
     notify_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// A worker's route to its caller's `before_tool_call` hooks (see
+/// [`HookBus::worker_route`]).
+struct WorkerRoute {
+    /// The calling session's bus (the host's, in a daemon).
+    caller: Arc<HookBus>,
+    /// The caller's tokio runtime. A worker runs on its own current-thread
+    /// runtime, which is dropped when the worker ends. An extension process
+    /// started or restarted from inside it would tie its pipes and reader
+    /// task to that runtime and lose them with the worker, so the caller's
+    /// handlers always run here.
+    host: tokio::runtime::Handle,
+    /// The conversation that started the worker (`None` when its caller
+    /// has none).
+    session_id: Option<String>,
+    /// The worker's id as its caller sees it (`sa_N`).
+    subagent_id: String,
+}
+
+impl WorkerRoute {
+    /// Run the caller's `before_tool_call` chain for one of the worker's
+    /// calls, stamped with the caller's conversation. A chain that cannot
+    /// run (the caller's runtime is gone, or a handler panicked) blocks the
+    /// call: the guard is not skipped.
+    async fn before_tool_call(&self, event: &HookEvent) -> HookResult {
+        let mut event = event.clone();
+        if event.session_id.is_none() {
+            event = event.with_session(self.session_id.as_deref());
+        }
+        event.subagent_id = Some(self.subagent_id.clone());
+        let caller = Arc::clone(&self.caller);
+        match self
+            .host
+            .spawn(async move { caller.emit_to_own_handlers(&event).await })
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(
+                    subagent_id = %self.subagent_id,
+                    error = %error,
+                    "before_tool_call hooks could not run for a subagent tool call; blocking it"
+                );
+                HookResult::block(format!(
+                    "the before_tool_call hooks could not run for this subagent tool call ({error})"
+                ))
+            }
+        }
+    }
 }
 
 impl HookBus {
@@ -185,16 +249,34 @@ impl HookBus {
             session_injection: RwLock::new(HashMap::new()),
             generations: std::sync::Mutex::new(HashMap::new()),
             transforms_of: None,
+            worker_route: None,
+            required: RequiredGuards::process(),
             notify_slots: Arc::new(tokio::sync::Semaphore::new(NOTIFY_MAX_IN_FLIGHT)),
         }
+    }
+
+    /// This bus checked against `gate` instead of the process's (tests).
+    #[cfg(test)]
+    pub(crate) fn with_required_guards(mut self, gate: Arc<RequiredGuards>) -> Self {
+        self.required = gate;
+        self
+    }
+
+    /// The required guards this bus checks every `before_tool_call` against:
+    /// the extension manager marks them, the daemon's `Pong` reports them.
+    pub fn required_guards(&self) -> &Arc<RequiredGuards> {
+        &self.required
     }
 
     /// The hook bus a subagent worker runs with: a read-only view of
     /// `host`'s `after_tool_call` subscriptions from extensions that hold
     /// `tools.transform_output`, so output transforms (compression,
-    /// redaction) see worker tool results too. Nothing else fires in a
-    /// worker: no `before_tool_call` (no confirm prompt, block or modify),
-    /// no message or session hooks, no observe-only `after_tool_call`.
+    /// redaction) see worker tool results too. Nothing else fires on the
+    /// view itself: no `before_tool_call` (no confirm prompt, block or
+    /// modify), no message or session hooks, no observe-only
+    /// `after_tool_call`. A worker's `before_tool_call` reaches its
+    /// caller's chain only through a [`Self::worker_route`] layered on
+    /// this view ([`Self::with_worker_transforms_of`]).
     ///
     /// Live, not a snapshot: every [`Self::emit`] reads `host`'s current
     /// handler list, so an extension loaded, reloaded or unloaded while a
@@ -211,6 +293,7 @@ impl HookBus {
         // A view of a view reads the same host.
         let host = host.transforms_of.clone().unwrap_or_else(|| Arc::clone(host));
         Arc::new(Self {
+            required: Arc::clone(&host.required),
             transforms_of: Some(host),
             ..Self::new()
         })
@@ -239,6 +322,62 @@ impl HookBus {
             .cloned()
             .collect();
         (!regs.is_empty()).then_some(regs)
+    }
+
+    /// A worker's (subagent's) bus. It has no handlers of its own: each
+    /// `before_tool_call` the worker emits runs `caller`'s chain instead, on
+    /// `host` (the caller's runtime), with `session_id` set to the caller's
+    /// conversation when the event has none (subject to
+    /// `SYNAPS_HOOK_SESSION_ID=0`). The result, a `Confirm` included, is the
+    /// caller's chain's; who answers a `Confirm` is the worker runtime's
+    /// confirm route. Every other hook kind finds no handlers here, as on an
+    /// empty bus, unless the host's output transforms are layered on
+    /// ([`Self::with_worker_transforms_of`]).
+    pub fn worker_route(
+        caller: Arc<HookBus>,
+        host: tokio::runtime::Handle,
+        session_id: Option<String>,
+        subagent_id: String,
+    ) -> Self {
+        // A worker's worker runs the chain its caller runs, not the (empty)
+        // handler list of its caller's own route.
+        let (caller, host, session_id) = match &caller.worker_route {
+            Some(up) => (
+                Arc::clone(&up.caller),
+                up.host.clone(),
+                up.session_id.clone().or(session_id),
+            ),
+            None => (caller, host, session_id),
+        };
+        Self {
+            required: Arc::clone(&caller.required),
+            worker_route: Some(WorkerRoute {
+                caller,
+                host,
+                session_id,
+                subagent_id,
+            }),
+            ..Self::new()
+        }
+    }
+
+    /// Whether this is a worker's bus routed to a caller's hooks.
+    pub fn is_worker_route(&self) -> bool {
+        self.worker_route.is_some()
+    }
+
+    /// This worker route ([`Self::worker_route`]) plus the host output
+    /// transforms `view` dispatches, so one worker bus runs both its
+    /// caller's `before_tool_call` chain and the host's `after_tool_call`
+    /// transforms (`subagent_transform_hooks`).
+    ///
+    /// Only ever narrows: `view` contributes its host only when it is a
+    /// worker view ([`Self::worker_transforms`]). A plain bus (the
+    /// detached `subagent_transform_hooks = false` bus, or a full host bus)
+    /// contributes nothing, so this never hands a worker a full host bus.
+    pub fn with_worker_transforms_of(mut self, view: &HookBus) -> Self {
+        self.transforms_of = view.transforms_of.clone();
+        self
     }
 
     /// Current load generation of `extension_id` (0 until first unloaded).
@@ -299,6 +438,35 @@ impl HookBus {
         matcher: Option<HookMatcher>,
         permissions: PermissionSet,
     ) -> Result<(), String> {
+        self.subscribe_with_failure_policy(
+            kind,
+            handler,
+            tool_filter,
+            matcher,
+            permissions,
+            HookFailurePolicy::Continue,
+        )
+        .await
+    }
+
+    /// [`Self::subscribe`] with the manifest's `on_failure`. `Block` is
+    /// refused for any hook but `before_tool_call`.
+    pub async fn subscribe_with_failure_policy(
+        &self,
+        kind: HookKind,
+        handler: Arc<dyn crate::extensions::runtime::ExtensionHandler>,
+        tool_filter: Option<String>,
+        matcher: Option<HookMatcher>,
+        permissions: PermissionSet,
+        on_failure: HookFailurePolicy,
+    ) -> Result<(), String> {
+        if on_failure == HookFailurePolicy::Block && kind != HookKind::BeforeToolCall {
+            return Err(format!(
+                "Extension '{}' hook '{}' cannot use on_failure \"block\": only before_tool_call can block a call its extension did not answer",
+                handler.id(),
+                kind.as_str(),
+            ));
+        }
         if self.is_worker_view() {
             return Err(format!(
                 "Extension '{}' cannot subscribe to a worker's hook view; subscribe to the host bus",
@@ -320,6 +488,7 @@ impl HookBus {
             tool_filter,
             matcher,
             permissions,
+            on_failure,
         };
 
         let mut handlers = self.handlers.write().await;
@@ -348,8 +517,87 @@ impl HookBus {
     ///
     /// On a worker view ([`Self::worker_transforms`]) only the host's
     /// `after_tool_call` transform handlers run, each through
-    /// `handle_no_spawn`; every other kind returns `Continue` at once.
+    /// `handle_no_spawn`; every other kind returns `Continue` at once. On
+    /// a worker route ([`Self::worker_route`]) a `before_tool_call` runs the
+    /// caller's chain instead; the other kinds dispatch as above (a route
+    /// with a view layered on runs both).
     pub async fn emit(&self, event: &HookEvent) -> HookResult {
+        if let Some(route) = &self.worker_route {
+            if event.kind == HookKind::BeforeToolCall {
+                return route.before_tool_call(event).await;
+            }
+        }
+        self.emit_to_own_handlers(event).await
+    }
+
+    /// [`Self::emit`] on this bus's own handlers, never through a worker
+    /// route. A worker route runs its caller's chain with it (not with
+    /// `emit`, so the spawned future does not contain itself).
+    ///
+    /// A `before_tool_call` is refused while a required guard is not loaded
+    /// ([`RequiredGuards::check`]), checked before the chain (so the call
+    /// reaches no hook and never runs) and again after it unless the chain
+    /// blocked ([`RequiredGuards::recheck`]: a guard that died, or was
+    /// reloaded, while the call was in its chain cannot have its silence
+    /// read as an allow). No allow fallback: the refusal is a `Block` on
+    /// every bus, a worker's included.
+    ///
+    /// A `before_tool_call` chain runs the required guards last, in
+    /// registration order among themselves, so a guard vets the input as
+    /// every other extension's `modify` left it. A required guard's `modify`
+    /// after another required guard has answered blocks the call: that
+    /// guard would never see the input it ran.
+    ///
+    /// In the chain, a required guard's own handler is called with
+    /// [`ExtensionHandler::handle_required`](crate::extensions::runtime::ExtensionHandler::handle_required)
+    /// whatever its manifest's `on_failure` says, and no usable answer
+    /// (the 5 s timeout, an error, a failed call, an answer it may not
+    /// give before a call, or a `modify` the bus cannot apply after an
+    /// earlier Confirm) blocks the call, naming the guard and the cause
+    /// ([`no_answer_text`]). Every other handler keeps its `on_failure`.
+    async fn emit_to_own_handlers(&self, event: &HookEvent) -> HookResult {
+        if event.kind != HookKind::BeforeToolCall || self.required.is_empty() {
+            return self.dispatch_own_handlers(event).await;
+        }
+        let pass = match self.required.check().await {
+            Ok(pass) => pass,
+            Err(refusal) => return HookResult::block(refusal),
+        };
+        // A loaded guard this bus does not hold would never see the call
+        // (a worker's view, a detached empty bus): that is not an allow.
+        if let Some(name) = self.guard_not_on_this_bus(&pass).await {
+            return HookResult::block(format!(
+                "required guard '{name}' is not subscribed to before_tool_call on this \
+                 hook bus (no route to it), so it cannot vet this tool call"
+            ));
+        }
+        let result = self.dispatch_own_handlers(event).await;
+        if matches!(result, HookResult::Block { .. }) {
+            return result;
+        }
+        match self.required.recheck(&pass).await {
+            Some(refusal) => HookResult::block(refusal),
+            None => result,
+        }
+    }
+
+    /// The first required guard in `pass` with no `before_tool_call`
+    /// registration on this bus.
+    async fn guard_not_on_this_bus(&self, pass: &GuardPass) -> Option<String> {
+        let mut names = pass.names().peekable();
+        names.peek()?;
+        let handlers = self.handlers.read().await;
+        let regs = handlers.get(&HookKind::BeforeToolCall);
+        names
+            .find(|name| {
+                !regs.is_some_and(|regs| regs.iter().any(|reg| reg.handler.id() == *name))
+            })
+            .map(str::to_string)
+    }
+
+    /// [`Self::emit_to_own_handlers`]'s dispatch, after the required-guard
+    /// check.
+    async fn dispatch_own_handlers(&self, event: &HookEvent) -> HookResult {
         // Snapshot the handler list and drop the lock immediately.
         // This prevents holding the RwLock across async handler calls
         // (which could block subscribe/unsubscribe for the entire
@@ -368,6 +616,14 @@ impl HookBus {
                 }
             }
         }; // lock dropped here
+        let mut registrations = registrations;
+        // Required guards run last, so each vets the input as every other
+        // extension left it: an extension later in the chain could rewrite
+        // what a guard had already approved. (Stable: registration order
+        // holds among the guards, and among everything else.)
+        if event.kind == HookKind::BeforeToolCall {
+            registrations.sort_by_key(|reg| self.required.is_required(reg.handler.id()));
+        }
 
         // Collect injections from all handlers rather than returning on first
         let mut injections = Injections::default();
@@ -385,6 +641,8 @@ impl HookBus {
         let mut modified_event: Option<HookEvent> = None;
         // Who rewrote it (chain order, de-duplicated).
         let mut modified_by: Vec<String> = Vec::new();
+        // The first required guard that has answered in this chain.
+        let mut guard_answered: Option<String> = None;
 
         for reg in &registrations {
             let ev: &HookEvent = modified_event.as_ref().unwrap_or(event);
@@ -408,14 +666,33 @@ impl HookBus {
             let event_clone = ev.clone();
             let trace_enabled = extensions_trace_enabled();
             let started_at = trace_enabled.then(Instant::now);
+            // A required guard's `before_tool_call` never fails open,
+            // whatever its manifest's `on_failure` says: no answer in time,
+            // an error, a failed call or an answer it may not give blocks
+            // the call, naming the guard and the cause.
+            let required = ev.kind == HookKind::BeforeToolCall
+                && self.required.is_required(reg.handler.id());
             let call = async {
-                if no_spawn {
+                if required {
+                    handler
+                        .handle_required(&event_clone, no_spawn)
+                        .await
+                        .unwrap_or_else(|why| {
+                            HookResult::block(no_answer_text(handler.id(), &why))
+                        })
+                } else if reg.on_failure == HookFailurePolicy::Block {
+                    handler.handle_fail_closed(&event_clone, no_spawn).await
+                } else if no_spawn {
                     handler.handle_no_spawn(&event_clone).await
                 } else {
                     handler.handle(&event_clone).await
                 }
             };
             let result = tokio::time::timeout(HANDLER_TIMEOUT, call).await;
+            let answered_before = guard_answered.clone();
+            if required && result.is_ok() {
+                guard_answered.get_or_insert_with(|| reg.handler.id().to_string());
+            }
 
             if trace_enabled {
                 let health = reg.handler.health().await;
@@ -455,6 +732,19 @@ impl HookBus {
             }
 
             match result {
+                Ok(result) if required && !ev.kind.allows_result(&result) => {
+                    let action = hook_result_action(&result);
+                    let why = NoAnswer::BadAnswer(format!(
+                        "'{action}' is not an answer to a before_tool_call"
+                    ));
+                    tracing::warn!(
+                        hook = %ev.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        action,
+                        "Required guard returned an action not allowed for the hook — blocking the call"
+                    );
+                    return HookResult::block(no_answer_text(reg.handler.id(), &why));
+                }
                 Ok(result) if !ev.kind.allows_result(&result) => {
                     tracing::warn!(
                         hook = %ev.kind.as_str(),
@@ -482,6 +772,38 @@ impl HookBus {
                     );
                     // Accumulate — don't early-return. Multiple extensions can inject.
                     injections.push(reg.handler.id(), &result);
+                }
+                Ok(HookResult::Modify { .. }) if required && answered_before.is_some() => {
+                    // Another required guard has already vetted the input
+                    // as it stood: this rewrite would run an input that
+                    // guard never saw.
+                    let why = NoAnswer::BadAnswer(format!(
+                        "'modify' cannot apply here: required guard '{}' had already vetted the input as it was",
+                        answered_before.unwrap_or_default()
+                    ));
+                    tracing::warn!(
+                        hook = %ev.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        "Required guard's Modify comes after another guard vetted the input — blocking the call"
+                    );
+                    return HookResult::block(no_answer_text(reg.handler.id(), &why));
+                }
+                Ok(HookResult::Modify { .. }) if required && !confirms.is_empty() => {
+                    // A required guard's rewrite the bus may not apply
+                    // (after an earlier Confirm) would let the input it
+                    // rewrote run as it was; it blocks, naming the guard,
+                    // like any answer the bus cannot use from it.
+                    let confirming: Vec<&str> = confirms.iter().map(|(id, _)| id.as_str()).collect();
+                    let why = NoAnswer::BadAnswer(format!(
+                        "'modify' cannot apply here: an earlier extension ({}) asked to confirm the input as it was",
+                        confirming.join(", ")
+                    ));
+                    tracing::warn!(
+                        hook = %ev.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        "Required guard's Modify cannot apply here — blocking the call"
+                    );
+                    return HookResult::block(no_answer_text(reg.handler.id(), &why));
                 }
                 Ok(HookResult::Modify { input }) => {
                     if !confirms.is_empty() {
@@ -573,6 +895,24 @@ impl HookBus {
                             );
                         }
                     }
+                }
+                Err(_timeout) if required => {
+                    tracing::warn!(
+                        hook = %ev.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        timeout_secs = HANDLER_TIMEOUT.as_secs(),
+                        "Required guard timed out — blocking the call"
+                    );
+                    return HookResult::block(no_answer_text(reg.handler.id(), &NoAnswer::Timeout));
+                }
+                Err(_timeout) if reg.on_failure == HookFailurePolicy::Block => {
+                    tracing::warn!(
+                        hook = %ev.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        timeout_secs = HANDLER_TIMEOUT.as_secs(),
+                        "Guard hook handler timed out — blocking the call"
+                    );
+                    return reg.on_failure.timed_out(reg.handler.id());
                 }
                 Err(_timeout) => {
                     tracing::warn!(

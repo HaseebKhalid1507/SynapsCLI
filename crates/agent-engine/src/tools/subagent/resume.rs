@@ -406,6 +406,8 @@ impl Tool for SubagentResumeTool {
         let session_allow_all = ctx.capabilities.session_allow_all.clone();
         let telemetry = ctx.capabilities.telemetry.clone();
         let telemetry = telemetry.map(|t| t.for_worker(&label, &handle_id));
+        // Captured here, in the calling tool call's task, for the worker thread.
+        let worker_hooks = super::WorkerHooks::of(&ctx.capabilities, &handle_id);
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
@@ -534,6 +536,8 @@ impl Tool for SubagentResumeTool {
                             telemetry.as_ref(),
                             &workspace,
                         );
+                        // Required guards see this worker's tool calls too.
+                        worker_hooks.apply(&mut runtime, &config);
                         runtime.set_system_prompt(super::compose_system_prompt(system_prompt));
                         runtime.set_model(model_a.clone());
                         super::fit_subagent_context_window(&mut runtime);

@@ -193,6 +193,7 @@ mod tests {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
                 matcher: None,
+                on_failure: None,
             }],
             config: vec![ExtensionConfigEntry {
                 key: "api_key".to_string(),

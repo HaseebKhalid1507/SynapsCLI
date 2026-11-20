@@ -18,7 +18,8 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use super::{ExtensionHandler, ExtensionHealth, ExtensionLifecycle, RestartPolicy};
-use crate::extensions::hooks::events::{HookEvent, HookResult};
+use crate::extensions::hooks::events::{HookEvent, HookFailurePolicy, HookResult};
+use crate::extensions::required_guards::NoAnswer;
 use crate::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION;
 use agent_core::memory::author::Author;
 
@@ -657,6 +658,30 @@ impl ProcessLifecycle {
         // Idempotent; no wraparound and no window that exposes the old token
         // as healthy while teardown or replacement is already underway.
         self.generation.fetch_or(1, Ordering::AcqRel);
+    }
+
+    /// Why this transport cannot answer now, or `None` while its child
+    /// runs and its token is valid. Waits for the child lock (held only to
+    /// kill or poll it), so a concurrent check never reads as down.
+    async fn down(&self) -> Option<String> {
+        if self.generation.load(Ordering::Acquire) & 1 == 0 {
+            let polled = self.child.lock().await.try_wait();
+            match polled {
+                Ok(None) => {}
+                Ok(Some(status)) => {
+                    self.invalidate();
+                    return Some(format!("its process exited ({status})"));
+                }
+                Err(e) => {
+                    self.invalidate();
+                    return Some(format!("its process could not be checked ({e})"));
+                }
+            }
+        }
+        if self.generation.load(Ordering::Acquire) & 1 != 0 {
+            return Some("its process is gone (its transport closed)".to_string());
+        }
+        None
     }
 
     fn snapshot(&self, recovered: bool) -> Option<ExtensionLifecycle> {
@@ -1616,11 +1641,14 @@ impl ProcessExtension {
 
     /// A `hook.handle` call's outcome as the handler's decision: a
     /// malformed `modify` blocks, every other failure (bad result, transport
-    /// error, timeout) is `Continue`.
+    /// error, failed respawn, timeout) is `Continue`, or under
+    /// `on_failure: "block"` the fixed guard block.
     fn hook_result(
         &self,
         outcome: Result<Result<Value, String>, tokio::time::error::Elapsed>,
+        on_failure: HookFailurePolicy,
     ) -> HookResult {
+        let fail_closed = on_failure == HookFailurePolicy::Block;
         match outcome {
             Ok(Ok(value)) => match serde_json::from_value(value.clone()) {
                 Ok(result) => result,
@@ -1637,6 +1665,7 @@ impl ProcessExtension {
                         Some("modify") => HookResult::Block {
                             reason: "Extension returned malformed modify result".to_string(),
                         },
+                        _ if fail_closed => on_failure.unanswered(&self.id),
                         // A malformed `replace` is safe to ignore: the original
                         // tool output is preserved by emit_after_tool_call.
                         // Explicit arm so this intent can't be silently changed
@@ -1646,6 +1675,14 @@ impl ProcessExtension {
                     }
                 }
             },
+            Ok(Err(e)) if fail_closed => {
+                tracing::warn!(
+                    extension = %self.id,
+                    error = %e,
+                    "Guard hook handler failed — blocking the call",
+                );
+                on_failure.unanswered(&self.id)
+            }
             Ok(Err(e)) => {
                 tracing::warn!(
                     extension = %self.id,
@@ -1653,6 +1690,14 @@ impl ProcessExtension {
                     "Extension hook handler failed — continuing",
                 );
                 HookResult::Continue
+            }
+            Err(_) if fail_closed => {
+                tracing::warn!(
+                    extension = %self.id,
+                    timeout_secs = 5,
+                    "Guard hook handler timed out — blocking the call",
+                );
+                on_failure.timed_out(&self.id)
             }
             Err(_) => {
                 tracing::warn!(
@@ -1663,6 +1708,85 @@ impl ProcessExtension {
                 HookResult::Continue
             }
         }
+    }
+
+    /// One `hook.handle` (restart-capable), answered per `on_failure` when
+    /// the extension does not answer.
+    async fn handle_with(&self, event: &HookEvent, on_failure: HookFailurePolicy) -> HookResult {
+        let params = serde_json::to_value(event).unwrap_or(Value::Null);
+        self.hook_result(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.call("hook.handle", params),
+            )
+            .await,
+            on_failure,
+        )
+    }
+
+    /// [`Self::handle_with`] on the running child only (no spawn/restart).
+    async fn handle_no_spawn_with(
+        &self,
+        event: &HookEvent,
+        on_failure: HookFailurePolicy,
+    ) -> HookResult {
+        let params = serde_json::to_value(event).unwrap_or(Value::Null);
+        self.hook_result(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.call_no_spawn("hook.handle", params),
+            )
+            .await,
+            on_failure,
+        )
+    }
+
+    /// One `hook.handle` for a required guard (restart-capable, or on the
+    /// running child only when `no_spawn`), its outcome as
+    /// [`Self::required_answer`] reads it.
+    async fn handle_required_with(
+        &self,
+        event: &HookEvent,
+        no_spawn: bool,
+    ) -> Result<HookResult, NoAnswer> {
+        let params = serde_json::to_value(event).unwrap_or(Value::Null);
+        let call = async {
+            if no_spawn {
+                self.call_no_spawn("hook.handle", params).await
+            } else {
+                self.call("hook.handle", params).await
+            }
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), call).await;
+        self.required_answer(outcome.ok())
+    }
+
+    /// A required guard's `hook.handle` outcome (`None`: no answer within
+    /// 5 s). Only a hook result is an answer; a timeout, a JSON-RPC error, a
+    /// failed call or anything that is not a hook result (a malformed
+    /// `modify` included) is a [`NoAnswer`], never `Continue`.
+    fn required_answer(
+        &self,
+        outcome: Option<Result<Value, String>>,
+    ) -> Result<HookResult, NoAnswer> {
+        let why = match outcome {
+            Some(Ok(value)) => match serde_json::from_value::<HookResult>(value) {
+                Ok(result) => return Ok(result),
+                Err(error) => NoAnswer::BadAnswer(error.to_string()),
+            },
+            Some(Err(error)) => match error.strip_prefix(APPLICATION_ERROR_PREFIX) {
+                Some(message) => NoAnswer::Error(message.to_string()),
+                None => NoAnswer::CallFailed(error),
+            },
+            None => NoAnswer::Timeout,
+        };
+        tracing::warn!(
+            extension = %self.id,
+            cause = %why.code(),
+            detail = %why.detail(),
+            "Required guard gave no usable answer — blocking the call",
+        );
+        Err(why)
     }
 
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
@@ -2258,6 +2382,17 @@ impl ExtensionHandler for ProcessExtension {
         lifecycle.snapshot(self.total_restarts.load(Ordering::Relaxed) > 0)
     }
 
+    async fn guard_down(&self) -> Option<String> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Some("its process was stopped".to_string());
+        }
+        let lifecycle = self.inbox.lifecycle.lock().await.clone();
+        match lifecycle {
+            Some(lifecycle) => lifecycle.down().await,
+            None => Some("its process never started".to_string()),
+        }
+    }
+
     async fn call_tool_for(
         &self,
         name: &str,
@@ -2432,28 +2567,32 @@ impl ExtensionHandler for ProcessExtension {
     }
 
     async fn handle(&self, event: &HookEvent) -> HookResult {
-        let params = serde_json::to_value(event).unwrap_or(Value::Null);
-        self.hook_result(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.call("hook.handle", params),
-            )
-            .await,
-        )
+        self.handle_with(event, HookFailurePolicy::Continue).await
     }
 
     /// The worker path: one `hook.handle` on the running child only. No
     /// spawn, no restart (`call_no_spawn`): a missing child or a dead
     /// transport is a failed call, so `Continue`.
     async fn handle_no_spawn(&self, event: &HookEvent) -> HookResult {
-        let params = serde_json::to_value(event).unwrap_or(Value::Null);
-        self.hook_result(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.call_no_spawn("hook.handle", params),
-            )
-            .await,
-        )
+        self.handle_no_spawn_with(event, HookFailurePolicy::Continue)
+            .await
+    }
+
+    async fn handle_fail_closed(&self, event: &HookEvent, no_spawn: bool) -> HookResult {
+        if no_spawn {
+            self.handle_no_spawn_with(event, HookFailurePolicy::Block)
+                .await
+        } else {
+            self.handle_with(event, HookFailurePolicy::Block).await
+        }
+    }
+
+    async fn handle_required(
+        &self,
+        event: &HookEvent,
+        no_spawn: bool,
+    ) -> Result<HookResult, NoAnswer> {
+        self.handle_required_with(event, no_spawn).await
     }
 
     async fn get_info(&self) -> Result<crate::extensions::info::PluginInfo, String> {
@@ -3543,5 +3682,258 @@ done"#
         assert_eq!(bounded(ext.handle_no_spawn(&event)).await, HookResult::Continue);
         assert!(ext.state.lock().await.is_none(), "no process was respawned");
         assert_eq!(ext.total_restarts.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod guard_fail_closed_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A `before_tool_call` guard: answers `initialize` with `$3` and every
+    /// `hook.handle` with `$1`. With `$2` set it refuses to start (exit 1)
+    /// once `$2` exists, so its first start creates it and every respawn
+    /// fails. With `$4` set it writes its pid there. With `$5` set it
+    /// answers a `tool.call` after `$5` seconds without blocking its reads.
+    /// With `$6` set it logs each request it receives there. With `$7` set
+    /// it takes 7 s to answer a `hook.handle` whose request is longer than
+    /// `$7` bytes (a guard slow on a large input).
+    pub(crate) const GUARD: &str = r#"if [ -n "$2" ]; then
+    [ -e "$2" ] && exit 1
+    : > "$2"
+fi
+[ -n "$4" ] && echo $$ > "$4"
+while IFS= read -r header; do
+    length=${header#Content-Length: }
+    length=${length%?}
+    IFS= read -r blank || exit 1
+    body=$(dd bs=1 count="$length" 2>/dev/null) || exit 1
+    id=${body##*\"id\":}
+    id=${id%%[!0-9]*}
+    case "$body" in
+        *'"method":"initialize"'*) method=initialize result=$3 ;;
+        *'"method":"hook.handle"'*) method=hook result=$1 ;;
+        *'"method":"tool.call"'*) method=tool result='{}' ;;
+        *) method=other result='{}' ;;
+    esac
+    [ -n "$6" ] && echo "$method" >> "$6"
+    reply='{"jsonrpc":"2.0","id":'"$id"',"result":'"$result"'}'
+    if [ "$method" = hook ] && [ -n "$7" ] && [ "$length" -gt "$7" ]; then
+        sleep 7
+    fi
+    if [ "$method" = tool ] && [ -n "$5" ]; then
+        (sleep "$5"; printf 'Content-Length: %s\r\n\r\n%s' "${#reply}" "$reply") &
+        continue
+    fi
+    printf 'Content-Length: %s\r\n\r\n%s' "${#reply}" "$reply"
+done"#;
+
+    /// The live guard's own answer.
+    pub(crate) const NO: &str = r#"{"action":"block","reason":"guard says no"}"#;
+
+    pub(crate) fn init() -> String {
+        serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {}
+        })
+        .to_string()
+    }
+
+    pub(crate) fn blocked(id: &str) -> HookResult {
+        HookResult::block(format!("guard {id} didn't answer; the call is blocked"))
+    }
+
+    pub(crate) fn timed_out(id: &str) -> HookResult {
+        HookResult::block(format!(
+            "guard {id} didn't answer within 5 s (busy or stopped); the call is blocked"
+        ))
+    }
+
+    pub(crate) fn signal(pid: &str, sig: &str) {
+        let status = std::process::Command::new("kill")
+            .args([sig, pid])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill {sig} {pid}");
+    }
+
+    async fn guard(answer: &str, marker: Option<&std::path::Path>) -> ProcessExtension {
+        let marker = marker.map(|p| p.display().to_string()).unwrap_or_default();
+        busy_guard(answer, &marker, "", "").await
+    }
+
+    /// [`GUARD`] with its `$2`, `$5` and `$6`.
+    async fn busy_guard(answer: &str, marker: &str, delay: &str, log: &str) -> ProcessExtension {
+        let init = init();
+        let args = [
+            "-c",
+            GUARD,
+            "guard",
+            answer,
+            marker,
+            init.as_str(),
+            "",
+            delay,
+            log,
+        ]
+        .map(String::from);
+        let ext = ProcessExtension::spawn("example-guard", "/bin/sh", &args)
+            .await
+            .expect("spawn the guard fixture");
+        tokio::time::timeout(Duration::from_secs(5), ext.initialize_for_test(None))
+            .await
+            .expect("bounded initialize")
+            .expect("initialize");
+        ext
+    }
+
+    fn call() -> HookEvent {
+        HookEvent::before_tool_call("bash", serde_json::json!({"command": "rm -rf /"}))
+    }
+
+    fn said_no() -> HookResult {
+        HookResult::block("guard says no")
+    }
+
+    async fn pid(ext: &ProcessExtension) -> String {
+        let lifecycle = ext.state.lock().await.as_ref().unwrap().lifecycle.clone();
+        let pid = lifecycle.child.lock().await.id().expect("the guard runs");
+        pid.to_string()
+    }
+
+    /// Kill the child and wait until the reader has seen it die.
+    async fn crash(ext: &ProcessExtension) {
+        let lifecycle = ext.state.lock().await.as_ref().unwrap().lifecycle.clone();
+        lifecycle.child.lock().await.start_kill().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ext.inbox.closed.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the reader sees the crash");
+    }
+
+    /// A guard stopped with SIGSTOP never answers: failing closed, the call
+    /// is blocked at the 5 s hook timeout.
+    #[tokio::test]
+    async fn a_stopped_guard_blocks_within_the_hook_timeout_when_failing_closed() {
+        let ext = guard(NO, None).await;
+        assert_eq!(ext.handle_fail_closed(&call(), false).await, said_no());
+        let pid = pid(&ext).await;
+        signal(&pid, "-STOP");
+        let started = Instant::now();
+        let result = ext.handle_fail_closed(&call(), false).await;
+        let waited = started.elapsed();
+        ext.force_shutdown().await;
+        assert_eq!(result, timed_out("example-guard"));
+        assert!(
+            waited < Duration::from_secs(6),
+            "within the hook timeout: {waited:?}"
+        );
+    }
+
+    /// The default (fail open) is unchanged: the stopped guard is skipped.
+    #[tokio::test]
+    async fn a_stopped_guard_still_continues_when_failing_open() {
+        let ext = guard(NO, None).await;
+        let pid = pid(&ext).await;
+        signal(&pid, "-STOP");
+        let result = ext.handle(&call()).await;
+        ext.force_shutdown().await;
+        assert_eq!(result, HookResult::Continue);
+    }
+
+    /// A killed guard whose respawn fails blocks at once when failing
+    /// closed (a transport error, not the timeout), and still continues
+    /// when failing open.
+    #[tokio::test]
+    async fn a_killed_guard_whose_respawn_fails_blocks_when_failing_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = guard(NO, Some(&dir.path().join("started"))).await;
+        assert_eq!(ext.handle_fail_closed(&call(), false).await, said_no());
+        crash(&ext).await;
+        let started = Instant::now();
+        assert_eq!(ext.handle_fail_closed(&call(), false).await, blocked("example-guard"));
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_secs(4), "{waited:?}");
+        let restarts = ext.total_restarts.load(Ordering::Relaxed);
+        assert_eq!(restarts, 1, "a respawn was tried");
+        assert_eq!(ext.handle(&call()).await, HookResult::Continue);
+        ext.force_shutdown().await;
+    }
+
+    /// Respawn is unchanged: a killed guard that can start again comes back
+    /// on the next call and answers it.
+    #[tokio::test]
+    async fn a_killed_guard_that_respawns_answers_the_next_call() {
+        let ext = guard(NO, None).await;
+        crash(&ext).await;
+        assert_eq!(ext.handle_fail_closed(&call(), false).await, said_no());
+        assert_eq!(ext.total_restarts.load(Ordering::Relaxed), 1);
+        ext.force_shutdown().await;
+    }
+
+    /// The no-spawn path never respawns: a guard that is not running
+    /// blocks when failing closed and passes through when failing open.
+    #[tokio::test]
+    async fn a_guard_that_is_not_running_blocks_on_the_no_spawn_path() {
+        let ext = guard(NO, None).await;
+        assert_eq!(ext.handle_fail_closed(&call(), true).await, said_no());
+        crash(&ext).await;
+        assert_eq!(ext.handle_fail_closed(&call(), true).await, blocked("example-guard"));
+        assert_eq!(ext.handle_no_spawn(&call()).await, HookResult::Continue);
+        ext.shutdown().await;
+        assert_eq!(ext.handle_fail_closed(&call(), true).await, blocked("example-guard"));
+        let restarts = ext.total_restarts.load(Ordering::Relaxed);
+        assert_eq!(restarts, 0, "never respawned");
+    }
+
+    /// An answer that is not a hook result is no answer when failing
+    /// closed; failing open it is ignored, as before.
+    #[tokio::test]
+    async fn a_malformed_answer_blocks_when_failing_closed() {
+        let ext = guard(r#"{"action":"bogus"}"#, None).await;
+        assert_eq!(ext.handle_fail_closed(&call(), false).await, blocked("example-guard"));
+        assert_eq!(ext.handle(&call()).await, HookResult::Continue);
+        ext.force_shutdown().await;
+    }
+
+    /// Calls to one extension are serialized: a hook arriving while the
+    /// guard serves its own slow call waits behind it, never reaches the
+    /// guard, and times out like a stopped guard.
+    #[tokio::test]
+    async fn a_guard_busy_with_its_own_slow_call_times_out_like_a_stopped_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("received");
+        let received = || std::fs::read_to_string(&log).unwrap_or_default();
+        let ext = Arc::new(busy_guard(NO, "", "7", &log.display().to_string()).await);
+        let busy = tokio::spawn({
+            let ext = Arc::clone(&ext);
+            async move { ext.call_tool_no_chat("slow", serde_json::json!({})).await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !received().contains("tool") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the guard took the slow call");
+        let started = Instant::now();
+        let result = ext.handle_fail_closed(&call(), false).await;
+        let waited = started.elapsed();
+        let during = received();
+        let slow = busy.await.unwrap();
+        eprintln!("busy guard: {result:?} after {waited:?}; guard received {during:?}");
+        ext.force_shutdown().await;
+        assert_eq!(result, timed_out("example-guard"));
+        assert!(
+            waited >= Duration::from_secs(5) && waited < Duration::from_secs(6),
+            "{waited:?}"
+        );
+        assert!(!during.contains("hook"), "the hook never reached the guard");
+        assert!(slow.is_ok(), "the slow call itself completes: {slow:?}");
+        let after = received();
+        assert!(!after.contains("hook"), "the timed-out hook is not sent");
     }
 }

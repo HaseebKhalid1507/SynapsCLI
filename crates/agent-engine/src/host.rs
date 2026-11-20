@@ -43,7 +43,9 @@ pub struct HostOpts {
     /// (the installed host wins — see [`EngineHost::boot_and_install`]).
     pub profile: Option<String>,
     /// Echoed to callers (`EngineBoot::no_extensions`) — extension discovery
-    /// is gated by the renderer after boot, not by the host. Not read here.
+    /// is gated by the renderer after boot, not by the host. The host reads
+    /// it for one thing: with it set, a configured required guard is marked
+    /// "extensions off" (and refuses every tool call) instead of pending.
     pub no_extensions: bool,
     /// When MCP servers without cached descriptors are discovered.
     /// [`McpDiscovery::Inline`] (in-process modes) discovers them during
@@ -198,6 +200,12 @@ impl EngineHost {
         )));
 
         let hook_bus = Arc::new(HookBus::new());
+        // This config's required guards gate every tool call from now:
+        // pending until discovery loads them (or not loaded at all with
+        // extensions off).
+        hook_bus
+            .required_guards()
+            .host_booting(&config.required_guards, opts.no_extensions);
         let mut ext_mgr = crate::extensions::manager::ExtensionManager::new_with_tools(
             Arc::clone(&hook_bus),
             Arc::clone(&tools),
@@ -431,10 +439,12 @@ impl EngineHost {
     /// `tools.transform_output` ([`HookBus::worker_transforms`]). Output
     /// transforms (compression, redaction) see a worker's tool results the
     /// way they see the foreground's; `before_tool_call` and every other
-    /// hook kind still do not fire for subagent tool calls, so a worker
-    /// never raises a confirm prompt. The extension sees `session_id: null`
-    /// (a worker has no conversation id). `subagent_transform_hooks = off`
-    /// detaches it (`apply_subagent_runtime_policy`).
+    /// hook kind still do not fire on this view itself, so with no required
+    /// guard configured a worker never raises a confirm prompt. (With one
+    /// configured the spawn path routes the worker's `before_tool_call` to
+    /// its caller's chain, `WorkerHooks`.) The extension sees `session_id:
+    /// null` (a worker has no conversation id). `subagent_transform_hooks =
+    /// off` detaches it (`apply_subagent_runtime_policy`).
     pub fn worker_hook_bus(&self) -> Arc<HookBus> {
         HookBus::worker_transforms(&self.parts.hook_bus)
     }

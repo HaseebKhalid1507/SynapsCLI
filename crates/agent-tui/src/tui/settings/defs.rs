@@ -38,6 +38,7 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("subagent_max_total", "legacy flat alias of subagent.max_total (edit that row)"),
     ("favorite_models", "owned by the model picker (/models favorites)"),
     ("disabled_plugins", "owned by the Plugins tab"),
+    ("required_guards", "owner-set guard requirement, set by hand in the config file; no product path writes it (the engine does not write-protect the file)"),
     ("tool_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
     ("daemon_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
     ("provider.*", "owned by the Providers tab (API keys)"),

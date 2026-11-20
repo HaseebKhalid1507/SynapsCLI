@@ -86,6 +86,12 @@ pub struct Pong {
     pub pid: u32,
     pub uptime_s: u64,
     pub sessions: usize,
+    /// One row per required guard (none when the daemon requires none or is
+    /// an older build that does not report them).
+    pub required_guards: Vec<crate::session::wire::RequiredGuardHealth>,
+    /// Whether the daemon requires any guard at all (`false` from an older
+    /// daemon, which does not report it).
+    pub required_guards_configured: bool,
 }
 
 /// What `synaps auth state` got from the daemon.
@@ -246,7 +252,13 @@ impl Connected {
 
     pub async fn ping(&mut self) -> Result<Pong, TransportError> {
         match self.request(ClientFrame::Ping).await? {
-            DaemonFrame::Pong { pid, uptime_s, sessions } => Ok(Pong { pid, uptime_s, sessions }),
+            DaemonFrame::Pong {
+                pid,
+                uptime_s,
+                sessions,
+                required_guards,
+                required_guards_configured,
+            } => Ok(Pong { pid, uptime_s, sessions, required_guards, required_guards_configured }),
             other => Err(TransportError::Protocol(format!("expected pong, got {other:?}"))),
         }
     }
@@ -284,7 +296,13 @@ impl Connected {
     /// `Purge` → the daemon runs `memstat::purge_arenas()`; replies `Pong`.
     pub async fn purge(&mut self) -> Result<Pong, TransportError> {
         match self.request(ClientFrame::Purge).await? {
-            DaemonFrame::Pong { pid, uptime_s, sessions } => Ok(Pong { pid, uptime_s, sessions }),
+            DaemonFrame::Pong {
+                pid,
+                uptime_s,
+                sessions,
+                required_guards,
+                required_guards_configured,
+            } => Ok(Pong { pid, uptime_s, sessions, required_guards, required_guards_configured }),
             DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
             other => Err(TransportError::Protocol(format!("expected pong, got {other:?}"))),
         }
@@ -1264,7 +1282,13 @@ mod tests {
                         boot_id: String::new(),
                     })
                 }
-                ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
+                ClientFrame::Ping => DaemonFrame::Pong {
+                    pid: 1,
+                    uptime_s: 0,
+                    sessions: 0,
+                    required_guards: Vec::new(),
+                    required_guards_configured: false,
+                },
                 ClientFrame::Attach(_) => DaemonFrame::Attached(AttachedWire::new(
                     ClientId(7),
                     AttachSnapshot {

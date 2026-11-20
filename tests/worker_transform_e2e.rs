@@ -48,11 +48,13 @@ fn manifest(spy: &std::path::Path) -> ExtensionManifest {
                 hook: "after_tool_call".into(),
                 tool: None,
                 matcher: None,
+                on_failure: None,
             },
             HookSubscription {
                 hook: "before_tool_call".into(),
                 tool: None,
                 matcher: None,
+                on_failure: None,
             },
         ],
         config: vec![],

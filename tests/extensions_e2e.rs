@@ -172,11 +172,13 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
                 matcher: None,
+                on_failure: None,
             },
             synaps_cli::extensions::manifest::HookSubscription {
                 hook: "after_tool_call".to_string(),
                 tool: Some("bash".to_string()),
                 matcher: None,
+                on_failure: None,
             },
         ],
         config: vec![],
@@ -303,6 +305,7 @@ async fn after_tool_call_replace_substitutes_output_via_real_extension() {
             hook: "after_tool_call".to_string(),
             tool: Some("bash".to_string()),
             matcher: None,
+            on_failure: None,
         }],
         config: vec![],
     };
@@ -629,6 +632,7 @@ async fn extension_registering_tools_requires_tools_register_permission() {
             hook: "before_tool_call".to_string(),
             tool: Some("bash".to_string()),
             matcher: None,
+            on_failure: None,
         }],
         config: vec![],
     };
@@ -774,6 +778,7 @@ async fn provider_capability_specs_are_validated() {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
                 matcher: None,
+                on_failure: None,
             }],
             config: vec![],
         };
@@ -827,6 +832,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
             hook: "before_tool_call".to_string(),
             tool: Some("bash".to_string()),
             matcher: None,
+            on_failure: None,
         }],
         config: vec![
             ExtensionConfigEntry {
@@ -900,6 +906,7 @@ async fn extension_missing_required_config_fails_before_spawn() {
             hook: "before_tool_call".to_string(),
             tool: Some("bash".to_string()),
             matcher: None,
+            on_failure: None,
         }],
         config: vec![ExtensionConfigEntry {
             key: "endpoint".to_string(),
@@ -957,6 +964,7 @@ async fn declared_secret_env_survives_extension_restart_without_persistence() {
             hook: "before_tool_call".to_string(),
             tool: Some("bash".to_string()),
             matcher: None,
+            on_failure: None,
         }],
         config: vec![ExtensionConfigEntry {
             key: "pria_agent_tool_token".to_string(),

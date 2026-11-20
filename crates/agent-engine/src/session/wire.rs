@@ -448,6 +448,17 @@ fn mirror() -> AttachMode {
 
 // ── daemon → client ───────────────────────────────────────────────────────────
 
+/// `Pong.required_guards`: one row per required guard of the daemon's
+/// config, loaded (and its process live) or not, with the cause
+/// (`code: detail`) when not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequiredGuardHealth {
+    pub name: String,
+    pub loaded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
@@ -462,6 +473,18 @@ pub enum DaemonFrame {
         pid: u32,
         uptime_s: u64,
         sessions: usize,
+        /// Additive, no protocol bump: one row per required guard; omitted
+        /// when the config requires none (an older daemon never sends it,
+        /// an older client ignores it).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        required_guards: Vec<RequiredGuardHealth>,
+        /// Whether the daemon requires any guard at all, so an empty
+        /// `required_guards` reads "configured: no", never "all loaded" (a
+        /// dropped or mistyped list shows). Additive, omitted when false: a
+        /// frame without it, an older daemon's too, reads false, and no guard
+        /// is required there either.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        required_guards_configured: bool,
     },
     SessionList {
         sessions: Vec<SessionMeta>,
@@ -2118,7 +2141,13 @@ mod tests {
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
             DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
-            DaemonFrame::Pong { pid: 1, uptime_s: 2, sessions: 0 },
+            DaemonFrame::Pong {
+                pid: 1,
+                uptime_s: 2,
+                sessions: 0,
+                required_guards: Vec::new(),
+                required_guards_configured: false,
+            },
             DaemonFrame::SessionList { sessions: vec![meta()] },
             DaemonFrame::Attached(AttachedWire::new(
                 ClientId(1),
@@ -2184,6 +2213,58 @@ mod tests {
             let line = encode_line(&f).unwrap();
             let back: DaemonFrame = decode_line(line.trim_end()).unwrap();
             assert_eq!(serde_json::to_string(&back).unwrap(), line.trim_end());
+        }
+    }
+
+    #[test]
+    fn pong_required_guard_fields_are_additive() {
+        // An older daemon's Pong has neither field: no guard is required.
+        let old: DaemonFrame =
+            decode_line(r#"{"type":"pong","pid":1,"uptime_s":2,"sessions":0}"#).unwrap();
+        match old {
+            DaemonFrame::Pong { required_guards, required_guards_configured, .. } => {
+                assert!(required_guards.is_empty() && !required_guards_configured);
+            }
+            other => panic!("not a pong: {other:?}"),
+        }
+        // None required: the frame is the one an older client reads.
+        let none = DaemonFrame::Pong {
+            pid: 1,
+            uptime_s: 2,
+            sessions: 0,
+            required_guards: Vec::new(),
+            required_guards_configured: false,
+        };
+        assert_eq!(
+            encode_line(&none).unwrap().trim_end(),
+            r#"{"type":"pong","pid":1,"uptime_s":2,"sessions":0}"#
+        );
+        // Some required: the rows and the configured flag round-trip.
+        let some = DaemonFrame::Pong {
+            pid: 1,
+            uptime_s: 2,
+            sessions: 0,
+            required_guards: vec![
+                RequiredGuardHealth { name: "example-guard".into(), loaded: true, cause: None },
+                RequiredGuardHealth {
+                    name: "other-guard".into(),
+                    loaded: false,
+                    cause: Some("disabled: 'other-guard' is listed in disabled_plugins".into()),
+                },
+            ],
+            required_guards_configured: true,
+        };
+        let line = encode_line(&some).unwrap();
+        assert!(line.contains(r#""required_guards_configured":true"#), "{line}");
+        let back: DaemonFrame = decode_line(line.trim_end()).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), line.trim_end());
+        match back {
+            DaemonFrame::Pong { required_guards, .. } => {
+                assert_eq!(required_guards.len(), 2);
+                assert!(required_guards[0].loaded && required_guards[0].cause.is_none());
+                assert!(!required_guards[1].loaded && required_guards[1].cause.is_some());
+            }
+            other => panic!("not a pong: {other:?}"),
         }
     }
 

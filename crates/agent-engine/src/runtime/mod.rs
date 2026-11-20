@@ -328,6 +328,22 @@ pub async fn resolve_before_tool_call_result(
     }
 }
 
+/// A worker's (subagent's) confirm route: its caller's prompt handle and
+/// auto-approve policy, which answer a `before_tool_call` `Confirm` on the
+/// worker's calls exactly as they answer the caller's own (with the caller's
+/// "Allow all" latch, which the worker already shares). Held by the worker's
+/// runtime and passed only to [`resolve_before_tool_call_decision`]; it
+/// never reaches the worker's tools, so no tool on a worker can raise a
+/// prompt (e.g. bash's sudo password prompt) through it.
+#[derive(Clone)]
+pub(crate) struct WorkerConfirm {
+    /// The caller's prompt handle (`None` when the caller has none: the
+    /// worker's `Confirm` then fails closed, as the caller's would).
+    pub(crate) prompt: Option<crate::tools::SecretPromptHandle>,
+    /// The caller's `auto_approve_confirms` for the turn that started it.
+    pub(crate) auto_approve: bool,
+}
+
 /// Resolve before_tool_call policy into executable input or a block reason.
 pub async fn resolve_before_tool_call_decision(
     original_input: Value,
@@ -703,6 +719,11 @@ pub struct Runtime {
     /// the user picks "Allow all from <ext>" in the Confirm dialog; shared by
     /// clones and delegated workers in the same session. Never persisted.
     session_allow_all: std::sync::Arc<crate::tools::SessionConfirmLatch>,
+    /// A subagent worker's route for answering a `before_tool_call`
+    /// `Confirm` on its caller's behalf (see [`WorkerConfirm`]); set with
+    /// the worker's hook route ([`Self::bind_worker_hooks`]), `None` on
+    /// every other runtime.
+    worker_confirm: Option<WorkerConfirm>,
     /// Shared exact MCP lease manager (Task 19). Installed at engine boot
     /// when MCP exact mode is active; streams mint per-session capabilities
     /// and RAII guards from it.
@@ -1031,6 +1052,7 @@ impl Runtime {
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
             session_allow_all: std::sync::Arc::new(crate::tools::SessionConfirmLatch::new()),
+            worker_confirm: None,
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -3167,6 +3189,39 @@ impl Runtime {
         }
     }
 
+    /// Route this worker's `before_tool_call` hooks to its caller: `bus`
+    /// (a [`HookBus::worker_route`](crate::extensions::hooks::HookBus::worker_route))
+    /// runs the caller's chain, and `confirm` answers a `Confirm` as the
+    /// caller's confirm step would.
+    pub(crate) fn bind_worker_hooks(
+        &mut self,
+        bus: Arc<crate::extensions::hooks::HookBus>,
+        confirm: WorkerConfirm,
+    ) {
+        self.hook_bus = bus;
+        self.worker_confirm = Some(confirm);
+    }
+
+    /// Whether this runtime's `before_tool_call` hooks are routed to a
+    /// caller (a worker bound by [`Self::bind_worker_hooks`]).
+    pub fn has_worker_hook_route(&self) -> bool {
+        self.worker_confirm.is_some()
+    }
+
+    /// The prompt and auto-approve policy that resolve a `before_tool_call`
+    /// `Confirm` on this runtime: the given (the turn's own) ones, or on a
+    /// worker with routed hooks its caller's.
+    fn hook_confirm_route(
+        &self,
+        own_prompt: Option<&crate::tools::SecretPromptHandle>,
+        own_auto_approve: bool,
+    ) -> (Option<crate::tools::SecretPromptHandle>, bool) {
+        match &self.worker_confirm {
+            Some(route) => (route.prompt.clone(), route.auto_approve),
+            None => (own_prompt.cloned(), own_auto_approve),
+        }
+    }
+
     /// Run a multi-turn conversation as a cancellable stream of [`StreamEvent`]s.
     /// This is the main entry point for chat UIs and agents. Handles tool execution,
     /// API retries, and dynamic tool registration (MCP) internally.
@@ -3331,6 +3386,10 @@ impl Runtime {
             round_signal: None,
         };
 
+        // Who answers a hook `Confirm`: the turn's prompt and policy, or on
+        // a worker with a routed chain its caller's.
+        let (hook_confirm_prompt, hook_auto_approve) =
+            self.hook_confirm_route(secret_prompt.as_ref(), auto_approve_confirms);
         let session = crate::runtime::stream::StreamSession {
             memory_backend: self.memory_backend.clone(),
             turn_completion: completion,
@@ -3373,6 +3432,8 @@ impl Runtime {
             env_stripped: self.env_stripped.clone(),
             env_warned: self.env_warned.clone(),
             auto_approve_confirms,
+            hook_confirm_prompt,
+            hook_auto_approve,
             session_allow_all: self.session_allow_all.clone(),
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
@@ -3492,6 +3553,7 @@ impl Clone for Runtime {
             activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),
             session_allow_all: self.session_allow_all.clone(),
+            worker_confirm: self.worker_confirm.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             // Clones SHARE the durable session scope: dropping one clone or
             // one stream can never kill a sibling's leases.
