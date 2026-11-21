@@ -34,6 +34,7 @@ memchr             = "2"
 axum               = { version = "0.7", features = ["ws"] }
 url                = "2"
 urlencoding        = "2"
+llm-prices         = "1.8.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
