@@ -103,7 +103,10 @@ fn is_sonnet_5(m: &str) -> bool {
 /// so it works with full model IDs like `claude-opus-4-5-20251101` as well as
 /// short names like `claude-opus`.
 ///
-/// Falls back to Sonnet pricing for unknown models.
+/// Non-Anthropic models (OpenAI, Gemini, Groq, xAI, DeepSeek, ...) are priced
+/// from the dated, source-cited [`llm_prices`] table, including its
+/// long-context tier. Only a model neither table knows falls back to Sonnet
+/// pricing.
 #[inline]
 fn model_prices(model: &str, prompt_tokens: u64) -> (f64, f64) {
     match model {
@@ -136,8 +139,28 @@ fn model_prices(model: &str, prompt_tokens: u64) -> (f64, f64) {
         }
         m if is_version(m, "3-haiku") || is_version(m, "haiku-3") => (0.25, 1.25),
         m if m.contains("haiku") => (1.0, 5.0),
-        _ => (3.0, 15.0), // default: Sonnet pricing
+        m => catalog_prices(m, prompt_tokens).unwrap_or((3.0, 15.0)), // default: Sonnet pricing
     }
+}
+
+/// The `llm-prices` row for a model the Anthropic table above does not cover.
+/// Rows without both an input and an output price are ignored.
+fn catalog_row(model: &str) -> Option<&'static llm_prices::Price> {
+    llm_prices::lookup(model).filter(|p| p.input.is_some() && p.output.is_some())
+}
+
+/// `(input, output)` per million tokens from `llm-prices`, using the row's
+/// long-context prices when the prompt is over its threshold.
+fn catalog_prices(model: &str, prompt_tokens: u64) -> Option<(f64, f64)> {
+    let p = catalog_row(model)?;
+    if let Some(lc) = &p.long_context {
+        if prompt_tokens > lc.threshold_tokens {
+            if let (Some(i), Some(o)) = (lc.input, lc.output) {
+                return Some((i, o));
+            }
+        }
+    }
+    Some((p.input?, p.output?))
 }
 
 /// Cache-read price as a multiple of the input price
@@ -156,7 +179,23 @@ pub fn cache_read_multiplier(model: &str) -> f64 {
             0.025
         }
         m if is_version(m, "opus-5-5") || is_version(m, "sonnet-5-5") => 0.05,
-        _ => 0.1,
+        m if m.contains("claude")
+            || m.contains("opus")
+            || m.contains("sonnet")
+            || m.contains("haiku")
+            || m.contains("fable")
+            || m.contains("mythos") =>
+        {
+            0.1
+        }
+        // Other providers list their own cached-input price (gpt-5: $0.125
+        // against $1.25 input, 0.1x; gpt-4o: 0.5x).
+        m => catalog_row(m)
+            .and_then(|p| match (p.cache_read, p.input) {
+                (Some(read), Some(input)) if input > 0.0 => Some(read / input),
+                _ => None,
+            })
+            .unwrap_or(0.1),
     }
 }
 
@@ -482,6 +521,33 @@ mod tests {
         let cost_unknown = calculate_cost("gpt-99-turbo", 1_000_000, 0, 0, 0);
         let cost_sonnet = calculate_cost("claude-sonnet-4-5", 1_000_000, 0, 0, 0);
         assert!((cost_unknown - cost_sonnet).abs() < 1e-9);
+    }
+
+    #[test]
+    fn non_anthropic_models_use_their_own_list_prices() {
+        // gpt-5: $1.25 in / $10 out, cached input $0.125. Before, every
+        // OpenAI/Gemini id was billed as Sonnet ($3 / $15).
+        for m in ["gpt-5", "openai/gpt-5", "gpt-5-2025-08-07"] {
+            let cost = calculate_cost(m, 1_000_000, 1_000_000, 0, 0);
+            assert!((cost - 11.25).abs() < 1e-9, "{m}: ${cost}");
+            let read = calculate_cost(m, 0, 0, 1_000_000, 0);
+            assert!((read - 0.125).abs() < 1e-9, "{m}: read ${read}");
+        }
+        // Gemini 2.5 Flash: $0.30 in / $2.50 out.
+        let flash = calculate_cost("gemini-2.5-flash", 1_000_000, 1_000_000, 0, 0);
+        assert!((flash - 2.8).abs() < 1e-9, "${flash}");
+        // Gemini 2.5 Pro bills a prompt over 200k tokens at its long-context
+        // rate ($2.50 in / $15 out instead of $1.25 / $10).
+        let short = calculate_cost("gemini-2.5-pro", 200_000, 0, 0, 0);
+        assert!((short - 0.25).abs() < 1e-9, "${short}");
+        let long = calculate_cost("gemini-2.5-pro", 200_001, 0, 0, 0);
+        assert!((long - 0.200_001 * 2.5).abs() < 1e-9, "${long}");
+        // Claude ids stay on this module's own table.
+        assert_eq!(
+            calculate_cost("claude-opus-5-5", 1_000_000, 1_000_000, 0, 0),
+            24.0
+        );
+        assert_eq!(cache_read_multiplier("claude-sonnet-4-5"), 0.1);
     }
 
     #[test]
