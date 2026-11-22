@@ -533,6 +533,40 @@ fn content_text(content: &Value) -> String {
     }
 }
 
+/// Recognize only the cold-resume envelope we emit, not arbitrary task headings.
+/// Old archives may already contain nested envelopes inside their task block.
+fn cold_resume_task(content: &Value) -> Option<String> {
+    let blocks = content.as_array()?;
+    let header = blocks.first()?["text"].as_str()?;
+    if !header.starts_with("[Resumed by the orchestrator. Your earlier run in this task (") {
+        return None;
+    }
+    let mut task = blocks.get(1)?["text"]
+        .as_str()?
+        .strip_prefix("## Your original task\n\n")?;
+    let nested = task.starts_with("[Resumed by the orchestrator. Your earlier run in this task (");
+    while task.starts_with("[Resumed by the orchestrator. Your earlier run in this task (") {
+        let Some((_, inner)) = task.split_once("\n## Your original task\n\n") else {
+            break;
+        };
+        task = inner;
+    }
+    // A legacy task block concatenated all blocks of the previous envelope.
+    // Once unwrapped, discard its old tail/report/instructions, not the task.
+    for heading in [
+        "\n## Earlier context windows of this run",
+        "\n## The last steps of your earlier run",
+        "\n## Your final report",
+    ] {
+        if nested {
+            if let Some((original, _)) = task.split_once(heading) {
+                task = original;
+            }
+        }
+    }
+    Some(task.to_owned())
+}
+
 /// Text of a tool_result's `content` (string or blocks; images named only).
 fn tool_result_text(content: &Value) -> String {
     match content {
@@ -636,7 +670,10 @@ pub fn cold_resume_messages(
         info.messages, info.est_tokens, info.est_tokens
     );
     let task = first_user
-        .map(|i| content_text(&history[i]["content"]))
+        .map(|i| {
+            cold_resume_task(&history[i]["content"])
+                .unwrap_or_else(|| content_text(&history[i]["content"]))
+        })
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| "(not recorded)".to_string());
     let task = format!(
@@ -671,9 +708,25 @@ pub fn cold_resume_messages(
     let mut used = 0usize;
     let mut cut = false;
     'walk: for (i, message) in history.iter().enumerate().rev() {
-        if Some(i) == first_user || i == last_assistant {
+        if i == last_assistant {
             continue;
         }
+        let prior_note;
+        let message = if Some(i) == first_user {
+            if cold_resume_task(&message["content"]).is_none() {
+                continue;
+            }
+            // Keep the previous continuation instructions in the bounded recent
+            // tail, rather than silently losing them or nesting the whole envelope.
+            prior_note = serde_json::json!({
+                "role": "user",
+                "content": message["content"].as_array().and_then(|b| b.last())
+                    .and_then(|b| b["text"].as_str()).unwrap_or("")
+            });
+            &prior_note
+        } else {
+            message
+        };
         for line in render_message_lines(message).into_iter().rev() {
             let len = line.chars().count() + 1;
             if used + len > budget {
@@ -1231,6 +1284,41 @@ mod cold_resume_tests {
         // Host metadata stays off the wire.
         let wire = serde_json::to_string(&crate::runtime::continuation::WireMessages(&cold)).unwrap();
         assert!(!wire.contains(MARKER_KEY));
+    }
+
+    #[test]
+    fn repeated_cold_resumes_keep_one_original_task() {
+        let mut history = big_history(60);
+        for round in 0..12 {
+            let cold = cold_resume_messages(
+                &history, &format!("LATEST-{round}"), &info_for(&history),
+            ).unwrap();
+            assert_eq!(cold[0]["content"][1]["text"],
+                "## Your original task\n\nTASK-MARK build the plate");
+            assert!(joined_text(&cold).contains(&format!("LATEST-{round}")));
+            history = cold.iter().map(|m| (**m).clone()).collect();
+            history.extend(big_history(60).into_iter().skip(1));
+        }
+    }
+
+    #[test]
+    fn legacy_nested_resume_keeps_task_and_previous_instructions() {
+        let history = big_history(60);
+        let cold = cold_resume_messages(
+            &history, "PREVIOUS-INSTRUCTIONS", &info_for(&history),
+        ).unwrap();
+        let mut legacy = (*cold[0]).clone();
+        legacy["content"][1]["text"] = serde_json::json!(format!(
+            "## Your original task\n\n{}", joined_text(&cold)
+        ));
+        assert_eq!(cold_resume_task(&legacy["content"]).unwrap(), "TASK-MARK build the plate");
+        assert!(cold_resume_task(&serde_json::json!("## Your original task\n\nuser task")).is_none());
+        let history = vec![legacy, serde_json::json!({"role":"assistant", "content":"done"})];
+        let info = ColdResumeInfo { messages: 2, est_tokens: 100_000, cache_age_secs: None };
+        let next = cold_resume_messages(&history, "LATEST", &info).unwrap();
+        assert!(joined_text(&next).contains("PREVIOUS-INSTRUCTIONS"));
+        assert_eq!(next[0]["content"][1]["text"],
+            "## Your original task\n\nTASK-MARK build the plate");
     }
 
     #[test]
