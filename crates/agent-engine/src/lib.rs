@@ -18,6 +18,9 @@ pub mod skills;
 #[cfg(test)]
 pub(crate) mod test_env;
 pub mod tools;
+/// Agent cards (C1): the card model only. Inert: no tool, wire or session
+/// path reaches it yet.
+pub mod ui;
 
 // ── agent-core facade ──────────────────────────────────────────────────────────
 // Re-export core so that internal `crate::core::X`, `crate::config`, etc.

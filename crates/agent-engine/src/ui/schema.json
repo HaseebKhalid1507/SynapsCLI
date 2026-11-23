@@ -1,0 +1,22 @@
+{"type":"object","additionalProperties":false,
+ "properties":{
+  "question":{"type":"string","minLength":1,"maxLength":120},
+  "detail":{"type":"string","maxLength":1500},
+  "options":{"type":"array","minItems":2,"maxItems":9,"items":{"oneOf":[
+    {"type":"string","minLength":1,"maxLength":60},
+    {"type":"object","additionalProperties":false,"required":["label"],"properties":{
+      "label":{"type":"string","minLength":1,"maxLength":60},
+      "hint":{"type":"string","maxLength":120},
+      "note":{"type":"string","minLength":1,"maxLength":80}}}]}},
+  "multi":{"type":"boolean","default":false},
+  "default":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"},"maxItems":9}]},
+  "fields":{"type":"array","minItems":1,"maxItems":5,"items":{"type":"object","additionalProperties":false,
+    "required":["id","label"],"properties":{
+      "id":{"type":"string","pattern":"^[a-z][a-z0-9_]{0,23}$"},
+      "label":{"type":"string","minLength":1,"maxLength":60},
+      "type":{"enum":["text","long","check"],"default":"text"},
+      "value":{"oneOf":[{"type":"string"},{"type":"boolean"}]},
+      "placeholder":{"type":"string","maxLength":80},
+      "optional":{"type":"boolean","default":false}}}},
+  "wait":{"type":"boolean","default":false},
+  "close":{"type":"string","pattern":"^s_[0-9a-f]{16}$"}}}
