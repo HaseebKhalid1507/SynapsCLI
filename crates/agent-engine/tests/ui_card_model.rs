@@ -1,6 +1,6 @@
-//! The C1 card model against its fixture corpus (`tests/fixtures/ui/` at
-//! the repository root; the desk's D1 copies it), and the measured
-//! worst-case budget of §4.4 (R2-M3).
+//! The C1 card model against its fixture corpus (`tests/fixtures/ui/` in
+//! this package; the desk's D1 copies it), and the measured worst-case
+//! budget of §4.4 (R2-M3).
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,7 @@ use agent_engine::ui::*;
 use serde_json::{json, Value};
 
 fn corpus() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ui")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui")
 }
 
 fn read_dir(kind: &str) -> Vec<(String, Value)> {
