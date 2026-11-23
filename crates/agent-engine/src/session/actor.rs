@@ -981,6 +981,10 @@ impl SessionActor {
             )
         };
 
+        // The model fence starts at the model this session starts with,
+        // before its loop can run anything: an event's turn may come before
+        // any command (Shady #436 R6-1).
+        let start_model = runtime.model().to_string();
         let actor = SessionActor {
             id,
             meta,
@@ -998,6 +1002,7 @@ impl SessionActor {
                 config.cache_keepwarm_headless,
                 cache_keepwarm,
                 owned.is_some(),
+                start_model,
             ),
             park_deadline: None,
             park_recheck_at: None,

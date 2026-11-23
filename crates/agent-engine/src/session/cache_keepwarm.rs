@@ -1011,8 +1011,9 @@ pub(crate) struct KeepWarmState {
     turn_started_at: Option<Instant>,
     /// Usage of the latest real request (`None` until one reported).
     last_request: Option<KeepWarmUsage>,
-    /// The model the command loop last saw ([`SessionActor::cache_model_fence`]):
-    /// another one starts a new cache lifetime.
+    /// The model the actor last saw ([`SessionActor::cache_model_fence`]):
+    /// another one starts a new cache lifetime. Set at construction, to the
+    /// model the session starts with ([`KeepWarmState::new`]).
     fence_model: Option<String>,
     /// A qualifying client (see [`client_qualifies`]) has been attached at
     /// some point. By default that is a TUI/attach client that can type;
@@ -1038,6 +1039,7 @@ impl KeepWarmState {
         headless: bool,
         override_slot: OverrideSlot,
         owned: bool,
+        model: String,
     ) -> Self {
         let override_mode = *override_slot
             .lock()
@@ -1049,6 +1051,7 @@ impl KeepWarmState {
             owned,
             override_mode,
             override_slot,
+            fence_model: Some(model),
             ..Self::default()
         }
     }
@@ -1176,6 +1179,8 @@ impl SessionActor {
         }
         let model = self.runtime.model();
         if self.cache_keepwarm.fence_model.as_deref() != Some(model) {
+            // Seeded at construction (`None` only in unit tests that build
+            // the state bare): no first-observation exemption to rely on.
             let first = self.cache_keepwarm.fence_model.is_none();
             self.cache_keepwarm.fence_model = Some(model.to_string());
             if !first {
@@ -1866,7 +1871,7 @@ mod tests {
     #[test]
     fn an_owned_session_never_keeps_warm() {
         for owned in [false, true] {
-            let mut kw = KeepWarmState::new(CacheKeepWarm::Auto, 4, true, OverrideSlot::default(), owned);
+            let mut kw = KeepWarmState::new(CacheKeepWarm::Auto, 4, true, OverrideSlot::default(), owned, "m".into());
             kw.note_attach(ClientKind::Rpc, AttachMode::Mirror);
             kw.note_attach(ClientKind::Tui, AttachMode::Mirror);
             assert_eq!(kw.interactive_seen, !owned, "owned: {owned}");
