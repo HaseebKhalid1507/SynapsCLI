@@ -2146,8 +2146,9 @@ fn secs(c: &serde_json::Value, k: &str) -> u64 {
 }
 
 /// A cached turn on model A, then a switch to B: B's cache is cold (A's
-/// countdown would be a lie), and stays cold switched back to A; B's own
-/// first cached request starts B's countdown. A no-op `Set` keeps it.
+/// countdown would be a lie), and stays cold switched back to A; A's next
+/// cached request starts a fresh countdown. A no-op `Set` keeps it. (B's
+/// own first request: `another_model_proves_its_own_ttl`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn a_model_switch_leaves_the_cache_cold() {
