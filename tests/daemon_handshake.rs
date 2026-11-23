@@ -118,7 +118,7 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
             assert_eq!(w.pid, std::process::id());
             assert_eq!(
                 w.features,
-                [FEATURE_OWNED_SESSIONS, FEATURE_SESSION_WORKERS, FEATURE_SESSION_PAGE],
+                [FEATURE_OWNED_SESSIONS, FEATURE_SESSION_WORKERS, FEATURE_SESSION_PAGE, FEATURE_CACHE_EXPIRY],
                 "every feature this daemon serves"
             );
         }
