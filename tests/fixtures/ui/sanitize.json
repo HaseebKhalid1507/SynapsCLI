@@ -1,0 +1,179 @@
+{
+  "about": "ui_sanitize parity (§4.3). single: a one-line field; multi: detail and long values. refused: what validation refuses in an agent-written string, with a teaching line (it never reaches sanitizing).",
+  "cases": [
+    {
+      "in": "plain",
+      "single": "plain",
+      "multi": "plain",
+      "refused": null
+    },
+    {
+      "in": "a\nb\tc",
+      "single": "a b c",
+      "multi": "a\nb c",
+      "refused": null
+    },
+    {
+      "in": "a\r\nb",
+      "single": "a b",
+      "multi": "a\nb",
+      "refused": {
+        "char": "U+000D",
+        "why": "a control character"
+      }
+    },
+    {
+      "in": "\u001b[31mred\u001b[0m",
+      "single": "[31mred[0m",
+      "multi": "[31mred[0m",
+      "refused": {
+        "char": "U+001B",
+        "why": "a control character"
+      }
+    },
+    {
+      "in": "a\u0085b",
+      "single": "ab",
+      "multi": "ab",
+      "refused": {
+        "char": "U+0085",
+        "why": "a control character"
+      }
+    },
+    {
+      "in": "a\u009bb",
+      "single": "ab",
+      "multi": "ab",
+      "refused": {
+        "char": "U+009B",
+        "why": "a control character"
+      }
+    },
+    {
+      "in": "\u202etxt.exe",
+      "single": "txt.exe",
+      "multi": "txt.exe",
+      "refused": {
+        "char": "U+202E",
+        "why": "a bidi control"
+      }
+    },
+    {
+      "in": "a\u2066b\u2069",
+      "single": "ab",
+      "multi": "ab",
+      "refused": {
+        "char": "U+2066",
+        "why": "a bidi control"
+      }
+    },
+    {
+      "in": "a\u200eb\u200fc\u061cd",
+      "single": "abcd",
+      "multi": "abcd",
+      "refused": null
+    },
+    {
+      "in": "zero\u200bwidth",
+      "single": "zerowidth",
+      "multi": "zerowidth",
+      "refused": null
+    },
+    {
+      "in": "w\u2060j",
+      "single": "wj",
+      "multi": "wj",
+      "refused": null
+    },
+    {
+      "in": "\ufeffbom",
+      "single": "bom",
+      "multi": "bom",
+      "refused": null
+    },
+    {
+      "in": "soft\u00adhyphen",
+      "single": "softhyphen",
+      "multi": "softhyphen",
+      "refused": null
+    },
+    {
+      "in": "emoji❤\ufe0f",
+      "single": "emoji❤",
+      "multi": "emoji❤",
+      "refused": null
+    },
+    {
+      "in": "vs\udb40\udd00x",
+      "single": "vsx",
+      "multi": "vsx",
+      "refused": null
+    },
+    {
+      "in": "tag\udb40\udc41\udb40\udc7f",
+      "single": "tag",
+      "multi": "tag",
+      "refused": null
+    },
+    {
+      "in": "line\u2028para\u2029",
+      "single": "linepara",
+      "multi": "linepara",
+      "refused": null
+    },
+    {
+      "in": "👨\u200d👩\u200d👧",
+      "single": "👨\u200d👩\u200d👧",
+      "multi": "👨\u200d👩\u200d👧",
+      "refused": null
+    },
+    {
+      "in": "می\u200cخواهم",
+      "single": "می\u200cخواهم",
+      "multi": "می\u200cخواهم",
+      "refused": null
+    },
+    {
+      "in": "https://example.test/?a=<b>&c=\"d\"",
+      "single": "https://example.test/?a=<b>&c=\"d\"",
+      "multi": "https://example.test/?a=<b>&c=\"d\"",
+      "refused": null
+    },
+    {
+      "in": "[link](javascript:alert(1))",
+      "single": "[link](javascript:alert(1))",
+      "multi": "[link](javascript:alert(1))",
+      "refused": null
+    },
+    {
+      "in": "mongolian\u180e",
+      "single": "mongolian",
+      "multi": "mongolian",
+      "refused": null
+    },
+    {
+      "in": "hangul\u3164filler",
+      "single": "hangulfiller",
+      "multi": "hangulfiller",
+      "refused": null
+    },
+    {
+      "in": "\u034fcgj",
+      "single": "cgj",
+      "multi": "cgj",
+      "refused": null
+    },
+    {
+      "in": "\u00a0nbsp stays",
+      "single": "\u00a0nbsp stays",
+      "multi": "\u00a0nbsp stays",
+      "refused": null
+    },
+    {
+      "in": "\u2060\u200b",
+      "single": "",
+      "multi": "",
+      "refused": null
+    }
+  ]
+}

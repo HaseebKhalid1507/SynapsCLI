@@ -1,0 +1,14 @@
+{
+  "about": "An unknown key on a field",
+  "input": {
+    "question": "Q",
+    "fields": [
+      {
+        "id": "a",
+        "label": "A",
+        "required": true
+      }
+    ]
+  },
+  "error": "fields[0].required: unknown key; a field takes id, label, type, value, placeholder and optional"
+}

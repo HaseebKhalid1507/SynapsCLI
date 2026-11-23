@@ -1,0 +1,62 @@
+{
+  "about": "§3.6: an answer delivered after its turn ended carries the <asked> capsule (≤1 KiB).",
+  "input": {
+    "question": "Release target?",
+    "detail": "Tag v0.13.0\nand push the crate",
+    "fields": [
+      {
+        "id": "target",
+        "label": "Release target"
+      },
+      {
+        "id": "notes",
+        "label": "Notes",
+        "optional": true
+      }
+    ]
+  },
+  "doc": {
+    "question": "Release target?",
+    "detail": "Tag v0.13.0\nand push the crate",
+    "multi": false,
+    "fields": [
+      {
+        "id": "target",
+        "label": "Release target",
+        "type": "text",
+        "value": "",
+        "optional": false
+      },
+      {
+        "id": "notes",
+        "label": "Notes",
+        "type": "text",
+        "value": "",
+        "optional": true
+      }
+    ]
+  },
+  "wait": false,
+  "mode": "form",
+  "contract": "c1:b723e60a74129c51f993a92783f001cd",
+  "answers": [
+    {
+      "card": "s_9c0d1e2f3a4b5c6d",
+      "answer_id": "a_1f2e3d4c5b6a7980",
+      "status": "answered",
+      "rev": 1,
+      "values": {
+        "fields": {
+          "target": "prod",
+          "notes": ""
+        }
+      },
+      "late": {
+        "turn_message": "Cut the 0.13 release\nand tell me when it's out",
+        "task": "Cut the 0.13 release and tell me when it's out",
+        "asked": "<asked during=\"Cut the 0.13 release and tell me when it's out\">detail: Tag v0.13.0 and push the crate · fields: target=Release target, notes=Notes</asked>"
+      },
+      "message": "<ui_answer card=\"s_9c0d1e2f3a4b5c6d\" answer=\"a_1f2e3d4c5b6a7980\" q=\"Release target?\" late=\"true\">{\"fields\":{\"target\":\"prod\",\"notes\":\"\"}}\n<asked during=\"Cut the 0.13 release and tell me when it's out\">detail: Tag v0.13.0 and push the crate · fields: target=Release target, notes=Notes</asked></ui_answer>"
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "about": "Appendix A4: choice plus one field (form mode).",
+  "input": {
+    "question": "Which test runner?",
+    "options": [
+      "vitest",
+      "jest",
+      "node:test"
+    ],
+    "default": "vitest",
+    "fields": [
+      {
+        "id": "watch",
+        "label": "Enable watch mode",
+        "type": "check",
+        "value": true
+      }
+    ]
+  },
+  "doc": {
+    "question": "Which test runner?",
+    "options": [
+      {
+        "label": "vitest"
+      },
+      {
+        "label": "jest"
+      },
+      {
+        "label": "node:test"
+      }
+    ],
+    "multi": false,
+    "default": "vitest",
+    "fields": [
+      {
+        "id": "watch",
+        "label": "Enable watch mode",
+        "type": "check",
+        "value": true,
+        "optional": false
+      }
+    ]
+  },
+  "wait": false,
+  "mode": "form",
+  "contract": "c1:69a9c8d2ea0140bba6f024fd646bc623",
+  "answers": [
+    {
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_c3d4e5f60718293a",
+      "status": "answered",
+      "rev": 1,
+      "values": {
+        "choice": "vitest",
+        "fields": {
+          "watch": true
+        }
+      },
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_c3d4e5f60718293a\" q=\"Which test runner?\">{\"choice\":\"vitest\",\"fields\":{\"watch\":true}}</ui_answer>"
+    }
+  ],
+  "bad_answers": [
+    {
+      "values": {
+        "choice": "vitest"
+      },
+      "error": "fields: required: every field, by id"
+    }
+  ]
+}

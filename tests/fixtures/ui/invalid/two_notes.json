@@ -1,0 +1,17 @@
+{
+  "about": "Two note options",
+  "input": {
+    "question": "Q",
+    "options": [
+      {
+        "label": "a",
+        "note": "?"
+      },
+      {
+        "label": "b",
+        "note": "?"
+      }
+    ]
+  },
+  "error": "options[1].note: only one option may ask for a note (options[0] already does)"
+}

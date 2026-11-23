@@ -1,0 +1,12 @@
+{
+  "about": "Appendix A: a duplicate label (case-insensitive)",
+  "input": {
+    "question": "Proceed?",
+    "options": [
+      "Yes",
+      "No",
+      "yes"
+    ]
+  },
+  "error": "options[2]: \"yes\" duplicates options[0]; labels must differ (ignoring case)"
+}

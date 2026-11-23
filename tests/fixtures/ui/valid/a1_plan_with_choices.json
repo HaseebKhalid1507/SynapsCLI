@@ -1,0 +1,88 @@
+{
+  "about": "Appendix A1: plan with choices (quick, live). Shown, then the user clicks the first option.",
+  "input": {
+    "question": "Which approach?",
+    "detail": "The parser has three call sites; a rewrite touches all of them.",
+    "options": [
+      "Refactor the parser",
+      "Rewrite from scratch",
+      "Leave it"
+    ],
+    "default": "Refactor the parser"
+  },
+  "doc": {
+    "question": "Which approach?",
+    "detail": "The parser has three call sites; a rewrite touches all of them.",
+    "options": [
+      {
+        "label": "Refactor the parser"
+      },
+      {
+        "label": "Rewrite from scratch"
+      },
+      {
+        "label": "Leave it"
+      }
+    ],
+    "multi": false,
+    "default": "Refactor the parser"
+  },
+  "wait": false,
+  "mode": "quick",
+  "contract": "c1:dd88bb46e6b36d702d326c325b6b5c61",
+  "answers": [
+    {
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_6c1d4b7e9f203a58",
+      "status": "answered",
+      "rev": 1,
+      "values": {
+        "choice": "Refactor the parser"
+      },
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_6c1d4b7e9f203a58\" q=\"Which approach?\">{\"choice\":\"Refactor the parser\"}</ui_answer>"
+    },
+    {
+      "about": "§3.6: a revision",
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_91aa30c5e7d24b16",
+      "status": "revised",
+      "rev": 2,
+      "values": {
+        "choice": "Rewrite from scratch"
+      },
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_91aa30c5e7d24b16\" q=\"Which approach?\" status=\"revised\" rev=\"2\">{\"choice\":\"Rewrite from scratch\"}</ui_answer>"
+    },
+    {
+      "about": "§3.6: a skip",
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_02f3c4d5e6f70819",
+      "status": "skipped",
+      "rev": 1,
+      "values": {},
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_02f3c4d5e6f70819\" q=\"Which approach?\" status=\"skipped\">{}</ui_answer>"
+    }
+  ],
+  "bad_answers": [
+    {
+      "values": {
+        "choice": "refactor the parser"
+      },
+      "error": "choice: not one of the option labels"
+    },
+    {
+      "values": {
+        "choice": "Leave it",
+        "note": "x"
+      },
+      "error": "note: the chosen option takes no note"
+    },
+    {
+      "values": {},
+      "error": "choice: required"
+    }
+  ],
+  "shown": {
+    "status": "shown",
+    "id": "s_3f2a91c0d4e2a871"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "about": "A C1 control (U+009B, CSI) in the detail",
+  "input": {
+    "question": "Q",
+    "detail": "a\u009b2Jb",
+    "options": [
+      "a",
+      "b"
+    ]
+  },
+  "error": "detail: holds U+009B (a control character); remove it"
+}

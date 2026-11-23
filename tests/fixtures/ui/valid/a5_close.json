@@ -1,0 +1,11 @@
+{
+  "about": "Appendix A5: withdraw a moot question.",
+  "input": {
+    "close": "s_3f2a91c0d4e2a871"
+  },
+  "close": "s_3f2a91c0d4e2a871",
+  "result": {
+    "status": "closed",
+    "id": "s_3f2a91c0d4e2a871"
+  }
+}

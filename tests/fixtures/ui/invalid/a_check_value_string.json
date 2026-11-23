@@ -1,0 +1,15 @@
+{
+  "about": "Appendix A: value \"yes\" on a check",
+  "input": {
+    "question": "Publish?",
+    "fields": [
+      {
+        "id": "publish",
+        "label": "Publish",
+        "type": "check",
+        "value": "yes"
+      }
+    ]
+  },
+  "error": "fields[0].value: a check takes true or false (got \"yes\")"
+}

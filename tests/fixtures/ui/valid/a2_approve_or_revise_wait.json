@@ -1,0 +1,78 @@
+{
+  "about": "Appendix A2: approve or revise with a note (quick + note, wait). The answer goes to the waiting tool.",
+  "input": {
+    "question": "Plan ready. Go ahead?",
+    "detail": "1. Extract `Lexer`\n2. Port call sites\n3. Delete the old parser",
+    "wait": true,
+    "options": [
+      "Approve",
+      {
+        "label": "Revise",
+        "note": "What should change?"
+      }
+    ],
+    "default": "Approve"
+  },
+  "doc": {
+    "question": "Plan ready. Go ahead?",
+    "detail": "1. Extract `Lexer`\n2. Port call sites\n3. Delete the old parser",
+    "options": [
+      {
+        "label": "Approve"
+      },
+      {
+        "label": "Revise",
+        "note": "What should change?"
+      }
+    ],
+    "multi": false,
+    "default": "Approve"
+  },
+  "wait": true,
+  "mode": "quick",
+  "contract": "c1:174db9659e8d6f46417d49d0010bfdbf",
+  "answers": [
+    {
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_7e4b19c2d03f5a68",
+      "status": "answered",
+      "rev": 1,
+      "values": {
+        "choice": "Revise",
+        "note": "keep the old parser behind a flag"
+      },
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_7e4b19c2d03f5a68\" q=\"Plan ready. Go ahead?\">{\"choice\":\"Revise\",\"note\":\"keep the old parser behind a flag\"}</ui_answer>"
+    }
+  ],
+  "bad_answers": [
+    {
+      "values": {
+        "choice": "Revise"
+      },
+      "error": "note: required for this option"
+    },
+    {
+      "values": {
+        "choice": "Revise",
+        "note": ""
+      },
+      "error": "note: must not be empty"
+    },
+    {
+      "values": {
+        "choice": "Revise",
+        "note": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      "error": "note: at most 500 characters (got 501)"
+    }
+  ],
+  "wait_result": {
+    "status": "answered",
+    "id": "s_3f2a91c0d4e2a871",
+    "answer_id": "a_7e4b19c2d03f5a68",
+    "answer": {
+      "choice": "Revise",
+      "note": "keep the old parser behind a flag"
+    }
+  }
+}

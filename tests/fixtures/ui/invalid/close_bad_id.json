@@ -1,0 +1,7 @@
+{
+  "about": "close with a malformed id",
+  "input": {
+    "close": "s_3F2A91C0D4E2A871"
+  },
+  "error": "close: must be the id of a card you created, like s_3f2a91c0d4e2a871"
+}

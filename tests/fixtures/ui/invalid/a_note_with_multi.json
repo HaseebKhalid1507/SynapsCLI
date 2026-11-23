@@ -1,0 +1,15 @@
+{
+  "about": "Appendix A: note with multi",
+  "input": {
+    "question": "Which?",
+    "multi": true,
+    "options": [
+      "A",
+      {
+        "label": "Other",
+        "note": "Which one?"
+      }
+    ]
+  },
+  "error": "options[1].note: not allowed with multi; use a field for free text"
+}

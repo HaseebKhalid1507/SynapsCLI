@@ -1,0 +1,11 @@
+{
+  "about": "A C0 control (ESC) in an option label",
+  "input": {
+    "question": "Q",
+    "options": [
+      "ok",
+      "\u001b[31mred"
+    ]
+  },
+  "error": "options[1]: holds U+001B (a control character); remove it"
+}

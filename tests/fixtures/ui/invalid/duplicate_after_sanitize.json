@@ -1,0 +1,11 @@
+{
+  "about": "Labels equal once invisible characters are dropped",
+  "input": {
+    "question": "Q",
+    "options": [
+      "Approve",
+      "Ap\u200bprove"
+    ]
+  },
+  "error": "options[1]: \"Approve\" duplicates options[0]; labels must differ (ignoring case)"
+}

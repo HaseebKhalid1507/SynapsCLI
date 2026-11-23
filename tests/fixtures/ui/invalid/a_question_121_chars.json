@@ -1,0 +1,11 @@
+{
+  "about": "Appendix A: a 121-character question",
+  "input": {
+    "question": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "options": [
+      "A",
+      "B"
+    ]
+  },
+  "error": "question: at most 120 characters (got 121); put the rest in detail"
+}

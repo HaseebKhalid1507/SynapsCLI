@@ -1,0 +1,8 @@
+{
+  "about": "A question with nothing to answer",
+  "input": {
+    "question": "Q",
+    "detail": "d"
+  },
+  "error": "options: a card needs options or fields (or both)"
+}

@@ -1,0 +1,12 @@
+{
+  "about": "Appendix A: default not among the options",
+  "input": {
+    "question": "Proceed?",
+    "options": [
+      "Yes",
+      "No"
+    ],
+    "default": "Maybe"
+  },
+  "error": "default: \"Maybe\" is not one of the option labels"
+}

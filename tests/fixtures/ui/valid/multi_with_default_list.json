@@ -1,0 +1,110 @@
+{
+  "about": "Multi-select: the default is a list; the answer may be empty; late answers repeat the chosen options' hints.",
+  "input": {
+    "question": "Which checks should run?",
+    "options": [
+      {
+        "label": "lint",
+        "hint": "clippy -D warnings"
+      },
+      {
+        "label": "test"
+      },
+      {
+        "label": "fmt",
+        "hint": "rustfmt --check"
+      }
+    ],
+    "multi": true,
+    "default": [
+      "lint",
+      "test"
+    ]
+  },
+  "doc": {
+    "question": "Which checks should run?",
+    "options": [
+      {
+        "label": "lint",
+        "hint": "clippy -D warnings"
+      },
+      {
+        "label": "test"
+      },
+      {
+        "label": "fmt",
+        "hint": "rustfmt --check"
+      }
+    ],
+    "multi": true,
+    "default": [
+      "lint",
+      "test"
+    ]
+  },
+  "wait": false,
+  "mode": "form",
+  "contract": "c1:6e998b20c534b55d1559a47a45100adb",
+  "answers": [
+    {
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_00112233445566aa",
+      "status": "answered",
+      "rev": 1,
+      "values": {
+        "choice": [
+          "fmt",
+          "lint"
+        ]
+      },
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_00112233445566aa\" q=\"Which checks should run?\">{\"choice\":[\"fmt\",\"lint\"]}</ui_answer>"
+    },
+    {
+      "about": "none chosen",
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_00112233445566bb",
+      "status": "answered",
+      "rev": 1,
+      "values": {
+        "choice": []
+      },
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_00112233445566bb\" q=\"Which checks should run?\">{\"choice\":[]}</ui_answer>"
+    },
+    {
+      "about": "late, with hints",
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_00112233445566cc",
+      "status": "answered",
+      "rev": 1,
+      "values": {
+        "choice": [
+          "fmt",
+          "lint"
+        ]
+      },
+      "late": {
+        "turn_message": "run the checks",
+        "task": "run the checks",
+        "asked": "<asked during=\"run the checks\">hints: fmt=rustfmt --check, lint=clippy -D warnings</asked>"
+      },
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_00112233445566cc\" q=\"Which checks should run?\" late=\"true\">{\"choice\":[\"fmt\",\"lint\"]}\n<asked during=\"run the checks\">hints: fmt=rustfmt --check, lint=clippy -D warnings</asked></ui_answer>"
+    }
+  ],
+  "bad_answers": [
+    {
+      "values": {
+        "choice": "lint"
+      },
+      "error": "choice: must be a list of option labels"
+    },
+    {
+      "values": {
+        "choice": [
+          "lint",
+          "lint"
+        ]
+      },
+      "error": "choice[1]: listed twice"
+    }
+  ]
+}

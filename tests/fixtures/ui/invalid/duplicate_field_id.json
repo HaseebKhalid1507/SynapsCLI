@@ -1,0 +1,17 @@
+{
+  "about": "A duplicate field id",
+  "input": {
+    "question": "Q",
+    "fields": [
+      {
+        "id": "a",
+        "label": "A"
+      },
+      {
+        "id": "a",
+        "label": "B"
+      }
+    ]
+  },
+  "error": "fields[1].id: \"a\" duplicates fields[0].id"
+}

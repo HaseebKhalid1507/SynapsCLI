@@ -1,0 +1,14 @@
+{
+  "about": "A bidi isolate (U+2067) in a hint",
+  "input": {
+    "question": "Q",
+    "options": [
+      "a",
+      {
+        "label": "b",
+        "hint": "x\u2067y"
+      }
+    ]
+  },
+  "error": "options[1].hint: holds U+2067 (a bidi control); remove it"
+}

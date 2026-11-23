@@ -1,0 +1,12 @@
+{
+  "about": "A detail of 31 lines",
+  "input": {
+    "question": "Q",
+    "detail": "l\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl\nl",
+    "options": [
+      "a",
+      "b"
+    ]
+  },
+  "error": "detail: at most 30 lines (got 31)"
+}

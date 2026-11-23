@@ -1,0 +1,13 @@
+{
+  "about": "Appendix A: a field id of \"Version\"",
+  "input": {
+    "question": "Release details",
+    "fields": [
+      {
+        "id": "Version",
+        "label": "Version"
+      }
+    ]
+  },
+  "error": "fields[0].id: \"Version\" must match ^[a-z][a-z0-9_]{0,23}$: a lowercase letter, then up to 23 lowercase letters, digits or _"
+}

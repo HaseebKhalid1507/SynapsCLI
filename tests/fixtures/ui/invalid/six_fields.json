@@ -1,0 +1,33 @@
+{
+  "about": "Six fields",
+  "input": {
+    "question": "Q",
+    "fields": [
+      {
+        "id": "f0",
+        "label": "L"
+      },
+      {
+        "id": "f1",
+        "label": "L"
+      },
+      {
+        "id": "f2",
+        "label": "L"
+      },
+      {
+        "id": "f3",
+        "label": "L"
+      },
+      {
+        "id": "f4",
+        "label": "L"
+      },
+      {
+        "id": "f5",
+        "label": "L"
+      }
+    ]
+  },
+  "error": "fields: at most 5 (got 6); ask fewer things at once"
+}

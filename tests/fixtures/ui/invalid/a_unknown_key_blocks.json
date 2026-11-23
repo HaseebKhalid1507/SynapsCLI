@@ -1,0 +1,16 @@
+{
+  "about": "Appendix A: an unknown key blocks",
+  "input": {
+    "question": "Which?",
+    "options": [
+      "A",
+      "B"
+    ],
+    "blocks": [
+      {
+        "type": "text"
+      }
+    ]
+  },
+  "error": "blocks: unknown parameter; use question, detail, options, multi, default, fields, wait or close"
+}

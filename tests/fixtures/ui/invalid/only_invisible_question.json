@@ -1,0 +1,11 @@
+{
+  "about": "A question of invisible characters only",
+  "input": {
+    "question": "\u200b\u2060",
+    "options": [
+      "a",
+      "b"
+    ]
+  },
+  "error": "question: must not be empty (it holds only invisible characters)"
+}

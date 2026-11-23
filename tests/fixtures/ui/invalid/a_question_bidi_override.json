@@ -1,0 +1,11 @@
+{
+  "about": "Appendix A: a question holding a bidi override (U+202E)",
+  "input": {
+    "question": "Delete \u202etxt.exe\u202c?",
+    "options": [
+      "Yes",
+      "No"
+    ]
+  },
+  "error": "question: holds U+202E (a bidi control); remove it"
+}

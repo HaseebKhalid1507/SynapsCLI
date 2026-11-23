@@ -1,0 +1,14 @@
+{
+  "about": "An unknown key on an option",
+  "input": {
+    "question": "Q",
+    "options": [
+      "a",
+      {
+        "label": "b",
+        "id": "b"
+      }
+    ]
+  },
+  "error": "options[1].id: unknown key; an option takes label, hint and note"
+}

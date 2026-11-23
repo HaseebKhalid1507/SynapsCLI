@@ -1,0 +1,15 @@
+{
+  "about": "optional on a check",
+  "input": {
+    "question": "Q",
+    "fields": [
+      {
+        "id": "a",
+        "label": "A",
+        "type": "check",
+        "optional": true
+      }
+    ]
+  },
+  "error": "fields[0].optional: a check is always answered; only text and long fields can be optional"
+}

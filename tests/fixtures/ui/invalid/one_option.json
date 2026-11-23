@@ -1,0 +1,10 @@
+{
+  "about": "One option",
+  "input": {
+    "question": "Q",
+    "options": [
+      "only"
+    ]
+  },
+  "error": "options: at least 2 (got 1); one option is not a choice"
+}

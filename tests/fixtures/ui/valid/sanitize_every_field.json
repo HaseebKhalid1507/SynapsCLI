@@ -1,0 +1,111 @@
+{
+  "about": "§4.3: default-ignorables dropped from every string field, ZWJ/ZWNJ kept, \\n folded to a space in single-line fields, \\t to a space everywhere. The answer message's q attribute is the sanitized question.",
+  "input": {
+    "question": "Ship\u200b it?\u200e\nNow",
+    "detail": "Line\u2060 one\n\tLine two\ufeff\u2028",
+    "options": [
+      "Yes\u00ad\ufe0f",
+      {
+        "label": "No\udb40\udc41",
+        "hint": "keep\nwaiting\u200b",
+        "note": "Why\u200e?"
+      },
+      "Ask 👨\u200d👩\u200d👧"
+    ],
+    "default": "Yes\u200b",
+    "fields": [
+      {
+        "id": "why",
+        "label": "Re\u200cason\u200b",
+        "placeholder": "one\nline\u2060",
+        "value": "pre\tfill\ufeff"
+      },
+      {
+        "id": "more",
+        "label": "More",
+        "type": "long",
+        "value": "a\nb\u00ad",
+        "optional": true
+      }
+    ]
+  },
+  "doc": {
+    "question": "Ship it? Now",
+    "detail": "Line one\n Line two",
+    "options": [
+      {
+        "label": "Yes"
+      },
+      {
+        "label": "No",
+        "hint": "keep waiting",
+        "note": "Why?"
+      },
+      {
+        "label": "Ask 👨\u200d👩\u200d👧"
+      }
+    ],
+    "multi": false,
+    "default": "Yes",
+    "fields": [
+      {
+        "id": "why",
+        "label": "Re\u200cason",
+        "type": "text",
+        "value": "pre fill",
+        "placeholder": "one line",
+        "optional": false
+      },
+      {
+        "id": "more",
+        "label": "More",
+        "type": "long",
+        "value": "a\nb",
+        "optional": true
+      }
+    ]
+  },
+  "wait": false,
+  "mode": "form",
+  "contract": "c1:fb772ff37d79e2e00e9512fcb589879c",
+  "answers": [
+    {
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_abcdef0123456789",
+      "status": "answered",
+      "rev": 1,
+      "values": {
+        "choice": "No",
+        "note": "user \u202ebidi\u202c is data",
+        "fields": {
+          "why": "x",
+          "more": "line\n\tline"
+        }
+      },
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_abcdef0123456789\" q=\"Ship it? Now\">{\"choice\":\"No\",\"note\":\"user \u202ebidi\u202c is data\",\"fields\":{\"why\":\"x\",\"more\":\"line\\n\\tline\"}}</ui_answer>"
+    }
+  ],
+  "bad_answers": [
+    {
+      "values": {
+        "choice": "No",
+        "note": "a\u001bb",
+        "fields": {
+          "why": "x",
+          "more": ""
+        }
+      },
+      "error": "note: holds U+001B (a control character)"
+    },
+    {
+      "values": {
+        "choice": "Yes",
+        "fields": {
+          "why": "a\nb",
+          "more": ""
+        }
+      },
+      "error": "fields.why: holds U+000A (a control character)"
+    }
+  ]
+}
