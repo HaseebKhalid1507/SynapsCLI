@@ -2474,12 +2474,13 @@ async fn the_cache_field_reaches_only_a_client_that_asked() {
 
 // ── Status.cache: a request producer's own cache lifetime (Shady #436 R3) ──
 
-/// A turn's round that wrote 2k with the 1h TTL and calls `cache_gate`.
+/// A turn's round that read 18k, wrote 2k with the 1h TTL, and calls
+/// `cache_gate`.
 const SSE_GATE_TOOL: &str = concat!(
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_gate\",\"type\":\"message\",",
     "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
     "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
-    "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":0,",
+    "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":18000,",
     "\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":2000}}}}\n\n",
     "data: {\"type\":\"content_block_start\",\"index\":0,",
     "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_gate\",\"name\":\"cache_gate\"}}\n\n",
@@ -2488,7 +2489,7 @@ const SSE_GATE_TOOL: &str = concat!(
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
     "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
-    "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":0,",
+    "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":18000,",
     "\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":2000}}}\n\n",
     "data: {\"type\":\"message_stop\"}\n\n",
 );
@@ -2638,5 +2639,60 @@ async fn a_turn_running_across_a_switch_and_back_is_the_old_lifetime_s() {
     let c = status(&mut t, 1524).await["cache"].clone();
     assert_eq!(c["ttl"], "1h", "A's new turn: {c}");
     assert!(secs(&c, "expires_in_secs") >= 3540, "{c}");
+    end(&mut t).await;
+}
+
+const TOOL_PINGS_1H: &str = "cache_keepwarm = off\ncache_keepwarm_tools = on\ncache_ttl = 1h\nthinking = off\n";
+
+/// The tool-round pings' interval while alive.
+fn fast_tool_pings() -> agent_engine::runtime::tool_keepwarm::testing::IntervalOverride {
+    agent_engine::runtime::tool_keepwarm::testing::IntervalOverride::set(Duration::from_millis(300))
+}
+
+/// A tool-round keep-warm ping answered 200 with no usage: booked at its
+/// worst case (the session's cost grows), proving nothing (the round's
+/// countdown is not renewed by its acceptance). Shady #436 R3, follow-up 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_tool_ping_without_usage_costs_and_renews_nothing() {
+    let _fast = fast_tool_pings();
+    let (_h, script, bodies, mut t, _host, started, release) = scripted_gate(TOOL_PINGS_1H).await;
+    script.turns(Reply::Tool);
+    script.pings(Reply::NoUsage);
+    t.send(submit("hello")).await.unwrap();
+    tokio::time::timeout(PATIENCE, started.notified()).await.expect("the tool runs");
+    let before = status(&mut t, 1530).await;
+    assert_eq!(before["cache"]["ttl"], "1h", "the round wrote 1h: {before}");
+    let cost = before["cost"].as_f64().unwrap();
+    let st = status_until(&mut t, 1531, PATIENCE, |st| st["cost"].as_f64().unwrap() > cost).await;
+    assert!(pings(&bodies) >= 1, "a ping went out: {st}");
+    assert!(st["cost"].as_f64().unwrap() > cost, "booked at its worst case: {before} → {st}");
+    assert_eq!(st["cache"]["expires_at"], before["cache"]["expires_at"], "not renewed: {before} → {st}");
+    release.notify_one();
+    idle(&mut t).await;
+    end(&mut t).await;
+}
+
+/// A tool-round ping of model A's turn, sent after a switch to B while the
+/// tool runs, reads A's cache (real provider usage): still not B's
+/// evidence. The pings inherit their turn's cache lifetime (Shady #436
+/// R3-2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_old_turn_s_tool_ping_after_a_switch_never_warms_the_new_model() {
+    let _fast = fast_tool_pings();
+    let (_h, script, bodies, mut t, _host, started, release) = scripted_gate(TOOL_PINGS_1H).await;
+    script.turns(Reply::Tool);
+    script.pings(Reply::ReadOnly);
+    t.send(submit("hello")).await.unwrap();
+    tokio::time::timeout(PATIENCE, started.notified()).await.expect("the tool runs");
+    set_model(&mut t, 1540, MODEL_B).await;
+    let sent = pings(&bodies);
+    assert!(wait_pings(&bodies, sent + 2, PATIENCE).await, "the turn keeps pinging A");
+    let st = status(&mut t, 1541).await;
+    assert!(st["cache"].is_null(), "A's ping, sent after the switch, is not B's: {st}");
+    script.turns(Reply::Cached);
+    release.notify_one();
+    idle(&mut t).await;
     end(&mut t).await;
 }
