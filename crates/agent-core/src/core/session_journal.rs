@@ -1157,12 +1157,18 @@ fn save_journal_mode(
         return full_snapshot_reset(handle, session);
     }
     let saved = &session.api_messages[..state.durable_len];
+    // A mark stamped, changed or removed on a saved message (an adoption,
+    // agent-ui §3.6) always snapshots, before the amend below is even
+    // considered: `head_hash` leaves the last message out, so a mark
+    // changed only there would otherwise ride a hooked tail's amend.
+    if ui_hash(saved)? != state.ui_hash {
+        return full_snapshot_reset(handle, session);
+    }
     let (saved_head, saved_hash) = history_hashes(saved)?;
     let unchanged = saved_hash == state.history_hash
         && turns_hash(saved)? == state.turns_hash
         && times_hash(saved)? == state.times_hash
-        && hooked_hash(saved)? == state.hooked_hash
-        && ui_hash(saved)? == state.ui_hash;
+        && hooked_hash(saved)? == state.hooked_hash;
     // The `before_message` hook's edit of a prompt the frontend saved
     // before the turn (#414): only the last saved message changed and it is
     // now a hooked user message. Amend it (O(message)); any other edit
@@ -1636,19 +1642,28 @@ fn journal_meta_tail_from_handle(
 
 // ─── deletion ────────────────────────────────────────────────────────────────
 
-/// Remove a session's agent-card sidecar (`<id>.ui`), snapshot, journal
-/// AND turn draft (`session_draft`) (compaction rollback, retention).
-/// Idempotent — missing files are not errors. The sidecar goes first
-/// (agent-ui §7 C2): a delete cut short leaves history without its cards,
-/// never cards without their history.
+/// Remove a session's agent-card files (`<id>.ui`, its quarantine and
+/// their temps), snapshot, journal AND turn draft (`session_draft`)
+/// (compaction rollback, retention). Idempotent — missing files are not
+/// errors. The card files go first, behind a directory sync
+/// ([`delete_sidecar_first`](crate::core::session_surfaces::delete_sidecar_first),
+/// agent-ui §7 C2): a delete cut short, even by an OS crash, leaves
+/// history without its cards, never cards without their history.
 pub fn delete_session_files_in_dir(dir: &Path, id: &str) -> std::io::Result<()> {
     let Some(handle) = open_sessions_dir(dir)? else {
         return Ok(()); // no directory — idempotently nothing to delete
     };
-    remove_artifact_if_exists(&handle, &crate::core::session_surfaces::sidecar_name(id))?;
-    remove_artifact_if_exists(&handle, &format!("{id}.json"))?;
-    remove_artifact_if_exists(&handle, &format!("{id}.journal"))?;
-    remove_artifact_if_exists(&handle, &format!("{id}.turn"))
+    let history = [
+        format!("{id}.json"),
+        format!("{id}.journal"),
+        format!("{id}.turn"),
+    ];
+    crate::core::session_surfaces::delete_sidecar_first(
+        id,
+        &history,
+        &mut |name| remove_artifact_if_exists(&handle, name),
+        &mut || sync_sessions_dir(&handle),
+    )
 }
 
 fn remove_artifact_if_exists(handle: &SessionsDirHandle, name: &str) -> std::io::Result<()> {

@@ -36,10 +36,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::ui_types::{
-    is_host_id, is_session_id, Answer, AnswerState, AnswerStatus, Delivery, Downgrade,
-    LedgerRecord, LogEntry, Phase, StopKind, SurfaceState, Tombstone, UiMark, Verb, WaitMode,
-    ACTION_LOG_MAX, ATTACHED_MAX_STATES, LEDGER_MAX_RECORDS, LEDGER_MAX_VALUE_BYTES, MARK_KEY,
-    SIDECAR_MAX_BYTES, SURFACE_STATE_MAX_BYTES, TOMBSTONES_MAX, TOMBSTONE_MAX_BYTES,
+    is_call_id, is_host_id, is_session_id, is_turn_id, Answer, AnswerState, AnswerStatus, Delivery,
+    Downgrade, LedgerRecord, LogEntry, Phase, StopKind, SurfaceState, Tombstone, UiMark, Verb,
+    WaitMode, ACTION_LOG_MAX, ANSWER_MAX_BYTES, ATTACHED_MAX_STATES, BY_MAX_BYTES,
+    CAPSULE_MAX_BYTES, LEDGER_MAX_RECORDS, LEDGER_MAX_VALUE_BYTES, MARK_KEY, QUESTION_MAX,
+    SIDECAR_MAX_BYTES, SURFACE_STATE_MAX_BYTES, TASK_EXCERPT_MAX, TOMBSTONES_MAX,
+    TOMBSTONE_MAX_BYTES,
 };
 
 /// The sidecar format's version.
@@ -72,6 +74,51 @@ pub fn sidecar_name(session_id: &str) -> String {
 /// Where an unprovable prepared sidecar goes (§3.11 step 0): never served.
 pub fn quarantine_name(session_id: &str) -> String {
     format!("{session_id}.ui.quarantine")
+}
+
+/// Every file a session's cards can leave in its directory: the sidecar,
+/// its quarantine, and the `<name>.tmp` each one's atomic write goes
+/// through (`ConfinedDir::write_atomic`; a crash mid-write leaves it). All
+/// of them go with the session, so no answer text outlives it.
+pub fn sidecar_files(session_id: &str) -> [String; 4] {
+    let ui = sidecar_name(session_id);
+    let quarantine = quarantine_name(session_id);
+    [
+        format!("{ui}.tmp"),
+        format!("{quarantine}.tmp"),
+        quarantine,
+        ui,
+    ]
+}
+
+/// Delete one session's files, its cards first: the one ordering every
+/// deletion shares (a session's deletion, retention's sweeps and `forget`;
+/// agent-ui §7 C2). The card files ([`sidecar_files`]) are unlinked, the
+/// directory is synced, and only then is any of `history` (names in the
+/// same directory) unlinked, then a closing sync. A failed unlink or a
+/// failed barrier stops before any history file goes, so a deletion cut
+/// short by an error, a process death or an OS crash leaves history
+/// without its cards, never cards without their history.
+///
+/// `unlink` treats a missing file as done. On Windows the callers' sync is
+/// a no-op (no directory can be fsynced there; NTFS journals its metadata
+/// itself, see `session_journal::sync_sessions_dir`): the order is then the
+/// syscall order, which holds across a process death but is not promised
+/// across a power loss. Agent cards run on unix only (`ConfinedUiFs`).
+pub fn delete_sidecar_first(
+    session_id: &str,
+    history: &[String],
+    unlink: &mut dyn FnMut(&str) -> io::Result<()>,
+    sync_dir: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    for name in sidecar_files(session_id) {
+        unlink(&name)?;
+    }
+    sync_dir()?;
+    for name in history {
+        unlink(name)?;
+    }
+    sync_dir()
 }
 
 /// 128 random bits as 32 lowercase hex: a lineage or a handoff id.
@@ -255,8 +302,56 @@ fn bounds(what: impl Into<String>) -> SidecarError {
     SidecarError::Bounds(what.into())
 }
 
-/// The structural bounds of §4.4 and v3.2 #11. Docs are not revalidated
-/// here: the engine does that between decode and [`recover`] (v3.2 #12).
+/// A contract: `"c1:"` + hex128 (§2.2).
+fn is_contract(s: &str) -> bool {
+    s.strip_prefix("c1:").is_some_and(is_hex128)
+}
+
+/// An action-log entry: a client's hex128 `action_id` and its payload's
+/// hex128 hash (§3.7, v3.2 #10).
+fn is_log_entry(e: &LogEntry) -> bool {
+    is_hex128(&e.action_id) && is_hex128(&e.hash)
+}
+
+/// A card's own bounds, field by field (§2.2, v3.2 #11), before its total.
+fn check_card(c: &CardRecord) -> Result<(), SidecarError> {
+    let st = &c.state;
+    if !is_call_id(&st.call_id) {
+        return Err(bounds("call_id"));
+    }
+    if !is_contract(&st.contract) {
+        return Err(bounds("contract"));
+    }
+    if st.origin.turn.as_deref().is_some_and(|t| !is_turn_id(t))
+        || st.origin.task.chars().count() > TASK_EXCERPT_MAX
+    {
+        return Err(bounds("origin"));
+    }
+    if st.actions.len() > ACTION_LOG_MAX
+        || c.log.len() > ACTION_LOG_MAX
+        || !st.actions.iter().all(|a| is_hex128(a))
+        || !c.log.iter().all(is_log_entry)
+    {
+        return Err(bounds("action log"));
+    }
+    if let Some(a) = &st.answer {
+        let ok = is_hex128(&a.action_id)
+            && is_host_id(&a.answer_id, "a_")
+            && a.by.len() <= BY_MAX_BYTES
+            && a.values.to_json().len() <= ANSWER_MAX_BYTES;
+        if !ok {
+            return Err(bounds("answer"));
+        }
+    }
+    Ok(())
+}
+
+/// The structural bounds of §4.4 and v3.2 #11, every field the format
+/// bounds: identifiers, `origin`, `by`, the action logs, a ledger record's
+/// `q` and `asked` capsule and its values, then each category's total. A
+/// sidecar out of any of them is refused whole, never trimmed. Docs are not
+/// revalidated here: the engine does that between decode and [`recover`]
+/// (v3.2 #12).
 pub fn check_bounds(s: &Sidecar) -> Result<(), SidecarError> {
     if s.v != SIDECAR_VERSION {
         return Err(bounds(format!("version {}", s.v)));
@@ -299,9 +394,7 @@ pub fn check_bounds(s: &Sidecar) -> Result<(), SidecarError> {
         if !is_host_id(&st.id, "s_") || !ids.insert(st.id.as_str()) {
             return Err(bounds("card id"));
         }
-        if st.actions.len() > ACTION_LOG_MAX || c.log.len() > ACTION_LOG_MAX {
-            return Err(bounds("action log"));
-        }
+        check_card(c)?;
         let n = serde_json::to_vec(st).map_or(usize::MAX, |b| b.len());
         if n > SURFACE_STATE_MAX_BYTES {
             return Err(bounds("card size"));
@@ -319,7 +412,20 @@ pub fn check_bounds(s: &Sidecar) -> Result<(), SidecarError> {
         {
             return Err(bounds("ledger record"));
         }
-        values = values.saturating_add(r.values.to_json().len());
+        if r.q.chars().count() > QUESTION_MAX {
+            return Err(bounds("ledger q"));
+        }
+        if r.asked
+            .as_ref()
+            .is_some_and(|a| a.len() > CAPSULE_MAX_BYTES)
+        {
+            return Err(bounds("ledger asked"));
+        }
+        let n = r.values.to_json().len();
+        if n > ANSWER_MAX_BYTES {
+            return Err(bounds("ledger values"));
+        }
+        values = values.saturating_add(n);
     }
     if values > LEDGER_MAX_VALUE_BYTES {
         return Err(bounds("ledger values"));
@@ -329,7 +435,11 @@ pub fn check_bounds(s: &Sidecar) -> Result<(), SidecarError> {
     }
     for t in &s.tombstones {
         let n = serde_json::to_vec(t).map_or(usize::MAX, |b| b.len());
-        if !is_host_id(&t.id, "s_") || t.log.len() > ACTION_LOG_MAX || n > TOMBSTONE_MAX_BYTES {
+        if !is_host_id(&t.id, "s_")
+            || t.log.len() > ACTION_LOG_MAX
+            || !t.log.iter().all(is_log_entry)
+            || n > TOMBSTONE_MAX_BYTES
+        {
             return Err(bounds("tombstone"));
         }
     }
@@ -476,8 +586,9 @@ impl UiFs for ConfinedUiFs {
 /// The C2 exit gate's filesystem model. Files are kept twice: what a
 /// reader sees now, and what survives a crash (the state at the last
 /// directory sync). A crash drops every rename and unlink not followed by
-/// a directory sync, or keeps them all (the OS happened to flush). Every
-/// failpoint fires once per count.
+/// a directory sync, or keeps them all (the OS happened to flush), or
+/// keeps any subset of them, each independently
+/// ([`ModelFs::crash_keeping`]). Every failpoint fires once per count.
 #[derive(Debug, Default)]
 pub struct ModelFs {
     state: Mutex<ModelState>,
@@ -496,6 +607,48 @@ struct ModelState {
     stalled: bool,
     renames: Vec<Rename>,
     sync_calls: u32,
+    fail_read: u32,
+    panic_remove: Option<bool>,
+    /// Operations left before the process dies (`None`: it doesn't).
+    dies_in: Option<u32>,
+    /// The metadata operations since the last directory sync, in order.
+    unsynced: Vec<Meta>,
+    /// Every operation, in order: `write x`, `remove x`, `sync`.
+    log: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+enum Meta {
+    Put(String, Vec<u8>),
+    Remove(String),
+}
+
+impl ModelState {
+    /// One more operation: an error once the process has died.
+    fn step(&mut self, what: String) -> io::Result<()> {
+        if let Some(n) = self.dies_in.as_mut() {
+            if *n == 0 {
+                return Err(io::Error::other("model fs: the process has died"));
+            }
+            *n -= 1;
+        }
+        self.log.push(what);
+        Ok(())
+    }
+
+    fn put_visible(&mut self, name: &str, data: Vec<u8>) {
+        self.unsynced
+            .push(Meta::Put(name.to_string(), data.clone()));
+        self.visible.insert(name.to_string(), data);
+    }
+
+    fn remove_visible(&mut self, name: &str) -> Option<Vec<u8>> {
+        let old = self.visible.remove(name);
+        if old.is_some() {
+            self.unsynced.push(Meta::Remove(name.to_string()));
+        }
+        old
+    }
 }
 
 /// One rename the model performed: the file, the `seq` it replaced and the
@@ -541,6 +694,56 @@ impl ModelFs {
         }
     }
 
+    /// The next `n` reads fail with an I/O error.
+    pub fn fail_read(&self, n: u32) {
+        self.st().fail_read = n;
+    }
+
+    /// The next removal panics its caller, before or after the unlink.
+    pub fn panic_next_remove(&self, after_unlink: bool) {
+        self.st().panic_remove = Some(after_unlink);
+    }
+
+    /// The process dies after `n` more operations (writes, removals,
+    /// syncs): every later one fails, as nothing after a death runs.
+    pub fn die_after(&self, n: u32) {
+        self.st().dies_in = Some(n);
+    }
+
+    /// Every operation so far: `write x`, `remove x`, `sync`.
+    pub fn log(&self) -> Vec<String> {
+        self.st().log.clone()
+    }
+
+    /// How many metadata operations a crash now could keep or lose.
+    pub fn unsynced(&self) -> usize {
+        self.st().unsynced.len()
+    }
+
+    /// An OS crash that keeps the `i`th unsynced operation when `keep(i)`,
+    /// each independently of the others. Failpoints reset.
+    pub fn crash_keeping(&self, keep: &dyn Fn(usize) -> bool) {
+        let mut st = self.st();
+        let mut files = st.synced.clone();
+        for (i, op) in std::mem::take(&mut st.unsynced).into_iter().enumerate() {
+            if !keep(i) {
+                continue;
+            }
+            match op {
+                Meta::Put(name, data) => {
+                    files.insert(name, data);
+                }
+                Meta::Remove(name) => {
+                    files.remove(&name);
+                }
+            }
+        }
+        st.visible = files.clone();
+        st.synced = files;
+        drop(st);
+        self.crash(true);
+    }
+
     /// Writes block (before their rename) until [`ModelFs::release`].
     pub fn stall(&self) {
         self.st().stalled = true;
@@ -560,6 +763,10 @@ impl ModelFs {
         } else {
             st.visible = st.synced.clone();
         }
+        st.unsynced.clear();
+        st.fail_read = 0;
+        st.panic_remove = None;
+        st.dies_in = None;
         st.fail_before_rename = 0;
         st.fail_after_rename = 0;
         st.fail_sync = 0;
@@ -615,13 +822,19 @@ impl UiFs for ModelFs {
                 error: io::Error::other("model fs: failure before the rename"),
             });
         }
+        if let Err(error) = st.step(format!("write {name}")) {
+            return Err(WriteFailure {
+                published: false,
+                error,
+            });
+        }
         let before = st.visible.get(name).and_then(|b| peek_seq(b));
         st.renames.push(Rename {
             name: name.to_string(),
             before,
             after: peek_seq(data),
         });
-        st.visible.insert(name.to_string(), data.to_vec());
+        st.put_visible(name, data.to_vec());
         if st.panic_after_rename {
             st.panic_after_rename = false;
             drop(st);
@@ -639,17 +852,24 @@ impl UiFs for ModelFs {
 
     fn sync_dir(&self) -> io::Result<()> {
         let mut st = self.st();
+        st.step("sync".into())?;
         st.sync_calls += 1;
         if st.fail_sync > 0 {
             st.fail_sync -= 1;
             return Err(io::Error::other("model fs: directory sync failed"));
         }
         st.synced = st.visible.clone();
+        st.unsynced.clear();
         Ok(())
     }
 
     fn read(&self, name: &str, max: usize) -> io::Result<ReadBack> {
-        Ok(match self.st().visible.get(name) {
+        let mut st = self.st();
+        if st.fail_read > 0 {
+            st.fail_read -= 1;
+            return Err(io::Error::other("model fs: EIO on read"));
+        }
+        Ok(match st.visible.get(name) {
             None => ReadBack::Missing,
             Some(b) if b.len() > max => ReadBack::TooLarge(b.len() as u64),
             Some(b) => ReadBack::Bytes(b.clone()),
@@ -657,14 +877,26 @@ impl UiFs for ModelFs {
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
-        self.st().visible.remove(name);
+        let mut st = self.st();
+        st.step(format!("remove {name}"))?;
+        let panic = st.panic_remove.take();
+        if panic == Some(false) {
+            drop(st);
+            panic!("model fs: the writer dies before its unlink");
+        }
+        st.remove_visible(name);
+        if panic == Some(true) {
+            drop(st);
+            panic!("model fs: the writer dies after its unlink");
+        }
         Ok(())
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         let mut st = self.st();
-        if let Some(b) = st.visible.remove(from) {
-            st.visible.insert(to.to_string(), b);
+        st.step(format!("rename {from} {to}"))?;
+        if let Some(b) = st.remove_visible(from) {
+            st.put_visible(to, b);
         }
         Ok(())
     }
@@ -681,7 +913,10 @@ pub enum Outcome {
     /// never renamed.
     NotPublished(String),
     /// Renamed, but the directory sync failed (after the writer's retries,
-    /// from the store: the store has failed).
+    /// from the store: the store has failed). From the store it also means
+    /// the outcome is unknown: the writer died and its read-back proved
+    /// nothing (H1). Either way the change may be on disk: it is never
+    /// rolled back.
     Unsynced(String),
 }
 
@@ -742,6 +977,10 @@ pub enum Refusal {
     Busy,
     /// The store has failed closed.
     Storage(String),
+    /// The image is over its bounds (v3.3 #2a): a bug guard tripped, not a
+    /// failed store. Nothing was written, and the store takes the next
+    /// commit.
+    Bounds(String),
 }
 
 /// A commit's progress.
@@ -835,6 +1074,14 @@ fn spawn_writer<F: UiFs>(
             }
         })?;
     Ok(Writer { jobs, outcomes })
+}
+
+/// What a read-back after a writer's death proves.
+enum Evidence {
+    Missing,
+    Seq(u64),
+    /// Nothing: the read failed, or the bytes hold no `seq`.
+    Unknown(String),
 }
 
 #[derive(Clone, Debug)]
@@ -939,18 +1186,40 @@ impl<F: UiFs> UiStore<F> {
         Ok(seq)
     }
 
-    fn respawn(&mut self, name: &str) -> Result<Option<u64>, Refusal> {
-        let on_disk = match self.fs.read(name, SIDECAR_READ_MAX_BYTES) {
-            Ok(ReadBack::Bytes(b)) => peek_seq(&b),
-            _ => None,
+    /// Read `name` back after its writer died (§3.4). Only a read that
+    /// succeeds is evidence: an I/O error, a file over the read bound or
+    /// bytes without a `seq` prove nothing either way (H1).
+    fn read_back(&self, name: &str) -> Evidence {
+        match self.fs.read(name, SIDECAR_READ_MAX_BYTES) {
+            Ok(ReadBack::Missing) => Evidence::Missing,
+            Ok(ReadBack::Bytes(b)) => match peek_seq(&b) {
+                Some(seq) => Evidence::Seq(seq),
+                None => Evidence::Unknown(format!("{name} holds no readable seq")),
+            },
+            Ok(ReadBack::TooLarge(n)) => {
+                Evidence::Unknown(format!("{name} is {n} bytes, over the read bound"))
+            }
+            Err(e) => Evidence::Unknown(format!("couldn't read {name} back: {e}")),
+        }
+    }
+
+    /// A fresh writer after one died, its floor from a read-back that
+    /// proved something. Evidence that proves nothing fails the store
+    /// closed instead: no writer is started from it.
+    fn respawn(&mut self, name: &str) -> Result<Evidence, Refusal> {
+        let evidence = self.read_back(name);
+        let floor = match &evidence {
+            Evidence::Unknown(e) => {
+                self.failed = Some(e.clone());
+                return Err(Refusal::Storage(e.clone()));
+            }
+            Evidence::Seq(seq) => HashMap::from([(name.to_string(), *seq)]),
+            Evidence::Missing => HashMap::new(),
         };
-        let floor = on_disk
-            .map(|s| HashMap::from([(name.to_string(), s)]))
-            .unwrap_or_default();
         match spawn_writer(self.fs.clone(), self.cfg, floor) {
             Ok(w) => {
                 self.writer = w;
-                Ok(on_disk)
+                Ok(evidence)
             }
             Err(e) => {
                 let e = format!("couldn't start the writer: {e}");
@@ -965,7 +1234,7 @@ impl<F: UiFs> UiStore<F> {
     pub fn commit(&mut self, image: &mut Sidecar) -> Result<u64, Refusal> {
         let seq = self.next_seq()?;
         image.seq = seq;
-        let bytes = encode_sidecar(image).map_err(|e| Refusal::Storage(e.to_string()))?;
+        let bytes = encode_sidecar(image).map_err(|e| Refusal::Bounds(e.to_string()))?;
         let name = sidecar_name(&image.session_id);
         let flight = InFlight {
             seq,
@@ -1018,19 +1287,38 @@ impl<F: UiFs> UiStore<F> {
         self.poll(budget)
     }
 
+    /// The writer died with `flight` in it. Only a read-back that succeeds
+    /// decides: a write is published when the file holds its `seq`, and
+    /// never published when the file holds an older one or none; a removal
+    /// is done when the file is gone, and never happened when it is still
+    /// there. Anything else (a failed read, a newer `seq`, no `seq`) leaves
+    /// the outcome unknown: the store fails closed with the change kept
+    /// pending (`Unsynced`), never rolled back (H1).
     fn after_writer_death(&mut self, flight: &InFlight) -> Poll {
-        let on_disk = match self.respawn(&flight.name) {
-            Ok(s) => s,
-            Err(Refusal::Storage(e)) => {
+        let evidence = match self.respawn(&flight.name) {
+            Ok(e) => e,
+            Err(Refusal::Storage(e) | Refusal::Bounds(e)) => {
+                self.failed = Some(e.clone());
                 self.inflight = None;
                 return Poll::Done(Outcome::Unsynced(e));
             }
-            Err(Refusal::Busy) => None,
+            Err(Refusal::Busy) => Evidence::Unknown("the writer is busy".into()),
         };
-        let published = if flight.remove {
-            on_disk.is_none()
-        } else {
-            on_disk == Some(flight.seq)
+        let published = match (flight.remove, &evidence) {
+            (true, Evidence::Missing) => true,
+            (true, Evidence::Seq(_)) => false,
+            (false, Evidence::Seq(s)) if *s == flight.seq => true,
+            (false, Evidence::Seq(s)) if *s < flight.seq => false,
+            (false, Evidence::Missing) => false,
+            (_, other) => {
+                let e = match other {
+                    Evidence::Unknown(e) => e.clone(),
+                    _ => format!("{} holds a seq newer than {}", flight.name, flight.seq),
+                };
+                self.failed = Some(e.clone());
+                self.inflight = None;
+                return Poll::Done(Outcome::Unsynced(e));
+            }
         };
         if !published {
             self.inflight = None;
@@ -1108,8 +1396,13 @@ pub enum Op {
     Close {
         card: String,
     },
-    /// `/new`: no card, answer or tombstone survives it.
-    Clear,
+    /// `/new` (T19), at `at`: no card or answer survives it, but every
+    /// card's action log does, as a tombstone stamped `at` (v3.3 #1), so a
+    /// retry of an accepted action still gets its original outcome. The
+    /// tombstones already there stay, under the usual 128 / 7-day bounds.
+    Clear {
+        at: String,
+    },
     /// T15/T16 (and T17, T21): the epoch rises.
     Stop(StopKind),
     /// T13/T14: every waiting card goes live.
@@ -1216,12 +1509,24 @@ pub fn apply(sc: &mut Sidecar, op: &Op) {
                 c.state.offers.clear();
             }
         }
-        Op::Clear => {
-            sc.cards.clear();
+        Op::Clear { at } => {
+            for c in sc.cards.drain(..) {
+                sc.tombstones.push(Tombstone {
+                    id: c.state.id,
+                    at: at.clone(),
+                    log: c.log,
+                });
+            }
             sc.ledger.clear();
-            sc.tombstones.clear();
             sc.newest_settled = None;
             ROOT_BASE.clone_into(&mut sc.base);
+            if let Ok(now) = DateTime::parse_from_rfc3339(at) {
+                let now = now.with_timezone(&Utc);
+                sc.tombstones
+                    .retain(|t| !older_than(&t.at, now, TOMBSTONE_MAX_AGE));
+            }
+            let over = sc.tombstones.len().saturating_sub(TOMBSTONES_MAX);
+            sc.tombstones.drain(..over);
         }
         Op::Stop(kind) => {
             sc.epoch = sc.epoch.saturating_add(1);
@@ -1518,7 +1823,7 @@ impl Images {
         }
         // #5: the store, and a handoff's fence.
         match store.admit() {
-            Err(Refusal::Storage(e)) => return Err(Admission::Storage(e)),
+            Err(Refusal::Storage(e) | Refusal::Bounds(e)) => return Err(Admission::Storage(e)),
             Err(Refusal::Busy) => return Err(Admission::Busy),
             Ok(()) => {}
         }

@@ -274,8 +274,9 @@ fn sanitize_fixtures() {
 // them escaped). Numbers are at their type's maximum and enums at their
 // longest spelling, so the fixed-shape transitions (epoch, expiry, final
 // receipts, settle, downgrade) can't grow an image: they only change those
-// fields. Identifiers are at their v3.2 #11 bounds. C2 and C3 re-run this
-// against their real types.
+// fields. Identifiers are at their v3.2 #11 bounds. C2 re-runs the
+// sidecar's half against its real types
+// (`worst_sidecar_of_real_types_fits`); C3 re-runs the wire's.
 //
 // A part bounded in bytes (the doc, a stored capsule) is a filler at its
 // allowance, not an example: an example only shows the bound is nearly
@@ -480,44 +481,11 @@ fn worst_case_budget_is_measured() {
     let attached_bytes = bytes(&attached);
     let tomb_bytes = bytes(&tombstone());
 
-    let per_record = LEDGER_MAX_VALUE_BYTES / LEDGER_MAX_RECORDS;
-    let record_values = {
-        let mut v = json!({"fields": {"f0": ""}});
-        v["fields"]["f0"] = json!("x".repeat(per_record - bytes(&v)));
-        assert_eq!(bytes(&v), per_record);
-        v
-    };
-    let record = json!({
-        "answer_id": format!("a_{}", hex(16)), "card": format!("s_{}", hex(16)), "rev": u32::MAX,
-        "status": "answered", "values": record_values, "wake": false, "epoch": u32::MAX,
-        "delivery": "in_context", "q": wide(QUESTION_MAX),
-        "asked": filler(CAPSULE_STORED_ALLOWANCE),
-    });
-    let binding = json!({"session_id": session_id(), "base": hex(64), "seq": u64::MAX});
-    let sidecar = json!({
-        "v": 1,
-        "session_id": session_id(),
-        "lineage": hex(32),
-        "base": hex(64),
-        "seq": u64::MAX,
-        "epoch": u32::MAX,
-        "checkpointed": true,
-        "compacting": {"hx": hex(32), "from": binding, "to": binding},
-        "prepared": {"hx": hex(32), "parent": session_id(), "from_seq": u64::MAX},
-        "moved_to": {"to": session_id(), "hx": hex(32)},
-        "cards": (0..ATTACHED_MAX_STATES).map(|_| json!({"state": state, "log": log()})).collect::<Vec<_>>(),
-        "ledger": vec![record; LEDGER_MAX_RECORDS],
-        "tombstones": vec![tombstone(); TOMBSTONES_MAX],
-        "newest_settled": format!("a_{}", hex(16)),
-    });
-    let sidecar_bytes = bytes(&sidecar);
-
     eprintln!(
         "ui budget (measured): doc allowed {DOC_MAX_BYTES} B (example {doc_bytes} B); \
          capsule stored allowed {CAPSULE_STORED_ALLOWANCE} B (example {} B, stored {asked_bytes} B); \
          SurfaceState {state_bytes} B (cap {SURFACE_STATE_MAX_BYTES}); \
-         Attached.surfaces {attached_bytes} B (cap {ATTACHED_MAX_BYTES}); tombstone {tomb_bytes} B (cap {TOMBSTONE_MAX_BYTES}); \
-         sidecar {sidecar_bytes} B (cap {SIDECAR_MAX_BYTES})",
+         Attached.surfaces {attached_bytes} B (cap {ATTACHED_MAX_BYTES}); tombstone {tomb_bytes} B (cap {TOMBSTONE_MAX_BYTES})",
         asked.len()
     );
     assert!(
@@ -541,10 +509,266 @@ fn worst_case_budget_is_measured() {
         tomb_bytes <= TOMBSTONE_MAX_BYTES,
         "tombstone {tomb_bytes} B"
     );
+}
+
+/// A C0 control: one character and one byte, which JSON writes as
+/// `\u00XX`, 6 bytes: the costliest a string's character or byte can be
+/// once the sidecar's decoder, not the sanitizer, is what admits it.
+const C0: &str = "\u{1}";
+
+fn sid(i: usize) -> String {
+    format!("s_{:016x}", u64::MAX - i as u64)
+}
+
+fn aid(i: usize) -> String {
+    format!("a_{:016x}", u64::MAX - i as u64)
+}
+
+/// Answer values of exactly `n` bytes, as the ledger counts them.
+fn values_of(n: usize) -> Answer {
+    let mut a: Answer = serde_json::from_value(json!({"fields": {"f0": ""}})).unwrap();
+    let pad = n - a.to_json().len();
+    a = serde_json::from_value(json!({"fields": {"f0": "x".repeat(pad)}})).unwrap();
+    assert_eq!(a.to_json().len(), n);
+    a
+}
+
+fn real_log() -> Vec<LogEntry> {
+    (0..ACTION_LOG_MAX)
+        .map(|_| LogEntry {
+            action_id: hex(32),
+            hash: hex(32),
+            rev: u32::MAX,
+        })
+        .collect()
+}
+
+/// §2.2 `SurfaceState` of the real type, every field `check_bounds` bounds
+/// at its bound in its costliest bytes; the doc is the max-size example
+/// (the measurement swaps in a `DOC_MAX_BYTES` filler).
+fn real_worst_state(i: usize, doc: &CardDoc) -> SurfaceState {
+    let longest = |v: Vec<Value>| v.into_iter().max_by_key(bytes).unwrap();
+    SurfaceState {
+        id: sid(i),
+        call_id: call_id(),
+        rev: u64::MAX,
+        contract: contract(doc),
+        catalog: u32::MAX,
+        mode: WaitMode::Waiting,
+        phase: serde_json::from_value(longest(
+            [
+                Phase::Open,
+                Phase::Answered,
+                Phase::Skipped,
+                Phase::Withdrawn,
+                Phase::Expired,
+                Phase::Closed,
+                Phase::Unknown,
+            ]
+            .iter()
+            .map(|p| serde_json::to_value(p).unwrap())
+            .collect(),
+        ))
+        .unwrap(),
+        offers: vec![Verb::Answer, Verb::Skip, Verb::Revise],
+        doc: doc.clone(),
+        origin: Origin {
+            turn: Some(turn_id()),
+            task: C0.repeat(TASK_EXCERPT_MAX),
+            stopped: Some(serde_json::from_value(stop_kind()).unwrap()),
+        },
+        epoch: u32::MAX,
+        resume: false,
+        actions: (0..ACTION_LOG_MAX).map(|_| hex(32)).collect(),
+        raised_at: rfc3339().into(),
+        downgraded: Some(Downgrade::Abandoned),
+        answer: Some(AnswerState {
+            rev: u32::MAX,
+            action_id: hex(32),
+            answer_id: aid(i),
+            status: AnswerStatus::Answered,
+            values: values_of(ANSWER_MAX_BYTES),
+            delivery: Delivery::InContext,
+            wake: false,
+            by: C0.repeat(BY_MAX_BYTES),
+            at: rfc3339().into(),
+        }),
+    }
+}
+
+/// C2's half of the budget (Shady #440 M4): every category full at once,
+/// built from the real types the sidecar serializes (`CardRecord` and its
+/// `SurfaceState`, `LedgerRecord`, `Tombstone`, the three handoff fields
+/// at once, `Sidecar`), so a field added or widened changes this
+/// measurement. Each field `check_bounds` bounds is at its bound in the
+/// bytes JSON spends most on: the stored capsule is 1 KiB of C0 controls
+/// (its `CAPSULE_STORED_ALLOWANCE`, for real), `q`, `task` and `by` are
+/// too. The real image passes `check_bounds` and encodes; with each doc
+/// swapped for its `DOC_MAX_BYTES` filler it still fits
+/// `SIDECAR_MAX_BYTES`; and no transition that can't be refused makes it
+/// longer.
+#[test]
+fn worst_sidecar_of_real_types_fits() {
+    use agent_core::core::session_surfaces::{
+        apply, check_bounds, encode_sidecar, CardRecord, Compacting, HandoffFrom, HandoffTo,
+        MovedTo, Op, Prepared, Sidecar, SIDECAR_VERSION,
+    };
+    let doc = doc_example();
+    let per_record = LEDGER_MAX_VALUE_BYTES / LEDGER_MAX_RECORDS;
+    let from = HandoffFrom {
+        session_id: session_id(),
+        base: hex(64),
+        seq: u64::MAX,
+    };
+    let real = Sidecar {
+        v: SIDECAR_VERSION,
+        session_id: session_id(),
+        lineage: hex(32),
+        base: hex(64),
+        seq: u64::MAX,
+        epoch: u32::MAX,
+        checkpointed: true,
+        compacting: Some(Compacting {
+            hx: hex(32),
+            from,
+            to: HandoffTo {
+                session_id: session_id(),
+                base: hex(64),
+            },
+        }),
+        prepared: Some(Prepared {
+            hx: hex(32),
+            parent: session_id(),
+            from_seq: u64::MAX,
+        }),
+        moved_to: Some(MovedTo {
+            to: session_id(),
+            hx: hex(32),
+        }),
+        cards: (0..ATTACHED_MAX_STATES)
+            .map(|i| CardRecord {
+                state: real_worst_state(i, &doc),
+                log: real_log(),
+            })
+            .collect(),
+        ledger: (0..LEDGER_MAX_RECORDS)
+            .map(|i| LedgerRecord {
+                answer_id: aid(100 + i),
+                card: sid(i % ATTACHED_MAX_STATES),
+                rev: u32::MAX,
+                status: AnswerStatus::Answered,
+                values: values_of(per_record),
+                wake: false,
+                epoch: u32::MAX,
+                delivery: Delivery::InContext,
+                q: C0.repeat(QUESTION_MAX),
+                asked: Some(C0.repeat(CAPSULE_MAX_BYTES)),
+            })
+            .collect(),
+        tombstones: (0..TOMBSTONES_MAX)
+            .map(|i| Tombstone {
+                id: sid(1000 + i),
+                at: rfc3339().into(),
+                log: real_log(),
+            })
+            .collect(),
+        newest_settled: Some(aid(100)),
+    };
+    check_bounds(&real).unwrap();
+    let real_bytes = encode_sidecar(&real).unwrap().len();
+
+    let asked = json!(real.ledger[0].asked);
+    assert_eq!(
+        bytes(&asked),
+        CAPSULE_STORED_ALLOWANCE,
+        "the capsule at its allowance"
+    );
+    let tomb_bytes = bytes(&serde_json::to_value(&real.tombstones[0]).unwrap());
+    assert!(
+        tomb_bytes <= TOMBSTONE_MAX_BYTES,
+        "tombstone {tomb_bytes} B"
+    );
+
+    // The docs at their allowance, not the example.
+    let mut v = serde_json::to_value(&real).unwrap();
+    for c in v["cards"].as_array_mut().unwrap() {
+        c["state"]["doc"] = filler(DOC_MAX_BYTES);
+        let state_bytes = bytes(&c["state"]);
+        assert!(
+            state_bytes <= SURFACE_STATE_MAX_BYTES,
+            "SurfaceState {state_bytes} B"
+        );
+    }
+    let attached_bytes = bytes(&Value::Array(
+        v["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["state"].clone())
+            .collect(),
+    ));
+    let sidecar_bytes = bytes(&v);
+    eprintln!(
+        "sidecar budget (real types): {sidecar_bytes} B with every doc at {DOC_MAX_BYTES} B \
+         (real image {real_bytes} B; cap {SIDECAR_MAX_BYTES}); Attached.surfaces \
+         {attached_bytes} B (cap {ATTACHED_MAX_BYTES}); tombstone {tomb_bytes} B"
+    );
+    assert!(
+        attached_bytes <= ATTACHED_MAX_BYTES,
+        "Attached.surfaces {attached_bytes} B"
+    );
     assert!(
         sidecar_bytes <= SIDECAR_MAX_BYTES,
         "sidecar {sidecar_bytes} B"
     );
+
+    // The transitions no commit may refuse only change fields already at
+    // their longest: none makes the image longer.
+    let mut ops = vec![
+        Op::Checkpoint,
+        Op::Expire { card: sid(0) },
+        Op::Settle {
+            answer_id: aid(101),
+        },
+    ];
+    ops.extend(
+        [
+            StopKind::User,
+            StopKind::System,
+            StopKind::Reload,
+            StopKind::Crash,
+        ]
+        .map(Op::Stop),
+    );
+    ops.extend(
+        [
+            Downgrade::Timeout,
+            Downgrade::Abandoned,
+            Downgrade::Reload,
+            Downgrade::Crash,
+        ]
+        .map(Op::Downgrade),
+    );
+    ops.extend(
+        [
+            Delivery::Queued,
+            Delivery::Handed,
+            Delivery::InContext,
+            Delivery::Recorded,
+            Delivery::Settled,
+            Delivery::Unknown,
+        ]
+        .map(|to| Op::Deliver {
+            answer_id: aid(102),
+            to,
+        }),
+    );
+    for op in ops {
+        let mut after = real.clone();
+        apply(&mut after, &op);
+        let n = encode_sidecar(&after).unwrap().len();
+        assert!(n <= real_bytes, "{op:?} grew the image to {n} B");
+    }
 }
 
 #[test]

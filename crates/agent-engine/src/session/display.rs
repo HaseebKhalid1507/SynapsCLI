@@ -41,8 +41,29 @@ pub struct DisplayTail {
     /// host marks prove about a `ui` call or a host answer. Parallel to
     /// `items` and empty when no item has one, like `times`; older readers
     /// ignore it. Clients use [`DisplayTail::ui_item`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Decoded one element at a time (v3.3 #4): an element this build can't
+    /// read (a later variant or outcome) becomes `None`, never a frame
+    /// error, so an older client attached to a newer daemon still decodes
+    /// the tail, with the vector still parallel to `items`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_ui"
+    )]
     pub ui: Vec<Option<UiItem>>,
+}
+
+/// `ui`'s reader: a list, each element a `UiItem` or else `None`.
+fn lenient_ui<'de, D>(d: D) -> Result<Vec<Option<UiItem>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|v| serde_json::from_value(v).ok())
+        .collect())
 }
 
 impl DisplayTail {
@@ -704,6 +725,50 @@ mod tests {
             let old: DisplayTail =
                 serde_json::from_value(json!({"items": [], "omitted": 0})).unwrap();
             assert!(old.ui.is_empty());
+        }
+
+        /// v3.3 #4: a later build's fold (a new outcome, a new variant)
+        /// reads as `None` in its slot, never a frame error; its valid
+        /// neighbours and the alignment with `items` stay.
+        #[test]
+        fn an_unknown_fold_element_reads_as_none() {
+            let wire = json!({
+                "items": [
+                    {"kind": "user", "text": "a"},
+                    {"kind": "tool_use", "tool_id": "t1", "tool_name": "ui", "input": "{}"},
+                    {"kind": "tool_use", "tool_id": "t2", "tool_name": "ui", "input": "{}"},
+                    {"kind": "user", "text": "b"},
+                    {"kind": "text", "text": "c"},
+                ],
+                "omitted": 0,
+                "ui": [
+                    null,
+                    {"call": {"outcome": "teleported", "card": CARD}},
+                    {"call": {"outcome": "shown", "card": CARD}},
+                    {"poll": {"card": CARD}},
+                    {"answer": {"card": CARD, "answer": ANS, "rev": 1, "status": "answered", "late": false}},
+                ],
+            });
+            let tail: DisplayTail = serde_json::from_value(wire).unwrap();
+            assert_eq!(tail.items.len(), 5);
+            assert_eq!(tail.ui.len(), 5, "still parallel to items");
+            assert_eq!(tail.ui_item(0), None);
+            assert_eq!(tail.ui_item(1), None, "a future outcome");
+            assert_eq!(
+                tail.ui_item(2),
+                Some(&UiItem::Call {
+                    outcome: UiOutcome::Shown,
+                    card: Some(CARD.into()),
+                    answer: None,
+                    values: None,
+                })
+            );
+            assert_eq!(tail.ui_item(3), None, "a future variant");
+            assert!(matches!(tail.ui_item(4), Some(UiItem::Answer { .. })));
+            // On the wire again, an unknown element is `null`.
+            let again = serde_json::to_value(&tail).unwrap();
+            assert_eq!(again["ui"][1], Value::Null);
+            assert_eq!(again["ui"][3], Value::Null);
         }
     }
 }

@@ -519,9 +519,10 @@ pub fn sweep_at(
                     continue;
                 }
                 if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                    delete_sidecars(&path, &mut outcome).map_err(RetentionError::Io)?;
+                    delete_snapshot_files(&path, &[], &mut outcome).map_err(RetentionError::Io)?;
+                } else {
+                    delete_file(&path, &mut outcome).map_err(RetentionError::Io)?;
                 }
-                delete_file(&path, &mut outcome).map_err(RetentionError::Io)?;
             }
         }
 
@@ -737,13 +738,13 @@ fn delete_file(path: &Path, outcome: &mut SweepOutcome) -> io::Result<()> {
 /// (`session_draft`, `<id>.turn`).
 const PAIRED_SESSION_EXTENSIONS: [&str; 2] = ["journal", "turn"];
 
-/// The agent-card sidecar and its quarantine (`<id>.ui`,
-/// `<id>.ui.quarantine`; agent-ui §7 C2) also live and die with the
-/// snapshot, and go before it: a sweep cut short leaves history without its
-/// cards, never cards without their history. Their own mtime says nothing
-/// about the session's age (a card can sit unchanged while the session
-/// runs on).
-const SIDECAR_SUFFIXES: [&str; 2] = [".ui", ".ui.quarantine"];
+/// The agent-card files (`<id>.ui`, `<id>.ui.quarantine` and their
+/// `.tmp`s: `session_surfaces::sidecar_files`; agent-ui §7 C2) also live
+/// and die with the snapshot, and go before it, behind a directory sync: a
+/// sweep cut short leaves history without its cards, never cards without
+/// their history. Their own mtime says nothing about the session's age (a
+/// card can sit unchanged while the session runs on).
+const SIDECAR_SUFFIXES: [&str; 4] = [".ui", ".ui.quarantine", ".ui.tmp", ".ui.quarantine.tmp"];
 
 /// The snapshot a sidecar file belongs to (`<id>.json` beside it).
 fn sidecar_snapshot(path: &Path) -> Option<PathBuf> {
@@ -764,18 +765,57 @@ fn is_paired_journal(path: &Path) -> bool {
         || sidecar_snapshot(path).is_some_and(|snapshot| snapshot.exists())
 }
 
-/// Delete the sidecar files of the snapshot at `snapshot` (`<id>.json`).
-fn delete_sidecars(snapshot: &Path, outcome: &mut SweepOutcome) -> io::Result<()> {
-    let Some(id) = snapshot.file_stem().and_then(|s| s.to_str()) else {
-        return Ok(());
+/// Delete the snapshot at `snapshot` (`<id>.json`) and the `paired`
+/// extensions beside it, through the sidecar-first barrier
+/// (`session_surfaces::delete_sidecar_first`): its card files, a directory
+/// sync, then the snapshot and its pairs, then a closing sync.
+fn delete_snapshot_files(
+    snapshot: &Path,
+    paired: &[&str],
+    outcome: &mut SweepOutcome,
+) -> io::Result<()> {
+    let (Some(dir), Some(id)) = (
+        snapshot.parent(),
+        snapshot.file_stem().and_then(|s| s.to_str()),
+    ) else {
+        return delete_file(snapshot, outcome);
     };
-    for suffix in SIDECAR_SUFFIXES {
-        let sidecar = snapshot.with_file_name(format!("{id}{suffix}"));
-        if sidecar.exists() {
-            delete_file(&sidecar, outcome)?;
-        }
+    let history: Vec<String> = std::iter::once("json")
+        .chain(paired.iter().copied())
+        .map(|ext| format!("{id}.{ext}"))
+        .collect();
+    crate::core::session_surfaces::delete_sidecar_first(
+        id,
+        &history,
+        &mut |name| delete_if_present(&dir.join(name), outcome),
+        &mut || sync_dir(dir),
+    )
+}
+
+fn delete_if_present(path: &Path, outcome: &mut SweepOutcome) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+        Ok(_) => match delete_file(path, outcome) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
     }
-    Ok(())
+}
+
+/// The barrier of [`delete_snapshot_files`]. Windows has no directory
+/// fsync (see `session_journal::sync_sessions_dir`): there the order is the
+/// syscall order only.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 /// Remove session `id`'s tool-output spill dir (`<base>/spill/<id>/`).
@@ -796,18 +836,10 @@ fn remove_session_spill(
 /// files first.
 fn delete_session_artifact(path: &Path, outcome: &mut SweepOutcome) -> io::Result<()> {
     if path.extension().and_then(|e| e.to_str()) == Some("json") {
-        delete_sidecars(path, outcome)?;
+        delete_snapshot_files(path, &PAIRED_SESSION_EXTENSIONS, outcome)
+    } else {
+        delete_file(path, outcome)
     }
-    delete_file(path, outcome)?;
-    if path.extension().and_then(|e| e.to_str()) == Some("json") {
-        for ext in PAIRED_SESSION_EXTENSIONS {
-            let paired = path.with_extension(ext);
-            if paired.exists() {
-                delete_file(&paired, outcome)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Rewrite one memory JSONL file, dropping tombstoned records, records past
@@ -1081,18 +1113,17 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
             let path = roots
                 .sessions_dir()
                 .join(format!("{}.json", file.display()));
-            fs::remove_file(path)?;
+            // An unknown session is NotFound, before anything is deleted.
+            fs::symlink_metadata(&path)?;
             // Pair-delete the opt-in journal (Task 35) and any turn draft —
-            // forgetting a session must not leave replayable state behind.
-            for ext in PAIRED_SESSION_EXTENSIONS {
-                let paired = roots
-                    .sessions_dir()
-                    .join(format!("{}.{ext}", file.display()));
-                match fs::remove_file(paired) {
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    other => other?,
-                }
-            }
+            // forgetting a session must not leave replayable state behind —
+            // and its agent-card files first, behind the same barrier as
+            // every sweep (agent-ui §7 C2).
+            delete_snapshot_files(
+                &path,
+                &PAIRED_SESSION_EXTENSIONS,
+                &mut SweepOutcome::default(),
+            )?;
             // And its tool-output spill files.
             crate::core::tool_spill::remove_session_spill(&roots.spill_dir(), id)?;
             Ok(())

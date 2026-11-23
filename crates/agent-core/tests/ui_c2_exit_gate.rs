@@ -50,7 +50,7 @@ fn aid(n: u8) -> String {
 }
 
 fn act(n: u8) -> String {
-    format!("act-{n}")
+    format!("{n:032x}")
 }
 
 fn contract() -> String {
@@ -570,7 +570,7 @@ fn pending_commit_then_new() {
         if !clear {
             w.fs.fail_before_rename(1);
         }
-        match w.commit(Some(Op::Clear)) {
+        match w.commit(Some(Op::Clear { at: hours_ago(0) })) {
             Poll::Done(Outcome::Durable) => assert!(w.img.projection().cards.is_empty()),
             Poll::Done(Outcome::NotPublished(_)) => {
                 // The same writer unlinks `.ui`, then syncs the directory.
@@ -1339,7 +1339,7 @@ fn new_then_crash() {
     let mut w = world();
     w.commit_ok(create(1, WaitMode::Live));
     w.commit_ok(accept(1, 1));
-    w.commit_ok(Op::Clear);
+    w.commit_ok(Op::Clear { at: hours_ago(0) });
     w.fs.crash(false);
     let plan = w.recover(SID, &history(&[]), None);
     assert!(image(&plan).cards.is_empty() && image(&plan).ledger.is_empty());
@@ -1349,7 +1349,7 @@ fn new_then_crash() {
     w.commit_ok(accept(1, 1));
     w.fs.fail_before_rename(1);
     assert!(matches!(
-        w.commit(Some(Op::Clear)),
+        w.commit(Some(Op::Clear { at: hours_ago(0) })),
         Poll::Done(Outcome::NotPublished(_))
     ));
     w.store.remove(SID).unwrap();
@@ -1479,4 +1479,213 @@ fn checkpoint_barrier_reports_failure() {
     // A checkpointed image recovers without a second epoch rise.
     let plan = w.recover(SID, &history(&[answer_msg(LINEAGE, 1, 1, 1)]), None);
     assert_eq!(image(&plan).epoch, d.epoch);
+}
+
+// ── #440 review, round 2 ─────────────────────────────────────────────────
+
+/// H1: the writer dies and its read-back fails (EIO), for a write after or
+/// before its rename and a removal after or before its unlink. A failed
+/// read proves nothing: the outcome is unknown (`Unsynced`, the store
+/// failed closed), never `NotPublished` and never a durable removal. The
+/// change stays pending: no rollback, and no new admission.
+#[test]
+fn store_read_back_error_is_not_evidence() {
+    for after in [true, false] {
+        let mut w = world();
+        w.commit_ok(create(1, WaitMode::Live));
+        w.fs.panic_next_write(after);
+        w.fs.fail_read(1);
+        w.img.commit(&mut w.store, Some(accept(1, 1))).unwrap();
+        let out = w.img.poll(&mut w.store, LONG);
+        assert!(
+            matches!(out, Poll::Done(Outcome::Unsynced(_))),
+            "write, after {after}: {out:?}"
+        );
+        assert_eq!(Lifecycle::of(&out), Lifecycle::Unconfirmed);
+        assert!(w.store.failure().is_some(), "failed closed");
+        assert!(
+            matches!(w.img.pending_op(), Some(Op::Accept(_))),
+            "kept pending, never rolled back"
+        );
+        assert!(card(&w.img.live(), 1).answer.is_some());
+        assert!(card(&w.img.projection(), 1).answer.is_none());
+        assert_eq!(
+            w.img.admit(&w.store, &request(1, 1, Verb::Answer, 0, 0)),
+            Err(Admission::Pending)
+        );
+        let other = w.img.admit(&w.store, &request(1, 2, Verb::Answer, 0, 0));
+        assert!(matches!(other, Err(Admission::Storage(_))), "{other:?}");
+        let next = w.img.commit(&mut w.store, Some(Op::Close { card: sid(1) }));
+        assert!(matches!(next, Err(Refusal::Storage(_))), "{next:?}");
+
+        let mut w = world();
+        w.commit_ok(create(1, WaitMode::Live));
+        w.fs.panic_next_remove(after);
+        w.fs.fail_read(1);
+        w.store.remove(SID).unwrap();
+        let out = w.store.poll(LONG);
+        assert!(
+            matches!(out, Poll::Done(Outcome::Unsynced(_))),
+            "remove, after {after}: {out:?}"
+        );
+        assert_eq!(Lifecycle::of(&out), Lifecycle::Unconfirmed);
+        assert!(w.store.failure().is_some(), "failed closed");
+    }
+    // A read-back that does read decides, as before: a removal the file
+    // outlived never happened; one it didn't, did.
+    for after in [true, false] {
+        let mut w = world();
+        w.commit_ok(create(1, WaitMode::Live));
+        w.fs.panic_next_remove(after);
+        w.store.remove(SID).unwrap();
+        let out = w.store.poll(LONG);
+        if after {
+            assert_eq!(out, Poll::Done(Outcome::Durable));
+            assert!(w.fs.get(&sidecar_name(SID)).is_none());
+        } else {
+            assert!(
+                matches!(out, Poll::Done(Outcome::NotPublished(_))),
+                "{out:?}"
+            );
+            assert!(w.fs.get(&sidecar_name(SID)).is_some());
+        }
+        assert!(w.store.failure().is_none());
+    }
+}
+
+/// v3.3 #2a: an image over its bounds (a create that would make 13 cards)
+/// is refused as `Bounds`: nothing is written, the store isn't failed, and
+/// the next valid commit is Durable.
+#[test]
+fn over_bounds_image_is_refused_as_bounds() {
+    let mut w = world();
+    for n in 0..ATTACHED_MAX_STATES as u8 {
+        w.commit_ok(create(n, WaitMode::Live));
+    }
+    let writes = w.fs.renames().len();
+    let seq = w.store.last_seq();
+    let r = w.img.commit(&mut w.store, Some(create(99, WaitMode::Live)));
+    assert!(matches!(r, Err(Refusal::Bounds(_))), "{r:?}");
+    assert_eq!(w.fs.renames().len(), writes, "nothing written");
+    assert_eq!(w.store.last_seq(), seq);
+    assert!(w.store.failure().is_none(), "not a failed store");
+    assert!(w.img.live().card(&sid(99)).is_none());
+    w.commit_ok(Op::Close { card: sid(0) });
+    assert_eq!(w.on_disk(SID).unwrap().seq, seq + 1);
+}
+
+/// M3 / v3.3 #1: a successful `/new` keeps every card's action log as a
+/// tombstone stamped with the clear's time. A retry of an accepted action,
+/// before and after a restart, gets its original outcome (`duplicate`);
+/// no card is open or deliverable; the tombstones already there stay.
+#[test]
+fn new_keeps_the_retry_logs() {
+    let mut w = world();
+    w.commit_ok(create(1, WaitMode::Live));
+    w.commit_ok(accept(1, 1));
+    w.commit_ok(create(2, WaitMode::Live));
+    let old = Tombstone {
+        id: sid(7),
+        at: hours_ago(2),
+        log: Vec::new(),
+    };
+    let stale = Tombstone {
+        id: sid(8),
+        at: hours_ago(8 * 24),
+        log: Vec::new(),
+    };
+    let mut seeded = w.img.durable().clone();
+    seeded.tombstones = vec![stale, old.clone()];
+    w.img = Images::new(seeded);
+    w.commit_ok(Op::Clear { at: hours_ago(0) });
+    let retry = request(1, 1, Verb::Answer, 0, 0);
+    let check = |s: &Sidecar| {
+        assert!(s.cards.is_empty() && s.ledger.is_empty(), "{s:?}");
+        let ids: Vec<&str> = s.tombstones.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [sid(7), sid(1), sid(2)],
+            "kept, then the cleared cards; past 7 days gone"
+        );
+        assert_eq!(s.tombstones[1].at, hours_ago(0));
+        assert_eq!(s.tombstones[1].log.len(), 1);
+    };
+    check(w.img.durable());
+    assert_eq!(
+        w.img.admit(&w.store, &retry),
+        Err(Admission::Duplicate { rev: 1 })
+    );
+    let open = w.img.admit(&w.store, &request(2, 2, Verb::Answer, 0, 0));
+    assert_eq!(open, Err(Admission::Resolved), "no card is open");
+
+    w.fs.crash(false);
+    let plan = w.recover(SID, &history(&[]), None);
+    assert!(plan.deliver.is_empty());
+    check(image(&plan));
+    let store = UiStore::open(w.fs.clone(), SID, cfg()).unwrap();
+    let img = Images::new(image(&plan).clone());
+    assert_eq!(
+        img.admit(&store, &retry),
+        Err(Admission::Duplicate { rev: 1 })
+    );
+}
+
+/// H2: a session's deletion is sidecar first across an OS crash, not only
+/// in syscall order. The order is: card files, a directory sync, history,
+/// a closing sync; a failed barrier touches no history file; and at every
+/// cut (the process dies after k operations) an OS crash that keeps any
+/// subset of the unsynced unlinks, each independently, never leaves card
+/// files without all of their history.
+#[test]
+fn session_deleted_sidecar_first_across_crashes() {
+    let history: Vec<String> = ["json", "journal", "turn"]
+        .iter()
+        .map(|e| format!("{SID}.{e}"))
+        .collect();
+    let setup = || {
+        let fs = ModelFs::new();
+        for name in sidecar_files(SID).iter().chain(&history) {
+            fs.put(name, b"{}");
+        }
+        fs
+    };
+    let delete = |fs: &ModelFs| {
+        delete_sidecar_first(SID, &history, &mut |n| fs.remove(n), &mut || fs.sync_dir())
+    };
+
+    let fs = setup();
+    delete(&fs).unwrap();
+    let mut order: Vec<String> = sidecar_files(SID)
+        .iter()
+        .map(|n| format!("remove {n}"))
+        .collect();
+    order.push("sync".into());
+    order.extend(history.iter().map(|n| format!("remove {n}")));
+    order.push("sync".into());
+    assert_eq!(fs.log(), order);
+    assert!(fs.names().is_empty());
+
+    let fs = setup();
+    fs.fail_sync(1);
+    assert!(delete(&fs).is_err());
+    for name in &history {
+        assert!(fs.get(name).is_some(), "{name} survives a failed barrier");
+        assert!(!fs.log().contains(&format!("remove {name}")));
+    }
+
+    for cut in 0..=order.len() as u32 {
+        let probe = setup();
+        probe.die_after(cut);
+        let _ = delete(&probe);
+        for kept in 0..(1u32 << probe.unsynced()) {
+            let fs = setup();
+            fs.die_after(cut);
+            let _ = delete(&fs);
+            fs.crash_keeping(&|i| kept & (1 << i) != 0);
+            let names = fs.names();
+            let cards = sidecar_files(SID).iter().any(|c| names.contains(c));
+            let all_history = history.iter().all(|h| names.contains(h));
+            assert!(!cards || all_history, "cut {cut}, kept {kept:b}: {names:?}");
+        }
+    }
 }

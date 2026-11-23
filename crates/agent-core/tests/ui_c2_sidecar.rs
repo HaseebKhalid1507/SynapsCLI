@@ -73,7 +73,7 @@ fn accepted_at(card: u8, n: u8, note: Option<String>, at: &str, offers: Vec<Verb
             asked: None,
         },
         action: LogEntry {
-            action_id: format!("act-{n}"),
+            action_id: format!("{n:032x}"),
             hash: action_hash(Verb::Answer, 0, 0, &values),
             rev: 1,
         },
@@ -246,9 +246,14 @@ fn sidecar_deleted_first() {
     save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
     let snapshot = dir.as_path().join(format!("{}.json", s.id));
     let sidecar = dir.as_path().join(sidecar_name(&s.id));
-    std::fs::write(&sidecar, b"{}").unwrap();
+    for f in sidecar_files(&s.id) {
+        std::fs::write(dir.as_path().join(f), b"{}").unwrap();
+    }
     delete_session_files_in_dir(dir.as_path(), &s.id).unwrap();
-    assert!(!sidecar.exists() && !snapshot.exists());
+    for f in sidecar_files(&s.id) {
+        assert!(!dir.as_path().join(&f).exists(), "{f} survived");
+    }
+    assert!(!snapshot.exists());
     assert!(!journal_path(dir.as_path(), &s.id).exists());
     // The sidecar can't be unlinked (a directory in its place): the delete
     // fails before it touches the history.
@@ -256,10 +261,118 @@ fn sidecar_deleted_first() {
     std::fs::create_dir(&sidecar).unwrap();
     std::fs::write(sidecar.join("keep"), b"x").unwrap();
     assert!(delete_session_files_in_dir(dir.as_path(), &s.id).is_err());
-    assert!(snapshot.exists() || journal_path(dir.as_path(), &s.id).exists());
+    assert!(snapshot.exists() && journal_path(dir.as_path(), &s.id).exists());
     std::fs::remove_dir_all(&sidecar).unwrap();
     delete_session_files_in_dir(dir.as_path(), &s.id).unwrap();
     assert!(!snapshot.exists() && !journal_path(dir.as_path(), &s.id).exists());
+}
+
+/// M4: every field the format bounds, at N and N+1, on encode and decode.
+/// At N+1 the whole sidecar is refused (`Bounds`), never trimmed, even
+/// with its total far below 512 KiB; a ledger `asked` or `q` hogging
+/// hundreds of KiB is refused the same way.
+#[test]
+fn sidecar_field_bounds() {
+    type Edit = Box<dyn Fn(&mut Sidecar)>;
+    fn card0(s: &mut Sidecar) -> &mut SurfaceState {
+        &mut s.cards[0].state
+    }
+    fn answer0(s: &mut Sidecar) -> &mut AnswerState {
+        s.cards[0].state.answer.as_mut().unwrap()
+    }
+    let cases: Vec<(&str, Edit, Edit)> = vec![
+        (
+            "call_id",
+            Box::new(|s: &mut Sidecar| card0(s).call_id = "~".repeat(CALL_ID_MAX_BYTES)),
+            Box::new(|s: &mut Sidecar| card0(s).call_id = "~".repeat(CALL_ID_MAX_BYTES + 1)),
+        ),
+        (
+            "origin.turn",
+            Box::new(|s: &mut Sidecar| {
+                card0(s).origin.turn = Some("3f2a91c0-d4e2-4a87-9b1f-0123456789ab".into())
+            }),
+            Box::new(|s: &mut Sidecar| {
+                card0(s).origin.turn = Some("3f2a91c0-d4e2-4a87-9b1f-0123456789abc".into())
+            }),
+        ),
+        (
+            "origin.task",
+            Box::new(|s: &mut Sidecar| card0(s).origin.task = "é".repeat(TASK_EXCERPT_MAX)),
+            Box::new(|s: &mut Sidecar| card0(s).origin.task = "é".repeat(TASK_EXCERPT_MAX + 1)),
+        ),
+        (
+            "contract",
+            Box::new(|s: &mut Sidecar| card0(s).contract = format!("c1:{}", "f".repeat(32))),
+            Box::new(|s: &mut Sidecar| card0(s).contract = format!("c1:{}", "f".repeat(33))),
+        ),
+        (
+            "answer.by",
+            Box::new(|s: &mut Sidecar| answer0(s).by = "b".repeat(BY_MAX_BYTES)),
+            Box::new(|s: &mut Sidecar| answer0(s).by = "b".repeat(BY_MAX_BYTES + 1)),
+        ),
+        (
+            "answer.action_id",
+            Box::new(|s: &mut Sidecar| answer0(s).action_id = "f".repeat(32)),
+            Box::new(|s: &mut Sidecar| answer0(s).action_id = "f".repeat(33)),
+        ),
+        (
+            "actions",
+            Box::new(|s: &mut Sidecar| card0(s).actions = vec!["f".repeat(32)]),
+            Box::new(|s: &mut Sidecar| card0(s).actions = vec!["act-1".into()]),
+        ),
+        (
+            "log hash",
+            Box::new(|s: &mut Sidecar| s.cards[0].log[0].hash = "f".repeat(32)),
+            Box::new(|s: &mut Sidecar| s.cards[0].log[0].hash = "f".repeat(31)),
+        ),
+        (
+            "ledger q",
+            Box::new(|s: &mut Sidecar| s.ledger[0].q = "é".repeat(QUESTION_MAX)),
+            Box::new(|s: &mut Sidecar| s.ledger[0].q = "é".repeat(QUESTION_MAX + 1)),
+        ),
+        (
+            "ledger asked",
+            Box::new(|s: &mut Sidecar| s.ledger[0].asked = Some("a".repeat(CAPSULE_MAX_BYTES))),
+            Box::new(|s: &mut Sidecar| s.ledger[0].asked = Some("a".repeat(CAPSULE_MAX_BYTES + 1))),
+        ),
+        (
+            "ledger asked, hundreds of KiB",
+            Box::new(|s: &mut Sidecar| s.ledger[0].asked = None),
+            Box::new(|s: &mut Sidecar| s.ledger[0].asked = Some("a".repeat(300 * 1024))),
+        ),
+        (
+            "ledger q, hundreds of KiB",
+            Box::new(|s: &mut Sidecar| s.ledger[0].q = "q".into()),
+            Box::new(|s: &mut Sidecar| s.ledger[0].q = "q".repeat(300 * 1024)),
+        ),
+        (
+            "tombstone log",
+            Box::new(|s: &mut Sidecar| s.tombstones[0].log[0].action_id = "f".repeat(32)),
+            Box::new(|s: &mut Sidecar| s.tombstones[0].log[0].action_id = "act-1".into()),
+        ),
+    ];
+    for (what, at_n, past_n) in cases {
+        let mut s = full_image();
+        s.tombstones.push(Tombstone {
+            id: format!("s_{:016x}", 9),
+            at: AT.into(),
+            log: s.cards[0].log.clone(),
+        });
+        at_n(&mut s);
+        let bytes = encode_sidecar(&s).unwrap_or_else(|e| panic!("{what} at N: {e}"));
+        assert_eq!(decode_sidecar(&bytes).unwrap(), s, "{what} at N");
+        past_n(&mut s);
+        assert!(
+            matches!(encode_sidecar(&s), Err(SidecarError::Bounds(_))),
+            "{what} past N encoded"
+        );
+        let raw = serde_json::to_vec(&s).unwrap();
+        assert!(raw.len() < SIDECAR_MAX_BYTES, "{what}: {} B", raw.len());
+        assert!(
+            matches!(decode_sidecar(&raw), Err(SidecarError::Bounds(_))),
+            "{what} past N decoded"
+        );
+    }
 }
 
 /// T20 and eviction (§4.4): revisable receipts beyond the newest eight, or
@@ -340,7 +453,9 @@ mod retention {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
 
-    use agent_core::core::retention::{sweep_at, RetentionPolicy, RetentionRoots};
+    use agent_core::core::retention::{
+        forget, sweep_at, RetentionDomain, RetentionPolicy, RetentionRoots,
+    };
     use agent_core::core::session::Session;
     use agent_core::core::session_journal::{save_session_in_dir, SessionPersistence};
 
@@ -460,6 +575,48 @@ mod retention {
         assert!(sessions.join(format!("{LIVE}.json")).exists());
         assert!(sessions.join(format!("{LIVE}.ui")).exists());
     }
+
+    /// M2: an explicit `forget` takes the session's card files too (the
+    /// sidecar, its quarantine, their temps), and first: when the sidecar
+    /// can't go, neither the snapshot nor the journal does.
+    #[test]
+    fn forget_takes_the_sidecars_first() {
+        let (_tmp, roots, sessions) = roots();
+        let journaled = |id: &str| {
+            let mut s = Session::new("claude-sonnet-4-6", "medium", Some("harness prompt"));
+            s.id = id.to_string();
+            s.api_messages.push(std::sync::Arc::new(
+                serde_json::json!({"role": "user", "content": "hi"}),
+            ));
+            save_session_in_dir(&sessions, &s, SessionPersistence::Journal).unwrap();
+            s.api_messages.push(std::sync::Arc::new(
+                serde_json::json!({"role": "assistant", "content": "yo"}),
+            ));
+            save_session_in_dir(&sessions, &s, SessionPersistence::Journal).unwrap();
+        };
+        journaled(DEAD);
+        let cards = super::sidecar_files(DEAD);
+        for f in &cards {
+            std::fs::write(sessions.join(f), b"{}").unwrap();
+        }
+        let history = [format!("{DEAD}.json"), format!("{DEAD}.journal")];
+        assert!(history.iter().all(|f| sessions.join(f).exists()));
+        forget(&roots, RetentionDomain::Sessions, DEAD).unwrap();
+        for f in cards.iter().chain(&history) {
+            assert!(!sessions.join(f).exists(), "{f} survived forget");
+        }
+
+        journaled(DEAD);
+        let sidecar = sessions.join(super::sidecar_name(DEAD));
+        std::fs::create_dir(&sidecar).unwrap();
+        std::fs::write(sidecar.join("keep"), b"x").unwrap();
+        assert!(forget(&roots, RetentionDomain::Sessions, DEAD).is_err());
+        for f in &history {
+            assert!(sessions.join(f).exists(), "{f} went before its sidecar");
+        }
+        // An unknown session is still an error, and touches nothing.
+        assert!(forget(&roots, RetentionDomain::Sessions, LIVE).is_err());
+    }
 }
 
 /// `_synaps_ui` is the fourth sibling key (agent-ui §3.6, §7 C2): persisted
@@ -569,6 +726,59 @@ mod marks {
             .push(Arc::new(json!({"role": "assistant", "content": "ok"})));
         let receipt = save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
         assert_eq!(receipt.mode, SaveMode::Append { messages: 1 });
+    }
+
+    /// The same on a hooked last user message (#414's amend shortcut,
+    /// `_synaps_hooked` even 0): adding, replacing or removing its mark is a
+    /// full snapshot, never an amend, and the next unchanged save appends.
+    #[test]
+    fn a_mark_on_a_hooked_tail_snapshots() {
+        use agent_core::core::extension_context::set_hooked;
+        let edits: [(&str, Option<Value>, Option<Value>); 3] = [
+            ("add", None, Some(mark(3))),
+            ("replace", Some(mark(3)), Some(mark(4))),
+            ("remove", Some(mark(3)), None),
+        ];
+        for (what, before, after) in edits {
+            let (_tmp, dir) = super::tmp_dir();
+            let mut s = session();
+            let mut tail = json!({"role": "user", "content": "and then?"});
+            set_hooked(&mut tail, 0);
+            if let Some(m) = before {
+                tail.as_object_mut().unwrap().insert(MARK_KEY.into(), m);
+            }
+            s.api_messages.push(Arc::new(tail));
+            save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
+            let last = Arc::make_mut(s.api_messages.last_mut().unwrap())
+                .as_object_mut()
+                .unwrap();
+            match after {
+                Some(m) => {
+                    last.insert(MARK_KEY.into(), m);
+                }
+                None => {
+                    last.remove(MARK_KEY);
+                }
+            }
+            let receipt =
+                save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
+            assert_eq!(receipt.mode, SaveMode::FullSnapshot, "{what}");
+            assert_eq!(
+                marks_of(&load_session_in_dir(dir.as_path(), &s.id).unwrap()),
+                marks_of(&s),
+                "{what}"
+            );
+            s.api_messages
+                .push(Arc::new(json!({"role": "assistant", "content": "ok"})));
+            let receipt =
+                save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
+            assert_eq!(receipt.mode, SaveMode::Append { messages: 1 }, "{what}");
+            assert_eq!(
+                marks_of(&load_session_in_dir(dir.as_path(), &s.id).unwrap()),
+                marks_of(&s),
+                "{what}"
+            );
+        }
     }
 
     /// A malformed mark on disk (snapshot or journal) is dropped, never

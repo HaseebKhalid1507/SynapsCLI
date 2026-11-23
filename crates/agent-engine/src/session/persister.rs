@@ -162,8 +162,8 @@ impl Persister {
 
     /// `Saved` once a successful history save of the ticket's session,
     /// covering it, was applied; `NotYet` before, and after a failed one.
-    /// Unused until agent cards settle on it (C4a).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Unused until agent cards settle on it (C4a); its test is unix-only.
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
     pub(crate) fn receipt(&self, ticket: &Ticket) -> Receipt {
         self.shared.lock().receipts.receipt(ticket)
     }
