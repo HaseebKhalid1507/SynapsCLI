@@ -293,7 +293,6 @@ impl LocalTransport {
     }
 }
 
-#[async_trait::async_trait]
 /// The live filter of an in-process client: card traffic reaches it only
 /// as it would over the socket (`wire::client_decodes`, #445). Everything
 /// else passes, as it always did here.
@@ -306,6 +305,7 @@ pub(crate) fn local_decodes(caps: super::types::ClientCapabilities, event: &Sess
     }
 }
 
+#[async_trait::async_trait]
 impl ClientTransport for LocalTransport {
     fn session_id(&self) -> &SessionId {
         &self.handle.id

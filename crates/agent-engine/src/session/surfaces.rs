@@ -1553,6 +1553,7 @@ impl SessionActor {
         }
         if pushed {
             self.request_save();
+            self.emit_conversation();
         }
         self.surfaces_commit_noted();
         wake

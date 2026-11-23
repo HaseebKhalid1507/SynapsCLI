@@ -690,3 +690,175 @@ async fn ui_off_withdraws_open_live_cards() {
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     end(&mut a).await;
 }
+
+// ── answers and compaction (T8, §3.6 capsule, R3-H2) ────────────────────────
+
+/// Streaming turns are served `bodies` in order (the last repeats); the
+/// non-streaming compaction call gets a JSON summary after `delay`.
+/// Returns (url, turn requests, compaction requests).
+async fn stub_cards(
+    bodies: &'static [&'static str],
+    delay: Duration,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let turns = Arc::new(AtomicUsize::new(0));
+    let compactions = Arc::new(AtomicUsize::new(0));
+    let (t, c) = (Arc::clone(&turns), Arc::clone(&compactions));
+    let app = axum::Router::new().fallback(move |body: String| {
+        let (t, c) = (Arc::clone(&t), Arc::clone(&c));
+        async move {
+            if body.contains("\"stream\":true") {
+                let i = t.fetch_add(1, Ordering::SeqCst).min(bodies.len() - 1);
+                return (axum::http::StatusCode::OK, [("content-type", "text/event-stream")], bodies[i].to_string())
+                    .into_response();
+            }
+            c.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+            axum::Json(serde_json::json!({
+                "id": "msg_c", "type": "message", "role": "assistant",
+                "model": MODEL, "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "SUMMARY: the user was asked a question."}],
+                "usage": {"input_tokens": 50, "output_tokens": 10}
+            }))
+            .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), turns, compactions)
+}
+
+/// A session with one open card and a compaction now running (5 s).
+async fn card_then_compacting(
+) -> (agent_engine::session::SessionHandle, LocalTransport, SurfaceState, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let (url, turns, _) = stub_cards(&[SSE_UI_CREATE, SSE_HI, SSE_HI], Duration::from_secs(5)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cards_cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    a.send(submit("ask me")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let card = cards(&seen).pop().expect("a card");
+    a.send(SessionCommand::Compact { instructions: None }).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::CompactionStarted { .. })).await;
+    (handle, a, card, turns)
+}
+
+/// Exit gate, consent at dispatch (R3-H2): an answer accepted while a
+/// compaction runs is queued (T8); the user Cancels, which aborts the
+/// compaction and finds the wake. The drain puts the answer into context
+/// once, with no wake: zero new turns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn queued_answer_then_cancel_then_drain() {
+    let _h = Home::new();
+    let (_handle, mut a, card, turns) = card_then_compacting().await;
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    a.send_from_self(SessionCommand::Cancel).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(e.event, SessionEventWire::CompactionCancelled)));
+    let mut seen = seen;
+    seen.extend(drain_for(&mut a, Duration::from_millis(600)).await);
+    assert!(!seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })), "zero new turns: {seen:#?}");
+    assert_eq!(ui_answers(&last_conversation(&seen).api_messages, &card.id), 1, "in context once");
+    assert!(cards(&seen).iter().any(|c| c.epoch > card.epoch), "the Cancel raised the epoch");
+    assert_eq!(turns.load(std::sync::atomic::Ordering::SeqCst), 2);
+    end(&mut a).await;
+}
+
+/// Exit gate, consent at dispatch (R3-H2): the answer's start is deferred
+/// behind a running compaction (T8), and a system stop (a host stop)
+/// comes first. The answer enters context once, with no wake: zero new
+/// turns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn deferred_start_then_system_stop() {
+    let _h = Home::new();
+    let (handle, mut a, card, turns) = card_then_compacting().await;
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    handle
+        .send(SessionCommand::Checkpoint { reason: agent_engine::session::CheckpointReason::HostRequest })
+        .await
+        .unwrap();
+    let id = agent_engine::session::wire::CHECKPOINT_QUERY_ID;
+    let mut seen = until(&mut a, |e| matches!(e, SessionEventWire::QueryResult { id: q, .. } if *q == id)).await;
+    seen.extend(drain_for(&mut a, Duration::from_millis(600)).await);
+    assert!(!seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })), "zero new turns: {seen:#?}");
+    assert_eq!(ui_answers(&last_conversation(&seen).api_messages, &card.id), 1, "in context once");
+    let stopped = cards(&seen).into_iter().filter(|c| c.id == card.id).last().expect("the stop's upsert");
+    assert!(stopped.epoch > card.epoch && stopped.offers.is_empty(), "{stopped:?}");
+    assert!(stopped.answer.as_ref().is_some_and(|x| x.rev == 1));
+    assert_eq!(turns.load(std::sync::atomic::Ordering::SeqCst), 2);
+    end(&mut a).await;
+}
+
+/// `SSE_UI_CREATE` with another `ui` input.
+fn ui_create_sse(input: serde_json::Value) -> &'static str {
+    let old = r#""partial_json":"{\"question\":\"Which approach?\",\"options\":[\"Refactor\",\"Leave it\"],\"default\":\"Refactor\"}""#;
+    assert!(SSE_UI_CREATE.contains(old));
+    let new = format!("\"partial_json\":{}", serde_json::to_string(&input.to_string()).unwrap());
+    Box::leak(SSE_UI_CREATE.replace(old, &new).into_boxed_str())
+}
+
+/// Exit gate, late-answer capsule (R3-M1): the card's user message and its
+/// `ui` call are really gone from history (an in-place compaction). The
+/// answer arrives late with the capsule built at acceptance from the
+/// sidecar's record: at most 1 KiB encoded, naming what it omitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn late_answer_after_compaction_capsule() {
+    let _h = Home::new();
+    let long = |n: usize, w: &str| std::iter::repeat(w).take(n).collect::<Vec<_>>().join(" ");
+    let fields: Vec<serde_json::Value> = (0..5)
+        .map(|i| serde_json::json!({"id": format!("f{i}_{}", "a".repeat(21)), "label": long(6, "labelword"), "optional": true}))
+        .collect();
+    let doc = serde_json::json!({
+        "question": "Which approach?",
+        "detail": long(120, "detailword"),
+        "options": [{"label": "Refactor", "hint": long(11, "hintwords1")}, "Leave it"],
+        "fields": fields,
+    });
+    let bodies: &'static [&'static str] = Box::leak(vec![ui_create_sse(doc), SSE_HI, SSE_HI].into_boxed_slice());
+    let (url, turns, compactions) = stub_cards(bodies, Duration::ZERO).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cards_cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    let task = format!("please decide this for me: {}", long(30, "taskword"));
+    a.send(submit(&task)).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let card = cards(&seen).pop().expect("a card");
+
+    a.send(SessionCommand::Compact { instructions: None }).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::CompactionApplied { .. })).await;
+    assert_eq!(compactions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let mut seen = seen;
+    seen.extend(until(&mut a, |e| matches!(e, SessionEventWire::Conversation(_))).await);
+    let history = last_conversation(&seen).api_messages;
+    let flat = serde_json::to_string(&history).unwrap();
+    assert!(!flat.contains("toolu_ui1") && !flat.contains("taskword"), "really gone: {flat}");
+
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let history = last_conversation(&seen).api_messages;
+    let msg = history
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .find(|t| t.starts_with(&format!("<ui_answer card=\"{}\"", card.id)))
+        .expect("the late answer");
+    assert!(msg.contains(" late=\"true\""), "{msg}");
+    let from = msg.find("<asked ").expect("a capsule");
+    let to = msg.find("</asked>").expect("a capsule") + "</asked>".len();
+    let capsule = &msg[from..to];
+    assert!(capsule.len() <= 1024, "{} bytes", capsule.len());
+    assert!(capsule.contains("during=\"please decide this for me"), "{capsule}");
+    assert!(capsule.contains(" omitted=\""), "names its omissions: {capsule}");
+    assert_eq!(turns.load(std::sync::atomic::Ordering::SeqCst), 3, "the answer started one turn");
+    end(&mut a).await;
+}

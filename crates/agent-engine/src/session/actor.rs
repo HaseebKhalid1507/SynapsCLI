@@ -5144,10 +5144,11 @@ impl SessionActor {
         }
         if self.streaming {
             self.cancel_turn(interrupt).await;
-        } else if reload {
-            // Agent cards (T17): the epoch rises with or without a turn;
-            // the cancelled turn's tail already raised it.
-            self.surfaces_stop(crate::ui::StopKind::Reload);
+        } else {
+            // Agent cards: the epoch rises with or without a turn (T17 for
+            // a reload, T16 for a host stop); a cancelled turn's tail
+            // already raised it.
+            self.surfaces_stop(if reload { crate::ui::StopKind::Reload } else { crate::ui::StopKind::System });
         }
         // Again after the turn cancel: every worker to await, including
         // any the cancelled turn registered meanwhile.
@@ -5407,6 +5408,11 @@ impl SessionActor {
         if let Some(job) = self.compact.take() {
             job.task.abort();
             self.emit(SessionEventWire::CompactionCancelled);
+            // Agent cards (T8): answers queued behind it go into history
+            // now. An abort never starts a turn: every caller is a stop.
+            if self.drain_queued_answers() {
+                tracing::debug!(session = %self.id, "agent cards: a queued answer's wake is dropped with the aborted compaction");
+            }
             self.publish_presence();
         }
     }
@@ -5796,6 +5802,9 @@ impl SessionActor {
         }
         if self.streaming {
             self.cancel_turn(interrupt).await;
+        } else {
+            // Agent cards (T16): the session ending is a system stop.
+            self.surfaces_stop(crate::ui::StopKind::System);
         }
         self.abort_compaction();
         // Outstanding prompts are cancelled (tool sees `None`).
@@ -6064,6 +6073,7 @@ impl SessionTask {
         let queue = Arc::clone(&self.0.event_queue);
         let reason = loop {
             let actor = &mut self.0;
+            let surface_tick = actor.surfaces.tick();
             tokio::select! {
                 cmd = actor.cmd_rx.recv() => match cmd {
                     Some(cmd) => {
@@ -6076,7 +6086,7 @@ impl SessionTask {
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
                 Some(req) = actor.surfaces.tool_rx.recv() => actor.on_ui_tool(req),
-                _ = super::surfaces::surface_tick(actor.surfaces.tick()) => actor.poll_surfaces().await,
+                _ = super::surfaces::surface_tick(surface_tick) => actor.poll_surfaces().await,
                 // A held wake (and its permit) stays queued.
                 _ = queue.notified(), if !actor.holds(WorkSource::QueueWake) => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => {
