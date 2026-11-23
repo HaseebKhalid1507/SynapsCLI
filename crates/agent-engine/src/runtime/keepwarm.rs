@@ -86,14 +86,25 @@ impl CacheAnchor {
 /// and the cache evidence of this request chain ([`CacheEvidence`]).
 /// Runtime clones get a FRESH cell (a clone is a different request chain,
 /// like the TTL latches); `share_ttl_latches` shares it.
+///
+/// The runtime's own cell is the chain's: its cache lifetime is the
+/// current one, replaced by [`Self::forget`]. A request producer (a turn,
+/// its retries and tool pings, an idle ping) gets a [`Self::bind`]ing: the
+/// same scheduler anchor, and the cache lifetime current when it was
+/// built, for good. A producer built before a forget reports into the
+/// lifetime it was built in, which the chain no longer reads (Shady #436
+/// R3-2: a turn still running on model A after a switch to B).
 #[derive(Debug, Default)]
 pub struct CacheAnchorCell {
-    anchor: std::sync::Mutex<Option<CacheAnchor>>,
-    life: std::sync::Mutex<CacheLife>,
+    /// Every binding's: keep-warm schedules from the chain's last
+    /// accepted request, whatever lifetime it was in.
+    anchor: std::sync::Arc<std::sync::Mutex<Option<CacheAnchor>>>,
+    life: std::sync::Mutex<std::sync::Arc<CacheLife>>,
 }
 
 /// Which request a provider usage belongs to: taken as the request is
-/// handed to the HTTP client ([`CacheAnchorCell::ticket`]).
+/// handed to the HTTP client ([`CacheAnchorCell::ticket`]), before any of
+/// its answer (Shady #436 R3-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheTicket {
     /// The cache lifetime it was sent in ([`CacheAnchorCell::forget`]).
@@ -142,13 +153,27 @@ impl CacheEvidence {
     }
 }
 
+/// One cache lifetime of a request chain: what its requests sent and proved.
 #[derive(Debug, Default)]
 struct CacheLife {
-    /// Bumped by [`CacheAnchorCell::forget`].
-    life: u64,
+    /// Its place in the chain: one more than the lifetime it replaced.
+    id: u64,
+    state: std::sync::Mutex<LifeState>,
+}
+
+#[derive(Debug, Default)]
+struct LifeState {
     /// Requests handed to the HTTP client.
     sent: u64,
     evidence: Option<CacheEvidence>,
+}
+
+impl CacheLife {
+    fn state(&self) -> std::sync::MutexGuard<'_, LifeState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 impl CacheAnchorCell {
@@ -169,17 +194,32 @@ impl CacheAnchorCell {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn life(&self) -> std::sync::MutexGuard<'_, CacheLife> {
-        self.life
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn life(&self) -> std::sync::Arc<CacheLife> {
+        std::sync::Arc::clone(
+            &self
+                .life
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
-    /// A request is being sent at `at`, asking for `requested`.
+    /// A request producer's cell: the chain's scheduler anchor, and the
+    /// cache lifetime current now, which a later [`Self::forget`] of the
+    /// chain does not move (it is not the chain's to read any more).
+    pub fn bind(&self) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            anchor: std::sync::Arc::clone(&self.anchor),
+            life: std::sync::Mutex::new(self.life()),
+        })
+    }
+
+    /// A request is being handed to the HTTP client at `at`, asking for
+    /// `requested`: call it before the request goes, never on its answer.
     pub fn ticket(&self, at: CacheAnchor, requested: crate::core::config::CacheTtl) -> CacheTicket {
-        let mut l = self.life();
+        let life = self.life();
+        let mut l = life.state();
         l.sent += 1;
-        CacheTicket { life: l.life, seq: l.sent, at, requested }
+        CacheTicket { life: life.id, seq: l.sent, at, requested }
     }
 
     /// The provider reported the usage of `ticket`'s request: what it read
@@ -195,8 +235,9 @@ impl CacheAnchorCell {
         write_1h: Option<u64>,
     ) {
         use crate::core::config::CacheTtl;
-        let mut l = self.life();
-        if ticket.life != l.life || l.evidence.is_some_and(|e| e.ticket.seq > ticket.seq) {
+        let life = self.life();
+        let mut l = life.state();
+        if ticket.life != life.id || l.evidence.is_some_and(|e| e.ticket.seq > ticket.seq) {
             return;
         }
         let cached = read + write > 0;
@@ -212,17 +253,20 @@ impl CacheAnchorCell {
         l.evidence = Some(CacheEvidence { ticket, cached, proven });
     }
 
-    /// The latest request's evidence in this cache lifetime.
+    /// The latest request's evidence in this cell's cache lifetime.
     pub fn evidence(&self) -> Option<CacheEvidence> {
-        self.life().evidence
+        self.life().state().evidence
     }
 
-    /// The history or the model changed: nothing cached before applies,
-    /// and no request sent before reports into the new lifetime.
+    /// The history or the model changed: a new cache lifetime, with
+    /// nothing cached; no request sent before reports into it, nor any
+    /// producer bound before ([`Self::bind`]).
     pub fn forget(&self) {
-        let mut l = self.life();
-        l.life += 1;
-        l.evidence = None;
+        let mut life = self
+            .life
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *life = std::sync::Arc::new(CacheLife { id: life.id + 1, ..Default::default() });
     }
 }
 
@@ -837,8 +881,9 @@ impl Runtime {
             anthropic_tool_split,
             usage_counters: None,
             // A successful ping refreshes the cache: it moves the anchor the
-            // next ping is scheduled from.
-            cache_anchor: Some(Arc::clone(&self.cache_anchor)),
+            // next ping is scheduled from. Its evidence is the cache
+            // lifetime's it is built in (Shady #436 R3-2).
+            cache_anchor: Some(self.cache_anchor.bind()),
             keepwarm: Some(KeepWarmRequest {
                 mode,
                 status: Arc::clone(&tap.status),
@@ -2286,6 +2331,36 @@ mod tests {
         let five = cell.ticket(at, FiveMinutes);
         cell.observe(five, 0, 2_000, Some(0), Some(2_000));
         assert_eq!(cell.evidence().unwrap().honoured(), FiveMinutes, "what it asked");
+    }
+
+    /// A producer bound in one lifetime (a turn on model A, its retries and
+    /// tool pings) keeps reporting into it after the chain moved on (a
+    /// switch to B, and back to A): the chain never reads it, while its
+    /// accepted requests still move the shared scheduler anchor. A producer
+    /// bound after the move is the chain's.
+    #[test]
+    fn a_producer_bound_before_a_forget_never_reports_into_the_new_lifetime() {
+        use crate::core::config::CacheTtl::OneHour;
+        let chain = CacheAnchorCell::default();
+        let turn_a = chain.bind();
+        chain.forget();
+        let at = CacheAnchor::now();
+        let t = turn_a.ticket(at, OneHour);
+        turn_a.stamp(at);
+        turn_a.observe(t, 0, 2_000, Some(0), Some(2_000));
+        assert_eq!(chain.evidence(), None, "B's lifetime holds nothing of A's");
+        assert!(turn_a.evidence().is_some_and(|e| e.cached), "A's own lifetime");
+        assert_eq!(chain.get(), Some(at), "scheduling sees every accepted request");
+
+        chain.forget();
+        let t = turn_a.ticket(at, OneHour);
+        turn_a.observe(t, 2_000, 0, None, None);
+        assert_eq!(chain.evidence(), None, "A again is another lifetime than A's first");
+
+        let turn = chain.bind();
+        let t = turn.ticket(at, OneHour);
+        turn.observe(t, 0, 2_000, Some(0), Some(2_000));
+        assert!(chain.evidence().is_some_and(|e| e.cached && e.ticket == t));
     }
 
     #[test]

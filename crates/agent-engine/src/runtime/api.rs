@@ -1765,6 +1765,14 @@ impl ApiMethods {
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
                     let sent_at = super::keepwarm::CacheAnchor::now();
+                    // This attempt's place in the cache lifetime and the
+                    // send order, taken now, before any of its answer
+                    // (Shady #436 R3-1): headers that arrive after a model
+                    // switch, or after a later request's, change neither.
+                    let attempt_ticket = options
+                        .cache_anchor
+                        .as_ref()
+                        .map(|anchor| anchor.ticket(sent_at, cache_ttl));
                     sent_at_ms = crate::epoch_millis();
                     let req = wire.encoding_header(req);
                     let req = match &options.keepwarm {
@@ -1800,8 +1808,8 @@ impl ApiMethods {
                                 // no earlier than `sent_at`.
                                 if let Some(anchor) = &options.cache_anchor {
                                     anchor.stamp(sent_at);
-                                    cache_ticket = Some(anchor.ticket(sent_at, cache_ttl));
                                 }
+                                cache_ticket = attempt_ticket;
                                 if !anthropic_cooled.is_empty() {
                                     let served = super::auth::turn_pinned_credential(
                                         &options.credential_source,

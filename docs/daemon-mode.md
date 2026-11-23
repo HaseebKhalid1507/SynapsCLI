@@ -865,7 +865,10 @@ C: bye | socket close = Detach (turn keeps running)
   usage is the cache's evidence (a real request or a keep-warm ping, recorded by the transport for
   that request; a booked estimate never is): its send time, and the TTL this cache lifetime's own
   writes proved (`1h` only after a 1h write). A failed or usage-less request leaves it aging; an
-  applied compaction, `/clear`, `/resume` or another model starts a new lifetime. A parked session's
+  applied compaction, `/clear`, `/resume` or another model starts a new lifetime. A request belongs
+  to the lifetime its producer started in (a turn with its retries and tool pings, an idle ping),
+  taken as it is sent: a turn still running on the old model after a switch, or an answer landing
+  after it, is never the new lifetime's evidence. A parked session's
   status has no `cache` (unknown). Count down `expires_in_secs` on the client's own clock (one that
   also counts suspended time); `expires_at` is informational.
 

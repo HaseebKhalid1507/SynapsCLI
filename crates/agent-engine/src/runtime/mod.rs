@@ -3387,8 +3387,10 @@ impl Runtime {
             anthropic_tool_split: None,
             usage_counters: None,
             // The foreground turn's accepted requests are what keep-warm
-            // schedules from.
-            cache_anchor: Some(self.cache_anchor.clone()),
+            // schedules from. Its rounds, retries and tool pings report
+            // their cache evidence into the cache lifetime the turn starts
+            // in, whatever replaces it meanwhile (Shady #436 R3-2).
+            cache_anchor: Some(self.cache_anchor.bind()),
             keepwarm: None,
             // The foreground chain: the only requests that thread
             // `diagnostics.previous_message_id`.
