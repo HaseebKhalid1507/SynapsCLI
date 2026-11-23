@@ -655,26 +655,32 @@ impl Ledger {
     }
 }
 
-/// Every pid in `/proc` with its stat fields (one walk). Empty off Linux.
+/// Every pid in `/proc` with its stat fields (one walk). Empty off Linux,
+/// and when `/proc` could not be read (see [`read_proc`]).
 pub fn scan_proc() -> Vec<(u32, StatFields)> {
+    read_proc().unwrap_or_default()
+}
+
+/// [`scan_proc`], or the error that stopped the walk. A sweep (which ends
+/// every record whose process is not listed) uses this one: `scan_proc`
+/// reads a walk that failed as a host with no process at all.
+pub fn read_proc() -> std::io::Result<Vec<(u32, StatFields)>> {
     #[cfg(target_os = "linux")]
     {
         let mut out = Vec::new();
-        if let Ok(dir) = std::fs::read_dir("/proc") {
-            for entry in dir.flatten() {
-                let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
-                    continue;
-                };
-                if let Some(stat) = read_stat(pid) {
-                    out.push((pid, stat));
-                }
+        for entry in std::fs::read_dir("/proc")?.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            if let Some(stat) = read_stat(pid) {
+                out.push((pid, stat));
             }
         }
-        out
+        Ok(out)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Vec::new()
+        Ok(Vec::new())
     }
 }
 
@@ -753,8 +759,10 @@ pub fn maybe_sweep() {
         return;
     };
     rt.spawn_blocking(move || {
-        let scan = scan_proc();
-        lock().finish_sweep(Some(&scan), watermark, Instant::now());
+        // A walk that could not be read applies nothing (it is no evidence
+        // that every process is gone); the next sweep is due as usual.
+        let scan = read_proc().ok();
+        lock().finish_sweep(scan.as_deref(), watermark, Instant::now());
     });
 }
 
@@ -1003,6 +1011,29 @@ mod tests {
         assert_eq!(l.len(), MAX_TOTAL);
         assert!(!l.records.iter().any(|r| r.child.pid == 10_300));
         assert!(l.list(Some("s1"), None).sessions[0].truncated, "s1 lost a record");
+    }
+
+    /// A sweep whose walk could not be read applies nothing: no record is
+    /// ended on a read that failed (it is no evidence that every process is
+    /// gone); the next sweep is due after the usual interval, and one that
+    /// read a table listing no process does end the record.
+    #[test]
+    fn a_sweep_whose_walk_failed_ends_no_record() {
+        let states = |l: &Ledger| -> Vec<(String, ChildState)> {
+            l.list(Some("s"), None).sessions[0].children.iter().map(|c| (c.tool_id.clone(), c.state)).collect()
+        };
+        let mut l = Ledger::new();
+        l.insert("s", spawn("a", ident(90, 5, 90)));
+        let t0 = Instant::now();
+        let watermark = l.claim_sweep(t0).expect("due");
+        l.finish_sweep(None, watermark, t0);
+        assert_eq!(states(&l), vec![("a".to_string(), ChildState::Running)], "a failed walk ends nothing");
+        assert!(l.claim_sweep(t0).is_none(), "not due again at once");
+        let t1 = t0 + SWEEP_EVERY;
+        let watermark = l.claim_sweep(t1).expect("due again");
+        let empty: Vec<(u32, StatFields)> = Vec::new();
+        l.finish_sweep(Some(empty.as_slice()), watermark, t1);
+        assert_eq!(states(&l), vec![("a".to_string(), ChildState::Ended)], "a walk that was read ends it");
     }
 
     #[test]
