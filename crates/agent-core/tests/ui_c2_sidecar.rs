@@ -11,6 +11,15 @@ const LINEAGE: &str = "0123456789abcdef0123456789abcdef";
 const HX: &str = "00112233445566778899aabbccddeeff";
 const AT: &str = "2026-11-23T11:00:00+00:00";
 
+/// A temp dir, and its path with no symlink on the way: the confined
+/// sessions directory refuses one (macOS's `/var` is a link to
+/// `/private/var`), as the crate's own tests canonicalize theirs.
+fn tmp_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    (tmp, dir)
+}
+
 fn card(n: u8) -> SurfaceState {
     SurfaceState {
         id: format!("s_{n:016x}"),
@@ -229,28 +238,28 @@ fn sidecar_deleted_first() {
     use agent_core::core::session_journal::{
         delete_session_files_in_dir, journal_path, save_session_in_dir, SessionPersistence,
     };
-    let tmp = tempfile::TempDir::new().unwrap();
+    let (_tmp, dir) = tmp_dir();
     let mut s = Session::new("claude-sonnet-4-6", "medium", Some("harness prompt"));
     s.api_messages.push(std::sync::Arc::new(
         json!({"role": "user", "content": "hello"}),
     ));
-    save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
-    let snapshot = tmp.path().join(format!("{}.json", s.id));
-    let sidecar = tmp.path().join(sidecar_name(&s.id));
+    save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
+    let snapshot = dir.as_path().join(format!("{}.json", s.id));
+    let sidecar = dir.as_path().join(sidecar_name(&s.id));
     std::fs::write(&sidecar, b"{}").unwrap();
-    delete_session_files_in_dir(tmp.path(), &s.id).unwrap();
+    delete_session_files_in_dir(dir.as_path(), &s.id).unwrap();
     assert!(!sidecar.exists() && !snapshot.exists());
-    assert!(!journal_path(tmp.path(), &s.id).exists());
+    assert!(!journal_path(dir.as_path(), &s.id).exists());
     // The sidecar can't be unlinked (a directory in its place): the delete
     // fails before it touches the history.
-    save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+    save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
     std::fs::create_dir(&sidecar).unwrap();
     std::fs::write(sidecar.join("keep"), b"x").unwrap();
-    assert!(delete_session_files_in_dir(tmp.path(), &s.id).is_err());
-    assert!(snapshot.exists() || journal_path(tmp.path(), &s.id).exists());
+    assert!(delete_session_files_in_dir(dir.as_path(), &s.id).is_err());
+    assert!(snapshot.exists() || journal_path(dir.as_path(), &s.id).exists());
     std::fs::remove_dir_all(&sidecar).unwrap();
-    delete_session_files_in_dir(tmp.path(), &s.id).unwrap();
-    assert!(!snapshot.exists() && !journal_path(tmp.path(), &s.id).exists());
+    delete_session_files_in_dir(dir.as_path(), &s.id).unwrap();
+    assert!(!snapshot.exists() && !journal_path(dir.as_path(), &s.id).exists());
 }
 
 /// T20 and eviction (§4.4): revisable receipts beyond the newest eight, or
@@ -340,11 +349,11 @@ mod retention {
     const NOW_MS: u64 = 1_800_000_000_000; // 2027
 
     fn roots() -> (tempfile::TempDir, RetentionRoots, PathBuf) {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let (tmp, dir) = super::tmp_dir();
         let roots = RetentionRoots {
-            config_dir: tmp.path().join("config"),
-            base_dir: tmp.path().join("base"),
-            cache_dir: tmp.path().join("cache"),
+            config_dir: dir.join("config"),
+            base_dir: dir.join("base"),
+            cache_dir: dir.join("cache"),
         };
         for d in [
             roots.config_dir.join("sessions"),
@@ -498,11 +507,11 @@ mod marks {
     #[test]
     fn marks_round_trip_in_both_modes() {
         for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
-            let tmp = tempfile::TempDir::new().unwrap();
+            let (_tmp, dir) = super::tmp_dir();
             let mut s = session();
-            save_session_in_dir(tmp.path(), &s, mode).unwrap();
+            save_session_in_dir(dir.as_path(), &s, mode).unwrap();
             let snapshot =
-                std::fs::read_to_string(tmp.path().join(format!("{}.json", s.id))).unwrap();
+                std::fs::read_to_string(dir.as_path().join(format!("{}.json", s.id))).unwrap();
             assert!(
                 snapshot.contains("\"_ui_marks\":[[1,{"),
                 "{mode:?}: {snapshot}"
@@ -511,21 +520,21 @@ mod marks {
                 ..snapshot.find("\"_ui_marks\"").unwrap()];
             assert!(!api.contains(MARK_KEY), "{mode:?}: never inside a message");
             assert_eq!(
-                marks_of(&load_session_in_dir(tmp.path(), &s.id).unwrap()),
+                marks_of(&load_session_in_dir(dir.as_path(), &s.id).unwrap()),
                 marks_of(&s),
                 "{mode:?}"
             );
             if mode == SessionPersistence::Journal {
                 s.api_messages
                     .push(marked("<ui_answer>…</ui_answer>", mark(2)));
-                let receipt = save_session_in_dir(tmp.path(), &s, mode).unwrap();
+                let receipt = save_session_in_dir(dir.as_path(), &s, mode).unwrap();
                 assert_eq!(receipt.mode, SaveMode::Append { messages: 1 });
-                let journal = std::fs::read_to_string(journal_path(tmp.path(), &s.id)).unwrap();
+                let journal = std::fs::read_to_string(journal_path(dir.as_path(), &s.id)).unwrap();
                 let line: Value = serde_json::from_str(journal.lines().nth(1).unwrap()).unwrap();
                 assert_eq!(line["u"], mark(2));
                 assert!(line["m"].get(MARK_KEY).is_none());
                 assert_eq!(
-                    marks_of(&load_session_in_dir(tmp.path(), &s.id).unwrap()),
+                    marks_of(&load_session_in_dir(dir.as_path(), &s.id).unwrap()),
                     marks_of(&s)
                 );
             }
@@ -537,28 +546,28 @@ mod marks {
     /// replay never applies it to a base without it.
     #[test]
     fn a_mark_on_a_saved_message_snapshots() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let (_tmp, dir) = super::tmp_dir();
         let mut s = session();
         s.api_messages.push(Arc::new(
             json!({"role": "user", "content": [{"type": "tool_result"}]}),
         ));
-        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
         let adopted = json!({"l": super::LINEAGE, "results": [{"card": format!("s_{:016x}", 3), "answer": null}]});
         Arc::make_mut(&mut s.api_messages[2])
             .as_object_mut()
             .unwrap()
             .insert(MARK_KEY.into(), adopted);
-        let receipt = save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        let receipt = save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
         assert_eq!(receipt.mode, SaveMode::FullSnapshot);
         assert_eq!(
-            marks_of(&load_session_in_dir(tmp.path(), &s.id).unwrap()),
+            marks_of(&load_session_in_dir(dir.as_path(), &s.id).unwrap()),
             marks_of(&s)
         );
         // Unchanged since: the next save appends nothing new and needs no
         // snapshot.
         s.api_messages
             .push(Arc::new(json!({"role": "assistant", "content": "ok"})));
-        let receipt = save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        let receipt = save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
         assert_eq!(receipt.mode, SaveMode::Append { messages: 1 });
     }
 
@@ -567,33 +576,33 @@ mod marks {
     /// evidence. Well-formed marks beside it stay.
     #[test]
     fn malformed_marks_are_dropped() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let (_tmp, dir) = super::tmp_dir();
         let mut s = session();
         s.api_messages
             .push(Arc::new(json!({"role": "assistant", "content": "ok"})));
-        save_session_in_dir(tmp.path(), &s, SessionPersistence::Json).unwrap();
-        let path = tmp.path().join(format!("{}.json", s.id));
+        save_session_in_dir(dir.as_path(), &s, SessionPersistence::Json).unwrap();
+        let path = dir.as_path().join(format!("{}.json", s.id));
         let mut snap: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         snap["_ui_marks"] = json!([[0, {"l": "", "card": "x"}], "junk", [1, mark(1)], [2, {"l": super::LINEAGE, "results": []}]]);
         std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
-        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        let loaded = load_session_in_dir(dir.as_path(), &s.id).unwrap();
         assert_eq!(marks_of(&loaded), vec![None, Some(mark(1)), None]);
         snap["_ui_marks"] = json!({"not": "a list"});
         std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
         assert_eq!(
-            marks_of(&load_session_in_dir(tmp.path(), &s.id).unwrap()),
+            marks_of(&load_session_in_dir(dir.as_path(), &s.id).unwrap()),
             vec![None, None, None]
         );
         // Journal: a malformed `u` is dropped with its message kept.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let (_tmp, dir) = super::tmp_dir();
         let mut s = session();
-        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
         s.api_messages.push(marked(
             "<ui_answer>…</ui_answer>",
             json!({"l": super::LINEAGE, "rev": 9}),
         ));
-        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
-        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        save_session_in_dir(dir.as_path(), &s, SessionPersistence::Journal).unwrap();
+        let loaded = load_session_in_dir(dir.as_path(), &s.id).unwrap();
         assert_eq!(loaded.api_messages.len(), 3);
         assert_eq!(marks_of(&loaded), vec![None, Some(mark(1)), None]);
     }
