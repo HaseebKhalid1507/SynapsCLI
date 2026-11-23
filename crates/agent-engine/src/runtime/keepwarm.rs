@@ -85,7 +85,7 @@ impl CacheAnchor {
 /// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]),
 /// and the cache evidence of this request chain ([`CacheEvidence`]).
 /// Runtime clones get a FRESH cell (a clone is a different request chain,
-/// like the TTL latches); `share_ttl_latches` shares it.
+/// like the TTL latches); `share_ttl_latches` binds it.
 ///
 /// The runtime's own cell is the chain's: its cache lifetime is the
 /// current one, replaced by [`Self::forget`]. A request producer (a turn,
@@ -942,7 +942,9 @@ impl Runtime {
             usage_counters: None,
             // A successful ping refreshes the cache: it moves the anchor the
             // next ping is scheduled from. Its evidence is the cache
-            // lifetime's it is built in (Shady #436 R3-2).
+            // lifetime's its runtime was snapshotted in: the actor's
+            // `session_producer` bound it before spawning this (Shady #436
+            // R3-2, R4-1).
             cache_anchor: Some(self.cache_anchor.bind()),
             keepwarm: Some(KeepWarmRequest {
                 mode,

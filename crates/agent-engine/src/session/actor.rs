@@ -13,7 +13,9 @@
 //! - `Runtime::clone()` resets TTL latches. The actor clones it only for
 //!   driver stream-start (Prepared→Started) and compaction. The stream-start
 //!   clone shares the original's TTL atomics via `share_ttl_latches` so a
-//!   redundant 1h→5m downgrade notice per driver turn is avoided. The
+//!   redundant 1h→5m downgrade notice per driver turn is avoided; it is
+//!   taken with `Runtime::session_producer`, which also binds its cache
+//!   lifetime before the setup is spawned (so is the idle ping's). The
 //!   compaction clone is read-only+discarded and needs no sharing.
 //! - `emit` is the ONLY `seq` increment site.
 //! - `Detach` never touches `stream`/`cancel`; only `End` (and `Cancel`)
@@ -2295,11 +2297,12 @@ impl SessionActor {
                             let (tx, rx) = mpsc::unbounded_channel();
                             self.steer_tx = Some(tx);
                             self.owner_steer_budget = None;
-                            let mut runtime = self.runtime.clone();
                             // F2: share the parent's TTL latches so the
                             // driver turn doesn't fire a redundant 1h→5m
-                            // downgrade notice.
-                            runtime.share_ttl_latches(&self.runtime);
+                            // downgrade notice. Its cache lifetime is bound
+                            // here, with its model and history, before its
+                            // setup is spawned (Shady #436 R4-1).
+                            let runtime = self.runtime.session_producer();
                             let history = self.conv.api_messages.clone();
                             let secret = self.secret_prompt_handle.clone();
                             let session_id = self.id.0.clone();

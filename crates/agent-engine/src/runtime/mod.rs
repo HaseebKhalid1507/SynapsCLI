@@ -674,8 +674,9 @@ pub struct Runtime {
     /// prefix is already cached. Shared into `ApiOptions` for every request.
     saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// When this runtime's foreground request chain last had an Anthropic
-    /// request accepted (task #444 keep-warm scheduling). Fresh per clone,
-    /// shared by `share_ttl_latches`, like the TTL latches above.
+    /// request accepted (task #444 keep-warm scheduling), and its cache
+    /// evidence. Fresh per clone; `share_ttl_latches` binds it (the same
+    /// scheduler anchor, the cache lifetime current then).
     cache_anchor: std::sync::Arc<keepwarm::CacheAnchorCell>,
     /// Last foreground Anthropic message id (`msg_...`) — threaded into the
     /// next request's `diagnostics.previous_message_id` when diagnostics is
@@ -3017,13 +3018,31 @@ impl Runtime {
         self.cache_ttl.resolve_for_auth_type(&auth.auth_type)
     }
 
+    /// A detached request producer of this session (an idle keep-warm ping,
+    /// a driver turn): a clone made now, with the session's latches and its
+    /// cache evidence bound now ([`Self::share_ttl_latches`]). Take it with
+    /// the model and history snapshot it sends, before anything is spawned
+    /// or awaited: its requests report into the cache lifetime of that
+    /// snapshot, never one a switch made while it was setting up (Shady
+    /// #436 R4-1).
+    pub fn session_producer(&self) -> Runtime {
+        let mut producer = self.clone();
+        producer.share_ttl_latches(self);
+        producer
+    }
+
     /// Thread a parent runtime's TTL atomics onto this (cloned) runtime so
     /// that a driver-owned turn shares the session's single downgrade latch
-    /// instead of firing a redundant 1h→5m notice.
+    /// instead of firing a redundant 1h→5m notice. The cache cell is
+    /// BOUND, here and now (`CacheAnchorCell::bind`): the parent's
+    /// scheduler anchor, and the cache lifetime current at this call, which
+    /// a later `cache_forget` of the parent does not move. Never the
+    /// parent's own cell: a producer that set up after a switch would take
+    /// the new lifetime for its old model's requests (Shady #436 R4-1).
     pub fn share_ttl_latches(&mut self, parent: &Runtime) {
         self.ttl_downgrade_notified = parent.ttl_downgrade_notified.clone();
         self.saw_1h_honored = parent.saw_1h_honored.clone();
-        self.cache_anchor = parent.cache_anchor.clone();
+        self.cache_anchor = parent.cache_anchor.bind();
         // Same session, same diagnostics chain: a driver turn continues it,
         // and a ping sees the same rejection latch (it never moves the chain).
         self.last_msg_id = parent.last_msg_id.clone();
@@ -3391,7 +3410,9 @@ impl Runtime {
             // The foreground turn's accepted requests are what keep-warm
             // schedules from. Its rounds, retries and tool pings report
             // their cache evidence into the cache lifetime the turn starts
-            // in, whatever replaces it meanwhile (Shady #436 R3-2).
+            // in, whatever replaces it meanwhile (Shady #436 R3-2). A
+            // detached producer's runtime is bound already, at its snapshot
+            // (`session_producer`): binding a bound cell keeps its lifetime.
             cache_anchor: Some(self.cache_anchor.bind()),
             keepwarm: None,
             // The foreground chain: the only requests that thread

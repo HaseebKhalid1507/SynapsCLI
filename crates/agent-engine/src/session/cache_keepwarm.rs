@@ -1495,10 +1495,11 @@ impl SessionActor {
                 let worst_usd = p.worst_next_usd();
                 // A detached clone sharing the anchor and the TTL latches:
                 // the actor keeps serving clients while the ping runs; a
-                // turn start aborts it.
+                // turn start aborts it. Its cache lifetime is bound here,
+                // with the model and history it sends: a switch while it
+                // sets up is not its lifetime (Shady #436 R4-1).
                 let history = self.conv.api_messages.clone();
-                let mut runtime = self.runtime.clone();
-                runtime.share_ttl_latches(&self.runtime);
+                let runtime = self.runtime.session_producer();
                 let cancel = CancellationToken::new();
                 let token = cancel.clone();
                 let tap = PingTap::default();
