@@ -46,6 +46,8 @@ fn meta(id: &str, name: Option<&str>) -> SessionMeta {
         messages: 0,
         workers: Default::default(),
         updated_at: None,
+        surfaces_waiting: 0,
+        surfaces_open: 0,
     }
 }
 

@@ -1035,3 +1035,45 @@ async fn reload_without_a_rebind_ends_the_session_after_the_grace() {
     assert!(journal(&guard, &snap.meta.journal_id).contains("hello"), "the journal stays");
     SocketTransport::shutdown(&sock, false).await.unwrap();
 }
+
+/// An owned session's card actions are its owner's (agent-ui §4.2), over a
+/// real socket: the frame decodes and `client_may_send` passes it. An
+/// observer's is refused as owned input; until C4a the owner's is refused
+/// as unavailable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn card_actions_on_an_owned_session_are_the_owners() {
+    let guard = HomeGuard::new();
+    let d = start_in_process(&guard, Script::Sse(ANTHROPIC_SSE), None).await;
+    let sock = d.paths.sock.clone();
+    let (mut owner, sid, _) = create_owned(&sock, guard.home.path(), false).await;
+    let mut obs = observe(&sock, &sid).await;
+    let action = || SessionCommand::SurfaceAction {
+        surface_id: "s_3f2a91c0d4e2a871".into(),
+        contract: format!("c1:{}", "9d".repeat(16)),
+        action_id: "5b0c".repeat(8),
+        expect_rev: 0,
+        epoch: 0,
+        verb: agent_engine::ui::Verb::Answer,
+        values: Some(serde_json::json!({"choice": "Refactor the parser"})),
+    };
+    for (t, owned) in [(&mut obs, true), (&mut owner, false)] {
+        t.send_from_self(action()).await.unwrap();
+        let me = t.client_id();
+        let seen = until(t, |e| matches!(e, SessionEventWire::Refused { client, .. } if *client == me)).await;
+        match &seen.last().unwrap().event {
+            SessionEventWire::Refused { command, reason, .. } => {
+                assert_eq!(command, "surface_action");
+                if owned {
+                    assert!(reason.contains("owned by the client that created it"), "{reason}");
+                } else {
+                    assert_eq!(reason, SURFACES_UNAVAILABLE);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    owner.detach().await;
+    wait_gone(&sock, &sid, Duration::from_secs(5)).await;
+    stop_in_process(d).await;
+}

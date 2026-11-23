@@ -50,6 +50,10 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         | C::PluginCommand { .. }
         | C::Resume { .. }
         | C::KeepWarm { .. }
+        // An agent card's answer is input: the actor applies the owned,
+        // input-authority and reload-fence rules (agent-ui §2.4), and until
+        // C4a refuses it.
+        | C::SurfaceAction { .. }
         // `/takeover`: the actor checks the attach mode.
         | C::TakeInput => Ok(()),
         // A reload checkpoint stops every worker and fences the session
@@ -958,9 +962,12 @@ fn forwarded(history: HistoryMode, caps: ClientCapabilities, env: &Envelope) -> 
 
 /// The attach snapshot as this client may receive it: its turn replay
 /// without events it cannot decode — one would sink the whole `Attached`
-/// frame, and with it every reconnect.
+/// frame, and with it every reconnect — and only the agent cards its
+/// catalog covers (the actor's `snapshot_for` already filtered them; this
+/// is the socket's own gate, beside the replay's).
 fn replay_for(caps: ClientCapabilities, mut snapshot: AttachSnapshot) -> AttachSnapshot {
     snapshot.replay.retain(|env| client_decodes(caps, &env.event));
+    snapshot.surfaces.retain(|card| surface_decodes(caps, card));
     snapshot
 }
 
@@ -1063,6 +1070,7 @@ mod tests {
             client_input: ClientInput::wire_default(),
             input_owner: None,
             display_tail: None,
+            surfaces: Vec::new(),
         };
         let kinds = |s: &AttachSnapshot| -> Vec<String> {
             s.replay
@@ -1077,6 +1085,63 @@ mod tests {
         };
         assert_eq!(kinds(&replay_for(old, snapshot.clone())), vec!["other"]);
         assert_eq!(kinds(&replay_for(new, snapshot)), vec!["queued", "other", "started"]);
+    }
+
+    /// Agent cards (agent-ui §2.1, C3): a client that declared no catalog
+    /// (every older client; this build's TUI too) gets no `surface` or
+    /// `surface_result` event, live or replayed, and no `Attached.surfaces`.
+    /// A capable client gets a card only when its catalog covers the card's.
+    #[test]
+    fn a_client_without_the_catalog_gets_no_card_traffic() {
+        let card = crate::session::wire::test_card(1);
+        let ev = |event| Envelope { session_id: SessionId::from("s"), seq: 1, ts: chrono::Utc::now(), event };
+        let surface = ev(SessionEventWire::Surface(Box::new(card.clone())));
+        let later = ev(SessionEventWire::Surface(Box::new(crate::session::wire::test_card(2))));
+        let result = ev(SessionEventWire::SurfaceResult(SurfaceResult {
+            client: ClientId(1),
+            action_id: "5b0c".repeat(8),
+            outcome: SurfaceOutcome::Refused,
+            reason: Some(SurfaceRefusal::Forbidden),
+            retry: Some(false),
+            answer_rev: None,
+        }));
+        let old = ClientCapabilities::default();
+        let this = ClientCapabilities::current();
+        let one = ClientCapabilities { surfaces: 1, ..this };
+        let two = ClientCapabilities { surfaces: 2, ..this };
+        for history in [HistoryMode::Full, HistoryMode::Digest] {
+            for caps in [old, this] {
+                for e in [&surface, &later, &result] {
+                    assert!(!forwarded(history, caps, e), "{caps:?}: {:?}", e.event);
+                }
+            }
+            assert!(forwarded(history, one, &surface) && forwarded(history, one, &result));
+            assert!(!forwarded(history, one, &later), "catalog 1 doesn't cover a catalog-2 card");
+            assert!(forwarded(history, two, &later) && forwarded(history, two, &surface));
+        }
+
+        let mut snapshot = AttachSnapshot {
+            meta: crate::session::handle::echo::meta_for(&SessionId::from("s")),
+            view: crate::session::handle::echo::view_for(),
+            conversation: Default::default(),
+            streaming: true,
+            replay: vec![surface, later, result],
+            pending_prompts: vec![],
+            clients: vec![],
+            roster: Vec::new(),
+            client_input: ClientInput::wire_default(),
+            input_owner: None,
+            display_tail: None,
+            surfaces: vec![card.clone(), crate::session::wire::test_card(2)],
+        };
+        for caps in [old, this] {
+            let s = replay_for(caps, snapshot.clone());
+            assert!(s.replay.is_empty() && s.surfaces.is_empty(), "{caps:?}");
+        }
+        let s = replay_for(one, snapshot.clone());
+        assert_eq!((s.replay.len(), s.surfaces), (2, vec![card]));
+        snapshot = replay_for(two, snapshot);
+        assert_eq!((snapshot.replay.len(), snapshot.surfaces.len()), (3, 2));
     }
 
     /// A large frame doesn't pin its buffer for the life of the connection:

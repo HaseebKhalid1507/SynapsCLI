@@ -380,6 +380,7 @@ fn is_input_command(cmd: &SessionCommand) -> bool {
             | SessionCommand::Resume { .. }
             | SessionCommand::KeepWarm { .. }
             | SessionCommand::DriverStart { .. }
+            | SessionCommand::SurfaceAction { .. }
             | SessionCommand::End {
                 reason: EndReason::ClientQuit
             }
@@ -524,6 +525,7 @@ pub(crate) fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::ArmPark => "arm_park",
         SessionCommand::HostEvent(_) => "host_event",
         SessionCommand::DriverStart { .. } => "driver_start",
+        SessionCommand::SurfaceAction { .. } => "surface_action",
     }
 }
 
@@ -908,6 +910,8 @@ impl SessionActor {
             messages: 0,
             workers: Default::default(),
             updated_at: None,
+            surfaces_waiting: 0,
+            surfaces_open: 0,
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
@@ -1141,6 +1145,9 @@ impl SessionActor {
                 event,
                 SessionEventWire::Prompt(_)
                     | SessionEventWire::PromptResolved { .. }
+                    // `Attached.surfaces` is authoritative (agent-ui §2.3).
+                    | SessionEventWire::Surface(_)
+                    | SessionEventWire::SurfaceResult(_)
                     | SessionEventWire::Attached { .. }
                     | SessionEventWire::QueryResult { .. }
                     | SessionEventWire::Conversation(_)
@@ -4807,6 +4814,7 @@ impl SessionActor {
             client_input: self.client_input,
             input_owner: self.input_owner,
             display_tail: None,
+            surfaces: Vec::new(),
         }
     }
 
@@ -4816,6 +4824,8 @@ impl SessionActor {
     /// envelopes (the trailing `Conversation` digest carries len/hash).
     pub(crate) fn snapshot_for(&self, client: &ClientMeta) -> AttachSnapshot {
         let mut snap = self.snapshot();
+        // Only the cards this client's catalog covers (agent-ui §2.5).
+        snap.surfaces.retain(|card| super::wire::surface_decodes(client.capabilities, card));
         if client.history == HistoryMode::Digest {
             snap.display_tail = Some(super::display::display_tail(
                 &snap.conversation.api_messages,
@@ -5361,6 +5371,20 @@ impl SessionActor {
             }
             return ControlFlow::Continue(());
         }
+        // Agent cards are wire types only until C4a: a card action that
+        // passed the owned, input and fence checks is refused here, before
+        // it can make its sender the active client or wake a parked
+        // session. The host never answers cards.
+        if matches!(cmd, SessionCommand::SurfaceAction { .. }) {
+            if let Some(c) = from {
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason: super::SURFACES_UNAVAILABLE.to_string(),
+                });
+            }
+            return ControlFlow::Continue(());
+        }
         // Accepted input: with `client_input = shared` its sender becomes the
         // active client. `KeepWarm` doesn't count: `--keep-warm` sends it
         // on attach, not a person typing.
@@ -5606,6 +5630,8 @@ impl SessionActor {
             SessionCommand::DriverStart { plugin, command, arg } => {
                 self.driver_start(plugin, command, arg);
             }
+            // Refused above, before any of this (inert until C4a).
+            SessionCommand::SurfaceAction { .. } => {}
         }
         ControlFlow::Continue(())
     }

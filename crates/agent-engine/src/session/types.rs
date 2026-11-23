@@ -527,6 +527,14 @@ pub struct SessionMeta {
     /// journal's `updated_at`. Absent on held rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Agent cards (agent-ui §2.7), presence only: open cards a tool waits
+    /// on (the desk's NEEDS YOU), and open live ones (ASKED).
+    /// `awaiting_input` stays prompts-only. Omitted when 0; always 0 until
+    /// C4a, and from an older daemon. An older client ignores them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub surfaces_waiting: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub surfaces_open: u32,
 }
 
 impl SessionMeta {
@@ -820,12 +828,20 @@ pub struct ClientCapabilities {
     /// session is told `Ended{ClientQuit}` (`wire::ended_for`).
     #[serde(default)]
     pub owner_gone: bool,
+    /// The agent-card catalog major this client can render *and* answer
+    /// (agent-ui §2.1); 0 for none, and for a render-only build. `surface`
+    /// and `surface_result` events and `Attached.surfaces` reach only a
+    /// client with a catalog at least the card's (`wire::client_decodes`,
+    /// `wire::surface_decodes`). This build renders no cards (the TUI's are
+    /// C5), so it declares 0, and the daemon sends no cards until C4a.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub surfaces: u32,
 }
 
 impl ClientCapabilities {
     /// What this build decodes.
     pub fn current() -> Self {
-        Self { tool_queue: true, owner_reason_input: true, owner_gone: true }
+        Self { tool_queue: true, owner_reason_input: true, owner_gone: true, surfaces: 0 }
     }
 
     fn is_none(&self) -> bool {
@@ -1204,7 +1220,34 @@ pub enum SessionCommand {
         command: String,
         arg: String,
     },
+    /// Answer, skip or revise an agent card (agent-ui §2.4). Input: owned,
+    /// input-authority and reload-fence rules apply as to a typed message.
+    /// `values` are the user's answer: like `Answer`, NEVER traced and
+    /// redacted by `Debug`. A client sends it only to a daemon that lists
+    /// `agent_surfaces`; until C4a no daemon does, and the actor refuses it
+    /// (`SURFACES_UNAVAILABLE`).
+    SurfaceAction {
+        surface_id: String,
+        /// The card's `contract` as the client drew it (§5.4).
+        contract: String,
+        /// 32 hex, minted per user commit, reused for its retries (§3.7).
+        action_id: String,
+        /// The `answer.rev` the client saw; 0 before any answer.
+        expect_rev: u32,
+        /// The `SurfaceState.epoch` the user saw (§3.9).
+        epoch: u32,
+        verb: crate::ui::Verb,
+        /// Raw: the actor parses them against the card's doc (§3.3 #11), so
+        /// a malformed answer is a typed `invalid` refusal, not a frame
+        /// error with nothing to tie it to the action.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        values: Option<serde_json::Value>,
+    },
 }
+
+/// What the actor answers a `SurfaceAction` with until C4a: the command
+/// exists on the wire, nothing behind it does.
+pub const SURFACES_UNAVAILABLE: &str = "agent cards are not available in this daemon";
 
 /// What `Checkpoint{Reload}` reports so `daemon reload` can rebuild the
 /// session as it IS (not as it was created): the actor's config, keep-warm
@@ -1242,8 +1285,9 @@ impl SessionCommand {
     /// exec failed: anything that starts a turn (a `Steer` with no turn
     /// running is a `Submit`), changes the conversation or journal the
     /// record points at, launches or steers work, or changes a setting the
-    /// record already carries. Cancel, answers, queries, saves and
-    /// attach/detach stay open.
+    /// record already carries. Cancel, prompt answers, queries, saves and
+    /// attach/detach stay open; a card action is fenced (agent-ui §3.10: it
+    /// can start a turn).
     pub fn refused_while_reloading(&self) -> bool {
         matches!(
             self,
@@ -1259,6 +1303,7 @@ impl SessionCommand {
                 | Self::DriverStart { .. }
                 | Self::Set { .. }
                 | Self::KeepWarm { .. }
+                | Self::SurfaceAction { .. }
         )
     }
 }
@@ -1294,6 +1339,16 @@ impl std::fmt::Debug for SessionCommand {
                 .debug_struct("Answer")
                 .field("prompt_id", prompt_id)
                 .field("value", &format_args!("<redacted>"))
+                .finish(),
+            Self::SurfaceAction { surface_id, contract, action_id, expect_rev, epoch, verb, .. } => f
+                .debug_struct("SurfaceAction")
+                .field("surface_id", surface_id)
+                .field("contract", contract)
+                .field("action_id", action_id)
+                .field("expect_rev", expect_rev)
+                .field("epoch", epoch)
+                .field("verb", verb)
+                .field("values", &format_args!("<redacted>"))
                 .finish(),
             Self::Resume { id, .. } => f
                 .debug_struct("Resume")
@@ -1610,6 +1665,69 @@ pub enum SessionEventWire {
         cost: f64,
         cap: f64,
     },
+    /// An agent card's full state (agent-ui §2.3): clients upsert by
+    /// `(id, rev)`. Only to clients that declared its catalog
+    /// (`wire::client_decodes`); never in the turn replay ring. Not sent
+    /// before C4a.
+    Surface(Box<crate::ui::SurfaceState>),
+    /// One client's reply to its `SurfaceAction` (§2.3), like `Refused`.
+    /// Only to clients with `capabilities.surfaces >= 1`; never replayed.
+    /// Not sent before C4a.
+    SurfaceResult(SurfaceResult),
+}
+
+/// The reply to one `SurfaceAction` (agent-ui §2.3, §3.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceResult {
+    pub client: ClientId,
+    pub action_id: String,
+    pub outcome: SurfaceOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<SurfaceRefusal>,
+    /// Whether retrying the same action may succeed (§3.3's `retry`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<bool>,
+    /// The answer revision the action produced: on `accepted`, and on a
+    /// `duplicate`, whose original outcome is always an accepted one (only
+    /// accepted actions are logged, §3.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_rev: Option<u32>,
+}
+
+/// A `SurfaceResult`'s outcome (§2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceOutcome {
+    Accepted,
+    /// The write's outcome isn't known yet (§3.4); a final result follows.
+    Pending,
+    /// The action was accepted before: no effect this time.
+    Duplicate,
+    Refused,
+    /// An outcome from a newer daemon. Never sent.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a `SurfaceAction` was refused (§3.3's reasons, in its order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceRefusal {
+    RateLimited,
+    Forbidden,
+    Reloading,
+    Invalid,
+    Busy,
+    Storage,
+    Resolved,
+    Gone,
+    Stale,
+    Stopped,
+    Conflict,
+    Unavailable,
+    /// A reason from a newer daemon. Never sent.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1779,6 +1897,10 @@ pub struct AttachSnapshot {
     /// Daemon-projected display tail — `Some` iff the client attached with
     /// `HistoryMode::Digest` (`conversation.api_messages` is then empty).
     pub display_tail: Option<crate::session::display::DisplayTail>,
+    /// Every retained agent card, from the committed projection (agent-ui
+    /// §2.5), and only the cards this client's catalog covers
+    /// (`snapshot_for`). Empty until C4a.
+    pub surfaces: Vec<crate::ui::SurfaceState>,
 }
 
 impl AttachSnapshot {

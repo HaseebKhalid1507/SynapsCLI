@@ -1109,7 +1109,13 @@ impl ClientTransport for SocketTransport {
                     return None;
                 }
                 Ok(Some(other)) => {
-                    tracing::debug!("socket_transport: unexpected frame after attach: {other:?}");
+                    // The frame's type only: an `Attached` carries agent
+                    // cards and their answers, which are never traced.
+                    let kind = serde_json::to_value(&other)
+                        .ok()
+                        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+                        .unwrap_or_default();
+                    tracing::debug!("socket_transport: unexpected frame after attach: {kind}");
                     continue;
                 }
                 Err(e) => {
@@ -1279,6 +1285,7 @@ mod tests {
                         client_input: ClientInput::wire_default(),
                         input_owner: Some(ClientId(7)),
                         display_tail: None,
+                        surfaces: Vec::new(),
                     },
                 )),
                 // A reload announced, then the owner cut for lagging.
@@ -1737,6 +1744,7 @@ mod tests {
                         client_input: ClientInput::wire_default(),
                         input_owner: Some(ClientId(7)),
                         display_tail: None,
+                        surfaces: Vec::new(),
                     },
                 ));
                 w.write_all(encode_line(&reply).unwrap().as_bytes()).await.unwrap();

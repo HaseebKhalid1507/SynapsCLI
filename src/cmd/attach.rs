@@ -165,6 +165,8 @@ impl Client {
             SessionEventWire::CostCapReached { scope, cost, cap } => self.out(&format!(
                 "[{scope} cost cap reached: ${cost:.4} ≥ ${cap:.4} — turn cancelled, driver revoked]\n"
             )),
+            // No catalog declared (`surfaces: 0`): the daemon sends none.
+            SessionEventWire::Surface(_) | SessionEventWire::SurfaceResult(_) => {}
         }
     }
 

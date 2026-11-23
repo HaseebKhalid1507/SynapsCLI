@@ -67,6 +67,8 @@ fn own_meta() -> SessionMeta {
         messages: 0,
         workers: Default::default(),
         updated_at: None,
+        surfaces_waiting: 0,
+        surfaces_open: 0,
     }
 }
 

@@ -909,6 +909,9 @@ pub(super) async fn handle_session_event_arm(
             )));
             app.request_redraw();
         }
+        // Agent cards: this build declares no catalog (`surfaces: 0`), so
+        // the daemon sends it none; the TUI's cards are C5.
+        SessionEventWire::Surface(_) | SessionEventWire::SurfaceResult(_) => {}
     }
     ArmFlow::Continue
 }

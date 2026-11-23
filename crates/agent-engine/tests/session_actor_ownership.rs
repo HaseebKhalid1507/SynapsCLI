@@ -871,3 +871,95 @@ async fn an_engine_command_that_changes_the_view_reaches_every_client() {
     until(&mut a, |e| matches!(e, SessionEventWire::QueryResult { id: 5, .. })).await;
     end(&mut a).await;
 }
+
+// ── agent cards (agent-ui §4.2, C3) ─────────────────────────────────────────
+
+fn card_action() -> SessionCommand {
+    SessionCommand::SurfaceAction {
+        surface_id: "s_3f2a91c0d4e2a871".into(),
+        contract: format!("c1:{}", "9d".repeat(16)),
+        action_id: "5b0c".repeat(8),
+        expect_rev: 0,
+        epoch: 0,
+        verb: agent_engine::ui::Verb::Answer,
+        values: Some(serde_json::json!({"choice": "Refactor the parser"})),
+    }
+}
+
+/// The refusal `t` gets for a card action.
+async fn card_refusal(t: &mut LocalTransport) -> String {
+    t.send_from_self(card_action()).await.unwrap();
+    let me = t.client_id();
+    // `Refused` reaches every client; each renders its own.
+    let seen = until(t, |e| matches!(e, SessionEventWire::Refused { client, .. } if *client == me)).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::Refused { client, command, reason } => {
+            assert_eq!(*client, t.client_id());
+            assert_eq!(command, "surface_action");
+            reason.clone()
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// A card answer is input (agent-ui §4.2): with `client_input = exclusive`
+/// only the input owner's passes, an observer's and a read-only mirror's
+/// are refused as typed input is. Until C4a the owner's is refused too, as
+/// unavailable: no turn, no ownership change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn exclusive_card_actions_are_the_input_owners() {
+    let _h = Home::new();
+    let (url, hits) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
+
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut b, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut o, _) = attach(&handle, ClientKind::Tui, AttachMode::Observe).await;
+    for t in [&mut b, &mut o] {
+        let reason = card_refusal(t).await;
+        assert!(reason.starts_with("input owned by"), "{reason}");
+    }
+    assert_eq!(card_refusal(&mut a).await, agent_engine::session::SURFACES_UNAVAILABLE);
+    let a_saw = drain_for(&mut a, Duration::from_millis(300)).await;
+    assert!(
+        !a_saw.iter().any(|e| matches!(
+            e.event,
+            SessionEventWire::TurnStarted { .. } | SessionEventWire::InputOwnerChanged { .. }
+        )),
+        "{a_saw:#?}"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "no request");
+    assert_eq!(a.input_owner(), Some(a.client_id()));
+    end(&mut a).await;
+}
+
+/// `client_input = shared`: an observer's card action is refused as its
+/// typing is; a drive client's passes input authority and, until C4a, is
+/// refused as unavailable without making it the active client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn shared_card_actions_refuse_observers() {
+    let _h = Home::new();
+    let (url, hits) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(shared_cfg()).await.unwrap();
+
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut b, _) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;
+    let (mut o, _) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
+    let reason = card_refusal(&mut o).await;
+    assert!(reason.contains("--observe"), "{reason}");
+    assert_eq!(card_refusal(&mut b).await, agent_engine::session::SURFACES_UNAVAILABLE);
+    let a_saw = drain_for(&mut a, Duration::from_millis(300)).await;
+    assert!(
+        !a_saw.iter().any(|e| matches!(e.event, SessionEventWire::InputOwnerChanged { .. })),
+        "a refused card action made its sender active: {a_saw:#?}"
+    );
+    assert_eq!(a.input_owner(), Some(a.client_id()));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "no request");
+    end(&mut a).await;
+}

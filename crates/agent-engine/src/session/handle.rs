@@ -534,6 +534,8 @@ pub mod echo {
             messages: 0,
             workers: Default::default(),
             updated_at: None,
+            surfaces_waiting: 0,
+            surfaces_open: 0,
         }
     }
 
@@ -614,6 +616,7 @@ pub mod echo {
                 client_input: ClientInput::wire_default(),
                 input_owner: None,
                 display_tail,
+                surfaces: Vec::new(),
             }
         }
 
@@ -803,6 +806,8 @@ pub mod locked_placeholder {
             messages: 0,
             workers: Default::default(),
             updated_at: None,
+            surfaces_waiting: 0,
+            surfaces_open: 0,
         };
         let view = crate::session::view::RuntimeView {
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),

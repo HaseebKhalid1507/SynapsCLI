@@ -115,6 +115,8 @@ pub fn saved_row(f: &SavedFacts, named_only: bool) -> Option<SessionMeta> {
         messages: f.messages.unwrap_or(0),
         workers: Default::default(),
         updated_at: Some(f.updated_at),
+        surfaces_waiting: 0,
+        surfaces_open: 0,
     })
 }
 

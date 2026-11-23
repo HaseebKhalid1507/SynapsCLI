@@ -245,6 +245,8 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::KeepWarm { .. }
         // Moves input ownership only; the next request is unchanged.
         | SessionCommand::TakeInput
+        // Refused until C4a, where an answer can start a turn (reclassify).
+        | SessionCommand::SurfaceAction { .. }
         | SessionCommand::Park
         // Its wakes reach the event queue like any other event.
         | SessionCommand::AdoptWorkers { .. }

@@ -305,6 +305,16 @@ async fn commands_that_start_work_are_refused_while_fenced() {
         SessionCommand::Resume { id: 3, query: "other".into() },
         SessionCommand::Compact { instructions: None },
         SessionCommand::EngineCommand { id: 4, name: "memory".into(), arg: "off".into() },
+        // An agent card's answer can start a turn (agent-ui §3.10).
+        SessionCommand::SurfaceAction {
+            surface_id: "s_3f2a91c0d4e2a871".into(),
+            contract: format!("c1:{}", "9d".repeat(16)),
+            action_id: "5b0c".repeat(8),
+            expect_rev: 0,
+            epoch: 0,
+            verb: agent_engine::ui::Verb::Answer,
+            values: Some(serde_json::json!({"choice": "Refactor the parser"})),
+        },
     ] {
         f.client.send_from_self(cmd).await.unwrap();
     }
@@ -315,7 +325,7 @@ async fn commands_that_start_work_are_refused_while_fenced() {
     let names: Vec<&str> = refused.iter().map(|(c, _)| c.as_str()).collect();
     assert_eq!(
         names,
-        ["steer", "submit", "new_session", "resume", "compact", "engine_command"],
+        ["steer", "submit", "new_session", "resume", "compact", "engine_command", "surface_action"],
         "{window:#?}"
     );
     assert!(refused.iter().all(|(_, r)| r == "daemon reloading; retry in a moment"), "{refused:?}");

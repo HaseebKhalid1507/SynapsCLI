@@ -741,6 +741,28 @@ pub struct AttachedWire {
     /// to another client. `None` otherwise and from an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_token: Option<OwnerToken>,
+    /// Agent cards (agent-ui §2.5): only for a client whose catalog covers
+    /// them, omitted when empty (always, until C4a); an older client
+    /// ignores the key. Read one card at a time (v3.3): a card this build
+    /// can't decode is dropped, never the frame.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_surfaces")]
+    pub surfaces: Vec<crate::ui::SurfaceState>,
+}
+
+/// `Attached.surfaces`, one card at a time: a card a newer daemon shaped
+/// differently (an unknown field, phase or verb) is dropped, and the
+/// `Attached` frame, which every reconnect needs, still decodes.
+fn lenient_surfaces<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<crate::ui::SurfaceState>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(cards) => cards.into_iter().filter_map(|c| serde_json::from_value(c).ok()).collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// The `surface` event's card, leniently: `None` when this build can't
+/// decode it, so the frame still does.
+fn lenient_surface<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Box<crate::ui::SurfaceState>>, D::Error> {
+    Ok(serde_json::from_value(serde_json::Value::deserialize(d)?).ok().map(Box::new))
 }
 
 impl AttachedWire {
@@ -759,6 +781,7 @@ impl AttachedWire {
             client_input: s.client_input,
             input_owner: s.input_owner,
             display_tail: s.display_tail,
+            surfaces: s.surfaces,
         }
     }
 
@@ -777,6 +800,7 @@ impl AttachedWire {
                 client_input: self.client_input,
                 input_owner: self.input_owner,
                 display_tail: self.display_tail,
+                surfaces: self.surfaces,
             },
         )
     }
@@ -958,6 +982,18 @@ pub enum WireSessionEvent {
         scope: String,
         cost: f64,
         cap: f64,
+    },
+    /// An agent card's state (agent-ui §2.3). `None`: a card this build
+    /// can't decode (v3.3), never a frame error.
+    Surface {
+        #[serde(default, deserialize_with = "lenient_surface")]
+        surface: Option<Box<crate::ui::SurfaceState>>,
+    },
+    /// The reply to one client's `SurfaceAction` (§2.3). Its enums take
+    /// a newer daemon's values as `Unknown`.
+    SurfaceResult {
+        #[serde(flatten)]
+        result: SurfaceResult,
     },
     /// Forward-compat: an additive variant from a newer daemon.
     #[serde(other)]
@@ -1258,6 +1294,8 @@ impl From<SessionEventWire> for WireSessionEvent {
             S::CostCapReached { scope, cost, cap } => {
                 Self::CostCapReached { scope, cost, cap }
             }
+            S::Surface(surface) => Self::Surface { surface: Some(surface) },
+            S::SurfaceResult(result) => Self::SurfaceResult { result },
         }
     }
 }
@@ -1325,6 +1363,11 @@ impl From<WireSessionEvent> for SessionEventWire {
             W::CostCapReached { scope, cost, cap } => {
                 Self::CostCapReached { scope, cost, cap }
             }
+            W::Surface { surface: Some(surface) } => Self::Surface(surface),
+            W::Surface { surface: None } => {
+                Self::SystemNotice("an agent card from a newer daemon could not be read (ignored)".into())
+            }
+            W::SurfaceResult { result } => Self::SurfaceResult(result),
             W::Unknown => Self::SystemNotice("unknown event from a newer daemon (ignored)".into()),
         }
     }
@@ -1357,8 +1400,20 @@ pub fn client_decodes(caps: ClientCapabilities, event: &SessionEventWire) -> boo
         SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { .. } | LlmEvent::ToolStarted { .. })) => {
             caps.tool_queue
         }
+        // Agent cards (agent-ui §2.1): a client without the catalog gets
+        // none of their traffic. An older one would read each as an
+        // `Unknown` event and show "unknown event from a newer daemon".
+        SessionEventWire::Surface(card) => surface_decodes(caps, card),
+        SessionEventWire::SurfaceResult(_) => caps.surfaces >= 1,
         _ => true,
     }
+}
+
+/// Whether a client that declared `caps` gets `card`: its catalog major
+/// covers the card's (agent-ui §2.1). A client that declared 0 (an older
+/// one, a render-only one) gets no card at all.
+pub fn surface_decodes(caps: ClientCapabilities, card: &crate::ui::SurfaceState) -> bool {
+    caps.surfaces >= card.catalog.max(1)
 }
 
 /// `env` as a client that declared `caps` can decode it: `EndReason` has no
@@ -1654,6 +1709,7 @@ mod tests {
                     client_input: ClientInput::Shared,
                     input_owner: Some(ClientId(1)),
                     display_tail: None,
+                    surfaces: Vec::new(),
                 },
             },
             S::ClientJoined { client: ClientId(1), kind: ClientKind::Attach, name: "discord".into(), mode: AttachMode::Observe },
@@ -1744,6 +1800,7 @@ mod tests {
                 client_input: ClientInput::Shared,
                 input_owner: None,
                 display_tail: None,
+                surfaces: Vec::new(),
             },
         );
         let line = encode_line(&DaemonFrame::Attached(attached)).unwrap();
@@ -1778,6 +1835,7 @@ mod tests {
             client_input,
             input_owner: Some(ClientId(1)),
             display_tail: None,
+            surfaces: Vec::new(),
         };
         let line = encode_line(&DaemonFrame::Attached(AttachedWire::new(ClientId(2), snap(ClientInput::Shared)))).unwrap();
         assert!(line.contains(r#""client_input":"shared""#), "{line}");
@@ -2134,6 +2192,7 @@ mod tests {
                     client_input: ClientInput::Shared,
                     input_owner: None,
                     display_tail: None,
+                    surfaces: Vec::new(),
                 },
             )),
             DaemonFrame::Event(env(SessionEventWire::SystemNotice("x".into())).into()),
@@ -2724,3 +2783,51 @@ mod catalog_page_tests {
         assert_eq!(h.meta_live().lifecycle, SessionLifecycle::Live);
     }
 }
+
+/// An agent card for tests (agent-ui §2.2): answered, `revise` offered,
+/// at catalog `catalog`.
+#[cfg(test)]
+pub(crate) fn test_card(catalog: u32) -> crate::ui::SurfaceState {
+    use crate::ui::*;
+    let doc = match parse_input(&serde_json::json!({
+        "question": "Which approach?",
+        "options": ["Refactor the parser", "Leave it"],
+    }))
+    .unwrap()
+    {
+        UiInput::Create { doc, .. } => doc,
+        UiInput::Close(_) => unreachable!(),
+    };
+    SurfaceState {
+        id: "s_3f2a91c0d4e2a871".into(),
+        call_id: "toolu_01".into(),
+        rev: 3,
+        contract: contract(&doc),
+        catalog,
+        mode: WaitMode::Live,
+        phase: Phase::Answered,
+        offers: vec![Verb::Revise],
+        doc,
+        origin: Origin { turn: Some("3f2a91c0-d4e2-4a87-9b1f-0123456789ab".into()), task: "fix the parser".into(), stopped: None },
+        epoch: 4,
+        resume: false,
+        actions: vec!["5b0c".repeat(8)],
+        raised_at: "2026-11-23T05:42:00Z".into(),
+        downgraded: None,
+        answer: Some(AnswerState {
+            rev: 1,
+            action_id: "5b0c".repeat(8),
+            answer_id: "a_0123456789abcdef".into(),
+            status: AnswerStatus::Answered,
+            values: serde_json::from_value(serde_json::json!({"choice": "Refactor the parser"})).unwrap(),
+            delivery: Delivery::InContext,
+            wake: true,
+            by: "desk-1".into(),
+            at: "2026-11-23T05:43:00Z".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+#[path = "wire_surfaces_tests.rs"]
+mod surfaces_tests;

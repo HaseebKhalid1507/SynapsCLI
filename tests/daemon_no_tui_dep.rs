@@ -62,7 +62,9 @@ fn rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 /// Source-grep guard (risk §6.5, PLAN-phase3 C2): nothing under
 /// `crates/agent-engine/src/{session,daemon}/**` traces an `Answer` body or
-/// a prompt value.
+/// a prompt value, nor (agent-ui §2.4, C3) a `SurfaceAction`'s `values` or
+/// an agent card: a `SurfaceState` carries its answer's values. The
+/// command's `Debug` redacts them (`session_command_debug_is_manual_and_lengthless`).
 #[test]
 fn daemon_never_traces_answer_bodies() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/agent-engine/src");
@@ -74,7 +76,12 @@ fn daemon_never_traces_answer_bodies() {
         for (i, line) in src.lines().enumerate() {
             if line.contains("tracing::") {
                 let l = line.to_ascii_lowercase();
-                assert!(!l.contains("answer") && !l.contains("value"), "{}:{}: {line}", f.display(), i + 1);
+                assert!(
+                    !l.contains("answer") && !l.contains("value") && !l.contains("surface"),
+                    "{}:{}: {line}",
+                    f.display(),
+                    i + 1
+                );
             }
         }
     }
@@ -130,6 +137,12 @@ fn session_command_debug_is_manual_and_lengthless() {
     let dbg_end = dbg.find("\n}\n").map(|e| e + 3).unwrap_or(dbg.len());
     let dbg = &dbg[..dbg_end];
     assert!(dbg.contains("<redacted>"), "SessionCommand Debug redacts bodies");
+    // A card action's values (agent-ui §2.4): the arm names every field
+    // but `values`, which it redacts.
+    let arm = &dbg[dbg.find("Self::SurfaceAction").expect("a SurfaceAction arm")..];
+    let arm = &arm[..arm.find(".finish()").unwrap()];
+    assert!(arm.contains(".field(\"values\", &format_args!(\"<redacted>\"))"), "{arm}");
+    assert!(!arm.contains("values,") && !arm.contains("values }"), "the arm binds `values`: {arm}");
     // `attachments.len()` is a count of attachments (P3-0 design), not a
     // body length; any other `.len()` inside the impl is a side channel.
     for (i, line) in dbg.lines().enumerate() {
