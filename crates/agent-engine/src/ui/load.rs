@@ -45,12 +45,12 @@ mod tests {
     const LINEAGE: &str = "0123456789abcdef0123456789abcdef";
 
     fn good_doc() -> CardDoc {
-        match super::super::parse_input(
-            &json!({"question": "Which approach?", "options": ["Refactor", "Rewrite"]}),
-        ) {
-            Ok(super::super::UiInput::Create { doc, .. }) => doc,
-            other => panic!("{other:?}"),
-        }
+        let input = json!({"question": "Which approach?", "options": ["Refactor", "Rewrite"]});
+        let Ok(super::super::UiInput::Create { doc, .. }) = super::super::parse_input(&input)
+        else {
+            panic!("a valid create");
+        };
+        doc
     }
 
     fn card(n: u8, doc: CardDoc) -> CardRecord {

@@ -176,7 +176,7 @@ fn ui_of(
                 *slot = fold
                     .calls
                     .iter()
-                    .find(|c| &c.call_id == tool_id)
+                    .find(|c| c.call_id == *tool_id)
                     .map(|c| UiItem::call(&c.outcome));
             }
         }

@@ -161,7 +161,7 @@ pub struct Fold {
 pub fn fold_history<M: std::borrow::Borrow<Value>>(messages: &[M]) -> Fold {
     let mut fold = Fold::default();
     for msg in messages {
-        let msg = msg.borrow();
+        let msg: &Value = <M as std::borrow::Borrow<Value>>::borrow(msg);
         match msg["role"].as_str() {
             Some("assistant") => {
                 for block in blocks(msg) {
