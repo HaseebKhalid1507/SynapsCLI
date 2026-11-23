@@ -820,12 +820,19 @@ pub struct ClientCapabilities {
     /// session is told `Ended{ClientQuit}` (`wire::ended_for`).
     #[serde(default)]
     pub owner_gone: bool,
+    /// Handles a late or unknown `Answer`'s `Refused{command: "answer"}`
+    /// apart from a setter's reply and a submit's (it changes neither). An
+    /// older TUI read any refusal addressed to it as its pending setter's
+    /// failure, or ended its presented turn, so without this a late answer
+    /// is dropped without a word, as before.
+    #[serde(default)]
+    pub answer_refused: bool,
 }
 
 impl ClientCapabilities {
     /// What this build decodes.
     pub fn current() -> Self {
-        Self { tool_queue: true, owner_reason_input: true, owner_gone: true }
+        Self { tool_queue: true, owner_reason_input: true, owner_gone: true, answer_refused: true }
     }
 
     fn is_none(&self) -> bool {

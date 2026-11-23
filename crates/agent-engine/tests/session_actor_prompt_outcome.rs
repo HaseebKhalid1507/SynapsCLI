@@ -215,3 +215,48 @@ async fn a_late_answer_is_refused_with_what_applied() {
     assert_eq!(answer_refusal(&mut b).await, format!("no pending prompt {}", pid + 100));
     end(&mut a).await;
 }
+
+/// An older client (no `answer_refused`) that answers late hears nothing,
+/// as before #437: no `Refused` reaches it, so neither a setter it waits on
+/// nor the turn it presents is touched (an older TUI read any refusal
+/// addressed to it as its setter's reply, or ended its turn on it). A
+/// current client answering late is refused, in the same stream, after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_older_client_answering_late_hears_no_refusal() {
+    let _h = Home::new();
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = confirm_host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let mut a = attach(&handle, ClientKind::Tui).await;
+    let mut meta = ClientMeta::new(ClientKind::Tui);
+    meta.capabilities.answer_refused = false;
+    let mut old = LocalTransport::attach_with(handle.clone(), meta, AttachMode::Mirror).await.unwrap().0;
+    let pid = raise(&mut a).await;
+    until(&mut old, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+
+    answer(&a, pid, Some("y")).await;
+    until(&mut old, |e| matches!(e, SessionEventWire::PromptResolved { .. })).await;
+    answer(&old, pid, Some("n")).await;
+    answer(&old, pid + 100, Some("y")).await;
+    // A current client's late answer, after the older one's: its refusal
+    // marks the point the older client's were handled by.
+    answer(&a, pid, Some("n")).await;
+    let a_id = a.client_id();
+    let old_id = old.client_id();
+    let seen = until(&mut old, |e| matches!(e, SessionEventWire::Refused { client, .. } if *client == a_id)).await;
+    assert!(
+        !seen.iter().any(|e| matches!(e.event, SessionEventWire::Refused { client, .. } if client == old_id)),
+        "the older client hears no refusal: {seen:#?}"
+    );
+    assert_eq!(answer_refusal(&mut a).await, format!("prompt {pid} was already resolved: allowed"));
+
+    let seen = until(&mut old, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(
+        !seen.iter().any(|e| matches!(e.event, SessionEventWire::Refused { client, .. } if client == old_id)),
+        "nor later in its turn: {seen:#?}"
+    );
+    assert_eq!(tool_results(&last_conversation(&seen)), vec!["allowed".to_string()], "the late answers changed nothing");
+    end(&mut a).await;
+}

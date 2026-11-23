@@ -1832,11 +1832,15 @@ mod tests {
         let m: ClientMeta = serde_json::from_str(legacy).unwrap();
         assert_eq!(m.capabilities, ClientCapabilities::default());
         assert!(!m.capabilities.tool_queue);
+        assert!(!m.capabilities.answer_refused);
 
         let h = Hello::new(ClientKind::Tui);
         assert!(h.client.capabilities.tool_queue);
         let line = encode_line(&ClientFrame::Hello(h)).unwrap();
-        assert!(line.contains(r#""capabilities":{"tool_queue":true,"owner_reason_input":true,"owner_gone":true}"#), "{line}");
+        assert!(
+            line.contains(r#""capabilities":{"tool_queue":true,"owner_reason_input":true,"owner_gone":true,"answer_refused":true}"#),
+            "{line}"
+        );
         match decode_line::<ClientFrame>(line.trim_end()).unwrap() {
             ClientFrame::Hello(h) => assert!(h.client.capabilities.tool_queue),
             other => panic!("{other:?}"),

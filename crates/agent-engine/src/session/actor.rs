@@ -4523,7 +4523,11 @@ impl SessionActor {
             // Unknown or already resolved: dedup on id. The client that
             // sent it is told: its answer changed nothing, and a
             // client that missed the `PromptResolved` learns what applied.
-            if let Some(c) = from {
+            // Only a client that says it handles this refusal: an older
+            // TUI read it as its pending setter's failure or ended its turn
+            // on it, so it is still dropped without a word there.
+            let handles = |c: ClientId| self.attached.get(&c).is_some_and(|a| a.meta.capabilities.answer_refused);
+            if let Some(c) = from.filter(|c| handles(*c)) {
                 let reason = match self.resolved_prompts.iter().rev().find(|(id, _)| *id == prompt_id) {
                     Some((_, outcome)) => format!("prompt {prompt_id} was already resolved: {}", outcome.as_str()),
                     None => format!("no pending prompt {prompt_id}"),
