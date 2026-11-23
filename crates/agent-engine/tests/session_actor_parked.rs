@@ -650,6 +650,9 @@ async fn a_card_action_never_wakes_a_parked_session() {
         match env.event {
             SessionEventWire::QueryResult { id: 43, value } => break value,
             e @ (SessionEventWire::Surface(_) | SessionEventWire::SurfaceResult(_)) => panic!("{e:?}"),
+            // The grace is zero: a wake would re-park before the Status
+            // reply, so the wake itself is what fails the test.
+            SessionEventWire::Lifecycle(SessionLifecycle::Live) => panic!("a card action woke the parked session"),
             _ => {}
         }
     };
