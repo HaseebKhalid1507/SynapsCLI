@@ -1140,21 +1140,7 @@ impl SessionActor {
     /// twice). Completed rounds leave the ring when their checkpoint is
     /// adopted (`trim_replay_to_checkpoint`).
     pub(crate) fn emit(&mut self, event: SessionEventWire) {
-        let replay = self.streaming
-            && !matches!(
-                event,
-                SessionEventWire::Prompt(_)
-                    | SessionEventWire::PromptResolved { .. }
-                    // `Attached.surfaces` is authoritative (agent-ui §2.3).
-                    | SessionEventWire::Surface(_)
-                    | SessionEventWire::SurfaceResult(_)
-                    | SessionEventWire::Attached { .. }
-                    | SessionEventWire::QueryResult { .. }
-                    | SessionEventWire::Conversation(_)
-                    | SessionEventWire::Stream(StreamEvent::Session(
-                        SessionEvent::MessageHistory(_)
-                    ))
-            );
+        let replay = self.streaming && replayed(&event);
         let env = Envelope {
             session_id: self.id.clone(),
             seq: self.seq,
@@ -6068,6 +6054,48 @@ async fn await_stopped_workers(
         .filter(|(_, s)| s.read().unwrap_or_else(|p| p.into_inner()).stopped_by_reload)
         .map(|(id, _)| id.clone())
         .collect()
+}
+
+/// Whether an event emitted mid-turn joins the turn replay ring
+/// ([`SessionActor::emit`]).
+fn replayed(event: &SessionEventWire) -> bool {
+    !matches!(
+        event,
+        SessionEventWire::Prompt(_)
+            | SessionEventWire::PromptResolved { .. }
+            // `Attached.surfaces` is authoritative (agent-ui §2.3).
+            | SessionEventWire::Surface(_)
+            | SessionEventWire::SurfaceResult(_)
+            | SessionEventWire::Attached { .. }
+            | SessionEventWire::QueryResult { .. }
+            | SessionEventWire::Conversation(_)
+            | SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
+    )
+}
+
+#[cfg(test)]
+mod replay_ring_tests {
+    use super::replayed;
+    use crate::session::*;
+    use crate::{LlmEvent, StreamEvent};
+
+    /// Agent cards (agent-ui §2.3, C3): neither card event joins the turn
+    /// replay ring; an attaching client reads `Attached.surfaces` instead.
+    #[test]
+    fn card_traffic_never_joins_the_replay_ring() {
+        let result = SurfaceResult {
+            client: ClientId(1),
+            action_id: "5b0c".repeat(8),
+            outcome: SurfaceOutcome::Accepted,
+            reason: None,
+            retry: None,
+            answer_rev: Some(2),
+            detail: None,
+        };
+        assert!(!replayed(&SessionEventWire::Surface(Box::new(crate::session::wire::test_card(1)))));
+        assert!(!replayed(&SessionEventWire::SurfaceResult(result)));
+        assert!(replayed(&SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text("t".into())))));
+    }
 }
 
 #[cfg(test)]

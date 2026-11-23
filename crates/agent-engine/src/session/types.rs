@@ -1692,6 +1692,29 @@ pub struct SurfaceResult {
     /// accepted actions are logged, §3.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer_rev: Option<u32>,
+    /// Why the action is `unavailable` (v3.4 #2, §3.3 #12). Meaningful
+    /// only with `reason: unavailable`; a reader ignores it on any other
+    /// reason. Absent when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<SurfaceUnavailable>,
+}
+
+/// `SurfaceResult.detail`: why a card can't take the action now (§3.3
+/// #12's four cases, in its order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceUnavailable {
+    /// The session needs a reload.
+    ContextBlocked,
+    /// The agent's queue is full.
+    QueueFull,
+    /// Earlier answers are still being saved.
+    LedgerFull,
+    /// Waiting for the session's owner.
+    AwaitingOwner,
+    /// A detail from a newer daemon. Never sent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A `SurfaceResult`'s outcome (§2.3).

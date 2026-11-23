@@ -654,11 +654,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     let fwd_announce = state.announce();
     // Phase 4 §2.3: Digest clients never receive the per-round full history;
     // the `Conversation` digest the actor emits right after is what they key on.
-    let history = hello.client.history;
     let caps = hello.client.capabilities;
-    let skip = move |env: &Envelope| -> bool {
-        !forwarded(history, caps, env) || (legacy && matches!(env.event, SessionEventWire::InputOwnerChanged { .. }))
-    };
+    let skip = pump_skip(hello.client.history, caps, legacy);
     // The owner of an owned session must never miss a frame silently (a
     // headless client keys on `Usage`/`Done`/tool results): its lag closes
     // its connection with `Bye{owner_lagged}` (and so ends the session).
@@ -675,27 +672,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                 // notice, Conversation with the kept partial history) are already in
                 // the broadcast; drain what is there, then stop.
                 _ = fwd_announce.cancelled() => {
-                    loop {
-                        match rx.try_recv() {
-                            Ok(env) => {
-                                if skip(&env) {
-                                    continue;
-                                }
-                                if fwd_tx.send(DaemonFrame::Event(ended_for(caps, env).into())).await.is_err() {
-                                    break;
-                                }
-                            }
-                            // The owner lost events here too: never a
-                            // silent gap it would re-bind across.
-                            Err(broadcast::error::TryRecvError::Lagged(n)) if owner => {
-                                tracing::warn!(session = %fwd_handle.id, dropped = n, "daemon: the owner lagged during a reload");
-                                fwd_lag_dropped.store(n, Ordering::SeqCst);
-                                fwd_lag.cancel();
-                                break;
-                            }
-                            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                            Err(_) => break,
-                        }
+                    // The owner lost events here too: never a silent gap
+                    // it would re-bind across.
+                    if let Err(n) = drain_announced(&mut rx, &skip, caps, &fwd_tx, owner).await {
+                        tracing::warn!(session = %fwd_handle.id, dropped = n, "daemon: the owner lagged during a reload");
+                        fwd_lag_dropped.store(n, Ordering::SeqCst);
+                        fwd_lag.cancel();
                     }
                     break;
                 }
@@ -945,6 +927,44 @@ async fn adopt_live_continue_target(state: &DaemonState, live: &SessionHandle) -
     }
 }
 
+/// What the pump skips for this client, on both of its paths (live and
+/// [`drain_announced`]): what [`forwarded`] refuses, and owner changes for
+/// a [`legacy_shared`] client.
+fn pump_skip(history: HistoryMode, caps: ClientCapabilities, legacy: bool) -> impl Fn(&Envelope) -> bool + Send + 'static {
+    move |env: &Envelope| -> bool {
+        !forwarded(history, caps, env) || (legacy && matches!(env.event, SessionEventWire::InputOwnerChanged { .. }))
+    }
+}
+
+/// The pump's reload drain (C3): when the reload is announced, the
+/// checkpoint's events (abort notice, `Conversation` with the kept partial
+/// history) are already in the broadcast. Forward what is there, through
+/// the live path's `skip`, then stop. `Err(n)`: the owner lagged, `n`
+/// events lost.
+async fn drain_announced(
+    rx: &mut broadcast::Receiver<Envelope>,
+    skip: &impl Fn(&Envelope) -> bool,
+    caps: ClientCapabilities,
+    tx: &mpsc::Sender<DaemonFrame>,
+    owner: bool,
+) -> Result<(), u64> {
+    loop {
+        match rx.try_recv() {
+            Ok(env) => {
+                if skip(&env) {
+                    continue;
+                }
+                if tx.send(DaemonFrame::Event(ended_for(caps, env).into())).await.is_err() {
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(n)) if owner => return Err(n),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
 /// Whether the pump forwards `env` to this connection's client. Never the
 /// actor's `Attached` (the conn sends its own). Digest clients never get the
 /// per-round full history; the `Conversation` digest the actor emits right
@@ -1104,6 +1124,7 @@ mod tests {
             reason: Some(SurfaceRefusal::Forbidden),
             retry: Some(false),
             answer_rev: None,
+            detail: None,
         }));
         let old = ClientCapabilities::default();
         let this = ClientCapabilities::current();
@@ -1142,6 +1163,50 @@ mod tests {
         assert_eq!((s.replay.len(), s.surfaces), (2, vec![card]));
         snapshot = replay_for(two, snapshot);
         assert_eq!((snapshot.replay.len(), snapshot.surfaces.len()), (3, 2));
+    }
+
+    /// The pump's reload drain goes through the live path's gate: card
+    /// traffic still in the broadcast when a reload is announced reaches a
+    /// capable client and never an old one, and the drain forwards the
+    /// rest. (The drain only sees events that land after the live `recv`
+    /// went idle, which a socket test can't pin; the live path's socket
+    /// test is `tests/daemon_socket.rs::card_traffic_reaches_only_a_client_with_the_catalog`.)
+    #[tokio::test]
+    async fn the_reload_drain_sends_card_traffic_only_to_a_client_with_the_catalog() {
+        let ev = |event| Envelope { session_id: SessionId::from("s"), seq: 1, ts: chrono::Utc::now(), event };
+        let result = SurfaceResult {
+            client: ClientId(1),
+            action_id: "5b0c".repeat(8),
+            outcome: SurfaceOutcome::Accepted,
+            reason: None,
+            retry: None,
+            answer_rev: Some(2),
+            detail: None,
+        };
+        let this = ClientCapabilities::current();
+        for (caps, want) in [
+            (ClientCapabilities::default(), vec!["system_notice"]),
+            (this, vec!["system_notice"]),
+            (ClientCapabilities { surfaces: 1, ..this }, vec!["surface", "surface_result", "system_notice"]),
+        ] {
+            let (btx, mut rx) = broadcast::channel(16);
+            for e in [
+                SessionEventWire::Surface(Box::new(crate::session::wire::test_card(1))),
+                SessionEventWire::SurfaceResult(result.clone()),
+                SessionEventWire::SystemNotice("checkpoint".into()),
+            ] {
+                btx.send(ev(e)).unwrap();
+            }
+            let (tx, mut out) = mpsc::channel(16);
+            drain_announced(&mut rx, &pump_skip(HistoryMode::Full, caps, false), caps, &tx, true).await.unwrap();
+            drop(tx);
+            let mut got = Vec::new();
+            while let Some(frame) = out.recv().await {
+                let v = serde_json::to_value(&frame).unwrap();
+                got.push(v["event"]["ev"].as_str().unwrap().to_owned());
+            }
+            assert_eq!(got, want, "{caps:?}");
+        }
     }
 
     /// A large frame doesn't pin its buffer for the life of the connection:

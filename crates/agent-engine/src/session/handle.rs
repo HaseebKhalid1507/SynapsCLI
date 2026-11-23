@@ -496,7 +496,9 @@ impl SessionHandle {
 pub mod echo {
     //! Minimal stand-in actor. Honours the envelope/seq contract, `Attach`,
     //! `Detach`, `Submit`, `Steer`, `Cancel`, `Query{View}`, `End`;
-    //! everything else is acknowledged with a `SystemNotice`.
+    //! `SurfaceAction` gets a `Surface` and a `SurfaceResult` (C4a's card
+    //! traffic, for the socket gate's tests); everything else is
+    //! acknowledged with a `SystemNotice`.
 
     use std::collections::HashMap;
 
@@ -735,7 +737,23 @@ pub mod echo {
             clients: HashMap::new(),
             conv: ConversationSnapshot::default(),
         };
-        while let Some(Addressed { cmd, .. }) = ep.cmd_rx.recv().await {
+        while let Some(Addressed { cmd, from }) = ep.cmd_rx.recv().await {
+            // Card traffic, as a C4a daemon would send it (the socket's
+            // per-client gate is what's under test): the card at catalog 1
+            // and the action's result.
+            if let SessionCommand::SurfaceAction { action_id, .. } = &cmd {
+                echo.emit(SessionEventWire::Surface(Box::new(crate::session::wire::test_card(1))));
+                echo.emit(SessionEventWire::SurfaceResult(SurfaceResult {
+                    client: from.unwrap_or(ClientId(0)),
+                    action_id: action_id.clone(),
+                    outcome: SurfaceOutcome::Accepted,
+                    reason: None,
+                    retry: None,
+                    answer_rev: Some(2),
+                    detail: None,
+                }));
+                continue;
+            }
             if !echo.handle(cmd) {
                 break;
             }

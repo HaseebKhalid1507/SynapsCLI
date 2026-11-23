@@ -600,6 +600,68 @@ async fn no_duplicate_index_start_record_on_unpark_and_status_never_wakes() {
     end(&mut b).await;
 }
 
+/// Agent cards (C3): a `SurfaceAction` reaching a parked session is
+/// refused before the wake. The host's (no sender) is the one that can
+/// arrive: a client's attach unparks first. It never wakes the session
+/// and draws no card traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_card_action_never_wakes_a_parked_session() {
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = Arc::clone(&host().await);
+    let handle = host.create_session(pcfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("hi")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    detach(&mut a).await;
+    assert!(wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(5)).await);
+
+    let mut rx = handle.subscribe();
+    handle
+        .send(SessionCommand::SurfaceAction {
+            surface_id: "s_3f2a91c0d4e2a871".into(),
+            contract: format!("c1:{}", "9d".repeat(16)),
+            action_id: "5b0c".repeat(8),
+            expect_rev: 0,
+            epoch: 0,
+            verb: agent_engine::ui::Verb::Answer,
+            values: Some(serde_json::json!({"choice": "Refactor the parser"})),
+        })
+        .await
+        .unwrap();
+    // Commands are handled in order: by this reply the action was too.
+    handle
+        .send(SessionCommand::Query {
+            id: 43,
+            query: SessionQuery::Status,
+        })
+        .await
+        .unwrap();
+    let v = loop {
+        let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match env.event {
+            SessionEventWire::QueryResult { id: 43, value } => break value,
+            e @ (SessionEventWire::Surface(_) | SessionEventWire::SurfaceResult(_)) => panic!("{e:?}"),
+            _ => {}
+        }
+    };
+    assert_eq!(v["lifecycle"], "parked");
+    assert_eq!(handle.lifecycle(), SessionLifecycle::Parked, "a card action never wakes");
+
+    let (mut b, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Attach))
+        .await
+        .unwrap();
+    end(&mut b).await;
+}
+
 /// B4: `--idle-exit` fires once every session is parked (REVIEW §5 retired):
 /// a real `Daemon` over the host map, one session, detach → park → the idle
 /// monitor requests shutdown without ever probing (waking) the actor.

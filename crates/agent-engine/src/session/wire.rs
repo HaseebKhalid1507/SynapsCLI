@@ -749,20 +749,31 @@ pub struct AttachedWire {
     pub surfaces: Vec<crate::ui::SurfaceState>,
 }
 
-/// `Attached.surfaces`, one card at a time: a card a newer daemon shaped
-/// differently (an unknown field, phase or verb) is dropped, and the
-/// `Attached` frame, which every reconnect needs, still decodes.
+/// One card off the wire. A verb this build doesn't know is one it doesn't
+/// implement, so it leaves `offers` and the card stays (v3.4 #4); the
+/// stored type stays strict. Any other shape this build can't read (an
+/// unknown field or phase) is `None`.
+fn lenient_card(mut card: serde_json::Value) -> Option<crate::ui::SurfaceState> {
+    if let Some(offers) = card.get_mut("offers").and_then(serde_json::Value::as_array_mut) {
+        offers.retain(|v| crate::ui::Verb::deserialize(v).is_ok());
+    }
+    serde_json::from_value(card).ok()
+}
+
+/// `Attached.surfaces`, one card at a time ([`lenient_card`]): a card a
+/// newer daemon shaped differently is dropped, and the `Attached` frame,
+/// which every reconnect needs, still decodes.
 fn lenient_surfaces<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<crate::ui::SurfaceState>, D::Error> {
     Ok(match serde_json::Value::deserialize(d)? {
-        serde_json::Value::Array(cards) => cards.into_iter().filter_map(|c| serde_json::from_value(c).ok()).collect(),
+        serde_json::Value::Array(cards) => cards.into_iter().filter_map(lenient_card).collect(),
         _ => Vec::new(),
     })
 }
 
-/// The `surface` event's card, leniently: `None` when this build can't
-/// decode it, so the frame still does.
+/// The `surface` event's card, leniently ([`lenient_card`]): `None` when
+/// this build can't decode it, so the frame still does.
 fn lenient_surface<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Box<crate::ui::SurfaceState>>, D::Error> {
-    Ok(serde_json::from_value(serde_json::Value::deserialize(d)?).ok().map(Box::new))
+    Ok(lenient_card(serde_json::Value::deserialize(d)?).map(Box::new))
 }
 
 impl AttachedWire {
@@ -2786,8 +2797,8 @@ mod catalog_page_tests {
 
 /// An agent card for tests (agent-ui §2.2): answered, `revise` offered,
 /// at catalog `catalog`.
-#[cfg(test)]
-pub(crate) fn test_card(catalog: u32) -> crate::ui::SurfaceState {
+#[cfg(any(test, feature = "testing"))]
+pub fn test_card(catalog: u32) -> crate::ui::SurfaceState {
     use crate::ui::*;
     let doc = match parse_input(&serde_json::json!({
         "question": "Which approach?",

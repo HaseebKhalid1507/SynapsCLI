@@ -54,6 +54,19 @@ fn every_outcome() -> Vec<SurfaceOutcome> {
     all
 }
 
+fn every_detail() -> Vec<SurfaceUnavailable> {
+    use SurfaceUnavailable as U;
+    let all = vec![U::ContextBlocked, U::QueueFull, U::LedgerFull, U::AwaitingOwner];
+    // A new detail must join the list (and the round trip below).
+    for u in &all {
+        match u {
+            U::ContextBlocked | U::QueueFull | U::LedgerFull | U::AwaitingOwner => {}
+            U::Unknown => unreachable!(),
+        }
+    }
+    all
+}
+
 fn every_refusal() -> Vec<SurfaceRefusal> {
     use SurfaceRefusal as R;
     let all = vec![
@@ -103,8 +116,9 @@ fn a_surface_event_round_trips() {
     }
 }
 
-/// `surface_result` (§2.3, §2.8) in every outcome and every refusal
-/// reason, with and without its optional keys, in §2.8's shape.
+/// `surface_result` (§2.3, §2.8) in every outcome, every refusal reason
+/// and every `unavailable` detail (v3.4 #2), with and without its optional
+/// keys, in §2.8's shape.
 #[test]
 fn every_surface_result_round_trips() {
     let refused = SurfaceResult {
@@ -114,6 +128,7 @@ fn every_surface_result_round_trips() {
         reason: Some(SurfaceRefusal::RateLimited),
         retry: Some(true),
         answer_rev: None,
+        detail: None,
     };
     let (v, _) = through_the_wire(SessionEventWire::SurfaceResult(refused.clone()));
     assert_eq!(
@@ -134,19 +149,50 @@ fn every_surface_result_round_trips() {
     for reason in every_refusal() {
         cases.push(SurfaceResult { reason: Some(reason), retry: Some(false), ..refused.clone() });
     }
+    let unavailable = SurfaceResult { reason: Some(SurfaceRefusal::Unavailable), ..refused.clone() };
+    for detail in every_detail() {
+        cases.push(SurfaceResult { detail: Some(detail), ..unavailable.clone() });
+    }
     for r in cases {
         match through_the_wire(SessionEventWire::SurfaceResult(r.clone())) {
             (v, SessionEventWire::SurfaceResult(back)) => {
                 assert_eq!(back, r, "{v}");
-                for (key, present) in
-                    [("reason", r.reason.is_some()), ("retry", r.retry.is_some()), ("answer_rev", r.answer_rev.is_some())]
-                {
+                for (key, present) in [
+                    ("reason", r.reason.is_some()),
+                    ("retry", r.retry.is_some()),
+                    ("answer_rev", r.answer_rev.is_some()),
+                    ("detail", r.detail.is_some()),
+                ] {
                     assert_eq!(v.get(key).is_some(), present, "{key}: {v}");
                 }
             }
             (_, other) => panic!("{other:?}"),
         }
     }
+
+    // `detail`, as §2.8 spells it: the four values, absent, and one from a
+    // newer daemon (`Unknown`, "Not sent · Retry").
+    for (detail, wire) in every_detail().into_iter().zip(["context_blocked", "queue_full", "ledger_full", "awaiting_owner"]) {
+        let (v, _) = through_the_wire(SessionEventWire::SurfaceResult(SurfaceResult { detail: Some(detail), ..unavailable.clone() }));
+        assert_eq!(
+            v,
+            json!({"ev": "surface_result", "client": 3, "action_id": "5b0c".repeat(8),
+                   "outcome": "refused", "reason": "unavailable", "retry": true, "detail": wire})
+        );
+    }
+    let read = |detail: Option<&str>| {
+        let mut v = json!({"ev": "surface_result", "client": 3, "action_id": "x", "outcome": "refused", "reason": "unavailable"});
+        if let Some(d) = detail {
+            v["detail"] = json!(d);
+        }
+        match SessionEventWire::from(serde_json::from_value::<WireSessionEvent>(v).unwrap()) {
+            SessionEventWire::SurfaceResult(r) => r.detail,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(read(None), None);
+    assert_eq!(read(Some("queue_full")), Some(SurfaceUnavailable::QueueFull));
+    assert_eq!(read(Some("cosmic_rays")), Some(SurfaceUnavailable::Unknown));
 }
 
 /// §2.4's command, as its example spells it, through a client frame:
@@ -241,6 +287,8 @@ fn attached_surfaces_round_trip() {
 /// notice an unknown event gets; a `surface_result` with an outcome or
 /// reason this build doesn't know reads them as `Unknown`. A failed frame
 /// reads as a dead socket, and `Attached` is what every reconnect needs.
+/// A verb this build doesn't know is one it doesn't implement (v3.4 #4):
+/// it leaves `offers`, and the card stays.
 #[test]
 fn a_card_this_build_cannot_read_never_fails_the_frame() {
     let card = test_card(1);
@@ -250,25 +298,41 @@ fn a_card_this_build_cannot_read_never_fails_the_frame() {
     field["from_the_future"] = json!(1);
     let mut verb = serde_json::to_value(&card).unwrap();
     verb["offers"] = json!(["revise", "forget"]);
+    let mut verbs = serde_json::to_value(&card).unwrap();
+    verbs["offers"] = json!(["forget", 7]);
+    let no_verbs = SurfaceState { offers: vec![], ..card.clone() };
 
-    for bad in [&phase, &field, &verb] {
+    let event = |surface: &serde_json::Value| {
         let line = json!({"type": "event", "session_id": "wire-1", "seq": 9, "ts": chrono::Utc::now(),
-                          "event": {"ev": "surface", "surface": bad}})
+                          "event": {"ev": "surface", "surface": surface}})
         .to_string();
         match decode_line::<DaemonFrame>(&line).unwrap() {
-            DaemonFrame::Event(w) => match Envelope::from(w).event {
-                SessionEventWire::SystemNotice(t) => assert!(t.contains("newer daemon"), "{t}"),
-                other => panic!("{other:?}"),
-            },
+            DaemonFrame::Event(w) => Envelope::from(w).event,
             other => panic!("{other:?}"),
+        }
+    };
+    for bad in [&phase, &field] {
+        match event(bad) {
+            SessionEventWire::SystemNotice(t) => assert!(t.contains("newer daemon"), "{t}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    for (newer, kept) in [(&verb, &card), (&verbs, &no_verbs)] {
+        match event(newer) {
+            SessionEventWire::Surface(c) => assert_eq!(*c, *kept, "{newer}"),
+            other => panic!("{newer}: {other:?}"),
         }
     }
 
     let line = encode_line(&DaemonFrame::Attached(AttachedWire::new(ClientId(1), snapshot(vec![card.clone()])))).unwrap();
     let mut v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
-    v["surfaces"].as_array_mut().unwrap().extend([phase, field, verb, json!(7)]);
+    v["surfaces"].as_array_mut().unwrap().extend([phase, field, verb, verbs, json!(7)]);
     match decode_line::<DaemonFrame>(&v.to_string()).unwrap() {
-        DaemonFrame::Attached(a) => assert_eq!(a.into_snapshot().1.surfaces, vec![card.clone()]),
+        DaemonFrame::Attached(a) => {
+            let kept = a.into_snapshot().1.surfaces;
+            assert_eq!(kept, vec![card.clone(), card.clone(), no_verbs]);
+            assert_eq!(kept[1].offers, [Verb::Revise]);
+        }
         other => panic!("{other:?}"),
     }
     v["surfaces"] = json!({"not": "a list"});
@@ -303,6 +367,7 @@ fn an_older_reader_reads_the_new_events_as_unknown() {
         reason: None,
         retry: None,
         answer_rev: Some(1),
+        detail: None,
     };
     for (tag, event) in [
         ("surface", SessionEventWire::Surface(Box::new(card.clone()))),

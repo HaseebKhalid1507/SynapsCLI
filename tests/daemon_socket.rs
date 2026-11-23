@@ -488,7 +488,91 @@ async fn digest_client_never_receives_message_history() {
     d.wait().await;
 }
 
-/// Phase 4 §2.3 (B4): a Digest client attaching to a ~20 MB history reads a
+/// Agent cards (agent-ui §2.1, C3), through the real pump: the session
+/// sends a `surface` and a `surface_result` (the echo actor answers a
+/// `SurfaceAction` with both, as C4a's daemon will). A client that declared
+/// the catalog gets both; one that didn't (this build's TUI, an older
+/// client, Full or Digest) gets neither, and the turn after them in full.
+#[tokio::test]
+#[serial]
+async fn card_traffic_reaches_only_a_client_with_the_catalog() {
+    let guard = HomeGuard::new();
+    let run = guard.base_dir().join("run");
+    let d = start(&run).await;
+    let paths = d.paths.clone();
+
+    let mut hello = Hello::new(ClientKind::Test);
+    hello.client.capabilities.surfaces = 1;
+    let conn = SocketTransport::connect(&paths.sock, hello).await.unwrap();
+    let (mut capable, _) = SocketTransport::attach(
+        conn,
+        Attach::create(SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() }, AttachMode::Mirror),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(next(&mut capable).await.event, SessionEventWire::ClientJoined { .. }));
+    let sid = capable.session_id().clone();
+    let mut old = Vec::new();
+    for hello in [Hello::new(ClientKind::Test), Hello::new(ClientKind::Test).with_history(HistoryMode::Digest)] {
+        assert_eq!(hello.client.capabilities.surfaces, 0);
+        let conn = SocketTransport::connect(&paths.sock, hello).await.unwrap();
+        let (mut t, _) =
+            SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await.unwrap();
+        assert!(matches!(next(&mut capable).await.event, SessionEventWire::ClientJoined { .. }));
+        for o in old.iter_mut() {
+            assert!(matches!(next(o).await.event, SessionEventWire::ClientJoined { .. }));
+        }
+        assert!(matches!(next(&mut t).await.event, SessionEventWire::ClientJoined { .. }));
+        old.push(t);
+    }
+
+    capable
+        .send(SessionCommand::SurfaceAction {
+            surface_id: "s_3f2a91c0d4e2a871".into(),
+            contract: format!("c1:{}", "9d".repeat(16)),
+            action_id: "5b0c".repeat(8),
+            expect_rev: 1,
+            epoch: 4,
+            verb: agent_engine::ui::Verb::Revise,
+            values: Some(serde_json::json!({"choice": "Leave it"})),
+        })
+        .await
+        .unwrap();
+    capable.send(SessionCommand::Submit { text: "after".into(), attachments: vec![] }).await.unwrap();
+
+    async fn until_conversation(t: &mut SocketTransport) -> Vec<SessionEventWire> {
+        let mut seen = Vec::new();
+        loop {
+            let e = next(t).await.event;
+            let done = matches!(e, SessionEventWire::Conversation(_));
+            seen.push(e);
+            if done {
+                return seen;
+            }
+        }
+    }
+    let cards = |seen: &[SessionEventWire]| {
+        seen.iter().filter(|e| matches!(e, SessionEventWire::Surface(_) | SessionEventWire::SurfaceResult(_))).count()
+    };
+    let seen = until_conversation(&mut capable).await;
+    match &seen[..2] {
+        [SessionEventWire::Surface(c), SessionEventWire::SurfaceResult(r)] => {
+            assert_eq!(**c, agent_engine::session::wire::test_card(1));
+            assert_eq!((r.client, r.action_id.as_str()), (capable.client_id(), "5b0c".repeat(8).as_str()));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(cards(&seen), 2);
+    for t in old.iter_mut() {
+        let seen = until_conversation(t).await;
+        assert_eq!(cards(&seen), 0, "{seen:?}");
+        assert!(matches!(seen[0], SessionEventWire::TurnStarted { .. }), "{seen:?}");
+    }
+
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
 /// SMALL `Attached` frame (tail only), keeps no mirror, and its
 /// `Conversation` events carry `messages_len` with empty `api_messages` —
 /// no `Query{Messages}` resync ever fires.

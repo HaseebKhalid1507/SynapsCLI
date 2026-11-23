@@ -1302,6 +1302,29 @@ mod tests {
                     w.write_all(encode_line(&bye).unwrap().as_bytes()).await.unwrap();
                     break;
                 }
+                // An `Attached` after the attach (unexpected): its card's
+                // answer carries `ANSWER_SENTINEL`.
+                ClientFrame::Cmd { cmd: SessionCommand::Submit { text, .. }, .. } if text == "unexpected-attached" => {
+                    let mut card = crate::session::wire::test_card(1);
+                    card.answer.as_mut().unwrap().values = serde_json::from_value(serde_json::json!({"choice": answer_sentinel()})).unwrap();
+                    DaemonFrame::Attached(AttachedWire::new(
+                        ClientId(7),
+                        AttachSnapshot {
+                            meta: crate::session::handle::echo::meta_for(&sid),
+                            view: crate::session::handle::echo::view_for(),
+                            conversation: ConversationSnapshot::default(),
+                            streaming: false,
+                            replay: vec![],
+                            pending_prompts: vec![],
+                            clients: vec![],
+                            roster: Vec::new(),
+                            client_input: ClientInput::wire_default(),
+                            input_owner: Some(ClientId(7)),
+                            display_tail: None,
+                            surfaces: vec![card],
+                        },
+                    ))
+                }
                 ClientFrame::Cmd { cmd: SessionCommand::Submit { text, .. }, .. } => {
                     seq += 1;
                     DaemonFrame::Event(WireEnvelope {
@@ -1405,6 +1428,61 @@ mod tests {
             }
             w.write_all(bytes.as_bytes()).await.unwrap();
         }
+    }
+
+    /// An agent card's answer, as only the user may see it: 31337 bytes, so
+    /// its length is as distinctive as its text.
+    fn answer_sentinel() -> String {
+        let head = "C3-ANSWER-SENTINEL-";
+        format!("{head}{}", "q".repeat(31337 - head.len()))
+    }
+
+    /// An unexpected frame after the attach is traced by its type only: an
+    /// `Attached` carries agent cards and their answers (C3), and neither
+    /// the answer nor its length ever reaches a log.
+    #[tokio::test]
+    async fn an_unexpected_frame_never_traces_a_card_answer() {
+        struct Cap(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Cap {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || Cap(sink.clone()))
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (_d, path) = sock();
+        let l = Listener::bind(&path).unwrap();
+        let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
+            .await
+            .unwrap();
+        t.send(SessionCommand::Submit { text: "unexpected-attached".into(), attachments: vec![] }).await.unwrap();
+        t.send(SessionCommand::Submit { text: "after".into(), attachments: vec![] }).await.unwrap();
+        match t.next_event().await.map(|e| e.event) {
+            Some(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(s)))) => assert_eq!(s, "after"),
+            other => panic!("{other:?}"),
+        }
+        t.detach().await;
+        let _ = srv.await;
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("unexpected frame after attach: attached"), "the branch ran: {logs}");
+        let sentinel = answer_sentinel();
+        assert!(!logs.contains("C3-ANSWER-SENTINEL"), "{logs}");
+        assert!(!logs.contains(&sentinel.len().to_string()), "{logs}");
     }
 
     fn sock() -> (tempfile::TempDir, std::path::PathBuf) {
