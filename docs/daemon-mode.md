@@ -854,7 +854,8 @@ C: bye | socket close = Detach (turn keeps running)
   token/secret/key names). Client → daemon `Answer.value` (e.g. a sudo password) is forwarded to the actor
   and nowhere else: `ClientFrame`'s `Debug` redacts `Answer`/`Submit`/`Steer` bodies, and
   `tests/daemon_no_tui_dep.rs::daemon_never_traces_answer_bodies` greps the daemon + socket transport
-  sources for any `tracing::` line mentioning `answer`/`value`.
+  sources for any `tracing::` line mentioning `answer`/`value`/`surface` (an agent card carries its
+  answer's values; `SurfaceAction`'s `Debug` redacts them too).
 - A bash tool command raises a sudo password prompt only through sudo's askpass hook, verified as a
   set-uid sudo inside that tool call ([sudo-askpass.md](sudo-askpass.md)), never from its output.
 - Backpressure, never silent drops: bounded writer queues both ways (`CMD_CHAN_CAP` = 256);
