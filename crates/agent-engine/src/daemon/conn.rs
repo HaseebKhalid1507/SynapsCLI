@@ -328,6 +328,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                     Err(super::reload::ReloadError::ExecFailed(e)) => {
                         let _ = tx.send(DaemonFrame::Error { session_id: None, message: format!("reload: {e}") }).await;
                     }
+                    // Agent cards (§3.10): names the session and the reason.
+                    Err(e @ super::reload::ReloadError::Aborted(_)) => {
+                        let _ = tx.send(DaemonFrame::Error { session_id: None, message: e.to_string() }).await;
+                    }
                     Ok(prepared) => {
                         // Tell the requester, flush, close — then exec.
                         pages.shutdown().await;

@@ -852,6 +852,7 @@ async fn handle_compact(
                     pending_events: Vec::new(),
                     queued_message: None,
                     hook_source: "manual".to_string(),
+                    successor_id: None,
                 },
             )
             .await

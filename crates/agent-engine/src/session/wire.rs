@@ -112,8 +112,10 @@ pub const RESERVED_QUERY_ID_BASE: u64 = 1 << 63;
 pub const DIGEST_RESYNC_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE;
 /// The daemon's idle monitor probes `Status` under this id.
 pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
-/// `Checkpoint` replies `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`
-/// so `reload.rs` can await it per session.
+/// `Checkpoint` replies `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true,
+/// record}}` so `reload.rs` can await it per session; `{ok:false,
+/// reason:"ui_store"|"history"}` when its agent-card barrier failed
+/// (agent-ui §3.10), which stops the reload.
 pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
 /// `SettingChanged{id}` broadcast when an engine command (`/model`,
 /// `/thinking`, …) changed the view: not a reply to any client's `Set`

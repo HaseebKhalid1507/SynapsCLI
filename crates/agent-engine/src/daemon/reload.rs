@@ -102,6 +102,9 @@ pub enum ReloadError {
     Refused(String),
     /// `execv` returned: the old image continues; sessions are checkpointed.
     ExecFailed(String),
+    /// A session's checkpoint barrier failed (agent cards, §3.10): every
+    /// session got `ReloadAborted`; the old image continues.
+    Aborted(String),
 }
 
 impl std::fmt::Display for ReloadError {
@@ -109,6 +112,7 @@ impl std::fmt::Display for ReloadError {
         match self {
             Self::Refused(w) => write!(f, "reload refused: {w}"),
             Self::ExecFailed(e) => write!(f, "reload exec failed: {e}"),
+            Self::Aborted(why) => write!(f, "reload aborted: {why}"),
         }
     }
 }
@@ -329,14 +333,24 @@ pub async fn probe_version(exe: &Path) -> Result<PrintVersion, String> {
 
 /// `Checkpoint{Reload}` → the actor's `SessionReloadRecord` (`None` when
 /// the checkpoint did not confirm in budget).
-async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
+/// What a session's reload checkpoint said.
+#[derive(Debug)]
+enum Checkpointed {
+    Done(SessionReloadRecord),
+    /// `{"ok":false,"reason":…}`: its agent-card barrier failed (§3.10).
+    Failed(String),
+    /// No usable reply in the budget.
+    NoReply,
+}
+
+async fn checkpoint_one(handle: SessionHandle) -> Checkpointed {
     let mut rx = handle.subscribe();
     if handle
         .send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload })
         .await
         .is_err()
     {
-        return None;
+        return Checkpointed::NoReply;
     }
     let wait = async {
         loop {
@@ -344,16 +358,35 @@ async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
                 Ok(env) => {
                     if let SessionEventWire::QueryResult { id, value } = env.event {
                         if id == CHECKPOINT_QUERY_ID {
-                            return serde_json::from_value(value["record"].clone()).ok();
+                            return checkpoint_reply(&value);
                         }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Checkpointed::NoReply,
             }
         }
     };
-    tokio::time::timeout(CHECKPOINT_BUDGET, wait).await.unwrap_or(None)
+    tokio::time::timeout(CHECKPOINT_BUDGET, wait).await.unwrap_or(Checkpointed::NoReply)
+}
+
+fn checkpoint_reply(value: &serde_json::Value) -> Checkpointed {
+    if value["ok"] == false {
+        let reason = value["reason"].as_str().unwrap_or("ui_store");
+        return Checkpointed::Failed(reason.to_string());
+    }
+    serde_json::from_value(value["record"].clone()).map_or(Checkpointed::NoReply, Checkpointed::Done)
+}
+
+/// Why a reload must stop for this session (§3.10), if it must: its
+/// barrier failed, or it didn't answer while it held agent-card state
+/// (decision 12: an unknown barrier is not a success).
+fn barrier_failure(h: &SessionHandle, c: &Checkpointed) -> Option<String> {
+    match c {
+        Checkpointed::Failed(reason) => Some(format!("session {}: {reason}", h.id)),
+        Checkpointed::NoReply if h.ui_barrier() => Some(format!("session {}: ui_store (no reply in time)", h.id)),
+        _ => None,
+    }
 }
 
 /// The session as it IS: the actor's record when the checkpoint confirmed,
@@ -495,11 +528,26 @@ pub async fn prepare(
     let handles = state.live_sessions();
     let results = futures::future::join_all(handles.iter().cloned().map(checkpoint_one)).await;
     let mut sessions = Vec::with_capacity(handles.len());
-    for (h, rec) in handles.iter().zip(results) {
-        if rec.is_none() {
-            tracing::warn!(session = %h.id, "reload: checkpoint did not confirm; recording from the handle");
+    let mut failed = Vec::new();
+    for (h, c) in handles.iter().zip(results) {
+        if let Some(why) = barrier_failure(h, &c) {
+            failed.push(why);
         }
+        let rec = match c {
+            Checkpointed::Done(r) => Some(r),
+            _ => {
+                tracing::warn!(session = %h.id, "reload: checkpoint did not confirm; recording from the handle");
+                None
+            }
+        };
         sessions.push(record(h, rec));
+    }
+    // Agent cards (§3.10): a failed or unknown barrier stops the reload.
+    if !failed.is_empty() {
+        tracing::warn!(sessions = %failed.join("; "), "reload: agent-card barrier failed; aborting");
+        abort_checkpoints(state).await;
+        state.reloading.store(false, Ordering::SeqCst);
+        return Err(ReloadError::Aborted(format!("agent cards couldn't be saved ({})", failed.join("; "))));
     }
 
     // 3. reload-state (0600, atomic).

@@ -85,6 +85,7 @@ fn transition(policy: CompactionPolicy) -> CompactionTransition {
         pending_events: Vec::new(),
         queued_message: None,
         hook_source: "phase5-harness".into(),
+        successor_id: None,
     }
 }
 

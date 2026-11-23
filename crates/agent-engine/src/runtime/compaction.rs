@@ -757,6 +757,10 @@ pub struct CompactionTransition {
     /// Frontend source tag for the `on_compaction` hook payload
     /// (e.g. "manual", "auto").
     pub hook_source: String,
+    /// The linked successor's id, minted by the caller: agent cards write
+    /// `<successor>.ui` before the transition (agent-ui §3.11). `None`:
+    /// minted here. Ignored in place.
+    pub successor_id: Option<String>,
 }
 
 /// Monotonic count of SUCCESSFUL compaction transitions applied through
@@ -847,6 +851,9 @@ pub async fn apply_compaction(
 
             let mut successor =
                 Session::from_compaction_record(current, &outcome.summary_text, record);
+            if let Some(id) = &transition.successor_id {
+                successor.id.clone_from(id);
+            }
             successor.api_messages.extend(extra_messages);
 
             // Step 1: save the successor. Failure here changes nothing.
@@ -1008,6 +1015,7 @@ mod transition_tests {
             pending_events: Vec::new(),
             queued_message: None,
             hook_source: "manual".to_string(),
+            successor_id: None,
         }
     }
 
@@ -1134,6 +1142,7 @@ mod transition_tests {
                 pending_events: vec!["⚡ [event] kuma: jellyfin DOWN".into()],
                 queued_message: Some("queued while compacting".into()),
                 hook_source: "manual".into(),
+                successor_id: None,
             },
         )
         .await

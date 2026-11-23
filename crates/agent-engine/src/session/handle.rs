@@ -45,6 +45,11 @@ pub struct Presence {
     /// live cards.
     pub surfaces_waiting: u32,
     pub surfaces_open: u32,
+    /// Host-only (agent-ui §3.10, decision 12): this session holds card
+    /// state a reload barrier protects (open cards, unsettled answers, a
+    /// commit in flight or a transition not yet committed). A reload
+    /// whose checkpoint it doesn't answer in time aborts.
+    pub ui_barrier: bool,
     // PR 3: `saved: daemon::saved::SavedFacts` (the actor driver), with
     // `chain_facts` walked at create from the `parent_session` headers, so
     // the hub can retire a session as the row `CatalogPage` will list.
@@ -376,6 +381,11 @@ impl SessionHandle {
     #[cfg(any(test, feature = "testing"))]
     pub fn set_journal_for_test(&self, cell: JournalCell) {
         self.journal.store(Arc::new(cell));
+    }
+
+    /// [`Presence::ui_barrier`].
+    pub fn ui_barrier(&self) -> bool {
+        self.presence.load().ui_barrier
     }
 
     /// Clients / input owner / pending prompts as last published.

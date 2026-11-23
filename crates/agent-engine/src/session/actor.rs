@@ -1227,10 +1227,16 @@ impl SessionActor {
         // This exact state is already queued or on disk — unless the last
         // write failed, in which case it is queued again.
         if self.last_queued_save.as_ref() == Some(&key) && self.persister.saves_ok() {
+            // Agent cards: that save holds the same history.
+            if let Some(t) = self.surfaces.last_ticket.clone() {
+                self.note_save_ticket(t);
+            }
             return;
         }
         self.last_queued_save = Some(key);
-        self.persister.save(session);
+        let ticket = self.persister.save(session);
+        self.surfaces.last_ticket = Some(ticket.clone());
+        self.note_save_ticket(ticket);
     }
 
     /// Wait, at most `SAVE_TIMEOUT`, until every queued save and draft
@@ -1434,6 +1440,7 @@ impl SessionActor {
             owning_client: self.owned.as_ref().and_then(|o| o.client),
             surfaces_waiting,
             surfaces_open,
+            ui_barrier: self.surfaces.barrier_needed(),
         }));
         self.publish_workers();
     }
@@ -1601,6 +1608,9 @@ impl SessionActor {
             // Ends with its owner instead.
             && self.owned.is_none()
             && self.driver.is_none()
+            // Agent cards (T22): parking waits until every answer in
+            // history is settled.
+            && !self.cards_unsettled()
     }
 
     /// (E-P7, §S3) Return the first breached spend ceiling, if any, as
@@ -4389,19 +4399,32 @@ impl SessionActor {
                 }
                 let policy: CompactionPolicy = self.config.compaction_policy.into();
                 let queued = self.conv.queued_message.clone();
-                let applied = apply_compaction(
-                    &self.runtime,
-                    &self.conv.session,
-                    &self.conv.api_messages,
-                    &outcome,
-                    CompactionTransition {
-                        policy,
-                        pending_events: self.conv.pending_events.clone(),
-                        queued_message: queued.clone(),
-                        hook_source: job.source.clone(),
-                    },
-                )
-                .await;
+                // Agent cards (§3.11): the handoff's Prepare, then the
+                // transition, then its Finish or Rollback. Unsettled
+                // answers fail the compaction; it is retried later.
+                let successor_id = (policy == CompactionPolicy::LinkedSuccessor)
+                    .then(|| agent_core::session::mint_session_id(chrono::Utc::now()));
+                let applied = match self.handoff_prepare(successor_id.as_deref()).await {
+                    Ok(handoff) => {
+                        let applied = apply_compaction(
+                            &self.runtime,
+                            &self.conv.session,
+                            &self.conv.api_messages,
+                            &outcome,
+                            CompactionTransition {
+                                policy,
+                                pending_events: self.conv.pending_events.clone(),
+                                queued_message: queued.clone(),
+                                hook_source: job.source.clone(),
+                                successor_id,
+                            },
+                        )
+                        .await;
+                        self.handoff_finish(handoff, applied.is_ok());
+                        applied
+                    }
+                    Err(e) => Err(crate::error::RuntimeError::Session(e)),
+                };
                 match applied {
                     Ok(applied) => {
                         let previous = applied.previous_session_id.clone();
@@ -4482,19 +4505,27 @@ impl SessionActor {
                 if !self.persister.flush().await {
                     tracing::warn!(session = %self.id, "compaction: an earlier save failed");
                 }
-                apply_compaction(
-                    &self.runtime,
-                    &self.conv.session,
-                    &self.conv.api_messages,
-                    &outcome,
-                    CompactionTransition {
-                        policy: CompactionPolicy::InPlace,
-                        pending_events: Vec::new(),
-                        queued_message: None,
-                        hook_source: source.to_string(),
-                    },
-                )
-                .await
+                match self.handoff_prepare(None).await {
+                    Ok(handoff) => {
+                        let applied = apply_compaction(
+                            &self.runtime,
+                            &self.conv.session,
+                            &self.conv.api_messages,
+                            &outcome,
+                            CompactionTransition {
+                                policy: CompactionPolicy::InPlace,
+                                pending_events: Vec::new(),
+                                queued_message: None,
+                                hook_source: source.to_string(),
+                                successor_id: None,
+                            },
+                        )
+                        .await;
+                        self.handoff_finish(handoff, applied.is_ok());
+                        applied
+                    }
+                    Err(e) => Err(crate::error::RuntimeError::Session(e)),
+                }
             }
             Err(e) => Err(e),
         };
@@ -5104,6 +5135,10 @@ impl SessionActor {
         }
         if self.streaming {
             self.cancel_turn(interrupt).await;
+        } else if reload {
+            // Agent cards (T17): the epoch rises with or without a turn;
+            // the cancelled turn's tail already raised it.
+            self.surfaces_stop(crate::ui::StopKind::Reload);
         }
         // Again after the turn cancel: every worker to await, including
         // any the cancelled turn registered meanwhile.
@@ -5118,6 +5153,14 @@ impl SessionActor {
         // awaited, by `cancel_turn`).
         if !self.save().await {
             tracing::warn!(session = %self.id, "checkpoint: save failed or timed out");
+        }
+        // Agent cards (§3.10): the barrier, within the checkpoint budget. A
+        // failure is the checkpoint's reply and the reload aborts; the
+        // fence is set either way, so `ReloadAborted` lifts it and wakes
+        // the workers stopped above.
+        let barrier = if reload { self.reload_barrier().await } else { Ok(()) };
+        if let Err(why) = barrier {
+            tracing::warn!(session = %self.id, reason = why, "checkpoint: agent-card barrier failed");
         }
         let notice = match reason {
             CheckpointReason::Reload => {
@@ -5147,10 +5190,11 @@ impl SessionActor {
             });
         }
         let record = serde_json::to_value(record).unwrap_or_default();
-        self.emit(SessionEventWire::QueryResult {
-            id: super::wire::CHECKPOINT_QUERY_ID,
-            value: serde_json::json!({ "ok": true, "record": record }),
-        });
+        let value = match barrier {
+            Ok(()) => serde_json::json!({ "ok": true, "record": record }),
+            Err(why) => serde_json::json!({ "ok": false, "reason": why }),
+        };
+        self.emit(SessionEventWire::QueryResult { id: super::wire::CHECKPOINT_QUERY_ID, value });
     }
 
     /// The workers a reload carries for this session: every registry entry,
@@ -5999,7 +6043,7 @@ impl SessionTask {
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
                 Some(req) = actor.surfaces.tool_rx.recv() => actor.on_ui_tool(req),
-                _ = super::surfaces::surface_tick(actor.surfaces.committing()) => actor.poll_surfaces().await,
+                _ = super::surfaces::surface_tick(actor.surfaces.tick()) => actor.poll_surfaces().await,
                 // A held wake (and its permit) stays queued.
                 _ = queue.notified(), if !actor.holds(WorkSource::QueueWake) => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => {

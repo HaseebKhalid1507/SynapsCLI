@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_core::core::session_surfaces::{
-    self as ss, Images, Lifecycle, Loaded, Op, Outcome, Poll, Refusal, Sidecar, StoreConfig, UiFs,
-    UiStore,
+    self as ss, Images, Lifecycle, Loaded, Op, Outcome, Poll, Receipt, Refusal, Sidecar, StoreConfig,
+    Ticket, UiFs, UiStore,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -40,6 +40,8 @@ use super::types::{
 pub const CATALOG: u32 = 1;
 /// How often an in-flight commit's outcome is looked for.
 const POLL_EVERY: Duration = Duration::from_millis(10);
+/// How often a history save's receipt is looked for (T22).
+const RECEIPT_EVERY: Duration = Duration::from_millis(50);
 /// §3.13 / §4.6: creations per turn and per hour, open live cards.
 pub const CREATES_PER_TURN: u32 = 4;
 pub const CREATES_PER_HOUR: usize = 20;
@@ -159,6 +161,15 @@ pub(crate) struct SurfaceTable {
     /// `ui` results this turn made, to mark on each adoption: `(call_id,
     /// card)` (§2.5, §3.6).
     results: Vec<(String, String)>,
+    /// T22: for each record in context, the first save ticket whose
+    /// history holds its mark (§3.11 "Recorded").
+    pub(crate) tickets: HashMap<String, Ticket>,
+    /// The ticket of the last queued history save.
+    pub(crate) last_ticket: Option<Ticket>,
+    /// A compaction handoff is between Prepare and Finish or Rollback
+    /// (§3.11), or a reload barrier runs (§3.10): accepted answers stay
+    /// queued (T8).
+    hold_routes: bool,
 }
 
 impl SurfaceTable {
@@ -177,6 +188,9 @@ impl SurfaceTable {
             buckets: HashMap::new(),
             handed: Vec::new(),
             results: Vec::new(),
+            tickets: HashMap::new(),
+            last_ticket: None,
+            hold_routes: false,
         }
     }
 
@@ -210,6 +224,18 @@ impl SurfaceTable {
         self.waiter.is_some()
     }
 
+    /// What the actor's tick waits for: a commit's outcome, or a save
+    /// receipt for an answer in context.
+    pub(crate) fn tick(&self) -> Tick {
+        if self.committing() {
+            Tick::Commit
+        } else if !self.tickets.is_empty() {
+            Tick::Receipt
+        } else {
+            Tick::Never
+        }
+    }
+
     fn open(&self) -> Option<&Open> {
         match &self.store {
             Store::Open(o) => Some(o),
@@ -228,6 +254,21 @@ impl SurfaceTable {
         self.projection()
             .map(|p| p.cards.into_iter().map(|c| c.state).collect())
             .unwrap_or_default()
+    }
+
+    /// Presence's host-only `ui_barrier` (§3.10, decision 12): open cards,
+    /// answers not yet settled, a commit in flight, or a transition not
+    /// yet committed.
+    pub(crate) fn barrier_needed(&self) -> bool {
+        let Some(o) = self.open() else {
+            return false;
+        };
+        if self.committing() || o.images.has_uncommitted() {
+            return true;
+        }
+        let live = o.images.live();
+        live.cards.iter().any(|c| c.state.phase == Phase::Open)
+            || live.ledger.iter().any(|r| r.delivery != ui::Delivery::Settled)
     }
 
     /// `(surfaces_waiting, surfaces_open)` for presence (§2.7).
@@ -250,13 +291,21 @@ impl SurfaceTable {
     }
 }
 
-/// Wakes the actor every [`POLL_EVERY`] while a commit is in flight;
-/// otherwise never.
-pub(crate) async fn surface_tick(committing: bool) {
-    if committing {
-        tokio::time::sleep(POLL_EVERY).await;
-    } else {
-        std::future::pending::<()>().await;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tick {
+    Commit,
+    Receipt,
+    Never,
+}
+
+/// Wakes the actor every [`POLL_EVERY`] while a commit is in flight, every
+/// [`RECEIPT_EVERY`] while an answer waits for its save receipt; otherwise
+/// never.
+pub(crate) async fn surface_tick(tick: Tick) {
+    match tick {
+        Tick::Commit => tokio::time::sleep(POLL_EVERY).await,
+        Tick::Receipt => tokio::time::sleep(RECEIPT_EVERY).await,
+        Tick::Never => std::future::pending::<()>().await,
     }
 }
 
@@ -594,6 +643,7 @@ impl SessionActor {
         self.surfaces.results.push((call_id_for_mark, id.clone()));
         let budget = o.store.config().budget;
         self.surfaces.waiter = Some(Waiter::Create { reply: Some(ReplyTo::new(reply, budget)), id });
+        self.publish_presence();
         None
     }
 
@@ -622,6 +672,7 @@ impl SessionActor {
         }
         let budget = o.store.config().budget;
         self.surfaces.waiter = Some(Waiter::Close { reply: Some(ReplyTo::new(reply, budget)), id });
+        self.publish_presence();
         None
     }
 
@@ -639,18 +690,29 @@ impl SessionActor {
         }
         if o.images.commit(&mut o.store, None).is_ok() {
             self.surfaces.waiter = Some(Waiter::Plain);
+            self.publish_presence();
         }
     }
 
     /// The tick: read the in-flight outcome, run what waited on it, then
     /// the next queued call.
     pub(crate) async fn poll_surfaces(&mut self) {
+        if !self.surfaces.committing() {
+            self.settle_recorded();
+            return;
+        }
+        self.poll_surfaces_with(Duration::ZERO).await;
+    }
+
+    /// One look at the in-flight commit, waiting up to `timeout` (a
+    /// Prepare's join).
+    async fn poll_surfaces_with(&mut self, timeout: Duration) {
         let Store::Open(o) = &mut self.surfaces.store else {
             self.surfaces.waiter = None;
             return;
         };
         let before = o.images.projection();
-        let poll = o.images.poll(&mut o.store, Duration::ZERO);
+        let poll = o.images.poll(&mut o.store, timeout);
         let lifecycle = Lifecycle::of(&poll);
         let done = matches!(poll, Poll::Done(_) | Poll::Idle);
         let after = o.images.projection();
@@ -736,6 +798,12 @@ impl SessionActor {
             self.publish_presence();
             if let Some(answer_id) = route {
                 self.route_answer(&answer_id).await;
+            }
+            // T22: settled records leave the ledger once that is durable,
+            // and a park that waited on them is armed again.
+            self.release_settled();
+            if self.attached.is_empty() && !self.cards_unsettled() {
+                self.rearm_park();
             }
             // What a stop or a delivery noted meanwhile commits next.
             self.surfaces_commit_noted();
@@ -983,6 +1051,7 @@ impl SessionActor {
         let deadline = tokio::time::Instant::now() + o.store.config().budget;
         self.surfaces.waiter =
             Some(Waiter::Action { client: c, action_id, answer_id, rev: 1, deadline, pending_sent: false });
+        self.publish_presence();
     }
 
     /// `may_wake(r)` (§3.9, R3-H2), evaluated at the start itself: the
@@ -1062,7 +1131,7 @@ impl SessionActor {
     /// T5–T8: route an answer that just became durable (§3.5).
     pub(crate) async fn route_answer(&mut self, answer_id: &str) {
         // T8: compaction running: stays queued, drained when it lands.
-        if self.compact.is_some() || self.compacting_inline {
+        if self.compact.is_some() || self.compacting_inline || self.surfaces.hold_routes {
             return;
         }
         if self.is_parked() {
@@ -1238,6 +1307,88 @@ impl SessionActor {
         }
     }
 
+    /// A history save was queued (`request_save`): every record in context
+    /// whose mark this history holds and that has no ticket yet gets this
+    /// one (§3.11: "the first ticket whose history holds its mark").
+    pub(crate) fn note_save_ticket(&mut self, ticket: Ticket) {
+        let Some(o) = self.surfaces.open() else {
+            return;
+        };
+        let live = o.images.live();
+        let waiting: Vec<String> = live
+            .ledger
+            .iter()
+            .filter(|r| r.delivery == ui::Delivery::InContext && !self.surfaces.tickets.contains_key(&r.answer_id))
+            .map(|r| r.answer_id.clone())
+            .collect();
+        if waiting.is_empty() || !self.conv.is_live() {
+            return;
+        }
+        let facts = ss::HistoryFacts::from_messages(&ticket.session_id, None, None, self.conv.api_messages.iter().map(|m| &**m));
+        for answer_id in waiting {
+            if facts.has_answer(&answer_id) {
+                self.surfaces.tickets.insert(answer_id, ticket.clone());
+            }
+        }
+    }
+
+    /// T22: a record whose ticket is `Saved` is `Recorded`, then settled by
+    /// the next commit.
+    fn settle_recorded(&mut self) {
+        let saved: Vec<String> = self
+            .surfaces
+            .tickets
+            .iter()
+            .filter(|(_, t)| self.persister.receipt(t) == Receipt::Saved)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if saved.is_empty() {
+            return;
+        }
+        let Store::Open(o) = &mut self.surfaces.store else {
+            self.surfaces.tickets.clear();
+            return;
+        };
+        for answer_id in saved {
+            self.surfaces.tickets.remove(&answer_id);
+            o.images.note(Op::Deliver { answer_id: answer_id.clone(), to: ui::Delivery::Recorded });
+            o.images.note(Op::Settle { answer_id });
+        }
+        self.surfaces_commit_noted();
+    }
+
+    /// Settled records leave the ledger, riding the next commit, once
+    /// their settlement is durable.
+    fn release_settled(&mut self) {
+        let Store::Open(o) = &mut self.surfaces.store else {
+            return;
+        };
+        let settled: Vec<String> = o
+            .images
+            .durable()
+            .ledger
+            .iter()
+            .filter(|r| r.delivery == ui::Delivery::Settled)
+            .map(|r| r.answer_id.clone())
+            .collect();
+        let live = o.images.live();
+        for answer_id in settled {
+            if live.record(&answer_id).is_some_and(|r| r.delivery == ui::Delivery::Settled) {
+                o.images.note(Op::Release { answer_id });
+            }
+        }
+    }
+
+    /// An answer is in history but not yet settled (T22): parking,
+    /// compaction and eviction wait for it.
+    pub(crate) fn cards_unsettled(&self) -> bool {
+        self.surfaces.open().is_some_and(|o| {
+            o.images.live().ledger.iter().any(|r| {
+                matches!(r.delivery, ui::Delivery::Handed | ui::Delivery::InContext | ui::Delivery::Recorded)
+            })
+        })
+    }
+
     /// T8's drain: after a compaction lands (or a wake), queued answers go
     /// into history. `true`: one may start a turn now.
     pub(crate) fn drain_queued_answers(&mut self) -> bool {
@@ -1269,6 +1420,254 @@ impl SessionActor {
         }
         self.surfaces_commit_noted();
         wake
+    }
+}
+
+impl SessionActor {
+    /// The reload barrier (§3.10), beside the checkpoint's save: join the
+    /// in-flight commit, every answer in context must have a `Saved`
+    /// receipt (they become `Recorded`), then one `checkpointed` commit
+    /// must be durable. `Err` names the reason the checkpoint reports:
+    /// `ui_store` or `history`. A chat without cards passes.
+    pub(crate) async fn reload_barrier(&mut self) -> Result<(), &'static str> {
+        let Some(budget) = self.surfaces_budget() else {
+            return Ok(());
+        };
+        self.surfaces.hold_routes = true;
+        let res = self.reload_barrier_inner(budget).await;
+        self.surfaces.hold_routes = false;
+        self.publish_presence();
+        res
+    }
+
+    async fn reload_barrier_inner(&mut self, budget: Duration) -> Result<(), &'static str> {
+        if !self.join_surfaces(budget).await {
+            return Err("ui_store");
+        }
+        let receipts = self.persister.receipts();
+        let Store::Open(o) = &mut self.surfaces.store else {
+            return Ok(());
+        };
+        let before = o.images.projection();
+        let res = ss::checkpoint_barrier(&mut o.images, &mut o.store, &self.surfaces.tickets, &receipts, budget);
+        let after = o.images.projection();
+        self.emit_card_changes(&before, &after);
+        match res {
+            Ok(()) => Ok(()),
+            Err(ss::BarrierFailure::History) => Err("history"),
+            Err(ss::BarrierFailure::UiStore(e)) => {
+                tracing::warn!(session = %self.id, "agent cards: reload barrier: {e}");
+                // A commit still unknown stays with the tick.
+                if self.surfaces.open().is_some_and(|o| o.images.in_flight()) {
+                    self.surfaces.waiter = Some(Waiter::Plain);
+                }
+                Err("ui_store")
+            }
+        }
+    }
+}
+
+/// A compaction handoff between Prepare and Finish (§3.11).
+pub(crate) struct Handoff {
+    /// The successor's prepared image; `None` in place.
+    successor: Option<Sidecar>,
+}
+
+impl SessionActor {
+    fn surfaces_budget(&self) -> Option<Duration> {
+        self.surfaces.open().map(|o| o.store.config().budget)
+    }
+
+    /// Join the in-flight commit, and whatever it set off, within `budget`.
+    async fn join_surfaces(&mut self, budget: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        while self.surfaces.committing() {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            self.poll_surfaces_with(left).await;
+        }
+        true
+    }
+
+    /// Commit what is noted plus `op`, and wait for it to be durable. A
+    /// commit still unknown at `budget` stays with the tick.
+    fn commit_durable(&mut self, op: Option<Op>, budget: Duration) -> Result<(), String> {
+        let Store::Open(o) = &mut self.surfaces.store else {
+            return Err("no card store".into());
+        };
+        let before = o.images.projection();
+        o.images.commit(&mut o.store, op).map_err(|r| format!("{r:?}"))?;
+        let poll = o.images.poll(&mut o.store, budget);
+        let after = o.images.projection();
+        let res = match poll {
+            Poll::Done(Outcome::Durable) | Poll::Idle => Ok(()),
+            Poll::Done(Outcome::NotPublished(e) | Outcome::Unsynced(e)) => Err(e),
+            Poll::Pending => {
+                self.surfaces.waiter = Some(Waiter::Plain);
+                Err("the card store didn't answer".into())
+            }
+        };
+        self.emit_card_changes(&before, &after);
+        res
+    }
+
+    /// A write outside the images (a successor's sidecar, or its removal),
+    /// joined within `budget`.
+    fn store_durable(&mut self, image: Option<&mut Sidecar>, remove: Option<&str>, budget: Duration) -> Result<(), String> {
+        let Store::Open(o) = &mut self.surfaces.store else {
+            return Err("no card store".into());
+        };
+        let issued = match (image, remove) {
+            (Some(img), _) => o.store.commit(img),
+            (None, Some(id)) => o.store.remove(id),
+            (None, None) => return Ok(()),
+        };
+        issued.map_err(|r| format!("{r:?}"))?;
+        match o.store.join(budget) {
+            Poll::Done(Outcome::Durable) | Poll::Idle => Ok(()),
+            Poll::Done(Outcome::NotPublished(e) | Outcome::Unsynced(e)) => Err(e),
+            Poll::Pending => Err("the card store didn't answer".into()),
+        }
+    }
+
+    /// Prepare (§3.11 step 1), when the summary lands: join the writer,
+    /// settle every answer in context, commit `compacting` on the parent
+    /// (the ledger cut), and for a successor write its prepared sidecar.
+    /// `Ok(None)`: this chat has no card store, nothing to hand off. `Err`:
+    /// the compaction fails, and is retried at the next boundary.
+    pub(crate) async fn handoff_prepare(&mut self, successor_id: Option<&str>) -> Result<Option<Handoff>, String> {
+        let Some(budget) = self.surfaces_budget() else {
+            return Ok(None);
+        };
+        self.surfaces.hold_routes = true;
+        let res = self.handoff_prepare_inner(successor_id, budget).await;
+        if res.is_err() {
+            self.surfaces.hold_routes = false;
+        }
+        res.map(Some)
+    }
+
+    async fn handoff_prepare_inner(&mut self, successor_id: Option<&str>, budget: Duration) -> Result<Handoff, String> {
+        // The fence: the in-flight commit's outcome, at the budget.
+        if !self.join_surfaces(budget).await {
+            return Err("card answers not yet saved: the card store didn't answer".into());
+        }
+        // Both receipts for every answer in context (T22).
+        let receipts = self.persister.receipts();
+        let Some(o) = self.surfaces.open() else {
+            return Err("no card store".into());
+        };
+        let live = o.images.live();
+        let mut settle = Vec::new();
+        for r in &live.ledger {
+            match r.delivery {
+                ui::Delivery::Handed => return Err(ss::HandoffError::Unsettled.to_string()),
+                ui::Delivery::InContext | ui::Delivery::Recorded => {
+                    let saved = r.delivery == ui::Delivery::Recorded
+                        || self.surfaces.tickets.get(&r.answer_id).is_some_and(|t| receipts.receipt(t) == Receipt::Saved);
+                    if !saved {
+                        return Err(ss::HandoffError::Unsettled.to_string());
+                    }
+                    settle.push(r.answer_id.clone());
+                }
+                _ => {}
+            }
+        }
+        if let Store::Open(o) = &mut self.surfaces.store {
+            for answer_id in settle {
+                self.surfaces.tickets.remove(&answer_id);
+                o.images.note(Op::Deliver { answer_id: answer_id.clone(), to: ui::Delivery::Recorded });
+                o.images.note(Op::Settle { answer_id });
+            }
+        }
+        if self.surfaces.open().is_some_and(|o| o.images.has_uncommitted()) {
+            self.commit_durable(None, budget)?;
+        }
+        // The cut.
+        let Some(o) = self.surfaces.open() else {
+            return Err("no card store".into());
+        };
+        let live = o.images.live();
+        let to = ss::HandoffTo {
+            session_id: successor_id.map_or_else(|| live.session_id.clone(), str::to_string),
+            base: agent_core::compaction::message_range_digest(&self.conv.api_messages),
+        };
+        let hx = ss::mint_hex128();
+        let (op, successor) = ss::prepare(&live, to, &hx).map_err(|e| e.to_string())?;
+        self.commit_durable(Some(op), budget)?;
+        let Some(mut successor) = successor else {
+            return Ok(Handoff { successor: None });
+        };
+        if let Err(e) = self.store_durable(Some(&mut successor), None, budget) {
+            self.handoff_rollback(Some(&successor.session_id), budget);
+            return Err(e);
+        }
+        Ok(Handoff { successor: Some(successor) })
+    }
+
+    /// Rollback (§3.11): the parent's writer removes `<successor>.ui`
+    /// first, then clears `compacting`.
+    fn handoff_rollback(&mut self, successor: Option<&str>, budget: Duration) {
+        if let Some(id) = successor {
+            if let Err(e) = self.store_durable(None, Some(id), budget) {
+                tracing::warn!(session = %self.id, "agent cards: rollback couldn't remove the successor's sidecar: {e}");
+            }
+        }
+        let Some(o) = self.surfaces.open() else {
+            return;
+        };
+        let op = ss::rollback(&o.images.live());
+        if let Err(e) = self.commit_durable(Some(op), budget) {
+            tracing::warn!(session = %self.id, "agent cards: handoff rollback not durable: {e}");
+        }
+    }
+
+    /// Finish (§3.11 step 3), or Rollback when the transition failed.
+    pub(crate) fn handoff_finish(&mut self, h: Option<Handoff>, applied: bool) {
+        let Some(h) = h else {
+            return;
+        };
+        self.surfaces.hold_routes = false;
+        let Some(budget) = self.surfaces_budget() else {
+            return;
+        };
+        if !applied {
+            let id = h.successor.as_ref().map(|s| s.session_id.clone());
+            self.handoff_rollback(id.as_deref(), budget);
+            return;
+        }
+        let Some(successor) = h.successor else {
+            let Some(o) = self.surfaces.open() else {
+                return;
+            };
+            let op = ss::finish_in_place(&o.images.live());
+            if let Err(e) = self.commit_durable(Some(op), budget) {
+                // Recovery finishes it: the history's base is `to.base`.
+                tracing::warn!(session = %self.id, "agent cards: in-place finish not durable: {e}");
+            }
+            return;
+        };
+        // The successor's sidecar is now the authority: bind the store to
+        // it and clear `prepared`; then the parent's last write, `moved_to`.
+        let Store::Open(o) = &mut self.surfaces.store else {
+            return;
+        };
+        let parent = o.images.live();
+        o.store.rebind(&successor.session_id);
+        o.images = Images::new(successor.clone());
+        let finish = ss::finish_successor(&successor);
+        if let Err(e) = self.commit_durable(Some(finish), budget) {
+            // Recovery step 0 proves it active from the parent's link.
+            tracing::warn!(session = %self.id, "agent cards: successor finish not durable: {e}");
+        }
+        let mut moved = parent.clone();
+        ss::apply(&mut moved, &ss::moved(&parent));
+        if let Err(e) = self.store_durable(Some(&mut moved), None, budget) {
+            // The parent has `compacted_into`: its sidecar is ignored.
+            tracing::warn!(session = %self.id, "agent cards: parent moved_to not durable: {e}");
+        }
     }
 }
 

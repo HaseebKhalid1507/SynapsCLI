@@ -1165,7 +1165,8 @@ pub enum SessionCommand {
     Resume { id: u64, query: String },
     /// (B1, used by C3 reload) cancel any turn (partial history + marker),
     /// abort compaction, save, close PTYs, emit Notice. Never ends the
-    /// session. Reply = `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`.
+    /// session. Reply = `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`,
+    /// or `{ok:false, reason}` when a reload's agent-card barrier failed.
     Checkpoint { reason: CheckpointReason },
     /// (B3) pin/unpin (`/pin on|off`, `--keep-warm`, `/keep-warm on|off`,
     /// `synaps daemon pin`). Published on `SessionHandle::pinned()`.
