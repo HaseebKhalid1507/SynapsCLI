@@ -1239,6 +1239,23 @@ pub(crate) fn build_codex_body(
     max_tokens: Option<u32>,
     prompt_cache_key: &str,
 ) -> serde_json::Value {
+    // GPT-6.2 appends the top-level `instructions` field AFTER `input`, so the
+    // system prompt goes in as the first `developer` input message (keeps the
+    // ordering and the cached prefix) and no top-level field is sent.
+    let gpt_6_2 = crate::runtime::openai::catalog::is_gpt_6_2_model(model);
+    let mut input = input;
+    if gpt_6_2 && !instructions.is_empty() {
+        if let Some(items) = input.as_array_mut() {
+            items.insert(
+                0,
+                json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{ "type": "input_text", "text": instructions }],
+                }),
+            );
+        }
+    }
     let mut body = json!({
         "model": model,
         "store": false,
@@ -1251,6 +1268,11 @@ pub(crate) fn build_codex_body(
         "text": { "verbosity": "medium" },
         "prompt_cache_key": prompt_cache_key,
     });
+    if gpt_6_2 {
+        if let Some(map) = body.as_object_mut() {
+            map.remove("instructions");
+        }
+    }
     if let Some(effort) = plan.wire_effort {
         body["reasoning"] = json!({ "effort": effort.as_str() });
     }
@@ -5098,6 +5120,88 @@ mod codex_wire_tests {
                 .unwrap_or_else(|| panic!("{level:?} must emit reasoning.effort"));
             assert_eq!(effort, expected, "{level:?}");
         }
+    }
+
+    /// GPT-6.2 request shape for one model: exact model id, reasoning.effort
+    /// with Off -> low, never flex/service_tier, and the system prompt as the
+    /// first `developer` input message instead of top-level `instructions`.
+    fn assert_gpt_6_2_request_shape(model: &str) {
+        let user = serde_json::json!({"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"hi"}]});
+        for (level, effort) in [
+            (ReasoningLevel::Off, "low"),
+            (ReasoningLevel::Low, "low"),
+            (ReasoningLevel::Medium, "medium"),
+            (ReasoningLevel::High, "high"),
+            (ReasoningLevel::XHigh, "xhigh"),
+            (ReasoningLevel::Max, "max"),
+            (ReasoningLevel::Ultra, "xhigh"),
+        ] {
+            let body = body_for_level(
+                model,
+                level,
+                serde_json::json!([user.clone()]),
+                "You are Synaps.".to_string(),
+                vec![],
+                None,
+                None,
+            );
+            assert_eq!(body["model"], model);
+            assert_eq!(body["reasoning"]["effort"], effort, "{model} {level:?}");
+            assert!(body.get("instructions").is_none(), "{model}: {body}");
+            assert!(body.get("service_tier").is_none(), "{model}: never flex");
+            assert!(!body.to_string().contains("flex"), "{model}");
+            let input = body["input"].as_array().expect("input");
+            assert_eq!(input.len(), 2, "{model}");
+            assert_eq!(input[0]["type"], "message");
+            assert_eq!(input[0]["role"], "developer");
+            assert_eq!(input[0]["content"][0]["type"], "input_text");
+            assert_eq!(input[0]["content"][0]["text"], "You are Synaps.");
+            assert_eq!(input[1], user);
+        }
+    }
+
+    #[test]
+    fn gpt_6_2_astra_body_leads_with_developer_prompt_and_never_sends_none_or_flex() {
+        assert_gpt_6_2_request_shape("gpt-6.2-astra");
+    }
+
+    #[test]
+    fn gpt_6_2_sol_body_leads_with_developer_prompt_and_never_sends_none_or_flex() {
+        assert_gpt_6_2_request_shape("gpt-6.2-sol");
+    }
+
+    /// GPT-6.1 Sol is unchanged: top-level `instructions`, untouched input,
+    /// Off omits reasoning, no service tier.
+    #[test]
+    fn gpt_6_1_sol_body_keeps_top_level_instructions_and_omitted_off() {
+        let user = serde_json::json!({"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"hi"}]});
+        let body = body_for_level(
+            "gpt-6.1-sol",
+            ReasoningLevel::Off,
+            serde_json::json!([user.clone()]),
+            "You are Synaps.".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(body["model"], "gpt-6.1-sol");
+        assert_eq!(body["instructions"], "You are Synaps.");
+        assert_eq!(body["input"], serde_json::json!([user]));
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("service_tier").is_none());
+        let low = body_for_level(
+            "gpt-6.1-sol",
+            ReasoningLevel::Low,
+            serde_json::json!([]),
+            "You are Synaps.".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(low["reasoning"]["effort"], "low");
+        assert_eq!(low["instructions"], "You are Synaps.");
     }
 
     #[test]

@@ -48,6 +48,21 @@ pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
         ReasoningLevel,
         Option<CodexMultiAgentVersion>,
     ) = match model_id {
+        // GPT-6.2 generation (official model pages): Responses API,
+        // reasoning.effort, multi-agent. No Codex ladder or default is
+        // published, so each row copies its predecessor: Sol as gpt-6.1-sol,
+        // Astra as gpt-6-astra. `none` is rejected by the API, so Off is sent
+        // as low (see `codex_effort_floor_is_low`).
+        "gpt-6.2-sol" => (
+            &[Low, Medium, High, XHigh, Max, Ultra],
+            Low,
+            Some(CodexMultiAgentVersion::V2),
+        ),
+        "gpt-6.2-astra" => (
+            &[Low, Medium, High, XHigh, Max, Ultra],
+            Medium,
+            Some(CodexMultiAgentVersion::V2),
+        ),
         // GPT-6.1 generation. Live row (2026-10-04, client_version >= 0.159.0):
         // default low, full ladder through Ultra, multi-agent v2 with
         // multi_agent_reasoning_effort xhigh (Ultra requests use xhigh).
@@ -84,16 +99,36 @@ pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
     };
     Some(ReasoningSupport::CodexNamed {
         supported: supported.to_vec(),
-        multi_agent_reasoning_effort: matches!(model_id, "gpt-6-astra" | "gpt-6.1-sol")
-            .then_some(XHigh),
+        multi_agent_reasoning_effort: matches!(
+            model_id,
+            "gpt-6.2-sol" | "gpt-6.2-astra" | "gpt-6-astra" | "gpt-6.1-sol"
+        )
+        .then_some(XHigh),
         default_level: Some(default_level),
         multi_agent_version,
     })
 }
 
+/// GPT-6.2 models (bare id or `openai-codex/`-qualified, exact ids only).
+/// Their API rejects `reasoning.effort: none` (use `low` for none/minimal)
+/// and appends the top-level `instructions` field after `input`, so the
+/// system prompt belongs in a leading developer message instead.
+pub fn is_gpt_6_2_model(model: &str) -> bool {
+    let id = model.strip_prefix("openai-codex/").unwrap_or(model);
+    matches!(id, "gpt-6.2-sol" | "gpt-6.2-astra")
+}
+
+/// Whether `model_id` must never be sent an effort below `low` (`none` /
+/// `minimal`): Off is planned as wire `low`.
+pub fn codex_effort_floor_is_low(model_id: &str) -> bool {
+    is_gpt_6_2_model(model_id)
+}
+
 /// Build the static catalog models with static capability data attached.
 pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
     [
+        ("gpt-6.2-sol", "GPT-6.2-Sol"),
+        ("gpt-6.2-astra", "GPT-6.2-Astra"),
         ("gpt-6.1-sol", "GPT-6.1-Sol"),
         ("gpt-6-astra", "GPT-6-Astra"),
         ("gpt-5.6-sol", "GPT-5.6-Sol"),
@@ -110,12 +145,19 @@ pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
         m.provider_kind = CatalogProviderKind::OpenAiCodex;
         m.label = Some(label.to_string());
         m.reasoning = codex_static_capability(id).unwrap_or(ReasoningSupport::Unknown);
+        // GPT-6.2: exact 1,050,000-token window from the official model pages.
+        if is_gpt_6_2_model(id) {
+            m.context_tokens = Some(agent_core::models::context_window_for_model(id));
+        }
         // Exact input-modality evidence from the official local Codex cache,
         // verified 2026-09-05. Do not infer from generation/family names:
         // gpt-5.4 was not observed, and spark explicitly advertises text only.
+        // GPT-6.2: "Text, Image" input on both official model pages.
         if matches!(
             id,
-            "gpt-6.1-sol"
+            "gpt-6.2-sol"
+                | "gpt-6.2-astra"
+                | "gpt-6.1-sol"
                 | "gpt-6-astra"
                 | "gpt-5.6-sol"
                 | "gpt-5.6-terra"
@@ -682,6 +724,10 @@ pub fn plan_codex_execution(
                     )
                 })?,
         )
+    } else if selected_level == ReasoningLevel::Off && codex_effort_floor_is_low(model_id) {
+        // GPT-6.2 rejects `none` (docs: use `low` for none/minimal), so Off
+        // is sent as the lowest accepted effort instead of being omitted.
+        Some(CodexWireEffort::Low)
     } else {
         CodexWireEffort::from_level(selected_level)
     };
@@ -769,8 +815,9 @@ mod tests {
         ] {
             for model in models {
                 let expected = match model.id.as_str() {
-                    "gpt-6.1-sol" | "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra"
-                    | "gpt-5.6-luna" | "gpt-5.5" | "gpt-5.4-mini" => {
+                    "gpt-6.2-sol" | "gpt-6.2-astra" | "gpt-6.1-sol" | "gpt-6-astra"
+                    | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5.5"
+                    | "gpt-5.4-mini" => {
                         vec![Modality::Text, Modality::Image]
                     }
                     // 5.4 unobserved; spark explicitly text-only.
@@ -1860,6 +1907,68 @@ mod tests {
         assert!(!codex_model_is_selectable(Some("hidden"), Some(true)));
     }
 
+    /// GPT-6.2 rows copy their predecessor's ladder (Sol: gpt-6.1-sol,
+    /// Astra: gpt-6-astra), carry the exact 1,050,000 window, and never plan
+    /// `none`: Off is sent as `low`. Predecessors are unchanged.
+    #[test]
+    fn gpt_6_2_rows_copy_their_predecessors_with_exact_window_and_low_floor() {
+        let models = codex_static_catalog_models();
+        for (id, pred) in [
+            ("gpt-6.2-sol", "gpt-6.1-sol"),
+            ("gpt-6.2-astra", "gpt-6-astra"),
+        ] {
+            let row = models.iter().find(|m| m.id == id).expect(id);
+            let prev = models.iter().find(|m| m.id == pred).expect(pred);
+            assert_eq!(row.reasoning, prev.reasoning, "{id}");
+            assert_eq!(row.input_modalities, prev.input_modalities, "{id}");
+            assert_eq!(
+                row.input_modalities,
+                vec![Modality::Text, Modality::Image],
+                "{id}"
+            );
+            assert_eq!(row.context_tokens, Some(1_050_000), "{id}");
+            assert_eq!(prev.context_tokens, None, "{pred}");
+            assert_eq!(row.runtime_id(), format!("openai-codex/{id}"));
+            assert!(
+                validate_codex_level(id, ReasoningLevel::Ultra, None).is_ok(),
+                "{id}"
+            );
+            let qualified = format!("openai-codex/{id}");
+            let off = plan_codex_execution(
+                &qualified,
+                ReasoningLevel::Off,
+                CodexRequestRole::Foreground,
+                None,
+            )
+            .expect("off plan");
+            assert_eq!(
+                off.wire_effort,
+                Some(CodexWireEffort::Low),
+                "{id}: none -> low"
+            );
+            assert!(is_gpt_6_2_model(id) && is_gpt_6_2_model(&qualified));
+        }
+        // Predecessors keep Off omitted, as before.
+        for pred in ["openai-codex/gpt-6.1-sol", "openai-codex/gpt-6-astra"] {
+            let off = plan_codex_execution(
+                pred,
+                ReasoningLevel::Off,
+                CodexRequestRole::Foreground,
+                None,
+            )
+            .expect("predecessor off plan");
+            assert_eq!(off.wire_effort, None, "{pred}");
+        }
+        for other in [
+            "gpt-6.2-astra-preview",
+            "other/gpt-6.2-sol",
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+        ] {
+            assert!(!is_gpt_6_2_model(other), "{other}");
+        }
+    }
+
     #[test]
     fn static_catalog_is_current_safe_chatgpt_oauth_set() {
         let models = codex_static_catalog_models();
@@ -1867,6 +1976,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
                 "gpt-6.1-sol",
                 "gpt-6-astra",
                 "gpt-5.6-sol",

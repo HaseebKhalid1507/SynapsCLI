@@ -164,7 +164,7 @@ pub(crate) fn open_expanded_provider(
         load_state: ExpandedLoadState::Loading,
     });
     if provider_key == "openai-codex" {
-        // Canonicalization resolves this to the nine static OAuth entries
+        // Canonicalization resolves this to the eleven static OAuth entries
         // (and marks favorites) — same central invariant as live results.
         super::apply_model_list_result(state, &provider_key, Ok(Vec::new()));
         return InputOutcome::None;
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn expanding_openai_codex_bypasses_network_and_shows_nine_static_rows() {
+    fn expanding_openai_codex_bypasses_network_and_shows_eleven_static_rows() {
         let mut state = ModelsModalState::new();
         let outcome = open_expanded_provider(
             &mut state,
@@ -307,6 +307,8 @@ mod tests {
                 assert_eq!(
                     ids,
                     vec![
+                        "openai-codex/gpt-6.2-sol",
+                        "openai-codex/gpt-6.2-astra",
                         "openai-codex/gpt-6.1-sol",
                         "openai-codex/gpt-6-astra",
                         "openai-codex/gpt-5.6-sol",
@@ -317,7 +319,7 @@ mod tests {
                         "openai-codex/gpt-5.4-mini",
                         "openai-codex/gpt-5.3-codex-spark",
                     ],
-                    "expanded rows must be exactly the nine static OAuth models, in order"
+                    "expanded rows must be exactly the eleven static OAuth models, in order"
                 );
             }
             other => panic!("expected static Ready rows without fetching, got {other:?}"),
