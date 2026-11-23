@@ -1881,6 +1881,18 @@ impl Runtime {
         &mut self,
         level: agent_core::reasoning::ReasoningLevel,
     ) -> std::result::Result<(), String> {
+        self.reasoning_level_refusal(level)?;
+        self.set_reasoning_level_explicit(level);
+        Ok(())
+    }
+
+    /// Why [`Self::set_reasoning_level_checked`] would refuse `level` for the
+    /// current model now, without changing anything (`Ok`: it would apply).
+    /// `SessionQuery::ModelOptions` lists the levels that pass.
+    pub fn reasoning_level_refusal(
+        &self,
+        level: agent_core::reasoning::ReasoningLevel,
+    ) -> std::result::Result<(), String> {
         crate::runtime::openai::catalog::validation::validate_reasoning_mutation(
             &self.model,
             level,
@@ -1911,7 +1923,6 @@ impl Runtime {
                 return Err("ultracode_requires_lifecycle_tools".into());
             }
         }
-        self.set_reasoning_level_explicit(level);
         Ok(())
     }
 

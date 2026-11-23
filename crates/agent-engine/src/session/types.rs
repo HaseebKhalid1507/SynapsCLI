@@ -1462,6 +1462,11 @@ pub enum SessionQuery {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         tool_queue: bool,
     },
+    /// `model_options::ModelOptions`: the models and thinking levels this
+    /// session's `Set{Model}` / `Set{ReasoningLevel}` would take now.
+    /// Gated on `wire::FEATURE_MODEL_OPTIONS`: an older daemon answers the
+    /// unknown variant with `Error{"malformed frame: unknown variant..."}`.
+    ModelOptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

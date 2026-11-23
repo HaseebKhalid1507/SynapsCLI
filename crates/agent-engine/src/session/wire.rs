@@ -74,6 +74,12 @@ pub const FEATURE_SESSION_WORKERS: &str = "session_workers";
 /// session that leaves the held set is pushed as its saved row).
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
 
+/// `Welcome.features` entry: this daemon answers `SessionQuery::ModelOptions`
+/// (`session::model_options`). An older one answers that query with
+/// `Error{"malformed frame: unknown variant `model_options`…"}`, so a client
+/// checks this first.
+pub const FEATURE_MODEL_OPTIONS: &str = "model_options";
+
 /// `CatalogPage.limit` when absent, and its ceiling.
 pub const CATALOG_PAGE_DEFAULT_LIMIT: u32 = 50;
 pub const CATALOG_PAGE_MAX_LIMIT: u32 = 200;
@@ -93,6 +99,7 @@ pub fn daemon_features() -> Vec<String> {
         FEATURE_OWNED_SESSIONS.to_string(),
         FEATURE_SESSION_WORKERS.to_string(),
         FEATURE_SESSION_PAGE.to_string(),
+        FEATURE_MODEL_OPTIONS.to_string(),
     ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
@@ -2609,6 +2616,8 @@ mod catalog_page_tests {
     fn catalog_page_frames_have_the_pinned_shape() {
         assert_eq!(FEATURE_SESSION_PAGE, "session_page");
         assert!(daemon_features().iter().any(|f| f == FEATURE_SESSION_PAGE), "advertised");
+        assert_eq!(FEATURE_MODEL_OPTIONS, "model_options");
+        assert!(daemon_features().iter().any(|f| f == FEATURE_MODEL_OPTIONS), "advertised");
         let req = ClientFrame::CatalogPage {
             req: 7,
             before: Some(CatalogCursor { updated_at: at(12, 4), id: "20261110-202033-64fb".into() }),

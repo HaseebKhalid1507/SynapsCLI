@@ -4788,6 +4788,13 @@ impl SessionActor {
                     other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                 }
             }
+            SessionQuery::ModelOptions => {
+                // The level check reads live capability evidence, as `Set` does.
+                let model = self.runtime.model().to_string();
+                self.runtime.prepare_model_capabilities(&model).await;
+                serde_json::to_value(super::model_options::session_model_options(&self.runtime))
+                    .unwrap_or_default()
+            }
         };
         self.emit(SessionEventWire::QueryResult { id, value });
     }
