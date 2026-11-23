@@ -162,3 +162,227 @@ async fn no_capable_client_attached_is_unavailable() {
     drain_for(&mut a, Duration::from_millis(50)).await;
     end(&mut a).await;
 }
+
+// ── answers (T2/T3, §3.3, §3.5) ─────────────────────────────────────────────
+
+use agent_engine::session::{AttachMode, SessionCommand, SurfaceOutcome, SurfaceRefusal, SurfaceResult};
+
+fn answer(card: &SurfaceState, action_id: &str, values: serde_json::Value) -> SessionCommand {
+    SessionCommand::SurfaceAction {
+        surface_id: card.id.clone(),
+        contract: card.contract.clone(),
+        action_id: action_id.into(),
+        expect_rev: 0,
+        epoch: card.epoch,
+        verb: agent_engine::ui::Verb::Answer,
+        values: Some(values),
+    }
+}
+
+/// `t`'s next `surface_result` for `action_id`.
+async fn result_for(t: &mut LocalTransport, action_id: &str) -> SurfaceResult {
+    let seen = until(t, |e| matches!(e, SessionEventWire::SurfaceResult(r) if r.action_id == action_id)).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::SurfaceResult(r) => r.clone(),
+        _ => unreachable!(),
+    }
+}
+
+/// A session with one open card, raised by a turn that has ended.
+async fn with_card(bodies: &'static [&'static str]) -> (agent_engine::session::SessionHandle, LocalTransport, SurfaceState, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let (url, hits) = stub_seq(bodies).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cards_cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    a.send(submit("ask me")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let card = cards(&seen).pop().expect("a card");
+    (handle, a, card, hits)
+}
+
+const A1: &str = "0123456789abcdef0123456789abcdef";
+const A2: &str = "fedcba9876543210fedcba9876543210";
+
+/// T2 + T7 (decision 1): an answer while idle is acknowledged once durable
+/// (`accepted`, `answer_rev` 1), the card becomes a receipt, the marked
+/// `<ui_answer>` enters history, and one turn starts. A retry of the same
+/// action is a `duplicate` with the logged rev and no effect (Appendix B
+/// #3, v3.4 #1); the same id with other values is `invalid`; a new action
+/// on the answered card is `resolved`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_idle_answer_is_acked_delivered_once_and_starts_one_turn() {
+    let _h = Home::new();
+    let (handle, mut a, card, hits) = with_card(&[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    let r = result_for(&mut a, A1).await;
+    assert_eq!((r.outcome, r.answer_rev, r.client), (SurfaceOutcome::Accepted, Some(1), a.client_id()));
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })), "one turn: {seen:#?}");
+    let receipt = cards(&seen).into_iter().find(|c| c.phase == Phase::Answered).expect("an upsert");
+    assert!(receipt.rev > card.rev && receipt.offers.is_empty());
+    assert_eq!(receipt.actions, vec![A1.to_string()]);
+    let ans = receipt.answer.as_ref().unwrap();
+    assert_eq!((ans.rev, ans.wake), (1, true));
+    let history = last_conversation(&seen).api_messages;
+    let delivered: Vec<_> = history
+        .iter()
+        .filter(|m| m["content"].as_str().is_some_and(|t| t.starts_with(&format!("<ui_answer card=\"{}\"", card.id))))
+        .collect();
+    assert_eq!(delivered.len(), 1, "in context once");
+    assert_eq!(delivered[0][agent_engine::ui::MARK_KEY]["answer"], ans.answer_id.as_str(), "marked");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    // The same action again: its original outcome, no effect.
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    let r = result_for(&mut a, A1).await;
+    assert_eq!((r.outcome, r.answer_rev), (SurfaceOutcome::Duplicate, Some(1)));
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Leave it"}))).await.unwrap();
+    let r = result_for(&mut a, A1).await;
+    assert_eq!((r.outcome, r.reason, r.retry), (SurfaceOutcome::Refused, Some(SurfaceRefusal::Invalid), Some(false)));
+    a.send_from_self(answer(&card, A2, serde_json::json!({"choice": "Leave it"}))).await.unwrap();
+    let r = result_for(&mut a, A2).await;
+    assert_eq!((r.outcome, r.reason), (SurfaceOutcome::Refused, Some(SurfaceRefusal::Resolved)));
+    let late = drain_for(&mut a, Duration::from_millis(300)).await;
+    assert!(!late.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3, "no second turn");
+    let _ = handle;
+    end(&mut a).await;
+}
+
+/// A skip is terminal and never starts a turn (T3): its message enters
+/// history, and the session stays idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_skip_enters_history_and_starts_nothing() {
+    let _h = Home::new();
+    let (_handle, mut a, card, hits) = with_card(&[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
+    a.send_from_self(SessionCommand::SurfaceAction {
+        surface_id: card.id.clone(),
+        contract: card.contract.clone(),
+        action_id: A1.into(),
+        expect_rev: 0,
+        epoch: card.epoch,
+        verb: agent_engine::ui::Verb::Skip,
+        values: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    let seen = drain_for(&mut a, Duration::from_millis(500)).await;
+    assert!(!seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })));
+    assert!(cards(&seen).iter().any(|c| c.phase == Phase::Skipped && c.answer.as_ref().is_some_and(|x| !x.wake)));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    end(&mut a).await;
+}
+
+/// #445: card traffic reaches an in-process client only as it would over
+/// the socket: a catalog-0 local client gets no `surface` and no
+/// `surface_result`, the capable one gets both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn card_traffic_reaches_only_a_local_client_with_the_catalog() {
+    let _h = Home::new();
+    let (url, _) = stub_seq(&[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cards_cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    let (mut old, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui)).await.unwrap();
+    a.send(submit("ask me")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let card = cards(&seen).pop().expect("a card");
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    // The old client saw both turns, and none of the card traffic.
+    let mut idles = 0;
+    let mut saw = Vec::new();
+    while idles < 2 {
+        let env = next(&mut old).await;
+        idles += usize::from(matches!(env.event, SessionEventWire::Idle));
+        saw.push(env);
+    }
+    assert!(
+        !saw.iter().any(|e| matches!(e.event, SessionEventWire::Surface(_) | SessionEventWire::SurfaceResult(_))),
+        "{saw:#?}"
+    );
+    end(&mut a).await;
+}
+
+/// v3.4 #6: to a capable client every refusal is a `surface_result` with
+/// its action id: an observer's is `forbidden` (no retry), and nothing
+/// changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_capable_observers_answer_is_forbidden() {
+    let _h = Home::new();
+    let (handle, mut a, card, hits) = with_card(&[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
+    let (mut o, _) = LocalTransport::attach_with(handle.clone(), capable(ClientKind::Attach), AttachMode::Observe)
+        .await
+        .unwrap();
+    o.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    let r = result_for(&mut o, A1).await;
+    assert_eq!((r.outcome, r.reason, r.retry), (SurfaceOutcome::Refused, Some(SurfaceRefusal::Forbidden), Some(false)));
+    let seen = drain_for(&mut a, Duration::from_millis(300)).await;
+    assert!(cards(&seen).is_empty() && !seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    end(&mut a).await;
+}
+
+/// C4a exit gate, `retry_after_cancel_needs_new_consent` (§3.9): an answer
+/// is refused `rate_limited` while the turn that asked still runs; the user
+/// Cancels; the outbox's retry of the same action gets `stopped` and starts
+/// nothing. A fresh commit at the new epoch ("Answer & resume") is
+/// accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn retry_after_cancel_needs_new_consent() {
+    let _h = Home::new();
+    let (url, hits) = stub_seq_endless_last(&[SSE_UI_CREATE, SSE_PREFIX]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cards_cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    a.send(submit("ask me")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Surface(_))).await;
+    let card = cards(&seen).pop().unwrap();
+    // Spend the bucket on bogus ids, then the real action is rate limited.
+    for i in 0..10 {
+        a.send_from_self(answer(&card, &format!("{i:032x}"), serde_json::json!("bogus"))).await.unwrap();
+    }
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    let r = result_for(&mut a, A1).await;
+    assert_eq!((r.reason, r.retry), (Some(SurfaceRefusal::RateLimited), Some(true)));
+    a.send_from_self(SessionCommand::Cancel).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await; // the bucket refills
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    let r = result_for(&mut a, A1).await;
+    assert_eq!((r.outcome, r.reason), (SurfaceOutcome::Refused, Some(SurfaceRefusal::Stopped)));
+    let quiet = drain_for(&mut a, Duration::from_millis(300)).await;
+    assert!(!quiet.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })));
+    // The card says so: resume, at the new epoch.
+    let now = handle_card(&handle).await;
+    assert!(now.epoch > card.epoch && now.resume && now.phase == Phase::Open, "{now:?}");
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    let mut fresh = answer(&now, A2, serde_json::json!({"choice": "Refactor"}));
+    if let SessionCommand::SurfaceAction { epoch, .. } = &mut fresh {
+        *epoch = now.epoch;
+    }
+    a.send_from_self(fresh).await.unwrap();
+    assert_eq!(result_for(&mut a, A2).await.outcome, SurfaceOutcome::Accepted);
+    until(&mut a, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    assert!(hits.load(std::sync::atomic::Ordering::SeqCst) > before, "Answer & resume starts the turn");
+    a.send_from_self(SessionCommand::Cancel).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    end(&mut a).await;
+}
+
+/// The card as a fresh capable attach sees it.
+async fn handle_card(handle: &agent_engine::session::SessionHandle) -> SurfaceState {
+    let (mut b, snap) = LocalTransport::attach(handle.clone(), capable(ClientKind::Attach)).await.unwrap();
+    b.send(SessionCommand::Detach { client: b.client_id() }).await.unwrap();
+    snap.surfaces.into_iter().next().expect("the card")
+}

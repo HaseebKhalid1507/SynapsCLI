@@ -1520,7 +1520,7 @@ impl SessionActor {
     /// Client `c` sent input (or answered a prompt): remember when, and with
     /// `client_input = shared` make it the active client. Observers never
     /// become active.
-    fn note_input(&mut self, c: ClientId) {
+    pub(crate) fn note_input(&mut self, c: ClientId) {
         let Some(a) = self.attached.get_mut(&c) else { return };
         if a.mode == AttachMode::Observe {
             return;
@@ -3515,6 +3515,11 @@ impl SessionActor {
     /// (Esc a moment after the answer ended) is not interrupted: no marker.
     pub(crate) async fn cancel_turn(&mut self, reason: crate::engine::interrupt::InterruptReason) {
         if !self.streaming {
+            // Agent cards (T15): a user Cancel with no turn running still
+            // revokes a pending answer's wake.
+            if reason == crate::engine::interrupt::InterruptReason::User {
+                self.surfaces_cancel_idle();
+            }
             if self.compact.is_some() {
                 self.abort_compaction();
                 if let Some(q) = self.conv.queued_message.take() {
@@ -3651,6 +3656,10 @@ impl SessionActor {
                 })));
             }
         }
+        // Agent cards (T12, T15–T17): the stop raises the epoch; answers
+        // handed to the turn but never adopted go in after the marker, and
+        // start nothing.
+        self.surfaces_interrupted(reason, completed);
         // Queues the save of this history, then the draft removal.
         self.clear_stream();
         // Cancel running reactive subagents; recover a poisoned guard rather
@@ -3803,7 +3812,8 @@ impl SessionActor {
                     out.closed = true;
                     break;
                 }
-                StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
+                StreamEvent::Session(SessionEvent::MessageHistory(mut history)) => {
+                    self.stamp_adopted(&mut history);
                     out.history = Some(history);
                 }
                 StreamEvent::Session(SessionEvent::ContextHeadCheckpoint {
@@ -4068,6 +4078,8 @@ impl SessionActor {
             Continue,
             AutoSendQueued(String),
             AutoTriggerEvents,
+            /// T11: an answer that may start a turn (§3.9) entered history.
+            AnswerWake,
             Failed,
         }
         let mut after = After::Continue;
@@ -4076,12 +4088,15 @@ impl SessionActor {
             // Text, a new provider response (or a retry's reset: the
             // in-flight text starts over), tool calls.
             StreamEvent::Llm(ref llm) => self.observe_turn_draft(llm),
-            StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
+            StreamEvent::Session(SessionEvent::MessageHistory(mut history)) => {
                 // Published at every round boundary as well as at the end of
                 // the turn (`runtime/stream.rs` ROUND CHECKPOINT): the session
                 // on disk follows the turn as it progresses. Queued, never
                 // awaited — the persister writes it (latest wins), so a slow
                 // disk can never stall the turn machine.
+                // Agent cards: the host's marks on what this history now
+                // holds (T9, §3.6).
+                self.stamp_adopted(&mut history);
                 self.conv.api_messages = history;
                 self.request_save();
                 // The round is committed: the draft now continues from here.
@@ -4130,8 +4145,14 @@ impl SessionActor {
                             })));
                     }
                 }
+                // Agent cards (T11): answers handed to the turn but never
+                // adopted go in now, in ledger order.
+                let answers_wake = self.flush_handed_answers();
                 if let Some(queued) = self.conv.queued_message.take() {
                     after = After::AutoSendQueued(queued);
+                } else if answers_wake {
+                    self.request_save();
+                    after = After::AnswerWake;
                 } else if had_pending {
                     self.request_save();
                     after = After::AutoTriggerEvents;
@@ -4196,6 +4217,18 @@ impl SessionActor {
                     serde_json::json!({"role": "user", "content": queued}),
                 ));
                 self.start_turn(TurnTrigger::QueuedAuto, Some(user_text)).await;
+            }
+            After::AnswerWake => {
+                if self.config.auto_compact {
+                    self.post_turn_chat().await;
+                }
+                if self.compact.is_some() {
+                    return;
+                }
+                // Human input (an answer is the user's): a `User` turn, the
+                // auto-turn count starts over (§2.1, §3.5).
+                self.consecutive_auto_turns = 0;
+                self.start_turn(TurnTrigger::User, None).await;
             }
             After::AutoTriggerEvents => {
                 if self.config.auto_compact {
@@ -4400,8 +4433,15 @@ impl SessionActor {
                 }
             }
         }
+        // Agent cards (T8): answers queued while it ran go in now.
+        let answers_wake = self.drain_queued_answers();
         self.emit_conversation();
         self.update_attach_state();
+        if answers_wake && !self.streaming && self.compact.is_none() {
+            self.consecutive_auto_turns = 0;
+            self.start_turn(TurnTrigger::User, None).await;
+            return;
+        }
         self.announce_idle().await;
     }
 
@@ -4969,6 +5009,7 @@ impl SessionActor {
     /// events buffer in the broadcast (§8 detach-without-abort). The owner
     /// leaving passes input to the oldest attached non-`Observe` client.
     pub(crate) fn detach(&mut self, client: ClientId) {
+        self.surfaces.client_gone(client);
         if self.attached.remove(&client).is_none() {
             return;
         }
@@ -5310,6 +5351,14 @@ impl SessionActor {
     async fn handle(&mut self, addressed: Addressed) -> std::ops::ControlFlow<EndReason> {
         use std::ops::ControlFlow;
         let Addressed { from, cmd } = addressed;
+        // Agent cards (agent-ui §3.3): all of admission runs in the card
+        // handler, before `note_input` and the B3 wake below, and every
+        // refusal to a capable client is a `surface_result` carrying the
+        // action id (v3.4 #6).
+        if matches!(cmd, SessionCommand::SurfaceAction { .. }) {
+            self.on_surface_action(from, cmd).await;
+            return ControlFlow::Continue(());
+        }
         if let Some(c) = from {
             // `rename` is the daemon's control-connection rename; an
             // attached client has `/saveas` (owner only).
@@ -5375,20 +5424,6 @@ impl SessionActor {
                     reason,
                 }),
                 None => self.emit(SessionEventWire::SystemNotice(reason)),
-            }
-            return ControlFlow::Continue(());
-        }
-        // Agent cards are wire types only until C4a: a card action that
-        // passed the owned, input and fence checks is refused here, before
-        // it can make its sender the active client or wake a parked
-        // session. The host never answers cards.
-        if matches!(cmd, SessionCommand::SurfaceAction { .. }) {
-            if let Some(c) = from {
-                self.emit(SessionEventWire::Refused {
-                    client: c,
-                    command: command_name(&cmd).to_string(),
-                    reason: super::SURFACES_UNAVAILABLE.to_string(),
-                });
             }
             return ControlFlow::Continue(());
         }
@@ -5637,7 +5672,7 @@ impl SessionActor {
             SessionCommand::DriverStart { plugin, command, arg } => {
                 self.driver_start(plugin, command, arg);
             }
-            // Refused above, before any of this (inert until C4a).
+            // Handled at the top (`on_surface_action`).
             SessionCommand::SurfaceAction { .. } => {}
         }
         ControlFlow::Continue(())
@@ -5950,7 +5985,7 @@ impl SessionTask {
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
                 Some(req) = actor.surfaces.tool_rx.recv() => actor.on_ui_tool(req),
-                _ = super::surfaces::surface_tick(actor.surfaces.committing()) => actor.poll_surfaces(),
+                _ = super::surfaces::surface_tick(actor.surfaces.committing()) => actor.poll_surfaces().await,
                 // A held wake (and its permit) stays queued.
                 _ = queue.notified(), if !actor.holds(WorkSource::QueueWake) => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => {

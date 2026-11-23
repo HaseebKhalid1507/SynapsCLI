@@ -1508,9 +1508,16 @@ fn sync_view(sc: &mut Sidecar, answer_id: &str) {
         return;
     };
     for c in &mut sc.cards {
+        let mut changed = false;
         if let Some(a) = c.state.answer.as_mut().filter(|a| a.answer_id == answer_id) {
+            changed = (a.delivery, a.wake) != (r.delivery, r.wake);
             a.delivery = r.delivery;
             a.wake = r.wake;
+        }
+        // Clients upsert by `(id, rev)` (§2.3): a changed receipt is a new
+        // state, or a client that has the old one would keep it (C4a).
+        if changed {
+            c.state.rev = c.state.rev.saturating_add(1);
         }
     }
 }

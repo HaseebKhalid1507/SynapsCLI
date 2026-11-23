@@ -219,7 +219,10 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::NewSession
         | SessionCommand::Resume { .. }
         | SessionCommand::EngineCommand { .. }
-        | SessionCommand::PluginCommand { .. } => Effect::Fingerprint,
+        | SessionCommand::PluginCommand { .. }
+        // An accepted card answer goes into history while idle, and starts
+        // a turn only with consent (agent-ui §3.5, C4a).
+        | SessionCommand::SurfaceAction { .. } => Effect::Fingerprint,
         SessionCommand::Set { setting, .. } => match setting {
             SessionSetting::Model { .. }
             | SessionSetting::ReasoningLevel { .. }
@@ -245,8 +248,6 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::KeepWarm { .. }
         // Moves input ownership only; the next request is unchanged.
         | SessionCommand::TakeInput
-        // Refused until C4a, where an answer can start a turn (reclassify).
-        | SessionCommand::SurfaceAction { .. }
         | SessionCommand::Park
         // Its wakes reach the event queue like any other event.
         | SessionCommand::AdoptWorkers { .. }

@@ -208,6 +208,9 @@ pub struct LocalTransport {
     client_input: ClientInput,
     /// Set after `Ended` (or actor gone): `next_event` returns `None` from then on.
     ended: bool,
+    /// What this client declared at attach: card traffic it can't decode
+    /// is dropped here, as the socket pump drops it (#445, agent-ui §2.1).
+    caps: super::types::ClientCapabilities,
 }
 
 impl LocalTransport {
@@ -230,6 +233,7 @@ impl LocalTransport {
         // `Attached` is broadcast; with one attach in flight per handle at a
         // time (every host today) the first one seen is ours.
         let mut rx = handle.subscribe();
+        let caps = meta.capabilities;
         handle
             .send(SessionCommand::Attach {
                 client: meta,
@@ -278,6 +282,7 @@ impl LocalTransport {
                 roster: Roster::from_snapshot(&snapshot),
                 client_input: snapshot.client_input,
                 ended: false,
+                caps,
             },
             snapshot,
         ))
@@ -289,6 +294,18 @@ impl LocalTransport {
 }
 
 #[async_trait::async_trait]
+/// The live filter of an in-process client: card traffic reaches it only
+/// as it would over the socket (`wire::client_decodes`, #445). Everything
+/// else passes, as it always did here.
+pub(crate) fn local_decodes(caps: super::types::ClientCapabilities, event: &SessionEventWire) -> bool {
+    match event {
+        SessionEventWire::Surface(_) | SessionEventWire::SurfaceResult(_) => {
+            super::wire::client_decodes(caps, event)
+        }
+        _ => true,
+    }
+}
+
 impl ClientTransport for LocalTransport {
     fn session_id(&self) -> &SessionId {
         &self.handle.id
@@ -313,16 +330,23 @@ impl ClientTransport for LocalTransport {
         // The handle itself holds a broadcast sender, so `Closed` never
         // fires on its own: end-of-stream is `Ended` or the actor going away
         // (drain what it left behind first).
-        let recv = tokio::select! {
-            biased;
-            r = self.rx.recv() => r,
-            _ = self.handle.closed() => match self.rx.try_recv() {
-                Ok(env) => Ok(env),
-                Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    Err(broadcast::error::RecvError::Lagged(n))
-                }
-                Err(_) => Err(broadcast::error::RecvError::Closed),
-            },
+        let recv = loop {
+            let r = tokio::select! {
+                biased;
+                r = self.rx.recv() => r,
+                _ = self.handle.closed() => match self.rx.try_recv() {
+                    Ok(env) => Ok(env),
+                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        Err(broadcast::error::RecvError::Lagged(n))
+                    }
+                    Err(_) => Err(broadcast::error::RecvError::Closed),
+                },
+            };
+            match r {
+                // Agent cards (#445): only what this client's catalog covers.
+                Ok(env) if !local_decodes(self.caps, &env.event) => continue,
+                r => break r,
+            }
         };
         match recv {
             Ok(env) => {

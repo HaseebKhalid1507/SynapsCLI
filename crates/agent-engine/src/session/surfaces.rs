@@ -14,7 +14,7 @@
 //! runs what waited on it then. A tool call that arrives while one is in
 //! flight waits its turn, in order.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +31,10 @@ use crate::ui::{
 };
 
 use super::actor::SessionActor;
-use super::types::SessionEventWire;
+use super::types::{
+    ClientId, SessionCommand, SessionEventWire, SurfaceOutcome, SurfaceRefusal, SurfaceResult,
+    SurfaceUnavailable,
+};
 
 /// The catalog this build draws and answers (`synaps:card/1`).
 pub const CATALOG: u32 = 1;
@@ -41,6 +44,8 @@ const POLL_EVERY: Duration = Duration::from_millis(10);
 pub const CREATES_PER_TURN: u32 = 4;
 pub const CREATES_PER_HOUR: usize = 20;
 pub const OPEN_LIVE_MAX: usize = 3;
+/// §3.3 #1 / §4.6: client actions per second (token bucket).
+pub const ACTIONS_PER_SECOND: f64 = 10.0;
 
 /// `UiStore` over any [`UiFs`]: the sessions directory, or a test's model.
 pub struct AnyFs(pub Arc<dyn UiFs>);
@@ -104,6 +109,16 @@ enum Waiter {
     Close { reply: Option<ReplyTo>, id: String },
     /// A commit with nobody waiting (`/ui off`, a stop's transitions).
     Plain,
+    /// T2/T3: a client's answer or skip. `accepted` once durable, then
+    /// routed; `pending` at the budget (a final result follows).
+    Action {
+        client: ClientId,
+        action_id: String,
+        answer_id: String,
+        rev: u32,
+        deadline: tokio::time::Instant,
+        pending_sent: bool,
+    },
 }
 
 struct ReplyTo {
@@ -134,6 +149,16 @@ pub(crate) struct SurfaceTable {
     /// The filesystem new stores use; the sessions directory unless a test
     /// injected one.
     fs: Option<Arc<dyn UiFs>>,
+    /// §3.3 #1: each client's token bucket (tokens, last refill).
+    buckets: HashMap<ClientId, (f64, tokio::time::Instant)>,
+    /// T6: answers steered into the running turn: `(answer_id, message
+    /// text, in context)`. Every history the turn publishes is the engine's
+    /// own copy, so the marks are stamped again on each adoption (T9) until
+    /// the turn ends (T11/T12).
+    handed: Vec<(String, String, bool)>,
+    /// `ui` results this turn made, to mark on each adoption: `(call_id,
+    /// card)` (§2.5, §3.6).
+    results: Vec<(String, String)>,
 }
 
 impl SurfaceTable {
@@ -149,7 +174,30 @@ impl SurfaceTable {
             created_this_turn: 0,
             created_at: VecDeque::new(),
             fs: None,
+            buckets: HashMap::new(),
+            handed: Vec::new(),
+            results: Vec::new(),
         }
+    }
+
+    /// §3.3 #1: 10 actions a second per client, refilled continuously.
+    fn take_token(&mut self, c: ClientId) -> bool {
+        let now = tokio::time::Instant::now();
+        let (tokens, at) = self.buckets.entry(c).or_insert((ACTIONS_PER_SECOND, now));
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * ACTIONS_PER_SECOND)
+            .min(ACTIONS_PER_SECOND);
+        *at = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A client left: its bucket goes.
+    pub(crate) fn client_gone(&mut self, c: ClientId) {
+        self.buckets.remove(&c);
     }
 
     /// Test seam: stores open on `fs` (the C2 fault model).
@@ -193,9 +241,12 @@ impl SurfaceTable {
         (waiting.len() as u32, live.len() as u32)
     }
 
-    /// A turn started: the per-turn creation count restarts.
+    /// A turn started: the per-turn creation count restarts, and nothing
+    /// is left to stamp from the last one.
     pub(crate) fn turn_started(&mut self) {
         self.created_this_turn = 0;
+        self.handed.clear();
+        self.results.clear();
     }
 }
 
@@ -430,7 +481,12 @@ impl SessionActor {
         };
         match parsed {
             UiInput::Create { doc, wait } => self.ui_create(call_id, doc, wait, reply),
-            UiInput::Close(id) => self.ui_close(id, reply),
+            UiInput::Close(id) => {
+                if let Some(c) = call_id.filter(|c| ui::is_call_id(c)) {
+                    self.surfaces.results.push((c, id.clone()));
+                }
+                self.ui_close(id, reply)
+            }
         }
     }
 
@@ -495,6 +551,7 @@ impl SessionActor {
             // L3: fail closed; the model's retry has a new call id.
             return Some((reply, tool_error("ui: card id already in use; try again")));
         }
+        let call_id_for_mark = call_id.clone();
         let state = SurfaceState {
             id: id.clone(),
             call_id,
@@ -534,6 +591,7 @@ impl SessionActor {
         }
         self.surfaces.created_this_turn += 1;
         self.surfaces.created_at.push_back(now);
+        self.surfaces.results.push((call_id_for_mark, id.clone()));
         let budget = o.store.config().budget;
         self.surfaces.waiter = Some(Waiter::Create { reply: Some(ReplyTo::new(reply, budget)), id });
         None
@@ -586,7 +644,7 @@ impl SessionActor {
 
     /// The tick: read the in-flight outcome, run what waited on it, then
     /// the next queued call.
-    pub(crate) fn poll_surfaces(&mut self) {
+    pub(crate) async fn poll_surfaces(&mut self) {
         let Store::Open(o) = &mut self.surfaces.store else {
             self.surfaces.waiter = None;
             return;
@@ -600,6 +658,8 @@ impl SessionActor {
             self.emit_card_changes(&before, &after);
         }
         let now = tokio::time::Instant::now();
+        let unconfirmed = |id: &str, note: &str| json!({"status": "unconfirmed", "id": id, "note": note});
+        let mut route = None;
         match self.surfaces.waiter.take() {
             None => {}
             Some(Waiter::Plain) => {
@@ -611,10 +671,10 @@ impl SessionActor {
                 let answer = match (&lifecycle, done) {
                     (Lifecycle::Done, true) => Some(json!({"status": "shown", "id": id})),
                     (Lifecycle::Failed(_), true) => Some(tool_error("ui: couldn't save the card; ask in plain text")),
-                    _ if reply.as_ref().is_some_and(|r| now >= r.deadline) || done => Some(json!({
-                        "status": "unconfirmed", "id": id,
-                        "note": "Not confirmed yet: the card may still appear, and its answer would arrive as a message. Close it if you ask in plain text instead.",
-                    })),
+                    _ if reply.as_ref().is_some_and(|r| now >= r.deadline) || done => Some(unconfirmed(
+                        &id,
+                        "Not confirmed yet: the card may still appear, and its answer would arrive as a message. Close it if you ask in plain text instead.",
+                    )),
                     _ => None,
                 };
                 if let Some(v) = answer {
@@ -630,10 +690,9 @@ impl SessionActor {
                 let answer = match (&lifecycle, done) {
                     (Lifecycle::Done, true) => Some(json!({"status": "closed", "id": id})),
                     (Lifecycle::Failed(_), true) => Some(tool_error("close: couldn't save; the card is still open")),
-                    _ if reply.as_ref().is_some_and(|r| now >= r.deadline) || done => Some(json!({
-                        "status": "unconfirmed", "id": id,
-                        "note": "Not confirmed yet: the card may still be open.",
-                    })),
+                    _ if reply.as_ref().is_some_and(|r| now >= r.deadline) || done => {
+                        Some(unconfirmed(&id, "Not confirmed yet: the card may still be open."))
+                    }
                     _ => None,
                 };
                 if let Some(v) = answer {
@@ -645,10 +704,40 @@ impl SessionActor {
                     self.surfaces.waiter = Some(Waiter::Close { reply, id });
                 }
             }
+            Some(Waiter::Action { client, action_id, answer_id, rev, deadline, pending_sent }) => match &poll {
+                Poll::Idle | Poll::Done(Outcome::Durable) => {
+                    // Durable: the ack (the upsert went above), then the route.
+                    self.surface_result(client, &action_id, SurfaceOutcome::Accepted, None, None, Some(rev), None);
+                    route = Some(answer_id);
+                }
+                Poll::Done(Outcome::NotPublished(_)) => {
+                    // The only outcome that may say "Not sent" (§3.4).
+                    self.surface_refused(client, &action_id, SurfaceRefusal::Storage, true, None);
+                }
+                Poll::Done(Outcome::Unsynced(_)) => {
+                    // Published, never durable: the store failed. It stays
+                    // pending and nothing is delivered from it (§3.4).
+                    if !pending_sent {
+                        self.surface_result(client, &action_id, SurfaceOutcome::Pending, None, None, None, None);
+                    }
+                }
+                Poll::Pending => {
+                    let mut pending_sent = pending_sent;
+                    if !pending_sent && now >= deadline {
+                        self.surface_result(client, &action_id, SurfaceOutcome::Pending, None, None, None, None);
+                        pending_sent = true;
+                    }
+                    self.surfaces.waiter =
+                        Some(Waiter::Action { client, action_id, answer_id, rev, deadline, pending_sent });
+                }
+            },
         }
         if done {
             self.publish_presence();
-            // What a stop or a downgrade noted meanwhile commits next.
+            if let Some(answer_id) = route {
+                self.route_answer(&answer_id).await;
+            }
+            // What a stop or a delivery noted meanwhile commits next.
             self.surfaces_commit_noted();
             while !self.surfaces.committing() {
                 let Some(req) = self.surfaces.queued.pop_front() else {
@@ -679,6 +768,493 @@ impl SessionActor {
         self.request_save();
     }
 
+}
+
+/// `hex128(sha256(canonical_json({verb, expect_rev, epoch, values})))`
+/// over the values **as received** (v3.4 #5, §3.7): admission #4 runs
+/// before #11 parses them, and a retry re-sends the stored payload, so its
+/// hash matches. A skip's absent values hash as `null`.
+pub fn action_hash(verb: Verb, expect_rev: u32, epoch: u32, values: Option<&Value>) -> String {
+    use sha2::{Digest, Sha256};
+    let payload = json!({
+        "verb": verb,
+        "expect_rev": expect_rev,
+        "epoch": epoch,
+        "values": values.cloned().unwrap_or(Value::Null),
+    });
+    let d = Sha256::digest(ui::contract::canonical_json(&payload).as_bytes());
+    d[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn is_action_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `"a_"` + 16 hex, host-random (§3.6).
+fn mint_answer_id() -> String {
+    format!("a_{}", &ss::mint_hex128()[..16])
+}
+
+impl SessionActor {
+    pub(crate) fn surface_result(
+        &mut self,
+        client: ClientId,
+        action_id: &str,
+        outcome: SurfaceOutcome,
+        reason: Option<SurfaceRefusal>,
+        retry: Option<bool>,
+        answer_rev: Option<u32>,
+        detail: Option<SurfaceUnavailable>,
+    ) {
+        self.emit(SessionEventWire::SurfaceResult(SurfaceResult {
+            client,
+            action_id: action_id.to_string(),
+            outcome,
+            reason,
+            retry,
+            answer_rev,
+            detail,
+        }));
+    }
+
+    fn surface_refused(
+        &mut self,
+        client: ClientId,
+        action_id: &str,
+        reason: SurfaceRefusal,
+        retry: bool,
+        detail: Option<SurfaceUnavailable>,
+    ) {
+        self.surface_result(client, action_id, SurfaceOutcome::Refused, Some(reason), Some(retry), None, detail);
+    }
+
+    /// A client's `surface_action` (§2.4, §3.3). All of admission runs
+    /// here, in order, before anything else of `handle`: before
+    /// `note_input` and before the B3 wake, so refused traffic never wakes
+    /// a parked session (v3.4 #6). Every refusal has no side effect.
+    pub(crate) async fn on_surface_action(&mut self, from: Option<ClientId>, cmd: SessionCommand) {
+        // The host never answers a card (§4.2).
+        let Some(c) = from else {
+            return;
+        };
+        let caps = self.attached.get(&c).map_or(0, |a| a.meta.capabilities.surfaces);
+        // v3.4 #3 (b), #6: a client that declared 0 keeps C3's `Refused`
+        // (owned, input and fence reasons first), never a `surface_result`.
+        if caps == 0 {
+            let reason = self
+                .owned_refusal(c, &cmd)
+                .or_else(|| self.input_refusal(c))
+                .or_else(|| self.reload_fence.is_some().then(|| super::RELOADING_REFUSAL.to_string()))
+                .unwrap_or_else(|| super::SURFACES_UNAVAILABLE.to_string());
+            self.emit(SessionEventWire::Refused { client: c, command: "surface_action".into(), reason });
+            return;
+        }
+        // #1: the client's bucket, first and cheap.
+        let rate_ok = self.surfaces.take_token(c);
+        let forbidden = self.owned_refusal(c, &cmd).is_some() || self.input_refusal(c).is_some();
+        let SessionCommand::SurfaceAction { surface_id, contract, action_id, expect_rev, epoch, verb, values } = cmd
+        else {
+            return;
+        };
+        if !rate_ok {
+            return self.surface_refused(c, &action_id, SurfaceRefusal::RateLimited, true, None);
+        }
+        // #2: owned session, input authority.
+        if forbidden {
+            return self.surface_refused(c, &action_id, SurfaceRefusal::Forbidden, false, None);
+        }
+        // #3: the reload fence.
+        if self.reload_fence.is_some() {
+            return self.surface_refused(c, &action_id, SurfaceRefusal::Reloading, true, None);
+        }
+        if !is_action_id(&action_id) {
+            return self.surface_refused(c, &action_id, SurfaceRefusal::Invalid, false, None);
+        }
+        if self.ensure_surface_store().is_err() {
+            return self.surface_refused(c, &action_id, SurfaceRefusal::Storage, false, None);
+        }
+        let hash = action_hash(verb, expect_rev, epoch, values.as_ref());
+        let req = ss::ActionRequest {
+            card: surface_id.clone(),
+            action_id: action_id.clone(),
+            hash: hash.clone(),
+            verb,
+            contract,
+            epoch,
+            expect_rev,
+        };
+        let Store::Open(o) = &self.surfaces.store else {
+            return self.surface_refused(c, &action_id, SurfaceRefusal::Storage, false, None);
+        };
+        // #4–#10 on the live state (C2's `Images::admit`).
+        if let Err(a) = o.images.admit(&o.store, &req) {
+            use ss::Admission as A;
+            return match a {
+                A::Duplicate { rev } => {
+                    self.surface_result(c, &action_id, SurfaceOutcome::Duplicate, None, None, Some(rev), None)
+                }
+                A::Pending => self.surface_result(c, &action_id, SurfaceOutcome::Pending, None, None, None, None),
+                A::Reused => self.surface_refused(c, &action_id, SurfaceRefusal::Invalid, false, None),
+                A::Busy => self.surface_refused(c, &action_id, SurfaceRefusal::Busy, true, None),
+                A::Storage(_) => self.surface_refused(c, &action_id, SurfaceRefusal::Storage, false, None),
+                A::Resolved => self.surface_refused(c, &action_id, SurfaceRefusal::Resolved, false, None),
+                A::Gone => self.surface_refused(c, &action_id, SurfaceRefusal::Gone, false, None),
+                A::Stale => self.surface_refused(c, &action_id, SurfaceRefusal::Stale, false, None),
+                A::Stopped => self.surface_refused(c, &action_id, SurfaceRefusal::Stopped, false, None),
+                A::Conflict => self.surface_refused(c, &action_id, SurfaceRefusal::Conflict, false, None),
+            };
+        }
+        let live = o.images.live();
+        let Some(card) = live.card(&surface_id).cloned() else {
+            return self.surface_refused(c, &action_id, SurfaceRefusal::Gone, false, None);
+        };
+        // v3.4 #3 (c): a catalog this client doesn't draw was never sent to
+        // it, so for it the card doesn't exist.
+        if card.catalog > caps {
+            return self.surface_refused(c, &action_id, SurfaceRefusal::Gone, false, None);
+        }
+        // #11: the values, against the doc. Verb and values pair strictly
+        // (v3.4 #5): an answer has values, a skip none.
+        let parsed = match (verb, &values) {
+            (Verb::Answer, Some(v)) if ui::contract::canonical_json(v).len() <= ui::ANSWER_MAX_BYTES => {
+                ui::answer::parse_answer(&card.doc, v).ok()
+            }
+            (Verb::Skip, None) => Some(ui::Answer::default()),
+            _ => None,
+        };
+        let Some(answer) = parsed else {
+            return self.surface_refused(c, &action_id, SurfaceRefusal::Invalid, false, None);
+        };
+        // #12: routing is admissible now.
+        let blocked = if self.conv.is_live() && self.conv.context_head.is_blocked(&self.conv.session) {
+            Some(SurfaceUnavailable::ContextBlocked)
+        } else if self.driver.as_ref().is_some_and(|d| d.steering.len() >= super::driver::STEERING_MAX_MESSAGES) {
+            Some(SurfaceUnavailable::QueueFull)
+        } else if live.ledger.len() >= ui::LEDGER_MAX_RECORDS
+            || live.ledger.iter().map(|r| r.values.to_json().len()).sum::<usize>() + answer.to_json().len()
+                > ui::LEDGER_MAX_VALUE_BYTES
+        {
+            Some(SurfaceUnavailable::LedgerFull)
+        } else if self.owned.as_ref().is_some_and(|o| o.awaiting_owner) {
+            Some(SurfaceUnavailable::AwaitingOwner)
+        } else {
+            None
+        };
+        if let Some(detail) = blocked {
+            return self.surface_refused(c, &action_id, SurfaceRefusal::Unavailable, true, Some(detail));
+        }
+        // Admitted: with shared input the answerer becomes the active client.
+        self.note_input(c);
+        let status = match verb {
+            Verb::Skip => ui::AnswerStatus::Skipped,
+            _ => ui::AnswerStatus::Answered,
+        };
+        let q = card.doc.question.clone();
+        let asked = ui::answer::build_capsule(&card.doc, &card.origin.task, &answer);
+        let answer_id = mint_answer_id();
+        let by = self.attached.get(&c).map(|a| a.name.clone()).unwrap_or_default();
+        let accepted = ss::Accepted {
+            record: ui::LedgerRecord {
+                answer_id: answer_id.clone(),
+                card: surface_id,
+                rev: 1,
+                status,
+                values: answer,
+                // §3.9: consent for this epoch; a skip never starts a turn.
+                wake: verb == Verb::Answer,
+                epoch: live.epoch,
+                delivery: ui::Delivery::Queued,
+                q,
+                asked: Some(asked.as_str().to_string()),
+            },
+            action: ui::LogEntry { action_id: action_id.clone(), hash, rev: 1 },
+            by: ui::roster_label(&by),
+            at: rfc3339_now(),
+            // C4c adds `revise`.
+            offers: Vec::new(),
+        };
+        let Store::Open(o) = &mut self.surfaces.store else {
+            return;
+        };
+        match o.images.commit(&mut o.store, Some(Op::Accept(Box::new(accepted)))) {
+            Ok(_) => {}
+            Err(Refusal::Busy) => return self.surface_refused(c, &action_id, SurfaceRefusal::Busy, true, None),
+            Err(Refusal::Storage(_) | Refusal::Bounds(_)) => {
+                return self.surface_refused(c, &action_id, SurfaceRefusal::Storage, false, None)
+            }
+        }
+        let deadline = tokio::time::Instant::now() + o.store.config().budget;
+        self.surfaces.waiter =
+            Some(Waiter::Action { client: c, action_id, answer_id, rev: 1, deadline, pending_sent: false });
+    }
+
+    /// `may_wake(r)` (§3.9, R3-H2), evaluated at the start itself: the
+    /// record has consent, for the current epoch, and policy allows a start
+    /// (cards on, no fence, no owner wait).
+    pub(crate) fn may_wake(&self, answer_id: &str) -> bool {
+        let Some(o) = self.surfaces.open() else {
+            return false;
+        };
+        let live = o.images.live();
+        let Some(r) = live.record(answer_id) else {
+            return false;
+        };
+        r.wake && r.epoch == live.epoch && self.surfaces.enabled && self.autonomous_work_blocked().is_none()
+    }
+
+    /// The message an answer reaches the model as (§3.6), with its mark.
+    /// `late`: delivered outside the turn that raised its card; it carries
+    /// the capsule built at acceptance.
+    fn answer_message(&self, answer_id: &str, late: bool) -> Option<Value> {
+        let o = self.surfaces.open()?;
+        let live = o.images.live();
+        let r = live.record(answer_id)?;
+        let m = ui::AnswerMessage {
+            card: r.card.clone(),
+            answer_id: r.answer_id.clone(),
+            q: r.q.clone(),
+            status: r.status,
+            rev: r.rev,
+            values: r.values.clone(),
+            asked: if late { r.asked.as_deref().and_then(ui::Capsule::parse) } else { None },
+        };
+        let mark = ui::UiMark::Answer(ui::AnswerMark {
+            l: live.lineage.clone(),
+            card: r.card.clone(),
+            answer: r.answer_id.clone(),
+            rev: r.rev,
+            status: r.status,
+        });
+        let mut msg = json!({"role": "user", "content": ui::answer::format_answer_message(&m)});
+        msg[ui::MARK_KEY] = serde_json::to_value(mark).ok()?;
+        Some(msg)
+    }
+
+    /// Whether this answer would reach the turn that asked (no capsule).
+    fn on_time(&self, answer_id: &str) -> bool {
+        let Some(o) = self.surfaces.open() else {
+            return false;
+        };
+        let live = o.images.live();
+        let card = live.record(answer_id).and_then(|r| live.card(&r.card));
+        let turn = self.card_origin().turn;
+        self.streaming
+            && card.is_some_and(|c| c.origin.stopped.is_none() && c.origin.turn.is_some() && c.origin.turn == turn)
+    }
+
+    fn note_delivery(&mut self, answer_id: &str, to: ui::Delivery) {
+        if let Store::Open(o) = &mut self.surfaces.store {
+            o.images.note(Op::Deliver { answer_id: answer_id.to_string(), to });
+        }
+    }
+
+    /// Push a record's marked message into history (T7, T8's drain, T11,
+    /// T12): in context. The caller decides about a turn.
+    fn push_answer(&mut self, answer_id: &str) -> bool {
+        if !self.conv.is_live() {
+            return false;
+        }
+        let Some(msg) = self.answer_message(answer_id, true) else {
+            return false;
+        };
+        self.conv.api_messages.push(Arc::new(msg));
+        self.note_delivery(answer_id, ui::Delivery::InContext);
+        true
+    }
+
+    /// T5–T8: route an answer that just became durable (§3.5).
+    pub(crate) async fn route_answer(&mut self, answer_id: &str) {
+        // T8: compaction running: stays queued, drained when it lands.
+        if self.compact.is_some() || self.compacting_inline {
+            return;
+        }
+        if self.is_parked() {
+            let wakes = self.may_wake(answer_id);
+            // Only an answer whose route starts a turn wakes a parked
+            // session (v3.4 #6); a failed wake leaves it queued (T8).
+            if !wakes || self.ensure_live().await.is_err() {
+                return;
+            }
+        }
+        if self.streaming {
+            // T6: into the running turn, tracked until adopted.
+            let on_time = self.on_time(answer_id);
+            let Some(msg) = self.answer_message(answer_id, !on_time) else {
+                return;
+            };
+            let text = msg["content"].as_str().unwrap_or_default().to_string();
+            if let Some(tx) = &self.steer_tx {
+                let _ = tx.send(text.clone());
+            }
+            self.surfaces.handed.push((answer_id.to_string(), text, false));
+            self.note_delivery(answer_id, ui::Delivery::Handed);
+            self.emit_conversation();
+            return;
+        }
+        // T7: idle: into history, then a turn if consent holds now.
+        if !self.push_answer(answer_id) {
+            return;
+        }
+        self.request_save();
+        self.emit_conversation();
+        if self.driver.is_some() {
+            // An armed driver runs the session's turns: the answer waits in
+            // history for its next one (the conservative reading).
+            return;
+        }
+        if self.may_wake(answer_id) {
+            // Human input: the auto-turn count starts over, as a submit's.
+            self.consecutive_auto_turns = 0;
+            self.start_turn(super::types::TurnTrigger::User, None).await;
+        }
+    }
+
+    /// T9: stamp the marks an adopted history now holds: an answer steered
+    /// into the turn, and the user message carrying `ui` results.
+    /// Idempotent: each adoption is the engine's unstamped copy.
+    pub(crate) fn stamp_adopted(&mut self, history: &mut [crate::SharedMessage]) {
+        let Some(lineage) = self.surfaces.open().map(|o| o.images.live().lineage.clone()) else {
+            return;
+        };
+        let mut handed = std::mem::take(&mut self.surfaces.handed);
+        for (answer_id, text, in_context) in &mut handed {
+            let hit = history.iter_mut().rev().find(|m| {
+                m.get("role").and_then(Value::as_str) == Some("user")
+                    && m.get("content").and_then(Value::as_str) == Some(text.as_str())
+            });
+            let (Some(m), Some(marked)) = (hit, self.answer_message(answer_id, false)) else {
+                continue;
+            };
+            if m.get(ui::MARK_KEY) != Some(&marked[ui::MARK_KEY]) {
+                Arc::make_mut(m)[ui::MARK_KEY] = marked[ui::MARK_KEY].clone();
+            }
+            if !*in_context {
+                *in_context = true;
+                self.note_delivery(answer_id, ui::Delivery::InContext);
+            }
+        }
+        self.surfaces.handed = handed;
+        // The `ui` results: one mark per user message, listing its cards.
+        for (call_id, card) in self.surfaces.results.clone() {
+            let hit = history.iter_mut().rev().find(|m| {
+                m.get("content").and_then(Value::as_array).is_some_and(|blocks| {
+                    blocks.iter().any(|b| {
+                        b.get("type").and_then(Value::as_str) == Some("tool_result")
+                            && b.get("tool_use_id").and_then(Value::as_str) == Some(call_id.as_str())
+                    })
+                })
+            });
+            let Some(m) = hit else {
+                continue;
+            };
+            let mut results = match m.get(ui::MARK_KEY).cloned().and_then(|v| serde_json::from_value::<ui::UiMark>(v).ok()) {
+                Some(ui::UiMark::Results(r)) => r.results,
+                _ => Vec::new(),
+            };
+            if results.iter().any(|r| r.card == card) {
+                continue;
+            }
+            results.push(ui::ResultMark { card, answer: None });
+            let mark = ui::UiMark::Results(ui::ResultsMark { l: lineage.clone(), results });
+            if let Ok(v) = serde_json::to_value(mark) {
+                Arc::make_mut(m)[ui::MARK_KEY] = v;
+            }
+        }
+    }
+
+    /// T11: the turn ended with answers handed but never adopted: into
+    /// history, in ledger order. `true`: one of them may start a turn now.
+    pub(crate) fn flush_handed_answers(&mut self) -> bool {
+        let handed = std::mem::take(&mut self.surfaces.handed);
+        self.surfaces.results.clear();
+        let mut wake = false;
+        for (answer_id, _, in_context) in handed {
+            if !in_context && self.push_answer(&answer_id) {
+                wake |= self.may_wake(&answer_id);
+            }
+        }
+        wake
+    }
+
+    /// The tail of an interrupted turn (T12, T15–T17): the stop raises the
+    /// epoch, then answers handed but never adopted go in after the marker,
+    /// and no turn starts. `completed`: the engine had finished the turn.
+    pub(crate) fn surfaces_interrupted(&mut self, reason: crate::engine::interrupt::InterruptReason, completed: bool) {
+        use crate::engine::interrupt::InterruptReason as R;
+        let kind = match reason {
+            R::User => ui::StopKind::User,
+            R::CostCap | R::Host | R::Driver => ui::StopKind::System,
+            R::Restart => ui::StopKind::Reload,
+            R::Crash | R::Unknown => ui::StopKind::Crash,
+        };
+        if !completed {
+            self.surfaces_stop(kind);
+        }
+        let handed = std::mem::take(&mut self.surfaces.handed);
+        self.surfaces.results.clear();
+        for (answer_id, _, in_context) in handed {
+            if !in_context {
+                self.push_answer(&answer_id);
+            }
+        }
+    }
+
+    /// A stop (T15/T16): the epoch rises in memory now and rides the next
+    /// commit; the cancel never waits for it.
+    pub(crate) fn surfaces_stop(&mut self, kind: ui::StopKind) {
+        let Store::Open(o) = &mut self.surfaces.store else {
+            return;
+        };
+        o.images.note(Op::Stop(kind));
+        self.surfaces_commit_noted();
+    }
+
+    /// A user Cancel with no turn running revokes a pending wake (T15): a
+    /// queued record with consent.
+    pub(crate) fn surfaces_cancel_idle(&mut self) {
+        let wake_pending = self.surfaces.open().is_some_and(|o| {
+            let live = o.images.live();
+            live.ledger
+                .iter()
+                .any(|r| r.wake && r.epoch == live.epoch && r.delivery == ui::Delivery::Queued)
+        });
+        if wake_pending {
+            self.surfaces_stop(ui::StopKind::User);
+        }
+    }
+
+    /// T8's drain: after a compaction lands (or a wake), queued answers go
+    /// into history. `true`: one may start a turn now.
+    pub(crate) fn drain_queued_answers(&mut self) -> bool {
+        if self.streaming {
+            return false;
+        }
+        let queued: Vec<String> = self
+            .surfaces
+            .open()
+            .map(|o| {
+                o.images
+                    .live()
+                    .ledger
+                    .iter()
+                    .filter(|r| r.delivery == ui::Delivery::Queued)
+                    .map(|r| r.answer_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (mut wake, mut pushed) = (false, false);
+        for answer_id in queued {
+            if self.push_answer(&answer_id) {
+                pushed = true;
+                wake |= self.may_wake(&answer_id);
+            }
+        }
+        if pushed {
+            self.request_save();
+        }
+        self.surfaces_commit_noted();
+        wake
+    }
 }
 
 #[cfg(test)]
