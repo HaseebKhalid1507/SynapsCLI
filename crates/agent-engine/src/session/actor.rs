@@ -4702,9 +4702,12 @@ impl SessionActor {
             SessionQuery::Status => {
                 // Configured + resolved prompt-cache TTL (`auto` → 1h on OAuth).
                 let cache_ttl = self.cache_ttl_status_json().await;
+                // When the prompt cache expires (`null`: nothing known cached).
+                let cache = self.cache_expiry_json().await;
                 serde_json::json!({
                     "session": self.conv.session.id,
                     "cache_ttl": cache_ttl,
+                    "cache": cache,
                     "model": self.runtime.model(),
                     "lifecycle": SessionLifecycle::from_u8(self.lifecycle.load(std::sync::atomic::Ordering::Acquire)),
                     "tokens": { "input": self.conv.total_input_tokens, "output": self.conv.total_output_tokens },

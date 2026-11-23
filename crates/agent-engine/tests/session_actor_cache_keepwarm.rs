@@ -1926,3 +1926,39 @@ async fn budgeted_thinking_small_prefix_pings_within_the_reported_bound() {
         .await
         .unwrap();
 }
+
+/// `Status.cache`: when the prompt cache expires, from the last accepted
+/// request and the TTL the server honours (here a 1h write: 1h; the
+/// downgrade cases are `honoured_ttl`'s unit tests), relative and wall; `null` before any request and once the history is replaced. The
+/// same block is in `/keepwarm status`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn status_says_when_the_cache_expires() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = off\ncache_ttl = 1h\nthinking = off\n");
+    let (url, _bodies) = recording_stub().await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let st = status(&mut t, 1200).await;
+    assert!(st["cache"].is_null(), "no request yet: {st}");
+    turn(&mut t, "hello").await;
+    let st = status(&mut t, 1201).await;
+    let c = &st["cache"];
+    assert_eq!((c["ttl"].as_str(), c["ttl_secs"].as_u64()), (Some("1h"), Some(3600)), "{st}");
+    let left = c["expires_in_secs"].as_u64().unwrap();
+    assert!((3540..=3600).contains(&left), "just written: {st}");
+    assert_eq!(c["downgraded"], false);
+    let at = chrono::DateTime::parse_from_rfc3339(c["expires_at"].as_str().unwrap()).unwrap();
+    let from_now = at.signed_duration_since(chrono::Utc::now()).num_seconds();
+    assert!((3530..=3601).contains(&from_now), "wall: {st}");
+    let kw = keepwarm(&mut t, 1202, "status").await;
+    assert_eq!(kw["cache"]["ttl_secs"], 3600, "/keepwarm status has it too: {kw}");
+    t.send(SessionCommand::NewSession).await.unwrap();
+    let st = status_until(&mut t, 1203, PATIENCE, |st| st["cache"].is_null()).await;
+    assert!(st["cache"].is_null(), "the history was replaced: {st}");
+    end(&mut t).await;
+}

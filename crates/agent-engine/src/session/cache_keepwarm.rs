@@ -1675,6 +1675,60 @@ impl SessionActor {
         })
     }
 
+    /// When this session's prompt cache expires if nothing touches it: the
+    /// anchor (send time of the last accepted request; a keep-warm ping
+    /// re-stamps it) plus the TTL the server HONOURS, not the configured
+    /// one (`1h` with a silent downgrade, or with no 1h write yet, is `5m`:
+    /// [`honoured_ttl`]). `null` when nothing is known to be cached: no
+    /// request in this process yet (a fresh, unparked or reloaded session),
+    /// the last request cached nothing, the history was replaced since
+    /// (compaction, `/clear`, `/resume`), or off the native Anthropic
+    /// transport. `expires_in_secs` is relative to now (a client on another
+    /// machine counts it down on its own clock); `expires_at` is wall time.
+    /// `Status` (`cache`) and `/keepwarm status`.
+    pub(crate) async fn cache_expiry_json(&mut self) -> serde_json::Value {
+        if self.runtime.cache_keepwarm_ineligibility().is_some() {
+            return serde_json::Value::Null;
+        }
+        let Some(anchor) = self.runtime.cache_anchor() else {
+            return serde_json::Value::Null;
+        };
+        let last = self.cache_keepwarm.last_request.clone();
+        match &last {
+            Some(u) if u.cache_read_tokens + u.cache_write_tokens == 0 => {
+                return serde_json::Value::Null
+            }
+            // Reset with no turn running: the history was replaced.
+            None if self.cache_keepwarm.turn_started_at.is_none() => {
+                return serde_json::Value::Null
+            }
+            _ => {}
+        }
+        let ttl = match self.cache_keepwarm.period.as_ref() {
+            Some(p) => p.ttl(),
+            None => {
+                let evidence = TtlEvidence {
+                    downgraded: self.runtime.cache_ttl_downgraded(),
+                    saw_1h: self.runtime.cache_1h_honoured(),
+                    write_1h: last.as_ref().and_then(|u| u.cache_write_1h).unwrap_or(0),
+                    write_5m: last.as_ref().and_then(|u| u.cache_write_5m).unwrap_or(0),
+                };
+                honoured_ttl(self.runtime.resolved_cache_ttl().await, evidence)
+            }
+        };
+        let governing = governing_ttl(ttl);
+        let age = age(&anchor, Instant::now(), SystemTime::now());
+        let expires_at = chrono::DateTime::<chrono::Utc>::from(anchor.wall + governing);
+        serde_json::json!({
+            "ttl": ttl.as_str(),
+            "ttl_secs": governing.as_secs(),
+            "age_secs": age.as_secs(),
+            "expires_in_secs": governing.saturating_sub(age).as_secs(),
+            "expires_at": expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "downgraded": self.runtime.cache_ttl_downgraded(),
+        })
+    }
+
     /// `/keepwarm [status|off|auto|<N>h]` (actor-owned, like `/saveas`).
     pub(crate) async fn cache_keepwarm_command(&mut self, arg: &str) -> serde_json::Value {
         let arg = arg.trim();
@@ -1707,6 +1761,7 @@ impl SessionActor {
         let prefix_matches = self.cache_keepwarm_recheck().await;
         let mut status = self.cache_keepwarm_status_json(prefix_matches);
         status["cache_ttl"] = self.cache_ttl_status_json().await;
+        status["cache"] = self.cache_expiry_json().await;
         serde_json::json!({
             "kind": "output",
             "text": render_status(&status),
