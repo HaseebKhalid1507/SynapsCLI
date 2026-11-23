@@ -1166,8 +1166,9 @@ impl SessionActor {
         }
     }
 
-    /// After any command: another model than the last one seen (`Set`,
-    /// `/model`, a restore) is a cold cache, even if it is switched back.
+    /// After any command, a driver's commit and an unpark: another model
+    /// than the last one seen (`Set`, `/model`, a restore, a driver's
+    /// selection) is a cold cache, even if it is switched back.
     pub(crate) fn cache_model_fence(&mut self) {
         // Parked: no runtime to ask (nor evidence to forget).
         if self.is_parked() {

@@ -2238,6 +2238,11 @@ impl SessionActor {
                             }
                             // Apply the prepared runtime.
                             *self.runtime = candidate;
+                            // Its model may be another: the fence moves with
+                            // it now, before the driver's producer binds its
+                            // cache lifetime below. A later `Set` back to the
+                            // old model is then a change (Shady #436 R5-1).
+                            self.cache_model_fence();
                             self.conv.session.model = self.runtime.model().to_owned();
                             self.conv.session.thinking_level =
                                 self.runtime.thinking_level().to_owned();
@@ -2830,6 +2835,9 @@ impl SessionActor {
         }
         self.publish_view().await;
         self.state = AttachState::Detached { running: false };
+        // The fresh runtime knows nothing cached; the fence follows its
+        // model (the last published one), whatever woke it.
+        self.cache_model_fence();
         self.set_lifecycle(SessionLifecycle::Live);
         self.update_attach_state();
         // A hook that waited for the unpark runs now (once per session).

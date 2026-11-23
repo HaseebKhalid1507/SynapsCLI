@@ -273,6 +273,10 @@ impl CacheAnchorCell {
 /// Test seam (Shady #436 R4-1): holds request producers in their async
 /// setup, right before they build their request options, so a test can
 /// change the session (switch its model) while one waits there.
+/// Compiled only with `cfg(test)` or the `testing` feature: normal builds
+/// and the release workflow never enable it, but nothing stops an explicit
+/// `--features testing` (or `--all-features`) build, release profile or
+/// not, from including it.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::SeqCst};
