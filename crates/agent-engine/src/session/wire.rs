@@ -74,6 +74,12 @@ pub const FEATURE_SESSION_WORKERS: &str = "session_workers";
 /// session that leaves the held set is pushed as its saved row).
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
 
+/// `Welcome.features` entry: this daemon's `Status` carries `cache` (when the
+/// session's prompt cache expires, `SessionActor::cache_expiry_json`). The
+/// field is additive (an older daemon omits it); the entry lets a client
+/// skip the `Status` query altogether on a daemon that cannot answer it.
+pub const FEATURE_CACHE_EXPIRY: &str = "cache_expiry";
+
 /// `CatalogPage.limit` when absent, and its ceiling.
 pub const CATALOG_PAGE_DEFAULT_LIMIT: u32 = 50;
 pub const CATALOG_PAGE_MAX_LIMIT: u32 = 200;
@@ -93,6 +99,7 @@ pub fn daemon_features() -> Vec<String> {
         FEATURE_OWNED_SESSIONS.to_string(),
         FEATURE_SESSION_WORKERS.to_string(),
         FEATURE_SESSION_PAGE.to_string(),
+        FEATURE_CACHE_EXPIRY.to_string(),
     ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
@@ -2609,6 +2616,8 @@ mod catalog_page_tests {
     fn catalog_page_frames_have_the_pinned_shape() {
         assert_eq!(FEATURE_SESSION_PAGE, "session_page");
         assert!(daemon_features().iter().any(|f| f == FEATURE_SESSION_PAGE), "advertised");
+        assert_eq!(FEATURE_CACHE_EXPIRY, "cache_expiry");
+        assert!(daemon_features().iter().any(|f| f == FEATURE_CACHE_EXPIRY), "advertised");
         let req = ClientFrame::CatalogPage {
             req: 7,
             before: Some(CatalogCursor { updated_at: at(12, 4), id: "20261110-202033-64fb".into() }),
