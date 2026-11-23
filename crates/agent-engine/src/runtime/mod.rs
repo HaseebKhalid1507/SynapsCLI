@@ -62,6 +62,31 @@ use auth::AuthMethods;
 use helpers::HelperMethods;
 use stream::StreamMethods;
 use types::AuthState;
+
+/// A model choice as `Runtime::try_set_model` takes it. Older model pickers
+/// passed the rendered health row back, e.g. `✅  339ms  groq/llama-3.3-70b`:
+/// that exact decoration shape is removed, rather than searching inside the
+/// ID (provider-qualified IDs may legitimately contain `claude-` after their
+/// slash).
+fn clean_model_choice(model: &str) -> &str {
+    let trimmed = model.trim();
+    trimmed
+        .split_once(char::is_whitespace)
+        .and_then(|(_, rest)| {
+            let rest = rest.trim_start();
+            let (latency, candidate) = rest.split_once(char::is_whitespace)?;
+            let millis = latency.strip_suffix("ms")?;
+            if !millis.is_empty() && millis.chars().all(|c| c.is_ascii_digit()) {
+                let candidate = candidate.trim();
+                if !candidate.is_empty() && !candidate.chars().any(char::is_whitespace) {
+                    return Some(candidate);
+                }
+            }
+            None
+        })
+        .unwrap_or(trimmed)
+}
+
 pub use types::{AgentEvent, CancelCause, LlmEvent, SessionEvent, StreamEvent, TurnCompletion};
 pub use stream::activation_policy;
 
@@ -1429,6 +1454,53 @@ impl Runtime {
         self.try_set_model(model).ok().flatten()
     }
 
+    /// Why no model change would apply now, whichever model (`None`: one
+    /// may). Manifestless orchestration snapshots are tied to the exact
+    /// foreground identity: a model mutation is refused while a policy worker
+    /// remains unreconciled; replacing its registry would erase the
+    /// completion-gate remediation path, while changing only the runtime model
+    /// would create a stale authorization snapshot.
+    pub fn model_switch_blocked(&self) -> Option<String> {
+        (self.prompt_reload_source.is_none()
+            && self
+                .orchestration
+                .as_ref()
+                .is_some_and(|current| !current.unreconciled_runtime_handles().is_empty()))
+        .then(|| "model change blocked: workers require collection/reconciliation".to_string())
+    }
+
+    /// Why [`Self::try_set_model`] would refuse `model` as this session's
+    /// foreground model, setting the session-wide
+    /// [`Self::model_switch_blocked`] aside; nothing is changed (`Ok`: it
+    /// would apply). `SessionQuery::ModelOptions` lists the models that pass.
+    pub fn foreground_model_refusal(&self, model: &str) -> std::result::Result<(), String> {
+        self.foreground_model_plan(clean_model_choice(model)).map(|_| ())
+    }
+
+    /// The manifestless policy that replaces the current one when `cleaned`
+    /// becomes the foreground model (`None`: none to replace), or why it
+    /// cannot. Side-effect free: [`Self::try_set_model`] installs it,
+    /// [`Self::foreground_model_refusal`] only asks.
+    fn foreground_model_plan(
+        &self,
+        cleaned: &str,
+    ) -> std::result::Result<Option<Arc<crate::orchestration::OrchestrationRuntime>>, String> {
+        if self.prompt_reload_source.is_some() || self.orchestration.is_none() {
+            return Ok(None);
+        }
+        let foreground = crate::orchestration::canonical_foreground_identity(cleaned)
+            .map_err(|_| "model change blocked: unresolved foreground model".to_string())?;
+        let replacement =
+            crate::orchestration::OrchestrationRuntime::from_limits(foreground, self.subagent_limits)
+                .map_err(|_| "model change blocked: trusted worker catalog unavailable".to_string())?;
+        for trusted in &self.trusted_worker_models {
+            replacement
+                .grant_worker_model(trusted.as_str())
+                .map_err(|_| "model change blocked: configured worker trust invalid".to_string())?;
+        }
+        Ok(Some(Arc::new(replacement)))
+    }
+
     /// Apply a model change while preserving orchestration lifecycle invariants.
     /// Returns an error instead of mutating either model or policy when active
     /// workers still require collection/reconciliation or when the replacement
@@ -1439,60 +1511,11 @@ impl Runtime {
         &mut self,
         model: String,
     ) -> std::result::Result<Option<ReasoningClamp>, String> {
-        // Older model pickers passed the rendered health row back here, e.g.
-        // `✅  339ms  groq/llama-3.3-70b`. Remove that exact decoration shape,
-        // rather than searching inside the ID: provider-qualified IDs may
-        // legitimately contain `claude-` after their slash.
-        let trimmed = model.trim();
-        let cleaned = trimmed
-            .split_once(char::is_whitespace)
-            .and_then(|(_, rest)| {
-                let rest = rest.trim_start();
-                let (latency, candidate) = rest.split_once(char::is_whitespace)?;
-                let millis = latency.strip_suffix("ms")?;
-                if !millis.is_empty() && millis.chars().all(|c| c.is_ascii_digit()) {
-                    let candidate = candidate.trim();
-                    if !candidate.is_empty() && !candidate.chars().any(char::is_whitespace) {
-                        return Some(candidate);
-                    }
-                }
-                None
-            })
-            .unwrap_or(trimmed);
-        // Manifestless orchestration snapshots are tied to the exact foreground
-        // identity. Refuse the model mutation while a policy worker remains
-        // unreconciled; replacing its registry would erase the completion-gate
-        // remediation path, while changing only the runtime model would create a
-        // stale authorization snapshot.
-        if self.prompt_reload_source.is_none()
-            && self
-                .orchestration
-                .as_ref()
-                .is_some_and(|current| !current.unreconciled_runtime_handles().is_empty())
-        {
-            return Err("model change blocked: workers require collection/reconciliation".into());
+        let cleaned = clean_model_choice(&model);
+        if let Some(blocked) = self.model_switch_blocked() {
+            return Err(blocked);
         }
-        let orchestration_replacement = if self.prompt_reload_source.is_none()
-            && self.orchestration.is_some()
-        {
-            let foreground = crate::orchestration::canonical_foreground_identity(cleaned)
-                .map_err(|_| "model change blocked: unresolved foreground model".to_string())?;
-            let replacement = crate::orchestration::OrchestrationRuntime::from_limits(
-                foreground,
-                self.subagent_limits,
-            )
-            .map_err(|_| "model change blocked: trusted worker catalog unavailable".to_string())?;
-            for trusted in &self.trusted_worker_models {
-                replacement
-                    .grant_worker_model(trusted.as_str())
-                    .map_err(|_| {
-                        "model change blocked: configured worker trust invalid".to_string()
-                    })?;
-            }
-            Some(Arc::new(replacement))
-        } else {
-            None
-        };
+        let orchestration_replacement = self.foreground_model_plan(cleaned)?;
         self.model = cleaned.to_owned();
         // Replace the manifestless policy atomically after a safe model change so
         // inheritance and exact same-provider choices follow the new foreground.
@@ -1720,6 +1743,39 @@ impl Runtime {
             );
             crate::runtime::openai::catalog::ensure_muse_catalog_for(model, &broker).await;
         }
+    }
+
+    /// Which providers THIS runtime's credential source can serve now (its
+    /// broker's non-secret `capabilities`, keyed like model prefixes:
+    /// `anthropic`, `openai-codex`, a static provider's key, `local`), or
+    /// why it cannot say. A remote broker is asked over HTTP, bounded by
+    /// `timeout`. On a local source an API key in the environment counts for
+    /// the providers that read one (`ANTHROPIC_API_KEY`, Muse's); a remote
+    /// source never uses local credentials, so it never counts them.
+    pub async fn provider_availability(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<std::collections::BTreeSet<String>, String> {
+        let broker = crate::auth::broker_from_source(
+            &self.credential_source,
+            &self.token_cache,
+            self.client.clone(),
+        );
+        let caps = tokio::time::timeout(timeout, broker.capabilities())
+            .await
+            .map_err(|_| "the credential broker did not answer in time".to_string())?
+            .map_err(|e| format!("the credential broker did not answer: {e}"))?;
+        let mut keys: std::collections::BTreeSet<String> =
+            caps.into_iter().filter(|p| p.configured).map(|p| p.key).collect();
+        if !self.credential_source.is_remote() {
+            if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty()) {
+                keys.insert("anthropic".into());
+            }
+            if agent_core::auth::muse::env_api_key_present() {
+                keys.insert("muse".into());
+            }
+        }
+        Ok(keys)
     }
 
     /// Whether this runtime projects a progressive (core-only) tool schema.

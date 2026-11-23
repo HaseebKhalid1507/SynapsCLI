@@ -77,8 +77,22 @@ pub const FEATURE_SESSION_PAGE: &str = "session_page";
 /// `Welcome.features` entry: this daemon answers `SessionQuery::ModelOptions`
 /// (`session::model_options`). An older one answers that query with
 /// `Error{"malformed frame: unknown variant `model_options`…"}`, so a client
-/// checks this first.
+/// checks this first ([`feature_needed`]; `SocketTransport::send` does). As
+/// with `session_page`, the client opts in by asking: the answer is a
+/// `QueryReply` to the client that asked, never sent to any other.
 pub const FEATURE_MODEL_OPTIONS: &str = "model_options";
+
+/// The `Welcome.features` entry a daemon must list before a client sends
+/// `cmd` (an older daemon answers the new variant or field with "malformed
+/// frame", or ignores it), and the request's name for `DaemonTooOld`.
+pub fn feature_needed(cmd: &SessionCommand) -> Option<(&'static str, &'static str)> {
+    match cmd {
+        SessionCommand::Query { query: SessionQuery::ModelOptions, .. } => {
+            Some((FEATURE_MODEL_OPTIONS, "model options"))
+        }
+        _ => None,
+    }
+}
 
 /// `CatalogPage.limit` when absent, and its ceiling.
 pub const CATALOG_PAGE_DEFAULT_LIMIT: u32 = 50;

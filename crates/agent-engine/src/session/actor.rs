@@ -4701,6 +4701,8 @@ impl SessionActor {
             self.reply(from, false, id, value);
             return;
         }
+        // An answer the client opted into by asking: to it alone.
+        let addressed = matches!(query, SessionQuery::ModelOptions);
         let value = match query {
             SessionQuery::Status => {
                 // Configured + resolved prompt-cache TTL (`auto` → 1h on OAuth).
@@ -4795,11 +4797,11 @@ impl SessionActor {
                 // The level check reads live capability evidence, as `Set` does.
                 let model = self.runtime.model().to_string();
                 self.runtime.prepare_model_capabilities(&model).await;
-                serde_json::to_value(super::model_options::session_model_options(&self.runtime))
+                serde_json::to_value(super::model_options::session_model_options(&self.runtime).await)
                     .unwrap_or_default()
             }
         };
-        self.reply(from, false, id, value);
+        self.reply(from, addressed, id, value);
     }
 
     /// A query's answer: to the client that asked only when `addressed`

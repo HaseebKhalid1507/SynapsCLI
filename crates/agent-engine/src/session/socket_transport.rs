@@ -1052,7 +1052,12 @@ impl ClientTransport for SocketTransport {
         &self.meta
     }
 
+    /// A command an older daemon cannot take ([`feature_needed`]) is never
+    /// sent to one that does not list its feature: `DaemonTooOld`.
     async fn send(&self, cmd: SessionCommand) -> Result<(), TransportError> {
+        if let Some((_, request)) = feature_needed(&cmd).filter(|(f, _)| !self.welcome.supports(f)) {
+            return Err(TransportError::DaemonTooOld { daemon_version: self.welcome.daemon_version.clone(), request });
+        }
         match self.writer.try_send(ClientFrame::Cmd { session_id: self.session.clone(), cmd }) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(TransportError::Backpressure),
@@ -1782,6 +1787,31 @@ mod tests {
         );
         conn.bye().await;
         assert_eq!(srv.await.unwrap(), vec!["Bye".to_string()], "no CatalogPage ever reached the daemon");
+    }
+
+    /// A daemon without `model_options` in `Welcome.features` would answer
+    /// "unknown variant": the query is never sent, and the connection goes on.
+    #[tokio::test]
+    async fn model_options_against_a_daemon_without_the_feature_is_too_old() {
+        let (_d, path) = sock();
+        let l = Listener::bind(&path).unwrap();
+        let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        assert!(!conn.welcome.supports(FEATURE_MODEL_OPTIONS));
+        let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
+            .await
+            .unwrap();
+        let err = t.send(SessionCommand::Query { id: 3, query: SessionQuery::ModelOptions }).await.unwrap_err();
+        assert!(matches!(err, TransportError::DaemonTooOld { request: "model options", .. }), "{err}");
+        // Nothing went out: the next command's answer is the next frame.
+        t.send(SessionCommand::Submit { text: "after".into(), attachments: vec![] }).await.unwrap();
+        let e = tokio::time::timeout(std::time::Duration::from_secs(2), t.next_event()).await.expect("no event");
+        match e.map(|e| e.event) {
+            Some(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(s)))) => assert_eq!(s, "after"),
+            other => panic!("{other:?}"),
+        }
+        t.detach().await;
+        let _ = srv.await;
     }
 
     /// A daemon that advertises the feature but grants no owner token: the
