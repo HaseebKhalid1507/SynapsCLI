@@ -331,6 +331,9 @@ fn timed_items(msgs: &[SharedMessage]) -> Projected {
     (items, times, ui)
 }
 
+/// One message's display items, its time, and each item's fold.
+type Group = (Vec<DisplayItem>, Option<String>, Vec<Option<UiItem>>);
+
 /// The last `max_items` display items (`0` = unbounded). Walks from the back
 /// and stops once the cap is met; the head is only counted (no allocation),
 /// so a 20 MB history costs O(tail) allocations + one O(n) scan.
@@ -348,7 +351,7 @@ pub fn display_tail(msgs: &[SharedMessage], max_items: usize) -> DisplayTail {
     // after its call); only the tail is projected.
     let fold = fold_of(msgs);
     // Per-message item groups, newest first, until we hold >= max_items.
-    let mut groups: Vec<(Vec<DisplayItem>, Option<String>, Vec<Option<UiItem>>)> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
     let mut held = 0usize;
     let mut idx = msgs.len();
     while idx > 0 && held < max_items {
