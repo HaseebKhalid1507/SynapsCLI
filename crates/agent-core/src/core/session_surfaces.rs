@@ -40,7 +40,7 @@ use super::ui_types::{
     Downgrade, LedgerRecord, LogEntry, Phase, StopKind, SurfaceState, Tombstone, UiMark, Verb,
     WaitMode, ACTION_LOG_MAX, ANSWER_MAX_BYTES, ATTACHED_MAX_STATES, BY_MAX_BYTES,
     CAPSULE_MAX_BYTES, LEDGER_MAX_RECORDS, LEDGER_MAX_VALUE_BYTES, MARK_KEY, QUESTION_MAX,
-    SIDECAR_MAX_BYTES, SURFACE_STATE_MAX_BYTES, TASK_EXCERPT_MAX, TOMBSTONES_MAX,
+    SIDECAR_MAX_BYTES, SURFACE_STATE_MAX_BYTES, TASK_EXCERPT_MAX, TIME_MAX_BYTES, TOMBSTONES_MAX,
     TOMBSTONE_MAX_BYTES,
 };
 
@@ -307,6 +307,28 @@ fn is_contract(s: &str) -> bool {
     s.strip_prefix("c1:").is_some_and(is_hex128)
 }
 
+/// What `s` costs between JSON's quotes, as serde_json writes it.
+fn json_len(s: &str) -> usize {
+    s.bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 2,
+            0..=0x1f => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// A stored time: at most [`TIME_MAX_BYTES`] as JSON writes it. It need
+/// not parse (an unreadable time counts as oldest, v3.3 #3).
+fn is_time(s: &str) -> bool {
+    json_len(s) <= TIME_MAX_BYTES
+}
+
+/// `offers`: a set of [`Verb::ALL`], each at most once.
+fn is_offer_set(v: &[Verb]) -> bool {
+    v.len() <= Verb::ALL.len() && v.iter().enumerate().all(|(i, x)| !v[..i].contains(x))
+}
+
 /// An action-log entry: a client's hex128 `action_id` and its payload's
 /// hex128 hash (§3.7, v3.2 #10).
 fn is_log_entry(e: &LogEntry) -> bool {
@@ -321,6 +343,12 @@ fn check_card(c: &CardRecord) -> Result<(), SidecarError> {
     }
     if !is_contract(&st.contract) {
         return Err(bounds("contract"));
+    }
+    if !is_offer_set(&st.offers) {
+        return Err(bounds("offers"));
+    }
+    if !is_time(&st.raised_at) {
+        return Err(bounds("raised_at"));
     }
     if st.origin.turn.as_deref().is_some_and(|t| !is_turn_id(t))
         || st.origin.task.chars().count() > TASK_EXCERPT_MAX
@@ -338,6 +366,7 @@ fn check_card(c: &CardRecord) -> Result<(), SidecarError> {
         let ok = is_hex128(&a.action_id)
             && is_host_id(&a.answer_id, "a_")
             && a.by.len() <= BY_MAX_BYTES
+            && is_time(&a.at)
             && a.values.to_json().len() <= ANSWER_MAX_BYTES;
         if !ok {
             return Err(bounds("answer"));
@@ -347,8 +376,13 @@ fn check_card(c: &CardRecord) -> Result<(), SidecarError> {
 }
 
 /// The structural bounds of §4.4 and v3.2 #11, every field the format
-/// bounds: identifiers, `origin`, `by`, the action logs, a ledger record's
-/// `q` and `asked` capsule and its values, then each category's total. A
+/// bounds: identifiers, `origin`, `offers`, the stored times, `by`, the
+/// action logs, a ledger record's `q` and `asked` capsule and its values,
+/// then each category's total. Every field of the format is bounded on its
+/// own, so a tombstone can't reach [`TOMBSTONE_MAX_BYTES`] nor a card
+/// [`SURFACE_STATE_MAX_BYTES`] (the engine's
+/// `worst_sidecar_of_real_types_fits` measures each at its maximum); those
+/// totals stay as guards. A
 /// sidecar out of any of them is refused whole, never trimmed. Docs are not
 /// revalidated here: the engine does that between decode and [`recover`]
 /// (v3.2 #12).
@@ -436,6 +470,7 @@ pub fn check_bounds(s: &Sidecar) -> Result<(), SidecarError> {
     for t in &s.tombstones {
         let n = serde_json::to_vec(t).map_or(usize::MAX, |b| b.len());
         if !is_host_id(&t.id, "s_")
+            || !is_time(&t.at)
             || t.log.len() > ACTION_LOG_MAX
             || !t.log.iter().all(is_log_entry)
             || n > TOMBSTONE_MAX_BYTES
@@ -1203,15 +1238,21 @@ impl<F: UiFs> UiStore<F> {
         }
     }
 
-    /// A fresh writer after one died, its floor from a read-back that
-    /// proved something. Evidence that proves nothing fails the store
-    /// closed instead: no writer is started from it.
-    fn respawn(&mut self, name: &str) -> Result<Evidence, Refusal> {
+    /// A fresh writer after one died between commits, its floor from a
+    /// read-back of `name`.
+    fn respawn(&mut self, name: &str) -> Result<(), Refusal> {
         let evidence = self.read_back(name);
-        let floor = match &evidence {
+        self.respawn_from(name, &evidence).map_err(Refusal::Storage)
+    }
+
+    /// A fresh writer, its floor from `evidence`, which must prove
+    /// something. Evidence that proves nothing fails the store closed
+    /// instead: no writer is started from it.
+    fn respawn_from(&mut self, name: &str, evidence: &Evidence) -> Result<(), String> {
+        let floor = match evidence {
             Evidence::Unknown(e) => {
                 self.failed = Some(e.clone());
-                return Err(Refusal::Storage(e.clone()));
+                return Err(e.clone());
             }
             Evidence::Seq(seq) => HashMap::from([(name.to_string(), *seq)]),
             Evidence::Missing => HashMap::new(),
@@ -1219,12 +1260,12 @@ impl<F: UiFs> UiStore<F> {
         match spawn_writer(self.fs.clone(), self.cfg, floor) {
             Ok(w) => {
                 self.writer = w;
-                Ok(evidence)
+                Ok(())
             }
             Err(e) => {
                 let e = format!("couldn't start the writer: {e}");
                 self.failed = Some(e.clone());
-                Err(Refusal::Storage(e))
+                Err(e)
             }
         }
     }
@@ -1288,38 +1329,35 @@ impl<F: UiFs> UiStore<F> {
     }
 
     /// The writer died with `flight` in it. Only a read-back that succeeds
-    /// decides: a write is published when the file holds its `seq`, and
+    /// decides, and it is classified against `flight` before any writer
+    /// starts: a write is published when the file holds its `seq`, and
     /// never published when the file holds an older one or none; a removal
-    /// is done when the file is gone, and never happened when it is still
-    /// there. Anything else (a failed read, a newer `seq`, no `seq`) leaves
-    /// the outcome unknown: the store fails closed with the change kept
-    /// pending (`Unsynced`), never rolled back (H1).
+    /// is done when the file is gone, and never happened when the file
+    /// still holds an older `seq`. Anything else (a failed read, a file
+    /// over the read bound, no `seq`, a `seq` past a write's or at or past
+    /// a removal's own, which no file ever holds) leaves the outcome
+    /// unknown: the store fails closed with the change kept pending
+    /// (`Unsynced`), never rolled back, and no writer is started (H1).
     fn after_writer_death(&mut self, flight: &InFlight) -> Poll {
-        let evidence = match self.respawn(&flight.name) {
-            Ok(e) => e,
-            Err(Refusal::Storage(e) | Refusal::Bounds(e)) => {
-                self.failed = Some(e.clone());
-                self.inflight = None;
-                return Poll::Done(Outcome::Unsynced(e));
-            }
-            Err(Refusal::Busy) => Evidence::Unknown("the writer is busy".into()),
-        };
+        let evidence = self.read_back(&flight.name);
         let published = match (flight.remove, &evidence) {
             (true, Evidence::Missing) => true,
-            (true, Evidence::Seq(_)) => false,
+            (true, Evidence::Seq(s)) if *s < flight.seq => false,
             (false, Evidence::Seq(s)) if *s == flight.seq => true,
             (false, Evidence::Seq(s)) if *s < flight.seq => false,
             (false, Evidence::Missing) => false,
-            (_, other) => {
-                let e = match other {
-                    Evidence::Unknown(e) => e.clone(),
-                    _ => format!("{} holds a seq newer than {}", flight.name, flight.seq),
-                };
-                self.failed = Some(e.clone());
-                self.inflight = None;
-                return Poll::Done(Outcome::Unsynced(e));
+            (_, Evidence::Unknown(e)) => return self.unsynced(e.clone()),
+            (_, Evidence::Seq(s)) => {
+                let e = format!(
+                    "{} holds seq {s}, not older than the in-flight {}",
+                    flight.name, flight.seq
+                );
+                return self.unsynced(e);
             }
         };
+        if let Err(e) = self.respawn_from(&flight.name, &evidence) {
+            return self.unsynced(e);
+        }
         if !published {
             self.inflight = None;
             return Poll::Done(Outcome::NotPublished(
@@ -1332,11 +1370,16 @@ impl<F: UiFs> UiStore<F> {
             .send(Job::Sync { seq: flight.seq })
             .is_err()
         {
-            self.inflight = None;
-            self.failed = Some("the writer is gone".into());
-            return Poll::Done(Outcome::Unsynced("the writer is gone".into()));
+            return self.unsynced("the writer is gone".into());
         }
         self.poll(self.cfg.budget)
+    }
+
+    /// The in-flight change's outcome is unknown: the store fails closed.
+    fn unsynced(&mut self, e: String) -> Poll {
+        self.failed = Some(e.clone());
+        self.inflight = None;
+        Poll::Done(Outcome::Unsynced(e))
     }
 
     /// Read back and decode `<session_id>.ui` (a loader's read).

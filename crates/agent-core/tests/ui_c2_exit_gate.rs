@@ -1553,6 +1553,80 @@ fn store_read_back_error_is_not_evidence() {
     }
 }
 
+/// R2-M1: a read-back that reads but proves nothing about the in-flight
+/// change (a file over the read bound, bytes without a `seq`, a `seq` past
+/// a write's, or at or past a removal's own, which no file ever holds)
+/// leaves the outcome unknown, for both kinds of job: `Unsynced`, the
+/// store failed closed, nothing admitted after it. The file was put there
+/// behind the writer's back, as by another process.
+#[test]
+fn store_read_back_without_evidence_fails_closed() {
+    let at = |seq: u64| json!({"v": 1, "seq": seq}).to_string().into_bytes();
+    for remove in [false, true] {
+        let mut cases = vec!["oversized", "no seq", "newer seq"];
+        if remove {
+            cases.push("its own seq");
+        }
+        for what in cases {
+            let mut w = world();
+            w.commit_ok(create(1, WaitMode::Live));
+            let next = w.store.last_seq() + 1;
+            let bytes = match what {
+                "oversized" => vec![b' '; SIDECAR_READ_MAX_BYTES + 1],
+                "no seq" => b"{\"v\":1}".to_vec(),
+                "newer seq" => at(next + 1),
+                _ => at(next),
+            };
+            w.fs.put(&sidecar_name(SID), &bytes);
+            let out = if remove {
+                w.fs.panic_next_remove(false);
+                w.store.remove(SID).unwrap();
+                w.store.poll(LONG)
+            } else {
+                w.fs.panic_next_write(false);
+                w.img.commit(&mut w.store, Some(accept(1, 1))).unwrap();
+                w.img.poll(&mut w.store, LONG)
+            };
+            let case = format!("remove {remove}, {what}");
+            assert!(
+                matches!(out, Poll::Done(Outcome::Unsynced(_))),
+                "{case}: {out:?}"
+            );
+            assert_eq!(Lifecycle::of(&out), Lifecycle::Unconfirmed, "{case}");
+            assert!(w.store.failure().is_some(), "{case}: failed closed");
+            assert!(
+                matches!(w.store.admit(), Err(Refusal::Storage(_))),
+                "{case}: nothing admitted"
+            );
+            assert_eq!(w.store.last_seq(), next, "{case}: seq kept");
+            assert_eq!(w.fs.get(&sidecar_name(SID)), Some(bytes), "{case}");
+            if !remove {
+                assert!(
+                    matches!(w.img.pending_op(), Some(Op::Accept(_))),
+                    "{case}: kept pending, never rolled back"
+                );
+                assert_eq!(
+                    w.img.admit(&w.store, &request(1, 1, Verb::Answer, 0, 0)),
+                    Err(Admission::Pending),
+                    "{case}"
+                );
+            }
+        }
+    }
+    // An older seq still decides: the removal never happened.
+    let mut w = world();
+    w.commit_ok(create(1, WaitMode::Live));
+    w.fs.put(&sidecar_name(SID), &at(w.store.last_seq() - 1));
+    w.fs.panic_next_remove(false);
+    w.store.remove(SID).unwrap();
+    let out = w.store.poll(LONG);
+    assert!(
+        matches!(out, Poll::Done(Outcome::NotPublished(_))),
+        "{out:?}"
+    );
+    assert!(w.store.failure().is_none());
+}
+
 /// v3.3 #2a: an image over its bounds (a create that would make 13 cards)
 /// is refused as `Bounds`: nothing is written, the store isn't failed, and
 /// the next valid commit is Durable.

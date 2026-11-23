@@ -94,6 +94,11 @@ pub const TURN_ID_BYTES: usize = 36;
 /// `AnswerState.by`, the roster label: ≤64 bytes after `ui_sanitize`, cut
 /// with `…`, never refused (`agent_engine::ui::roster_label`).
 pub const BY_MAX_BYTES: usize = 64;
+/// A stored time (`raised_at`, `answer.at`, a tombstone's `at`), as JSON
+/// writes it (quotes aside): the longest RFC 3339 the host writes,
+/// `2026-11-23T05:42:00.123456789+00:00`. A shorter time that doesn't
+/// parse still loads, and counts as oldest (v3.3 #3).
+pub const TIME_MAX_BYTES: usize = 35;
 
 // ── System budget (§4.4, R2-M3). C1 measures these on worst-case images;
 // C2 (sidecar) and C3 (wire) enforce them. ────────────────────────────────
@@ -538,6 +543,11 @@ pub enum Verb {
     Answer,
     Skip,
     Revise,
+}
+
+impl Verb {
+    /// Every verb: `offers` is a set of these.
+    pub const ALL: [Verb; 3] = [Verb::Answer, Verb::Skip, Verb::Revise];
 }
 
 /// Why a waiting card became live (T13, T14, T17, T21).

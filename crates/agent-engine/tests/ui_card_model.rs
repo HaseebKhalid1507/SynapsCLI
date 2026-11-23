@@ -570,7 +570,7 @@ fn real_worst_state(i: usize, doc: &CardDoc) -> SurfaceState {
             .collect(),
         ))
         .unwrap(),
-        offers: vec![Verb::Answer, Verb::Skip, Verb::Revise],
+        offers: Verb::ALL.to_vec(),
         doc: doc.clone(),
         origin: Origin {
             turn: Some(turn_id()),
@@ -596,44 +596,57 @@ fn real_worst_state(i: usize, doc: &CardDoc) -> SurfaceState {
     }
 }
 
-/// C2's half of the budget (Shady #440 M4): every category full at once,
-/// built from the real types the sidecar serializes (`CardRecord` and its
-/// `SurfaceState`, `LedgerRecord`, `Tombstone`, the three handoff fields
-/// at once, `Sidecar`), so a field added or widened changes this
-/// measurement. Each field `check_bounds` bounds is at its bound in the
-/// bytes JSON spends most on: the stored capsule is 1 KiB of C0 controls
-/// (its `CAPSULE_STORED_ALLOWANCE`, for real), `q`, `task` and `by` are
-/// too. The real image passes `check_bounds` and encodes; with each doc
-/// swapped for its `DOC_MAX_BYTES` filler it still fits
-/// `SIDECAR_MAX_BYTES`; and no transition that can't be refused makes it
-/// longer.
+/// C2's half of the budget (Shady #440 M4, R2-M2): every category full at
+/// once, built from the real types the sidecar serializes (`CardRecord`
+/// and its `SurfaceState`, `LedgerRecord`, `Tombstone`, the three handoff
+/// fields at once, `Sidecar`), so a field added or widened changes this
+/// measurement. Every field is at the maximum `check_bounds` admits, in
+/// the bytes JSON spends most on: the stored capsule is 1 KiB of C0
+/// controls (its `CAPSULE_STORED_ALLOWANCE`, for real), `q`, `task` and
+/// `by` are too; `call_id` and every `base` are `\` at their byte bounds;
+/// each time is at `TIME_MAX_BYTES`; `offers` is every verb; numbers are at
+/// their type's maximum and each enum and bool at its longest spelling.
+/// No field is bounded only by its container, so a tombstone or a card
+/// can't grow past what is measured here. The real image passes
+/// `check_bounds` and encodes; with each doc swapped for its
+/// `DOC_MAX_BYTES` filler it still fits `SIDECAR_MAX_BYTES`; and no
+/// transition that can't be refused makes an image longer than that, from
+/// it or from one without the optional fields those transitions add.
 #[test]
 fn worst_sidecar_of_real_types_fits() {
     use agent_core::core::session_surfaces::{
         apply, check_bounds, encode_sidecar, CardRecord, Compacting, HandoffFrom, HandoffTo,
-        MovedTo, Op, Prepared, Sidecar, SIDECAR_VERSION,
+        MovedTo, Op, Prepared, Sidecar, BASE_MAX_BYTES, SIDECAR_VERSION,
     };
     let doc = doc_example();
     let per_record = LEDGER_MAX_VALUE_BYTES / LEDGER_MAX_RECORDS;
+    // `is_base` admits any ASCII graphic: `\` costs JSON two bytes.
+    let base = || "\\".repeat(BASE_MAX_BYTES);
+    assert_eq!(
+        bytes(&json!(rfc3339())),
+        TIME_MAX_BYTES + 2,
+        "a time at its bound"
+    );
+    assert_eq!(bytes(&json!(false)), 5, "`checkpointed: false`, the longer");
     let from = HandoffFrom {
         session_id: session_id(),
-        base: hex(64),
+        base: base(),
         seq: u64::MAX,
     };
     let real = Sidecar {
         v: SIDECAR_VERSION,
         session_id: session_id(),
         lineage: hex(32),
-        base: hex(64),
+        base: base(),
         seq: u64::MAX,
         epoch: u32::MAX,
-        checkpointed: true,
+        checkpointed: false,
         compacting: Some(Compacting {
             hx: hex(32),
             from,
             to: HandoffTo {
                 session_id: session_id(),
-                base: hex(64),
+                base: base(),
             },
         }),
         prepared: Some(Prepared {
@@ -726,6 +739,9 @@ fn worst_sidecar_of_real_types_fits() {
     // their longest: none makes the image longer.
     let mut ops = vec![
         Op::Checkpoint,
+        Op::Clear {
+            at: rfc3339().into(),
+        },
         Op::Expire { card: sid(0) },
         Op::Settle {
             answer_id: aid(101),
@@ -763,11 +779,25 @@ fn worst_sidecar_of_real_types_fits() {
             to,
         }),
     );
-    for op in ops {
-        let mut after = real.clone();
-        apply(&mut after, &op);
-        let n = encode_sidecar(&after).unwrap().len();
-        assert!(n <= real_bytes, "{op:?} grew the image to {n} B");
+    // From the maximum, and from the maximum without the optional fields
+    // a stop or a downgrade adds (`origin.stopped`, `downgraded`).
+    let mut lean = real.clone();
+    for c in &mut lean.cards {
+        c.state.origin.stopped = None;
+        c.state.downgraded = None;
+    }
+    for (from, image) in [("the maximum", &real), ("the lean maximum", &lean)] {
+        for op in &ops {
+            let mut after = image.clone();
+            apply(&mut after, op);
+            let n = encode_sidecar(&after)
+                .unwrap_or_else(|e| panic!("{op:?} from {from}: {e}"))
+                .len();
+            assert!(
+                n <= real_bytes,
+                "{op:?} from {from} grew the image to {n} B"
+            );
+        }
     }
 }
 

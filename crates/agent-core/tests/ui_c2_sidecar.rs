@@ -267,10 +267,48 @@ fn sidecar_deleted_first() {
     assert!(!snapshot.exists() && !journal_path(dir.as_path(), &s.id).exists());
 }
 
+/// Answer values of exactly `n` bytes as JSON writes them.
+fn values(n: usize) -> Answer {
+    let pad = n - values_floor();
+    let a: Answer = serde_json::from_value(json!({"fields": {"f0": "x".repeat(pad)}})).unwrap();
+    assert_eq!(a.to_json().len(), n);
+    a
+}
+
+fn values_floor() -> usize {
+    let a: Answer = serde_json::from_value(json!({"fields": {"f0": ""}})).unwrap();
+    a.to_json().len()
+}
+
+/// The ledger's values at [`LEDGER_MAX_VALUE_BYTES`] in all, plus `over`:
+/// seven records at the per-record cap, two sharing the rest.
+fn ledger_values(s: &mut Sidecar, over: usize) {
+    let r = s.ledger[0].clone();
+    let full = LEDGER_MAX_VALUE_BYTES / ANSWER_MAX_BYTES - 1;
+    s.ledger = (0..=full + 1)
+        .map(|i| {
+            let n = match i {
+                i if i < full => ANSWER_MAX_BYTES,
+                i if i == full => ANSWER_MAX_BYTES - values_floor(),
+                _ => values_floor() + over,
+            };
+            LedgerRecord {
+                answer_id: format!("a_{:016x}", 100 + i),
+                values: values(n),
+                ..r.clone()
+            }
+        })
+        .collect();
+    let total: usize = s.ledger.iter().map(|r| r.values.to_json().len()).sum();
+    assert_eq!(total, LEDGER_MAX_VALUE_BYTES + over);
+}
+
 /// M4: every field the format bounds, at N and N+1, on encode and decode.
 /// At N+1 the whole sidecar is refused (`Bounds`), never trimmed, even
-/// with its total far below 512 KiB; a ledger `asked` or `q` hogging
-/// hundreds of KiB is refused the same way.
+/// with its total far below 512 KiB; a ledger `asked` or `q`, a time or
+/// `offers` hogging hundreds of KiB is refused the same way. R2-M2: the
+/// times, `offers` and each value lane are bounded on their own, not only
+/// by the card or tombstone holding them.
 #[test]
 fn sidecar_field_bounds() {
     type Edit = Box<dyn Fn(&mut Sidecar)>;
@@ -349,6 +387,57 @@ fn sidecar_field_bounds() {
             "tombstone log",
             Box::new(|s: &mut Sidecar| s.tombstones[0].log[0].action_id = "f".repeat(32)),
             Box::new(|s: &mut Sidecar| s.tombstones[0].log[0].action_id = "act-1".into()),
+        ),
+        // R2-M2: the fields only their container bounded.
+        (
+            "offers repeated",
+            Box::new(|s: &mut Sidecar| card0(s).offers = Verb::ALL.to_vec()),
+            Box::new(|s: &mut Sidecar| card0(s).offers = vec![Verb::Answer, Verb::Answer]),
+        ),
+        (
+            "offers, thousands",
+            Box::new(|s: &mut Sidecar| card0(s).offers = Vec::new()),
+            Box::new(|s: &mut Sidecar| card0(s).offers = vec![Verb::Skip; 20_000]),
+        ),
+        (
+            "raised_at",
+            Box::new(|s: &mut Sidecar| card0(s).raised_at = "x".repeat(TIME_MAX_BYTES)),
+            Box::new(|s: &mut Sidecar| card0(s).raised_at = "x".repeat(TIME_MAX_BYTES + 1)),
+        ),
+        (
+            "raised_at, as JSON writes it",
+            Box::new(|s: &mut Sidecar| card0(s).raised_at = format!("x{}", "\\".repeat(17))),
+            Box::new(|s: &mut Sidecar| card0(s).raised_at = "\u{1}".repeat(6)),
+        ),
+        (
+            "raised_at, hundreds of KiB",
+            Box::new(|s: &mut Sidecar| card0(s).raised_at = String::new()),
+            Box::new(|s: &mut Sidecar| card0(s).raised_at = "x".repeat(300 * 1024)),
+        ),
+        (
+            "answer.at",
+            Box::new(|s: &mut Sidecar| answer0(s).at = "x".repeat(TIME_MAX_BYTES)),
+            Box::new(|s: &mut Sidecar| answer0(s).at = "x".repeat(TIME_MAX_BYTES + 1)),
+        ),
+        (
+            "tombstone at",
+            Box::new(|s: &mut Sidecar| s.tombstones[0].at = "x".repeat(TIME_MAX_BYTES)),
+            Box::new(|s: &mut Sidecar| s.tombstones[0].at = "x".repeat(TIME_MAX_BYTES + 1)),
+        ),
+        (
+            "answer values",
+            Box::new(|s: &mut Sidecar| answer0(s).values = values(ANSWER_MAX_BYTES)),
+            Box::new(|s: &mut Sidecar| answer0(s).values = values(ANSWER_MAX_BYTES + 1)),
+        ),
+        (
+            "ledger values",
+            Box::new(|s: &mut Sidecar| s.ledger[0].values = values(ANSWER_MAX_BYTES)),
+            Box::new(|s: &mut Sidecar| s.ledger[0].values = values(ANSWER_MAX_BYTES + 1)),
+        ),
+        (
+            "ledger values, all records",
+            Box::new(|s: &mut Sidecar| ledger_values(s, 0)),
+            Box::new(|s: &mut Sidecar| ledger_values(s, 1)),
         ),
     ];
     for (what, at_n, past_n) in cases {
