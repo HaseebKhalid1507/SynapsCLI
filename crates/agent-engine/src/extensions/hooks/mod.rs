@@ -641,6 +641,9 @@ impl HookBus {
         let mut modified_event: Option<HookEvent> = None;
         // Who rewrote it (chain order, de-duplicated).
         let mut modified_by: Vec<String> = Vec::new();
+        // The final input's source: the last applied rewriter, only when it
+        // is a required guard's loaded instance (see `HookResult::Modify`).
+        let mut rewriter: Option<String> = None;
         // The first required guard that has answered in this chain.
         let mut guard_answered: Option<String> = None;
 
@@ -805,7 +808,8 @@ impl HookBus {
                     );
                     return HookResult::block(no_answer_text(reg.handler.id(), &why));
                 }
-                Ok(HookResult::Modify { input }) => {
+                // A handler's own `source` is ignored; the bus stamps it.
+                Ok(HookResult::Modify { input, .. }) => {
                     if !confirms.is_empty() {
                         // The user is asked about the input as it stood at
                         // the first Confirm; a rewrite after that point
@@ -823,10 +827,23 @@ impl HookBus {
                         extension = %reg.handler.id(),
                         "Hook modified tool input by extension; later handlers vet the modified input"
                     );
+                    let id = reg.handler.id().to_string();
+                    // The source is host-stamped: the gate's loaded instance
+                    // for a required guard, never an id a handler claims or
+                    // shares. Any other rewrite still applies, with none.
+                    let loaded = self.required.is_loaded_instance(&id, &reg.handler);
+                    if required && !loaded {
+                        tracing::warn!(
+                            hook = %ev.kind.as_str(),
+                            extension = %id,
+                            generation = self.extension_generation(&id),
+                            "Required guard's Modify has no loaded instance on the gate; its source is unset"
+                        );
+                    }
+                    rewriter = loaded.then(|| id.clone());
                     let mut next = ev.clone();
                     next.tool_input = Some(input);
                     modified_event = Some(next);
-                    let id = reg.handler.id().to_string();
                     if !modified_by.contains(&id) {
                         modified_by.push(id);
                     }
@@ -953,7 +970,7 @@ impl HookBus {
             };
         }
         if let Some(input) = modified_event.and_then(|e| e.tool_input) {
-            return HookResult::Modify { input };
+            return HookResult::Modify { input, source: rewriter };
         }
 
         // Merge accumulated injections from all handlers. An advisory phase
@@ -1055,8 +1072,15 @@ impl HookBus {
                 Ok(result @ HookResult::Inject { .. }) => {
                     injections.push(reg.handler.id(), &result);
                 }
-                Ok(HookResult::Modify { input }) => {
-                    return HookResult::Modify { input };
+                Ok(HookResult::Modify { input, .. }) => {
+                    // As in the sequential chain: only a required guard's
+                    // loaded instance is a source.
+                    let id = reg.handler.id();
+                    let source = self
+                        .required
+                        .is_loaded_instance(id, &reg.handler)
+                        .then(|| id.to_string());
+                    return HookResult::Modify { input, source };
                 }
                 Ok(HookResult::Replace { output }) => {
                     return HookResult::Replace { output };
@@ -1824,6 +1848,7 @@ mod tests {
         assert_eq!(
             hook_result_action(&HookResult::Modify {
                 input: serde_json::json!({"command": "echo safe"}),
+                source: None,
             }),
             "modify"
         );
@@ -1959,6 +1984,10 @@ mod tests {
         fn id(&self) -> &str {
             &self.id
         }
+        // Live, when a test's gate marks it a loaded required guard.
+        async fn guard_down(&self) -> Option<String> {
+            None
+        }
         async fn handle(&self, event: &HookEvent) -> HookResult {
             *self.seen.lock().unwrap() = event.tool_input.clone();
             self.result.clone()
@@ -1975,6 +2004,7 @@ mod tests {
     fn modify(cmd: &str) -> HookResult {
         HookResult::Modify {
             input: serde_json::json!({ "command": cmd }),
+            source: None,
         }
     }
     async fn bus_of(handlers: Vec<Arc<dyn crate::extensions::runtime::ExtensionHandler>>) -> HookBus {
@@ -2045,7 +2075,7 @@ mod tests {
         .await;
         assert!(matches!(
             decision,
-            crate::runtime::BeforeToolCallDecision::Continue { input }
+            crate::runtime::BeforeToolCallDecision::Continue { input, rewritten_by: None }
                 if input == serde_json::json!({"command": "echo safe"})
         ));
     }
@@ -2059,12 +2089,137 @@ mod tests {
         let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "zero"}));
         assert!(matches!(
             bus.emit(&event).await,
-            HookResult::Modify { input } if input == serde_json::json!({"command": "two"})
+            HookResult::Modify { input, source: None } if input == serde_json::json!({"command": "two"})
         ));
         assert_eq!(
             second.seen.lock().unwrap().clone(),
             Some(serde_json::json!({"command": "one"}))
         );
+    }
+
+    /// A bus gated on `guard` (the config's `required_guards = guard`),
+    /// `loaded` its loaded instance, `handlers` subscribed in order.
+    async fn gated_on_guard(
+        loaded: Arc<InputSeen>,
+        handlers: Vec<Arc<dyn crate::extensions::runtime::ExtensionHandler>>,
+    ) -> HookBus {
+        let gate = Arc::new(RequiredGuards::new(&["guard".to_string()]));
+        gate.mark_loaded("guard", loaded);
+        let bus = HookBus::new().with_required_guards(gate);
+        let perms = perms_with(&[Permission::ToolsIntercept]);
+        for h in handlers {
+            bus.subscribe(HookKind::BeforeToolCall, h, None, None, perms.clone())
+                .await
+                .unwrap();
+        }
+        bus
+    }
+
+    /// WARN and above, as text, while `f` runs on this thread.
+    async fn warnings_during<F: std::future::Future>(f: F) -> (F::Output, String) {
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink(Arc::default());
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let out = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            f.await
+        };
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        (out, text)
+    }
+
+    const NO_LOADED_INSTANCE: &str =
+        "Required guard's Modify has no loaded instance on the gate; its source is unset";
+
+    /// Pin: a required guard's loaded instance is stamped as its rewrite's
+    /// source, and the rewrite applies.
+    #[tokio::test]
+    async fn a_required_guards_loaded_instance_is_its_modifys_source() {
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "zero"}));
+        let guard = input_seen("guard", modify("one"));
+        let bus = gated_on_guard(guard.clone(), vec![guard]).await;
+        assert_eq!(
+            bus.emit(&event).await,
+            HookResult::Modify {
+                input: serde_json::json!({ "command": "one" }),
+                source: Some("guard".into()),
+            }
+        );
+    }
+
+    /// Pin: any other extension's rewrite still applies, with no source;
+    /// a source the handler claims is ignored, its own id or the guard's.
+    #[tokio::test]
+    async fn another_extensions_modify_applies_with_no_source_and_a_claim_is_ignored() {
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "zero"}));
+        let claims_guard = || HookResult::Modify {
+            input: serde_json::json!({ "command": "two" }),
+            source: Some("guard".into()),
+        };
+        let two = || HookResult::Modify { input: serde_json::json!({ "command": "two" }), source: None };
+        // No guard required.
+        let bus = bus_of(vec![input_seen("other", claims_guard())]).await;
+        assert_eq!(bus.emit(&event).await, two());
+        // A guard required and loaded, answering Continue after the rewrite.
+        let guard = input_seen("guard", HookResult::Continue);
+        let bus = gated_on_guard(guard.clone(), vec![input_seen("other", claims_guard()), guard.clone()]).await;
+        assert_eq!(bus.emit(&event).await, two());
+        assert_eq!(
+            guard.seen.lock().unwrap().clone(),
+            Some(serde_json::json!({ "command": "two" })),
+            "the guard vets the rewrite"
+        );
+        // A later guard rewrite replaces an earlier source-less one.
+        let guard = input_seen("guard", modify("three"));
+        let bus = gated_on_guard(guard.clone(), vec![input_seen("other", claims_guard()), guard]).await;
+        assert_eq!(
+            bus.emit(&event).await,
+            HookResult::Modify {
+                input: serde_json::json!({ "command": "three" }),
+                source: Some("guard".into()),
+            }
+        );
+    }
+
+    /// Pin: an extension with a required guard's name that the host did not
+    /// load as that guard (a plugin folder of the same name) is never a
+    /// source. On a bus with no guard required its rewrite applies with no
+    /// source, unlogged; next to the loaded guard it applies with no source
+    /// and one fixed warning (no input values).
+    #[tokio::test]
+    async fn an_extension_named_like_a_guard_but_not_loaded_as_one_is_no_source() {
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "zero"}));
+        let one = || HookResult::Modify { input: serde_json::json!({ "command": "one" }), source: None };
+
+        let bus = bus_of(vec![input_seen("guard", modify("one"))]).await;
+        let (result, logged) = warnings_during(bus.emit(&event)).await;
+        assert_eq!(result, one());
+        assert!(!logged.contains(NO_LOADED_INSTANCE), "{logged}");
+
+        let loaded = input_seen("guard", HookResult::Continue);
+        let named_like_it = input_seen("guard", modify("one"));
+        let bus = gated_on_guard(loaded.clone(), vec![named_like_it, loaded.clone()]).await;
+        let (result, logged) = warnings_during(bus.emit(&event)).await;
+        assert_eq!(result, one());
+        assert_eq!(loaded.seen.lock().unwrap().clone(), Some(serde_json::json!({ "command": "one" })));
+        assert_eq!(logged.matches(NO_LOADED_INSTANCE).count(), 1, "{logged}");
+        assert!(logged.contains("extension=guard"), "{logged}");
+        assert!(!logged.contains("zero") && !logged.contains("\"one\""), "no input values: {logged}");
     }
 
     /// Unloading / reinstalling an extension under the same id bumps its
@@ -2116,6 +2271,7 @@ mod tests {
             "modifier",
             HookResult::Modify {
                 input: serde_json::json!({"command": "echo other"}),
+                source: None,
             },
         );
         let bus = bus_with(vec![confirmer, modifier]).await;
@@ -2217,6 +2373,7 @@ mod tests {
             "modifier",
             HookResult::Modify {
                 input: serde_json::json!({"command": "echo safe"}),
+                source: None,
             },
         );
         let after = TestHandler::new(

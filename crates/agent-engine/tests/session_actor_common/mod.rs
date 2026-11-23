@@ -429,7 +429,7 @@ impl agent_engine::Tool for RewrittenConfirmFixtureTool {
         )
         .await;
         Ok(match result {
-            HookResult::Modify { input } => format!(
+            HookResult::Modify { input, .. } => format!(
                 "ran:{}",
                 input["command"].as_str().unwrap_or("").split(" &&").next().unwrap_or("")
             ),
