@@ -19,6 +19,7 @@ mod fresh_id;
 #[cfg(any(test, feature = "testing"))]
 pub use fresh_id::testing as fresh_id_testing;
 pub mod handle;
+pub mod model_options;
 pub(crate) mod owned;
 mod persister;
 pub(crate) mod session_start;

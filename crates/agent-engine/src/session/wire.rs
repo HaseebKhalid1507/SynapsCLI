@@ -74,6 +74,14 @@ pub const FEATURE_SESSION_WORKERS: &str = "session_workers";
 /// session that leaves the held set is pushed as its saved row).
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
 
+/// `Welcome.features` entry: this daemon answers `SessionQuery::ModelOptions`
+/// (`session::model_options`). An older one answers that query with
+/// `Error{"malformed frame: unknown variant `model_options`…"}`, so a client
+/// checks this first ([`feature_needed`]; `SocketTransport::send` does). As
+/// with `session_page`, the client opts in by asking: the answer is a
+/// `QueryReply` to the client that asked, never sent to any other.
+pub const FEATURE_MODEL_OPTIONS: &str = "model_options";
+
 /// `Welcome.features` entry: this daemon answers `Status{cache: true}` with
 /// `cache` (when the session's prompt cache expires,
 /// `SessionActor::cache_expiry_json`). As with `session_page`, the client
@@ -87,6 +95,9 @@ pub const FEATURE_CACHE_EXPIRY: &str = "cache_expiry";
 /// frame", or ignores it), and the request's name for `DaemonTooOld`.
 pub fn feature_needed(cmd: &SessionCommand) -> Option<(&'static str, &'static str)> {
     match cmd {
+        SessionCommand::Query { query: SessionQuery::ModelOptions, .. } => {
+            Some((FEATURE_MODEL_OPTIONS, "model options"))
+        }
         SessionCommand::Query { query: SessionQuery::Status { cache: true }, .. } => {
             Some((FEATURE_CACHE_EXPIRY, "cache expiry"))
         }
@@ -113,6 +124,7 @@ pub fn daemon_features() -> Vec<String> {
         FEATURE_OWNED_SESSIONS.to_string(),
         FEATURE_SESSION_WORKERS.to_string(),
         FEATURE_SESSION_PAGE.to_string(),
+        FEATURE_MODEL_OPTIONS.to_string(),
         FEATURE_CACHE_EXPIRY.to_string(),
     ]
 }
@@ -2650,6 +2662,8 @@ mod catalog_page_tests {
     fn catalog_page_frames_have_the_pinned_shape() {
         assert_eq!(FEATURE_SESSION_PAGE, "session_page");
         assert!(daemon_features().iter().any(|f| f == FEATURE_SESSION_PAGE), "advertised");
+        assert_eq!(FEATURE_MODEL_OPTIONS, "model_options");
+        assert!(daemon_features().iter().any(|f| f == FEATURE_MODEL_OPTIONS), "advertised");
         assert_eq!(FEATURE_CACHE_EXPIRY, "cache_expiry");
         assert!(daemon_features().iter().any(|f| f == FEATURE_CACHE_EXPIRY), "advertised");
         let req = ClientFrame::CatalogPage {

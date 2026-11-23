@@ -743,7 +743,7 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page","cache_expiry"], boot_id?}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page","model_options","cache_expiry"], boot_id?}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
@@ -845,6 +845,16 @@ C: bye | socket close = Detach (turn keeps running)
 - Saved sessions are additive the same way. `Welcome.features` lists `session_page` when the daemon
   answers `catalog_page` (see "Saved sessions"); the reply and `lifecycle: "saved"` reach only a
   client that sent the frame. `SessionMeta.updated_at` is omitted on held rows.
+- Model options are additive the same way. `Welcome.features` lists `model_options` when the
+  daemon answers `cmd{query:{query:"model_options"}}` (an older one answers "malformed frame:
+  unknown variant"; `SocketTransport::send` refuses it there with `DaemonTooOld`). The client opts
+  in by asking: the answer is a `QueryReply` inside the daemon, an ordinary `query_result` to the
+  client that asked and to no other (`QueryResult` is otherwise broadcast to every attached
+  client). The value: `{model, thinking_level, models:[{id, label, provider, provider_key}],
+  thinking:[level], notice?}`: the static rows of the providers THIS session's credential source
+  serves (its broker's `capabilities`, local or remote), the enabled extension providers with a
+  handler, only ids `Set{Model}` would take as the foreground, and the current model in its
+  provider's section; `notice` says why the list is short or no switch would apply now.
 - Cache expiry is additive the same way. `Welcome.features` lists `cache_expiry` when the daemon
   answers `cmd{query:{query:"status", cache:true}}` with `cache`; `SocketTransport::send` never
   sends `cache:true` to a daemon without it (`DaemonTooOld`). A plain `status` (`cache` omitted, as

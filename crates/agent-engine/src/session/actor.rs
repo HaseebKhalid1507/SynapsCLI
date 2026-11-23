@@ -4683,7 +4683,7 @@ impl SessionActor {
     pub(crate) async fn query(&mut self, from: Option<ClientId>, id: u64, query: SessionQuery) {
         // Status/View never wake a parked session (the idle probe must not).
         if self.is_parked() {
-            let addressed = matches!(query, SessionQuery::Status { cache: true });
+            let addressed = matches!(query, SessionQuery::Status { cache: true } | SessionQuery::ModelOptions);
             let value = match query {
                 // Parked: no `cache` either way. Nothing of this process's
                 // requests is known (the runtime is gone), and a cache that
@@ -4714,7 +4714,7 @@ impl SessionActor {
             return;
         }
         // An answer the client opted into by asking: to it alone.
-        let addressed = matches!(query, SessionQuery::Status { cache: true });
+        let addressed = matches!(query, SessionQuery::Status { cache: true } | SessionQuery::ModelOptions);
         let value = match query {
             SessionQuery::Status { cache } => {
                 // Configured + resolved prompt-cache TTL (`auto` → 1h on OAuth).
@@ -4811,6 +4811,13 @@ impl SessionActor {
                     CommandResult::Output(text) => serde_json::json!({ "text": text }),
                     other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                 }
+            }
+            SessionQuery::ModelOptions => {
+                // The level check reads live capability evidence, as `Set` does.
+                let model = self.runtime.model().to_string();
+                self.runtime.prepare_model_capabilities(&model).await;
+                serde_json::to_value(super::model_options::session_model_options(&self.runtime).await)
+                    .unwrap_or_default()
             }
         };
         self.reply(from, addressed, id, value);
