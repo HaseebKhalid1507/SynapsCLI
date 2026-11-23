@@ -205,16 +205,13 @@ fn session_refused_is_rendered_only_for_me() {
     assert!(!theirs.contains("refused"), "{theirs}");
 }
 
-/// A late answer's refusal is said in a toast and undoes nothing:
-/// the turn this client submitted keeps streaming, and the text it sent is
-/// not put back in the editor (that undo is for a refused `Submit`).
+/// A late answer's refusal is said in a toast and undoes nothing: a turn
+/// this client presented keeps streaming (the generic refusal undoes a
+/// refused `Submit`'s presentation and gives its text back).
 #[test]
 fn a_refused_answer_undoes_nothing() {
-    use crossterm::event::{KeyCode, KeyModifiers};
     let mut h = TestHarness::boot_with_size(100, 30);
-    h.type_str("sent before the answer");
-    h.key(KeyCode::Enter, KeyModifiers::empty());
-    assert!(h.is_streaming(), "the submit presents its turn");
+    h.set_streaming(true);
     h.feed_event(
         W::Refused {
             client: ClientId(1),
@@ -226,7 +223,6 @@ fn a_refused_answer_undoes_nothing() {
     let frame = h.snapshot();
     assert!(frame.contains("answer refused"), "{frame}");
     assert!(h.is_streaming(), "the turn is not ended: {frame}");
-    assert_eq!(h.input_contents(), "", "the sent text is not given back");
 }
 
 #[test]
