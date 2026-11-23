@@ -136,8 +136,6 @@ pub fn validate_user_authorizable_model(raw: &str) -> Result<QualifiedModelId, S
         crate::runtime::openai::catalog::xai_model(model.model()).is_some()
     } else if model.provider() == "github-copilot" {
         crate::runtime::openai::catalog::github_copilot_runtime_model(model.model()).is_some()
-    } else if model.provider() == "google-gemini" {
-        crate::runtime::openai::catalog::google_gemini_model(model.model()).is_some()
     } else if model.provider() == "muse" {
         // Documented seed or an exact row from this process's authenticated
         // live Muse catalog — never an invented id.
@@ -208,7 +206,6 @@ impl OrchestrationRuntime {
         let mut descriptors = catalog::codex_static_catalog_models();
         descriptors.extend(catalog::xai_static_catalog_models());
         descriptors.extend(catalog::copilot_static_catalog_models());
-        descriptors.extend(catalog::google_gemini_static_catalog_models());
         let mut entries: Vec<_> = descriptors
             .into_iter()
             .filter_map(|descriptor| QualifiedModelId::parse(descriptor.runtime_id()).ok())

@@ -61,9 +61,6 @@ pub enum WireProtocol {
     OpenAiChatCompletions,
     OpenAiResponses,
     CodexResponses,
-    /// Google Gemini Code Assist v1internal:streamGenerateContent envelope.
-    /// Broker-proxied only.
-    GoogleGeminiCodeAssist,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRoute {
@@ -103,19 +100,6 @@ pub fn resolve_route(model: &str) -> Option<ResolvedRoute> {
                 provider: prefix.into(),
                 auth: AuthPolicy::BrokerProxy,
                 wire: descriptor,
-            });
-        }
-        if prefix == "google-gemini" {
-            // Broker-proxied only: broker owns the Google OAuth access token
-            // and pins cloudcode-pa.googleapis.com. Wire IDs are limited to
-            // the conservative catalog.
-            catalog::google_gemini_model(rest)?;
-            return Some(ResolvedRoute {
-                endpoint: crate::auth::broker::GOOGLE_GEMINI_CODE_ASSIST_BASE_URL.into(),
-                model: rest.into(),
-                provider: prefix.into(),
-                auth: AuthPolicy::BrokerProxy,
-                wire: WireProtocol::GoogleGeminiCodeAssist,
             });
         }
         if prefix == "openai-codex" {
@@ -436,27 +420,6 @@ pub(crate) async fn try_route_with_memory_backend(
             )
         }
         WireProtocol::AnthropicMessages => None,
-        WireProtocol::GoogleGeminiCodeAssist => {
-            if suppress_stream_deltas {
-                return Some(Err(
-                    "internal sync routing is unavailable for this streaming provider".into(),
-                ));
-            }
-            Some(
-                crate::runtime::google_gemini::runtime::call_google_gemini_stream_inner(
-                    &cfg,
-                    &broker,
-                    tools_schema,
-                    system_prompt,
-                    messages,
-                    tx,
-                    cancel,
-                    trace,
-                    exact_wire_bytes,
-                )
-                .await,
-            )
-        }
     }
 }
 
@@ -516,39 +479,13 @@ mod tests {
         assert!(resolve_route("xai-auth/grok-build-latest").is_none());
         assert!(resolve_route("xai-auth/grok-imagine-image").is_none());
 
-        // Every verified concrete text/tool wire ID in the catalog must resolve.
-        for descriptor in catalog::GOOGLE_GEMINI_TEXT_MODELS {
-            let route = resolve_route(&format!("google-gemini/{}", descriptor.id)).unwrap();
-            assert_eq!(route.provider, "google-gemini");
-            assert_eq!(route.model, descriptor.id);
-            assert_eq!(route.endpoint, "https://cloudcode-pa.googleapis.com");
-            assert_eq!(route.auth, AuthPolicy::BrokerProxy);
-            assert_eq!(route.wire, WireProtocol::GoogleGeminiCodeAssist);
-        }
-        // Aliases, unsupported media/embedding models, and family prefixes fail closed.
-        for banned in [
-            "auto-gemini-2.5",
-            "auto-gemini-3",
-            "text-embedding-004",
-            "gemini-2.5-image",
-            "gemini-2.5", // family prefix is not a wire id
-        ] {
+        // The removed Gemini Code Assist provider routes nowhere.
+        for id in ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-pro-latest"] {
             assert!(
-                resolve_route(&format!("google-gemini/{banned}")).is_none(),
-                "{banned} must not resolve"
+                resolve_route(&format!("google-gemini/{id}")).is_none(),
+                "google-gemini/{id} must not resolve"
             );
         }
-    }
-
-    /// Regression: `gemini-pro-latest` must NOT resolve — it is a public
-    /// Gemini API alias that Code Assist rejects with 404 NOT_FOUND. Routing
-    /// fails closed instead of emitting a doomed upstream request.
-    #[test]
-    fn does_not_resolve_public_api_alias_gemini_pro_latest() {
-        assert!(
-            resolve_route("google-gemini/gemini-pro-latest").is_none(),
-            "gemini-pro-latest is not a Code Assist wire ID (404 upstream)"
-        );
     }
 
     #[test]
@@ -603,20 +540,13 @@ mod tests {
         assert_eq!(route.wire, WireProtocol::CodexResponses);
     }
 
-    /// Regression: models under the `google-gemini/*` prefix must route through
-    /// `try_route` (i.e. the OpenAI-runtime dispatcher must return `Some(_)` so
-    /// the caller invokes the Gemini stream rather than falling through to the
-    /// Anthropic path and reporting a misleading 401. Before this fix,
-    /// `WireProtocol::GoogleGeminiCodeAssist => None` made `try_route` return
-    /// `None`.
-    ///
-    /// We drive `try_route` through the `Remote` credential source pointed at a
-    /// closed loopback port so the broker request errors out fast without
-    /// touching the developer's real auth.json or the network. The outcome we
-    /// assert is only that the routing dispatcher returned `Some(_)` — the
-    /// specific broker error is irrelevant.
+    /// A `google-gemini/*` model (the removed Gemini Code Assist provider)
+    /// fails closed inside `try_route` as an unknown route: never `None`
+    /// (which would fall through to the Anthropic path) and never a
+    /// dispatch. The `Remote` source points at a closed loopback port so no
+    /// real auth.json or network is touched.
     #[tokio::test]
-    async fn try_route_google_gemini_is_not_none_and_does_not_fall_through_to_anthropic() {
+    async fn try_route_removed_google_gemini_fails_closed_without_anthropic_fallthrough() {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(2))
             .build()
@@ -663,9 +593,12 @@ mod tests {
             .await
             .expect("try_route completed within budget");
 
+        let err = result
+            .expect("google-gemini must not fall through to Anthropic")
+            .expect_err("the removed provider must not dispatch");
         assert!(
-            result.is_some(),
-            "google-gemini must route through try_route (was None → fell through to Anthropic)"
+            err.to_string().contains("Unknown provider route"),
+            "{err}"
         );
     }
 

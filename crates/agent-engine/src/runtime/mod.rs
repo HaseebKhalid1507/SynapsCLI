@@ -23,7 +23,6 @@ pub(crate) mod cloud_invoke;
 pub mod compaction;
 pub mod context;
 pub mod continuation;
-pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
 mod http_phases;

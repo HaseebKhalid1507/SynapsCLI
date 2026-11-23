@@ -216,7 +216,7 @@ pub fn thinking_accounting_for_model(model: &str) -> ThinkingAccounting {
             | WireProtocol::OpenAiResponses
             | WireProtocol::CodexResponses,
         ) => ThinkingAccounting::InsideOutputBudget,
-        Some(WireProtocol::GoogleGeminiCodeAssist) | None => ThinkingAccounting::SeparateFromOutput,
+        None => ThinkingAccounting::SeparateFromOutput,
     }
 }
 
@@ -1045,8 +1045,8 @@ mod tests {
         }
     }
 
-    /// Gemini budgets thinking separately from response output; unroutable
-    /// models fall back to the conservative separate-reserve model.
+    /// Unroutable models (now including the removed `google-gemini/*`
+    /// provider) fall back to the conservative separate-reserve model.
     #[test]
     fn gemini_and_unknown_models_reserve_thinking_separately() {
         let messages: Vec<SharedMessage> =

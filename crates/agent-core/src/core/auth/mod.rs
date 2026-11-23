@@ -24,7 +24,6 @@ pub mod cloud;
 pub mod cloud_login;
 mod credential_source;
 pub mod github_copilot;
-pub mod google_gemini;
 pub mod google_vertex;
 pub mod identity;
 pub mod kimi_code;
@@ -100,7 +99,8 @@ pub use static_providers::{static_provider, StaticProviderSpec, LOCAL_PROVIDER_K
 pub use storage::{
     any_oauth_credential_present, auth_file_path, find_duplicate_identity, list_accounts,
     list_accounts_detailed, list_all_accounts, load_auth, load_cloud_state, load_credential,
-    load_provider_auth, load_static_key, remove_credential, save_account_metadata, save_auth,
+    load_provider_auth, load_static_key, remove_credential, remove_legacy_google_gemini_sign_in,
+    save_account_metadata, save_auth,
     save_cloud_state, save_credential, save_credential_unless_duplicate, save_provider_auth,
     save_static_key, set_slot_identity, AccountInventory, AccountMetadata, IdentityEvidence,
     LoginPersistOutcome,

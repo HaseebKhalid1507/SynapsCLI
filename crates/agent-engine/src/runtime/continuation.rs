@@ -4382,7 +4382,6 @@ mod budget_tests {
             "github-copilot/claude-sonnet-4.6",
             "github-copilot/gpt-5.3-codex",
             "openai-codex/gpt-5.1-codex-mini",
-            "google-gemini/gemini-2.5-pro",
             "xai-auth/grok-4",
             "my-plugin:my-provider:my-model",
             "unknown-provider/model",

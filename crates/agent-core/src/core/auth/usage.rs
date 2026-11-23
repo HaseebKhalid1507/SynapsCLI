@@ -1784,7 +1784,7 @@ pub async fn fetch_usage(
         }
         // Muse reports plan usage only as a side effect of the key mint
         // (`POST /muse-code/key`), which is not a read; no usage adapter.
-        OAuthProviderId::GitHubCopilot | OAuthProviderId::GoogleGemini | OAuthProviderId::Muse => {
+        OAuthProviderId::GitHubCopilot | OAuthProviderId::Muse => {
             Err(UsageError::UnsupportedProvider {
                 provider: provider.as_str().to_string(),
             })
@@ -2495,7 +2495,6 @@ mod tests {
         .unwrap();
         assert_eq!(v, serde_json::json!({"kind":"upstream_status","status":502}));
         assert!(!supports_usage(OAuthProviderId::GitHubCopilot));
-        assert!(!supports_usage(OAuthProviderId::GoogleGemini));
         assert_eq!(supported_usage_providers().len(), 4);
     }
 

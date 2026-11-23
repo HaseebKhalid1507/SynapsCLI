@@ -159,6 +159,11 @@ impl EngineHost {
             crate::config::set_profile(Some(prof.clone()));
         }
         let log_guard = crate::logging::init_logging();
+        // A saved sign-in of the removed Gemini Code Assist provider
+        // is dropped by name at startup, after logging so its one fixed line
+        // ("removed saved google-gemini sign-in") lands; nothing saved, no
+        // line. Failure is not fatal: the entry is inert (no provider reads it).
+        let _ = crate::auth::remove_legacy_google_gemini_sign_in();
 
         let client = crate::runtime::build_host_http_client()?;
         let capture_dir = crate::runtime::trace::default_capture_dir();

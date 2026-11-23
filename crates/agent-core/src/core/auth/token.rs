@@ -3245,12 +3245,6 @@ mod source_classification_tests {
     /// have fooled the old substring matcher.
     #[test]
     fn provider_errors_carry_their_kind() {
-        use super::super::google_gemini::GeminiAuthError as G;
-        assert_eq!(G::TokenRequestFailed(503).refresh_failure().kind, Transient);
-        assert_eq!(G::TokenRequestFailed(400).refresh_failure().kind, Credential);
-        assert_eq!(G::Transport.refresh_failure().kind, Transient);
-        assert_eq!(G::EmptyRefreshToken.refresh_failure().kind, Credential);
-
         use super::super::muse::MuseAuthError as M;
         assert_eq!(M::LoginRejected(401).refresh_failure().kind, Credential);
         assert_eq!(M::HttpStatus(503).refresh_failure().kind, Transient);
@@ -3269,26 +3263,6 @@ mod source_classification_tests {
         assert_eq!(C::SessionMintRejected(401).refresh_failure().kind, Credential);
         assert_eq!(C::HttpStatus(500).refresh_failure().kind, Transient);
         assert_eq!(C::Transport.refresh_failure().kind, Transient);
-    }
-
-    #[tokio::test]
-    async fn gemini_503_is_transient_and_invalid_grant_is_credential() {
-        use super::super::google_gemini::{refresh_with_registration_typed, GeminiRegistration};
-        let reg = GeminiRegistration::test("client-id", None).unwrap();
-        let run = |raw: String| {
-            let reg = &reg;
-            async move {
-                let url = format!("{}/token", serve(raw).await);
-                refresh_with_registration_typed(&Client::new(), &url, true, reg, "rt")
-                    .await
-                    .unwrap_err()
-            }
-        };
-        let busy = run(response("503 Service Unavailable", "{}")).await;
-        assert_eq!(busy.kind, Transient, "{busy}");
-        assert!(busy.message().contains("(HTTP 503)"), "{busy}");
-        let revoked = run(response("400 Bad Request", r#"{"error":"invalid_grant"}"#)).await;
-        assert_eq!(revoked.kind, Credential, "{revoked}");
     }
 
     #[tokio::test]

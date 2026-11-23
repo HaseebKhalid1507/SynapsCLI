@@ -529,7 +529,6 @@ fn known_provider(provider: &str) -> bool {
             | "xai-auth"
             | "kimi-code"
             | "github-copilot"
-            | "google-gemini"
             | "muse"
             | "local"
     ) || crate::runtime::openai::registry::providers()
@@ -931,7 +930,6 @@ fn validate_model_capability(model: &str, level: ReasoningLevel) -> Result<(), S
             "xai-auth" => catalog::xai_model(id).is_some(),
             "kimi-code" => catalog::kimi_code_model(id).is_some(),
             "github-copilot" => catalog::github_copilot_runtime_model(id).is_some(),
-            "google-gemini" => catalog::google_gemini_model(id).is_some(),
             "muse" => catalog::muse_runtime_model(id),
             _ => registry::providers()
                 .iter()

@@ -158,6 +158,60 @@ pub(crate) fn refresh_pending_path(auth_path: &Path, key: &str) -> PathBuf {
     auth_path.with_file_name(format!("{file_name}.{key}.refresh.pending"))
 }
 
+/// The storage key the removed Gemini Code Assist sign-in saved
+/// under (`google-gemini` and `google-gemini@<label>`).
+const LEGACY_GOOGLE_GEMINI_KEY: &str = "google-gemini";
+
+/// A saved slot of the removed Gemini Code Assist sign-in, by NAME only.
+fn is_legacy_google_gemini_key(key: &str) -> bool {
+    key.strip_prefix(LEGACY_GOOGLE_GEMINI_KEY)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('@'))
+}
+
+/// Run once at engine startup (`EngineHost::boot`, right after
+/// logging is up): drop any saved sign-in of the removed Gemini Code Assist
+/// provider from this config dir's own `auth.json`. See
+/// [`remove_legacy_google_gemini_slots_at`]. A store the active profile
+/// only inherits (the base one, when the profile has none of its own) is
+/// left alone, as [`remove_credential`] refuses it; a boot without that
+/// profile cleans it.
+pub fn remove_legacy_google_gemini_sign_in() -> std::result::Result<bool, String> {
+    remove_legacy_google_gemini_slots_at(
+        &crate::config::get_active_config_dir().join("auth.json"),
+    )
+}
+
+/// Removes every `google-gemini` / `google-gemini@<label>` entry (and its
+/// parked-refresh sidecar) from `path`, matching KEY NAMES only: no value is
+/// inspected, printed, logged or returned. When anything was removed it logs
+/// exactly one fixed line, "removed saved google-gemini sign-in" (no email,
+/// id, prefix, expiry, count or length); otherwise it logs nothing and
+/// writes nothing. A missing file is a no-op (not even a lock file).
+pub(crate) fn remove_legacy_google_gemini_slots_at(path: &Path) -> std::result::Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let removed: Vec<String> = with_locked_root(path, false, |root| {
+        let keys: Vec<String> = root
+            .keys()
+            .filter(|key| is_legacy_google_gemini_key(key))
+            .cloned()
+            .collect();
+        for key in &keys {
+            root.remove(key);
+        }
+        Ok((!keys.is_empty(), keys))
+    })?;
+    for key in &removed {
+        let _ = std::fs::remove_file(refresh_pending_path(path, key));
+    }
+    if removed.is_empty() {
+        return Ok(false);
+    }
+    tracing::info!("removed saved google-gemini sign-in");
+    Ok(true)
+}
+
 /// Non-secret metadata stored beside a credential (`label`, `identity`,
 /// `addedAt`). Kept separate from [`OAuthCredentials`] so refresh writes,
 /// which only carry token fields, never clobber it.
@@ -2066,5 +2120,179 @@ mod remove_sidecar_tests {
         std::fs::write(&work, "{}").unwrap();
         assert!(!remove_key_at(&path, "anthropic@work").unwrap());
         assert!(!work.exists());
+    }
+}
+
+/// Pins: a saved sign-in of the removed Gemini Code Assist provider
+/// is dropped by KEY NAME only. A removal logs exactly one line, the fixed
+/// text and nothing else (no email, id, prefix, expiry, count or length);
+/// with nothing saved nothing is logged, written or created.
+#[cfg(test)]
+mod legacy_google_gemini_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// The one line a removal logs, and all of it.
+    const LINE: &str = "removed saved google-gemini sign-in";
+    /// Stand-ins for the removed sign-in's token material and identity: no
+    /// log, error or kept file may ever carry them.
+    const SENTINEL: &str = "removed-gemini-SENTINEL-not-a-real-refresh-token";
+    const EMAIL: &str = "removed-gemini-sentinel@example.com";
+
+    /// Everything logged while `f` runs, at every level, as message and
+    /// fields only (no time, level or target), so it compares exactly.
+    fn logged<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_level(false)
+            .with_target(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, text)
+    }
+
+    /// What the removed sign-in saved, sentinels in every value.
+    fn legacy_entry() -> serde_json::Value {
+        serde_json::json!({
+            "type": "oauth",
+            "access": SENTINEL,
+            "refresh": SENTINEL,
+            "expires": 9_999_999_999_999u64,
+            "identity": EMAIL,
+            "projectId": SENTINEL,
+        })
+    }
+
+    /// Entries that must survive: other providers (the AI Studio key
+    /// `google` and Vertex included) and names that only look alike.
+    fn kept() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::json!({
+            "anthropic": {"type": "oauth", "access": "a", "refresh": "r", "expires": 1},
+            "anthropic@google-gemini": {"type": "oauth", "access": "a2", "refresh": "r2", "expires": 2},
+            "google": {"type": "api_key", "key": "fake-studio-key"},
+            "google-vertex": {"type": "api_key", "key": "vertex-fake"},
+            "google-gemini-x": {"type": "api_key", "key": "look-alike"},
+            "xgoogle-gemini": {"type": "api_key", "key": "look-alike-2"},
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    fn read_root(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_saved_sign_in_is_dropped_by_name_with_exactly_the_one_fixed_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut root = kept();
+        root.insert("google-gemini".into(), legacy_entry());
+        root.insert("google-gemini@work".into(), legacy_entry());
+        std::fs::write(&path, serde_json::to_string(&root).unwrap()).unwrap();
+        let parked = |key: &str| refresh_pending_path(&path, key);
+        for key in ["google-gemini", "google-gemini@work", "anthropic"] {
+            std::fs::write(parked(key), SENTINEL).unwrap();
+        }
+
+        let (out, log) = logged(|| remove_legacy_google_gemini_slots_at(&path));
+
+        assert_eq!(out, Ok(true));
+        assert_eq!(log, format!("{LINE}\n"), "one line, the fixed text, nothing else");
+        for leak in [SENTINEL, EMAIL, "work", "@", "2"] {
+            assert!(!log.contains(leak), "{leak:?} in {log:?}");
+        }
+        assert_eq!(read_root(&path), kept(), "only the removed provider's slots go");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains(SENTINEL));
+        assert!(!parked("google-gemini").exists(), "its parked refresh goes too");
+        assert!(!parked("google-gemini@work").exists());
+        assert_eq!(std::fs::read_to_string(parked("anthropic")).unwrap(), SENTINEL);
+
+        // Again: nothing left, so nothing is written or logged.
+        let bytes = std::fs::read(&path).unwrap();
+        let (again, log) = logged(|| remove_legacy_google_gemini_slots_at(&path));
+        assert_eq!(again, Ok(false));
+        assert_eq!(log, "");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_store_without_it_is_left_byte_for_byte_and_nothing_is_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        // Compact JSON: a rewrite (pretty-printed) would change the bytes.
+        for store in [serde_json::to_vec(&kept()).unwrap(), b"{}".to_vec()] {
+            std::fs::write(&path, &store).unwrap();
+            let (out, log) = logged(|| remove_legacy_google_gemini_slots_at(&path));
+            assert_eq!(out, Ok(false));
+            assert_eq!(log, "");
+            assert_eq!(std::fs::read(&path).unwrap(), store);
+        }
+    }
+
+    #[test]
+    fn no_store_is_a_no_op_that_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let (out, log) = logged(|| remove_legacy_google_gemini_slots_at(&path));
+        assert_eq!(out, Ok(false));
+        assert_eq!(log, "");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "no store, lock or sidecar is created"
+        );
+    }
+
+    /// A store that does not parse is not touched (it may hold every other
+    /// account), and neither the error nor the log carries its content.
+    #[test]
+    fn an_unparseable_store_is_untouched_and_its_content_never_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let store = format!("{{\"google-gemini\":{{\"refresh\":\"{SENTINEL}\"").into_bytes();
+        std::fs::write(&path, &store).unwrap();
+        let (out, log) = logged(|| remove_legacy_google_gemini_slots_at(&path));
+        let err = out.unwrap_err();
+        assert!(!err.contains(SENTINEL), "{err}");
+        assert_eq!(log, "");
+        assert_eq!(std::fs::read(&path).unwrap(), store);
+    }
+
+    #[test]
+    fn only_the_removed_providers_own_key_names_match() {
+        for key in ["google-gemini", "google-gemini@work", "google-gemini@"] {
+            assert!(is_legacy_google_gemini_key(key), "{key}");
+        }
+        for key in [
+            "",
+            "google",
+            "google@work",
+            "google-vertex",
+            "google-gemini-x",
+            "google-geminix",
+            "xgoogle-gemini",
+            "anthropic@google-gemini",
+        ] {
+            assert!(!is_legacy_google_gemini_key(key), "{key}");
+        }
     }
 }

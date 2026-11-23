@@ -1,7 +1,7 @@
 //! CP-11 fix-2 (A) — bounded caller-facing stream boundary, end-to-end.
 //!
-//! For each provider wire (Anthropic Messages, OpenAI Chat Completions,
-//! Gemini Code Assist), a hostile stub floods unbounded text deltas while
+//! For each provider wire (Anthropic Messages, OpenAI Chat Completions), a
+//! hostile stub floods unbounded text deltas while
 //! the CALLER of `Runtime::run_stream` never polls. The runtime must:
 //!
 //! - keep global relay retention within the FIXED preview budget the whole
@@ -45,17 +45,6 @@ fn oai_chat_flood_frame() -> &'static str {
     Box::leak(
         format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n")
             .into_boxed_str(),
-    )
-}
-
-fn gemini_flood_frame() -> &'static str {
-    let text = "x".repeat(FRAME_TEXT_BYTES);
-    Box::leak(
-        format!(
-            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"parts\":\
-             [{{\"text\":\"{text}\"}}]}}}}]}}}}\n\n"
-        )
-        .into_boxed_str(),
     )
 }
 
@@ -166,27 +155,6 @@ async fn openai_chat_flood_absent_consumer_fixed_retention_and_release() {
     let mut rt = Runtime::new().await.expect("runtime");
     rt.apply_config(&synaps_cli::SynapsConfig::default());
     rt.set_model("groq/fixture-model".to_string());
-    assert_bounded_flood_turn(&rt).await;
-
-    std::env::remove_var("SYNAPS_AUTH_ENDPOINT");
-    std::env::remove_var("SYNAPS_MACHINE_TOKEN");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn gemini_flood_absent_consumer_fixed_retention_and_release() {
-    let _guard = HomeGuard::new();
-    let (endpoint, _hits, _) = spawn_broker(BrokerScript::ProxyFlood {
-        preamble: "",
-        frame: gemini_flood_frame(),
-    })
-    .await;
-    std::env::set_var("SYNAPS_AUTH_ENDPOINT", &endpoint);
-    std::env::set_var("SYNAPS_MACHINE_TOKEN", "machine-token-fixture");
-
-    let mut rt = Runtime::new().await.expect("runtime");
-    rt.apply_config(&synaps_cli::SynapsConfig::default());
-    rt.set_model("google-gemini/gemini-2.5-pro".to_string());
     assert_bounded_flood_turn(&rt).await;
 
     std::env::remove_var("SYNAPS_AUTH_ENDPOINT");

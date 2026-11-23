@@ -71,17 +71,18 @@ async fn s3_timing_buckets_headers_first_byte_model_event_are_ordered_and_distin
 // S4 — translation losses explicit, or semantics preserved.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// (a) A clean text-only Gemini fixture reports ZERO losses and its wire
-/// body (captured at the loopback broker) preserves the normalized text and
-/// system prompt. (b) A message the Gemini translator must drop is reported
-/// explicitly. (c) A dotted tool name the OpenAI wire must rename is
-/// reported explicitly. RED at d20e03f; GREEN `1de6426` + `6e1c3dc`/`0d5c46a`.
+/// (a) A clean text-only OpenAI Chat fixture reports ZERO losses and its
+/// wire body (captured at the loopback broker) preserves the normalized
+/// text and system prompt. (b) A dotted tool name the OpenAI wire must
+/// rename is reported explicitly. RED at d20e03f; GREEN `1de6426` +
+/// `6e1c3dc`/`0d5c46a`. (The Gemini Code Assist translator case was
+/// removed with that provider.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s4_translation_losses_explicit_or_semantics_preserved() {
-    const MODEL: &str = "google-gemini/gemini-2.5-pro";
+    const MODEL: &str = "groq/fixture-model";
 
     // (a) clean fixture → no losses, semantics preserved on the wire.
-    let (endpoint, _, bodies) = spawn_broker(BrokerScript::ProxySse(GEMINI_SSE)).await;
+    let (endpoint, _, bodies) = spawn_broker(BrokerScript::ProxySse(OAI_CHAT_SSE)).await;
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, sink) = collecting_ctx(&tmp);
     let run = drive_try_route(
@@ -95,7 +96,7 @@ async fn s4_translation_losses_explicit_or_semantics_preserved() {
         false,
     )
     .await;
-    run.result.as_ref().expect("clean gemini fixture");
+    run.result.as_ref().expect("clean chat fixture");
     assert_eq!(run.records.len(), 1);
     assert!(
         run.records[0].translation_losses.is_empty(),
@@ -112,28 +113,9 @@ async fn s4_translation_losses_explicit_or_semantics_preserved() {
         "system prompt must survive translation onto the wire"
     );
 
-    // (b) dropped message → explicit loss.
+    // (b) renamed tool on the OpenAI wire → explicit rewrite.
     let run = broker_route_run(
         MODEL,
-        BrokerScript::ProxySse(GEMINI_SSE),
-        vec![
-            Arc::new(serde_json::json!({"role": "tool", "content": "dropped-by-gemini"})),
-            user_msg("kept"),
-        ],
-        vec![],
-        None,
-        false,
-    )
-    .await;
-    run.result.as_ref().expect("gemini drop fixture");
-    assert!(
-        !run.records[0].translation_losses.is_empty(),
-        "a dropped message must be reported, never silent"
-    );
-
-    // (c) renamed tool on the OpenAI wire → explicit rewrite.
-    let run = broker_route_run(
-        "groq/fixture-model",
         BrokerScript::ProxySse(OAI_CHAT_SSE),
         vec![user_msg("hi")],
         vec![serde_json::json!({
