@@ -1725,8 +1725,9 @@ impl ApiMethods {
         // notice about it reaches the session.
         let keepwarm_ping = options.keepwarm.is_some();
         let mut sent_at_ms;
-        // The accepted attempt: which request the usage is evidence of.
-        let mut cache_ticket = None;
+        // The accepted attempt's ticket: which request the usage is
+        // evidence of (every attempt takes one as it is sent).
+        let mut cache_ticket: Option<super::keepwarm::CacheTicket>;
 
         loop {
             let response = {
