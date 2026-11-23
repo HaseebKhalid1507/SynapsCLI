@@ -313,16 +313,29 @@ impl ClientTransport for LocalTransport {
         // The handle itself holds a broadcast sender, so `Closed` never
         // fires on its own: end-of-stream is `Ended` or the actor going away
         // (drain what it left behind first).
-        let recv = tokio::select! {
-            biased;
-            r = self.rx.recv() => r,
-            _ = self.handle.closed() => match self.rx.try_recv() {
-                Ok(env) => Ok(env),
-                Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    Err(broadcast::error::RecvError::Lagged(n))
+        let recv = loop {
+            let recv = tokio::select! {
+                biased;
+                r = self.rx.recv() => r,
+                _ = self.handle.closed() => match self.rx.try_recv() {
+                    Ok(env) => Ok(env),
+                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        Err(broadcast::error::RecvError::Lagged(n))
+                    }
+                    Err(_) => Err(broadcast::error::RecvError::Closed),
+                },
+            };
+            // Another client's `QueryReply` is not ours; ours is a `QueryResult`.
+            match recv {
+                Ok(Envelope { event: SessionEventWire::QueryReply { to, .. }, .. }) if to != self.client => {}
+                Ok(mut env) => {
+                    if let SessionEventWire::QueryReply { id, value, .. } = env.event {
+                        env.event = SessionEventWire::QueryResult { id, value };
+                    }
+                    break Ok(env);
                 }
-                Err(_) => Err(broadcast::error::RecvError::Closed),
-            },
+                Err(e) => break Err(e),
+            }
         };
         match recv {
             Ok(env) => {

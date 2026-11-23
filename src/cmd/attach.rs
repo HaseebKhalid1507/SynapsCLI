@@ -133,6 +133,8 @@ impl Client {
                 self.out(&format!("[{}: {}]\n", a.setting, if a.ok { "ok" } else { a.message.as_deref().unwrap_or("failed") }))
             }
             SessionEventWire::QueryResult { value, .. } => self.out(&format!("{value}\n")),
+            // Transports deliver it as `QueryResult` (to its addressee only).
+            SessionEventWire::QueryReply { .. } => {}
             SessionEventWire::Conversation(_)
             | SessionEventWire::LoaderProgress(_)
             | SessionEventWire::ExtensionNotification { .. }
