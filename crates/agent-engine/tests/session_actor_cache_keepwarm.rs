@@ -2668,6 +2668,8 @@ async fn a_tool_ping_without_usage_costs_and_renews_nothing() {
     assert!(pings(&bodies) >= 1, "a ping went out: {st}");
     assert!(st["cost"].as_f64().unwrap() > cost, "booked at its worst case: {before} → {st}");
     assert_eq!(st["cache"]["expires_at"], before["cache"]["expires_at"], "not renewed: {before} → {st}");
+    // The round after the tool answers without calling it again.
+    script.turns(Reply::Cached);
     release.notify_one();
     idle(&mut t).await;
     end(&mut t).await;
