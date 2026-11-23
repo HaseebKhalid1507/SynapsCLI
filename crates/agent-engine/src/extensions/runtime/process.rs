@@ -265,22 +265,30 @@ pub async fn execute_provider_tool_use(
     let runtime_name = authorized.runtime_name().to_string();
     let input = registry.translate_input_for_api_tool(&tool_name, input);
     // Whose call this is and the folder it runs in, kept for the hook after
-    // `ctx` is spent.
+    // `ctx` is spent. The conversation is the one the extension-provided
+    // model answers for (`null` for a worker, or a context that names none);
+    // the provider's call id is known too, so the hooks get it.
     let session_id = ctx.capabilities.session_id.clone();
     let cwd = ctx.capabilities.cwd.clone();
-    let decision = crate::runtime::resolve_before_tool_call_decision(
+    let hook_call = crate::extensions::hooks::events::ToolCallHookContext::for_tool_call(
+        session_id.as_deref(),
+        Some(tool_id.as_str()),
+        cwd.as_deref(),
+    );
+    // Tool-call events: no owner here (no worker handle).
+    let (hook_result, mut call_events) = crate::runtime::emit_before_tool_call_recorded(
+        hook_bus,
+        &tool_name,
+        Some(&runtime_name),
         input.clone(),
-        crate::runtime::emit_before_tool_call(
-            hook_bus,
-            &tool_name,
-            Some(&runtime_name),
-            input.clone(),
-            // The conversation the extension-provided model answers for
-            // (`null` for a worker, or a context that names none).
-            session_id.as_deref(),
-            cwd.as_deref(),
-        )
-        .await,
+        &hook_call,
+        None,
+    )
+    .await;
+    let decision = crate::runtime::resolve_before_tool_call_decision_for(
+        &hook_call,
+        input.clone(),
+        hook_result,
         ctx.capabilities.secret_prompt.as_ref(),
         false,
         // The session's latch, so "Allow all" here arms (and honours) the
@@ -293,6 +301,7 @@ pub async fn execute_provider_tool_use(
         let crate::runtime::BeforeToolCallDecision::Block { reason } = decision else {
             unreachable!()
         };
+        call_events.finish(crate::runtime::tool_call_events::ToolCallStatus::Blocked);
         return serde_json::json!({
             "type": "tool_result",
             "tool_use_id": tool_id,
@@ -306,15 +315,19 @@ pub async fn execute_provider_tool_use(
         Ok(output) => (output, false),
         Err(error) => (format!("Tool execution failed: {}", error), true),
     };
-    let result = crate::runtime::emit_after_tool_call(
+    call_events.finish(if is_error {
+        crate::runtime::tool_call_events::ToolCallStatus::Error
+    } else {
+        crate::runtime::tool_call_events::ToolCallStatus::Ok
+    });
+    let result = crate::runtime::emit_after_tool_call_with(
         hook_bus,
         &tool_name,
         Some(&runtime_name),
         input_for_hook,
         result,
         max_tool_output,
-        session_id.as_deref(),
-        cwd.as_deref(),
+        &hook_call,
     )
     .await;
 
@@ -3543,5 +3556,216 @@ done"#
         assert_eq!(bounded(ext.handle_no_spawn(&event)).await, HookResult::Continue);
         assert!(ext.state.lock().await.is_none(), "no process was respawned");
         assert_eq!(ext.total_restarts.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod provider_tool_hook_context_tests {
+    use super::*;
+    use crate::extensions::hooks::events::{HookEvent, HookKind, HookResult};
+    use crate::extensions::hooks::HookBus;
+    use crate::extensions::permissions::{Permission, PermissionSet};
+    use crate::tools::activation::{SessionId, SessionToolSet};
+    use crate::tools::{Tool, ToolContext, ToolOrigin, ToolRegistry};
+    use serde_json::json;
+
+    struct EchoTool;
+    #[async_trait::async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo_test"
+        }
+        fn description(&self) -> &str {
+            "echo test tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn origin(&self) -> ToolOrigin {
+            ToolOrigin::Builtin
+        }
+        async fn execute(&self, params: Value, _ctx: ToolContext) -> crate::Result<String> {
+            Ok(params["message"].as_str().unwrap_or_default().to_string())
+        }
+    }
+
+    /// Records every hook event it sees; answers Continue.
+    struct RecordingHook(Arc<std::sync::Mutex<Vec<HookEvent>>>);
+    #[async_trait::async_trait]
+    impl ExtensionHandler for RecordingHook {
+        fn id(&self) -> &str {
+            "recording-hook"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.0.lock().unwrap().push(event.clone());
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+    }
+
+    fn context_with_cwd(cwd: Option<std::path::PathBuf>) -> ToolContext {
+        ToolContext {
+            channels: crate::tools::ToolChannels {
+                tx_delta: None,
+                tx_events: None,
+            },
+            capabilities: crate::tools::ToolCapabilities {
+                session_allow_all: None,
+                launch_cancel: None,
+                memory_backend: None,
+                telemetry: None,
+                tool_register_tx: None,
+                session_manager: None,
+                subagent_registry: None,
+                event_queue: None,
+                delegation_parent: None,
+                codex_parent_plan: None,
+                secret_prompt: None,
+                orchestration: None,
+                tool_activation: None,
+                mcp_leases: None,
+                extension_leases: None,
+                cwd,
+                env: None,
+                env_stripped: Vec::new(),
+                env_warned: Default::default(),
+                session_id: None,
+                hook_bus: None,
+                continuation: None,
+            },
+            limits: crate::tools::ToolLimits {
+                max_tool_output: 1000,
+                max_tool_buffer: 256 * 1024,
+                bash_timeout: 1,
+                bash_max_timeout: 1,
+                subagent_timeout: 1,
+            },
+        }
+    }
+
+    /// The provider's call id and the tool's cwd reach both tool hooks on
+    /// the extension-provider path; there is no owning conversation here.
+    #[tokio::test]
+    async fn provider_tool_hooks_carry_the_call_id_and_the_tool_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let process_cwd = std::env::current_dir().unwrap();
+        for (cwd, expected) in [
+            (Some(dir.path().to_path_buf()), dir.path().to_path_buf()),
+            (None, process_cwd),
+        ] {
+            let mut registry = ToolRegistry::empty();
+            registry.register(Arc::new(EchoTool));
+            let session_tools = SessionToolSet::default_core_for_catalog(
+                SessionId::parse("provider-hook-context-test").unwrap(),
+                registry.catalog(),
+            );
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let bus = Arc::new(HookBus::new());
+            let mut perms = PermissionSet::new();
+            perms.grant(Permission::ToolsIntercept);
+            let handler: Arc<dyn ExtensionHandler> = Arc::new(RecordingHook(events.clone()));
+            for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
+                bus.subscribe(kind, handler.clone(), None, None, perms.clone())
+                    .await
+                    .unwrap();
+            }
+            let result = execute_provider_tool_use(
+                &registry,
+                &session_tools,
+                &bus,
+                ProviderToolUse {
+                    id: "call-1".to_string(),
+                    name: "echo_test".to_string(),
+                    input: json!({"message": "hello"}),
+                },
+                context_with_cwd(cwd.clone()),
+                1000,
+            )
+            .await;
+            assert_eq!(result["content"], "hello");
+            let events = events.lock().unwrap().clone();
+            let seen: Vec<_> = events
+                .iter()
+                .map(|e| {
+                    (
+                        e.kind,
+                        e.tool_call_id.clone(),
+                        e.cwd.clone(),
+                        e.session_id.clone(),
+                    )
+                })
+                .collect();
+            let want = Some(expected.to_str().unwrap().to_string());
+            assert_eq!(
+                seen,
+                vec![
+                    (
+                        HookKind::BeforeToolCall,
+                        Some("call-1".to_string()),
+                        want.clone(),
+                        None
+                    ),
+                    (
+                        HookKind::AfterToolCall,
+                        Some("call-1".to_string()),
+                        want,
+                        None
+                    ),
+                ],
+                "tool cwd {cwd:?}"
+            );
+        }
+    }
+
+    /// Group 7 (the extension-provider site): a provider's interior call is
+    /// recorded called → decided(allow) → finished(ok) under its call id,
+    /// with no conversation (`null`), no handle, and the tool's cwd on
+    /// `called`.
+    #[tokio::test]
+    async fn a_provider_tool_call_is_recorded_without_a_conversation() {
+        use crate::runtime::tool_call_events::{ToolCallDecision, ToolCallPhase, ToolCallStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::empty();
+        registry.register(Arc::new(EchoTool));
+        let session_tools = SessionToolSet::default_core_for_catalog(
+            SessionId::parse("provider-tool-call-events-test").unwrap(),
+            registry.catalog(),
+        );
+        let bus = Arc::new(HookBus::new());
+        bus.tool_call_hub().set_enabled(true);
+        let mut sub = bus.tool_call_hub().subscribe().unwrap();
+        let result = execute_provider_tool_use(
+            &registry,
+            &session_tools,
+            &bus,
+            ProviderToolUse {
+                id: "call-7".to_string(),
+                name: "echo_test".to_string(),
+                input: json!({"message": "hello"}),
+            },
+            context_with_cwd(Some(dir.path().to_path_buf())),
+            1000,
+        )
+        .await;
+        assert_eq!(result["content"], "hello");
+        let got: Vec<_> = std::iter::from_fn(|| sub.try_next()).collect();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert!(matches!(
+            &got[0].record.phase,
+            ToolCallPhase::Called { cwd: Some(c), .. } if c.as_str() == dir.path().to_str().unwrap()
+        ));
+        assert!(matches!(
+            &got[1].record.phase,
+            ToolCallPhase::Decided { decision: ToolCallDecision::Allow, by, .. } if by.is_empty()
+        ));
+        assert!(matches!(
+            got[2].record.phase,
+            ToolCallPhase::Finished { status: ToolCallStatus::Ok, .. }
+        ));
+        for d in &got {
+            assert_eq!(d.record.tool_id, "call-7");
+            assert_eq!(d.record.tool, "echo_test");
+            assert_eq!((d.record.session_id.as_deref(), d.record.handle_id.as_deref()), (None, None));
+        }
     }
 }

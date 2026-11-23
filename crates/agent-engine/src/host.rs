@@ -410,6 +410,8 @@ impl EngineHost {
     pub async fn worker_runtime(&self) -> Result<Runtime> {
         let mut host = self.parts.clone();
         host.client = crate::runtime::build_host_http_client()?;
+        // A worker's view of the host's transforms; it shares the host's
+        // tool-call hub, so its calls reach the daemon's subscribers too.
         host.hook_bus = self.worker_hook_bus();
         host.tools = Arc::new(RwLock::new(self.worker_registry().await));
         host.mcp_runtime = None;

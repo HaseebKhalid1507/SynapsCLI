@@ -207,6 +207,37 @@ pub fn hook_cwd(cwd: Option<&Path>) -> Option<String> {
     }
 }
 
+/// What a tool dispatch site knows about one call, attached to its
+/// `before_tool_call` / `after_tool_call` events by
+/// [`HookEvent::with_tool_call`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolCallHookContext<'a> {
+    /// Owning conversation id (`None` for workers), as for
+    /// [`HookEvent::with_session`].
+    pub session_id: Option<&'a str>,
+    /// The provider's id for the call (`tool_use.id`).
+    pub tool_call_id: Option<&'a str>,
+    /// The chat's working folder, from [`hook_cwd`].
+    pub cwd: Option<String>,
+}
+
+impl<'a> ToolCallHookContext<'a> {
+    /// Context for one call: `session_cwd` is the session's working
+    /// directory as the tools receive it (`ToolCapabilities::cwd`).
+    pub fn for_tool_call(
+        session_id: Option<&'a str>,
+        tool_call_id: Option<&'a str>,
+        session_cwd: Option<&Path>,
+    ) -> Self {
+        Self {
+            session_id,
+            // An empty provider id identifies nothing.
+            tool_call_id: tool_call_id.filter(|id| !id.is_empty()),
+            cwd: hook_cwd(session_cwd),
+        }
+    }
+}
+
 /// A hook event payload dispatched to extension handlers.
 ///
 /// Fields are optional and populated only when relevant to the hook kind:
@@ -236,6 +267,10 @@ pub fn hook_cwd(cwd: Option<&Path>) -> Option<String> {
 /// workers included. The constructors leave it `None`: only the emitter
 /// knows which chat the event is for.
 ///
+/// `before_tool_call` and `after_tool_call` from the tool dispatch sites also
+/// carry `tool_call_id` (set via [`HookEvent::with_tool_call`]); it is
+/// omitted from the JSON when absent, and on every other event.
+///
 /// The `data` field is available on all events for extensions that need to
 /// attach arbitrary structured context when constructing synthetic events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +292,12 @@ pub struct HookEvent {
     pub message: Option<String>,
     /// Session identifier for session lifecycle hooks.
     pub session_id: Option<String>,
+    /// The provider's id for this tool call (`tool_use.id`) on
+    /// `before_tool_call` / `after_tool_call`, when the dispatch site has
+    /// one. An extension can use it to join its before and after records.
+    /// Omitted from the JSON when absent, so other events keep their shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     /// The chat's working folder ([`hook_cwd`]).
     #[serde(default)]
     pub cwd: Option<String>,
@@ -294,6 +335,16 @@ impl HookEvent {
         self
     }
 
+    /// Attach a tool call's context (builder): the owning conversation id,
+    /// as [`HookEvent::with_session`], plus the call id and
+    /// the chat's working folder (as [`HookEvent::with_cwd`]).
+    pub fn with_tool_call(self, ctx: &ToolCallHookContext<'_>) -> Self {
+        let mut event = self.with_session(ctx.session_id);
+        event.tool_call_id = ctx.tool_call_id.map(str::to_string);
+        event.cwd = ctx.cwd.clone();
+        event
+    }
+
     /// Construct a `before_tool_call` event.
     pub fn before_tool_call(tool_name: &str, input: Value) -> Self {
         Self {
@@ -306,6 +357,7 @@ impl HookEvent {
             cwd: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
             data: Value::Null,
         }
     }
@@ -337,6 +389,7 @@ impl HookEvent {
             cwd: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
             data: Value::Null,
         }
     }
@@ -353,6 +406,7 @@ impl HookEvent {
             cwd: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
             data: Value::Null,
         }
     }
@@ -369,6 +423,7 @@ impl HookEvent {
             cwd: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
             data,
         }
     }
@@ -408,6 +463,7 @@ impl HookEvent {
             cwd: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
             data,
         }
     }
@@ -440,6 +496,7 @@ impl HookEvent {
             cwd: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
             data: serde_json::json!({
                 "archive_id": archive_id,
                 "path": path.and_then(Path::to_str),
@@ -503,6 +560,7 @@ impl HookEvent {
             cwd: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
             data: serde_json::json!({
                 "id": id,
                 "kind": kind,
@@ -524,6 +582,7 @@ impl HookEvent {
             cwd: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
             data: Value::Null,
         }
     }
@@ -540,6 +599,7 @@ impl HookEvent {
             cwd: None,
             tool_runtime_name: None,
             transcript,
+            tool_call_id: None,
             data: Value::Null,
         }
     }
@@ -1482,5 +1542,63 @@ mod tests {
         assert_eq!(r.inject_parts()[0].source, None);
         let wire = serde_json::to_value(InjectPart::saved("A").from_source("me")).unwrap();
         assert_eq!(wire, json!({"content": "A"}));
+    }
+
+    // ── Tool call context (tool_call_id, cwd) ────────────────────────────
+
+    #[test]
+    fn with_tool_call_attaches_session_call_id_and_cwd() {
+        let ctx = ToolCallHookContext::for_tool_call(
+            Some("conv-1"),
+            Some("toolu_01"),
+            Some(std::path::Path::new("/srv/project")),
+        );
+        for event in [
+            HookEvent::before_tool_call("bash", json!({"command": "ls"})).with_tool_call(&ctx),
+            HookEvent::after_tool_call("bash", json!({}), "out".into()).with_tool_call(&ctx),
+        ] {
+            assert_eq!(event.tool_call_id.as_deref(), Some("toolu_01"));
+            assert_eq!(event.cwd.as_deref(), Some("/srv/project"));
+            assert_eq!(event.session_id.as_deref(), Some("conv-1"));
+        }
+        // A context without them leaves both absent.
+        let bare = HookEvent::before_tool_call("bash", json!({}))
+            .with_tool_call(&ToolCallHookContext::default());
+        assert_eq!(
+            (bare.tool_call_id, bare.cwd, bare.session_id),
+            (None, None, None)
+        );
+        // An empty provider id counts as none.
+        let empty = ToolCallHookContext::for_tool_call(None, Some(""), None);
+        assert_eq!(empty.tool_call_id, None);
+    }
+
+    #[test]
+    fn tool_call_id_is_omitted_unless_present() {
+        // Every other event keeps its wire shape: no new key.
+        for event in [
+            HookEvent::before_message("hi"),
+            HookEvent::on_session_start("s"),
+            HookEvent::before_tool_call("bash", json!({})).with_session(Some("conv-1")),
+        ] {
+            let wire = serde_json::to_value(&event).unwrap();
+            let object = wire.as_object().unwrap();
+            assert!(!object.contains_key("tool_call_id"), "{wire}");
+        }
+        let mut event = HookEvent::before_tool_call("bash", json!({}));
+        event.tool_call_id = Some("toolu_01".into());
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["tool_call_id"], "toolu_01");
+    }
+
+    #[test]
+    fn an_event_without_the_new_fields_still_deserializes() {
+        let old = json!({
+            "kind": "before_tool_call", "tool_name": "bash", "tool_input": {"command": "ls"},
+            "tool_output": null, "message": null, "session_id": "conv-1", "data": null
+        });
+        let event: HookEvent = serde_json::from_value(old).unwrap();
+        assert_eq!((event.tool_call_id, event.cwd), (None, None));
+        assert_eq!(event.session_id.as_deref(), Some("conv-1"));
     }
 }

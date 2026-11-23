@@ -149,6 +149,10 @@ impl Tool for SubagentTool {
         let tx_events_inner = ctx.channels.tx_events.clone();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        // The worker's tool-call records name the calling session and its
+        // sa_N; its own session id stays None.
+        let tool_call_owner =
+            crate::runtime::tool_call_events::ToolCallOwner::for_worker(&ctx, &orchestration_id);
         let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
         if let Err(error) = orchestration.mark_starting(&orchestration_id) {
             orchestration.rollback(&orchestration_id);
@@ -201,6 +205,7 @@ impl Tool for SubagentTool {
                         subagent_id,
                         &label_inner,
                     );
+                    runtime.set_tool_call_owner(Some(tool_call_owner));
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();
