@@ -213,6 +213,16 @@ async fn with_card(bodies: &'static [&'static str]) -> CardSession {
 
 /// A request counter.
 type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+/// The model has had `n` requests: a turn's request lands just after its
+/// `TurnStarted`, so a test that cancels it waits for this first.
+async fn reached(hits: &Hits, n: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while hits.load(std::sync::atomic::Ordering::SeqCst) < n {
+        assert!(tokio::time::Instant::now() < deadline, "the model never got request {n}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 /// A session with one open card: its handle, a capable client, the card,
 /// the model's request count.
 type CardSession = (agent_engine::session::SessionHandle, LocalTransport, SurfaceState, Hits);
@@ -257,8 +267,17 @@ async fn an_idle_answer_is_acked_delivered_once_and_starts_one_turn() {
     a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Leave it"}))).await.unwrap();
     let r = result_for(&mut a, A1).await;
     assert_eq!((r.outcome, r.reason, r.retry), (SurfaceOutcome::Refused, Some(SurfaceRefusal::Invalid), Some(false)));
-    a.send_from_self(answer(&card, A2, serde_json::json!({"choice": "Leave it"}))).await.unwrap();
-    let r = result_for(&mut a, A2).await;
+    // A settle commit may still be in flight: `busy` is retried, as the
+    // outbox does (§3.8).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let r = loop {
+        a.send_from_self(answer(&card, A2, serde_json::json!({"choice": "Leave it"}))).await.unwrap();
+        let r = result_for(&mut a, A2).await;
+        if r.reason != Some(SurfaceRefusal::Busy) || tokio::time::Instant::now() > deadline {
+            break r;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!((r.outcome, r.reason), (SurfaceOutcome::Refused, Some(SurfaceRefusal::Resolved)));
     let late = drain_for(&mut a, Duration::from_millis(300)).await;
     assert!(!late.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })));
@@ -483,6 +502,7 @@ async fn system_stop_freezes_receipts() {
     let card = cards(&seen).pop().unwrap();
     a.send(submit("meanwhile")).await.unwrap();
     until(&mut a, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    reached(&hits, 3).await;
     handle
         .send(SessionCommand::Checkpoint { reason: agent_engine::session::CheckpointReason::HostRequest })
         .await
@@ -490,7 +510,9 @@ async fn system_stop_freezes_receipts() {
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::Surface(s) if s.phase == Phase::Expired)).await;
     let expired = cards(&seen).pop().unwrap();
     assert!(expired.offers.is_empty() && expired.epoch > card.epoch, "{expired:?}");
-    assert_eq!(expired.origin.stopped, Some(agent_engine::ui::StopKind::System));
+    // `stopped` marks a card a stop left open (it resumes); an expired one
+    // can't (the C2 model, `worst_sidecar_of_real_types_fits`).
+    assert_eq!(expired.origin.stopped, None);
     let mut late = answer(&card, A1, serde_json::json!({"choice": "Refactor"}));
     if let SessionCommand::SurfaceAction { epoch, .. } = &mut late {
         *epoch = expired.epoch;
@@ -524,6 +546,7 @@ async fn remote_cancel_while_disconnected() {
     a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
     assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
     until(&mut b, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    reached(&hits, 3).await;
     a.send(SessionCommand::Detach { client: a.client_id() }).await.unwrap();
     b.send_from_self(SessionCommand::Cancel).await.unwrap();
     let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
