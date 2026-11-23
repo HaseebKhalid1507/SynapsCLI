@@ -518,6 +518,9 @@ pub fn sweep_at(
                     outcome.protected_chain_heads += 1;
                     continue;
                 }
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    delete_sidecars(&path, &mut outcome).map_err(RetentionError::Io)?;
+                }
                 delete_file(&path, &mut outcome).map_err(RetentionError::Io)?;
             }
         }
@@ -734,14 +737,45 @@ fn delete_file(path: &Path, outcome: &mut SweepOutcome) -> io::Result<()> {
 /// (`session_draft`, `<id>.turn`).
 const PAIRED_SESSION_EXTENSIONS: [&str; 2] = ["journal", "turn"];
 
-/// True when `path` is a journal or turn draft whose snapshot sibling still
-/// exists — such a file is handled WITH its `.json` artifact, never as an
-/// independent retention candidate.
+/// The agent-card sidecar and its quarantine (`<id>.ui`,
+/// `<id>.ui.quarantine`; agent-ui §7 C2) also live and die with the
+/// snapshot, and go before it: a sweep cut short leaves history without its
+/// cards, never cards without their history. Their own mtime says nothing
+/// about the session's age (a card can sit unchanged while the session
+/// runs on).
+const SIDECAR_SUFFIXES: [&str; 2] = [".ui", ".ui.quarantine"];
+
+/// The snapshot a sidecar file belongs to (`<id>.json` beside it).
+fn sidecar_snapshot(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let id = SIDECAR_SUFFIXES.iter().find_map(|s| name.strip_suffix(s))?;
+    (!id.is_empty() && !id.contains('.')).then(|| path.with_file_name(format!("{id}.json")))
+}
+
+/// True when `path` is a journal, turn draft or sidecar whose snapshot
+/// sibling still exists — such a file is handled WITH its `.json` artifact,
+/// never as an independent retention candidate.
 fn is_paired_journal(path: &Path) -> bool {
-    path.extension()
+    (path
+        .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| PAIRED_SESSION_EXTENSIONS.contains(&e))
-        && path.with_extension("json").exists()
+        && path.with_extension("json").exists())
+        || sidecar_snapshot(path).is_some_and(|snapshot| snapshot.exists())
+}
+
+/// Delete the sidecar files of the snapshot at `snapshot` (`<id>.json`).
+fn delete_sidecars(snapshot: &Path, outcome: &mut SweepOutcome) -> io::Result<()> {
+    let Some(id) = snapshot.file_stem().and_then(|s| s.to_str()) else {
+        return Ok(());
+    };
+    for suffix in SIDECAR_SUFFIXES {
+        let sidecar = snapshot.with_file_name(format!("{id}{suffix}"));
+        if sidecar.exists() {
+            delete_file(&sidecar, outcome)?;
+        }
+    }
+    Ok(())
 }
 
 /// Remove session `id`'s tool-output spill dir (`<base>/spill/<id>/`).
@@ -758,8 +792,12 @@ fn remove_session_spill(
 
 /// Delete a session artifact: the file plus, for `.json` snapshots, any
 /// sibling journal and turn draft (Task 35 — a session and its journal die
-/// together, so a sweep can never orphan journal state).
+/// together, so a sweep can never orphan journal state), and its sidecar
+/// files first.
 fn delete_session_artifact(path: &Path, outcome: &mut SweepOutcome) -> io::Result<()> {
+    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        delete_sidecars(path, outcome)?;
+    }
     delete_file(path, outcome)?;
     if path.extension().and_then(|e| e.to_str()) == Some("json") {
         for ext in PAIRED_SESSION_EXTENSIONS {

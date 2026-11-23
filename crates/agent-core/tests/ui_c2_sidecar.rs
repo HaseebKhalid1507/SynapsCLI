@@ -326,3 +326,129 @@ fn retained_limits_close_then_evict() {
         "nothing settled and final to evict"
     );
 }
+
+mod retention {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use agent_core::core::retention::{sweep_at, RetentionPolicy, RetentionRoots};
+    use agent_core::core::session::Session;
+    use agent_core::core::session_journal::{save_session_in_dir, SessionPersistence};
+
+    const DEAD: &str = "20200101-000000-dead";
+    const LIVE: &str = "20990101-000000-live";
+    const NOW_MS: u64 = 1_800_000_000_000; // 2027
+
+    fn roots() -> (tempfile::TempDir, RetentionRoots, PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let roots = RetentionRoots {
+            config_dir: tmp.path().join("config"),
+            base_dir: tmp.path().join("base"),
+            cache_dir: tmp.path().join("cache"),
+        };
+        for d in [
+            roots.config_dir.join("sessions"),
+            roots.config_dir.join("chains"),
+            roots.base_dir.join("memory"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir_all(&roots.cache_dir).unwrap();
+        let sessions = roots.config_dir.join("sessions");
+        (tmp, roots, sessions)
+    }
+
+    fn saved(dir: &Path, id: &str, updated_at: &str) {
+        let mut s = Session::new("claude-sonnet-4-6", "medium", Some("harness prompt"));
+        s.id = id.to_string();
+        s.updated_at = chrono::DateTime::parse_from_rfc3339(updated_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        save_session_in_dir(dir, &s, SessionPersistence::Json).unwrap();
+    }
+
+    /// A file last written in 2020.
+    fn old_file(path: &Path) {
+        std::fs::write(path, b"{\"v\":1}").unwrap();
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(UNIX_EPOCH + Duration::from_secs(1_577_836_800))
+            .unwrap();
+    }
+
+    fn age_policy() -> RetentionPolicy {
+        RetentionPolicy {
+            max_age_days: Some(30),
+            max_disk_bytes: None,
+            include_notes: false,
+        }
+    }
+
+    /// A sidecar ages with its session's snapshot, not by its own mtime: a
+    /// live session's untouched sidecar stays, a swept session's sidecar
+    /// and quarantine go with it. One with no snapshot ages by its mtime.
+    #[test]
+    fn retention_ages_the_sidecar_with_its_session() {
+        let (_tmp, roots, sessions) = roots();
+        saved(&sessions, DEAD, "2020-01-01T00:00:00Z");
+        saved(&sessions, LIVE, "2099-01-01T00:00:00Z");
+        for f in [
+            format!("{DEAD}.ui"),
+            format!("{DEAD}.ui.quarantine"),
+            format!("{LIVE}.ui"),
+            "20200101-000000-orph.ui".into(),
+        ] {
+            old_file(&sessions.join(f));
+        }
+        sweep_at(&roots, &age_policy(), NOW_MS).unwrap();
+        assert!(!sessions.join(format!("{DEAD}.json")).exists());
+        assert!(!sessions.join(format!("{DEAD}.ui")).exists());
+        assert!(!sessions.join(format!("{DEAD}.ui.quarantine")).exists());
+        assert!(sessions.join(format!("{LIVE}.json")).exists());
+        assert!(
+            sessions.join(format!("{LIVE}.ui")).exists(),
+            "a live session's sidecar stays, however old its file"
+        );
+        assert!(!sessions.join("20200101-000000-orph.ui").exists());
+    }
+
+    /// The sidecar goes first: when it can't be unlinked (a directory in its
+    /// place), the sweep stops with the session's snapshot still there.
+    #[test]
+    fn retention_unlinks_the_sidecar_first() {
+        let (_tmp, roots, sessions) = roots();
+        saved(&sessions, DEAD, "2020-01-01T00:00:00Z");
+        let sidecar = sessions.join(format!("{DEAD}.ui"));
+        std::fs::create_dir(&sidecar).unwrap();
+        std::fs::write(sidecar.join("keep"), b"x").unwrap();
+        assert!(sweep_at(&roots, &age_policy(), NOW_MS).is_err());
+        assert!(sessions.join(format!("{DEAD}.json")).exists());
+    }
+
+    /// The disk budget evicts a snapshot with its sidecar (first), and never
+    /// a sidecar on its own while its snapshot stays.
+    #[test]
+    fn retention_budget_takes_the_sidecar_with_its_snapshot() {
+        let (_tmp, roots, sessions) = roots();
+        saved(&sessions, DEAD, "2020-01-01T00:00:00Z");
+        saved(&sessions, LIVE, "2099-01-01T00:00:00Z");
+        for f in [format!("{DEAD}.ui"), format!("{LIVE}.ui")] {
+            old_file(&sessions.join(f));
+        }
+        let size = |f: String| std::fs::metadata(sessions.join(f)).unwrap().len();
+        let total: u64 = std::fs::read_dir(&sessions)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        let budget = total - size(format!("{DEAD}.json")) - size(format!("{DEAD}.ui"));
+        let policy = RetentionPolicy {
+            max_age_days: None,
+            max_disk_bytes: Some(budget),
+            include_notes: false,
+        };
+        sweep_at(&roots, &policy, NOW_MS).unwrap();
+        assert!(!sessions.join(format!("{DEAD}.json")).exists());
+        assert!(!sessions.join(format!("{DEAD}.ui")).exists());
+        assert!(sessions.join(format!("{LIVE}.json")).exists());
+        assert!(sessions.join(format!("{LIVE}.ui")).exists());
+    }
+}
