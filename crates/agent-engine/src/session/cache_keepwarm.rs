@@ -929,19 +929,6 @@ impl Period {
     }
 }
 
-/// One request's own evidence about the prompt cache: its send time (the
-/// anchor its accepted response stamped), its usage (it read or wrote
-/// cached tokens) and its model. Never the anchor of one request with the
-/// usage of another, and only from a request whose usage arrived: a failed
-/// or unanswered request leaves the previous observation aging.
-#[derive(Clone, Debug)]
-pub(crate) struct CacheObservation {
-    anchor: CacheAnchor,
-    usage: KeepWarmUsage,
-    /// Another model's cache is not this one's.
-    model: String,
-}
-
 /// One in-flight ping.
 pub(crate) struct PingTask {
     pub(crate) handle: tokio::task::JoinHandle<PingReport>,
@@ -952,9 +939,6 @@ pub(crate) struct PingTask {
     /// The period's worst case for this ping at send time: what it is
     /// booked at if it was dispatched but no usage arrived.
     worst_usd: f64,
-    /// When it was sent, and the cache generation then (`cache_gen`).
-    sent: Instant,
-    cache_gen: u64,
 }
 
 impl PingTask {
@@ -1027,14 +1011,9 @@ pub(crate) struct KeepWarmState {
     turn_started_at: Option<Instant>,
     /// Usage of the latest real request (`None` until one reported).
     last_request: Option<KeepWarmUsage>,
-    /// What the session last confirmed about its prompt cache (`Status`'s
-    /// `cache`), apart from the scheduler's per-turn bookkeeping above: a
-    /// failed request leaves it, a replaced history or another model
-    /// clears it ([`SessionActor::cache_forget`]).
-    observed: Option<CacheObservation>,
-    /// Bumped whenever `observed` is cleared: a ping sent before cannot
-    /// bring the old cache back when it lands.
-    cache_gen: u64,
+    /// The model the command loop last saw ([`SessionActor::cache_model_fence`]):
+    /// another one starts a new cache lifetime.
+    fence_model: Option<String>,
     /// A qualifying client (see [`client_qualifies`]) has been attached at
     /// some point. By default that is a TUI/attach client that can type;
     /// script/RPC-only or observe-only sessions (nobody will be back to type
@@ -1171,55 +1150,36 @@ impl SessionActor {
     /// A provider Usage event of the running turn (one per request): the
     /// latest request's usage decides whether anything is cached at all.
     pub(crate) fn cache_keepwarm_note_usage(&mut self, usage: KeepWarmUsage) {
-        let since = self.cache_keepwarm.turn_started_at;
-        self.cache_observe(&usage, since);
         self.cache_keepwarm.last_request = Some(usage);
         // A real request refreshed/rewrote the cache: a new epoch.
         self.cache_keepwarm.epoch = None;
     }
 
-    /// A request's usage arrived: the cache observation is now that
-    /// request's, whole: its anchor (stamped at or after `since`, when it
-    /// was sent), its usage, the model. Usage that read and wrote nothing
-    /// means nothing is known cached.
-    fn cache_observe(&mut self, usage: &KeepWarmUsage, since: Option<Instant>) {
-        let cached = usage.cache_read_tokens + usage.cache_write_tokens > 0;
-        let anchor = self
-            .runtime
-            .cache_anchor()
-            .filter(|a| since.is_none_or(|t| a.mono >= t));
-        self.cache_keepwarm.observed = match anchor {
-            Some(anchor) if cached => Some(CacheObservation {
-                anchor,
-                usage: usage.clone(),
-                model: self.runtime.model().to_string(),
-            }),
-            _ => None,
-        };
-    }
-
     /// The history was replaced (compaction applied, `/clear`, `/resume`)
     /// or the model changed: nothing cached before applies, and no request
-    /// sent before brings it back.
+    /// sent before reports into the new lifetime (the runtime's cache
+    /// evidence, [`crate::runtime::keepwarm::CacheAnchorCell`]). Parked:
+    /// no runtime, and the unparked one starts with no evidence.
     pub(crate) fn cache_forget(&mut self) {
-        self.cache_keepwarm.observed = None;
-        self.cache_keepwarm.cache_gen += 1;
+        if !self.is_parked() {
+            self.runtime.cache_forget();
+        }
     }
 
-    /// After any command: a model other than the observed one (`Set`,
+    /// After any command: another model than the last one seen (`Set`,
     /// `/model`, a restore) is a cold cache, even if it is switched back.
     pub(crate) fn cache_model_fence(&mut self) {
-        // Parked: no runtime to ask (the park cleared the observation).
+        // Parked: no runtime to ask (nor evidence to forget).
         if self.is_parked() {
             return;
         }
-        if self
-            .cache_keepwarm
-            .observed
-            .as_ref()
-            .is_some_and(|o| o.model != self.runtime.model())
-        {
-            self.cache_forget();
+        let model = self.runtime.model();
+        if self.cache_keepwarm.fence_model.as_deref() != Some(model) {
+            let first = self.cache_keepwarm.fence_model.is_none();
+            self.cache_keepwarm.fence_model = Some(model.to_string());
+            if !first {
+                self.cache_forget();
+            }
         }
     }
 
@@ -1554,8 +1514,6 @@ impl SessionActor {
                     tap,
                     model: self.runtime.model().to_string(),
                     worst_usd,
-                    sent: Instant::now(),
-                    cache_gen: self.cache_keepwarm.cache_gen,
                 });
             }
         }
@@ -1607,11 +1565,6 @@ impl SessionActor {
         match report.result {
             Ok(PingOutcome::Sent) => {
                 let usage = report.usage;
-                // Its usage is the cache's news, unless the history or model
-                // changed since it was sent.
-                if task.cache_gen == self.cache_keepwarm.cache_gen {
-                    self.cache_observe(&usage, Some(task.sent));
-                }
                 self.cache_keepwarm.session_pings += 1;
                 let anchor = self.runtime.cache_anchor();
                 let downgraded = self.runtime.cache_ttl_downgraded();
@@ -1755,11 +1708,13 @@ impl SessionActor {
     }
 
     /// When this session's prompt cache expires if nothing touches it,
-    /// from the last request whose usage confirmed it ([`CacheObservation`]:
-    /// a real request or a keep-warm ping that read or wrote cached tokens):
-    /// its send time plus the TTL the server HONOURS, not the configured one
-    /// (`1h` with a silent downgrade, or with no 1h write yet, is `5m`:
-    /// [`honoured_ttl`]). `null` when nothing is known cached: no such
+    /// from the latest request whose provider-reported usage is the cache's
+    /// evidence (`CacheEvidence`, recorded by the transport for that exact
+    /// request: a real request or a keep-warm ping; a booked estimate never
+    /// is): its send time plus the TTL the server honoured for it, as this
+    /// cache lifetime's own writes proved it (`1h` only after a 1h write; a
+    /// 5m-only write of a 1h request is the downgrade; never another model's
+    /// or history's evidence). `null` when nothing is known cached: no such
     /// request in this process yet (a fresh, unparked or reloaded session),
     /// the last one cached nothing, the history was replaced since
     /// (compaction applied, `/clear`, `/resume`), the model changed, or off
@@ -1771,36 +1726,23 @@ impl SessionActor {
         if self.runtime.cache_keepwarm_ineligibility().is_some() {
             return serde_json::Value::Null;
         }
-        let Some(obs) = self
-            .cache_keepwarm
-            .observed
-            .clone()
-            .filter(|o| o.model == self.runtime.model())
-        else {
+        // A model changed by anything other than a command.
+        self.cache_model_fence();
+        let Some(e) = self.runtime.cache_evidence().filter(|e| e.cached) else {
             return serde_json::Value::Null;
         };
-        let ttl = match self.cache_keepwarm.period.as_ref() {
-            Some(p) => p.ttl(),
-            None => {
-                let evidence = TtlEvidence {
-                    downgraded: self.runtime.cache_ttl_downgraded(),
-                    saw_1h: self.runtime.cache_1h_honoured(),
-                    write_1h: obs.usage.cache_write_1h.unwrap_or(0),
-                    write_5m: obs.usage.cache_write_5m.unwrap_or(0),
-                };
-                honoured_ttl(self.runtime.resolved_cache_ttl().await, evidence)
-            }
-        };
+        let ttl = e.honoured();
         let governing = governing_ttl(ttl);
-        let age = age(&obs.anchor, Instant::now(), SystemTime::now());
-        let expires_at = chrono::DateTime::<chrono::Utc>::from(obs.anchor.wall + governing);
+        let at = e.ticket.at;
+        let age = age(&at, Instant::now(), SystemTime::now());
+        let expires_at = chrono::DateTime::<chrono::Utc>::from(at.wall + governing);
         serde_json::json!({
             "ttl": ttl.as_str(),
             "ttl_secs": governing.as_secs(),
             "age_secs": age.as_secs(),
             "expires_in_secs": governing.saturating_sub(age).as_secs(),
             "expires_at": expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "downgraded": self.runtime.cache_ttl_downgraded(),
+            "downgraded": e.downgraded(),
         })
     }
 

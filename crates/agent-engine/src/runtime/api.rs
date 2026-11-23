@@ -317,6 +317,17 @@ struct EventCtx<'t> {
     /// The round's keep-warm follows this response as it streams
     /// (`ApiOptions::round_signal`).
     round_signal: Option<&'t super::tool_keepwarm::RoundSignal>,
+    /// Where this request's provider usage is recorded as cache evidence,
+    /// and which request it is (`ApiOptions::cache_anchor`).
+    cache_evidence: Option<(&'t super::keepwarm::CacheAnchorCell, super::keepwarm::CacheTicket)>,
+}
+
+/// The request's provider-reported usage is the cache's evidence (the
+/// transport is its only writer: a booked estimate never is).
+fn record_cache_evidence(ctx: &EventCtx, read: u64, write: u64, write_5m: Option<u64>, write_1h: Option<u64>) {
+    if let Some((cell, ticket)) = ctx.cache_evidence {
+        cell.observe(ticket, read, write, write_5m, write_1h);
+    }
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -620,6 +631,7 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                             cache_create_5m, cache_create_1h,
                         );
                     }
+                    record_cache_evidence(ctx, cache_read, cache_create, cache_create_5m, cache_create_1h);
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
                         input_tokens: input_t,
                         output_tokens: output_t,
@@ -773,6 +785,7 @@ fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
             state.msg_start_cache_5m, state.msg_start_cache_1h,
         );
     }
+    record_cache_evidence(ctx, cache_read, cache_create, state.msg_start_cache_5m, state.msg_start_cache_1h);
     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
         input_tokens: input_t,
         output_tokens: output_t,
@@ -1712,6 +1725,8 @@ impl ApiMethods {
         // notice about it reaches the session.
         let keepwarm_ping = options.keepwarm.is_some();
         let mut sent_at_ms;
+        // The accepted attempt: which request the usage is evidence of.
+        let mut cache_ticket = None;
 
         loop {
             let response = {
@@ -1785,6 +1800,7 @@ impl ApiMethods {
                                 // no earlier than `sent_at`.
                                 if let Some(anchor) = &options.cache_anchor {
                                     anchor.stamp(sent_at);
+                                    cache_ticket = Some(anchor.ticket(sent_at, cache_ttl));
                                 }
                                 if !anthropic_cooled.is_empty() {
                                     let served = super::auth::turn_pinned_credential(
@@ -2394,6 +2410,7 @@ impl ApiMethods {
                 usage_counters: options.usage_counters.clone(),
                 cache_diagnosis: diagnostics.is_some(),
                 round_signal: options.round_signal.as_deref(),
+                cache_evidence: options.cache_anchor.as_deref().zip(cache_ticket),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -2945,6 +2962,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_evidence: None,
         }
     }
 
@@ -2979,6 +2997,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_evidence: None,
         }
     }
 
@@ -3005,6 +3024,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_evidence: None,
         }
     }
 
@@ -3501,6 +3521,39 @@ mod tests {
                     StreamEvent::Session(SessionEvent::Usage { .. }))).count(), 1);
             }
         }
+    }
+
+    /// The request's own provider usage (its final delta, or the residual
+    /// of a stream that died after `message_start`) is its cache evidence,
+    /// with its 1h/5m split; a stream with no usage records nothing.
+    #[test]
+    fn provider_usage_is_the_request_s_cache_evidence() {
+        use crate::core::config::CacheTtl::OneHour;
+        use crate::runtime::keepwarm::{CacheAnchor, CacheAnchorCell};
+        for final_delta in [false, true] {
+            let (mut state, tx, _rx) = harness();
+            let cell = CacheAnchorCell::default();
+            let ticket = cell.ticket(CacheAnchor::now(), OneHour);
+            let mut ctx = make_ctx_telemetry_off(&tx);
+            ctx.cache_evidence = Some((&cell, ticket));
+            feed(&[PROBED_LIVE_START], &mut state, &ctx);
+            assert_eq!(cell.evidence(), None, "message_start only captures");
+            if final_delta {
+                feed(&[PROBED_LIVE_DELTA], &mut state, &ctx);
+            }
+            emit_residual_usage(&mut state, &ctx);
+            let e = cell.evidence().expect("the request's usage");
+            assert_eq!(e.ticket, ticket);
+            assert!(e.cached);
+            assert_eq!(e.honoured(), OneHour, "its 1h write");
+        }
+        let (mut state, tx, _rx) = harness();
+        let cell = CacheAnchorCell::default();
+        let mut ctx = make_ctx_telemetry_off(&tx);
+        ctx.cache_evidence = Some((&cell, cell.ticket(CacheAnchor::now(), OneHour)));
+        feed(&[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#], &mut state, &ctx);
+        emit_residual_usage(&mut state, &ctx);
+        assert_eq!(cell.evidence(), None, "no usage: no evidence");
     }
 
     #[test]
@@ -4638,6 +4691,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_evidence: None,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(

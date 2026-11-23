@@ -851,10 +851,13 @@ C: bye | socket close = Detach (turn keeps running)
   an older client sends it) never carries the field, nor does `/keepwarm status`; the answer that
   does is a `QueryReply` inside the daemon, an ordinary `query_result` to the client that asked and
   to no other. `cache` is `null` when nothing is known cached, else `{ttl, ttl_secs, age_secs,
-  expires_in_secs, expires_at, downgraded}`, all from the last request whose usage confirmed the
-  cache (a real request or a keep-warm ping): its send time and the TTL the server honours. A
-  failed request leaves it aging; an applied compaction, `/clear`, `/resume` or another model
-  clears it. Count down `expires_in_secs` on the client's own clock; `expires_at` is informational.
+  expires_in_secs, expires_at, downgraded}`, all from the latest request whose provider-reported
+  usage is the cache's evidence (a real request or a keep-warm ping, recorded by the transport for
+  that request; a booked estimate never is): its send time, and the TTL this cache lifetime's own
+  writes proved (`1h` only after a 1h write). A failed or usage-less request leaves it aging; an
+  applied compaction, `/clear`, `/resume` or another model starts a new lifetime. A parked session's
+  status has no `cache` (unknown). Count down `expires_in_secs` on the client's own clock (one that
+  also counts suspended time); `expires_at` is informational.
 
 ## Security posture
 

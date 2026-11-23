@@ -2001,6 +2001,22 @@ const SSE_UNCACHED: &str = concat!(
     "data: {\"type\":\"message_stop\"}\n\n",
 );
 
+/// A 200 whose stream reports no usage at all: it may have been billed, it
+/// proved nothing about the cache.
+const SSE_NO_USAGE: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_kw\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",",
+    "\"stop_sequence\":null}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
 /// How the scripted stub answers a kind of request.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Reply {
@@ -2010,6 +2026,10 @@ enum Reply {
     Only5m,
     /// `SSE_UNCACHED`.
     Uncached,
+    /// `SSE_CACHED`: a read, no write.
+    ReadOnly,
+    /// `SSE_NO_USAGE`.
+    NoUsage,
     /// HTTP 400 (not retried): nothing accepted.
     Refused,
     /// No answer until aborted.
@@ -2070,6 +2090,8 @@ async fn scripted_stub(script: Script) -> (String, Arc<Mutex<Vec<String>>>) {
             let sse = match (reply, ping) {
                 (Reply::Only5m, _) => SSE_TURN_5M,
                 (Reply::Uncached, _) => SSE_UNCACHED,
+                (Reply::ReadOnly, _) => SSE_CACHED,
+                (Reply::NoUsage, _) => SSE_NO_USAGE,
                 (_, true) => SSE_CACHED,
                 (_, false) => SSE_TURN,
             };
@@ -2250,6 +2272,112 @@ async fn a_downgraded_1h_request_counts_down_from_5m() {
     let at = chrono::DateTime::parse_from_rfc3339(c["expires_at"].as_str().unwrap()).unwrap();
     let from_now = at.signed_duration_since(chrono::Utc::now()).num_seconds();
     assert!((230..=301).contains(&from_now), "wall: {st}");
+    end(&mut t).await;
+}
+
+/// Each cache lifetime proves its own TTL: model A's 1h requests were
+/// downgraded, then B's first request writes a 1h entry and B counts down
+/// from an hour (A's downgrade is not B's evidence).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn another_model_proves_its_own_ttl() {
+    let (_h, script, _bodies, _handle, mut t, _host) = scripted(NO_KEEPWARM_1H).await;
+    script.turns(Reply::Only5m);
+    turn(&mut t, "hello").await;
+    let c = status(&mut t, 1400).await["cache"].clone();
+    assert_eq!((c["ttl"].as_str(), c["downgraded"].as_bool()), (Some("5m"), Some(true)), "A: {c}");
+    set_model(&mut t, 1401, "claude-opus-4-6").await;
+    script.turns(Reply::Cached);
+    turn(&mut t, "on b").await;
+    let c = status(&mut t, 1402).await["cache"].clone();
+    assert_eq!((c["ttl"].as_str(), c["downgraded"].as_bool()), (Some("1h"), Some(false)), "B's own 1h write: {c}");
+    assert!(secs(&c, "expires_in_secs") >= 3540, "{c}");
+    end(&mut t).await;
+}
+
+/// ... and A's 1h proof is not B's: B's first request only read the cache,
+/// no write of B's proves 1h, so B's 1h request counts down from 5m (and
+/// was not downgraded either: nothing proved it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_1h_proof_does_not_carry_to_another_model() {
+    let (_h, script, _bodies, _handle, mut t, _host) = scripted(NO_KEEPWARM_1H).await;
+    turn(&mut t, "hello").await;
+    assert_eq!(status(&mut t, 1410).await["cache"]["ttl"], "1h", "A wrote 1h");
+    set_model(&mut t, 1411, "claude-opus-4-6").await;
+    script.turns(Reply::ReadOnly);
+    turn(&mut t, "on b").await;
+    let c = status(&mut t, 1412).await["cache"].clone();
+    assert_eq!((c["ttl"].as_str(), c["downgraded"].as_bool()), (Some("5m"), Some(false)), "{c}");
+    assert!(secs(&c, "expires_in_secs") <= 300, "{c}");
+    // B's own reads carry B's own proof: a 1h write, then a read, is 1h.
+    script.turns(Reply::Cached);
+    turn(&mut t, "write").await;
+    script.turns(Reply::ReadOnly);
+    turn(&mut t, "read").await;
+    assert_eq!(status(&mut t, 1413).await["cache"]["ttl"], "1h");
+    end(&mut t).await;
+}
+
+/// A keep-warm ping answered 200 with no usage at all (billed at its worst
+/// case, proving nothing): the last confirmed request's countdown keeps
+/// aging, neither renewed by the ping's acceptance nor emptied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_ping_without_usage_proves_nothing() {
+    let _fast = fast_pings();
+    let (_h, script, bodies, _handle, mut t, _host) =
+        scripted("cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n").await;
+    script.pings(Reply::NoUsage);
+    turn(&mut t, "hello").await;
+    let before = status(&mut t, 1420).await["cache"].clone();
+    assert!(!before.is_null(), "the turn's 1h write");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    status_until(&mut t, 1421, PATIENCE, |_| pings(&bodies) >= 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let st = status(&mut t, 1500).await;
+    let c = &st["cache"];
+    assert!(!c.is_null(), "a ping with no usage does not empty the cache: {st}");
+    assert_eq!(c["expires_at"], before["expires_at"], "nor renew it: {st}");
+    assert!(secs(c, "age_secs") >= 1, "the turn's countdown, aging: {st}");
+    end(&mut t).await;
+}
+
+/// A parked session's opted-in `Status` has no `cache` at all: its runtime
+/// is gone, and a cache that may still be warm is unknown, not cold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_parked_session_says_nothing_about_its_cache() {
+    let h = Home::new();
+    write_config(&h, NO_KEEPWARM_1H);
+    let (url, _bodies) = scripted_stub(Script::new()).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host
+        .create_session(SessionConfig {
+            persist: true,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    turn(&mut t, "hello").await;
+    assert!(!status(&mut t, 1430).await["cache"].is_null());
+    t.send(SessionCommand::Detach {
+        client: t.client_id(),
+    })
+    .await
+    .unwrap();
+    handle.send(SessionCommand::Park).await.unwrap();
+    assert!(wait_lifecycle(&handle, SessionLifecycle::Parked, PATIENCE).await);
+    let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let st = status(&mut t, 1431).await;
+    assert_eq!(st["lifecycle"], "parked", "{st}");
+    assert!(st.get("cache").is_none(), "unknown, not cold: {st}");
     end(&mut t).await;
 }
 

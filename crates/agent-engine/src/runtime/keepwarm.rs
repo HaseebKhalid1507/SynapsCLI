@@ -82,16 +82,79 @@ impl CacheAnchor {
     }
 }
 
-/// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]).
+/// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]),
+/// and the cache evidence of this request chain ([`CacheEvidence`]).
 /// Runtime clones get a FRESH cell (a clone is a different request chain,
 /// like the TTL latches); `share_ttl_latches` shares it.
 #[derive(Debug, Default)]
-pub struct CacheAnchorCell(std::sync::Mutex<Option<CacheAnchor>>);
+pub struct CacheAnchorCell {
+    anchor: std::sync::Mutex<Option<CacheAnchor>>,
+    life: std::sync::Mutex<CacheLife>,
+}
+
+/// Which request a provider usage belongs to: taken as the request is
+/// handed to the HTTP client ([`CacheAnchorCell::ticket`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheTicket {
+    /// The cache lifetime it was sent in ([`CacheAnchorCell::forget`]).
+    life: u64,
+    /// Send order in this chain: a later request's evidence is never undone
+    /// by an earlier one's usage arriving after it.
+    seq: u64,
+    /// Its send time.
+    pub at: CacheAnchor,
+    /// The TTL its cache markers asked for.
+    pub requested: crate::core::config::CacheTtl,
+}
+
+/// What one request's provider-reported usage proved about the prompt
+/// cache. Only the transport records it, where the provider's usage is
+/// parsed: a booked estimate (an unmeasured ping's worst case) is a cost,
+/// never evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheEvidence {
+    /// The request it is about.
+    pub ticket: CacheTicket,
+    /// It read or wrote cached tokens. `false`: nothing is known cached.
+    pub cached: bool,
+    /// The TTL the server honoured for this cache lifetime as far as its
+    /// requests proved it: a 1h write proves 1h, a 5m-only write of a 1h
+    /// request proves the downgrade, a read alone carries what the
+    /// lifetime's earlier writes proved (`None`: nothing proved).
+    pub proven: Option<crate::core::config::CacheTtl>,
+}
+
+impl CacheEvidence {
+    /// The TTL the cache entry is kept for: what the request asked, a `1h`
+    /// only when this lifetime proved it (else `5m`).
+    pub fn honoured(&self) -> crate::core::config::CacheTtl {
+        use crate::core::config::CacheTtl;
+        match self.ticket.requested {
+            CacheTtl::OneHour => self.proven.unwrap_or(CacheTtl::FiveMinutes),
+            other => other,
+        }
+    }
+
+    /// A 1h request kept for 5m: a write proved the downgrade.
+    pub fn downgraded(&self) -> bool {
+        use crate::core::config::CacheTtl;
+        self.ticket.requested == CacheTtl::OneHour && self.proven == Some(CacheTtl::FiveMinutes)
+    }
+}
+
+#[derive(Debug, Default)]
+struct CacheLife {
+    /// Bumped by [`CacheAnchorCell::forget`].
+    life: u64,
+    /// Requests handed to the HTTP client.
+    sent: u64,
+    evidence: Option<CacheEvidence>,
+}
 
 impl CacheAnchorCell {
     pub fn stamp(&self, at: CacheAnchor) {
         let mut slot = self
-            .0
+            .anchor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.is_none_or(|prev| prev.mono <= at.mono) {
@@ -101,9 +164,65 @@ impl CacheAnchorCell {
 
     pub fn get(&self) -> Option<CacheAnchor> {
         *self
-            .0
+            .anchor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn life(&self) -> std::sync::MutexGuard<'_, CacheLife> {
+        self.life
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A request is being sent at `at`, asking for `requested`.
+    pub fn ticket(&self, at: CacheAnchor, requested: crate::core::config::CacheTtl) -> CacheTicket {
+        let mut l = self.life();
+        l.sent += 1;
+        CacheTicket { life: l.life, seq: l.sent, at, requested }
+    }
+
+    /// The provider reported the usage of `ticket`'s request: what it read
+    /// and wrote, and its 1h / 5m write buckets. Kept unless the cache was
+    /// forgotten since it was sent, or a request sent later already
+    /// reported.
+    pub fn observe(
+        &self,
+        ticket: CacheTicket,
+        read: u64,
+        write: u64,
+        write_5m: Option<u64>,
+        write_1h: Option<u64>,
+    ) {
+        use crate::core::config::CacheTtl;
+        let mut l = self.life();
+        if ticket.life != l.life || l.evidence.is_some_and(|e| e.ticket.seq > ticket.seq) {
+            return;
+        }
+        let cached = read + write > 0;
+        let proven = if write_1h.unwrap_or(0) > 0 {
+            Some(CacheTtl::OneHour)
+        } else if write_5m.unwrap_or(0) > 0 && read == 0 {
+            Some(CacheTtl::FiveMinutes)
+        } else if cached {
+            l.evidence.filter(|e| e.cached).and_then(|e| e.proven)
+        } else {
+            None
+        };
+        l.evidence = Some(CacheEvidence { ticket, cached, proven });
+    }
+
+    /// The latest request's evidence in this cache lifetime.
+    pub fn evidence(&self) -> Option<CacheEvidence> {
+        self.life().evidence
+    }
+
+    /// The history or the model changed: nothing cached before applies,
+    /// and no request sent before reports into the new lifetime.
+    pub fn forget(&self) {
+        let mut l = self.life();
+        l.life += 1;
+        l.evidence = None;
     }
 }
 
@@ -449,6 +568,17 @@ impl Runtime {
     /// The last accepted Anthropic request of this runtime's request chain.
     pub fn cache_anchor(&self) -> Option<CacheAnchor> {
         self.cache_anchor.get()
+    }
+
+    /// The latest request's provider-reported cache evidence in this cache
+    /// lifetime ([`CacheAnchorCell::observe`]).
+    pub fn cache_evidence(&self) -> Option<CacheEvidence> {
+        self.cache_anchor.evidence()
+    }
+
+    /// A new cache lifetime: the history or the model changed.
+    pub fn cache_forget(&self) {
+        self.cache_anchor.forget();
     }
 
     /// The session's silent 1h→5m downgrade latch has fired: the server
@@ -2087,6 +2217,75 @@ mod tests {
             Some(later),
             "a late-arriving older stamp never rewinds"
         );
+    }
+
+    /// Cache evidence is one request's: a request sent later that cached
+    /// nothing is not undone by an earlier one's usage arriving after it,
+    /// and a later one that reported nothing leaves the earlier one's own
+    /// send time (never the later acceptance).
+    #[test]
+    fn cache_evidence_is_the_latest_sent_request_s_own() {
+        use crate::core::config::CacheTtl::OneHour;
+        let cell = CacheAnchorCell::default();
+        let t0 = CacheAnchor::now();
+        let t1 = CacheAnchor {
+            mono: t0.mono + std::time::Duration::from_secs(5),
+            wall: t0.wall + std::time::Duration::from_secs(5),
+        };
+        let long = cell.ticket(t0, OneHour);
+        let ping = cell.ticket(t1, OneHour);
+        cell.stamp(t1);
+        cell.observe(ping, 0, 0, None, None);
+        cell.observe(long, 18_000, 2_000, Some(0), Some(2_000));
+        let e = cell.evidence().expect("the ping's");
+        assert_eq!(e.ticket, ping);
+        assert!(!e.cached, "the newer request's cold result stands");
+
+        let cell = CacheAnchorCell::default();
+        let long = cell.ticket(t0, OneHour);
+        let _unmeasured = cell.ticket(t1, OneHour);
+        cell.stamp(t1);
+        cell.observe(long, 18_000, 2_000, Some(0), Some(2_000));
+        let e = cell.evidence().expect("the long request's");
+        assert_eq!(e.ticket.at, t0, "its own send time, not the newer acceptance");
+        assert!(e.cached);
+        assert_eq!(cell.get(), Some(t1), "scheduling still sees the acceptance");
+    }
+
+    /// A forgotten lifetime (history or model changed) takes no report from
+    /// a request sent before it, and its TTL proof starts over: a 1h write
+    /// proves 1h, a 5m-only write of a 1h request the downgrade, a read
+    /// carries the lifetime's proof (none: 5m, not downgraded).
+    #[test]
+    fn cache_evidence_proves_its_ttl_per_lifetime() {
+        use crate::core::config::CacheTtl::{FiveMinutes, OneHour};
+        let cell = CacheAnchorCell::default();
+        let at = CacheAnchor::now();
+        let a = cell.ticket(at, OneHour);
+        cell.observe(a, 0, 2_000, Some(2_000), Some(0));
+        let e = cell.evidence().unwrap();
+        assert_eq!((e.honoured(), e.downgraded()), (FiveMinutes, true));
+        let a2 = cell.ticket(at, OneHour);
+        cell.observe(a2, 2_000, 0, None, None);
+        assert!(cell.evidence().unwrap().downgraded(), "a read keeps the lifetime's proof");
+
+        let stale = cell.ticket(at, OneHour);
+        cell.forget();
+        cell.observe(stale, 2_000, 0, None, None);
+        assert_eq!(cell.evidence(), None, "sent before the forget");
+        let b = cell.ticket(at, OneHour);
+        cell.observe(b, 0, 2_000, Some(0), Some(2_000));
+        let e = cell.evidence().unwrap();
+        assert_eq!((e.honoured(), e.downgraded()), (OneHour, false), "B's own 1h write");
+
+        cell.forget();
+        let c = cell.ticket(at, OneHour);
+        cell.observe(c, 20_000, 0, None, None);
+        let e = cell.evidence().unwrap();
+        assert_eq!((e.honoured(), e.downgraded()), (FiveMinutes, false), "a read proves no TTL");
+        let five = cell.ticket(at, FiveMinutes);
+        cell.observe(five, 0, 2_000, Some(0), Some(2_000));
+        assert_eq!(cell.evidence().unwrap().honoured(), FiveMinutes, "what it asked");
     }
 
     #[test]

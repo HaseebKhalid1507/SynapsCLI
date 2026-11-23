@@ -2677,9 +2677,9 @@ impl SessionActor {
         let conv = self.conv.park_take();
         drop(conv);
         let runtime = self.runtime.park_take();
+        // Its cache evidence goes with it: the unparked runtime's request
+        // chain has confirmed nothing yet.
         drop(runtime);
-        // The unparked runtime sends nothing it has confirmed yet.
-        self.cache_forget();
         // Hand the freed pages back: jemalloc otherwise keeps them as
         // dirty/muzzy for its decay window, and a parked session that
         // still shows in RssAnon buys nothing.
@@ -4685,8 +4685,11 @@ impl SessionActor {
         if self.is_parked() {
             let addressed = matches!(query, SessionQuery::Status { cache: true });
             let value = match query {
-                SessionQuery::Status { cache } => {
-                    let mut v = serde_json::json!({
+                // Parked: no `cache` either way. Nothing of this process's
+                // requests is known (the runtime is gone), and a cache that
+                // may still be warm is not reported cold: unknown.
+                SessionQuery::Status { .. } => {
+                    serde_json::json!({
                         "session": self.journal_id_now(),
                         "model": self.view.load().model,
                         "lifecycle": SessionLifecycle::Parked,
@@ -4695,12 +4698,7 @@ impl SessionActor {
                         "attached": 0,
                         "pending_prompts": 0,
                         "pinned": self.keep_warm,
-                    });
-                    // Parked: nothing of this process's requests is known.
-                    if cache {
-                        v["cache"] = serde_json::Value::Null;
-                    }
-                    v
+                    })
                 }
                 SessionQuery::View => serde_json::to_value(&**self.view.load()).unwrap_or_default(),
                 // A parked session has no live workers; a watch poll must not wake it.
