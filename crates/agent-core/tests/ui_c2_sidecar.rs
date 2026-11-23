@@ -41,6 +41,10 @@ fn card(n: u8) -> SurfaceState {
 }
 
 fn accepted(card: u8, n: u8, note: Option<String>) -> Op {
+    accepted_at(card, n, note, AT, Vec::new())
+}
+
+fn accepted_at(card: u8, n: u8, note: Option<String>, at: &str, offers: Vec<Verb>) -> Op {
     let values = Answer {
         choice: Some(Choice::One("Refactor".into())),
         note,
@@ -65,8 +69,8 @@ fn accepted(card: u8, n: u8, note: Option<String>) -> Op {
             rev: 1,
         },
         by: "desk".into(),
-        at: AT.into(),
-        offers: Vec::new(),
+        at: at.into(),
+        offers,
     }))
 }
 
@@ -247,4 +251,78 @@ fn sidecar_deleted_first() {
     std::fs::remove_dir_all(&sidecar).unwrap();
     delete_session_files_in_dir(tmp.path(), &s.id).unwrap();
     assert!(!snapshot.exists() && !journal_path(tmp.path(), &s.id).exists());
+}
+
+/// T20 and eviction (§4.4): revisable receipts beyond the newest eight, or
+/// answered more than a day ago, are made final and keep their ledger
+/// records; only a final card whose answers are settled leaves for a
+/// tombstone, and only when the cards are over what `Attached.surfaces`
+/// carries.
+#[test]
+fn retained_limits_close_then_evict() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-11-23T12:00:00+00:00")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut s = Sidecar::new(SID, LINEAGE, ROOT_BASE);
+    // Ten revisable receipts answered n minutes ago (n = 1..=10), and one
+    // answered 30 h ago.
+    for n in 1..=11u8 {
+        apply(&mut s, &Op::Create(Box::new(card(n))));
+        let at = if n == 11 {
+            now - chrono::Duration::hours(30)
+        } else {
+            now - chrono::Duration::minutes(n as i64)
+        };
+        apply(
+            &mut s,
+            &accepted_at(n, n, None, &at.to_rfc3339(), vec![Verb::Revise]),
+        );
+    }
+    for n in 1..=11u8 {
+        apply(
+            &mut s,
+            &Op::Settle {
+                answer_id: format!("a_{n:016x}"),
+            },
+        );
+    }
+    let ledger = s.ledger.clone();
+    enforce_limits(&mut s, now);
+    let phase = |s: &Sidecar, n: u8| s.card(&format!("s_{n:016x}")).map(|c| c.phase);
+    // The oldest three (30 h, 10 min, 9 min) are final; the newest eight
+    // stay revisable.
+    for n in [11, 10, 9] {
+        assert_eq!(phase(&s, n), Some(Phase::Closed), "card {n}");
+        assert!(s.card(&format!("s_{n:016x}")).unwrap().offers.is_empty());
+    }
+    for n in 1..=8 {
+        assert_eq!(phase(&s, n), Some(Phase::Answered), "card {n}");
+    }
+    assert_eq!(s.ledger, ledger, "T20 never touches the ledger");
+    assert!(s.tombstones.is_empty(), "eleven cards fit: {s:?}");
+    // Two more open cards: thirteen. The oldest final, settled card (30 h)
+    // leaves for a tombstone with its log; nothing revisable or open does.
+    for n in 12..=13u8 {
+        apply(&mut s, &Op::Create(Box::new(card(n))));
+    }
+    enforce_limits(&mut s, now);
+    assert_eq!(s.cards.len(), ATTACHED_MAX_STATES);
+    assert_eq!(phase(&s, 11), None);
+    assert_eq!(s.tombstones.len(), 1);
+    assert_eq!(s.tombstones[0].id, format!("s_{:016x}", 11));
+    assert_eq!(s.tombstones[0].log.len(), 1);
+    assert!(encode_sidecar(&s).is_ok());
+    // An unsettled final card stays a card: the ledger's card is never
+    // evicted.
+    let mut t = s.clone();
+    t.ledger
+        .iter_mut()
+        .for_each(|r| r.delivery = Delivery::Queued);
+    apply(&mut t, &Op::Create(Box::new(card(14))));
+    enforce_limits(&mut t, now);
+    assert_eq!(
+        t.cards.len(),
+        ATTACHED_MAX_STATES + 1,
+        "nothing settled and final to evict"
+    );
 }

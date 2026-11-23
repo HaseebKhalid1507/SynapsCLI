@@ -1709,6 +1709,44 @@ pub fn enforce_limits(sc: &mut Sidecar, now: DateTime<Utc>) {
             st.rev = st.rev.saturating_add(1);
         }
     }
+    // T20 (§4.4): revisable receipts beyond the newest RETAINED_MAX, or
+    // answered more than a day ago, are made final, oldest first. The
+    // ledger is not touched.
+    let revisable =
+        |st: &SurfaceState| st.phase != Phase::Open && st.offers.contains(&Verb::Revise);
+    // When it was answered (raised, for one never answered); unreadable
+    // counts as oldest.
+    let since = |st: &SurfaceState| {
+        let at = st
+            .answer
+            .as_ref()
+            .map_or(st.raised_at.as_str(), |a| a.at.as_str());
+        DateTime::parse_from_rfc3339(at)
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
+    };
+    let day = chrono::Duration::from_std(OPEN_MAX_AGE).unwrap_or(chrono::Duration::MAX);
+    let mut order: Vec<(Option<DateTime<Utc>>, usize)> = sc
+        .cards
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| revisable(&c.state))
+        .map(|(i, c)| (since(&c.state), i))
+        .collect();
+    order.sort();
+    let over = order.len().saturating_sub(RETAINED_MAX);
+    for (k, (at, i)) in order.into_iter().enumerate() {
+        if k < over || at.is_none_or(|t| now.signed_duration_since(t) > day) {
+            let st = &mut sc.cards[i].state;
+            st.phase = Phase::Closed;
+            st.offers.clear();
+            st.rev = st.rev.saturating_add(1);
+        }
+    }
+    // Eviction touches only settled, non-revisable state (§4.4): when the
+    // cards are over what `Attached.surfaces` carries, the oldest final
+    // card whose answers are all settled leaves for a tombstone (its
+    // action log, for retries, §3.7).
     let unsettled: HashSet<String> = sc
         .ledger
         .iter()
@@ -1716,17 +1754,18 @@ pub fn enforce_limits(sc: &mut Sidecar, now: DateTime<Utc>) {
         .map(|r| r.card.clone())
         .collect();
     let at = now.to_rfc3339();
-    while sc
-        .cards
-        .iter()
-        .filter(|c| c.state.phase != Phase::Open)
-        .count()
-        > RETAINED_MAX
-    {
+    while sc.cards.len() > ATTACHED_MAX_STATES {
         let Some(i) = sc
             .cards
             .iter()
-            .position(|c| c.state.phase != Phase::Open && !unsettled.contains(&c.state.id))
+            .enumerate()
+            .filter(|(_, c)| {
+                c.state.phase != Phase::Open
+                    && !revisable(&c.state)
+                    && !unsettled.contains(&c.state.id)
+            })
+            .min_by_key(|(_, c)| since(&c.state))
+            .map(|(i, _)| i)
         else {
             break;
         };
