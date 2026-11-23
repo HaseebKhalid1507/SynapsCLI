@@ -1103,7 +1103,7 @@ impl Drop for ParkGrace {
 async fn an_answer_to_a_parked_session_wakes_it() {
     let _h = Home::new();
     let _g = ParkGrace::zero();
-    let (handle, mut a, card, hits) = with_card(&[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
+    let (handle, a, card, hits) = with_card(&[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
     a.send(SessionCommand::Detach { client: a.client_id() }).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while handle.lifecycle() != agent_engine::session::SessionLifecycle::Parked {
@@ -1278,16 +1278,20 @@ async fn an_older_history_restores_cards_as_unknown() {
     until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
     // Wait for the settle: the sidecar names the newest settled answer.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let sc = std::fs::read(sidecar_path(&journal)).ok().and_then(|b| agent_engine::core::session_surfaces::decode_sidecar(&b).ok());
+    let image = loop {
+        let bytes = std::fs::read(sidecar_path(&journal)).unwrap_or_default();
+        let sc = agent_engine::core::session_surfaces::decode_sidecar(&bytes).ok();
         if sc.is_some_and(|sc| sc.newest_settled.is_some()) {
-            break;
+            break bytes;
         }
         assert!(tokio::time::Instant::now() < deadline, "never settled");
         tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    };
     end(&mut a).await;
     gone(&handle).await;
+    // The process died here (an end would expire the open card, T16),
+    // and the history came back from an older copy.
+    std::fs::write(sidecar_path(&journal), &image).unwrap();
     older.restore(&journal);
 
     let host = host().await;
