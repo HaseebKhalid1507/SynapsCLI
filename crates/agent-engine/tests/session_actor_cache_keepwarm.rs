@@ -2034,15 +2034,23 @@ enum Reply {
     Refused,
     /// No answer until aborted.
     Hang,
+    /// A turn's `SSE_TURN`, its headers held until [`Script::release`].
+    Held,
+    /// `SSE_GATE_TOOL`: a 1h write, and a call of [`GateTool`].
+    Tool,
 }
 
 /// What the stub answers turns, pings and compaction with, settable mid-test.
 #[derive(Clone)]
-struct Script(Arc<Mutex<[Reply; 3]>>);
+struct Script(Arc<Mutex<[Reply; 3]>>, Arc<tokio::sync::Notify>);
 
 impl Script {
     fn new() -> Self {
-        Self(Arc::new(Mutex::new([Reply::Cached; 3])))
+        Self(Arc::new(Mutex::new([Reply::Cached; 3])), Arc::new(tokio::sync::Notify::new()))
+    }
+    /// A `Held` request answers.
+    fn release(&self) {
+        self.1.notify_one();
     }
     fn turns(&self, r: Reply) {
         self.0.lock().unwrap()[0] = r;
@@ -2076,6 +2084,7 @@ async fn scripted_stub(script: Script) -> (String, Arc<Mutex<Vec<String>>>) {
                         .into_response()
                 }
                 Reply::Hang => tokio::time::sleep(Duration::from_secs(600)).await,
+                Reply::Held => script.1.notified().await,
                 _ => {}
             }
             if !streaming {
@@ -2092,6 +2101,7 @@ async fn scripted_stub(script: Script) -> (String, Arc<Mutex<Vec<String>>>) {
                 (Reply::Uncached, _) => SSE_UNCACHED,
                 (Reply::ReadOnly, _) => SSE_CACHED,
                 (Reply::NoUsage, _) => SSE_NO_USAGE,
+                (Reply::Tool, _) => SSE_GATE_TOOL,
                 (_, true) => SSE_CACHED,
                 (_, false) => SSE_TURN,
             };
@@ -2460,4 +2470,173 @@ async fn the_cache_field_reaches_only_a_client_that_asked() {
     assert_eq!(second["ttl_secs"], first["ttl_secs"]);
     assert!(secs(&second, "age_secs") > secs(&first, "age_secs"));
     end(&mut asker).await;
+}
+
+// ── Status.cache: a request producer's own cache lifetime (Shady #436 R3) ──
+
+/// A turn's round that wrote 2k with the 1h TTL and calls `cache_gate`.
+const SSE_GATE_TOOL: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_gate\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":0,",
+    "\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":2000}}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_gate\",\"name\":\"cache_gate\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":0,",
+    "\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":2000}}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// Holds its turn at the tool: says it started, then waits to be let go.
+struct GateTool {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl agent_engine::Tool for GateTool {
+    fn name(&self) -> &str {
+        "cache_gate"
+    }
+    fn description(&self) -> &str {
+        "waits to be let go"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> agent_engine::tools::ToolOrigin {
+        agent_engine::tools::ToolOrigin::Builtin
+    }
+    async fn execute(&self, _params: serde_json::Value, _ctx: agent_engine::ToolContext) -> agent_engine::Result<String> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok("let go".into())
+    }
+}
+
+/// [`scripted`], with [`GateTool`] registered: its "started" and "let go".
+async fn scripted_gate(
+    config: &str,
+) -> (Home, Script, Arc<Mutex<Vec<String>>>, LocalTransport, Arc<agent_engine::EngineHost>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)
+{
+    let h = Home::new();
+    write_config(&h, config);
+    let script = Script::new();
+    let (url, bodies) = scripted_stub(script.clone()).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (started, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+    host.parts()
+        .tools
+        .write()
+        .await
+        .register(Arc::new(GateTool { started: Arc::clone(&started), release: Arc::clone(&release) }));
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (t, _) = LocalTransport::attach(handle, ClientMeta::new(ClientKind::Tui)).await.unwrap();
+    (h, script, bodies, t, host, started, release)
+}
+
+async fn idle(t: &mut LocalTransport) {
+    until(t, |e| matches!(e, agent_engine::session::SessionEventWire::Idle)).await;
+}
+
+/// The model a turn's request after its tool round was sent with.
+fn after_the_tool(bodies: &Arc<Mutex<Vec<String>>>) -> String {
+    let bodies = bodies.lock().unwrap();
+    let body = bodies.iter().rev().find(|b| b.contains("\"tool_result\"")).expect("the round after the tool");
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    v["model"].as_str().unwrap().to_string()
+}
+
+const MODEL_B: &str = "claude-opus-4-6";
+
+/// A turn on model A whose answer (a 1h write) comes back after a switch to
+/// B, its headers held meanwhile: B stays cold, and B's own first request
+/// proves B's own TTL (Shady #436 R3-1: the ticket is taken as the request
+/// is sent, not as its headers arrive).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_answer_that_lands_after_a_switch_is_not_the_new_model_s() {
+    let (_h, script, bodies, _handle, mut t, _host) = scripted(NO_KEEPWARM_1H).await;
+    script.turns(Reply::Held);
+    let sent = bodies.lock().unwrap().len();
+    t.send(submit("hello")).await.unwrap();
+    while bodies.lock().unwrap().len() == sent {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    set_model(&mut t, 1500, MODEL_B).await;
+    let st = status(&mut t, 1501).await;
+    assert!(st["cache"].is_null(), "B: nothing yet: {st}");
+    script.release();
+    idle(&mut t).await;
+    let st = status(&mut t, 1502).await;
+    assert!(st["cache"].is_null(), "A's answer, landed after the switch, is not B's: {st}");
+    script.turns(Reply::Only5m);
+    turn(&mut t, "on b").await;
+    let c = status(&mut t, 1503).await["cache"].clone();
+    assert_eq!((c["ttl"].as_str(), c["downgraded"].as_bool()), (Some("5m"), Some(true)), "B's own write: {c}");
+    end(&mut t).await;
+}
+
+/// A turn on model A paused at its tool, and a switch to B meanwhile: the
+/// switch does not cancel the turn, whose next round still goes to A,
+/// SENT after the switch, and writes A's cache. B stays cold; B's own
+/// request proves B's own TTL (Shady #436 R3-2: a producer reports into
+/// the cache lifetime it started in).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_turn_running_across_a_switch_never_warms_the_new_model() {
+    let (_h, script, bodies, mut t, _host, started, release) = scripted_gate(NO_KEEPWARM_1H).await;
+    script.turns(Reply::Tool);
+    t.send(submit("hello")).await.unwrap();
+    tokio::time::timeout(PATIENCE, started.notified()).await.expect("the tool runs");
+    let st = status(&mut t, 1510).await;
+    assert_eq!(st["cache"]["ttl"], "1h", "A's tool round wrote 1h: {st}");
+    script.turns(Reply::Cached);
+    set_model(&mut t, 1511, MODEL_B).await;
+    let st = status(&mut t, 1512).await;
+    assert!(st["cache"].is_null(), "B: nothing yet: {st}");
+    release.notify_one();
+    idle(&mut t).await;
+    assert_eq!(after_the_tool(&bodies), MODEL, "the running turn kept A");
+    let st = status(&mut t, 1513).await;
+    assert!(st["cache"].is_null(), "A's round, sent after the switch, is not B's: {st}");
+    script.turns(Reply::Only5m);
+    turn(&mut t, "on b").await;
+    let c = status(&mut t, 1514).await["cache"].clone();
+    assert_eq!((c["ttl"].as_str(), c["downgraded"].as_bool()), (Some("5m"), Some(true)), "B's own write: {c}");
+    end(&mut t).await;
+}
+
+/// ... and switched back to A while the turn waits: the same model's name,
+/// another cache lifetime. The old turn's round is still not its evidence
+/// (a fence on the model's name alone would let it in); A's next turn's is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_turn_running_across_a_switch_and_back_is_the_old_lifetime_s() {
+    let (_h, script, bodies, mut t, _host, started, release) = scripted_gate(NO_KEEPWARM_1H).await;
+    script.turns(Reply::Tool);
+    t.send(submit("hello")).await.unwrap();
+    tokio::time::timeout(PATIENCE, started.notified()).await.expect("the tool runs");
+    script.turns(Reply::Cached);
+    set_model(&mut t, 1520, MODEL_B).await;
+    set_model(&mut t, 1521, MODEL).await;
+    let st = status(&mut t, 1522).await;
+    assert!(st["cache"].is_null(), "switched back: nothing confirmed: {st}");
+    release.notify_one();
+    idle(&mut t).await;
+    assert_eq!(after_the_tool(&bodies), MODEL);
+    let st = status(&mut t, 1523).await;
+    assert!(st["cache"].is_null(), "the old turn's round is the old lifetime's: {st}");
+    turn(&mut t, "again").await;
+    let c = status(&mut t, 1524).await["cache"].clone();
+    assert_eq!(c["ttl"], "1h", "A's new turn: {c}");
+    assert!(secs(&c, "expires_in_secs") >= 3540, "{c}");
+    end(&mut t).await;
 }

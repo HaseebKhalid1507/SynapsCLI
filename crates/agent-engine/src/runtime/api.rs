@@ -7501,3 +7501,142 @@ mod cancellation_tests {
         )));
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shady #436 R3-1: a request's cache ticket is taken as it is sent, not when
+// its headers come back.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod cache_ticket_tests {
+    use super::{ApiMethods, ApiOptions};
+    use crate::auth::{CredentialSource, TokenCache};
+    use crate::runtime::keepwarm::CacheAnchorCell;
+    use crate::runtime::telemetry::TelemetryLevel;
+    use crate::runtime::types::AuthState;
+    use crate::{StreamEvent, ToolRegistry};
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, Notify, RwLock};
+
+    fn sse(read: u64, write: u64) -> String {
+        format!(
+            concat!(
+                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_t\",\"type\":\"message\",",
+                "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-haiku-4-5\",\"stop_reason\":null,",
+                "\"stop_sequence\":null,\"usage\":{{\"input_tokens\":10,\"output_tokens\":0,",
+                "\"cache_creation_input_tokens\":{write},\"cache_read_input_tokens\":{read},",
+                "\"cache_creation\":{{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":{write}}}}}}}}}\n\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,",
+                "\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,",
+                "\"delta\":{{\"type\":\"text_delta\",\"text\":\"hi\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",",
+                "\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":1}}}}\n\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            read = read,
+            write = write,
+        )
+    }
+
+    /// The first request is held (no headers) until `release`, and answers
+    /// with a 1h cache write; every later one answers at once, cold.
+    /// `arrived` wakes as each request reaches the stub.
+    async fn held_first_stub() -> (String, Arc<Notify>, Arc<Notify>) {
+        let (arrived, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let n = Arc::new(AtomicUsize::new(0));
+        let (a, r) = (Arc::clone(&arrived), Arc::clone(&release));
+        let app = axum::Router::new().fallback(move |_body: String| {
+            let (a, r, n) = (Arc::clone(&a), Arc::clone(&r), Arc::clone(&n));
+            async move {
+                let first = n.fetch_add(1, Ordering::SeqCst) == 0;
+                a.notify_one();
+                let body = if first {
+                    r.notified().await;
+                    sse(0, 2_000)
+                } else {
+                    sse(0, 0)
+                };
+                (axum::http::StatusCode::OK, [("content-type", "text/event-stream")], body).into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), arrived, release)
+    }
+
+    fn call(url: &str, cell: &Arc<CacheAnchorCell>) -> tokio::task::JoinHandle<crate::error::Result<serde_json::Value>> {
+        let options = ApiOptions {
+            anthropic_base_url: Some(url.to_string()),
+            credential_source: CredentialSource::Local,
+            token_cache: TokenCache::new(),
+            cache_anchor: Some(Arc::clone(cell)),
+            ..Default::default()
+        };
+        tokio::spawn(async move {
+            let auth = Arc::new(RwLock::new(AuthState {
+                auth_token: "sk-test".into(),
+                auth_type: "api_key".into(),
+                refresh_token: None,
+                token_expires: Some(9_999_999_999_999),
+                auth_file_mtime: None,
+                bound_credential: None,
+            }));
+            let messages = vec![Arc::new(serde_json::json!({"role": "user", "content": "hi"}))];
+            let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+            ApiMethods::call_api_stream(
+                &auth,
+                &reqwest::Client::new(),
+                "claude-haiku-4-5",
+                &ToolRegistry::new(),
+                &None,
+                0,
+                agent_core::reasoning::ReasoningLevel::Adaptive,
+                &messages,
+                tx,
+                0,
+                0,
+                &options,
+                TelemetryLevel::Off,
+            )
+            .await
+        })
+    }
+
+    /// A request sent in model A's cache lifetime whose headers arrive after
+    /// the chain moved to B's (a `Set` while it waited): its cache write is
+    /// A's, never B's evidence.
+    #[tokio::test]
+    async fn headers_after_a_lifetime_change_are_not_the_new_lifetime_s() {
+        let (url, arrived, release) = held_first_stub().await;
+        let chain = Arc::new(CacheAnchorCell::default());
+        let a = call(&url, &chain);
+        arrived.notified().await;
+        chain.forget();
+        release.notify_one();
+        a.await.unwrap().expect("A's request");
+        assert_eq!(chain.evidence(), None, "B's lifetime proves nothing of A's");
+        assert!(chain.get().is_some(), "A's acceptance still schedules keep-warm");
+    }
+
+    /// Two requests in one lifetime, the earlier-sent one answered last:
+    /// the later-sent one's cold result stands (send order, not header
+    /// arrival order).
+    #[tokio::test]
+    async fn the_later_sent_request_s_cold_result_outlives_an_earlier_one_s_late_headers() {
+        let (url, arrived, release) = held_first_stub().await;
+        let chain = Arc::new(CacheAnchorCell::default());
+        let first = call(&url, &chain);
+        arrived.notified().await;
+        call(&url, &chain).await.unwrap().expect("the second request");
+        let cold = chain.evidence().expect("the second request's");
+        assert!(!cold.cached);
+        release.notify_one();
+        first.await.unwrap().expect("the first request");
+        let e = chain.evidence().expect("evidence");
+        assert_eq!(e, cold, "the earlier-sent write does not undo the later cold result");
+    }
+}
