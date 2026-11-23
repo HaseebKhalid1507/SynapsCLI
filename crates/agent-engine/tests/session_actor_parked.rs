@@ -58,7 +58,7 @@ async fn wait_lifecycle(handle: &SessionHandle, want: SessionLifecycle, for_: Du
 async fn status(t: &mut LocalTransport, id: u64) -> serde_json::Value {
     t.send(SessionCommand::Query {
         id,
-        query: SessionQuery::Status,
+        query: SessionQuery::Status { cache: false },
     })
     .await
     .unwrap();
@@ -565,7 +565,7 @@ async fn no_duplicate_index_start_record_on_unpark_and_status_never_wakes() {
     handle
         .send(SessionCommand::Query {
             id: 42,
-            query: SessionQuery::Status,
+            query: SessionQuery::Status { cache: false },
         })
         .await
         .unwrap();

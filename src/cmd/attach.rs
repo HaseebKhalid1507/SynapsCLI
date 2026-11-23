@@ -211,7 +211,7 @@ impl Client {
                     .await;
             }
             "/sessions" => {
-                let _ = self.t.send(SessionCommand::Query { id: 1, query: SessionQuery::Status }).await;
+                let _ = self.t.send(SessionCommand::Query { id: 1, query: SessionQuery::Status { cache: false } }).await;
             }
             "/save" => {
                 let _ = self.t.send(SessionCommand::Save).await;

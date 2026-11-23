@@ -1432,8 +1432,15 @@ pub struct ReasoningClampWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "query", rename_all = "snake_case")]
 pub enum SessionQuery {
-    /// {session, model, tokens, cost, streaming, auto_turns, attached, pending_prompts}
-    Status,
+    /// {session, model, tokens, cost, streaming, auto_turns, attached, pending_prompts}.
+    /// `cache`: also when the prompt cache expires (`cache`: an object, or
+    /// `null` when nothing is known cached), answered to the asking client
+    /// only. Gated on `wire::FEATURE_CACHE_EXPIRY`; an older client omits it
+    /// and never receives the field; an older daemon ignores it.
+    Status {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cache: bool,
+    },
     /// Vec<SharedMessage> (api_messages)
     Messages,
     /// Vec<SubagentDisplayRow>

@@ -109,7 +109,7 @@ impl Run {
         self.t
             .send(SessionCommand::Query {
                 id: ID,
-                query: agent_engine::session::SessionQuery::Status,
+                query: agent_engine::session::SessionQuery::Status { cache: false },
             })
             .await
             .unwrap();

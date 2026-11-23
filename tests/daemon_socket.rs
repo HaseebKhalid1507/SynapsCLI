@@ -353,7 +353,7 @@ async fn idle_exit_counts_clientless_idle_sessions_and_never_a_running_turn() {
     let s2 = Arc::clone(&streaming);
     let actor = tokio::spawn(async move {
         while let Some(cmd) = ep.cmd_rx.recv().await {
-            if let SessionCommand::Query { id, query: SessionQuery::Status } = cmd.cmd {
+            if let SessionCommand::Query { id, query: SessionQuery::Status { .. } } = cmd.cmd {
                 assert_eq!(id, IDLE_PROBE_QUERY_ID);
                 assert!(cmd.from.is_none(), "idle probe is host-originated");
                 let value = serde_json::json!({ "streaming": s2.load(std::sync::atomic::Ordering::SeqCst), "pending_prompts": 0 });

@@ -125,7 +125,7 @@ async fn observer_never_owns_and_answer_allowed_from_any_client() {
     // Observer may query too.
     o.send_from_self(SessionCommand::Query {
         id: 9,
-        query: SessionQuery::Status,
+        query: SessionQuery::Status { cache: false },
     })
     .await
     .unwrap();
@@ -568,7 +568,7 @@ async fn checkpoint_is_owner_only_from_clients() {
     )));
     b.send_from_self(SessionCommand::Query {
         id: 3,
-        query: SessionQuery::Status,
+        query: SessionQuery::Status { cache: false },
     })
     .await
     .unwrap();

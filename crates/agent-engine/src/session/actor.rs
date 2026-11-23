@@ -4344,6 +4344,8 @@ impl SessionActor {
                 .await;
                 match applied {
                     Ok(applied) => {
+                        // The history was replaced: nothing cached before applies.
+                        self.cache_forget();
                         let previous = applied.previous_session_id.clone();
                         self.conv.session = applied.session;
                         self.conv.api_messages = applied.api_messages;
@@ -4433,6 +4435,8 @@ impl SessionActor {
         };
         match applied {
             Ok(applied) => {
+                // The history was replaced: nothing cached before applies.
+                self.cache_forget();
                 self.conv.session = applied.session;
                 self.conv.api_messages = applied.api_messages;
                 let after = self.runtime.assess_context(&self.conv.api_messages).await;
@@ -4677,17 +4681,25 @@ impl SessionActor {
     pub(crate) async fn query(&mut self, from: Option<ClientId>, id: u64, query: SessionQuery) {
         // Status/View never wake a parked session (the idle probe must not).
         if self.is_parked() {
+            let addressed = matches!(query, SessionQuery::Status { cache: true });
             let value = match query {
-                SessionQuery::Status => serde_json::json!({
-                    "session": self.journal_id_now(),
-                    "model": self.view.load().model,
-                    "lifecycle": SessionLifecycle::Parked,
-                    "streaming": false,
-                    "auto_turns": self.consecutive_auto_turns,
-                    "attached": 0,
-                    "pending_prompts": 0,
-                    "pinned": self.keep_warm,
-                }),
+                SessionQuery::Status { cache } => {
+                    let mut v = serde_json::json!({
+                        "session": self.journal_id_now(),
+                        "model": self.view.load().model,
+                        "lifecycle": SessionLifecycle::Parked,
+                        "streaming": false,
+                        "auto_turns": self.consecutive_auto_turns,
+                        "attached": 0,
+                        "pending_prompts": 0,
+                        "pinned": self.keep_warm,
+                    });
+                    // Parked: nothing of this process's requests is known.
+                    if cache {
+                        v["cache"] = serde_json::Value::Null;
+                    }
+                    v
+                }
                 SessionQuery::View => serde_json::to_value(&**self.view.load()).unwrap_or_default(),
                 // A parked session has no live workers; a watch poll must not wake it.
                 SessionQuery::SubagentWatch { handle_id, .. } => {
@@ -4698,19 +4710,21 @@ impl SessionActor {
                     Err(e) => serde_json::json!({ "error": e }),
                 },
             };
-            self.reply(from, false, id, value);
+            self.reply(from, addressed, id, value);
             return;
         }
+        // An answer the client opted into by asking: to it alone.
+        let addressed = matches!(query, SessionQuery::Status { cache: true });
         let value = match query {
-            SessionQuery::Status => {
+            SessionQuery::Status { cache } => {
                 // Configured + resolved prompt-cache TTL (`auto` → 1h on OAuth).
                 let cache_ttl = self.cache_ttl_status_json().await;
-                // When the prompt cache expires (`null`: nothing known cached).
-                let cache = self.cache_expiry_json().await;
-                serde_json::json!({
+                // When the prompt cache expires (`null`: nothing known
+                // cached): only for a client that asked (`cache`).
+                let cache = if cache { Some(self.cache_expiry_json().await) } else { None };
+                let mut status = serde_json::json!({
                     "session": self.conv.session.id,
                     "cache_ttl": cache_ttl,
-                    "cache": cache,
                     "model": self.runtime.model(),
                     "lifecycle": SessionLifecycle::from_u8(self.lifecycle.load(std::sync::atomic::Ordering::Acquire)),
                     "tokens": { "input": self.conv.total_input_tokens, "output": self.conv.total_output_tokens },
@@ -4725,7 +4739,11 @@ impl SessionActor {
                     "pending_prompts": self.pending_prompts.len(),
                     // `/pin` status in the TUI.
                     "pinned": self.keep_warm,
-                })
+                });
+                if let Some(cache) = cache {
+                    status["cache"] = cache;
+                }
+                status
             }
             SessionQuery::Messages => {
                 serde_json::to_value(&self.conv.api_messages).unwrap_or_default()
@@ -4795,7 +4813,7 @@ impl SessionActor {
                 }
             }
         };
-        self.reply(from, false, id, value);
+        self.reply(from, addressed, id, value);
     }
 
     /// A query's answer: to the client that asked only when `addressed`
@@ -5923,7 +5941,10 @@ impl SessionTask {
             tokio::select! {
                 cmd = actor.cmd_rx.recv() => match cmd {
                     Some(cmd) => {
-                        if let std::ops::ControlFlow::Break(reason) = actor.handle(cmd).await {
+                        let flow = actor.handle(cmd).await;
+                        // `Set{Model}`, `/model`, a restore: another model's cache is cold.
+                        actor.cache_model_fence();
+                        if let std::ops::ControlFlow::Break(reason) = flow {
                             break reason;
                         }
                     }

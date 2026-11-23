@@ -584,7 +584,7 @@ pub async fn session_is_idle(handle: &SessionHandle) -> bool {
         return true;
     }
     let mut rx = handle.subscribe();
-    if handle.send(SessionCommand::Query { id: IDLE_PROBE_QUERY_ID, query: SessionQuery::Status }).await.is_err() {
+    if handle.send(SessionCommand::Query { id: IDLE_PROBE_QUERY_ID, query: SessionQuery::Status { cache: false } }).await.is_err() {
         return false;
     }
     let probe = async {

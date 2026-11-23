@@ -493,7 +493,7 @@ mod actor {
                             let _ = t
                                 .send(SessionCommand::Query {
                                     id,
-                                    query: SessionQuery::Status,
+                                    query: SessionQuery::Status { cache: false },
                                 })
                                 .await;
                             let status = r.reply(&mut t, id).await;
@@ -521,7 +521,7 @@ mod actor {
                             let _ = t
                                 .send(SessionCommand::Query {
                                     id,
-                                    query: SessionQuery::Status,
+                                    query: SessionQuery::Status { cache: false },
                                 })
                                 .await;
                             let st = r.reply(&mut t, id).await;

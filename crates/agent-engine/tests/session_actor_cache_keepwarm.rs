@@ -311,7 +311,7 @@ async fn command_matrix_read_only_keeps_period_prefix_changes_end_it() {
             "query status",
             SessionCommand::Query {
                 id: next_id(),
-                query: SessionQuery::Status,
+                query: SessionQuery::Status { cache: true },
             },
         ),
         (
@@ -636,10 +636,11 @@ async fn wait_pings(bodies: &Arc<Mutex<Vec<String>>>, n: usize, for_: Duration) 
 }
 
 /// `Status` query through the real dispatch path.
+/// `Status{cache: true}` (the keep-warm block, and when the cache expires).
 async fn status(t: &mut LocalTransport, id: u64) -> serde_json::Value {
-    t.send(SessionCommand::Query {
+    t.send_from_self(SessionCommand::Query {
         id,
-        query: SessionQuery::Status,
+        query: SessionQuery::Status { cache: true },
     })
     .await
     .unwrap();
@@ -1927,10 +1928,10 @@ async fn budgeted_thinking_small_prefix_pings_within_the_reported_bound() {
         .unwrap();
 }
 
-/// `Status.cache`: when the prompt cache expires, from the last accepted
-/// request and the TTL the server honours (here a 1h write: 1h; the
-/// downgrade cases are `honoured_ttl`'s unit tests), relative and wall; `null` before any request and once the history is replaced. The
-/// same block is in `/keepwarm status`.
+/// `Status.cache`: when the prompt cache expires, from the last request
+/// that confirmed it and the TTL the server honours (here a 1h write: 1h),
+/// relative and wall; `null` before any request and once the history is
+/// replaced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn status_says_when_the_cache_expires() {
@@ -1955,10 +1956,337 @@ async fn status_says_when_the_cache_expires() {
     let at = chrono::DateTime::parse_from_rfc3339(c["expires_at"].as_str().unwrap()).unwrap();
     let from_now = at.signed_duration_since(chrono::Utc::now()).num_seconds();
     assert!((3530..=3601).contains(&from_now), "wall: {st}");
-    let kw = keepwarm(&mut t, 1202, "status").await;
-    assert_eq!(kw["cache"]["ttl_secs"], 3600, "/keepwarm status has it too: {kw}");
     t.send(SessionCommand::NewSession).await.unwrap();
     let st = status_until(&mut t, 1203, PATIENCE, |st| st["cache"].is_null()).await;
     assert!(st["cache"].is_null(), "the history was replaced: {st}");
     end(&mut t).await;
+}
+
+// ── Status.cache: one request's evidence (Shady #436) ────────────────────
+
+/// A turn that wrote only 5m entries on a 1h request: the server
+/// downgraded it.
+const SSE_TURN_5M: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_kw\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":0,",
+    "\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0}}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":1,",
+    "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":0,",
+    "\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// A request (a ping) that read and wrote nothing from the cache.
+const SSE_UNCACHED: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_kw\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":20010,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":20010,\"output_tokens\":1,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// How the scripted stub answers a kind of request.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Reply {
+    /// Turns: `SSE_TURN` (a 1h write); pings: `SSE_CACHED`; compaction: a summary.
+    Cached,
+    /// `SSE_TURN_5M`.
+    Only5m,
+    /// `SSE_UNCACHED`.
+    Uncached,
+    /// HTTP 400 (not retried): nothing accepted.
+    Refused,
+    /// No answer until aborted.
+    Hang,
+}
+
+/// What the stub answers turns, pings and compaction with, settable mid-test.
+#[derive(Clone)]
+struct Script(Arc<Mutex<[Reply; 3]>>);
+
+impl Script {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new([Reply::Cached; 3])))
+    }
+    fn turns(&self, r: Reply) {
+        self.0.lock().unwrap()[0] = r;
+    }
+    fn pings(&self, r: Reply) {
+        self.0.lock().unwrap()[1] = r;
+    }
+    fn compaction(&self, r: Reply) {
+        self.0.lock().unwrap()[2] = r;
+    }
+}
+
+async fn scripted_stub(script: Script) -> (String, Arc<Mutex<Vec<String>>>) {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let b = Arc::clone(&bodies);
+    let app = axum::Router::new().fallback(move |body: String| {
+        let (b, script) = (Arc::clone(&b), script.clone());
+        async move {
+            let streaming = body.contains("\"stream\":true");
+            let ping = body.contains(PING_MARK);
+            b.lock().unwrap().push(body);
+            let [turns, pings, compaction] = *script.0.lock().unwrap();
+            let reply = if !streaming { compaction } else if ping { pings } else { turns };
+            match reply {
+                Reply::Refused => {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({"type": "error", "error": {
+                            "type": "invalid_request_error", "message": "synthetic refusal"}})),
+                    )
+                        .into_response()
+                }
+                Reply::Hang => tokio::time::sleep(Duration::from_secs(600)).await,
+                _ => {}
+            }
+            if !streaming {
+                return axum::Json(serde_json::json!({
+                    "id": "msg_c", "type": "message", "role": "assistant",
+                    "model": MODEL, "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "summary"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                }))
+                .into_response();
+            }
+            let sse = match (reply, ping) {
+                (Reply::Only5m, _) => SSE_TURN_5M,
+                (Reply::Uncached, _) => SSE_UNCACHED,
+                (_, true) => SSE_CACHED,
+                (_, false) => SSE_TURN,
+            };
+            (axum::http::StatusCode::OK, [("content-type", "text/event-stream")], sse.to_string())
+                .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), bodies)
+}
+
+/// A session on the scripted stub; `config` is the config file's body.
+async fn scripted(
+    config: &str,
+) -> (Home, Script, Arc<Mutex<Vec<String>>>, SessionHandle, LocalTransport, Arc<agent_engine::EngineHost>) {
+    let h = Home::new();
+    write_config(&h, config);
+    let script = Script::new();
+    let (url, bodies) = scripted_stub(script.clone()).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    (h, script, bodies, handle, t, host)
+}
+
+const NO_KEEPWARM_1H: &str = "cache_keepwarm = off\ncache_ttl = 1h\nthinking = off\n";
+
+async fn set_model(t: &mut LocalTransport, id: u64, model: &str) {
+    t.send_from_self(SessionCommand::Set {
+        id,
+        setting: SessionSetting::Model { model: model.into() },
+    })
+    .await
+    .unwrap();
+    let seen = until(t, |e| {
+        matches!(e, agent_engine::session::SessionEventWire::SettingChanged(a) if a.id == id)
+    })
+    .await;
+    match &seen.last().unwrap().event {
+        agent_engine::session::SessionEventWire::SettingChanged(a) => assert!(a.ok, "{model}: {:?}", a.message),
+        _ => unreachable!(),
+    }
+}
+
+fn secs(c: &serde_json::Value, k: &str) -> u64 {
+    c[k].as_u64().unwrap_or_else(|| panic!("{k}: {c}"))
+}
+
+/// A cached turn on model A, then a switch to B: B's cache is cold (A's
+/// countdown would be a lie), and stays cold switched back to A; B's own
+/// first cached request starts B's countdown. A no-op `Set` keeps it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_model_switch_leaves_the_cache_cold() {
+    let (_h, _script, _bodies, _handle, mut t, _host) = scripted(NO_KEEPWARM_1H).await;
+    turn(&mut t, "hello").await;
+    assert!(!status(&mut t, 1300).await["cache"].is_null(), "warm after the turn");
+    set_model(&mut t, 1301, MODEL).await;
+    assert!(!status(&mut t, 1302).await["cache"].is_null(), "the same model: still warm");
+    set_model(&mut t, 1303, "claude-opus-4-6").await;
+    let st = status(&mut t, 1304).await;
+    assert!(st["cache"].is_null(), "another model's cache is cold: {st}");
+    set_model(&mut t, 1305, MODEL).await;
+    let st = status(&mut t, 1306).await;
+    assert!(st["cache"].is_null(), "switched back: still nothing confirmed: {st}");
+    turn(&mut t, "again").await;
+    let c = status(&mut t, 1307).await["cache"].clone();
+    assert!(secs(&c, "expires_in_secs") >= 3540, "a fresh countdown: {c}");
+    end(&mut t).await;
+}
+
+/// A keep-warm ping whose answer cached nothing: the cache is not warm,
+/// whatever the ping's fresh HTTP acceptance and the turn's old usage say.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_ping_that_cached_nothing_leaves_the_cache_cold() {
+    let _fast = fast_pings();
+    let (_h, script, bodies, _handle, mut t, _host) =
+        scripted("cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n").await;
+    script.pings(Reply::Uncached);
+    turn(&mut t, "hello").await;
+    let st = status_until(&mut t, 1320, PATIENCE, |st| {
+        pings(&bodies) >= 1 && st["keepwarm"]["period"].is_null()
+    })
+    .await;
+    assert!(pings(&bodies) >= 1, "{st}");
+    assert!(st["keepwarm"]["period"].is_null(), "the period ended: {st}");
+    assert!(st["cache"].is_null(), "the ping cached nothing: {st}");
+    end(&mut t).await;
+}
+
+/// A turn whose request was refused did not refresh the cache, and did not
+/// empty it either: the last cached request's countdown keeps aging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_failed_turn_keeps_the_last_cache_aging() {
+    let (_h, script, _bodies, _handle, mut t, _host) = scripted(NO_KEEPWARM_1H).await;
+    turn(&mut t, "hello").await;
+    let before = status(&mut t, 1340).await["cache"].clone();
+    assert!(!before.is_null());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    script.turns(Reply::Refused);
+    turn(&mut t, "refused").await;
+    let after = status(&mut t, 1341).await["cache"].clone();
+    assert!(!after.is_null(), "the cache did not go anywhere: {after}");
+    assert!(secs(&after, "age_secs") > secs(&before, "age_secs"), "not renewed: {before} → {after}");
+    assert!(secs(&after, "expires_in_secs") < secs(&before, "expires_in_secs"), "{before} → {after}");
+    assert_eq!(after["expires_at"], before["expires_at"], "the same request's expiry");
+    end(&mut t).await;
+}
+
+/// `/clear` replaced the history: nothing is cached for it, also while the
+/// next request is in flight (the old anchor is not its evidence).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_replaced_history_stays_cold_through_the_next_request() {
+    let (_h, script, bodies, _handle, mut t, _host) = scripted(NO_KEEPWARM_1H).await;
+    turn(&mut t, "hello").await;
+    assert!(!status(&mut t, 1360).await["cache"].is_null());
+    t.send(SessionCommand::NewSession).await.unwrap();
+    let st = status_until(&mut t, 1361, PATIENCE, |st| st["cache"].is_null()).await;
+    assert!(st["cache"].is_null(), "{st}");
+    script.turns(Reply::Hang);
+    let sent = bodies.lock().unwrap().len();
+    t.send(submit("pending")).await.unwrap();
+    until(&mut t, |e| matches!(e, agent_engine::session::SessionEventWire::TurnStarted { .. })).await;
+    while bodies.lock().unwrap().len() == sent {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let st = status(&mut t, 1370).await;
+    assert!(st["cache"].is_null(), "a request in flight is no evidence: {st}");
+    t.send(SessionCommand::Cancel).await.unwrap();
+    until(&mut t, |e| matches!(e, agent_engine::session::SessionEventWire::Idle)).await;
+    end(&mut t).await;
+}
+
+/// A compaction that failed replaced nothing: the cache stays; one that
+/// applied replaced the history: nothing is cached for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn only_an_applied_compaction_clears_the_cache() {
+    use agent_engine::session::SessionEventWire as E;
+    let (_h, script, _bodies, _handle, mut t, _host) = scripted(NO_KEEPWARM_1H).await;
+    turn(&mut t, "one").await;
+    turn(&mut t, "two").await;
+    assert!(!status(&mut t, 1380).await["cache"].is_null());
+    script.compaction(Reply::Refused);
+    t.send(SessionCommand::Compact { instructions: None }).await.unwrap();
+    until(&mut t, |e| matches!(e, E::CompactionFailed { .. })).await;
+    let st = status(&mut t, 1381).await;
+    assert!(!st["cache"].is_null(), "a failed compaction replaced nothing: {st}");
+    script.compaction(Reply::Cached);
+    t.send(SessionCommand::Compact { instructions: None }).await.unwrap();
+    until(&mut t, |e| matches!(e, E::CompactionApplied { .. })).await;
+    let st = status(&mut t, 1382).await;
+    assert!(st["cache"].is_null(), "the history was replaced: {st}");
+    end(&mut t).await;
+}
+
+/// The 1h→5m downgrade end to end: a 1h request whose answer wrote only 5m
+/// entries counts down from 5 minutes, and says it was downgraded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_downgraded_1h_request_counts_down_from_5m() {
+    let (_h, script, _bodies, _handle, mut t, _host) = scripted(NO_KEEPWARM_1H).await;
+    script.turns(Reply::Only5m);
+    turn(&mut t, "hello").await;
+    let st = status(&mut t, 1390).await;
+    let c = &st["cache"];
+    assert_eq!((c["ttl"].as_str(), c["ttl_secs"].as_u64()), (Some("5m"), Some(300)), "{st}");
+    assert_eq!(c["downgraded"], true, "{st}");
+    assert!((240..=300).contains(&secs(c, "expires_in_secs")), "{st}");
+    let at = chrono::DateTime::parse_from_rfc3339(c["expires_at"].as_str().unwrap()).unwrap();
+    let from_now = at.signed_duration_since(chrono::Utc::now()).num_seconds();
+    assert!((230..=301).contains(&from_now), "wall: {st}");
+    end(&mut t).await;
+}
+
+/// Gated as `catalog_page`: a client opts in by asking (`Status{cache}`,
+/// after `Welcome.features` lists `cache_expiry`). A plain `Status` (an older
+/// client's) never carries the field, nor does `/keepwarm status`; the
+/// answer that does reaches only the client that asked. Reading it changes
+/// nothing (a second read is the same request's countdown, older).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_cache_field_reaches_only_a_client_that_asked() {
+    use agent_engine::session::SessionEventWire as E;
+    let (_h, _script, _bodies, handle, mut asker, _host) = scripted(NO_KEEPWARM_1H).await;
+    let (mut old, _) = LocalTransport::attach_with(handle.clone(), ClientMeta::new(ClientKind::Tui), AttachMode::Mirror)
+        .await
+        .unwrap();
+    turn(&mut asker, "hello").await;
+    old.send_from_self(SessionCommand::Query { id: 1400, query: SessionQuery::Status { cache: false } })
+        .await
+        .unwrap();
+    let plain = query_result(&mut old, 1400).await;
+    assert!(plain.get("cache").is_none(), "a plain Status has no cache: {plain}");
+    assert!(plain.get("keepwarm").is_some(), "{plain}");
+    let first = status(&mut asker, 1401).await["cache"].clone();
+    assert!(!first.is_null());
+    old.send_from_self(SessionCommand::Query { id: 1402, query: SessionQuery::View }).await.unwrap();
+    let seen = until(&mut old, |e| matches!(e, E::QueryResult { id: 1402, .. })).await;
+    assert!(
+        !seen.iter().any(|e| matches!(e.event, E::QueryResult { id: 1401, .. } | E::QueryReply { .. })),
+        "another client received the cache answer"
+    );
+    let kw = keepwarm(&mut asker, 1403, "status").await;
+    assert!(kw.get("cache").is_none(), "/keepwarm status has no cache: {kw}");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let second = status(&mut asker, 1404).await["cache"].clone();
+    assert_eq!(second["expires_at"], first["expires_at"], "the same request: {first} → {second}");
+    assert_eq!(second["ttl_secs"], first["ttl_secs"]);
+    assert!(secs(&second, "age_secs") > secs(&first, "age_secs"));
+    end(&mut asker).await;
 }

@@ -74,11 +74,25 @@ pub const FEATURE_SESSION_WORKERS: &str = "session_workers";
 /// session that leaves the held set is pushed as its saved row).
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
 
-/// `Welcome.features` entry: this daemon's `Status` carries `cache` (when the
-/// session's prompt cache expires, `SessionActor::cache_expiry_json`). The
-/// field is additive (an older daemon omits it); the entry lets a client
-/// skip the `Status` query altogether on a daemon that cannot answer it.
+/// `Welcome.features` entry: this daemon answers `Status{cache: true}` with
+/// `cache` (when the session's prompt cache expires,
+/// `SessionActor::cache_expiry_json`). As with `session_page`, the client
+/// opts in by asking ([`feature_needed`]; `SocketTransport::send` checks):
+/// a plain `Status` never carries the field, and the answer that does is a
+/// `QueryReply` to the client that asked, never sent to any other.
 pub const FEATURE_CACHE_EXPIRY: &str = "cache_expiry";
+
+/// The `Welcome.features` entry a daemon must list before a client sends
+/// `cmd` (an older daemon answers the new variant or field with "malformed
+/// frame", or ignores it), and the request's name for `DaemonTooOld`.
+pub fn feature_needed(cmd: &SessionCommand) -> Option<(&'static str, &'static str)> {
+    match cmd {
+        SessionCommand::Query { query: SessionQuery::Status { cache: true }, .. } => {
+            Some((FEATURE_CACHE_EXPIRY, "cache expiry"))
+        }
+        _ => None,
+    }
+}
 
 /// `CatalogPage.limit` when absent, and its ceiling.
 pub const CATALOG_PAGE_DEFAULT_LIMIT: u32 = 50;
@@ -1884,6 +1898,23 @@ mod tests {
         }
     }
 
+    /// `Status`'s `cache` opt-in, as the watch query's `tool_queue`: an
+    /// older client's `{"query":"status"}` is `cache: false`, and off encodes
+    /// to exactly those bytes (an older daemon sees the old query); only a
+    /// client that asked gets the field, and [`feature_needed`] says which
+    /// daemon may be asked.
+    #[test]
+    fn the_status_querys_cache_flag_defaults_off() {
+        let old: SessionQuery = serde_json::from_str(r#"{"query":"status"}"#).unwrap();
+        assert!(matches!(old, SessionQuery::Status { cache: false }));
+        assert_eq!(serde_json::to_string(&SessionQuery::Status { cache: false }).unwrap(), r#"{"query":"status"}"#);
+        let on = serde_json::to_string(&SessionQuery::Status { cache: true }).unwrap();
+        assert_eq!(on, r#"{"query":"status","cache":true}"#);
+        let query = |cache| SessionCommand::Query { id: 1, query: SessionQuery::Status { cache } };
+        assert_eq!(feature_needed(&query(true)), Some((FEATURE_CACHE_EXPIRY, "cache expiry")));
+        assert_eq!(feature_needed(&query(false)), None);
+    }
+
     /// The watch query's opt-in: an older client's query omits it (off), an
     /// off flag is not serialized (an older daemon sees the old bytes).
     #[test]
@@ -2076,7 +2107,7 @@ mod tests {
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Submit { text: "hi".into(), attachments: vec![] } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Answer { prompt_id: 1, value: Some("pw".into()) } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::EngineCommand { id: 4, name: "model".into(), arg: "x".into() } },
-            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Query { id: 5, query: SessionQuery::Status } },
+            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Query { id: 5, query: SessionQuery::Status { cache: false } } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Set { id: 6, setting: SessionSetting::ReloadPrompt } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Checkpoint { reason: CheckpointReason::Reload } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::KeepWarm { on: true } },

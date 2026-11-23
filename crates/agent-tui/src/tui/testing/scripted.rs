@@ -384,7 +384,7 @@ impl ScriptedTransport {
             SessionCommand::Query { id, query } => {
                 let value = match query {
                     SessionQuery::View => serde_json::to_value(&*self.view).unwrap_or_default(),
-                    SessionQuery::Status => serde_json::json!({
+                    SessionQuery::Status { .. } => serde_json::json!({
                         "session": self.session.id,
                         "streaming": false,
                         "pending_prompts": 0,

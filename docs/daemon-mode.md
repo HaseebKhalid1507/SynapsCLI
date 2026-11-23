@@ -743,7 +743,7 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page"], boot_id?}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page","cache_expiry"], boot_id?}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
@@ -845,6 +845,16 @@ C: bye | socket close = Detach (turn keeps running)
 - Saved sessions are additive the same way. `Welcome.features` lists `session_page` when the daemon
   answers `catalog_page` (see "Saved sessions"); the reply and `lifecycle: "saved"` reach only a
   client that sent the frame. `SessionMeta.updated_at` is omitted on held rows.
+- Cache expiry is additive the same way. `Welcome.features` lists `cache_expiry` when the daemon
+  answers `cmd{query:{query:"status", cache:true}}` with `cache`; `SocketTransport::send` never
+  sends `cache:true` to a daemon without it (`DaemonTooOld`). A plain `status` (`cache` omitted, as
+  an older client sends it) never carries the field, nor does `/keepwarm status`; the answer that
+  does is a `QueryReply` inside the daemon, an ordinary `query_result` to the client that asked and
+  to no other. `cache` is `null` when nothing is known cached, else `{ttl, ttl_secs, age_secs,
+  expires_in_secs, expires_at, downgraded}`, all from the last request whose usage confirmed the
+  cache (a real request or a keep-warm ping): its send time and the TTL the server honours. A
+  failed request leaves it aging; an applied compaction, `/clear`, `/resume` or another model
+  clears it. Count down `expires_in_secs` on the client's own clock; `expires_at` is informational.
 
 ## Security posture
 

@@ -93,7 +93,7 @@ async fn compaction_does_not_block_attach_and_submit_is_queued_and_restored() {
     assert_eq!(snap.conversation.api_messages.len(), 4);
     b.send(SessionCommand::Query {
         id: 5,
-        query: SessionQuery::Status,
+        query: SessionQuery::Status { cache: false },
     })
     .await
     .unwrap();

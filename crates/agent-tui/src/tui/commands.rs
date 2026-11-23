@@ -406,7 +406,7 @@ async fn pin_command(cmd: &str, arg: &str, app: &mut App, link: &mut super::sess
                 app.push_msg(ChatMessage::Error(format!("pin failed: {e}")));
             }
         }
-        "" | "status" => match link.query(agent_engine::session::SessionQuery::Status).await {
+        "" | "status" => match link.query(agent_engine::session::SessionQuery::Status { cache: false }).await {
             Ok(value) => match value["pinned"].as_bool() {
                 Some(true) => app.push_msg(ChatMessage::System(
                     agent_engine::session::actor::PIN_ON_NOTICE.to_string(),
