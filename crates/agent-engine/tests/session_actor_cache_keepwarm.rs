@@ -2372,13 +2372,24 @@ async fn a_parked_session_says_nothing_about_its_cache() {
     .unwrap();
     handle.send(SessionCommand::Park).await.unwrap();
     assert!(wait_lifecycle(&handle, SessionLifecycle::Parked, PATIENCE).await);
-    let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+    // Asked by the host (an attach would wake it): the answer is broadcast.
+    let mut rx = handle.subscribe();
+    handle
+        .send(SessionCommand::Query {
+            id: 1431,
+            query: SessionQuery::Status { cache: true },
+        })
         .await
         .unwrap();
-    let st = status(&mut t, 1431).await;
+    let st = loop {
+        let env = tokio::time::timeout(PATIENCE, rx.recv()).await.unwrap().unwrap();
+        if let agent_engine::session::SessionEventWire::QueryResult { id: 1431, value } = env.event {
+            break value;
+        }
+    };
     assert_eq!(st["lifecycle"], "parked", "{st}");
+    assert_eq!(handle.lifecycle(), SessionLifecycle::Parked, "the status did not wake it");
     assert!(st.get("cache").is_none(), "unknown, not cold: {st}");
-    end(&mut t).await;
 }
 
 /// Gated as `catalog_page`: a client opts in by asking (`Status{cache}`,
