@@ -517,3 +517,164 @@ async fn timeout_pending_vs_write_failure() {
     assert_eq!(ui_answers(&history(&snap, &seen), &card_b.id), 1, "in context once");
     drop(d);
 }
+
+// ── two desks on one session (Appendix B #1, #3, #22) and a reload (#13) ────
+
+/// A capable desk attached to an existing session.
+async fn join(d: &DaemonProc, sid: &SessionId, mode: AttachMode) -> (SocketTransport, AttachSnapshot) {
+    let mut hello = Hello::new(ClientKind::Attach);
+    hello.client.capabilities.surfaces = 1;
+    let conn = SocketTransport::connect(&d.paths.sock, hello).await.unwrap();
+    SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode }).await.unwrap()
+}
+
+/// A new session both desks may type into, with cards on.
+async fn shared(d: &DaemonProc, cwd: &Path) -> (SocketTransport, AttachSnapshot) {
+    let mut hello = Hello::new(ClientKind::Test);
+    hello.client.capabilities.surfaces = 1;
+    let conn = SocketTransport::connect(&d.paths.sock, hello).await.unwrap();
+    let cfg = SessionConfig { client_input: Some(ClientInput::Shared), ..config(cwd, true, None) };
+    SocketTransport::attach(conn, Attach::create(cfg, AttachMode::Mirror)).await.unwrap()
+}
+
+/// Send `action` until it isn't refused `busy` (the outbox's backoff).
+async fn settle_result(t: &mut SocketTransport, card: &SurfaceState, action_id: &str) -> SurfaceResult {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let r = result_for(t, action_id).await;
+        if r.reason != Some(SurfaceRefusal::Busy) || tokio::time::Instant::now() > deadline {
+            return r;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        t.send_from_self(answer(card, action_id)).await.unwrap();
+    }
+}
+
+/// Appendix B #1, over the socket: two desks answer the same card at once.
+/// One is `accepted`, the other `resolved`; one message reaches history,
+/// and a later attach finds one receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn two_desks_answer_at_once() {
+    let guard = HomeGuard::new();
+    let url = spawn_model().await;
+    let ctl = control(&guard);
+    let d = spawn_daemon(&guard, &url, &ctl).await;
+    let (mut a, _) = shared(&d, guard.home.path()).await;
+    let card = raise_card(&mut a).await;
+    let (mut b, snap) = join(&d, a.session_id(), AttachMode::Mirror).await;
+    assert!(snap.surfaces.iter().any(|c| c.id == card.id), "the second desk sees the card");
+
+    a.send_from_self(answer(&card, A1)).await.unwrap();
+    b.send_from_self(answer(&card, A2)).await.unwrap();
+    let ra = settle_result(&mut a, &card, A1).await;
+    let rb = settle_result(&mut b, &card, A2).await;
+    let outcomes = [(ra.outcome, ra.reason), (rb.outcome, rb.reason)];
+    assert!(
+        outcomes.contains(&(SurfaceOutcome::Accepted, None))
+            && outcomes.contains(&(SurfaceOutcome::Refused, Some(SurfaceRefusal::Resolved))),
+        "{outcomes:?}"
+    );
+    let mut seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    seen.extend(quiet(&mut a, Duration::from_millis(300)).await);
+    assert_eq!(turns(&seen), 1, "{seen:#?}");
+    let (_, snap) = join(&d, a.session_id(), AttachMode::Observe).await;
+    assert_eq!(ui_answers(&snap.conversation.api_messages, &card.id), 1, "one message in history");
+    let now = snap.surfaces.iter().find(|c| c.id == card.id).expect("the receipt");
+    assert_eq!((now.phase, now.actions.len()), (Phase::Answered, 1), "{now:?}");
+    drop(d);
+}
+
+/// Appendix B #3, over the socket: a desk's connection drops before its
+/// `surface_result` arrives. It reconnects and its outbox re-sends the
+/// same action: `duplicate` with the logged `answer_rev`, no second
+/// delivery, no second turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_lost_result_is_a_duplicate_after_reconnect() {
+    let guard = HomeGuard::new();
+    let url = spawn_model().await;
+    let ctl = control(&guard);
+    let d = spawn_daemon(&guard, &url, &ctl).await;
+    let (mut a, _) = shared(&d, guard.home.path()).await;
+    let sid = a.session_id().clone();
+    let card = raise_card(&mut a).await;
+    let (mut watch, _) = join(&d, &sid, AttachMode::Observe).await;
+    a.send_from_self(answer(&card, A1)).await.unwrap();
+    // The receipt reaches the watcher; desk A never reads its result.
+    let mut seen =
+        until(&mut watch, |e| matches!(e, SessionEventWire::Surface(s) if s.id == card.id && s.phase == Phase::Answered)).await;
+    drop(a);
+    seen.extend(until(&mut watch, |e| matches!(e, SessionEventWire::Idle)).await);
+    assert_eq!(turns(&seen), 1, "{seen:#?}");
+
+    let (mut a2, snap) = join(&d, &sid, AttachMode::Mirror).await;
+    a2.send_from_self(answer(&card, A1)).await.unwrap();
+    let r = result_for(&mut a2, A1).await;
+    assert_eq!((r.outcome, r.answer_rev), (SurfaceOutcome::Duplicate, Some(1)), "{r:?}");
+    let seen = quiet(&mut a2, Duration::from_millis(600)).await;
+    assert_eq!(turns(&seen), 0, "{seen:#?}");
+    assert_eq!(ui_answers(&history(&snap, &seen), &card.id), 1, "no second delivery");
+    drop(d);
+}
+
+/// Appendix B #22, over the socket: an observing desk can't answer
+/// (`forbidden`); the owner's answer is accepted and the observer gets
+/// the receipt; a catalog-0 observer gets no card traffic at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_observer_desk_is_forbidden_and_sees_the_receipt() {
+    let guard = HomeGuard::new();
+    let url = spawn_model().await;
+    let ctl = control(&guard);
+    let d = spawn_daemon(&guard, &url, &ctl).await;
+    let (mut a, _) = attach(&d, guard.home.path(), true, None).await;
+    let card = raise_card(&mut a).await;
+    let (mut o, _) = join(&d, a.session_id(), AttachMode::Observe).await;
+    let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Attach)).await.unwrap();
+    let (mut old, snap_old) =
+        SocketTransport::attach(conn, Attach::Existing { session_id: a.session_id().clone(), mode: AttachMode::Observe })
+            .await
+            .unwrap();
+    assert!(snap_old.surfaces.is_empty(), "{:?}", snap_old.surfaces);
+
+    o.send_from_self(answer(&card, A2)).await.unwrap();
+    let r = result_for(&mut o, A2).await;
+    assert_eq!((r.outcome, r.reason, r.retry), (SurfaceOutcome::Refused, Some(SurfaceRefusal::Forbidden), Some(false)));
+    a.send_from_self(answer(&card, A1)).await.unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    let seen = until(&mut o, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(cards(&seen).iter().any(|c| c.id == card.id && c.phase == Phase::Answered), "{seen:#?}");
+    let seen = until(&mut old, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(
+        !seen.iter().any(|e| matches!(e, SessionEventWire::Surface(_) | SessionEventWire::SurfaceResult(_))),
+        "{seen:#?}"
+    );
+    drop(d);
+}
+
+/// Appendix B #13: an answer accepted just before a reload is in history
+/// once after the exec, and nothing wakes for it there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_answer_just_before_a_reload_is_in_context_once_after_it() {
+    let guard = HomeGuard::new();
+    let url = spawn_model().await;
+    let ctl = control(&guard);
+    let d = spawn_daemon(&guard, &url, &ctl).await;
+    let (mut a, _) = attach(&d, guard.home.path(), true, None).await;
+    let card = raise_card(&mut a).await;
+    a.send_from_self(answer(&card, A1)).await.unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    let generation = SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted");
+    assert_eq!(generation, 2);
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_secs(10), a.next_event()).await {}
+    let snap = tokio::time::timeout(Duration::from_secs(15), a.reconnect(AttachMode::Mirror))
+        .await
+        .expect("reconnect budget")
+        .expect("reconnected");
+    let seen = quiet(&mut a, Duration::from_millis(800)).await;
+    assert_eq!(turns(&seen), 0, "no wake after the exec: {seen:#?}");
+    assert_eq!(ui_answers(&history(&snap, &seen), &card.id), 1, "present once");
+    drop(d);
+}
