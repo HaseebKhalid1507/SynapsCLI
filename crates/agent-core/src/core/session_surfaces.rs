@@ -44,7 +44,15 @@ use super::ui_types::{
     TOMBSTONE_MAX_BYTES,
 };
 
-/// The sidecar format's version.
+/// The sidecar format's version. v1 is first defined by C2 (#440) as it
+/// stands, bounds included: no released build has ever written a sidecar
+/// (C1 and C2 are inert until C4a wires them), so no file from before
+/// these bounds exists in the wild and v1 has no older shape to read. From
+/// here v1 is frozen: a change that would refuse a file this encoder
+/// writes is a new version with its own migration, never a quiet
+/// tightening of v1. The engine's `worst_sidecar_of_real_types_fits`
+/// guards that: it round-trips v1's maximum through [`encode_sidecar`] and
+/// [`decode_sidecar`] and pins its size.
 pub const SIDECAR_VERSION: u32 = 1;
 /// A sidecar file over this is rejected unread (§4.4).
 pub const SIDECAR_READ_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -378,8 +386,10 @@ fn check_card(c: &CardRecord) -> Result<(), SidecarError> {
 /// The structural bounds of §4.4 and v3.2 #11, every field the format
 /// bounds: identifiers, `origin`, `offers`, the stored times, `by`, the
 /// action logs, a ledger record's `q` and `asked` capsule and its values,
-/// then each category's total. Every field of the format is bounded on its
-/// own, so a tombstone can't reach [`TOMBSTONE_MAX_BYTES`] nor a card
+/// then each category's total. Every field of the format but a card's doc
+/// is bounded here on its own; the doc's serialized size is bounded by the
+/// engine's revalidation, which every load runs before [`recover`]. With
+/// that, a tombstone can't reach [`TOMBSTONE_MAX_BYTES`] nor a card
 /// [`SURFACE_STATE_MAX_BYTES`] (the engine's
 /// `worst_sidecar_of_real_types_fits` measures each at its maximum); those
 /// totals stay as guards. A
@@ -496,7 +506,10 @@ pub fn encode_sidecar(s: &Sidecar) -> Result<Vec<u8>, SidecarError> {
     Ok(bytes)
 }
 
-/// Decode and bound-check a sidecar file's bytes.
+/// Decode and bound-check a sidecar file's bytes, by v1's bounds exactly
+/// as [`encode_sidecar`] applies them: v1 starts with C2, so there is no
+/// earlier v1 writer whose files these bounds could refuse (see
+/// [`SIDECAR_VERSION`]).
 pub fn decode_sidecar(bytes: &[u8]) -> Result<Sidecar, SidecarError> {
     if bytes.len() > SIDECAR_MAX_BYTES {
         return Err(SidecarError::TooLarge(bytes.len()));

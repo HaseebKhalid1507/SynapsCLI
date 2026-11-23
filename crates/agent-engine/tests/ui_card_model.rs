@@ -600,8 +600,9 @@ fn real_worst_state(i: usize, doc: &CardDoc) -> SurfaceState {
 /// once, built from the real types the sidecar serializes (`CardRecord`
 /// and its `SurfaceState`, `LedgerRecord`, `Tombstone`, the three handoff
 /// fields at once, `Sidecar`), so a field added or widened changes this
-/// measurement. Every field is at the maximum `check_bounds` admits, in
-/// the bytes JSON spends most on: the stored capsule is 1 KiB of C0
+/// measurement. Every field is at the maximum `check_bounds` admits (the
+/// doc at the size the engine's revalidation admits: core doesn't bound
+/// it), in the bytes JSON spends most on: the stored capsule is 1 KiB of C0
 /// controls (its `CAPSULE_STORED_ALLOWANCE`, for real), `q`, `task` and
 /// `by` are too; `call_id` and every `base` are `\` at their byte bounds;
 /// each time is at `TIME_MAX_BYTES`; `offers` is every verb; numbers are at
@@ -611,12 +612,21 @@ fn real_worst_state(i: usize, doc: &CardDoc) -> SurfaceState {
 /// `check_bounds` and encodes; with each doc swapped for its
 /// `DOC_MAX_BYTES` filler it still fits `SIDECAR_MAX_BYTES`; and no
 /// transition that can't be refused makes an image longer than that, from
-/// it or from one without the optional fields those transitions add.
+/// it, from one without the optional fields those transitions add, or
+/// from that one with every card open, live and waiting (each transition
+/// checked to do what it does to an open card).
+///
+/// It is also v1's guard (`SIDECAR_VERSION`): v1 starts with C2 and is
+/// frozen, so its maximum must read back whole and to the same bytes, and
+/// its size is pinned. A tighter bound shrinks the fixture (or refuses
+/// it) and fails here: it would refuse files v1 already admits, so it
+/// needs a new version and a migration, not an edit to v1. A looser bound
+/// only moves the pin.
 #[test]
 fn worst_sidecar_of_real_types_fits() {
     use agent_core::core::session_surfaces::{
-        apply, check_bounds, encode_sidecar, CardRecord, Compacting, HandoffFrom, HandoffTo,
-        MovedTo, Op, Prepared, Sidecar, BASE_MAX_BYTES, SIDECAR_VERSION,
+        apply, check_bounds, decode_sidecar, encode_sidecar, CardRecord, Compacting, HandoffFrom,
+        HandoffTo, MovedTo, Op, Prepared, Sidecar, BASE_MAX_BYTES, SIDECAR_VERSION,
     };
     let doc = doc_example();
     let per_record = LEDGER_MAX_VALUE_BYTES / LEDGER_MAX_RECORDS;
@@ -688,7 +698,16 @@ fn worst_sidecar_of_real_types_fits() {
         newest_settled: Some(aid(100)),
     };
     check_bounds(&real).unwrap();
-    let real_bytes = encode_sidecar(&real).unwrap().len();
+    let encoded = encode_sidecar(&real).unwrap();
+    let back = decode_sidecar(&encoded)
+        .unwrap_or_else(|e| panic!("v1's maximum, as encoded, no longer decodes: {e}"));
+    assert_eq!(back, real, "v1's maximum reads back whole");
+    assert_eq!(
+        encode_sidecar(&back).unwrap(),
+        encoded,
+        "and to the same bytes"
+    );
+    let real_bytes = encoded.len();
 
     let asked = json!(real.ledger[0].asked);
     assert_eq!(
@@ -733,6 +752,11 @@ fn worst_sidecar_of_real_types_fits() {
     assert!(
         sidecar_bytes <= SIDECAR_MAX_BYTES,
         "sidecar {sidecar_bytes} B"
+    );
+    assert_eq!(
+        sidecar_bytes, 502_879,
+        "v1's maximum moved: a tighter bound refuses files v1 already admits \
+         (a new version and a migration); a looser one only updates this pin"
     );
 
     // The transitions no commit may refuse only change fields already at
@@ -797,6 +821,66 @@ fn worst_sidecar_of_real_types_fits() {
                 n <= real_bytes,
                 "{op:?} from {from} grew the image to {n} B"
             );
+        }
+    }
+
+    // Shady #440 R3-L1: `real` is `Withdrawn`, where an expiry does nothing
+    // and a stop inserts no `origin.stopped`. The lean maximum with every
+    // card open, live and then waiting: each transition must do what it
+    // does to an open card, and still fit.
+    for mode in [WaitMode::Live, WaitMode::Waiting] {
+        let waiting = mode == WaitMode::Waiting;
+        let mut open = lean.clone();
+        for c in &mut open.cards {
+            c.state.phase = Phase::Open;
+            c.state.mode = mode;
+        }
+        for op in &ops {
+            let mut after = open.clone();
+            apply(&mut after, op);
+            let at = format!("{op:?} from the open lean maximum, {mode:?}");
+            match op {
+                Op::Expire { card } => {
+                    let st = &after
+                        .cards
+                        .iter()
+                        .find(|c| &c.state.id == card)
+                        .unwrap()
+                        .state;
+                    assert_eq!(st.phase, Phase::Expired, "{at}");
+                    assert_eq!(st.mode, WaitMode::Live, "{at}");
+                    assert!(st.offers.is_empty(), "{at}");
+                }
+                Op::Stop(kind) => {
+                    let expires = *kind == StopKind::System || (waiting && *kind == StopKind::User);
+                    let downgrade = match kind {
+                        StopKind::Reload if waiting => Some(Downgrade::Reload),
+                        StopKind::Crash if waiting => Some(Downgrade::Crash),
+                        _ => None,
+                    };
+                    for c in &after.cards {
+                        let st = &c.state;
+                        let phase = if expires { Phase::Expired } else { Phase::Open };
+                        assert_eq!(st.phase, phase, "{at}");
+                        assert_eq!(st.origin.stopped, (!expires).then_some(*kind), "{at}");
+                        assert_eq!(st.downgraded, downgrade, "{at}");
+                        if waiting {
+                            assert_eq!(st.mode, WaitMode::Live, "{at}");
+                        }
+                    }
+                }
+                Op::Downgrade(d) => {
+                    for c in &after.cards {
+                        assert_eq!(c.state.downgraded, waiting.then_some(*d), "{at}");
+                        assert_eq!(c.state.mode, WaitMode::Live, "{at}");
+                    }
+                }
+                _ => {}
+            }
+            let n = encode_sidecar(&after)
+                .unwrap_or_else(|e| panic!("{at}: {e}"))
+                .len();
+            assert!(n <= real_bytes, "{at} grew the image to {n} B");
         }
     }
 }
