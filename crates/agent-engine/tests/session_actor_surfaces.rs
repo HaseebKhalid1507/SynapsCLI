@@ -189,7 +189,7 @@ async fn result_for(t: &mut LocalTransport, action_id: &str) -> SurfaceResult {
 }
 
 /// A session with one open card, raised by a turn that has ended.
-async fn with_card(bodies: &'static [&'static str]) -> (agent_engine::session::SessionHandle, LocalTransport, SurfaceState, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+async fn with_card(bodies: &'static [&'static str]) -> CardSession {
     let (url, hits) = stub_seq(bodies).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
@@ -200,6 +200,12 @@ async fn with_card(bodies: &'static [&'static str]) -> (agent_engine::session::S
     let card = cards(&seen).pop().expect("a card");
     (handle, a, card, hits)
 }
+
+/// A request counter.
+type Hits = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+/// A session with one open card: its handle, a capable client, the card,
+/// the model's request count.
+type CardSession = (agent_engine::session::SessionHandle, LocalTransport, SurfaceState, Hits);
 
 const A1: &str = "0123456789abcdef0123456789abcdef";
 const A2: &str = "fedcba9876543210fedcba9876543210";
@@ -396,7 +402,7 @@ use agent_engine::core::session_surfaces::ModelFs;
 async fn with_card_on(
     fs: std::sync::Arc<ModelFs>,
     bodies: &'static [&'static str],
-) -> (agent_engine::session::SessionHandle, LocalTransport, SurfaceState, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+) -> CardSession {
     let (url, hits) = stub_seq(bodies).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
@@ -699,7 +705,7 @@ async fn ui_off_withdraws_open_live_cards() {
 async fn stub_cards(
     bodies: &'static [&'static str],
     delay: Duration,
-) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+) -> (String, Hits, Hits) {
     use axum::response::IntoResponse;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -733,7 +739,7 @@ async fn stub_cards(
 
 /// A session with one open card and a compaction now running (5 s).
 async fn card_then_compacting(
-) -> (agent_engine::session::SessionHandle, LocalTransport, SurfaceState, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+) -> CardSession {
     let (url, turns, _) = stub_cards(&[SSE_UI_CREATE, SSE_HI, SSE_HI], Duration::from_secs(5)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
@@ -813,7 +819,7 @@ fn ui_create_sse(input: serde_json::Value) -> &'static str {
 #[serial]
 async fn late_answer_after_compaction_capsule() {
     let _h = Home::new();
-    let long = |n: usize, w: &str| std::iter::repeat(w).take(n).collect::<Vec<_>>().join(" ");
+    let long = |n: usize, w: &str| vec![w; n].join(" ");
     let fields: Vec<serde_json::Value> = (0..5)
         .map(|i| serde_json::json!({"id": format!("f{i}_{}", "a".repeat(21)), "label": long(6, "labelword"), "optional": true}))
         .collect();

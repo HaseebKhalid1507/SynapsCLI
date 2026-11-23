@@ -217,6 +217,8 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     tx_events: None,
                 },
                 capabilities: synaps_cli::tools::ToolCapabilities {
+                    surfaces: None,
+                    tool_call_id: None,
                     session_allow_all: None,
                     launch_cancel: None,
                     memory_backend: None,
@@ -395,6 +397,8 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     tx_events: None,
                 },
                 capabilities: synaps_cli::tools::ToolCapabilities {
+                    surfaces: None,
+                    tool_call_id: None,
                     session_allow_all: None,
                     launch_cancel: None,
                     memory_backend: None,
@@ -450,6 +454,8 @@ fn whoami_ctx(session_id: Option<&str>, cwd: Option<&std::path::Path>) -> ToolCo
             tx_events: None,
         },
         capabilities: synaps_cli::tools::ToolCapabilities {
+            surfaces: None,
+            tool_call_id: None,
             session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,

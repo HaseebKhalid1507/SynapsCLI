@@ -335,7 +335,7 @@ pub async fn probe_version(exe: &Path) -> Result<PrintVersion, String> {
 /// the checkpoint did not confirm in budget).
 /// What a session's reload checkpoint said.
 enum Checkpointed {
-    Done(SessionReloadRecord),
+    Done(Box<SessionReloadRecord>),
     /// `{"ok":false,"reason":…}`: its agent-card barrier failed (§3.10).
     Failed(String),
     /// No usable reply in the budget.
@@ -374,7 +374,7 @@ fn checkpoint_reply(value: &serde_json::Value) -> Checkpointed {
         let reason = value["reason"].as_str().unwrap_or("ui_store");
         return Checkpointed::Failed(reason.to_string());
     }
-    serde_json::from_value(value["record"].clone()).map_or(Checkpointed::NoReply, Checkpointed::Done)
+    serde_json::from_value(value["record"].clone()).map_or(Checkpointed::NoReply, |r| Checkpointed::Done(Box::new(r)))
 }
 
 /// Why a reload must stop for this session (§3.10), if it must: its
@@ -533,7 +533,7 @@ pub async fn prepare(
             failed.push(why);
         }
         let rec = match c {
-            Checkpointed::Done(r) => Some(r),
+            Checkpointed::Done(r) => Some(*r),
             _ => {
                 tracing::warn!(session = %h.id, "reload: checkpoint did not confirm; recording from the handle");
                 None

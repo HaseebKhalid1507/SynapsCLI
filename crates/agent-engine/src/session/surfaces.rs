@@ -917,11 +917,8 @@ impl SessionActor {
         let mut route = None;
         match self.surfaces.waiter.take() {
             None => {}
-            Some(Waiter::Plain) => {
-                if !done {
-                    self.surfaces.waiter = Some(Waiter::Plain);
-                }
-            }
+            Some(Waiter::Plain) if !done => self.surfaces.waiter = Some(Waiter::Plain),
+            Some(Waiter::Plain) => {}
             Some(Waiter::Create { mut reply, id }) => {
                 let answer = match (&lifecycle, done) {
                     (Lifecycle::Done, true) => Some(json!({"status": "shown", "id": id})),
@@ -1054,6 +1051,7 @@ fn mint_answer_id() -> String {
 }
 
 impl SessionActor {
+    #[allow(clippy::too_many_arguments)] // one per `surface_result` field (§2.8)
     pub(crate) fn surface_result(
         &mut self,
         client: ClientId,

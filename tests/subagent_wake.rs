@@ -504,6 +504,8 @@ fn live_reactive_subagent_end_to_end() {
                 tx_events: None,
             },
             capabilities: ToolCapabilities {
+                surfaces: None,
+                tool_call_id: None,
                 session_allow_all: None,
                 launch_cancel: None,
                 memory_backend: None,
@@ -591,6 +593,8 @@ fn live_reactive_subagent_end_to_end() {
                 tx_events: None,
             },
             capabilities: ToolCapabilities {
+                surfaces: None,
+                tool_call_id: None,
                 session_allow_all: None,
                 launch_cancel: None,
                 memory_backend: None,

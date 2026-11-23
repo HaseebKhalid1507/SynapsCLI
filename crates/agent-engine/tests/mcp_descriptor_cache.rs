@@ -94,6 +94,8 @@ fn manual_ctx() -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            surfaces: None,
+            tool_call_id: None,
             session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
