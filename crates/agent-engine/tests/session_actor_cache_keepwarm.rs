@@ -2698,3 +2698,65 @@ async fn an_old_turn_s_tool_ping_after_a_switch_never_warms_the_new_model() {
     idle(&mut t).await;
     end(&mut t).await;
 }
+
+/// An idle keep-warm ping of model A, held in its setup before it builds
+/// its request, while the session switches to each of `models` (`[B]`, or
+/// `[B, A]`: A→B→A). Released, it still goes out on A's snapshot and reads
+/// A's cache (real provider usage), into the cache lifetime it was
+/// snapshotted in: never the session's new one, B's or the second A's
+/// (Shady #436 R4-1). Then the new lifetime's own turn proves its own TTL.
+async fn idle_ping_set_up_across(models: &[&str], first_id: u64) {
+    use agent_engine::runtime::keepwarm::testing::{Producer, SetupGate};
+    let _fast = fast_pings();
+    let (_h, script, bodies, _handle, mut t, _host) =
+        scripted("cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n").await;
+    script.pings(Reply::ReadOnly);
+    let gate = SetupGate::hold(Producer::IdlePing);
+    turn(&mut t, "hello").await;
+    let reached = async {
+        while gate.reached() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(PATIENCE, reached).await.expect("A's idle ping is set up");
+    let st = status(&mut t, first_id).await;
+    assert_eq!(st["cache"]["ttl"], "1h", "A's turn wrote 1h: {st}");
+    for (i, model) in models.iter().enumerate() {
+        set_model(&mut t, first_id + 1 + i as u64, model).await;
+    }
+    let st = status(&mut t, first_id + 5).await;
+    assert!(st["cache"].is_null(), "switched: nothing confirmed: {st}");
+    assert_eq!(pings(&bodies), 0, "the ping waits in its setup");
+    drop(gate);
+    assert!(wait_pings(&bodies, 1, PATIENCE).await, "A's ping goes out");
+    // The period's next ping (300 ms on) waits: after A→B→A it would be
+    // the new lifetime's own, and rightly read A's cache.
+    let _next = SetupGate::hold(Producer::IdlePing);
+    let st = status_until(&mut t, first_id + 10, PATIENCE, |st| {
+        st["keepwarm_cost"].as_f64().is_some_and(|c| c > 0.0)
+    })
+    .await;
+    assert_eq!(pings(&bodies), 1, "A's ping went out: {st}");
+    let ping = bodies.lock().unwrap().iter().find(|b| b.contains(PING_MARK)).cloned().unwrap();
+    let ping: serde_json::Value = serde_json::from_str(&ping).unwrap();
+    assert_eq!(ping["model"], MODEL, "on its snapshot's model");
+    assert!(st["cache"].is_null(), "A's ping, set up before the switch, is not the new lifetime's: {st}");
+
+    script.turns(Reply::Only5m);
+    turn(&mut t, "own").await;
+    let c = status(&mut t, first_id + 50).await["cache"].clone();
+    assert_eq!((c["ttl"].as_str(), c["downgraded"].as_bool()), (Some("5m"), Some(true)), "its own write: {c}");
+    end(&mut t).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_idle_ping_set_up_across_a_switch_never_warms_the_new_model() {
+    idle_ping_set_up_across(&[MODEL_B], 1600).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_idle_ping_set_up_across_a_switch_and_back_is_the_old_lifetime_s() {
+    idle_ping_set_up_across(&[MODEL_B, MODEL], 1700).await;
+}

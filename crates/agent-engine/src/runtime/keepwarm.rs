@@ -270,6 +270,62 @@ impl CacheAnchorCell {
     }
 }
 
+/// Test seam (Shady #436 R4-1): holds request producers in their async
+/// setup, right before they build their request options, so a test can
+/// change the session (switch its model) while one waits there.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
+
+    /// The producers a [`SetupGate`] holds.
+    #[derive(Debug, Clone, Copy)]
+    pub enum Producer {
+        /// An idle keep-warm ping that sends (never a probe).
+        IdlePing = 1,
+        /// A turn's stream setup (`run_stream_tracked`).
+        Turn = 2,
+    }
+
+    static HELD: AtomicU8 = AtomicU8::new(0);
+    static REACHED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Holds its producer's setup while alive (tests using it must be
+    /// `#[serial]`).
+    #[must_use = "the gate opens when the guard drops"]
+    pub struct SetupGate(u8);
+
+    impl SetupGate {
+        pub fn hold(producer: Producer) -> Self {
+            REACHED.store(0, SeqCst);
+            HELD.fetch_or(producer as u8, SeqCst);
+            Self(producer as u8)
+        }
+
+        /// How many producers reached the gate since it was held.
+        pub fn reached(&self) -> usize {
+            REACHED.load(SeqCst)
+        }
+    }
+
+    impl Drop for SetupGate {
+        fn drop(&mut self) {
+            HELD.fetch_and(!self.0, SeqCst);
+        }
+    }
+
+    pub(crate) async fn wait(producer: Producer) {
+        let held = || HELD.load(SeqCst) & producer as u8 != 0;
+        if !held() {
+            return;
+        }
+        REACHED.fetch_add(1, SeqCst);
+        while held() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 /// Token usage of one ping, as reported by the provider.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KeepWarmUsage {
@@ -850,6 +906,10 @@ impl Runtime {
             (tools_snapshot.tools_schema_without(&withheld), None)
         };
 
+        #[cfg(any(test, feature = "testing"))]
+        if matches!(mode, KeepWarmMode::Send { .. }) {
+            testing::wait(testing::Producer::IdlePing).await;
+        }
         let options = ApiOptions {
             // A ping runs no tool: nothing of the chat's goes with it.
             tool_context: None,
@@ -1024,6 +1084,25 @@ mod tests {
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",",
         "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":1,",
         "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    /// A turn's answer that wrote 2k with the 1h TTL.
+    const SSE_WRITE_1H: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_kw\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-opus-4-7\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+        "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":0,",
+        "\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":2000}}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",",
+        "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":1,",
+        "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":0,",
+        "\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":2000}}}\n\n",
         "data: {\"type\":\"message_stop\"}\n\n",
     );
 
@@ -2529,5 +2608,60 @@ mod tests {
         assert_eq!(t, reply_prefix_tokens(&plain), "thinking is not counted");
         assert!((100..200).contains(&t), "{t}");
         assert_eq!(reply_prefix_tokens(&[]), 0);
+    }
+
+    /// The actor's driver turn (`session/actor.rs`): a runtime snapshot
+    /// (`clone` + `share_ttl_latches`, on model A) whose stream setup runs
+    /// on a spawned task. Held in that setup, before it builds its request,
+    /// while the session switches model (`set_model` + the actor's fence,
+    /// `cache_forget`), `switches` times (2: A→B→A). Its request reports
+    /// into the lifetime it was snapshotted in, never the session's new one
+    /// (Shady #436 R4-1). Then the new lifetime's own request proves its own
+    /// TTL.
+    async fn driver_setup_across(switches: &[&str]) {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock_full(200, SSE_WRITE_1H).await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus(CacheTtl::OneHour);
+        let mut driver = rt.clone();
+        driver.share_ttl_latches(&rt);
+        let gate = testing::SetupGate::hold(testing::Producer::Turn);
+        let task = tokio::spawn(async move { real_turn(&driver, vec![user("go")]).await });
+        let reached = async {
+            while gate.reached() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), reached)
+            .await
+            .expect("the driver's setup reaches the gate");
+        for model in switches {
+            let _ = rt.set_model(model.to_string());
+            rt.cache_forget();
+        }
+        drop(gate);
+        task.await.unwrap();
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "the driver's request went out");
+        let sent: Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(sent["model"], "claude-opus-4-7", "on its own snapshot's model");
+        assert_eq!(rt.cache_evidence(), None, "the driver's 1h write is not the new lifetime's");
+
+        real_turn(&rt, vec![user("again")]).await;
+        let e = rt.cache_evidence().expect("the new lifetime's own request");
+        assert!(e.cached, "{e:?}");
+        assert_eq!(e.honoured(), CacheTtl::OneHour, "{e:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_driver_turn_set_up_across_a_switch_never_warms_the_new_model() {
+        driver_setup_across(&["claude-opus-4-6"]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_driver_turn_set_up_across_a_switch_and_back_is_the_old_lifetime_s() {
+        driver_setup_across(&["claude-opus-4-6", "claude-opus-4-7"]).await;
     }
 }

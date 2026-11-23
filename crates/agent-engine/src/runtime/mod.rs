@@ -3353,6 +3353,8 @@ impl Runtime {
         let reaper_registry = Arc::clone(&subagent_registry);
         let reaper_orchestration = self.orchestration.clone();
         let event_queue = self.event_queue.clone();
+        #[cfg(any(test, feature = "testing"))]
+        keepwarm::testing::wait(keepwarm::testing::Producer::Turn).await;
         let options = api::ApiOptions {
             // Placeholder: the stream loop installs the tool context its
             // own tools are made from before the first provider round.
