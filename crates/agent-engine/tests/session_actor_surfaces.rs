@@ -386,3 +386,238 @@ async fn handle_card(handle: &agent_engine::session::SessionHandle) -> SurfaceSt
     b.send(SessionCommand::Detach { client: b.client_id() }).await.unwrap();
     snap.surfaces.into_iter().next().expect("the card")
 }
+
+// ── consent and lifecycle (the C4a exit gate, §3.9–§3.11) ───────────────────
+
+use agent_engine::core::session_surfaces::ModelFs;
+
+/// A session whose card store is `fs`, with one open card from a turn that
+/// has ended.
+async fn with_card_on(
+    fs: std::sync::Arc<ModelFs>,
+    bodies: &'static [&'static str],
+) -> (agent_engine::session::SessionHandle, LocalTransport, SurfaceState, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let (url, hits) = stub_seq(bodies).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (handle, mut task) = host.create_session_unspawned(cards_cfg()).await.unwrap();
+    task.ui_fs_for_harness(fs);
+    tokio::spawn(task.run());
+    let (mut a, _) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    a.send(submit("ask me")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let card = cards(&seen).pop().expect("a card");
+    (handle, a, card, hits)
+}
+
+fn ui_answers(history: &[agent_engine::SharedMessage], card: &str) -> usize {
+    history
+        .iter()
+        .filter(|m| m["content"].as_str().is_some_and(|t| t.starts_with(&format!("<ui_answer card=\"{card}\""))))
+        .count()
+}
+
+/// Exit gate, consent at dispatch (R3-H2): the answer's commit is still
+/// unknown when the user Cancels (`pending`); the Cancel finds its wake and
+/// raises the epoch; the commit then lands. The answer enters context
+/// once, with no wake: zero new turns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pending_answer_commit_then_cancel_then_durable() {
+    let _h = Home::new();
+    let fs = ModelFs::new();
+    let (_handle, mut a, card, hits) = with_card_on(fs.clone(), &[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
+    fs.stall();
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Pending, "unknown at the budget");
+    a.send_from_self(SessionCommand::Cancel).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    fs.release();
+    let r = result_for(&mut a, A1).await;
+    assert_eq!((r.outcome, r.answer_rev), (SurfaceOutcome::Accepted, Some(1)));
+    let after = drain_for(&mut a, Duration::from_millis(600)).await;
+    assert!(!after.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })), "zero new turns: {after:#?}");
+    assert_eq!(ui_answers(&last_conversation(&after).api_messages, &card.id), 1, "in context once");
+    let shown = cards(&after);
+    assert!(shown.iter().any(|c| c.epoch > card.epoch), "the stop's upsert: {shown:?}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    end(&mut a).await;
+}
+
+/// Exit gate, consent (§3.9), C4a's half (`revise` is C4c): a system stop
+/// (a host stop here; the cost cap takes the same path) while a card is
+/// open expires it and leaves it nothing to offer; an answer sent anyway is
+/// `resolved`; no message, no turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn system_stop_freezes_receipts() {
+    let _h = Home::new();
+    let (url, hits) = stub_seq_endless_last(&[SSE_UI_CREATE, SSE_HI, SSE_PREFIX]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cards_cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    a.send(submit("ask me")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let card = cards(&seen).pop().unwrap();
+    a.send(submit("meanwhile")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    handle
+        .send(SessionCommand::Checkpoint { reason: agent_engine::session::CheckpointReason::HostRequest })
+        .await
+        .unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Surface(s) if s.phase == Phase::Expired)).await;
+    let expired = cards(&seen).pop().unwrap();
+    assert!(expired.offers.is_empty() && expired.epoch > card.epoch, "{expired:?}");
+    assert_eq!(expired.origin.stopped, Some(agent_engine::ui::StopKind::System));
+    let mut late = answer(&card, A1, serde_json::json!({"choice": "Refactor"}));
+    if let SessionCommand::SurfaceAction { epoch, .. } = &mut late {
+        *epoch = expired.epoch;
+    }
+    a.send_from_self(late).await.unwrap();
+    let r = result_for(&mut a, A1).await;
+    assert_eq!((r.outcome, r.reason), (SurfaceOutcome::Refused, Some(SurfaceRefusal::Resolved)));
+    let quiet = drain_for(&mut a, Duration::from_millis(400)).await;
+    assert!(!quiet.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    end(&mut a).await;
+}
+
+/// Exit gate, consent (§3.9 case 2), the daemon's half: desk A's answer
+/// starts the turn and A loses its connection; desk B Cancels. The epoch
+/// rose. A reconnects and its outbox re-sends the same action: a
+/// `duplicate`, nothing sent, no turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn remote_cancel_while_disconnected() {
+    let _h = Home::new();
+    let (url, hits) = stub_seq_endless_last(&[SSE_UI_CREATE, SSE_HI, SSE_PREFIX]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(shared_cards_cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    let (mut b, _) = LocalTransport::attach(handle.clone(), capable(ClientKind::Attach)).await.unwrap();
+    a.send(submit("ask me")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let card = cards(&seen).pop().unwrap();
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    until(&mut b, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    a.send(SessionCommand::Detach { client: a.client_id() }).await.unwrap();
+    b.send_from_self(SessionCommand::Cancel).await.unwrap();
+    until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    let (mut a2, snap) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    let now = snap.surfaces.iter().find(|c| c.id == card.id).cloned().expect("retained");
+    assert!(now.epoch > card.epoch, "{now:?}");
+    a2.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    let r = result_for(&mut a2, A1).await;
+    assert_eq!((r.outcome, r.answer_rev), (SurfaceOutcome::Duplicate, Some(1)));
+    let quiet = drain_for(&mut a2, Duration::from_millis(400)).await;
+    assert!(!quiet.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    end(&mut a2).await;
+}
+
+fn shared_cards_cfg() -> SessionConfig {
+    SessionConfig { client_input: Some(agent_engine::session::ClientInput::Shared), ..cards_cfg() }
+}
+
+/// The session's history files at one instant (not its `.ui`).
+struct History(Vec<(std::path::PathBuf, Vec<u8>)>);
+
+impl History {
+    fn capture(id: &str) -> Self {
+        let dir = agent_engine::core::session_lock::sessions_dir();
+        History(
+            ["json", "journal", "turn"]
+                .iter()
+                .map(|ext| dir.join(format!("{id}.{ext}")))
+                .filter_map(|p| std::fs::read(&p).ok().map(|b| (p, b)))
+                .collect(),
+        )
+    }
+    fn restore(&self, id: &str) {
+        let dir = agent_engine::core::session_lock::sessions_dir();
+        for ext in ["json", "journal", "turn"] {
+            let _ = std::fs::remove_file(dir.join(format!("{id}.{ext}")));
+        }
+        for (path, bytes) in &self.0 {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+}
+
+/// Exit gate, consent (§3.9 case 3): an answer is accepted while a turn
+/// runs, the turn is interrupted (T12 puts it after the marker), and the
+/// process dies before that history is saved. Recovery puts the answer into
+/// context once and starts no turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn interrupt_then_crash_keeps_no_wake() {
+    let _h = Home::new();
+    let (url, hits) = stub_seq_endless_last(&[SSE_UI_CREATE, SSE_HI, SSE_PREFIX]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cards_cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    a.send(submit("ask me")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let card = cards(&seen).pop().unwrap();
+    let id = handle.journal_id();
+    let before = History::capture(&id);
+    a.send(submit("meanwhile")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    a.send_from_self(SessionCommand::Cancel).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    // The crash: the session goes, and its history is as it was before the
+    // answer (the save never happened); the sidecar keeps what it wrote.
+    end(&mut a).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while handle.is_alive() {
+        assert!(tokio::time::Instant::now() < deadline, "actor never exited");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    before.restore(&id);
+
+    let handle = host
+        .create_session(SessionConfig { continue_session: Some(Some(id.clone())), ..cards_cfg() })
+        .await
+        .unwrap();
+    let (mut b, snap) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    assert_eq!(ui_answers(&snap.conversation.api_messages, &card.id), 1, "in context once");
+    let quiet = drain_for(&mut b, Duration::from_millis(600)).await;
+    assert!(!quiet.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })), "no wake");
+    let restored = snap.surfaces.iter().find(|c| c.id == card.id).expect("retained");
+    assert!(restored.answer.as_ref().is_some_and(|x| !x.wake), "{restored:?}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    end(&mut b).await;
+}
+
+/// The reload barrier (§3.10): with the card store failing, the reload
+/// checkpoint replies `{ok:false, reason:"ui_store"}`; `ReloadAborted` then
+/// lifts the fence and the session goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_failed_reload_barrier_is_the_checkpoints_reply() {
+    let _h = Home::new();
+    let fs = ModelFs::new();
+    let (handle, mut a, _card, _) = with_card_on(fs.clone(), &[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
+    // Every directory sync fails: the store fails closed (§3.4).
+    fs.fail_sync(1000);
+    handle
+        .send(SessionCommand::Checkpoint { reason: agent_engine::session::CheckpointReason::Reload })
+        .await
+        .unwrap();
+    let id = agent_engine::session::wire::CHECKPOINT_QUERY_ID;
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::QueryResult { id: q, .. } if *q == id)).await;
+    let SessionEventWire::QueryResult { value, .. } = &seen.last().unwrap().event else { unreachable!() };
+    assert_eq!((value["ok"].as_bool(), value["reason"].as_str()), (Some(false), Some("ui_store")), "{value}");
+    assert!(handle.ui_barrier(), "the session holds card state");
+    handle.send(SessionCommand::ReloadAborted).await.unwrap();
+    a.send(submit("still here")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    end(&mut a).await;
+}

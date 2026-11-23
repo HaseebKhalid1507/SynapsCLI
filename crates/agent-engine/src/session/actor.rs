@@ -6042,6 +6042,13 @@ impl SessionTask {
         (*self.0.runtime).clone()
     }
 
+    /// Test seam: this session's card store opens on `fs` (C2's fault
+    /// model, `session_surfaces::ModelFs`) instead of the sessions dir.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn ui_fs_for_harness(&mut self, fs: std::sync::Arc<dyn agent_core::core::session_surfaces::UiFs>) {
+        self.0.surfaces.use_fs(fs);
+    }
+
     /// Test seam: this session's event queue (what a worker's finalizer
     /// pushes its completion wake into).
     #[cfg(any(test, feature = "testing"))]

@@ -222,6 +222,7 @@ impl SurfaceTable {
     }
 
     /// Test seam: stores open on `fs` (the C2 fault model).
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn use_fs(&mut self, fs: Arc<dyn UiFs>) {
         self.fs = Some(fs);
     }

@@ -334,7 +334,6 @@ pub async fn probe_version(exe: &Path) -> Result<PrintVersion, String> {
 /// `Checkpoint{Reload}` → the actor's `SessionReloadRecord` (`None` when
 /// the checkpoint did not confirm in budget).
 /// What a session's reload checkpoint said.
-#[derive(Debug)]
 enum Checkpointed {
     Done(SessionReloadRecord),
     /// `{"ok":false,"reason":…}`: its agent-card barrier failed (§3.10).
