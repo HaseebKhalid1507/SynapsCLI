@@ -342,6 +342,16 @@ impl RequiredGuards {
         self.read().iter().any(|(n, _)| n == id)
     }
 
+    /// `handler` is required guard `id`'s loaded instance: `id` is named in
+    /// the config's `required_guards` and the gate holds this very handler
+    /// for it ([`Self::mark_loaded`]), not another handler with that id (a
+    /// plugin folder of the same name) and not a guard that is not required.
+    pub(crate) fn is_loaded_instance(&self, id: &str, handler: &Arc<dyn ExtensionHandler>) -> bool {
+        self.read().iter().any(|(name, slot)| {
+            name == id && matches!(slot, Slot::Loaded(loaded) if Arc::ptr_eq(loaded, handler))
+        })
+    }
+
     /// Required guard `id` loaded, live in `handler`. No-op for any other id
     /// (and for an invalid name, which stays refused).
     pub(crate) fn mark_loaded(&self, id: &str, handler: Arc<dyn ExtensionHandler>) {

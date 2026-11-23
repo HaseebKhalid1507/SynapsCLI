@@ -634,7 +634,20 @@ pub enum HookResult {
     /// Only valid on before_tool_call hooks. The output-side counterpart is
     /// [`HookResult::Replace`]. Does not stop the chain: later handlers see
     /// (and may block or confirm) the modified input.
-    Modify { input: Value },
+    ///
+    /// `source` is host-stamped by the hook bus, never read from or written
+    /// to the extension wire: the id of the extension whose `Modify` made the
+    /// final input (the last rewrite in the chain), set only when that
+    /// handler is the instance the host loaded as a required guard (the
+    /// gate's loaded instance for a name in the config's `required_guards`).
+    /// Any other rewriter, one claiming a guard's id included, leaves it
+    /// `None`. Every `Modify` still applies; the source only lets a host
+    /// policy check where a rewrite came from.
+    Modify {
+        input: Value,
+        #[serde(skip)]
+        source: Option<String>,
+    },
     /// Replace the tool **output** after execution (flat string), before it
     /// enters history. Only valid on after_tool_call hooks. The input-side
     /// counterpart is [`HookResult::Modify`] — distinct name because the payload
@@ -991,7 +1004,7 @@ mod tests {
                 HookResult::Block { reason: "r".into() },
                 HookResult::inject("c"),
                 HookResult::confirm("m"),
-                HookResult::Modify { input: json!({}) },
+                HookResult::Modify { input: json!({}), source: None },
                 HookResult::Replace { output: "o".into() },
                 HookResult::ContextPhase { phase: "new_task".into() },
             ] {
@@ -1360,6 +1373,7 @@ mod tests {
     fn hook_result_modify_serde() {
         let r = HookResult::Modify {
             input: json!({"command": "echo safe"}),
+            source: Some("guard".into()),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(
@@ -1369,7 +1383,8 @@ mod tests {
 
         let back: HookResult = serde_json::from_str(&json).unwrap();
         assert!(
-            matches!(back, HookResult::Modify { input } if input == json!({"command": "echo safe"}))
+            matches!(back, HookResult::Modify { input, source: None } if input == json!({"command": "echo safe"})),
+            "the source never crosses the wire"
         );
     }
 
@@ -1450,6 +1465,7 @@ mod tests {
                 "modify",
                 HookResult::Modify {
                     input: serde_json::json!({}),
+                    source: None,
                 },
             ),
             ("replace", HookResult::Replace { output: "o".into() }),

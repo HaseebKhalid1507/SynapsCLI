@@ -290,7 +290,7 @@ pub async fn execute_provider_tool_use(
     )
     .await;
 
-    let crate::runtime::BeforeToolCallDecision::Continue { input } = decision else {
+    let crate::runtime::BeforeToolCallDecision::Continue { input, .. } = decision else {
         let crate::runtime::BeforeToolCallDecision::Block { reason } = decision else {
             unreachable!()
         };

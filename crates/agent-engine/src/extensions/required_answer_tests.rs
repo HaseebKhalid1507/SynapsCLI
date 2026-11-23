@@ -299,7 +299,7 @@ async fn a_guard_that_is_not_required_keeps_its_on_failure() {
 
 /// The rewrite a guard answers with (the call without its `-rf /`).
 fn rewrite() -> HookResult {
-    HookResult::Modify { input: json!({"command": "rm -i /tmp/x"}) }
+    HookResult::Modify { input: json!({"command": "rm -i /tmp/x"}), source: None }
 }
 
 const MODIFY_AFTER_CONFIRM: &str = "bad-answer: its answer is not a usable hook result: 'modify' cannot apply here: an earlier extension (asker) asked to confirm the input as it was";
@@ -326,7 +326,11 @@ async fn a_required_guards_modify_after_a_confirm_blocks() {
     // Unchanged: no earlier Confirm, so the guard's rewrite applies.
     let required = Fake::new("example-guard", Mode::Answer(rewrite()));
     let (bus, _) = gated(&[(required, HookFailurePolicy::Continue)]).await;
-    assert_eq!(bus.emit(&call()).await, rewrite());
+    // The host stamps the loaded guard as the source.
+    assert_eq!(
+        bus.emit(&call()).await,
+        HookResult::Modify { input: json!({"command": "rm -i /tmp/x"}), source: Some("example-guard".into()) }
+    );
 
     // Unchanged: a guard that is not required has its rewrite ignored.
     let required = Fake::new("example-guard", Mode::Answer(HookResult::Continue));
@@ -697,7 +701,7 @@ fn harmless() -> HookEvent {
 }
 
 fn rewritten_to(command: &str) -> HookResult {
-    HookResult::Modify { input: json!({"command": command}) }
+    HookResult::Modify { input: json!({"command": command}), source: None }
 }
 
 /// A bus gated on `example-guard` and `second-guard` (both loaded and

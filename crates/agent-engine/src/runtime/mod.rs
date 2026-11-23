@@ -67,7 +67,12 @@ pub use stream::activation_policy;
 
 /// Result of resolving before_tool_call extension policy.
 pub enum BeforeToolCallDecision {
-    Continue { input: Value },
+    /// `rewritten_by` (host-set): the source of the `Modify` that made
+    /// `input` ([`HookResult::Modify`](crate::extensions::hooks::events::HookResult::Modify)'s
+    /// `source`, a required guard's loaded instance). `None` when the input
+    /// is the original, comes from an approved Confirm, or was rewritten by
+    /// any other extension.
+    Continue { input: Value, rewritten_by: Option<String> },
     Block { reason: String },
 }
 
@@ -218,7 +223,8 @@ fn approved(
     modified_input: Option<Value>,
 ) -> crate::extensions::hooks::events::HookResult {
     match modified_input {
-        Some(input) => crate::extensions::hooks::events::HookResult::Modify { input },
+        // An approved Confirm names no rewrite source.
+        Some(input) => crate::extensions::hooks::events::HookResult::Modify { input, source: None },
         None => crate::extensions::hooks::events::HookResult::Continue,
     }
 }
@@ -363,11 +369,12 @@ pub async fn resolve_before_tool_call_decision(
         crate::extensions::hooks::events::HookResult::Block { reason } => {
             BeforeToolCallDecision::Block { reason }
         }
-        crate::extensions::hooks::events::HookResult::Modify { input } => {
-            BeforeToolCallDecision::Continue { input }
+        crate::extensions::hooks::events::HookResult::Modify { input, source } => {
+            BeforeToolCallDecision::Continue { input, rewritten_by: source }
         }
         _ => BeforeToolCallDecision::Continue {
             input: original_input,
+            rewritten_by: None,
         },
     }
 }
@@ -4363,6 +4370,7 @@ mod tests {
             serde_json::json!({"command":"rm -rf /"}),
             crate::extensions::hooks::events::HookResult::Modify {
                 input: serde_json::json!({"command":"echo safe"}),
+                source: Some("guard".into()),
             },
             None,
             false,
@@ -4371,8 +4379,9 @@ mod tests {
         .await;
 
         match result {
-            BeforeToolCallDecision::Continue { input } => {
+            BeforeToolCallDecision::Continue { input, rewritten_by } => {
                 assert_eq!(input, serde_json::json!({"command":"echo safe"}));
+                assert_eq!(rewritten_by.as_deref(), Some("guard"), "the source is carried");
             }
             BeforeToolCallDecision::Block { reason } => panic!("unexpected block: {reason}"),
         }
@@ -4724,7 +4733,7 @@ mod tests {
         assert_eq!(scope.rewritten_by, ext(&["rewriter"]));
         assert!(matches!(
             result,
-            crate::extensions::hooks::events::HookResult::Modify { input }
+            crate::extensions::hooks::events::HookResult::Modify { input, source: None }
                 if input == serde_json::json!({"command": "rm -rf build/"})
         ));
         // No rewrite → no rewrite header, empty rewritten_by.

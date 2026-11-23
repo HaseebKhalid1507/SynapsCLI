@@ -2377,7 +2377,7 @@ impl StreamMethods {
                                 if let BeforeToolCallDecision::Block { reason } = decision {
                                     (format!("Tool call blocked by extension: {}", reason), None)
                                 } else {
-                                    let BeforeToolCallDecision::Continue { input } = decision
+                                    let BeforeToolCallDecision::Continue { input, .. } = decision
                                     else {
                                         unreachable!()
                                     };
@@ -2805,7 +2805,7 @@ impl StreamMethods {
                                     if let BeforeToolCallDecision::Block { reason } = decision {
                                         (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None, None, None)
                                     } else {
-                                    let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
+                                    let BeforeToolCallDecision::Continue { input, .. } = decision else { unreachable!() };
                                     let input_for_hook = input.clone();
                                     let spill_target = spill_target_for(
                                         &tool_spill_inner,
