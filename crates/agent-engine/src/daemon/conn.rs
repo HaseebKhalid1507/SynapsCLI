@@ -182,6 +182,18 @@ fn spawn_writer(mut w: ServerWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::ta
     (tx, task)
 }
 
+/// The `skills_reload` reply: the new pass's report, or a session-less
+/// `Error` when the walk failed (the last pass stays published).
+async fn skills_reload_answer(host: &crate::EngineHost, id: Option<u64>) -> DaemonFrame {
+    match host.reload_skills().await {
+        Ok(report) => DaemonFrame::SkillsResult { id, report },
+        Err(message) => DaemonFrame::Error {
+            session_id: None,
+            message,
+        },
+    }
+}
+
 pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: CancellationToken) {
     let (r, w) = crate::ipc::split_server(stream);
     let mut reader = BufReader::new(r);
@@ -363,6 +375,20 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             }
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
+            }
+            // `skills.reload`: an unattached connection only (refused below).
+            Ok(Read::Frame(ClientFrame::SkillsReload { id })) => {
+                let _ = tx
+                    .send(skills_reload_answer(&state.host, id).await)
+                    .await;
+            }
+            Ok(Read::Frame(ClientFrame::SkillsStatus { id })) => {
+                let _ = tx
+                    .send(DaemonFrame::SkillsResult {
+                        id,
+                        report: state.host.skills_status(),
+                    })
+                    .await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => {
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
@@ -753,6 +779,14 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             Ok(Read::Frame(ClientFrame::Sessions)) => {
                 let _ = tx.send(DaemonFrame::SessionList { sessions: state.session_metas() }).await;
             }
+            Ok(Read::Frame(ClientFrame::SkillsStatus { id })) => {
+                let _ = tx
+                    .send(DaemonFrame::SkillsResult {
+                        id,
+                        report: state.host.skills_status(),
+                    })
+                    .await;
+            }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 state.request_shutdown(force);
@@ -769,7 +803,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             | Ok(Read::Frame(ClientFrame::Pin { .. }))
             | Ok(Read::Frame(ClientFrame::Rename { .. }))
             | Ok(Read::Frame(ClientFrame::ReloadExtension { .. }))
-            | Ok(Read::Frame(ClientFrame::AuthState(_))) => {
+            | Ok(Read::Frame(ClientFrame::AuthState(_)))
+            | Ok(Read::Frame(ClientFrame::SkillsReload { .. })) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,
