@@ -508,7 +508,7 @@ async fn pending_prompt_is_resolved_and_the_turn_unwinds() {
     );
     assert!(seen.iter().any(|e| matches!(
         e.event,
-        SessionEventWire::PromptResolved { prompt_id } if prompt_id == id
+        SessionEventWire::PromptResolved { prompt_id, .. } if prompt_id == id
     )));
     assert_eq!(aborted(&seen).len(), 1);
     assert_eq!(

@@ -962,6 +962,71 @@ pub const CONFIRM_PROMPT_TITLE: &str = "Confirm tool call";
 /// `Secret` (masked input).
 pub const CONFIRM_ACTIVATION_PROMPT_TITLE: &str = "Confirm tool activation";
 
+/// What the session applied when a prompt left the pending set, carried on
+/// `PromptResolved`. An older daemon sends none (`None` on the wire
+/// event); a newer one may send an outcome this build does not know, read
+/// as [`PromptOutcome::Unknown`] rather than failing the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOutcome {
+    /// A Confirm answered Allow (or Allow all, where the gate honours it),
+    /// handed to the waiting call: the gate opens.
+    Allowed,
+    /// A Confirm answered anything else, or a Secret answered with no value,
+    /// handed to the waiting call: the gate stays shut.
+    Denied,
+    /// A Secret prompt's value, handed to the waiting call.
+    Answered,
+    /// No answer was applied: the turn was cancelled, revoked or
+    /// checkpointed, or the session ended, while the prompt waited; or an
+    /// answer came after the waiting call had already gone. The call never
+    /// passed its gate.
+    Cancelled,
+    /// Nobody was attached to answer before the abandonment deadline
+    /// (`SYNAPS_DAEMON_PROMPT_ABANDON_SECS`): the session answered for them,
+    /// fail-closed (deny).
+    TimedOut,
+    /// An outcome this build does not know (a newer daemon's).
+    #[serde(other)]
+    Unknown,
+}
+
+impl PromptOutcome {
+    /// Its wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::Answered => "answered",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// What an answer `value` to `prompt` applies, once the waiting call has
+    /// it: the same reading the gates make (`runtime::resolve_before_tool_call_result`
+    /// takes y/yes and Allow all; `tools::discovery`'s activation gate only
+    /// y/yes).
+    pub fn of_answer(prompt: &PromptRequest, value: Option<&str>) -> Self {
+        let v = value.map(str::trim);
+        match prompt.kind {
+            PromptKind::Secret if v.is_some() => Self::Answered,
+            PromptKind::Secret => Self::Denied,
+            PromptKind::Confirm => {
+                let yes = v.is_some_and(|v| v.eq_ignore_ascii_case("y") || v.eq_ignore_ascii_case("yes"));
+                let all = prompt.title == CONFIRM_PROMPT_TITLE
+                    && v.is_some_and(|v| v.eq_ignore_ascii_case(crate::tools::CONFIRM_ANSWER_ALLOW_ALL));
+                if yes || all {
+                    Self::Allowed
+                } else {
+                    Self::Denied
+                }
+            }
+        }
+    }
+}
+
 impl PromptKind {
     /// Derive the kind from the prompt title (the actor classifies at receipt;
     /// `SecretPromptHandle::prompt` classifies for the in-process TUI).
@@ -1505,8 +1570,9 @@ pub enum SessionEventWire {
     /// mirrors never diverge: the actor's api_messages IS the truth.
     Conversation(ConversationSnapshot),
     Prompt(PromptRequest),
-    /// So mirrors dismiss the modal.
-    PromptResolved { prompt_id: u64 },
+    /// So mirrors dismiss the modal. `outcome`: what the session applied;
+    /// `None` only from an older daemon over the wire.
+    PromptResolved { prompt_id: u64, outcome: Option<PromptOutcome> },
     /// Drained event card — presentation only.
     External(crate::events::types::Event),
     AutoTurnCapReached { cap: u32 },
@@ -1819,6 +1885,40 @@ pub mod reasoning_level_serde {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An answer's outcome is read the way its gate reads it.
+    #[test]
+    fn an_answers_outcome_is_what_its_gate_applies() {
+        let prompt = |title: &str| PromptRequest {
+            id: 1,
+            kind: PromptKind::from_title(title),
+            title: title.into(),
+            prompt: "p".into(),
+            raised_at: chrono::Utc::now(),
+            confirm_scope: None,
+        };
+        let call = prompt(CONFIRM_PROMPT_TITLE);
+        let activation = prompt(CONFIRM_ACTIVATION_PROMPT_TITLE);
+        let secret = prompt("sudo password");
+        use PromptOutcome::*;
+        for (p, v, want) in [
+            (&call, Some("y"), Allowed),
+            (&call, Some(" YES "), Allowed),
+            (&call, Some("always"), Allowed),
+            (&call, Some("n"), Denied),
+            (&call, Some(""), Denied),
+            (&call, None, Denied),
+            // The activation gate takes y/yes only (tools/discovery.rs).
+            (&activation, Some("yes"), Allowed),
+            (&activation, Some("always"), Denied),
+            (&activation, None, Denied),
+            (&secret, Some("hunter2"), Answered),
+            (&secret, Some(""), Answered),
+            (&secret, None, Denied),
+        ] {
+            assert_eq!(PromptOutcome::of_answer(p, v), want, "{} {v:?}", p.title);
+        }
+    }
 
     #[test]
     fn client_names_are_short_plain_labels() {

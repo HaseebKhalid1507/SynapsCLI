@@ -161,7 +161,9 @@ impl SessionLink {
                 reason,
             } = &env.event
             {
-                if *client == me {
+                // An `Answer` is sent without a round trip, so its refusal
+                // (a late answer) is never this command's reply.
+                if *client == me && command != "answer" {
                     return Err(format!("{command} refused: {reason}"));
                 }
             }
@@ -749,6 +751,29 @@ mod tests {
             })
             .await
             .expect("real reply picked");
+        assert!(applied.ok, "{applied:?}");
+        assert_eq!(link.buffered.len(), 1);
+    }
+
+    /// A late `Answer` (sent without a round trip) is refused to
+    /// this client. That refusal is not the reply to the next setter: it is
+    /// buffered for the loop, and the setter gets its own reply.
+    #[tokio::test]
+    async fn roundtrip_ignores_a_refused_answer() {
+        let mut t = ScriptedTransport::new(Runtime::new_headless());
+        t.push_event(SessionEventWire::Refused {
+            client: ClientId(1),
+            command: "answer".into(),
+            reason: "prompt 7 was already resolved: cancelled".into(),
+        });
+        let mut link = SessionLink::new(Box::new(t));
+        assert_eq!(link.client_id(), ClientId(1), "addressed to this client");
+        let applied = link
+            .set(SessionSetting::ContextWindow {
+                tokens: Some(1_000_000),
+            })
+            .await
+            .expect("the setter's own reply, not the answer's refusal");
         assert!(applied.ok, "{applied:?}");
         assert_eq!(link.buffered.len(), 1);
     }

@@ -700,7 +700,7 @@ async fn pending_prompt_survives_detach_and_replays_on_attach() {
     let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
     assert!(seen.iter().any(|e| matches!(
         e.event,
-        SessionEventWire::PromptResolved { prompt_id } if prompt_id == pid
+        SessionEventWire::PromptResolved { prompt_id, .. } if prompt_id == pid
     )));
     let conv = last_conversation(&seen);
     assert_eq!(tool_results(&conv), vec!["answered:6".to_string()]);
@@ -768,7 +768,7 @@ async fn pending_prompt_reattach_cancels_abandon_deadline() {
     let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
     assert!(seen.iter().any(|e| matches!(
         e.event,
-        SessionEventWire::PromptResolved { prompt_id } if prompt_id == pid
+        SessionEventWire::PromptResolved { prompt_id, .. } if prompt_id == pid
     )));
     assert_eq!(tool_results(&last_conversation(&seen)), vec!["answered:6".to_string()]);
     end(&mut b).await;

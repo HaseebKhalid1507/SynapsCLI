@@ -55,6 +55,10 @@ pub type ActiveStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent
 /// `turn_replay` cap (envelopes). §6 #9: the 2 MiB text bound is day 3.
 const TURN_REPLAY_CAP: usize = 4096;
 
+/// How many closed prompts the actor remembers to refuse a late `Answer`
+/// with what applied. Older ids get "no pending prompt".
+const RESOLVED_PROMPTS_KEPT: usize = 64;
+
 /// The in-flight turn draft (`sessions/<id>.turn`, see
 /// `agent_core::core::session_draft`): what the actor last knew about the
 /// response being streamed, flushed at most once per 1 Hz turn tick.
@@ -601,6 +605,9 @@ pub struct SessionActor {
     /// Held across detach; replayed in `AttachSnapshot.pending_prompts`.
     pub(crate) pending_prompts: VecDeque<(PromptRequest, oneshot::Sender<Option<String>>)>,
     pub(crate) next_prompt_id: u64,
+    /// The last [`RESOLVED_PROMPTS_KEPT`] prompts closed and what each
+    /// applied, so a late `Answer` is refused with the reason.
+    pub(crate) resolved_prompts: VecDeque<(u64, PromptOutcome)>,
     // ── clients ──
     pub(crate) cmd_rx: mpsc::Receiver<Addressed>,
     pub(crate) events: broadcast::Sender<Envelope>,
@@ -1018,6 +1025,7 @@ impl SessionActor {
             secret_prompt_rx,
             pending_prompts: VecDeque::new(),
             next_prompt_id: 1,
+            resolved_prompts: VecDeque::new(),
             cmd_rx,
             events,
             view,
@@ -2569,8 +2577,7 @@ impl SessionActor {
         }
         let had_prompts = !self.pending_prompts.is_empty();
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
-            let _ = tx.send(None);
-            self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+            self.close_prompt(&pr, tx, None, PromptOutcome::TimedOut);
         }
         if had_prompts {
             tracing::info!(session = %self.id, "pending prompt abandoned (no clients before deadline) — denied");
@@ -3736,8 +3743,7 @@ impl SessionActor {
             return;
         }
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
-            let _ = tx.send(None);
-            self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+            self.close_prompt(&pr, tx, None, PromptOutcome::Cancelled);
         }
         self.publish_presence();
         self.rearm_prompt_abandon();
@@ -4492,9 +4498,39 @@ impl SessionActor {
         None
     }
 
+    /// Close `pr`: hand `value` to its waiting call, remember and announce
+    /// what that applied (`PromptResolved.outcome`). `outcome` is what
+    /// the value means; a call that is already gone took nothing, so that
+    /// is `Cancelled` whatever the value was.
+    fn close_prompt(
+        &mut self,
+        pr: &PromptRequest,
+        tx: oneshot::Sender<Option<String>>,
+        value: Option<String>,
+        outcome: PromptOutcome,
+    ) -> PromptOutcome {
+        let applied = if tx.send(value).is_ok() { outcome } else { PromptOutcome::Cancelled };
+        if self.resolved_prompts.len() >= RESOLVED_PROMPTS_KEPT {
+            self.resolved_prompts.pop_front();
+        }
+        self.resolved_prompts.push_back((pr.id, applied));
+        self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id, outcome: Some(applied) });
+        applied
+    }
+
     fn answer(&mut self, from: Option<ClientId>, prompt_id: u64, value: Option<String>) {
         let Some(pos) = self.pending_prompts.iter().position(|(p, _)| p.id == prompt_id) else {
-            return; // unknown or already answered — dedup on id
+            // Unknown or already resolved: dedup on id. The client that
+            // sent it is told: its answer changed nothing, and a
+            // client that missed the `PromptResolved` learns what applied.
+            if let Some(c) = from {
+                let reason = match self.resolved_prompts.iter().rev().find(|(id, _)| *id == prompt_id) {
+                    Some((_, outcome)) => format!("prompt {prompt_id} was already resolved: {}", outcome.as_str()),
+                    None => format!("no pending prompt {prompt_id}"),
+                };
+                self.emit(SessionEventWire::Refused { client: c, command: "answer".to_string(), reason });
+            }
+            return;
         };
         let allow_all = value.as_deref().is_some_and(|v| {
             v.trim()
@@ -4516,15 +4552,12 @@ impl SessionActor {
             }
             return; // the prompt stays pending for an eligible client
         }
-        let approved = allow_all
-            || value
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|v| v.eq_ignore_ascii_case("y") || v.eq_ignore_ascii_case("yes"));
         let (prompt, tx) = self.pending_prompts.remove(pos).expect("position");
-        let _ = tx.send(value);
+        let outcome = PromptOutcome::of_answer(&prompt, value.as_deref());
+        // The notices below are about what was applied: a call already gone
+        // took no approval and armed no latch.
+        let approved = self.close_prompt(&prompt, tx, value, outcome) == PromptOutcome::Allowed;
         self.publish_presence();
-        self.emit(SessionEventWire::PromptResolved { prompt_id });
         let by = match from {
             Some(c) => self.client_label(c),
             None => "the host".to_string(),
@@ -4544,7 +4577,7 @@ impl SessionActor {
         }
         // Arming the latch is announced to every attached client, not just
         // the one that pressed the key.
-        if allow_all && prompt.title == CONFIRM_PROMPT_TITLE {
+        if approved && allow_all && prompt.title == CONFIRM_PROMPT_TITLE {
             if let Some(scope) = prompt.confirm_scope.as_ref().filter(|s| !s.extensions.is_empty()) {
                 self.emit(SessionEventWire::SystemNotice(format!(
                     "Allow all armed by {by}: tool-call confirms from {} are auto-approved \
@@ -4997,8 +5030,7 @@ impl SessionActor {
             self.driver_revoke("no clients attached");
             let had_prompts = !self.pending_prompts.is_empty();
             while let Some((pr, tx)) = self.pending_prompts.pop_front() {
-                let _ = tx.send(None);
-                self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+                self.close_prompt(&pr, tx, None, PromptOutcome::Cancelled);
             }
             if had_prompts {
                 self.publish_presence();
@@ -5039,8 +5071,7 @@ impl SessionActor {
         let stopped_workers = await_stopped_workers(self.id.as_str(), stopping).await;
         self.abort_compaction();
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
-            let _ = tx.send(None);
-            self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+            self.close_prompt(&pr, tx, None, PromptOutcome::Cancelled);
         }
         // One bounded wait covers the cancelled turn's save too (queued, not
         // awaited, by `cancel_turn`).
@@ -5651,8 +5682,7 @@ impl SessionActor {
         self.abort_compaction();
         // Outstanding prompts are cancelled (tool sees `None`).
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
-            let _ = tx.send(None);
-            self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+            self.close_prompt(&pr, tx, None, PromptOutcome::Cancelled);
         }
 
         let parked = !self.conv.is_live();

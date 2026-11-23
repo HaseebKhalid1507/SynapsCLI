@@ -880,7 +880,15 @@ pub enum WireSessionEvent {
     /// Digest only — see module docs.
     Conversation { digest: ConversationDigest },
     Prompt { request: PromptRequest },
-    PromptResolved { prompt_id: u64 },
+    /// `outcome`: additive, so no feature flag. An older daemon omits
+    /// it (`None`: the client falls back to what it can infer), an older
+    /// client ignores it, and an outcome newer than this build reads as
+    /// `PromptOutcome::Unknown`.
+    PromptResolved {
+        prompt_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<PromptOutcome>,
+    },
     External { event: crate::events::types::Event },
     AutoTurnCapReached { cap: u32 },
     Idle,
@@ -1212,7 +1220,7 @@ impl From<SessionEventWire> for WireSessionEvent {
             }
             S::Conversation(snapshot) => Self::Conversation { digest: ConversationDigest::of(&snapshot) },
             S::Prompt(request) => Self::Prompt { request },
-            S::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
+            S::PromptResolved { prompt_id, outcome } => Self::PromptResolved { prompt_id, outcome },
             S::External(event) => Self::External { event },
             S::AutoTurnCapReached { cap } => Self::AutoTurnCapReached { cap },
             S::Idle => Self::Idle,
@@ -1274,7 +1282,7 @@ impl From<WireSessionEvent> for SessionEventWire {
             // its mirror before handing the envelope up.
             W::Conversation { digest } => Self::Conversation(digest.into_snapshot(Vec::new())),
             W::Prompt { request } => Self::Prompt(request),
-            W::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
+            W::PromptResolved { prompt_id, outcome } => Self::PromptResolved { prompt_id, outcome },
             W::External { event } => Self::External(event),
             W::AutoTurnCapReached { cap } => Self::AutoTurnCapReached { cap },
             W::Idle => Self::Idle,
@@ -1622,7 +1630,7 @@ mod tests {
             S::TurnStarted { turn_baseline: 6, trigger: TurnTrigger::DriverAuto, user_text: None },
             S::Conversation(conv()),
             S::Prompt(prompt()),
-            S::PromptResolved { prompt_id: 3 },
+            S::PromptResolved { prompt_id: 3, outcome: Some(PromptOutcome::TimedOut) },
             S::External(crate::events::types::Event::simple("cli", "hello", None)),
             S::AutoTurnCapReached { cap: 5 },
             S::Idle,
@@ -1886,6 +1894,45 @@ mod tests {
         let on = SessionQuery::SubagentWatch { handle_id: "sa_1".into(), since: 4, tool_queue: true };
         let back: SessionQuery = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
         assert!(matches!(back, SessionQuery::SubagentWatch { tool_queue: true, .. }));
+    }
+
+    /// `PromptResolved.outcome` both ways: an older daemon's `PromptResolved` (no outcome)
+    /// decodes as `None`; a newer daemon's outcome this build does not know
+    /// decodes as `Unknown`, not a failed event; `None` is not written, so
+    /// the frame an older client gets is the one it always got, and one
+    /// with an outcome decodes in an older client's shape (the field is
+    /// ignored: `WireSessionEvent` does not deny unknown fields).
+    #[test]
+    fn prompt_resolved_outcome_is_additive() {
+        let old: WireSessionEvent = serde_json::from_str(r#"{"ev":"prompt_resolved","prompt_id":7}"#).unwrap();
+        assert!(matches!(old, WireSessionEvent::PromptResolved { prompt_id: 7, outcome: None }), "{old:?}");
+        let newer: WireSessionEvent =
+            serde_json::from_str(r#"{"ev":"prompt_resolved","prompt_id":7,"outcome":"vetoed_by_policy"}"#).unwrap();
+        assert!(
+            matches!(newer, WireSessionEvent::PromptResolved { outcome: Some(PromptOutcome::Unknown), .. }),
+            "{newer:?}"
+        );
+        let none = serde_json::to_string(&WireSessionEvent::PromptResolved { prompt_id: 7, outcome: None }).unwrap();
+        assert_eq!(none, r#"{"ev":"prompt_resolved","prompt_id":7}"#);
+        // An older client's shape: the variant without the field.
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "ev", rename_all = "snake_case")]
+        enum Older {
+            PromptResolved { prompt_id: u64 },
+        }
+        for (o, name) in [
+            (PromptOutcome::Allowed, "allowed"),
+            (PromptOutcome::Denied, "denied"),
+            (PromptOutcome::Answered, "answered"),
+            (PromptOutcome::Cancelled, "cancelled"),
+            (PromptOutcome::TimedOut, "timed_out"),
+        ] {
+            let line = serde_json::to_string(&WireSessionEvent::PromptResolved { prompt_id: 7, outcome: Some(o) }).unwrap();
+            assert_eq!(line, format!(r#"{{"ev":"prompt_resolved","prompt_id":7,"outcome":"{name}"}}"#));
+            assert_eq!(o.as_str(), name);
+            let Older::PromptResolved { prompt_id } = serde_json::from_str(&line).unwrap();
+            assert_eq!(prompt_id, 7);
+        }
     }
 
     #[test]

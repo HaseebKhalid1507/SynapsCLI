@@ -140,7 +140,7 @@ fn session_prompt_activates_pane_and_resolution_by_other_dismisses() {
         },
     )]);
     assert!(h.secret_prompt_active(), "Prompt must activate the pane");
-    h.feed_events(&[agent_engine::session::SessionEventWire::PromptResolved { prompt_id: 7 }]);
+    h.feed_events(&[agent_engine::session::SessionEventWire::PromptResolved { prompt_id: 7, outcome: None }]);
     assert!(!h.secret_prompt_active(), "foreign resolution dismisses");
 }
 
@@ -178,7 +178,7 @@ fn no_confirm_answers_lists_a_confirm_and_never_opens_the_pane() {
         h.sent_commands()
     );
 
-    h.feed_events(&[SessionEventWire::PromptResolved { prompt_id: 7 }]);
+    h.feed_events(&[SessionEventWire::PromptResolved { prompt_id: 7, outcome: None }]);
     let frame = h.snapshot();
     assert!(!frame.contains("Approval waiting"), "cleared: {frame}");
 
@@ -203,6 +203,30 @@ fn session_refused_is_rendered_only_for_me() {
         reason: "input owned by client #2".into(),
     }]);
     assert!(!theirs.contains("refused"), "{theirs}");
+}
+
+/// A late answer's refusal is said in a toast and undoes nothing:
+/// the turn this client submitted keeps streaming, and the text it sent is
+/// not put back in the editor (that undo is for a refused `Submit`).
+#[test]
+fn a_refused_answer_undoes_nothing() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.type_str("sent before the answer");
+    h.key(KeyCode::Enter, KeyModifiers::empty());
+    assert!(h.is_streaming(), "the submit presents its turn");
+    h.feed_event(
+        W::Refused {
+            client: ClientId(1),
+            command: "answer".into(),
+            reason: "prompt 7 was already resolved: cancelled".into(),
+        }
+        .into(),
+    );
+    let frame = h.snapshot();
+    assert!(frame.contains("answer refused"), "{frame}");
+    assert!(h.is_streaming(), "the turn is not ended: {frame}");
+    assert_eq!(h.input_contents(), "", "the sent text is not given back");
 }
 
 #[test]

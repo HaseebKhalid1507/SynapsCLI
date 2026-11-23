@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A resolved prompt says what was applied, and a late answer is refused.**
+  `PromptResolved` carries `outcome`: `allowed`, `denied`, `answered`,
+  `cancelled` (the turn or session ended first, or the waiting call was
+  gone) or `timed_out` (nobody attached by the abandonment deadline). A
+  client no longer has to guess from the tool's result text, where a cancel
+  at the gate reads like a denial. An `Answer` to a prompt that is no longer
+  pending gets `Refused{command: "answer"}` naming what applied, instead of
+  being dropped silently. The TUI shows that refusal as a toast and no
+  longer takes it for the reply to a setting change. Additive on the wire:
+  older daemons omit the field, older clients ignore it, and an outcome a
+  client doesn't know reads as `unknown`.
+
 - **Workers report what they used.** `subagent_status`, `subagent_collect`
   and a worker's completion event (`data.usage`) carry `usage`: provider
   requests (the worker's keep-warm pings included), input / output /

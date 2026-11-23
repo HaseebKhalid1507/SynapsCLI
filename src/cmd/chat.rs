@@ -100,7 +100,7 @@ mod actor {
                         })
                         .await;
                 }
-                SessionEventWire::PromptResolved { prompt_id } => {
+                SessionEventWire::PromptResolved { prompt_id, .. } => {
                     if self.pending_confirm.as_ref().is_some_and(|p| p.id == prompt_id) {
                         self.pending_confirm = None;
                     }

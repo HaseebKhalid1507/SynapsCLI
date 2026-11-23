@@ -594,7 +594,7 @@ pub(super) async fn handle_session_event_arm(
             prompt_bridge.on_prompt(req);
             sync_waiting_confirms(app, prompt_bridge);
         }
-        SessionEventWire::PromptResolved { prompt_id } => {
+        SessionEventWire::PromptResolved { prompt_id, .. } => {
             if prompt_bridge.on_resolved(prompt_id) {
                 app.secret_prompts.dismiss();
                 app.invalidate();
@@ -822,6 +822,14 @@ pub(super) async fn handle_session_event_arm(
             } else if client == me && command == "take_input" {
                 // `/takeover` changes no turn and submitted nothing: no undo.
                 app.push_msg(ChatMessage::Error(format!("/takeover refused: {reason}")));
+            } else if client == me && command == "answer" {
+                // An answer to a prompt that was already resolved, or one
+                // this client may not give. It submitted nothing and
+                // started no turn: say so, undo nothing.
+                app.toasts.upsert(
+                    super::toast::Toast::new("refused", format!("answer refused: {reason}")).titled("Session"),
+                );
+                app.request_redraw();
             } else if client == me {
                 let line = format!("{command} refused: {reason}{}", takeover_hint(&reason, app.observing));
                 let presented = app.streaming && app.turn_baseline == app.api_messages_len;
