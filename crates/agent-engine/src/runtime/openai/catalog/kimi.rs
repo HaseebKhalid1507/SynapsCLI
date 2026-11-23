@@ -77,7 +77,7 @@ pub fn kimi_static_capability(model_id: &str) -> Option<KimiReasoningCapability>
 // Exact ids served by the managed endpoint `https://api.kimi.com/coding/v1`
 // (`GET /models`), verified against the official Kimi Code CLI v0.31.1
 // provisioning output. This is a conservative allowlist: unknown ids fail
-// closed at route resolution, mirroring the xai-auth/google-gemini pattern.
+// closed at route resolution, mirroring the xai-auth pattern.
 
 /// One managed Kimi Code model row (id as served by `/models`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

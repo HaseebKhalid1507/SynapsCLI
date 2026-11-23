@@ -175,7 +175,6 @@ impl Transport {
             || id.is_empty()
             || model.trim() != model
             || model.chars().any(char::is_control)
-            || provider == "google-gemini"
         {
             return Err(UNSUPPORTED_TRANSPORT.into());
         }
@@ -191,10 +190,6 @@ impl Transport {
             }
             (route.wire, route.auth == AuthPolicy::BrokerProxy)
         };
-        if wire == WireProtocol::GoogleGeminiCodeAssist {
-            return Err(UNSUPPORTED_TRANSPORT.into());
-        }
-
         let qualified = format!("{provider}/{id}");
         let known_native = provider == "anthropic"
             && agent_core::models::KNOWN_MODELS
@@ -257,7 +252,6 @@ impl Transport {
             WireProtocol::OpenAiChatCompletions
             | WireProtocol::OpenAiResponses
             | WireProtocol::CodexResponses => advertised(Modality::File),
-            WireProtocol::GoogleGeminiCodeAssist => false,
         };
         Self {
             wire,

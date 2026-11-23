@@ -939,22 +939,9 @@ fn a11_cross_provider_logical_set_equivalence() {
             })
             .collect();
 
-        // Gemini-side: the REAL public provider adapter over the same
-        // projection (internal-only names are dropped by contract; none
-        // are present in this session set — assert that non-vacuously).
-        let gemini_specs = synaps_cli::runtime::google_gemini::translate_tool_schemas(&schemas);
-        let gemini_logical: BTreeSet<String> = gemini_specs
-            .iter()
-            .map(|t| registry.runtime_name_for_api(&t.name).to_string())
-            .collect();
-
         assert_eq!(
             anthropic_logical, openai_logical,
             "[{mode}] OpenAI must expose the same logical tool set"
-        );
-        assert_eq!(
-            anthropic_logical, gemini_logical,
-            "[{mode}] Gemini must expose the same logical tool set"
         );
         assert!(
             anthropic_logical.contains("ext__srv__echo_tool"),

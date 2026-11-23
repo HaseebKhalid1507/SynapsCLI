@@ -34,7 +34,6 @@ pub mod capability_cache;
 mod codex;
 mod generic;
 mod github_copilot;
-mod google_gemini;
 mod groq;
 pub mod kimi;
 pub mod muse;
@@ -66,11 +65,6 @@ pub use github_copilot::{
     CopilotModelDescriptor, CopilotPolicyState, CopilotWire, COPILOT_API_VERSION,
     COPILOT_FALLBACK_MODELS, MAX_MODELS_BODY_BYTES, MODELS_BASE_URL, MODELS_PATH, MODELS_URL,
     PROVIDER_KEY as COPILOT_PROVIDER_KEY, PROVIDER_NAME as COPILOT_PROVIDER_NAME,
-};
-pub use google_gemini::{
-    google_gemini_model, google_gemini_static_catalog_models, GoogleGeminiModelDescriptor,
-    GOOGLE_GEMINI_TEXT_MODELS, PROVIDER_KEY as GOOGLE_GEMINI_PROVIDER_KEY,
-    PROVIDER_NAME as GOOGLE_GEMINI_PROVIDER_NAME,
 };
 pub use groq::{infer_groq_reasoning, parse_groq_catalog_models};
 pub use kimi::{
@@ -377,7 +371,6 @@ pub struct AnthropicCatalogProvider;
 pub struct CodexCatalogProvider;
 pub struct XaiCatalogProvider;
 pub struct GitHubCopilotCatalogProvider;
-pub struct GoogleGeminiCatalogProvider;
 pub struct MuseCatalogProvider;
 pub struct GenericCatalogProvider;
 
@@ -390,7 +383,6 @@ pub fn catalog_provider_for(provider_key: &str) -> &'static dyn ModelCatalogProv
         "openai-codex" => &CodexCatalogProvider,
         "xai-auth" => &XaiCatalogProvider,
         "github-copilot" => &GitHubCopilotCatalogProvider,
-        "google-gemini" => &GoogleGeminiCatalogProvider,
         "muse" => &MuseCatalogProvider,
         _ => &GenericCatalogProvider,
     }
@@ -612,24 +604,6 @@ impl ModelCatalogProvider for GitHubCopilotCatalogProvider {
                 Err(CatalogBrokerError::Failed(err)) => Err(err),
             }
         })
-    }
-}
-
-impl ModelCatalogProvider for GoogleGeminiCatalogProvider {
-    fn provider_key(&self) -> &'static str {
-        "google-gemini"
-    }
-
-    fn fetch<'a>(
-        &'a self,
-        _client: &'a reqwest::Client,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogModel>, String>> + Send + 'a>> {
-        // The Code Assist model-discovery surface is not documented as a
-        // stable third-party API and there is no reviewed live-listing method
-        // in the broker allowlist yet. Fail closed to the conservative static
-        // catalog: text + tool-capable IDs whose provenance is the official
-        // Gemini CLI reference source.
-        Box::pin(async move { Ok(google_gemini_static_catalog_models()) })
     }
 }
 

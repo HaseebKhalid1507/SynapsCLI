@@ -19,7 +19,6 @@ pub enum OAuthProviderId {
     OpenAiCodex,
     Xai,
     GitHubCopilot,
-    GoogleGemini,
     KimiCode,
     Muse,
 }
@@ -31,7 +30,6 @@ impl OAuthProviderId {
             Self::OpenAiCodex => "openai-codex",
             Self::Xai => "xai-auth",
             Self::GitHubCopilot => "github-copilot",
-            Self::GoogleGemini => "google-gemini",
             Self::KimiCode => "kimi-code",
             Self::Muse => "muse",
         }
@@ -52,7 +50,6 @@ impl FromStr for OAuthProviderId {
             "openai-codex" => Ok(Self::OpenAiCodex),
             "xai-auth" => Ok(Self::Xai),
             "github-copilot" => Ok(Self::GitHubCopilot),
-            "google-gemini" => Ok(Self::GoogleGemini),
             "kimi-code" => Ok(Self::KimiCode),
             "muse" => Ok(Self::Muse),
             _ => Err(format!("unknown canonical OAuth provider id: {value}")),
@@ -100,7 +97,6 @@ pub enum ProviderBehavior {
     OpenAiCodex,
     Xai,
     GitHubCopilot,
-    GoogleGemini,
     KimiCode,
     Muse,
 }
@@ -167,7 +163,7 @@ pub fn registry() -> OAuthProviderRegistry {
     OAuthProviderRegistry::validate(DESCRIPTORS, []).expect("built-in OAuth registry must be valid")
 }
 
-pub const DESCRIPTORS: [OAuthProviderDescriptor; 7] = [
+pub const DESCRIPTORS: [OAuthProviderDescriptor; 6] = [
     OAuthProviderDescriptor {
         id: OAuthProviderId::Anthropic,
         display_name: "Claude",
@@ -203,16 +199,6 @@ pub const DESCRIPTORS: [OAuthProviderDescriptor; 7] = [
         behavior: ProviderBehavior::GitHubCopilot,
     },
     OAuthProviderDescriptor {
-        id: OAuthProviderId::GoogleGemini,
-        display_name: "Google Gemini (Code Assist)",
-        description: "Google account OAuth for Gemini CLI / Code Assist (experimental)",
-        recommended: false,
-        // Broker keeps the Google refresh token; runtime only ever sees the
-        // short-lived access token via AccessToken.
-        broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
-        behavior: ProviderBehavior::GoogleGemini,
-    },
-    OAuthProviderDescriptor {
         id: OAuthProviderId::KimiCode,
         display_name: "Kimi Code",
         description: "Kimi account device OAuth for Kimi Code (experimental)",
@@ -236,21 +222,42 @@ pub const DESCRIPTORS: [OAuthProviderDescriptor; 7] = [
     },
 ];
 
+/// The plain refusal for the removed Gemini Code Assist sign-in.
+/// Names the Google AI Studio API-key route; there is no fallback to any
+/// other login.
+pub const REMOVED_GEMINI_CODE_ASSIST_REFUSAL: &str =
+    "Gemini Code Assist sign-in was removed from synaps. For Gemini models use a Google AI \
+     Studio API key: run `synaps login --provider google` and paste the key at the prompt \
+     (or pipe it on stdin), then pick a `google/...` model.";
+
+/// The provider names the removed Gemini Code Assist sign-in answered to.
+/// `google` (AI Studio, API key) is NOT one of them.
+const REMOVED_GEMINI_CODE_ASSIST_NAMES: [&str; 4] =
+    ["google-gemini", "gemini", "gemini-cli", "gemini-code-assist"];
+
+/// `Some(refusal)` when `value` names the removed Gemini Code Assist
+/// sign-in (any case); `None` otherwise. Callers refuse and stop: they never
+/// fall back to another login.
+pub fn removed_provider_refusal(value: &str) -> Option<&'static str> {
+    let lower = value.trim().to_ascii_lowercase();
+    REMOVED_GEMINI_CODE_ASSIST_NAMES
+        .contains(&lower.as_str())
+        .then_some(REMOVED_GEMINI_CODE_ASSIST_REFUSAL)
+}
+
 /// CLI-only normalization. Internal callers must carry the canonical typed ID.
 pub fn parse_cli_provider(value: &str) -> Result<OAuthProviderId, String> {
+    if let Some(refusal) = removed_provider_refusal(value) {
+        return Err(refusal.to_string());
+    }
     match value.to_ascii_lowercase().as_str() {
         "claude" | "anthropic" => Ok(OAuthProviderId::Anthropic),
         "openai-codex" => Ok(OAuthProviderId::OpenAiCodex),
         "xai-auth" => Ok(OAuthProviderId::Xai),
         // Aliases normalize only at CLI parsing; storage key remains github-copilot.
         "github-copilot" | "copilot" | "gh-copilot" => Ok(OAuthProviderId::GitHubCopilot),
-        // CLI aliases only; canonical storage key is "google-gemini".
         // `google` is NOT accepted here: the static provider key "google"
-        // (Google AI Studio, API-key) already claims that CLI token and we
-        // must not silently redirect it to the Code Assist OAuth flow.
-        "google-gemini" | "gemini" | "gemini-cli" | "gemini-code-assist" => {
-            Ok(OAuthProviderId::GoogleGemini)
-        }
+        // (Google AI Studio, API-key) owns that CLI token.
         // CLI aliases only; canonical storage key is "kimi-code".
         // `kimi` is NOT accepted here: the static provider key "kimi"
         // (Moonshot platform, API-key) already claims that CLI token and we
@@ -298,9 +305,6 @@ async fn login_with_persist(
         ProviderBehavior::Xai => super::providers::xai::login_into(persist_key).await,
         ProviderBehavior::GitHubCopilot => {
             super::providers::github_copilot::login_into(persist_key).await
-        }
-        ProviderBehavior::GoogleGemini => {
-            super::providers::google_gemini::login_into(persist_key).await
         }
         ProviderBehavior::KimiCode => super::providers::kimi_code::login_into(persist_key).await,
         ProviderBehavior::Muse => super::providers::muse::login_into(persist_key).await,
@@ -375,9 +379,6 @@ pub async fn refresh(
         ProviderBehavior::GitHubCopilot => {
             super::providers::github_copilot::refresh(client, refresh).await
         }
-        ProviderBehavior::GoogleGemini => {
-            super::providers::google_gemini::refresh(client, refresh).await
-        }
         ProviderBehavior::KimiCode => super::providers::kimi_code::refresh(client, refresh).await,
         ProviderBehavior::Muse => super::providers::muse::refresh(client, refresh).await,
     }
@@ -424,56 +425,45 @@ mod tests {
         assert!(OAuthProviderId::from_str("claude").is_err());
     }
 
+    /// Every name the removed Gemini Code Assist sign-in answered
+    /// to is refused with the plain AI Studio message, in any case, and
+    /// resolves to no OAuth provider (no fallback to another login). The
+    /// AI Studio key `google` is not refused here and is no OAuth alias.
     #[test]
-    fn google_gemini_canonical_id_and_cli_aliases() {
-        // Canonical wire/storage id is exactly "google-gemini".
-        assert_eq!(OAuthProviderId::GoogleGemini.as_str(), "google-gemini");
-        assert_eq!(
-            OAuthProviderId::from_str("google-gemini").unwrap(),
-            OAuthProviderId::GoogleGemini
+    fn removed_gemini_code_assist_names_are_refused_with_the_ai_studio_route() {
+        for name in [
+            "google-gemini",
+            "gemini",
+            "gemini-cli",
+            "gemini-code-assist",
+            "Gemini",
+            "GEMINI-CLI",
+            " Google-Gemini ",
+        ] {
+            assert_eq!(
+                removed_provider_refusal(name),
+                Some(REMOVED_GEMINI_CODE_ASSIST_REFUSAL),
+                "{name}"
+            );
+            assert_eq!(
+                parse_cli_provider(name).unwrap_err(),
+                REMOVED_GEMINI_CODE_ASSIST_REFUSAL,
+                "{name}"
+            );
+            assert!(OAuthProviderId::from_str(name.trim()).is_err(), "{name}");
+        }
+        assert!(REMOVED_GEMINI_CODE_ASSIST_REFUSAL.contains("synaps login --provider google"));
+        assert!(REMOVED_GEMINI_CODE_ASSIST_REFUSAL.contains("AI Studio API key"));
+        // `google` stays the AI Studio key's: not refused, not an OAuth alias.
+        assert_eq!(removed_provider_refusal("google"), None);
+        assert!(parse_cli_provider("google").is_err());
+        assert_ne!(
+            parse_cli_provider("google").unwrap_err(),
+            REMOVED_GEMINI_CODE_ASSIST_REFUSAL
         );
-        // CLI aliases are CLI-only; canonical FromStr must reject them.
-        assert!(OAuthProviderId::from_str("gemini").is_err());
-        assert!(OAuthProviderId::from_str("gemini-cli").is_err());
-        // `google` MUST remain reserved for the static AI-Studio API-key
-        // provider; treating it as a Gemini OAuth alias would silently
-        // redirect existing users' `synaps login --provider google` flow.
-        assert!(
-            parse_cli_provider("google").is_err(),
-            "'google' must not resolve to google-gemini OAuth"
-        );
-        assert_eq!(
-            parse_cli_provider("Gemini").unwrap(),
-            OAuthProviderId::GoogleGemini
-        );
-        assert_eq!(
-            parse_cli_provider("GEMINI-CLI").unwrap(),
-            OAuthProviderId::GoogleGemini
-        );
-        assert_eq!(
-            parse_cli_provider("gemini-code-assist").unwrap(),
-            OAuthProviderId::GoogleGemini
-        );
-        assert_eq!(
-            parse_cli_provider("google-gemini").unwrap(),
-            OAuthProviderId::GoogleGemini
-        );
-
-        let registry = registry();
-        let desc = registry
-            .get(OAuthProviderId::GoogleGemini)
-            .expect("google-gemini descriptor must be registered");
-        assert_eq!(desc.id, OAuthProviderId::GoogleGemini);
-        // Broker keeps refresh; only vends access token + expiry.
-        assert_eq!(
-            desc.broker_strategy,
-            BrokerCredentialStrategy::OAuthAccessToken
-        );
-        assert_eq!(desc.behavior, ProviderBehavior::GoogleGemini);
-        assert!(
-            !desc.recommended,
-            "gemini is experimental — not recommended"
-        );
+        // No descriptor answers to the removed id.
+        assert!(registry().iter().all(|d| d.id.as_str() != "google-gemini"));
+        assert_eq!(registry().iter().count(), DESCRIPTORS.len());
     }
 
     #[test]

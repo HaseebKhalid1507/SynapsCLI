@@ -108,15 +108,6 @@ pub const OAI_RESPONSES_SSE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
-/// Minimal Gemini Code Assist SSE success body.
-pub const GEMINI_SSE: &str = concat!(
-    "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}}\n\n",
-    "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" there\"}]},",
-    "\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":9,",
-    "\"candidatesTokenCount\":4}}}\n\n",
-    "data: [DONE]\n\n",
-);
-
 /// Cloud broker `POST /cloud/invoke` newline-delimited `CloudEvent` body.
 pub const CLOUD_EVENTS: &str = concat!(
     "{\"type\":\"text_delta\",\"delta\":\"cloud \"}\n",

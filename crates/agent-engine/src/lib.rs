@@ -12,6 +12,10 @@ pub mod process_scope;
 pub mod host;
 pub mod mcp;
 pub mod memory_backend;
+// The removed Gemini Code Assist provider stays removed, and the AI Studio
+// key provider and Vertex stay as they were.
+#[cfg(test)]
+mod removed_gemini_tests;
 pub mod runtime;
 pub mod session;
 pub mod skills;
