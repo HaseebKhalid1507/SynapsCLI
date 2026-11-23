@@ -2121,6 +2121,8 @@ mod tests {
                 session_id: None,
                 hook_bus: None,
                 continuation: None,
+                surfaces: None,
+                tool_call_id: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30_000,

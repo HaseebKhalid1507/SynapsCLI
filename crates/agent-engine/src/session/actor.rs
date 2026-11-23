@@ -599,6 +599,9 @@ pub struct SessionActor {
     pub(crate) last_queued_save: Option<super::persister::SnapshotKey>,
     // ── prompts ──
     pub(crate) secret_prompt_handle: SecretPromptHandle,
+    /// Agent cards (agent-ui §3, C4a): the table, the store, and the `ui`
+    /// tool's channel.
+    pub(crate) surfaces: super::surfaces::SurfaceTable,
     pub(crate) secret_prompt_rx: mpsc::UnboundedReceiver<SecretPromptRequest>,
     /// Held across detach; replayed in `AttachSnapshot.pending_prompts`.
     pub(crate) pending_prompts: VecDeque<(PromptRequest, oneshot::Sender<Option<String>>)>,
@@ -817,6 +820,10 @@ impl SessionActor {
         if let Some(clock) = &cfg.message_clock {
             runtime.set_message_clock(clock.clone());
         }
+        // Agent cards: the create override, else `ui.surfaces` (§1.5).
+        let surfaces = super::surfaces::SurfaceTable::new(cfg.surfaces.unwrap_or(config.ui.surfaces));
+        runtime.set_surfaces(surfaces.handle.clone());
+        runtime.set_cards_enabled(surfaces.enabled);
 
         // Shared-inbox files are for whoever is at a keyboard: the gate stays
         // shut until a client owns input (`publish_presence`), so a detached,
@@ -1019,6 +1026,7 @@ impl SessionActor {
             persister: super::persister::Persister::new(agent_core::session_lock::sessions_dir()),
             last_queued_save: None,
             secret_prompt_handle: SecretPromptHandle::new(sp_tx),
+            surfaces,
             secret_prompt_rx,
             pending_prompts: VecDeque::new(),
             next_prompt_id: 1,
@@ -1399,6 +1407,7 @@ impl SessionActor {
             .filter(|_| self.can_end_idle() || self.can_park())
             .and_then(wall);
         let evict_due = self.park_deadline.filter(|_| parked).and_then(wall);
+        let (surfaces_waiting, surfaces_open) = self.surfaces.counts();
         let (title, cost_usd, messages) = if self.conv.is_live() {
             (
                 conversation_title(&self.conv),
@@ -1423,6 +1432,8 @@ impl SessionActor {
             cost_usd,
             messages,
             owning_client: self.owned.as_ref().and_then(|o| o.client),
+            surfaces_waiting,
+            surfaces_open,
         }));
         self.publish_workers();
     }
@@ -1490,7 +1501,7 @@ impl SessionActor {
     /// Why client `c` may not send an input command, if it may not.
     /// `exclusive`: anyone but the owner. `shared`: observers (and clients
     /// that aren't attached); every drive client may.
-    fn input_refusal(&self, c: ClientId) -> Option<String> {
+    pub(crate) fn input_refusal(&self, c: ClientId) -> Option<String> {
         match self.client_input {
             ClientInput::Exclusive => (self.input_owner != Some(c)).then(|| match self.input_owner {
                 Some(o) => format!("input owned by {}", self.client_label(o)),
@@ -2734,11 +2745,14 @@ impl SessionActor {
         let replay = self.settings_replay.clone();
         let journal_present = self.journal_exists();
         let view = self.view.load_full();
+        let (cards_handle, cards_on) = (self.surfaces.handle.clone(), self.surfaces.enabled);
         let build = async move {
             let config: crate::SynapsConfig = (**host.config()).clone();
             // §4: cwd before apply_config — see `create`.
             let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
             runtime.set_event_queue(queue);
+            runtime.set_surfaces(cards_handle);
+            runtime.set_cards_enabled(cards_on);
             let mut sb = if journal_present {
                 crate::engine::setup::resolve_session_and_prompt(
                     &mut runtime,
@@ -3038,6 +3052,7 @@ impl SessionActor {
     /// the turn is live from here either way.
     pub(crate) async fn start_turn(&mut self, trigger: TurnTrigger, user_text: Option<String>) {
         self.cache_keepwarm_turn_started();
+        self.surfaces.turn_started();
         let ct = CancellationToken::new();
         let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
         self.streaming = true;
@@ -3766,6 +3781,12 @@ impl SessionActor {
                 biased;
                 Some(req) = self.secret_prompt_rx.recv() => {
                     let _ = req.response_tx.send(None);
+                    continue;
+                }
+                // A `ui` call made before the tool saw the cancel: served
+                // as ever (a card outlives a user Cancel, §3.9).
+                Some(req) = self.surfaces.tool_rx.recv() => {
+                    self.on_ui_tool(req);
                     continue;
                 }
                 next = tokio::time::timeout_at(deadline, stream.next()) => match next {
@@ -4800,7 +4821,7 @@ impl SessionActor {
             client_input: self.client_input,
             input_owner: self.input_owner,
             display_tail: None,
-            surfaces: Vec::new(),
+            surfaces: self.surfaces.snapshot_cards(),
         }
     }
 
@@ -5928,6 +5949,8 @@ impl SessionTask {
                     None => break EndReason::HostShutdown,
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
+                Some(req) = actor.surfaces.tool_rx.recv() => actor.on_ui_tool(req),
+                _ = super::surfaces::surface_tick(actor.surfaces.committing()) => actor.poll_surfaces(),
                 // A held wake (and its permit) stays queued.
                 _ = queue.notified(), if !actor.holds(WorkSource::QueueWake) => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => {

@@ -36,6 +36,8 @@ pub(crate) fn create_tool_context() -> ToolContext {
             session_id: None,
             hook_bus: None,
             continuation: None,
+            surfaces: None,
+            tool_call_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,

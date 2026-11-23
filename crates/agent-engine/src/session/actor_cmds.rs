@@ -118,6 +118,24 @@ impl SessionActor {
             self.emit(SessionEventWire::QueryResult { id, value });
             return;
         }
+        // `/ui on|off|status` (agent-ui §1.5, T23): this session's agent
+        // cards. Off withdraws the open ones; the tool leaves the next
+        // request (one prompt-cache miss, on an explicit command).
+        if cmd == "ui" {
+            let text = match arg.trim() {
+                "on" => Ok(self.set_cards(true)),
+                "off" => Ok(self.set_cards(false)),
+                "" | "status" => Ok(if self.surfaces.enabled { "cards are on" } else { "cards are off" }.to_string()),
+                other => Err(format!("usage: /ui on|off|status (got {other:?})")),
+            };
+            let value = match text {
+                Ok(text) => serde_json::json!({ "kind": "notice", "event": "ui", "text": text, "on": self.surfaces.enabled }),
+                Err(text) => serde_json::json!({ "kind": "error", "text": text }),
+            };
+            self.publish_presence();
+            self.emit(SessionEventWire::QueryResult { id, value });
+            return;
+        }
         // `/auth reload` is async (broker round-trip), so it cannot live in
         // the sync `handle_engine_command`. Never echoes a token.
         if cmd == "auth" {

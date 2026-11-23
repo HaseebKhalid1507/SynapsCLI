@@ -10,17 +10,22 @@ use crate::tools::catalog::{ToolCatalog, ToolId};
 
 /// The built-in tools a chat is not offered. `context_checkpoint` writes to
 /// a chat's rollover state, so a chat without context management has no use
-/// for it, and it is not worth the catalog tokens there.
+/// for it, and it is not worth the catalog tokens there. `ui` (agent cards)
+/// is withheld until the chat's cards are on (`ui.surfaces`, the create
+/// override or `/ui on`; agent-ui §1.5): not offered, not discoverable.
 ///
 /// This is decided per chat and kept in the chat's own session tool set
 /// ([`chat_tool_set`]). The tools themselves stay in the registry, which
 /// every chat on the host shares: removing one there removed it for all.
-pub(super) fn withheld_tools(context_enabled: bool) -> Vec<ToolId> {
-    if context_enabled {
-        Vec::new()
-    } else {
-        vec![ToolId::builtin("context_checkpoint")]
+pub(super) fn withheld_tools(context_enabled: bool, cards_enabled: bool) -> Vec<ToolId> {
+    let mut withheld = Vec::new();
+    if !context_enabled {
+        withheld.push(ToolId::builtin("context_checkpoint"));
     }
+    if !cards_enabled {
+        withheld.push(ToolId::builtin(crate::tools::ui::UI_TOOL));
+    }
+    withheld
 }
 
 /// The session tool set a turn of a chat starts from: the core
@@ -33,10 +38,11 @@ pub(super) fn chat_tool_set(
     catalog: &ToolCatalog,
     progressive: bool,
     context_enabled: bool,
+    cards_enabled: bool,
     always_loaded: &[ToolId],
 ) -> SessionToolSet {
     super::continuation::context_tool_set(session, catalog, progressive, context_enabled, always_loaded)
-        .withholding(withheld_tools(context_enabled))
+        .withholding(withheld_tools(context_enabled, cards_enabled))
 }
 
 #[cfg(test)]
@@ -87,11 +93,32 @@ mod tests {
     /// disclosure off). The chat with context management may call
     /// `context_checkpoint` and is sent it; the chat without is refused it
     /// and not sent it. Nothing was taken out of the registry.
+    /// Agent cards (agent-ui §1.5): `ui` is registered once, for every
+    /// chat, and offered only to a chat whose cards are on.
+    #[test]
+    fn ui_is_offered_only_to_a_chat_with_cards_on() {
+        let registry = ToolRegistry::new();
+        assert!(registry.get("ui").is_some(), "registered for every chat");
+        for progressive in [false, true] {
+            let on = chat_tool_set(session("on"), registry.catalog(), progressive, false, true, &[]);
+            let off = chat_tool_set(session("off"), registry.catalog(), progressive, false, false, &[]);
+            assert!(!allowed(&registry, &off, "ui"));
+            let sent = registry.tools_schema_without(off.withheld()).unwrap();
+            assert!(!names(&sent).contains(&"ui"));
+            let ui = ToolId::builtin("ui");
+            assert!(off.withheld().any(|id| *id == ui), "withheld");
+            assert!(!on.withheld().any(|id| *id == ui));
+            if !progressive {
+                assert!(allowed(&registry, &on, "ui"));
+            }
+        }
+    }
+
     #[test]
     fn two_chats_on_one_registry_are_each_offered_their_own_tools() {
         let registry = ToolRegistry::new();
-        let has = chat_tool_set(session("has"), registry.catalog(), false, true, &[]);
-        let lacks = chat_tool_set(session("lacks"), registry.catalog(), false, false, &[]);
+        let has = chat_tool_set(session("has"), registry.catalog(), false, true, true, &[]);
+        let lacks = chat_tool_set(session("lacks"), registry.catalog(), false, false, true, &[]);
         assert!(allowed(&registry, &has, "context_checkpoint"));
         assert!(!allowed(&registry, &lacks, "context_checkpoint"));
         assert!(registry.get("context_checkpoint").is_some(), "stays registered");
@@ -131,8 +158,8 @@ mod tests {
         let registry = ToolRegistry::new();
         let catalog = registry.catalog();
         let checkpoint = ToolId::builtin("context_checkpoint");
-        let has = chat_tool_set(session("has"), catalog, true, true, &[]);
-        let mut lacks = chat_tool_set(session("lacks"), catalog, true, false, &[]);
+        let has = chat_tool_set(session("has"), catalog, true, true, true, &[]);
+        let mut lacks = chat_tool_set(session("lacks"), catalog, true, false, true, &[]);
         assert!(allowed(&registry, &has, "context_checkpoint"));
         assert!(!allowed(&registry, &lacks, "context_checkpoint"));
 
@@ -152,7 +179,7 @@ mod tests {
         // deferred case is the bare progressive core with the same (empty)
         // withheld list.
         let mut offered = SessionToolSet::progressive_core_with(session("offered"), catalog, &[])
-            .withholding(withheld_tools(true));
+            .withholding(withheld_tools(true, true));
         assert!(!allowed(&registry, &offered, "context_checkpoint"));
         assert!(deferred(&offered).contains(&"context_checkpoint".to_string()));
         let found = search(&registry, offered.clone()).await;
@@ -174,7 +201,7 @@ mod tests {
         for progressive in [false, true] {
             let mut registry = ToolRegistry::new();
             let id = session("lacks");
-            let lacks = chat_tool_set(id.clone(), registry.catalog(), progressive, false, &[]);
+            let lacks = chat_tool_set(id.clone(), registry.catalog(), progressive, false, true, &[]);
             registry.register(Arc::new(Late));
             assert!(lacks.is_stale(registry.catalog()));
             let (rebuilt, _) = crate::runtime::stream::rebuild_stale_tool_set(

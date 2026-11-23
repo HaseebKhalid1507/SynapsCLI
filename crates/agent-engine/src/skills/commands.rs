@@ -205,6 +205,8 @@ fn command_tool_context(chat: CommandChat<'_>) -> ToolContext {
             session_id: chat.session_id.map(str::to_string),
             hook_bus: None,
             continuation: None,
+            surfaces: None,
+            tool_call_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 30_000,

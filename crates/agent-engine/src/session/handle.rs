@@ -41,6 +41,10 @@ pub struct Presence {
     /// session waits for its owner to bind or re-bind). Always `None` for a
     /// session that is not owned (`SessionHandle::is_owned`).
     pub owning_client: Option<ClientId>,
+    /// Agent cards (agent-ui §2.7): open cards a tool waits on, and open
+    /// live cards.
+    pub surfaces_waiting: u32,
+    pub surfaces_open: u32,
     // PR 3: `saved: daemon::saved::SavedFacts` (the actor driver), with
     // `chain_facts` walked at create from the `parent_session` headers, so
     // the hub can retire a session as the row `CatalogPage` will list.
@@ -432,6 +436,8 @@ impl SessionHandle {
         m.title = p.title;
         m.cost_usd = p.cost_usd;
         m.messages = p.messages;
+        m.surfaces_waiting = p.surfaces_waiting;
+        m.surfaces_open = p.surfaces_open;
         m.workers = (**self.workers.load()).clone();
         m
     }

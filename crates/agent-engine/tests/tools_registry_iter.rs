@@ -105,11 +105,11 @@ fn iter_tools_sorted_is_deterministic_across_calls() {
     assert_eq!(first_call, expected, "order must be ascending alphabetical");
 }
 
-// ─── 3. Builtin registry (ToolRegistry::new) — 26 tools in sorted order ─────
+// ─── 3. Builtin registry (ToolRegistry::new) — 27 tools in sorted order ─────
 
-/// 26 builtins; the hardened build (`--no-default-features`) has no `bash`
+/// 27 builtins; the hardened build (`--no-default-features`) has no `bash`
 /// and no `shell_start`/`shell_send`/`shell_end`.
-const BUILTIN_COUNT: usize = if cfg!(feature = "command-exec") { 26 } else { 22 };
+const BUILTIN_COUNT: usize = if cfg!(feature = "command-exec") { 27 } else { 23 };
 
 fn is_command_exec_tool(name: &str) -> bool {
     name == "bash" || name.starts_with("shell_")
@@ -155,6 +155,7 @@ fn iter_tools_sorted_on_default_registry_has_18_tools_in_order() {
         "subagent_start",
         "subagent_status",
         "subagent_steer",
+        "ui",
         "write",
     ];
 

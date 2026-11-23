@@ -48,6 +48,7 @@ mod registry;
 pub mod respond;
 pub mod send_channel;
 pub mod shell;
+pub mod ui;
 pub(crate) mod util;
 pub(crate) mod utf8_stream;
 pub(crate) use util::expand_path;
@@ -212,6 +213,13 @@ pub struct ToolCapabilities {
     /// chat: the tool refuses there. (A worker carries its own state, which
     /// is never enabled, and its registry has no such tool.)
     pub continuation: Option<crate::runtime::continuation::SharedContinuation>,
+    /// The session actor's end for the `ui` tool (agent cards, C4a).
+    /// `None` wherever no actor serves cards: the tool says `unavailable`.
+    pub surfaces: Option<ui::SurfaceToolHandle>,
+    /// This call's `tool_use` id, set per call by the stream loop
+    /// ([`TurnToolContext::for_tool_call`]). The `ui` tool binds its card
+    /// to it (§2.2 `call_id`). `None` in a turn's own context.
+    pub tool_call_id: Option<String>,
 }
 
 impl ToolCapabilities {
@@ -362,6 +370,17 @@ impl TurnToolContext {
             capabilities: self.0.capabilities.clone(),
             limits: self.0.limits.clone(),
         }
+    }
+
+    /// [`Self::for_call`] for the call with this `tool_use` id.
+    pub fn for_tool_call(
+        &self,
+        tx_delta: Option<crate::tools::output::DeltaSender>,
+        tool_call_id: &str,
+    ) -> ToolContext {
+        let mut ctx = self.for_call(tx_delta);
+        ctx.capabilities.tool_call_id = Some(tool_call_id.to_string());
+        ctx
     }
 
     pub fn capabilities(&self) -> &ToolCapabilities {

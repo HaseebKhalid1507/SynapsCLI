@@ -356,6 +356,11 @@ pub struct SessionConfig {
     /// journal, restored into the new actor's conversation cell.
     #[serde(skip)]
     pub restore_conversation: Option<RestoredConversation>,
+    /// Agent cards for this session at create (agent-ui §1.5): `Some(on)`
+    /// overrides `ui.surfaces`; `None` follows it. `/ui on|off` changes it
+    /// later. An older daemon ignores the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surfaces: Option<bool>,
 }
 
 /// A reloaded actor's conversation cell (`SessionConfig::restore_conversation`).
@@ -412,6 +417,7 @@ impl Default for SessionConfig {
             message_clock: None,
             owned: None,
             restore_conversation: None,
+            surfaces: None,
         }
     }
 }

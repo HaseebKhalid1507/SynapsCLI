@@ -742,6 +742,12 @@ pub struct Runtime {
     /// byte-for-byte so activations and late registrations never change the
     /// cached prompt prefix. Outer `None` = not rendered yet.
     tool_catalog_prompt: Arc<std::sync::Mutex<Option<Option<String>>>>,
+    /// Agent cards (agent-ui §1.5): the session actor's end for the `ui`
+    /// tool, and whether this chat's cards are on. Clones share the flag,
+    /// so `/ui on|off` reaches every copy. Off, the chat is not offered
+    /// `ui` and its turns carry no handle.
+    surfaces: Option<crate::tools::ui::SurfaceToolHandle>,
+    cards_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// The `SessionToolSet` retained for `host_tool_session` across stream
     /// turns (exact activations are session-scoped). Minted empty with the
     /// runtime and shared by `Clone`, exactly like `host_tool_session`.
@@ -1042,6 +1048,8 @@ impl Runtime {
             message_clock: Default::default(),
             host_tool_session: fresh_host_tool_session(),
             tool_catalog_prompt: Arc::new(std::sync::Mutex::new(None)),
+            surfaces: None,
+            cards_enabled: Default::default(),
             retained_tool_set: Default::default(),
             pending_tool_restore: Default::default(),
             session_id: None,
@@ -1136,6 +1144,33 @@ impl Runtime {
         }
     }
 
+    /// The session actor's end for the `ui` tool (set once, at spawn).
+    pub fn set_surfaces(&mut self, handle: crate::tools::ui::SurfaceToolHandle) {
+        self.surfaces = Some(handle);
+    }
+
+    /// Turn this chat's cards on or off (agent-ui §1.5). A change re-renders
+    /// the frozen tool catalog: one prompt-cache miss, on an explicit user
+    /// command or at create.
+    pub fn set_cards_enabled(&self, on: bool) {
+        use std::sync::atomic::Ordering;
+        if self.cards_enabled.swap(on, Ordering::SeqCst) != on {
+            *self
+                .tool_catalog_prompt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
+    pub fn cards_enabled(&self) -> bool {
+        self.cards_enabled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// What a turn's tools get for `ui`: the actor's end while cards are on.
+    fn turn_surfaces(&self) -> Option<crate::tools::ui::SurfaceToolHandle> {
+        self.surfaces.clone().filter(|_| self.cards_enabled())
+    }
+
     /// The progressive-disclosure catalog of activatable tools for the
     /// system prompt, frozen per session (see `tool_catalog_prompt`). `None`
     /// when progressive disclosure is off, model-initiated activation is
@@ -1165,6 +1200,7 @@ impl Runtime {
                     registry.catalog(),
                     true,
                     self.context_management_enabled(),
+                    self.cards_enabled(),
                     &self.tools_always_loaded,
                 );
                 let core: std::collections::HashSet<String> = core_set
@@ -1689,7 +1725,8 @@ impl Runtime {
     /// the host's and holds every chat's tools, so its own
     /// [`ToolRegistry::tools_schema`] is not what any one chat sends.
     pub async fn offered_tools_schema(&self) -> Arc<Vec<Value>> {
-        let withheld = chat_tools::withheld_tools(self.context_management_enabled());
+        let withheld =
+            chat_tools::withheld_tools(self.context_management_enabled(), self.cards_enabled());
         let registry = self.tools.read().await;
         registry
             .tools_schema_without(&withheld)
@@ -3366,6 +3403,7 @@ impl Runtime {
             subagent_registry,
             event_queue,
             secret_prompt,
+            surfaces: self.turn_surfaces(),
             hook_bus: self.hook_bus.clone(),
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
@@ -3508,6 +3546,8 @@ impl Clone for Runtime {
             // can never share session grants.
             host_tool_session: self.host_tool_session.clone(),
             tool_catalog_prompt: Arc::clone(&self.tool_catalog_prompt),
+            surfaces: self.surfaces.clone(),
+            cards_enabled: Arc::clone(&self.cards_enabled),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
             pending_tool_restore: std::sync::Arc::clone(&self.pending_tool_restore),
             // Clones serve the same conversation.

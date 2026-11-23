@@ -3,7 +3,7 @@
 //! Spawns the real `synaps` binary (via CARGO_BIN_EXE_synaps) and asserts
 //! the contract described in the P13 acceptance criteria:
 //!   - Output is valid JSON
-//!   - Contains all 26 builtin tools
+//!   - Contains all 27 builtin tools
 //!   - Each tool's parameters is a valid JSON Schema (object-typed, has `properties`)
 //!   - Output is deterministic across runs (byte-identical)
 //!   - `--pretty` output matches the committed docs/tools.json (drift-check contract)
@@ -43,7 +43,7 @@ fn run_export(extra_args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("synaps tools export output is valid UTF-8")
 }
 
-/// The 26 builtin tool names from docs/tools.json (alphabetical, authoritative).
+/// The 27 builtin tool names from docs/tools.json (alphabetical, authoritative).
 #[cfg(feature = "command-exec")]
 const EXPECTED_TOOL_NAMES: &[&str] = &[
     "activate_tools",
@@ -71,6 +71,7 @@ const EXPECTED_TOOL_NAMES: &[&str] = &[
     "subagent_start",
     "subagent_status",
     "subagent_steer",
+    "ui",
     "write",
 ];
 
@@ -90,7 +91,7 @@ fn export_pretty_produces_valid_json() {
         .expect("`synaps tools export --pretty` output must be parseable as valid JSON");
 }
 
-// ─── Test 2: Output contains all 26 builtin tools ────────────────────────────
+// ─── Test 2: Output contains all 27 builtin tools ────────────────────────────
 
 // docs/tools.json and the tool count describe the default build; the
 // hardened (--no-default-features) binary has no bash/shell_* tools.
@@ -103,8 +104,8 @@ fn export_contains_all_24_builtin_tools() {
 
     assert_eq!(
         manifest.len(),
-        26,
-        "export must contain exactly 26 builtin tools, got {}: {:?}",
+        27,
+        "export must contain exactly 27 builtin tools, got {}: {:?}",
         manifest.len(),
         manifest
             .iter()

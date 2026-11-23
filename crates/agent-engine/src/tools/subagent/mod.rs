@@ -1060,8 +1060,8 @@ mod codex_ultra_worker_tests {
     /// The stream loop's serial and parallel lane each making a call's
     /// context from the turn's one tool context.
     const BOTH_LANES: [&str; 2] = [
-        "tool.execute_rich(input, dispatch_tools.for_call(",
-        "t.execute_rich(input, dispatch_tools_inner.for_call(",
+        "tool.execute_rich(input, dispatch_tools.for_tool_call(",
+        "t.execute_rich(input, dispatch_tools_inner.for_tool_call(",
     ];
 
     #[test]

@@ -78,6 +78,12 @@ impl ToolRegistry {
             // because every chat on the host shares this registry. Primary
             // registry only: a worker has no rollover state of this kind.
             Arc::new(crate::tools::context_checkpoint::ContextCheckpointTool {}),
+            // Agent cards (agent-ui §1.4). One stateless instance for every
+            // chat: a call goes to its own session's actor through the
+            // call's context. Withheld from a chat until its cards are on
+            // (`chat_tools::withheld_tools`). Primary registry only: a
+            // worker has no user to ask.
+            Arc::new(crate::tools::ui::UiTool),
         ];
         // Arbitrary command-execution tools are only present when the
         // `command-exec` feature is enabled (default). A `--no-default-features`
@@ -1113,9 +1119,10 @@ mod tests {
         // extension serves one).
         assert_eq!(
             registry.tools_schema().len(),
-            26 + usize::from(cfg!(windows))
+            27 + usize::from(cfg!(windows))
         );
         assert!(registry.get("context_checkpoint").is_some());
+        assert!(registry.get("ui").is_some());
         for name in ["forum_post", "forum_read", "forum_forget"] {
             assert!(registry.get(name).is_none(), "{name} is no longer built in");
         }

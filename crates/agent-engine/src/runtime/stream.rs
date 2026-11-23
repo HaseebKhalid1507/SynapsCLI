@@ -212,6 +212,8 @@ pub(super) struct StreamSession {
     /// Shared per-session "already warned" set (T5 dedup fix).
     pub(super) env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
+    /// The session actor's end for the `ui` tool (agent cards).
+    pub(super) surfaces: Option<crate::tools::ui::SurfaceToolHandle>,
     pub(super) auto_approve_confirms: bool,
     /// Session "Allow all" latch shared with the owning [`Runtime`].
     pub(super) session_allow_all: Arc<crate::tools::SessionConfirmLatch>,
@@ -779,6 +781,7 @@ impl StreamMethods {
             env_stripped,
             env_warned,
             secret_prompt,
+            surfaces,
             auto_approve_confirms,
             session_allow_all,
             telemetry_level,
@@ -942,6 +945,7 @@ impl StreamMethods {
                 registry.catalog(),
                 progressive_tool_disclosure,
                 context_enabled,
+                surfaces.is_some(),
                 &tools_always_loaded,
             );
             retain_session_tool_set(
@@ -1011,6 +1015,8 @@ impl StreamMethods {
                 session_id: session_id.clone(),
                 hook_bus: Some(hook_bus.clone()),
                 continuation: Some(continuation.clone()),
+                surfaces: surfaces.clone(),
+                tool_call_id: None,
             },
             crate::tools::ToolLimits {
                 max_tool_output,
@@ -2387,7 +2393,7 @@ impl StreamMethods {
                                         &input,
                                         cwd.as_deref(),
                                     );
-                                    match await_tool_call(&cancel, tool.execute_rich(input, dispatch_tools.for_call(Some(tx_d)))).await {
+                                    match await_tool_call(&cancel, tool.execute_rich(input, dispatch_tools.for_tool_call(Some(tx_d), &tool_id))).await {
                                         (Some(res), _) => {
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks) = match res {
@@ -2832,7 +2838,7 @@ impl StreamMethods {
                                     );
                                     let tx_d = delta_channel.sender;
 
-                                    match await_tool_call(&cancel_token, t.execute_rich(input, dispatch_tools_inner.for_call(Some(tx_d)))).await {
+                                    match await_tool_call(&cancel_token, t.execute_rich(input, dispatch_tools_inner.for_tool_call(Some(tx_d), &tool_id))).await {
                                         (Some(res), _) => {
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks, errored) = match res {
@@ -4536,6 +4542,7 @@ mod rich_output_tests {
             env_stripped: Vec::new(),
             env_warned: Default::default(),
             secret_prompt: None,
+            surfaces: None,
             auto_approve_confirms: true,
             session_allow_all: Arc::new(crate::tools::SessionConfirmLatch::new()),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
@@ -6605,6 +6612,7 @@ mod rich_output_tests {
             env_stripped: Vec::new(),
             env_warned: Default::default(),
             secret_prompt: None,
+            surfaces: None,
             auto_approve_confirms: true,
             session_allow_all: Arc::new(crate::tools::SessionConfirmLatch::new()),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,

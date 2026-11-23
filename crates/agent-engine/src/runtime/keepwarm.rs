@@ -625,6 +625,7 @@ impl Runtime {
                 tools_snapshot.catalog(),
                 true,
                 context_enabled,
+                self.cards_enabled(),
                 &self.tools_always_loaded,
             );
             // The SAME selection a turn start makes (`retain_session_tool_set`),
@@ -672,7 +673,7 @@ impl Runtime {
             });
             (Some(Arc::new(schema)), split)
         } else {
-            let withheld = super::chat_tools::withheld_tools(context_enabled);
+            let withheld = super::chat_tools::withheld_tools(context_enabled, self.cards_enabled());
             (tools_snapshot.tools_schema_without(&withheld), None)
         };
 

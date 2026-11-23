@@ -987,6 +987,16 @@ pub struct EventsConfig {
     pub auto_turn_cap: u32,
 }
 
+/// Agent cards (`agent-ui` §1.5): `ui.surfaces = off | on`, whether a
+/// session offers the `ui` tool and can create cards. **Off** until C6.
+/// A session's create-time override and `/ui on|off` take precedence.
+/// Protocol support (`agent_surfaces` in `Welcome.features`) is the
+/// build's, never this setting's.
+#[derive(Debug, Clone, Default)]
+pub struct UiConfig {
+    pub surfaces: bool,
+}
+
 /// Default for `events.auto_turn_cap` — mirrors `engine::reactor::AUTO_TURN_CAP`.
 pub const DEFAULT_AUTO_TURN_CAP: u32 = 5;
 
@@ -1496,6 +1506,8 @@ pub struct SynapsConfig {
     pub server: ServerConfig,
     pub auth: AuthConfig,
     pub events: EventsConfig,
+    /// `ui.*`: agent cards (off by default).
+    pub ui: UiConfig,
     pub provider_keys: BTreeMap<String, String>,
     pub keybinds: std::collections::HashMap<String, String>,
     /// Typed per-role turn budgets (Task 23, spec §8.1).
@@ -1571,6 +1583,7 @@ impl Default for SynapsConfig {
             server: ServerConfig::default(),
             auth: AuthConfig::default(),
             events: EventsConfig::default(),
+            ui: UiConfig::default(),
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
             turn_budgets: TurnBudgetsConfig::default(),
@@ -2402,6 +2415,13 @@ fn apply_config_content_with(
                     ));
                 }
             }
+            "ui.surfaces" => match val.trim().to_lowercase().as_str() {
+                "on" | "true" | "1" | "yes" => config.ui.surfaces = true,
+                "off" | "false" | "0" | "no" => config.ui.surfaces = false,
+                _ => config.warnings.push(format!(
+                    "ui.surfaces = {val} — expected on or off; keeping off"
+                )),
+            },
             "session_persistence" => {
                 match crate::core::session_journal::SessionPersistence::parse(val) {
                     Some(mode) => config.session_persistence = mode,

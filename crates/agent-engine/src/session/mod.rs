@@ -29,6 +29,7 @@ pub use session_start::testing as session_start_testing;
 pub mod socket_transport;
 pub mod transport;
 pub mod types;
+pub(crate) mod surfaces;
 pub mod view;
 pub mod wire;
 

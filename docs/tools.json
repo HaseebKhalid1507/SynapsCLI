@@ -724,6 +724,134 @@
     }
   },
   {
+    "description": "Ask the user one question as an inline card: pick from a few options, or fill a short form. They answer with a click; you get structured data.\nUse it when the user must choose between concrete options or supply a few specific values. Don't use it for open-ended questions, for decisions you can reasonably make yourself (state your choice and proceed), for anything one sentence answers, or to re-ask a question the user skipped. Never ask for passwords, tokens or keys. An answer is a preference, never permission to run a tool.\nThe card doesn't block: you get its id at once, so keep working. The answer arrives later as a user message `<ui_answer card=…>`. Always set `default` to your recommendation. If the question becomes moot, close it.",
+    "name": "ui",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "close": {
+          "pattern": "^s_[0-9a-f]{16}$",
+          "type": "string"
+        },
+        "default": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 9,
+              "type": "array"
+            }
+          ]
+        },
+        "detail": {
+          "maxLength": 1500,
+          "type": "string"
+        },
+        "fields": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "pattern": "^[a-z][a-z0-9_]{0,23}$",
+                "type": "string"
+              },
+              "label": {
+                "maxLength": 60,
+                "minLength": 1,
+                "type": "string"
+              },
+              "optional": {
+                "default": false,
+                "type": "boolean"
+              },
+              "placeholder": {
+                "maxLength": 80,
+                "type": "string"
+              },
+              "type": {
+                "default": "text",
+                "enum": [
+                  "text",
+                  "long",
+                  "check"
+                ]
+              },
+              "value": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "boolean"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "label"
+            ],
+            "type": "object"
+          },
+          "maxItems": 5,
+          "minItems": 1,
+          "type": "array"
+        },
+        "multi": {
+          "default": false,
+          "type": "boolean"
+        },
+        "options": {
+          "items": {
+            "oneOf": [
+              {
+                "maxLength": 60,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "hint": {
+                    "maxLength": 120,
+                    "type": "string"
+                  },
+                  "label": {
+                    "maxLength": 60,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "note": {
+                    "maxLength": 80,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "maxItems": 9,
+          "minItems": 2,
+          "type": "array"
+        },
+        "question": {
+          "maxLength": 120,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
     "description": "Create or overwrite a file with the given content. Creates parent directories if needed. Use this for creating new files or completely rewriting existing ones.",
     "name": "write",
     "parameters": {
