@@ -3843,7 +3843,9 @@ impl SessionActor {
                 },
                 StreamEvent::Agent(AgentEvent::SteeringDelivered { ref message }) => {
                     self.note_steering_delivered(message);
-                    self.emit(SessionEventWire::Stream(event));
+                    if !self.is_handed_answer(&event) {
+                        self.emit(SessionEventWire::Stream(event));
+                    }
                 }
                 StreamEvent::Session(SessionEvent::Usage { .. }) => {
                     self.record_usage(&event);
@@ -4045,10 +4047,13 @@ impl SessionActor {
         // context-head checkpoint is actor-internal (its receipt is ours to
         // complete) and must not reach clients: the wire has no such event
         // and maps it to `Done`, which ended the turn on socket clients.
+        // A card answer steered into the turn isn't the user's typing: its
+        // receipt is the card (agent-ui §3.5), so no client draws its text.
         if !matches!(
             event,
             StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. })
-        ) {
+        ) && !self.is_handed_answer(&event)
+        {
             self.emit(SessionEventWire::Stream(event.clone()));
         }
 
@@ -4078,8 +4083,9 @@ impl SessionActor {
             Continue,
             AutoSendQueued(String),
             AutoTriggerEvents,
-            /// T11: an answer that may start a turn (§3.9) entered history.
-            AnswerWake,
+            /// T11: answers with consent entered history (§3.9); their
+            /// ids, checked again at the start itself (R3-H2).
+            AnswerWake(Vec<String>),
             Failed,
         }
         let mut after = After::Continue;
@@ -4150,9 +4156,9 @@ impl SessionActor {
                 let answers_wake = self.flush_handed_answers();
                 if let Some(queued) = self.conv.queued_message.take() {
                     after = After::AutoSendQueued(queued);
-                } else if answers_wake {
+                } else if !answers_wake.is_empty() {
                     self.request_save();
-                    after = After::AnswerWake;
+                    after = After::AnswerWake(answers_wake);
                 } else if had_pending {
                     self.request_save();
                     after = After::AutoTriggerEvents;
@@ -4218,17 +4224,25 @@ impl SessionActor {
                 ));
                 self.start_turn(TurnTrigger::QueuedAuto, Some(user_text)).await;
             }
-            After::AnswerWake => {
+            After::AnswerWake(answers) => {
                 if self.config.auto_compact {
                     self.post_turn_chat().await;
                 }
+                // A compaction that starts now takes the answers with it
+                // and starts nothing (fail-safe: no turn without consent).
                 if self.compact.is_some() {
                     return;
                 }
-                // Human input (an answer is the user's): a `User` turn, the
-                // auto-turn count starts over (§2.1, §3.5).
-                self.consecutive_auto_turns = 0;
-                self.start_turn(TurnTrigger::User, None).await;
+                // Consent at the start itself (R3-H2): a stop since `Done`
+                // withdrew it. An armed driver runs the session's turns.
+                if self.driver.is_none() && answers.iter().any(|a| self.may_wake(a)) {
+                    // Human input (an answer is the user's): a `User` turn,
+                    // the auto-turn count starts over (§2.1, §3.5).
+                    self.consecutive_auto_turns = 0;
+                    self.start_turn(TurnTrigger::User, None).await;
+                } else {
+                    self.announce_idle().await;
+                }
             }
             After::AutoTriggerEvents => {
                 if self.config.auto_compact {

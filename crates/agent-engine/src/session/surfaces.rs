@@ -750,12 +750,9 @@ impl SessionActor {
 
     /// One `surface` upsert per card whose committed state changed (§2.3):
     /// the pump sends each only to clients whose catalog covers it.
-    fn emit_card_changes(&mut self, before: &Option<Sidecar>, after: &Option<Sidecar>) {
-        let Some(after) = after else {
-            return;
-        };
+    pub(crate) fn emit_card_changes(&mut self, before: &Sidecar, after: &Sidecar) {
         for c in &after.cards {
-            let prev = before.as_ref().and_then(|b| b.card(&c.state.id));
+            let prev = before.card(&c.state.id);
             if prev != Some(&c.state) {
                 self.emit(SessionEventWire::Surface(Box::new(c.state.clone())));
             }
@@ -1117,6 +1114,7 @@ impl SessionActor {
             return;
         };
         let mut handed = std::mem::take(&mut self.surfaces.handed);
+        let mut noted = false;
         for (answer_id, text, in_context) in &mut handed {
             let hit = history.iter_mut().rev().find(|m| {
                 m.get("role").and_then(Value::as_str) == Some("user")
@@ -1130,10 +1128,14 @@ impl SessionActor {
             }
             if !*in_context {
                 *in_context = true;
+                noted = true;
                 self.note_delivery(answer_id, ui::Delivery::InContext);
             }
         }
         self.surfaces.handed = handed;
+        if noted {
+            self.surfaces_commit_noted();
+        }
         // The `ui` results: one mark per user message, listing its cards.
         for (call_id, card) in self.surfaces.results.clone() {
             let hit = history.iter_mut().rev().find(|m| {
@@ -1162,24 +1164,39 @@ impl SessionActor {
         }
     }
 
+    /// A `SteeringDelivered` for an answer this turn was handed (T6).
+    pub(crate) fn is_handed_answer(&self, event: &crate::StreamEvent) -> bool {
+        match event {
+            crate::StreamEvent::Agent(crate::AgentEvent::SteeringDelivered { message }) => {
+                self.surfaces.handed.iter().any(|(_, text, _)| text == message)
+            }
+            _ => false,
+        }
+    }
+
     /// T11: the turn ended with answers handed but never adopted: into
-    /// history, in ledger order. `true`: one of them may start a turn now.
-    pub(crate) fn flush_handed_answers(&mut self) -> bool {
+    /// history, in ledger order. Returns those that may start a turn.
+    pub(crate) fn flush_handed_answers(&mut self) -> Vec<String> {
         let handed = std::mem::take(&mut self.surfaces.handed);
         self.surfaces.results.clear();
-        let mut wake = false;
+        let mut wake = Vec::new();
         for (answer_id, _, in_context) in handed {
-            if !in_context && self.push_answer(&answer_id) {
-                wake |= self.may_wake(&answer_id);
+            if !in_context && self.push_answer(&answer_id) && self.may_wake(&answer_id) {
+                wake.push(answer_id);
             }
+        }
+        if !wake.is_empty() || self.surfaces.open().is_some_and(|o| o.images.has_uncommitted()) {
+            self.surfaces_commit_noted();
         }
         wake
     }
 
     /// The tail of an interrupted turn (T12, T15–T17): the stop raises the
     /// epoch, then answers handed but never adopted go in after the marker,
-    /// and no turn starts. `completed`: the engine had finished the turn.
-    pub(crate) fn surfaces_interrupted(&mut self, reason: crate::engine::interrupt::InterruptReason, completed: bool) {
+    /// and no turn starts. A turn the engine had already finished
+    /// (`_completed`) still raises it: a cancel withdraws consent either way
+    /// (the conservative reading).
+    pub(crate) fn surfaces_interrupted(&mut self, reason: crate::engine::interrupt::InterruptReason, _completed: bool) {
         use crate::engine::interrupt::InterruptReason as R;
         let kind = match reason {
             R::User => ui::StopKind::User,
@@ -1187,9 +1204,7 @@ impl SessionActor {
             R::Restart => ui::StopKind::Reload,
             R::Crash | R::Unknown => ui::StopKind::Crash,
         };
-        if !completed {
-            self.surfaces_stop(kind);
-        }
+        self.surfaces_stop(kind);
         let handed = std::mem::take(&mut self.surfaces.handed);
         self.surfaces.results.clear();
         for (answer_id, _, in_context) in handed {
