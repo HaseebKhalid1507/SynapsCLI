@@ -123,8 +123,8 @@ impl SessionActor {
         // request (one prompt-cache miss, on an explicit command).
         if cmd == "ui" {
             let text = match arg.trim() {
-                "on" => Ok(self.set_cards(true)),
-                "off" => Ok(self.set_cards(false)),
+                "on" => self.set_cards(true).await,
+                "off" => self.set_cards(false).await,
                 "" | "status" => Ok(if self.surfaces.enabled { "cards are on" } else { "cards are off" }.to_string()),
                 other => Err(format!("usage: /ui on|off|status (got {other:?})")),
             };

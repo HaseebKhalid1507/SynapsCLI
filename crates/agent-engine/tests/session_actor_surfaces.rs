@@ -621,3 +621,72 @@ async fn a_failed_reload_barrier_is_the_checkpoints_reply() {
     until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
     end(&mut a).await;
 }
+
+// ── availability (R2-M5, §1.5, Appendix B #31) ──────────────────────────────
+
+async fn ui_command(t: &mut LocalTransport, id: u64, arg: &str) -> serde_json::Value {
+    t.send(SessionCommand::EngineCommand { id, name: "ui".into(), arg: arg.into() }).await.unwrap();
+    let seen = until(t, |e| matches!(e, SessionEventWire::QueryResult { id: q, .. } if *q == id)).await;
+    let SessionEventWire::QueryResult { value, .. } = &seen.last().unwrap().event else { unreachable!() };
+    value.clone()
+}
+
+/// Global off (the default), the create override on: a capable desk's
+/// answer is accepted and starts the turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn global_off_create_override_on_a_capable_desk_answers() {
+    let _h = Home::new();
+    let (_handle, mut a, card, hits) = with_card(&[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Leave it"}))).await.unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    until(&mut a, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    end(&mut a).await;
+}
+
+/// `/ui on` on an existing connection: the next turn's model can raise a
+/// card, and the same client answers it, with no reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn ui_on_works_on_an_existing_connection() {
+    let _h = Home::new();
+    let (url, _) = stub_seq(&[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(SessionConfig { persist: true, ..cfg() }).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
+    assert_eq!(ui_command(&mut a, 7, "on").await["on"], true);
+    a.send(submit("ask me")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let card = cards(&seen).pop().expect("a card after /ui on");
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    end(&mut a).await;
+}
+
+/// `/ui off` with an open live card (T23): withdrawn and durable before the
+/// reply; an answer sent anyway is `resolved`; the tool is withheld.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn ui_off_withdraws_open_live_cards() {
+    let _h = Home::new();
+    let (handle, mut a, card, hits) = with_card(&[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
+    let v = ui_command(&mut a, 8, "off").await;
+    assert_eq!(v["on"], false, "{v}");
+    assert_eq!(v["text"], "cards are off: open cards were withdrawn");
+    let journal = handle.meta_live().journal_id;
+    let path = agent_engine::core::session_lock::sessions_dir().join(format!("{journal}.ui"));
+    let sc = agent_engine::core::session_surfaces::decode_sidecar(&std::fs::read(&path).unwrap()).unwrap();
+    let on_disk = sc.card(&card.id).expect("retained");
+    assert_eq!(on_disk.phase, Phase::Withdrawn, "durable before the reply");
+    assert!(on_disk.offers.is_empty());
+    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
+    let r = result_for(&mut a, A1).await;
+    assert_eq!((r.outcome, r.reason), (SurfaceOutcome::Refused, Some(SurfaceRefusal::Resolved)));
+    assert_eq!(handle.meta_live().surfaces_open, 0);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    end(&mut a).await;
+}

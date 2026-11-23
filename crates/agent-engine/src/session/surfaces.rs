@@ -377,26 +377,25 @@ fn user_text(msg: &Value) -> Option<String> {
 impl SessionActor {
     /// Cards on or off for this session (`/ui on|off`, the create override).
     /// Off withdraws every open card and makes receipts final, durable
-    /// before the reply (T23). Returns the reply line.
-    pub(crate) fn set_cards(&mut self, on: bool) -> String {
-        self.config.surfaces = Some(on);
+    /// before the reply (T23): a withdrawal that isn't published refuses
+    /// `/ui off`; one still unknown at the budget says "turning off…".
+    /// Returns the reply line.
+    pub(crate) async fn set_cards(&mut self, on: bool) -> Result<String, String> {
         let was = self.surfaces.enabled;
-        self.surfaces.enabled = on;
-        if self.runtime.is_live() {
-            self.runtime.set_cards_enabled(on);
-        }
         if on {
-            return if was { "cards are already on".into() } else { "cards are on".into() };
+            self.cards_enabled_now(true);
+            return Ok(if was { "cards are already on".into() } else { "cards are on".into() });
         }
         if !was {
-            return "cards are already off".into();
+            return Ok("cards are already off".into());
         }
         let open: Vec<String> = self
             .surfaces
             .open()
-            .map(|o| o.images.live())
-            .map(|live| {
-                live.cards
+            .map(|o| {
+                o.images
+                    .live()
+                    .cards
                     .iter()
                     .filter(|c| c.state.phase == Phase::Open || !c.state.offers.is_empty())
                     .map(|c| c.state.id.clone())
@@ -404,15 +403,39 @@ impl SessionActor {
             })
             .unwrap_or_default();
         if open.is_empty() {
-            return "cards are off".into();
+            self.cards_enabled_now(false);
+            return Ok("cards are off".into());
+        }
+        let budget = self.surfaces_budget().unwrap_or(ss::COMMIT_BUDGET);
+        if !self.join_surfaces(budget).await {
+            return Err("cards: the card store didn't answer; try /ui off again".into());
         }
         if let Store::Open(o) = &mut self.surfaces.store {
             for card in open {
                 o.images.note(Op::Close { card });
             }
         }
-        self.surfaces_commit_noted();
-        "cards are off: open cards were withdrawn".into()
+        match self.commit_durable(None, budget) {
+            Ok(()) => {
+                self.cards_enabled_now(false);
+                self.publish_presence();
+                Ok("cards are off: open cards were withdrawn".into())
+            }
+            // Unknown: off now; the final upsert follows the outcome.
+            Err(_) if self.surfaces.committing() => {
+                self.cards_enabled_now(false);
+                Ok("cards: turning off…".into())
+            }
+            Err(e) => Err(format!("cards: couldn't withdraw the open cards ({e}); they stay on")),
+        }
+    }
+
+    fn cards_enabled_now(&mut self, on: bool) {
+        self.config.surfaces = Some(on);
+        self.surfaces.enabled = on;
+        if self.runtime.is_live() {
+            self.runtime.set_cards_enabled(on);
+        }
     }
 
     /// Open the store on first use. A chat with a sidecar opened it at load
