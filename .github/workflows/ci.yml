@@ -117,6 +117,10 @@ jobs:
       # grep's and find's in-process search (FIFOs, symlinks, O_NONBLOCK) on
       # BSD libc.
       - run: cargo test --locked -p synaps-engine --lib -- tools::search tools::grep tools::find
+      # The agent-card sidecar's crash consistency (agent-ui §7, the C2 exit
+      # gate) must hold on macOS too: its rename and directory-sync
+      # semantics differ from Linux's.
+      - run: cargo test --locked -p synaps-core --test ui_c2_exit_gate --test ui_c2_sidecar
 
   # Nothing else compiles for Windows, so Windows-only breakage landed
   # unnoticed: `dev` stopped building there when the Unix-socket daemon
