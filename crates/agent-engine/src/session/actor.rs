@@ -5802,11 +5802,12 @@ impl SessionActor {
         }
         if self.streaming {
             self.cancel_turn(interrupt).await;
-        } else {
-            // Agent cards (T16): the session ending is a system stop.
-            self.surfaces_stop(crate::ui::StopKind::System);
         }
+        // Agent cards (T16): the session ending is a system stop, after
+        // whatever the cancelled turn's tail did.
+        self.surfaces_stop(crate::ui::StopKind::System);
         self.abort_compaction();
+        self.surfaces_flush().await;
         // Outstanding prompts are cancelled (tool sees `None`).
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
             let _ = tx.send(None);

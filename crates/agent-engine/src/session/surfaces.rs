@@ -77,7 +77,64 @@ fn sessions_fs() -> std::io::Result<Arc<dyn UiFs>> {
     let dir = agent_core::core::private_fs::ConfinedDir::create_absolute_no_symlinks(
         &agent_core::session_lock::sessions_dir(),
     )?;
-    Ok(Arc::new(ss::ConfinedUiFs::new(dir)))
+    let fs: Arc<dyn UiFs> = Arc::new(ss::ConfinedUiFs::new(dir));
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(control) = std::env::var_os("SYNAPS_TEST_UI_FS") {
+        return Ok(Arc::new(ControlledFs { inner: fs, control: control.into() }));
+    }
+    Ok(fs)
+}
+
+/// Test builds only: `SYNAPS_TEST_UI_FS=<file>` lets the daemon-level card
+/// tests steer a real daemon's card store. The file is read before each
+/// write and sync: comma-separated `stall:<ms>` (the write waits first,
+/// past the commit budget), `fail` (the write fails before the rename),
+/// `syncfail` (the directory sync fails). Empty or absent: the real store.
+#[cfg(all(unix, any(test, feature = "testing")))]
+struct ControlledFs {
+    inner: Arc<dyn UiFs>,
+    control: std::path::PathBuf,
+}
+
+#[cfg(all(unix, any(test, feature = "testing")))]
+impl ControlledFs {
+    fn words(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.control)
+            .unwrap_or_default()
+            .split(',')
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty())
+            .collect()
+    }
+}
+
+#[cfg(all(unix, any(test, feature = "testing")))]
+impl UiFs for ControlledFs {
+    fn write_atomic(&self, name: &str, data: &[u8]) -> Result<(), ss::WriteFailure> {
+        let words = self.words();
+        if let Some(ms) = words.iter().find_map(|w| w.strip_prefix("stall:")?.parse::<u64>().ok()) {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+        if words.iter().any(|w| w == "fail") {
+            return Err(ss::WriteFailure { published: false, error: std::io::Error::other("injected: before the rename") });
+        }
+        self.inner.write_atomic(name, data)
+    }
+    fn sync_dir(&self) -> std::io::Result<()> {
+        if self.words().iter().any(|w| w == "syncfail") {
+            return Err(std::io::Error::other("injected: the directory sync"));
+        }
+        self.inner.sync_dir()
+    }
+    fn read(&self, name: &str, max: usize) -> std::io::Result<ss::ReadBack> {
+        self.inner.read(name, max)
+    }
+    fn remove(&self, name: &str) -> std::io::Result<()> {
+        self.inner.remove(name)
+    }
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        self.inner.rename(from, to)
+    }
 }
 
 #[cfg(not(unix))]
@@ -1613,6 +1670,18 @@ pub(crate) struct Handoff {
 impl SessionActor {
     fn surfaces_budget(&self) -> Option<Duration> {
         self.surfaces.open().map(|o| o.store.config().budget)
+    }
+
+    /// The session is ending (T16): its stop, and whatever was in flight,
+    /// is durable before it goes, within the store's budget.
+    pub(crate) async fn surfaces_flush(&mut self) {
+        let Some(budget) = self.surfaces_budget() else {
+            return;
+        };
+        self.surfaces_commit_noted();
+        if !self.join_surfaces(budget).await {
+            tracing::warn!(session = %self.id, "agent cards: the last commit was still unknown when the session ended");
+        }
     }
 
     /// Join the in-flight commit, and whatever it set off, within `budget`.
