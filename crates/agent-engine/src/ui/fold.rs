@@ -156,10 +156,12 @@ pub struct Fold {
     pub unmatched: Vec<FoldedAnswer>,
 }
 
-/// Fold an API history (`role`/`content` messages) into its `ui` calls.
-pub fn fold_history(messages: &[Value]) -> Fold {
+/// Fold an API history (`role`/`content` messages, owned or shared) into
+/// its `ui` calls.
+pub fn fold_history<M: std::borrow::Borrow<Value>>(messages: &[M]) -> Fold {
     let mut fold = Fold::default();
     for msg in messages {
+        let msg = msg.borrow();
         match msg["role"].as_str() {
             Some("assistant") => {
                 for block in blocks(msg) {

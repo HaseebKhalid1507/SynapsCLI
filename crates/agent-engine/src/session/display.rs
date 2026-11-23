@@ -9,8 +9,10 @@
 //! No TUI types here — this crate never depends on agent-tui.
 
 use agent_core::core::extension_context::{self, user_content};
+use agent_core::core::ui_types::{Answer, AnswerStatus, MARK_KEY};
 use serde::{Deserialize, Serialize};
 
+use crate::ui::fold::{fold_answer, fold_history, Fold, Outcome};
 use crate::SharedMessage;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,12 +37,159 @@ pub struct DisplayTail {
     /// Clients use [`DisplayTail::time`], never index it directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub times: Vec<Option<String>>,
+    /// The daemon's fold of each item (agent-ui §2.5, v3.2): what history's
+    /// host marks prove about a `ui` call or a host answer. Parallel to
+    /// `items` and empty when no item has one, like `times`; older readers
+    /// ignore it. Clients use [`DisplayTail::ui_item`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ui: Vec<Option<UiItem>>,
 }
 
 impl DisplayTail {
     /// The recorded time of `items[i]`, if any.
     pub fn time(&self, i: usize) -> Option<&str> {
         self.times.get(i)?.as_deref()
+    }
+
+    /// The fold result of `items[i]`, if any.
+    pub fn ui_item(&self, i: usize) -> Option<&UiItem> {
+        self.ui.get(i)?.as_ref()
+    }
+}
+
+/// One item's fold result (agent-ui §2.5): `{"answer":{…}}` on a `User` item
+/// the daemon folded as a host answer (its values are in the item's text),
+/// `{"call":{…}}` on a `ToolUse{ui}` item. Never a new [`DisplayItem`]
+/// variant: that enum has no `#[serde(other)]`, so older clients would
+/// fail on one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiItem {
+    Answer {
+        card: String,
+        answer: String,
+        rev: u32,
+        status: AnswerStatus,
+        late: bool,
+    },
+    Call {
+        outcome: UiOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<String>,
+        /// Only on `answered`: a `wait` result's values, which the Digest
+        /// otherwise lacks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        values: Option<Answer>,
+    },
+}
+
+/// What history proves about a `ui` call ([`Outcome`], on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiOutcome {
+    Shown,
+    Answered,
+    Skipped,
+    Pending,
+    Closed,
+    Unconfirmed,
+    NotRecorded,
+    NoCard,
+}
+
+impl UiItem {
+    fn call(outcome: &Outcome) -> Self {
+        let (o, card, answer, values) = match outcome {
+            Outcome::NotRecorded => (UiOutcome::NotRecorded, None, None, None),
+            Outcome::NoCard => (UiOutcome::NoCard, None, None, None),
+            Outcome::Shown { card } => (UiOutcome::Shown, Some(card), None, None),
+            Outcome::Answered {
+                card,
+                answer_id,
+                answer,
+            } => (
+                UiOutcome::Answered,
+                Some(card),
+                Some(answer_id),
+                Some(answer.clone()),
+            ),
+            Outcome::Skipped { card, answer_id } => {
+                (UiOutcome::Skipped, Some(card), Some(answer_id), None)
+            }
+            Outcome::Pending { card } => (UiOutcome::Pending, Some(card), None, None),
+            Outcome::Closed { card } => (UiOutcome::Closed, Some(card), None, None),
+            Outcome::Unconfirmed { card } => (UiOutcome::Unconfirmed, Some(card), None, None),
+        };
+        UiItem::Call {
+            outcome: o,
+            card: card.cloned(),
+            answer: answer.cloned(),
+            values,
+        }
+    }
+}
+
+/// The fold of `msgs`, when anything in them can fold: a host mark or a
+/// `ui` call. One cheap scan otherwise.
+fn fold_of(msgs: &[SharedMessage]) -> Option<Fold> {
+    let any = msgs.iter().any(|m| {
+        m.get(MARK_KEY).is_some()
+            || m["content"].as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b["type"] == "tool_use" && b["name"] == "ui")
+            })
+    });
+    any.then(|| fold_history(msgs))
+}
+
+/// The fold results of `items`, the display items of `msg`, in order.
+fn ui_of(
+    msg: &serde_json::Value,
+    items: &[DisplayItem],
+    fold: Option<&Fold>,
+) -> Vec<Option<UiItem>> {
+    let mut out = vec![None; items.len()];
+    let Some(fold) = fold else {
+        return out;
+    };
+    // A host answer is its message's first item (its text, as sent).
+    if msg["role"] == "user" && user_content(msg).is_string() {
+        if let (Some(a), Some(slot)) = (fold_answer(msg), out.first_mut()) {
+            *slot = Some(UiItem::Answer {
+                card: a.card,
+                answer: a.answer_id,
+                rev: a.rev,
+                status: a.status,
+                late: a.late,
+            });
+        }
+    }
+    for (item, slot) in items.iter().zip(out.iter_mut()) {
+        if let DisplayItem::ToolUse {
+            tool_id, tool_name, ..
+        } = item
+        {
+            if tool_name == "ui" {
+                *slot = fold
+                    .calls
+                    .iter()
+                    .find(|c| &c.call_id == tool_id)
+                    .map(|c| UiItem::call(&c.outcome));
+            }
+        }
+    }
+    out
+}
+
+/// `ui` for items projected from messages: dropped when none has one.
+fn item_ui(ui: Vec<Option<UiItem>>) -> Vec<Option<UiItem>> {
+    if ui.iter().all(Option::is_none) {
+        Vec::new()
+    } else {
+        ui
     }
 }
 
@@ -163,17 +312,23 @@ pub fn display_items(msgs: &[SharedMessage]) -> Vec<DisplayItem> {
     out
 }
 
-/// Every display item of `msgs` with its message's time.
-fn timed_items(msgs: &[SharedMessage]) -> (Vec<DisplayItem>, Vec<Option<String>>) {
+/// Every display item of `msgs` with its message's time and its fold.
+type Projected = (Vec<DisplayItem>, Vec<Option<String>>, Vec<Option<UiItem>>);
+
+fn timed_items(msgs: &[SharedMessage]) -> Projected {
+    let fold = fold_of(msgs);
     let mut items = Vec::new();
     let mut times = Vec::new();
+    let mut ui = Vec::new();
     for m in msgs {
+        let start = items.len();
         items_of(m, &mut items);
         if times.len() < items.len() {
             times.resize(items.len(), time_of(m));
+            ui.extend(ui_of(m, &items[start..], fold.as_ref()));
         }
     }
-    (items, times)
+    (items, times, ui)
 }
 
 /// The last `max_items` display items (`0` = unbounded). Walks from the back
@@ -181,11 +336,19 @@ fn timed_items(msgs: &[SharedMessage]) -> (Vec<DisplayItem>, Vec<Option<String>>
 /// so a 20 MB history costs O(tail) allocations + one O(n) scan.
 pub fn display_tail(msgs: &[SharedMessage], max_items: usize) -> DisplayTail {
     if max_items == 0 {
-        let (items, times) = timed_items(msgs);
-        return DisplayTail { items, omitted: 0, times: item_times(times) };
+        let (items, times, ui) = timed_items(msgs);
+        return DisplayTail {
+            items,
+            omitted: 0,
+            times: item_times(times),
+            ui: item_ui(ui),
+        };
     }
+    // The fold reads the whole history (a result or an answer can come long
+    // after its call); only the tail is projected.
+    let fold = fold_of(msgs);
     // Per-message item groups, newest first, until we hold >= max_items.
-    let mut groups: Vec<(Vec<DisplayItem>, Option<String>)> = Vec::new();
+    let mut groups: Vec<(Vec<DisplayItem>, Option<String>, Vec<Option<UiItem>>)> = Vec::new();
     let mut held = 0usize;
     let mut idx = msgs.len();
     while idx > 0 && held < max_items {
@@ -194,23 +357,32 @@ pub fn display_tail(msgs: &[SharedMessage], max_items: usize) -> DisplayTail {
         items_of(&msgs[idx], &mut g);
         held += g.len();
         let at = if g.is_empty() { None } else { time_of(&msgs[idx]) };
-        groups.push((g, at));
+        let ui = ui_of(&msgs[idx], &g, fold.as_ref());
+        groups.push((g, at, ui));
     }
     // Items before `idx` were never projected: count them without cloning.
     let mut omitted: usize = msgs[..idx].iter().map(|m| count_items_of(m)).sum();
     let mut items: Vec<DisplayItem> = Vec::with_capacity(held);
     let mut times: Vec<Option<String>> = Vec::with_capacity(held);
-    for (g, at) in groups.into_iter().rev() {
+    let mut ui: Vec<Option<UiItem>> = Vec::with_capacity(held);
+    for (g, at, u) in groups.into_iter().rev() {
         times.extend(std::iter::repeat_n(at, g.len()));
         items.extend(g);
+        ui.extend(u);
     }
     if items.len() > max_items {
         let extra = items.len() - max_items;
         items.drain(..extra);
         times.drain(..extra);
+        ui.drain(..extra);
         omitted += extra;
     }
-    DisplayTail { items, omitted, times: item_times(times) }
+    DisplayTail {
+        items,
+        omitted,
+        times: item_times(times),
+        ui: item_ui(ui),
+    }
 }
 
 #[cfg(test)]
@@ -373,5 +545,162 @@ mod tests {
         assert_eq!(old.time(0), None);
         let round: DisplayTail = serde_json::from_value(serde_json::to_value(&all).unwrap()).unwrap();
         assert_eq!(round, all);
+    }
+
+    mod ui {
+        use super::*;
+        use crate::ui::answer::{format_answer_message, AnswerMessage};
+        use agent_core::core::ui_types::Choice;
+        use serde_json::{json, Value};
+
+        const CARD: &str = "s_3f2a91c0d4e2a871";
+        const ANS: &str = "a_6c1d4b7e9f203a58";
+
+        fn m(v: Value) -> SharedMessage {
+            Arc::new(v)
+        }
+
+        fn call(id: &str, input: Value) -> SharedMessage {
+            m(
+                json!({"role": "assistant", "content": [{"type": "text", "text": "asking"},
+                {"type": "tool_use", "id": id, "name": "ui", "input": input}]}),
+            )
+        }
+
+        fn result(id: &str, content: Value, mark: Option<Value>) -> SharedMessage {
+            let mut v = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id,
+                "content": content.to_string()}]});
+            if let Some(mark) = mark {
+                v[MARK_KEY] = mark;
+            }
+            m(v)
+        }
+
+        fn answer_text() -> String {
+            format_answer_message(&AnswerMessage {
+                card: CARD.into(),
+                answer_id: ANS.into(),
+                q: "Which approach?".into(),
+                status: AnswerStatus::Answered,
+                rev: 1,
+                values: Answer {
+                    choice: Some(Choice::One("Refactor the parser".into())),
+                    ..Answer::default()
+                },
+                asked: None,
+            })
+        }
+
+        fn answered(marked: bool) -> SharedMessage {
+            let mut v = json!({"role": "user", "content": answer_text()});
+            if marked {
+                v[MARK_KEY] = json!({"l": "9b1f", "card": CARD, "answer": ANS, "rev": 1, "status": "answered"});
+            }
+            m(v)
+        }
+
+        fn question() -> Value {
+            json!({"question": "Which approach?", "options": ["Refactor the parser", "Rewrite from scratch"]})
+        }
+
+        fn history() -> Vec<SharedMessage> {
+            vec![
+                user("refactor the parser"),
+                call("toolu_1", question()),
+                result(
+                    "toolu_1",
+                    json!({"status": "shown", "id": CARD}),
+                    Some(json!({"l": "9b1f", "results": [{"card": CARD, "answer": null}]})),
+                ),
+                answered(true),
+                // A look-alike typed by the user: no mark, typed text.
+                answered(false),
+                call("toolu_2", question()),
+                m(
+                    json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2",
+                    "is_error": true, "content": "blocks: unknown parameter"}]}),
+                ),
+                call("toolu_3", question()),
+            ]
+        }
+
+        /// `ui` is the daemon's fold, parallel to `items`: a proven `ui`
+        /// call's outcome, a marked host answer, nothing for typed text or
+        /// other items; an error result is a tool row (`no_card`), a call
+        /// without evidence `not_recorded`.
+        #[test]
+        fn the_tail_carries_the_fold() {
+            let tail = display_tail(&history(), 0);
+            assert_eq!(tail.ui.len(), tail.items.len());
+            let call = |o, card: Option<&str>| UiItem::Call {
+                outcome: o,
+                card: card.map(str::to_string),
+                answer: None,
+                values: None,
+            };
+            let expect = vec![
+                None, // "refactor the parser"
+                None, // "asking"
+                Some(call(UiOutcome::Shown, Some(CARD))),
+                Some(UiItem::Answer {
+                    card: CARD.into(),
+                    answer: ANS.into(),
+                    rev: 1,
+                    status: AnswerStatus::Answered,
+                    late: false,
+                }),
+                None, // the look-alike
+                None,
+                Some(call(UiOutcome::NoCard, None)),
+                None,
+                Some(call(UiOutcome::NotRecorded, None)),
+            ];
+            assert_eq!(tail.ui, expect, "{:?}", tail.items);
+            assert_eq!(tail.ui_item(3), expect[3].as_ref());
+            // On the wire, as §2.5 writes it.
+            let wire = serde_json::to_value(&tail).unwrap();
+            assert_eq!(
+                wire["ui"][2],
+                json!({"call": {"outcome": "shown", "card": CARD}})
+            );
+            assert_eq!(
+                wire["ui"][3],
+                json!({"answer": {"card": CARD, "answer": ANS, "rev": 1, "status": "answered", "late": false}})
+            );
+            assert_eq!(wire["ui"][8], json!({"call": {"outcome": "not_recorded"}}));
+            assert_eq!(serde_json::from_value::<DisplayTail>(wire).unwrap(), tail);
+        }
+
+        /// A capped tail keeps `ui` parallel: the fold still reads the whole
+        /// history (a result folds its call even when the call's message
+        /// is the tail's first), and only the tail is projected.
+        #[test]
+        fn a_capped_tail_keeps_the_fold_parallel() {
+            let full = display_tail(&history(), 0);
+            for cap in 1..=full.items.len() {
+                let tail = display_tail(&history(), cap);
+                assert_eq!(tail.items.len(), cap);
+                let from = full.items.len() - cap;
+                let want = item_ui(full.ui[from..].to_vec());
+                assert_eq!(tail.ui, want, "cap {cap}");
+            }
+        }
+
+        /// No `ui` call and no mark: no `ui` on the wire (older readers see
+        /// the tail they always did).
+        #[test]
+        fn no_fold_no_field() {
+            let msgs = vec![
+                user("hi"),
+                assistant(json!([{"type": "text", "text": "yo"}])),
+            ];
+            let tail = display_tail(&msgs, 0);
+            assert!(tail.ui.is_empty());
+            assert!(serde_json::to_value(&tail).unwrap().get("ui").is_none());
+            // An older daemon's tail (no field) reads as no fold.
+            let old: DisplayTail =
+                serde_json::from_value(json!({"items": [], "omitted": 0})).unwrap();
+            assert!(old.ui.is_empty());
+        }
     }
 }
