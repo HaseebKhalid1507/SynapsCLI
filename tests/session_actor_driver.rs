@@ -1903,3 +1903,143 @@ async fn a_turn_waiting_for_on_session_start_outlasts_a_rejected_driver_start() 
     assert_eq!(start_seam::calls(&actor.handle.journal_id()), calls + 1, "the hook ran once");
     actor.end().await;
 }
+
+// ── cache expiry across a driver-selected model (Shady #436 R5-1) ───────────
+
+/// Every request: an answer that wrote 2k to the prompt cache with the 1h
+/// TTL (and read 18k), so a turn leaves cache evidence for `Status`.
+const SSE_CACHED_1H: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c1\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":18000,",
+    "\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":2000}}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":1,",
+    "\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":18000,",
+    "\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":2000}}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// No idle pings (nothing but the turns writes the cache); 1h requested.
+const NO_KEEPWARM_1H: &str = "cache_keepwarm = off\ncache_ttl = 1h\n";
+
+/// The plugin's favorite (`stub_host`): the driver's model, B. The session's
+/// own is [`MODEL`], A.
+const DRIVER_MODEL: &str = "claude-fable-5-1";
+
+impl TestActor {
+    /// `Status{cache: true}`, as this client.
+    async fn cache_status(&mut self, id: u64) -> serde_json::Value {
+        self.t
+            .send_from_self(SessionCommand::Query {
+                id,
+                query: agent_engine::session::SessionQuery::Status { cache: true },
+            })
+            .await
+            .unwrap();
+        match self
+            .until(|e| matches!(e, SessionEventWire::QueryResult { id: i, .. } if *i == id))
+            .await
+        {
+            SessionEventWire::QueryResult { value, .. } => value,
+            _ => unreachable!(),
+        }
+    }
+
+    /// `Set{Model}`, as this client; it applies.
+    async fn set_model(&mut self, id: u64, model: &str) {
+        self.t
+            .send_from_self(SessionCommand::Set {
+                id,
+                setting: agent_engine::session::SessionSetting::Model { model: model.into() },
+            })
+            .await
+            .unwrap();
+        match self
+            .until(|e| matches!(e, SessionEventWire::SettingChanged(a) if a.id == id))
+            .await
+        {
+            SessionEventWire::SettingChanged(a) => assert!(a.ok, "{model}: {:?}", a.message),
+            _ => unreachable!(),
+        }
+    }
+
+    /// One driver turn (`--turns 1`) on the driver's model, then the plugin
+    /// stops it. Nothing is sent to the session after `DriverStart`.
+    async fn one_driver_turn(&mut self) {
+        self.send(SessionCommand::DriverStart {
+            plugin: "autonomous".into(),
+            command: "auto".into(),
+            arg: "start --turns 1 -- test task".into(),
+        })
+        .await;
+        match self
+            .until(|e| matches!(e, SessionEventWire::DriverTurnOutcome { .. }))
+            .await
+        {
+            SessionEventWire::DriverTurnOutcome { outcome, .. } => {
+                assert!(matches!(outcome, Outcome::Success), "{outcome:?}")
+            }
+            _ => unreachable!(),
+        }
+        match self
+            .until(|e| matches!(e, SessionEventWire::DriverRevoked { .. }))
+            .await
+        {
+            SessionEventWire::DriverRevoked { reason, .. } => {
+                assert!(reason.contains("owner requested stop"), "{reason}")
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// A session on A; the driver commits B and B's turn writes 1h. The next
+/// command is `Set{A}`: no `Status` (or anything) in between, so only the
+/// driver's commit can have moved the model fence. A's cache is cold: B's
+/// write is not A's. Then A's own turn proves its own TTL (Shady #436
+/// R5-1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_switch_back_after_a_driver_turn_on_another_model_is_cold() {
+    hermetic_base_dir::pin();
+    let guard = HomeGuard::new();
+    let (host, _temp) = stub_host(&guard, Script::Sse(SSE_CACHED_1H), NO_KEEPWARM_1H).await;
+    let mut actor = session(&host).await;
+    actor.one_driver_turn().await;
+    actor.set_model(1601, MODEL).await;
+    let st = actor.cache_status(1602).await;
+    assert_eq!(st["model"], MODEL, "{st}");
+    assert!(st["cache"].is_null(), "B's write, under the driver, is not A's: {st}");
+    actor
+        .send(SessionCommand::Submit { text: "hello".into(), attachments: vec![] })
+        .await;
+    actor.until(|e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    actor.until(|e| matches!(e, SessionEventWire::Idle)).await;
+    let st = actor.cache_status(1603).await;
+    assert_eq!(st["cache"]["ttl"], "1h", "A's own write: {st}");
+    actor.end().await;
+}
+
+/// A session on A; the driver commits B and B's turn writes 1h. B stays
+/// the model: its own write is its warm cache (the commit's fence must not
+/// forget the lifetime B's turn reports into).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_driver_turn_s_write_is_its_model_s_cache() {
+    hermetic_base_dir::pin();
+    let guard = HomeGuard::new();
+    let (host, _temp) = stub_host(&guard, Script::Sse(SSE_CACHED_1H), NO_KEEPWARM_1H).await;
+    let mut actor = session(&host).await;
+    actor.one_driver_turn().await;
+    let st = actor.cache_status(1611).await;
+    assert!(st["model"].as_str().is_some_and(|m| m.ends_with(DRIVER_MODEL)), "{st}");
+    assert_eq!(st["cache"]["ttl"], "1h", "B's own write: {st}");
+    actor.end().await;
+}
