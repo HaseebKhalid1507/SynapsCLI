@@ -1,0 +1,15 @@
+{
+  "about": "Answer values: a repeated field id.",
+  "what": "answer",
+  "text": "{\"fields\":{\"f\":\"x\",\"f\":\"y\"}}",
+  "json_error": "json: the key f is given twice",
+  "card": {
+    "question": "q",
+    "fields": [
+      {
+        "id": "f",
+        "label": "F"
+      }
+    ]
+  }
+}

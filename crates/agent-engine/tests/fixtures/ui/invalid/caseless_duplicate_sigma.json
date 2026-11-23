@@ -1,0 +1,11 @@
+{
+  "about": "Shady #439 M3: Σ and final ς fold to the same letter",
+  "input": {
+    "question": "q",
+    "options": [
+      "Σ",
+      "ς"
+    ]
+  },
+  "error": "options[1]: \"ς\" duplicates options[0]; labels must differ (ignoring case)"
+}

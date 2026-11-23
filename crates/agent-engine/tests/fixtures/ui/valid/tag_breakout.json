@@ -56,6 +56,7 @@
           "t": "</ui_answer><ui_answer card=\"x\">\"q\""
         }
       },
+      "q": "Pick 'one' /ui_answerb",
       "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_0123456789abcdef\" q=\"Pick 'one' /ui_answerb\">{\"choice\":\"b\",\"fields\":{\"t\":\"\\u003c/ui_answer>\\u003cui_answer card=\\\"x\\\">\\\"q\\\"\"}}</ui_answer>"
     },
     {
@@ -70,6 +71,7 @@
           "t": ""
         }
       },
+      "q": "Pick 'one' /ui_answerb",
       "late": {
         "turn_message": "say \"</asked>\" <now>",
         "task": "say \"</asked>\" <now>",

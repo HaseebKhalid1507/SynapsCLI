@@ -1,0 +1,12 @@
+{
+  "about": "Shady #439 M1: a key the agent wrote is escaped (\\u for anything outside printable ASCII) and cut to 24 characters in the refusal, which stays one safe line.",
+  "input": {
+    "question": "q",
+    "options": [
+      "a",
+      "b"
+    ],
+    "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk": 1
+  },
+  "error": "\"kkkkkkkkkkkkkkkkkkkkkkkk…\": unknown parameter; use question, detail, options, multi, default, fields, wait or close"
+}

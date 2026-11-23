@@ -1,0 +1,13 @@
+{
+  "about": "Answer values: a repeated key.",
+  "what": "answer",
+  "text": "{\"choice\":\"a\",\"choice\":\"b\"}",
+  "json_error": "json: the key choice is given twice",
+  "card": {
+    "question": "q",
+    "options": [
+      "a",
+      "b"
+    ]
+  }
+}

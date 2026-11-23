@@ -1,0 +1,14 @@
+{
+  "about": "Shady #439 M1: a key the agent wrote is escaped (\\u for anything outside printable ASCII) and cut to 24 characters in the refusal, which stays one safe line.",
+  "input": {
+    "question": "q",
+    "options": [
+      "a",
+      {
+        "label": "b",
+        "\u001b[31m\n\u202eforged\u200b": 1
+      }
+    ]
+  },
+  "error": "options[1].\"\\u001b[31m\\u000a\\u202eforged\\u200b\": unknown key; an option takes label, hint and note"
+}

@@ -1,0 +1,15 @@
+{
+  "about": "v3.2 #4: a list of more than one default without multi is still refused",
+  "input": {
+    "question": "q",
+    "options": [
+      "a",
+      "b"
+    ],
+    "default": [
+      "a",
+      "b"
+    ]
+  },
+  "error": "default: one option label (a list of more than one only when multi is true)"
+}

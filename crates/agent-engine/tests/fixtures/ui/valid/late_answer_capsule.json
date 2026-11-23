@@ -51,6 +51,7 @@
           "notes": ""
         }
       },
+      "q": "Release target?",
       "late": {
         "turn_message": "Cut the 0.13 release\nand tell me when it's out",
         "task": "Cut the 0.13 release and tell me when it's out",

@@ -41,6 +41,7 @@
         "choice": "Revise",
         "note": "keep the old parser behind a flag"
       },
+      "q": "Plan ready. Go ahead?",
       "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_7e4b19c2d03f5a68\" q=\"Plan ready. Go ahead?\">{\"choice\":\"Revise\",\"note\":\"keep the old parser behind a flag\"}</ui_answer>"
     }
   ],

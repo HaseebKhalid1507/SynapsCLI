@@ -1,0 +1,6 @@
+{
+  "about": "At any level.",
+  "what": "input",
+  "text": "{\"question\":\"q\",\"options\":[\"a\",{\"label\":\"b\",\"label\":\"c\"}]}",
+  "json_error": "json: the key label is given twice"
+}

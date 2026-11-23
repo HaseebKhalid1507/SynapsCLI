@@ -1,0 +1,49 @@
+{
+  "about": "v3.2 #4: a string default with multi becomes [label]; it matches ignoring case (full case folding) and is stored in the label's spelling.",
+  "input": {
+    "question": "Which checks?",
+    "options": [
+      "Lint",
+      "Test",
+      "Straße"
+    ],
+    "multi": true,
+    "default": "STRASSE"
+  },
+  "doc": {
+    "question": "Which checks?",
+    "options": [
+      {
+        "label": "Lint"
+      },
+      {
+        "label": "Test"
+      },
+      {
+        "label": "Straße"
+      }
+    ],
+    "multi": true,
+    "default": [
+      "Straße"
+    ]
+  },
+  "wait": false,
+  "mode": "form",
+  "contract": "c1:bec69447e4e095ef43957cf6ac19a337",
+  "answers": [
+    {
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_1a2b3c4d5e6f7a8b",
+      "status": "answered",
+      "rev": 1,
+      "values": {
+        "choice": [
+          "Lint"
+        ]
+      },
+      "q": "Which checks?",
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_1a2b3c4d5e6f7a8b\" q=\"Which checks?\">{\"choice\":[\"Lint\"]}</ui_answer>"
+    }
+  ]
+}

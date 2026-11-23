@@ -1,0 +1,20 @@
+{
+  "about": "Answer values that decode and validate.",
+  "what": "answer",
+  "text": "{\"fields\":{\"f\":\"x\"}}",
+  "json_error": null,
+  "card": {
+    "question": "q",
+    "fields": [
+      {
+        "id": "f",
+        "label": "F"
+      }
+    ]
+  },
+  "values": {
+    "fields": {
+      "f": "x"
+    }
+  }
+}

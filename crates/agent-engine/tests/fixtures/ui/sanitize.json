@@ -17,10 +17,7 @@
       "in": "a\r\nb",
       "single": "a b",
       "multi": "a\nb",
-      "refused": {
-        "char": "U+000D",
-        "why": "a control character"
-      }
+      "refused": null
     },
     {
       "in": "\u001b[31mred\u001b[0m",

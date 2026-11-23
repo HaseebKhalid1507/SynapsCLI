@@ -1,0 +1,73 @@
+{
+  "about": "v3.2 #1: \\r\\n and a lone \\r are line endings in agent-written strings: \\n before any check, then folded to a space in single-line fields. Never refused. In answer values a \\r is refused: clients normalize before they commit.",
+  "input": {
+    "question": "Ship\r\nit?",
+    "detail": "one\r\ntwo\rthree",
+    "options": [
+      "a\rb",
+      "c"
+    ],
+    "fields": [
+      {
+        "id": "x",
+        "label": "L",
+        "type": "long",
+        "placeholder": "x\ry",
+        "value": "p\r\nq"
+      }
+    ]
+  },
+  "doc": {
+    "question": "Ship it?",
+    "detail": "one\ntwo\nthree",
+    "options": [
+      {
+        "label": "a b"
+      },
+      {
+        "label": "c"
+      }
+    ],
+    "multi": false,
+    "fields": [
+      {
+        "id": "x",
+        "label": "L",
+        "type": "long",
+        "value": "p\nq",
+        "placeholder": "x y",
+        "optional": false
+      }
+    ]
+  },
+  "wait": false,
+  "mode": "form",
+  "contract": "c1:8a07d70865833f2411715ccd0ce1023e",
+  "answers": [
+    {
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_0a0b0c0d0e0f1011",
+      "status": "answered",
+      "rev": 1,
+      "values": {
+        "choice": "a b",
+        "fields": {
+          "x": "one\nline"
+        }
+      },
+      "q": "Ship it?",
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_0a0b0c0d0e0f1011\" q=\"Ship it?\">{\"choice\":\"a b\",\"fields\":{\"x\":\"one\\nline\"}}</ui_answer>"
+    }
+  ],
+  "bad_answers": [
+    {
+      "values": {
+        "choice": "c",
+        "fields": {
+          "x": "a\r\nb"
+        }
+      },
+      "error": "fields.x: holds U+000D (a control character)"
+    }
+  ]
+}

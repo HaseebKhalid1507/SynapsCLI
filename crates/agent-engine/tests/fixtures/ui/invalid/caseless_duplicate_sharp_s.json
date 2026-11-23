@@ -1,0 +1,11 @@
+{
+  "about": "Shady #439 M3: Straße and STRASSE fold to the same label",
+  "input": {
+    "question": "q",
+    "options": [
+      "Straße",
+      "STRASSE"
+    ]
+  },
+  "error": "options[1]: \"STRASSE\" duplicates options[0]; labels must differ (ignoring case)"
+}

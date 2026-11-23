@@ -1,0 +1,18 @@
+{
+  "about": "A valid surrogate pair is one character.",
+  "what": "input",
+  "text": "{\"question\":\"\\ud83d\\ude00?\",\"options\":[\"a\",\"b\"]}",
+  "json_error": null,
+  "doc": {
+    "question": "😀?",
+    "options": [
+      {
+        "label": "a"
+      },
+      {
+        "label": "b"
+      }
+    ],
+    "multi": false
+  }
+}

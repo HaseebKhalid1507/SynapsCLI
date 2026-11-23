@@ -57,6 +57,7 @@
           "lint"
         ]
       },
+      "q": "Which checks should run?",
       "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_00112233445566aa\" q=\"Which checks should run?\">{\"choice\":[\"fmt\",\"lint\"]}</ui_answer>"
     },
     {
@@ -68,6 +69,7 @@
       "values": {
         "choice": []
       },
+      "q": "Which checks should run?",
       "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_00112233445566bb\" q=\"Which checks should run?\">{\"choice\":[]}</ui_answer>"
     },
     {
@@ -82,6 +84,7 @@
           "lint"
         ]
       },
+      "q": "Which checks should run?",
       "late": {
         "turn_message": "run the checks",
         "task": "run the checks",

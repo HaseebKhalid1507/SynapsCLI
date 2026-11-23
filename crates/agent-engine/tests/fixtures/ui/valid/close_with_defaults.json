@@ -1,0 +1,13 @@
+{
+  "about": "v3.2 #5: beside close, wait:false and multi:false are schema defaults and count as absent.",
+  "input": {
+    "close": "s_3f2a91c0d4e2a871",
+    "wait": false,
+    "multi": false
+  },
+  "close": "s_3f2a91c0d4e2a871",
+  "result": {
+    "status": "closed",
+    "id": "s_3f2a91c0d4e2a871"
+  }
+}

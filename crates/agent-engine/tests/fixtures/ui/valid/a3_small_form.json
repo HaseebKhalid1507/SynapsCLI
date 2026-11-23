@@ -65,6 +65,7 @@
           "publish": true
         }
       },
+      "q": "Release details",
       "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_5b8e2c7d1f9a3046\" q=\"Release details\">{\"fields\":{\"version\":\"0.13.0\",\"notes\":\"\",\"publish\":true}}</ui_answer>"
     }
   ],
@@ -97,6 +98,28 @@
         }
       },
       "error": "fields.publish: a check takes true or false"
+    },
+    {
+      "values": {
+        "fields": {
+          "version": "0.13.0",
+          "notes": "",
+          "publish": true
+        },
+        "\u001b]0;x\u0007\n": 1
+      },
+      "error": "\"\\u001b]0;x\\u0007\\u000a\": unknown key; an answer has choice, note and fields"
+    },
+    {
+      "values": {
+        "fields": {
+          "version": "0.13.0",
+          "notes": "",
+          "publish": true,
+          "\u202ex": 1
+        }
+      },
+      "error": "fields.\"\\u202ex\": no such field"
     }
   ]
 }

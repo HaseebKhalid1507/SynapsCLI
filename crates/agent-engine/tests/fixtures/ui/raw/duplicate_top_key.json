@@ -1,0 +1,6 @@
+{
+  "about": "A repeated key is refused at decoding, never resolved last-wins.",
+  "what": "input",
+  "text": "{\"question\":\"q\",\"options\":[\"a\",\"b\"],\"question\":\"r\"}",
+  "json_error": "json: the key question is given twice"
+}

@@ -1,0 +1,14 @@
+{
+  "about": "Shady #439 M1: a key the agent wrote is escaped (\\u for anything outside printable ASCII) and cut to 24 characters in the refusal, which stays one safe line.",
+  "input": {
+    "question": "q",
+    "fields": [
+      {
+        "id": "a",
+        "label": "L",
+        "\u001b[31m\n\u202eforged\u200b": 1
+      }
+    ]
+  },
+  "error": "fields[0].\"\\u001b[31m\\u000a\\u202eforged\\u200b\": unknown key; a field takes id, label, type, value, placeholder and optional"
+}

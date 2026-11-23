@@ -1,0 +1,7 @@
+{
+  "about": "A big integer decodes (as f64) and is refused by type.",
+  "what": "input",
+  "text": "{\"question\":\"q\",\"options\":[\"a\",\"b\"],\"multi\":123456789012345678901234567890}",
+  "json_error": null,
+  "error": "multi: must be true or false"
+}

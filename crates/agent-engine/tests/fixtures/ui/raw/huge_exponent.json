@@ -1,0 +1,6 @@
+{
+  "about": "A number out of f64 range.",
+  "what": "input",
+  "text": "{\"question\":\"q\",\"options\":[\"a\",\"b\"],\"multi\":1e400}",
+  "json_error": "json: "
+}

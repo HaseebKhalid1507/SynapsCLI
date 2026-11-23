@@ -1,0 +1,42 @@
+{
+  "about": "v3.2 #4: a one-item list default without multi becomes the label, matched ignoring case.",
+  "input": {
+    "question": "Proceed?",
+    "options": [
+      "Yes",
+      "No"
+    ],
+    "default": [
+      "YES"
+    ]
+  },
+  "doc": {
+    "question": "Proceed?",
+    "options": [
+      {
+        "label": "Yes"
+      },
+      {
+        "label": "No"
+      }
+    ],
+    "multi": false,
+    "default": "Yes"
+  },
+  "wait": false,
+  "mode": "quick",
+  "contract": "c1:e6c8a4304c85ba0b046d71d2b3551615",
+  "answers": [
+    {
+      "card": "s_3f2a91c0d4e2a871",
+      "answer_id": "a_2a3b4c5d6e7f8a9b",
+      "status": "answered",
+      "rev": 1,
+      "values": {
+        "choice": "No"
+      },
+      "q": "Proceed?",
+      "message": "<ui_answer card=\"s_3f2a91c0d4e2a871\" answer=\"a_2a3b4c5d6e7f8a9b\" q=\"Proceed?\">{\"choice\":\"No\"}</ui_answer>"
+    }
+  ]
+}
