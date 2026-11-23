@@ -103,7 +103,14 @@ enum Read {
     Eof,
     Oversize,
     Bad(String),
+    /// A `surface_action` over [`SURFACE_ACTION_MAX_FRAME_BYTES`] (agent-ui
+    /// §4.4): refused before it is enqueued, the connection stays.
+    CardTooLarge(SessionId),
 }
+
+/// Agent cards (§2.4, §4.4): a `surface_action` frame line is at most
+/// 16 KiB. A client measures before sending (§3.8).
+pub const SURFACE_ACTION_MAX_FRAME_BYTES: usize = 16 * 1024;
 
 /// Capacity a connection's frame buffer is reset to after a large frame.
 const FRAME_BUF_KEEP: usize = 64 * 1024;
@@ -147,6 +154,11 @@ async fn read_frame_into(reader: &mut Reader, line: &mut String) -> std::io::Res
             continue;
         }
         return Ok(match decode_line::<ClientFrame>(t) {
+            Ok(ClientFrame::Cmd { session_id, cmd: SessionCommand::SurfaceAction { .. } })
+                if t.len() > SURFACE_ACTION_MAX_FRAME_BYTES =>
+            {
+                Read::CardTooLarge(session_id)
+            }
             Ok(f) => Read::Frame(f),
             Err(e) => Read::Bad(e),
         });
@@ -195,7 +207,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     // ── handshake: first frame MUST be Hello ──
     let hello = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader, &mut line)).await {
         Ok(Ok(Read::Frame(ClientFrame::Hello(h)))) => h,
-        Ok(Ok(Read::Frame(_))) | Ok(Ok(Read::Bad(_))) => {
+        Ok(Ok(Read::Frame(_))) | Ok(Ok(Read::Bad(_))) | Ok(Ok(Read::CardTooLarge(_))) => {
             let _ = tx
                 .send(DaemonFrame::Refused { reason: RefuseReason::Protocol, message: "first frame must be hello".into() })
                 .await;
@@ -423,6 +435,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             }
             Ok(Read::Bad(e)) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: format!("malformed frame: {e}") }).await;
+            }
+            Ok(Read::CardTooLarge(session_id)) => {
+                let _ = tx.send(DaemonFrame::Error { session_id: Some(session_id), message: "not attached".into() }).await;
             }
         }
     };
@@ -808,6 +823,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             }
             Ok(Read::Bad(e)) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: format!("malformed frame: {e}") }).await;
+            }
+            Ok(Read::CardTooLarge(session_id)) => {
+                let message = format!("surface_action frame over {} bytes", SURFACE_ACTION_MAX_FRAME_BYTES);
+                let _ = tx.send(DaemonFrame::Error { session_id: Some(session_id), message }).await;
             }
         }
     }

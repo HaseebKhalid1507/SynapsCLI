@@ -515,6 +515,13 @@ impl SessionActor {
         self.consecutive_auto_turns = 0;
         self.runtime.begin_conversation(Some(new_id.clone()));
         self.set_journal_id(new_id.clone(), super::handle::JournalMove::Resume);
+        // Agent cards (T21 at resume): the old chat's store goes, the
+        // resumed chat's sidecar is recovered (the lock holder's alone).
+        if self.session_lock.is_some() {
+            self.recover_surfaces_at_load();
+        } else {
+            self.surfaces_reset();
+        }
         // The listing follows the conversation now held: its name, title,
         // cost and messages (as `/clear` does).
         self.sync_name();

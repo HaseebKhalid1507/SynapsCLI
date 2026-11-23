@@ -87,13 +87,24 @@ pub struct CatalogCursor {
     pub id: String,
 }
 
+/// Agent cards (agent-ui §1.5, §2.1): this daemon accepts `surface_action`
+/// and sends card traffic to a client whose catalog covers it. It follows
+/// the build, never the config: listed wherever the build has C4a and
+/// directory sync (Unix), whether or not any session has cards on.
+pub const FEATURE_AGENT_SURFACES: &str = "agent_surfaces";
+
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
-    vec![
+    let mut f = vec![
         FEATURE_OWNED_SESSIONS.to_string(),
         FEATURE_SESSION_WORKERS.to_string(),
         FEATURE_SESSION_PAGE.to_string(),
-    ]
+    ];
+    // Fail closed where directory sync isn't available (§3.4).
+    if cfg!(unix) {
+        f.push(FEATURE_AGENT_SURFACES.to_string());
+    }
+    f
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;

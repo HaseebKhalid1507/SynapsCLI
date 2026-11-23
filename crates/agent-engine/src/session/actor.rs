@@ -821,7 +821,10 @@ impl SessionActor {
             runtime.set_message_clock(clock.clone());
         }
         // Agent cards: the create override, else `ui.surfaces` (§1.5).
-        let surfaces = super::surfaces::SurfaceTable::new(cfg.surfaces.unwrap_or(config.ui.surfaces));
+        let mut surfaces = super::surfaces::SurfaceTable::new(cfg.surfaces.unwrap_or(config.ui.surfaces));
+        // T21 at spawn: a loaded chat's sidecar is recovered before the
+        // first command (the lock holder's alone, as the turn draft).
+        surfaces.recover_at_start = sb.continued && cfg.persist && session_lock.is_some();
         runtime.set_surfaces(surfaces.handle.clone());
         runtime.set_cards_enabled(surfaces.enabled);
 
@@ -2834,6 +2837,12 @@ impl SessionActor {
         runtime.restore_tool_activations(std::mem::take(&mut self.parked_tool_activations));
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
+        // T21 at unpark: a store still open from before the park is the
+        // authority (a park waits for every answer to settle); a session
+        // restored parked loads its sidecar now.
+        if !self.surfaces.is_open() && journal_present && self.config.persist && self.session_lock.is_some() {
+            self.recover_surfaces_at_load();
+        }
         // The name comes from disk: a rename while parked wrote it there.
         if self.meta.name != self.conv.session.name {
             let name = self.conv.session.name.clone();
@@ -5602,10 +5611,24 @@ impl SessionActor {
                 // Before `clear` saves the old session: a ping in flight is
                 // aborted and booked to it, not to the new one.
                 self.cache_keepwarm_conversation_replaced();
+                // Agent cards (T19): every card closed and tombstoned,
+                // durable, before the conversation is replaced.
+                if let Err(e) = self.surfaces_clear_for_new().await {
+                    match from {
+                        Some(c) => self.emit(SessionEventWire::Refused {
+                            client: c,
+                            command: "new_session".into(),
+                            reason: e,
+                        }),
+                        None => self.emit(SessionEventWire::SystemNotice(e)),
+                    }
+                    return ControlFlow::Continue(());
+                }
                 // `clear` saves the old session directly: queued saves of it
                 // must land first, never after.
                 self.persister.flush().await;
                 self.conv.clear(&self.runtime).await;
+                self.surfaces_reset();
                 self.runtime
                     .begin_conversation(Some(self.conv.session.id.clone()));
                 // A new conversation: the old one is no longer held here
@@ -6028,6 +6051,9 @@ impl SessionTask {
 
     /// Unbiased select (the TUI loop is unbiased too).
     pub async fn run(mut self) {
+        if std::mem::take(&mut self.0.surfaces.recover_at_start) {
+            self.0.recover_surfaces_at_load();
+        }
         let queue = Arc::clone(&self.0.event_queue);
         let reason = loop {
             let actor = &mut self.0;

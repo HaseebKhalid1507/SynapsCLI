@@ -1231,8 +1231,9 @@ pub enum SessionCommand {
     /// input-authority and reload-fence rules apply as to a typed message.
     /// `values` are the user's answer: like `Answer`, NEVER traced and
     /// redacted by `Debug`. A client sends it only to a daemon that lists
-    /// `agent_surfaces`; until C4a no daemon does, and the actor refuses it
-    /// (`SURFACES_UNAVAILABLE`).
+    /// `agent_surfaces` (C4a, Unix builds). A client that declared no
+    /// catalog gets the C3 `Refused` (`SURFACES_UNAVAILABLE`); a capable
+    /// one gets a `surface_result` for every action.
     SurfaceAction {
         surface_id: String,
         /// The card's `contract` as the client drew it (§5.4).
@@ -1252,8 +1253,8 @@ pub enum SessionCommand {
     },
 }
 
-/// What the actor answers a `SurfaceAction` with until C4a: the command
-/// exists on the wire, nothing behind it does.
+/// What the actor answers a `SurfaceAction` from a client that declared no
+/// card catalog (`surfaces: 0`), after the owned, input and fence checks.
 pub const SURFACES_UNAVAILABLE: &str = "agent cards are not available in this daemon";
 
 /// What `Checkpoint{Reload}` reports so `daemon reload` can rebuild the

@@ -166,6 +166,8 @@ pub(crate) struct SurfaceTable {
     pub(crate) tickets: HashMap<String, Ticket>,
     /// The ticket of the last queued history save.
     pub(crate) last_ticket: Option<Ticket>,
+    /// Spawn loaded a chat: recover its sidecar before the first command.
+    pub(crate) recover_at_start: bool,
     /// A compaction handoff is between Prepare and Finish or Rollback
     /// (§3.11), or a reload barrier runs (§3.10): accepted answers stay
     /// queued (T8).
@@ -191,7 +193,12 @@ impl SurfaceTable {
             tickets: HashMap::new(),
             last_ticket: None,
             hold_routes: false,
+            recover_at_start: false,
         }
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        matches!(self.store, Store::Open(_))
     }
 
     /// §3.3 #1: 10 actions a second per client, refilled continuously.
@@ -322,6 +329,23 @@ pub fn surface_id(journal_id: &str, call_id: &str) -> String {
     format!("s_{hex}")
 }
 
+/// Step 0's read of a prepared sidecar's parent (§3.11): its record's
+/// `compacted_into` and its sidecar. Unreadable files are `Unreadable`.
+fn parent_facts(store: &UiStore<AnyFs>, parent: &str) -> ss::ParentFacts {
+    if !ui::is_session_id(parent) {
+        return ss::ParentFacts::Unreadable;
+    }
+    let Ok(record) = agent_core::session::Session::load(parent) else {
+        return ss::ParentFacts::Unreadable;
+    };
+    let sidecar = match store.read(parent) {
+        Ok(Loaded::Image(sc)) => Some(sc),
+        Ok(_) => None,
+        Err(_) => return ss::ParentFacts::Unreadable,
+    };
+    ss::ParentFacts::Read { compacted_into: record.compacted_into, sidecar }
+}
+
 fn tool_error(line: impl Into<String>) -> Value {
     json!({"status": "error", "error": line.into()})
 }
@@ -390,21 +414,43 @@ impl SessionActor {
         "cards are off: open cards were withdrawn".into()
     }
 
-    /// Open the store, reading this session's sidecar (recovery, T21, runs
-    /// at load; this is its first-use half). An error fails the store
-    /// closed.
+    /// Open the store on first use. A chat with a sidecar opened it at load
+    /// ([`Self::recover_surfaces_at_load`]); here it starts empty. An error
+    /// fails the store closed.
     fn ensure_surface_store(&mut self) -> Result<(), String> {
         match &self.surfaces.store {
             Store::Open(_) => return Ok(()),
             Store::Failed(e) => return Err(e.clone()),
             Store::Unopened => {}
         }
+        self.open_and_recover(false).map(|_| ())
+    }
+
+    /// T21 at the three load sites (spawn, unpark, resume): forget the
+    /// previous conversation's store, then, if this chat has a sidecar,
+    /// recover it (§3.11) before the first attach snapshot. Never starts
+    /// a turn (decision 11).
+    pub(crate) fn recover_surfaces_at_load(&mut self) {
+        self.surfaces_reset();
+        if !self.config.persist || !self.conv.is_live() {
+            return;
+        }
+        if let Err(e) = self.open_and_recover(true) {
+            tracing::warn!(session = %self.id, "agent cards: recovery failed: {e}");
+        }
+    }
+
+    /// Open the store and run recovery. `only_if_present`: a chat with no
+    /// sidecar stays unopened. `Ok(true)`: the store is open.
+    fn open_and_recover(&mut self, only_if_present: bool) -> Result<bool, String> {
         let session_id = self.journal_id_now();
-        let res = self.open_surface_store(&session_id);
-        match res {
-            Ok(open) => {
+        match self.open_surface_store(&session_id, only_if_present) {
+            Ok(None) => Ok(false),
+            Ok(Some((open, plan))) => {
                 self.surfaces.store = Store::Open(Box::new(open));
-                Ok(())
+                self.apply_recovery(plan);
+                self.publish_presence();
+                Ok(true)
             }
             Err(e) => {
                 tracing::warn!(session = %self.id, "agent cards: store failed: {e}");
@@ -414,7 +460,8 @@ impl SessionActor {
         }
     }
 
-    fn open_surface_store(&self, session_id: &str) -> Result<Open, String> {
+    /// The store, and recovery's plan already committed (§3.11 steps 0–6).
+    fn open_surface_store(&self, session_id: &str, only_if_present: bool) -> Result<Option<(Open, ss::Plan)>, String> {
         if !ui::is_session_id(session_id) {
             return Err("session id outside its bound".into());
         }
@@ -422,16 +469,24 @@ impl SessionActor {
             Some(fs) => Arc::clone(fs),
             None => sessions_fs().map_err(|e| e.to_string())?,
         };
-        let mut store = UiStore::open(Arc::new(AnyFs(fs)), session_id, StoreConfig::default())
+        let mut store = UiStore::open(Arc::new(AnyFs(Arc::clone(&fs))), session_id, StoreConfig::default())
             .map_err(|e| e.to_string())?;
         let loaded = ui::load::revalidated(store.read(session_id).map_err(|e| e.to_string())?);
-        let facts = self.history_facts(session_id);
-        let plan = ss::recover(&loaded, &facts, None, chrono::Utc::now());
-        if !plan.files.is_empty() {
-            // Only the store's own files: the plan names this session's.
-            tracing::info!(session = %self.id, files = plan.files.len(), "agent cards: recovery file actions skipped at first use");
+        if only_if_present && matches!(loaded, Loaded::Missing) {
+            return Ok(None);
         }
-        let durable = match plan.commit {
+        let facts = self.history_facts(session_id);
+        // Step 0: a prepared successor reads its parent's files, never
+        // writing them.
+        let parent = match &loaded {
+            Loaded::Image(sc) => sc.prepared.as_ref().map(|p| parent_facts(&store, &p.parent)),
+            _ => None,
+        };
+        let plan = ss::recover(&loaded, &facts, parent.as_ref(), chrono::Utc::now());
+        if !plan.files.is_empty() {
+            ss::apply_files(&*fs, &plan.files).map_err(|e| e.to_string())?;
+        }
+        let durable = match plan.commit.clone() {
             Some(mut image) => {
                 store.commit(&mut image).map_err(|r| format!("{r:?}"))?;
                 match store.join(ss::COMMIT_BUDGET) {
@@ -439,12 +494,69 @@ impl SessionActor {
                     other => return Err(format!("recovery commit: {other:?}")),
                 }
             }
-            None => match loaded {
-                Loaded::Image(sc) if plan.class == ss::Class::Related => *sc,
-                _ => Sidecar::new(session_id, &ss::mint_hex128(), &facts.base),
-            },
+            None => Sidecar::new(session_id, &ss::mint_hex128(), &facts.base),
         };
-        Ok(Open { store, images: Images::new(durable) })
+        Ok(Some((Open { store, images: Images::new(durable) }, plan)))
+    }
+
+    /// Recovery's last step: records the history lacks go back into
+    /// context once, after any interruption marker, with no wake; records
+    /// it holds settle with the next commit.
+    fn apply_recovery(&mut self, plan: ss::Plan) {
+        let mut pushed = false;
+        for answer_id in &plan.deliver {
+            pushed |= self.push_answer(answer_id);
+        }
+        if let Store::Open(o) = &mut self.surfaces.store {
+            for answer_id in plan.recorded {
+                o.images.note(Op::Settle { answer_id });
+            }
+        }
+        if pushed {
+            self.request_save();
+        }
+        self.surfaces_commit_noted();
+    }
+
+    /// Forget this conversation's store (the conversation changed): its
+    /// in-flight commit is joined first, so nothing of it lands later
+    /// unseen.
+    pub(crate) fn surfaces_reset(&mut self) {
+        if let Store::Open(o) = &mut self.surfaces.store {
+            let budget = o.store.config().budget;
+            let _ = o.images.poll(&mut o.store, budget);
+        }
+        self.surfaces.store = Store::Unopened;
+        self.surfaces.waiter = None;
+        self.surfaces.tickets.clear();
+        self.surfaces.handed.clear();
+        self.surfaces.results.clear();
+        self.surfaces.last_ticket = None;
+        self.surfaces.hold_routes = false;
+    }
+
+    /// T19 (`/new`), before the conversation is replaced: every card
+    /// closed, the table tombstones, durable. A clear that isn't published
+    /// unlinks the sidecar instead; if that fails too, `/new` is refused
+    /// with the storage error.
+    pub(crate) async fn surfaces_clear_for_new(&mut self) -> Result<(), String> {
+        let Some(budget) = self.surfaces_budget() else {
+            return Ok(());
+        };
+        if !self.join_surfaces(budget).await {
+            return Err("cards: the card store didn't answer; try /new again".into());
+        }
+        let session_id = self.journal_id_now();
+        if let Err(e) = self.commit_durable(Some(Op::Clear { at: rfc3339_now() }), budget) {
+            if self.surfaces.committing() {
+                // Unknown: it may still land; a retry clears again.
+                return Err("cards: still clearing; try /new again".into());
+            }
+            tracing::warn!(session = %self.id, "agent cards: clear not published ({e}); removing the sidecar");
+            self.store_durable(None, Some(&session_id), budget)
+                .map_err(|e| format!("cards: couldn't clear the card store: {e}"))?;
+        }
+        Ok(())
     }
 
     /// What the loaded history says, for recovery (§3.11).

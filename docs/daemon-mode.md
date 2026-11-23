@@ -743,7 +743,7 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page"], boot_id?}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page","agent_surfaces"], boot_id?}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
@@ -754,6 +754,9 @@ C: catalog_page{req, before?, limit?, named_only?} → D: catalog_page{req, sess
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode, owned?:{forward_secrets?:[[k,v]]}}
 D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients, owner_token?} | error
 C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event", session_id, seq, ts, event:WireSessionEvent} …
+C: {"type":"cmd", session_id, cmd:{"cmd":"surface_action", surface_id, contract, action_id, expect_rev, epoch, verb:"answer"|"skip"|"revise", values?}}   (feature agent_surfaces; frame ≤16 KiB, else a session error)
+D: {"ev":"surface", surface:SurfaceState} | {"ev":"surface_result", client, action_id, outcome:"accepted"|"pending"|"duplicate"|"refused", reason?, retry?, answer_rev?, detail?}   (surface: capabilities.surfaces ≥ card.catalog; surface_result: ≥ 1)
+D: attached{…, surfaces?:[SurfaceState]}   SessionMeta{…, surfaces_waiting?, surfaces_open?}
 C: bye | socket close = Detach (turn keeps running)
 ```
 
@@ -845,6 +848,17 @@ C: bye | socket close = Detach (turn keeps running)
 - Saved sessions are additive the same way. `Welcome.features` lists `session_page` when the daemon
   answers `catalog_page` (see "Saved sessions"); the reply and `lifecycle: "saved"` reach only a
   client that sent the frame. `SessionMeta.updated_at` is omitted on held rows.
+- Agent cards are additive the same way. `Welcome.features` lists `agent_surfaces` wherever the
+  build has them (Unix: they need directory sync), whatever `ui.surfaces` says; a session offers
+  the `ui` tool only when its cards are on (`ui.surfaces`, the create override, `/ui on`). A
+  client declares the card catalog it renders and answers in `Hello.capabilities.surfaces`
+  (omitted = 0). Card traffic (`surface`, `surface_result`, `attached.surfaces`) reaches only a
+  client whose catalog covers the card; a client that declared 0 gets none of it, and its
+  `surface_action` is refused with the plain `refused` event. To a capable client every refusal
+  is a `surface_result` carrying its `action_id` (`reason`: `rate_limited`, `forbidden`,
+  `reloading`, `storage`, `busy`, `resolved`, `gone`, `stale`, `stopped`, `conflict`, `invalid`,
+  `unavailable` with `detail`: `context_blocked`, `queue_full`, `ledger_full`, `awaiting_owner`).
+  A `surface_action` frame over 16 KiB gets a session `error` (no action id): measure first.
 
 ## Security posture
 
