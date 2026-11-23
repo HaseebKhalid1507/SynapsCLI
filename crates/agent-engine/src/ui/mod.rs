@@ -26,6 +26,7 @@ pub mod answer;
 pub mod contract;
 pub mod doc;
 pub mod fold;
+pub mod load;
 pub mod sanitize;
 
 pub use agent_core::core::ui_types::*;
