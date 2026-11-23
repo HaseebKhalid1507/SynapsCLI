@@ -1143,6 +1143,7 @@ impl SessionActor {
                     | SessionEventWire::PromptResolved { .. }
                     | SessionEventWire::Attached { .. }
                     | SessionEventWire::QueryResult { .. }
+                    | SessionEventWire::QueryReply { .. }
                     | SessionEventWire::Conversation(_)
                     | SessionEventWire::Stream(StreamEvent::Session(
                         SessionEvent::MessageHistory(_)
@@ -4671,7 +4672,9 @@ impl SessionActor {
         }));
     }
 
-    pub(crate) async fn query(&mut self, id: u64, query: SessionQuery) {
+    /// `from`: the client that asked (`None`: the host). An answer only it
+    /// may receive goes out as [`SessionEventWire::QueryReply`] ([`Self::reply`]).
+    pub(crate) async fn query(&mut self, from: Option<ClientId>, id: u64, query: SessionQuery) {
         // Status/View never wake a parked session (the idle probe must not).
         if self.is_parked() {
             let value = match query {
@@ -4691,11 +4694,11 @@ impl SessionActor {
                     serde_json::json!({ "error": format!("no subagent {handle_id} in this session") })
                 }
                 _ => match self.ensure_live().await {
-                    Ok(()) => return Box::pin(self.query(id, query)).await,
+                    Ok(()) => return Box::pin(self.query(from, id, query)).await,
                     Err(e) => serde_json::json!({ "error": e }),
                 },
             };
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.reply(from, false, id, value);
             return;
         }
         let value = match query {
@@ -4792,7 +4795,16 @@ impl SessionActor {
                 }
             }
         };
-        self.emit(SessionEventWire::QueryResult { id, value });
+        self.reply(from, false, id, value);
+    }
+
+    /// A query's answer: to the client that asked only when `addressed`
+    /// (an answer it opted into), else to every client, as always.
+    fn reply(&mut self, from: Option<ClientId>, addressed: bool, id: u64, value: serde_json::Value) {
+        match from.filter(|_| addressed) {
+            Some(to) => self.emit(SessionEventWire::QueryReply { to, id, value }),
+            None => self.emit(SessionEventWire::QueryResult { id, value }),
+        }
     }
 
     // ── attach / detach ──────────────────────────────────────────────────
@@ -5508,7 +5520,7 @@ impl SessionActor {
             SessionCommand::Save => {
                 self.save().await;
             }
-            SessionCommand::Query { id, query } => self.query(id, query).await,
+            SessionCommand::Query { id, query } => self.query(from, id, query).await,
             // `/close` ends the session, which no other engine command can.
             SessionCommand::EngineCommand { id, name, arg } if name == CLOSE_COMMAND => {
                 if let Some(reason) = self.close_command(id, &arg, from.is_none()) {

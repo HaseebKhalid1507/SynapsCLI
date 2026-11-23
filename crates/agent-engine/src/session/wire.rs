@@ -1232,6 +1232,9 @@ impl From<SessionEventWire> for WireSessionEvent {
             }
             S::SettingChanged(applied) => Self::SettingChanged { applied },
             S::QueryResult { id, value } => Self::QueryResult { id, value },
+            // Its addressee only (the conn's pump drops it for every other
+            // client): an ordinary `QueryResult` on the wire.
+            S::QueryReply { id, value, .. } => Self::QueryResult { id, value },
             S::Attached { client, snapshot } => Self::Attached { client, snapshot: AttachedWire::new(client, snapshot) },
             S::ClientJoined { client, kind, name, mode } => Self::ClientJoined { client, kind, name, mode: Some(mode) },
             S::ClientLeft { client } => Self::ClientLeft { client },

@@ -651,6 +651,8 @@ pub(super) async fn handle_session_event_arm(
                 }
             }
         }
+        // Transports deliver it as `QueryResult` (to its addressee only).
+        SessionEventWire::QueryReply { .. } => {}
         SessionEventWire::QueryResult { id, value } => {
             // The subagent watch poll is fire-and-forget; anything else is
             // unsolicited (another client's / a host query): nothing to render.

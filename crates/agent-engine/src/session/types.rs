@@ -1527,6 +1527,13 @@ pub enum SessionEventWire {
     },
     SettingChanged(SettingApplied),
     QueryResult { id: u64, value: serde_json::Value },
+    /// The answer to a query only the client that asked may receive: one
+    /// it opted into by asking (`SessionQuery::ModelOptions`, a `Status`
+    /// with `cache`), as `catalog_page`'s reply reaches only the connection
+    /// that sent it. Every transport delivers it to `to` as `QueryResult`
+    /// and to no other client (an older client never sees an answer it did
+    /// not ask for). Never replayed.
+    QueryReply { to: ClientId, id: u64, value: serde_json::Value },
     /// Only to the attaching client.
     Attached {
         client: ClientId,

@@ -653,7 +653,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     let history = hello.client.history;
     let caps = hello.client.capabilities;
     let skip = move |env: &Envelope| -> bool {
-        !forwarded(history, caps, env) || (legacy && matches!(env.event, SessionEventWire::InputOwnerChanged { .. }))
+        !forwarded(history, caps, client, env)
+            || (legacy && matches!(env.event, SessionEventWire::InputOwnerChanged { .. }))
     };
     // The owner of an owned session must never miss a frame silently (a
     // headless client keys on `Usage`/`Done`/tool results): its lag closes
@@ -946,8 +947,10 @@ async fn adopt_live_continue_target(state: &DaemonState, live: &SessionHandle) -
 /// per-round full history; the `Conversation` digest the actor emits right
 /// after is what they key on (phase 4 §2.3). And never an event the client
 /// cannot decode ([`client_decodes`]: an older client fails the whole frame).
-fn forwarded(history: HistoryMode, caps: ClientCapabilities, env: &Envelope) -> bool {
+/// A `QueryReply` only to the client it answers.
+fn forwarded(history: HistoryMode, caps: ClientCapabilities, client: ClientId, env: &Envelope) -> bool {
     !(matches!(env.event, SessionEventWire::Attached { .. })
+        || matches!(env.event, SessionEventWire::QueryReply { to, .. } if to != client)
         || (history == HistoryMode::Digest
             && matches!(
                 env.event,
@@ -1027,6 +1030,28 @@ mod tests {
         }
     }
 
+    /// A `QueryReply` reaches the client it answers, as `QueryResult`, and
+    /// no other client, whatever its capabilities or history mode.
+    #[test]
+    fn a_query_reply_is_forwarded_only_to_the_client_that_asked() {
+        let reply = Envelope {
+            session_id: SessionId::from("s"),
+            seq: 1,
+            ts: chrono::Utc::now(),
+            event: SessionEventWire::QueryReply { to: ClientId(2), id: 7, value: serde_json::json!({"a": 1}) },
+        };
+        for history in [HistoryMode::Full, HistoryMode::Digest] {
+            for caps in [ClientCapabilities::default(), ClientCapabilities::current()] {
+                assert!(forwarded(history, caps, ClientId(2), &reply));
+                assert!(!forwarded(history, caps, ClientId(3), &reply));
+            }
+        }
+        match WireEnvelope::from(reply).event {
+            WireSessionEvent::QueryResult { id: 7, value } => assert_eq!(value["a"], 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// An older client (no `tool_queue` capability) is never sent the queue
     /// signals — live or in the attach replay — and still gets every other
     /// event; a current client gets them all.
@@ -1041,13 +1066,14 @@ mod tests {
         }));
         let old = ClientCapabilities::default();
         let new = ClientCapabilities::current();
+        let me = ClientId(1);
         for history in [HistoryMode::Full, HistoryMode::Digest] {
-            assert!(!forwarded(history, old, &queued));
-            assert!(!forwarded(history, old, &started));
-            assert!(forwarded(history, old, &result));
-            assert!(forwarded(history, new, &queued));
-            assert!(forwarded(history, new, &started));
-            assert!(forwarded(history, new, &result));
+            assert!(!forwarded(history, old, me, &queued));
+            assert!(!forwarded(history, old, me, &started));
+            assert!(forwarded(history, old, me, &result));
+            assert!(forwarded(history, new, me, &queued));
+            assert!(forwarded(history, new, me, &started));
+            assert!(forwarded(history, new, me, &result));
         }
 
         let session = crate::session::handle::echo::meta_for(&SessionId::from("s"));
