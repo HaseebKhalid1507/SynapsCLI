@@ -393,6 +393,9 @@ enum JournalRecord {
         /// [`hooked_hash`] of the same prefix; absent = no hooked message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hooked_hash: Option<String>,
+        /// [`ui_hash`] of the same prefix; absent = no agent-card mark.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui_hash: Option<String>,
         /// [`head_hash`] of the same prefix: what an amend of its last
         /// message must leave unchanged. Absent = no amend (snapshot).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -416,6 +419,10 @@ enum JournalRecord {
         /// JSON on read: a malformed count is dropped, never fatal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         h: Option<serde_json::Value>,
+        /// Its agent-card mark ([`MARK_KEY`], agent-ui §3.6), beside it
+        /// too. Any JSON on read: a malformed mark is dropped, never fatal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        u: Option<serde_json::Value>,
         /// An AMEND: `m` (with `t`, `at`, `h`) replaces the message at `i`,
         /// which must be the last one so far. Written when only the newest
         /// saved message changed (the `before_message` hook saving context
@@ -440,6 +447,8 @@ enum JournalRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hooked_hash: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         head_hash: Option<String>,
     },
 }
@@ -453,8 +462,13 @@ fn message_turn_id(message: &serde_json::Value) -> Option<&str> {
 /// snapshot).
 use crate::core::extension_context::HOOKED_KEY;
 
+/// A message's agent-card mark (`_synaps_ui`, agent-ui §3.6), persisted
+/// beside it the same way (`u` on journal `msg` records, `_ui_marks` in the
+/// snapshot). Older builds ignore both and lose only the mark.
+use crate::core::ui_types::MARK_KEY;
+
 /// In-memory host keys that are persisted beside a message, never inside.
-const SIBLING_KEYS: [&str; 3] = [MESSAGE_TURN_KEY, MESSAGE_AT_KEY, HOOKED_KEY];
+const SIBLING_KEYS: [&str; 4] = [MESSAGE_TURN_KEY, MESSAGE_AT_KEY, HOOKED_KEY, MARK_KEY];
 
 fn has_sibling_key(object: &serde_json::Map<String, serde_json::Value>) -> bool {
     SIBLING_KEYS.iter().any(|k| object.contains_key(*k))
@@ -594,6 +608,66 @@ fn journal_hooked(h: Option<serde_json::Value>) -> Option<usize> {
         tracing::warn!("malformed journal before_message count dropped");
     }
     n
+}
+
+/// `(index, mark)` of every marked message, in order.
+fn ui_marks(messages: &[SharedMessage]) -> Vec<(usize, &serde_json::Value)> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| m.get(MARK_KEY).map(|mark| (i, mark)))
+        .collect()
+}
+
+/// Like [`turns_hash`], for agent-card marks: a mark stamped on an
+/// already-saved message (an adoption, agent-ui §3.6) is an edit the
+/// history hash cannot see. `None` = no mark.
+fn ui_hash(messages: &[SharedMessage]) -> std::io::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let marks = ui_marks(messages);
+    if marks.is_empty() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(&marks).map_err(std::io::Error::other)?;
+    Ok(Some(format!("{:x}", Sha256::digest(&bytes))))
+}
+
+/// A stored mark, kept only when it is a well-formed one
+/// ([`crate::core::ui_types::UiMark::is_valid`]). Anything else is dropped
+/// with a warning: the message then reads as unmarked, which recovery
+/// treats as no evidence (agent-ui §3.11).
+fn valid_ui_mark(mark: serde_json::Value) -> Option<serde_json::Value> {
+    let ok = serde_json::from_value::<crate::core::ui_types::UiMark>(mark.clone())
+        .is_ok_and(|m| m.is_valid());
+    if !ok {
+        tracing::warn!("malformed agent-card mark dropped");
+    }
+    ok.then_some(mark)
+}
+
+/// Well-formed `[index, mark]` entries of a snapshot's `_ui_marks`.
+fn stored_ui_marks(value: serde_json::Value) -> Vec<(usize, serde_json::Value)> {
+    let entries = match value {
+        serde_json::Value::Null => return Vec::new(),
+        serde_json::Value::Array(entries) => entries,
+        _ => {
+            tracing::warn!("session snapshot has a malformed _ui_marks; marks dropped");
+            return Vec::new();
+        }
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let (i, mark) = serde_json::from_value::<(usize, serde_json::Value)>(entry).ok()?;
+            Some((i, valid_ui_mark(mark)?))
+        })
+        .collect()
+}
+
+fn set_ui_mark(message: &mut serde_json::Value, mark: serde_json::Value) {
+    if let Some(object) = message.as_object_mut() {
+        object.insert(MARK_KEY.into(), mark);
+    }
 }
 
 fn set_message_time(message: &mut serde_json::Value, ts: String) {
@@ -737,6 +811,9 @@ struct SnapshotBinding {
     /// (`session_catalog::body`). Lenient: [`stored_hooked`].
     #[serde(default, rename = "_hooked")]
     hooked: serde_json::Value,
+    /// After `api_messages`, like `_turn_ids`. Lenient: [`stored_ui_marks`].
+    #[serde(default, rename = "_ui_marks")]
+    ui_marks: serde_json::Value,
 }
 
 /// Well-formed `[index, RFC 3339 time]` entries of a snapshot's
@@ -878,12 +955,22 @@ fn head_hash(messages: &[SharedMessage], head: Option<String>) -> std::io::Resul
         return Ok(None);
     };
     let prefix = &messages[..messages.len() - 1];
-    let digest = serde_json::to_vec(&(
-        head,
-        turns_hash(prefix)?,
-        times_hash(prefix)?,
-        hooked_hash(prefix)?,
-    ))
+    let digest = match ui_hash(prefix)? {
+        // Unmarked: the digest journals written before marks hold.
+        None => serde_json::to_vec(&(
+            head,
+            turns_hash(prefix)?,
+            times_hash(prefix)?,
+            hooked_hash(prefix)?,
+        )),
+        Some(ui) => serde_json::to_vec(&(
+            head,
+            turns_hash(prefix)?,
+            times_hash(prefix)?,
+            hooked_hash(prefix)?,
+            ui,
+        )),
+    }
     .map_err(std::io::Error::other)?;
     Ok(Some(format!("{:x}", Sha256::digest(&digest))))
 }
@@ -896,6 +983,7 @@ struct JournalState {
     turns_hash: Option<String>,
     times_hash: Option<String>,
     hooked_hash: Option<String>,
+    ui_hash: Option<String>,
     head_hash: Option<String>,
     bytes: u64,
 }
@@ -930,6 +1018,7 @@ fn read_journal_state(
         turns_hash: mut turns,
         times_hash: mut times,
         hooked_hash: mut hooked,
+        ui_hash: mut ui,
         head_hash: mut head,
         ..
     } = open
@@ -959,6 +1048,7 @@ fn read_journal_state(
                 turns_hash: next_turns,
                 times_hash: next_times,
                 hooked_hash: next_hooked,
+                ui_hash: next_ui,
                 head_hash: next_head,
             }) if v == JOURNAL_SCHEMA_VERSION
                 && meta.id == id
@@ -968,6 +1058,7 @@ fn read_journal_state(
                 turns = next_turns;
                 times = next_times;
                 hooked = next_hooked;
+                ui = next_ui;
                 head = next_head;
                 amended = false;
                 hashed_len = durable_len;
@@ -984,6 +1075,7 @@ fn read_journal_state(
         turns_hash: turns,
         times_hash: times,
         hooked_hash: hooked,
+        ui_hash: ui,
         head_hash: head,
         bytes: raw.len() as u64,
     }))
@@ -1069,7 +1161,8 @@ fn save_journal_mode(
     let unchanged = saved_hash == state.history_hash
         && turns_hash(saved)? == state.turns_hash
         && times_hash(saved)? == state.times_hash
-        && hooked_hash(saved)? == state.hooked_hash;
+        && hooked_hash(saved)? == state.hooked_hash
+        && ui_hash(saved)? == state.ui_hash;
     // The `before_message` hook's edit of a prompt the frontend saved
     // before the turn (#414): only the last saved message changed and it is
     // now a hooked user message. Amend it (O(message)); any other edit
@@ -1099,6 +1192,7 @@ fn save_journal_mode(
             t: message_turn_id(msg).map(serde_json::Value::from),
             at: message_time(msg).map(serde_json::Value::from),
             h: crate::core::extension_context::hooked(msg).map(serde_json::Value::from),
+            u: msg.get(MARK_KEY).cloned(),
             amend: i < state.durable_len,
         };
         serde_json::to_writer(&mut buf, &record).map_err(std::io::Error::other)?;
@@ -1112,6 +1206,7 @@ fn save_journal_mode(
         turns_hash: turns_hash(&session.api_messages)?,
         times_hash: times_hash(&session.api_messages)?,
         hooked_hash: hooked_hash(&session.api_messages)?,
+        ui_hash: ui_hash(&session.api_messages)?,
         head_hash: head_hash(&session.api_messages, head)?,
     };
     serde_json::to_writer(&mut buf, &meta).map_err(std::io::Error::other)?;
@@ -1205,6 +1300,9 @@ struct SessionSnapshotRef<'a> {
     /// Storage-only too: each message's recorded time, beside it.
     #[serde(rename = "_message_times", skip_serializing_if = "Vec::is_empty")]
     message_times: Vec<(usize, &'a str)>,
+    /// Storage-only too: each marked message's agent-card mark, beside it.
+    #[serde(rename = "_ui_marks", skip_serializing_if = "Vec::is_empty")]
+    ui_marks: Vec<(usize, &'a serde_json::Value)>,
 }
 
 impl<'a> SessionSnapshotRef<'a> {
@@ -1238,6 +1336,7 @@ impl<'a> SessionSnapshotRef<'a> {
             compaction: &s.compaction,
             turn_ids: turn_ids(&s.api_messages),
             message_times: message_times(&s.api_messages),
+            ui_marks: ui_marks(&s.api_messages),
         }
     }
 }
@@ -1292,6 +1391,7 @@ fn publish_snapshot(
             turns_hash: turns_hash(&session.api_messages)?,
             times_hash: times_hash(&session.api_messages)?,
             hooked_hash: hooked_hash(&session.api_messages)?,
+            ui_hash: ui_hash(&session.api_messages)?,
             head_hash: head_hash(&session.api_messages, head)?,
         };
         serde_json::to_writer(&mut journal, &open).map_err(std::io::Error::other)?;
@@ -1380,6 +1480,11 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             crate::core::extension_context::set_hooked(std::sync::Arc::make_mut(message), n);
         }
     }
+    for (i, mark) in stored_ui_marks(binding.ui_marks) {
+        if let Some(message) = session.api_messages.get_mut(i) {
+            set_ui_mark(std::sync::Arc::make_mut(message), mark);
+        }
+    }
 
     let Some(raw) = read_artifact_bytes(&handle, &format!("{id}.journal"))? else {
         return Ok(session);
@@ -1408,6 +1513,7 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
                 t,
                 at,
                 h,
+                u,
                 amend: true,
                 ..
             }) => {
@@ -1425,9 +1531,20 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
                 if let Some(n) = journal_hooked(h) {
                     crate::core::extension_context::set_hooked(&mut m, n);
                 }
+                if let Some(mark) = u.and_then(valid_ui_mark) {
+                    set_ui_mark(&mut m, mark);
+                }
                 session.api_messages[i] = std::sync::Arc::new(m);
             }
-            Ok(JournalRecord::Msg { i, mut m, t, at, h, .. }) => {
+            Ok(JournalRecord::Msg {
+                i,
+                mut m,
+                t,
+                at,
+                h,
+                u,
+                ..
+            }) => {
                 if i == session.api_messages.len() {
                     if let Some(serde_json::Value::String(id)) = t {
                         set_turn_id(&mut m, id);
@@ -1437,6 +1554,9 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
                     }
                     if let Some(n) = journal_hooked(h) {
                         crate::core::extension_context::set_hooked(&mut m, n);
+                    }
+                    if let Some(mark) = u.and_then(valid_ui_mark) {
+                        set_ui_mark(&mut m, mark);
                     }
                     session.api_messages.push(std::sync::Arc::new(m));
                 } else if i > session.api_messages.len() {
@@ -1857,6 +1977,7 @@ mod tests {
             turns_hash: None,
             times_hash: None,
             hooked_hash: None,
+            ui_hash: None,
             head_hash: None,
         }];
         for i in 1..5 {
@@ -1868,6 +1989,7 @@ mod tests {
                 t: None,
                 at: None,
                 h: None,
+                u: None,
                 amend: false,
             });
         }
@@ -1880,6 +2002,7 @@ mod tests {
             turns_hash: None,
             times_hash: None,
             hooked_hash: None,
+            ui_hash: None,
             head_hash: None,
         });
         let mut bytes = Vec::new();
@@ -2343,6 +2466,14 @@ mod snapshot_only_fields {
             s.api_messages.push(std::sync::Arc::new(
                 serde_json::json!({"role": "assistant", "content": format!("a{turn}")}),
             ));
+            // An agent-card mark rides beside the message (`u`, agent-ui
+            // §7 C2): 0.10.1 must parse that record too.
+            set_ui_mark(
+                std::sync::Arc::make_mut(s.api_messages.last_mut().unwrap()),
+                serde_json::json!({"l": "0123456789abcdef0123456789abcdef",
+                    "card": "s_0000000000000001", "answer": format!("a_000000000000000{turn}"),
+                    "rev": 1, "status": "answered"}),
+            );
             s.session_cost += 0.25;
             s.keepwarm_cost += 0.125;
             s.total_cache_read_tokens += 1_000;
@@ -2367,10 +2498,20 @@ mod snapshot_only_fields {
             );
         }
         assert_eq!(metas, 2);
+        assert_eq!(
+            raw.matches("\"u\":{").count(),
+            2,
+            "the marks are journaled: {raw}"
+        );
+        assert!(!raw.contains(MARK_KEY), "never inside a message: {raw}");
         // And this build still reads back the full history, with the
         // keep-warm label as of the snapshot (stale until the next one).
         let loaded = load_session_in_dir(&dir, &s.id).unwrap();
         assert_eq!(loaded.api_messages.len(), 3);
+        assert_eq!(
+            loaded.api_messages[2].get(MARK_KEY),
+            s.api_messages[2].get(MARK_KEY)
+        );
         assert_eq!(loaded.session_cost, 1.5);
         assert_eq!(loaded.keepwarm_cost, 0.5);
         assert_eq!(loaded.total_cache_read_tokens, 2_000);

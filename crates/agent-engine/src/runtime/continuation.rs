@@ -4442,6 +4442,31 @@ mod budget_tests {
         assert_eq!(TURN_KEY, agent_core::core::session_journal::MESSAGE_TURN_KEY);
     }
 
+    /// An agent card's mark (`_synaps_ui`, agent-ui §3.6, §7 C2) is host
+    /// metadata too: neither its `<ui_answer>` form nor its `ui` results
+    /// form reaches a provider, copied or streamed.
+    #[test]
+    fn provider_messages_never_carry_a_ui_mark() {
+        use agent_core::core::ui_types::MARK_KEY;
+        assert!(MARK_KEY.starts_with(HOST_KEY_PREFIX));
+        let lineage = "0123456789abcdef0123456789abcdef";
+        let mut answer = json!({"role":"user","content":"<ui_answer>{}</ui_answer>"});
+        answer[MARK_KEY] = json!({"l": lineage, "card": "s_0000000000000001",
+            "answer": "a_0000000000000001", "rev": 1, "status": "answered"});
+        let mut results = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"shown"}]});
+        results[MARK_KEY] =
+            json!({"l": lineage, "results": [{"card": "s_0000000000000002", "answer": null}]});
+        let messages: Vec<SharedMessage> = vec![Arc::new(answer), Arc::new(results)];
+        let wire = wire_messages(&messages).expect("host keys present");
+        for m in &wire {
+            assert!(m.get(MARK_KEY).is_none(), "{m}");
+        }
+        let streamed =
+            String::from_utf8(serde_json::to_vec(&WireMessages(&messages)).unwrap()).unwrap();
+        assert!(!streamed.contains(MARK_KEY), "{streamed}");
+        assert_eq!(streamed, serde_json::to_string(&wire).unwrap());
+    }
+
     /// The host's tool-in-flight note (a cancel whose drain timed out) is
     /// not a user request: an event wake after it keeps the turn start on
     /// the real prompt. It carries no host key at all (recognised by its

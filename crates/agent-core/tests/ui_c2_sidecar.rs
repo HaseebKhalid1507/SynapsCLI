@@ -452,3 +452,149 @@ mod retention {
         assert!(sessions.join(format!("{LIVE}.ui")).exists());
     }
 }
+
+/// `_synaps_ui` is the fourth sibling key (agent-ui §3.6, §7 C2): persisted
+/// beside a message (`u` on journal `msg` records, `_ui_marks` in the
+/// snapshot), never inside it, the way #414 persists `_synaps_hooked`.
+mod marks {
+    use std::sync::Arc;
+
+    use agent_core::core::session::Session;
+    use agent_core::core::session_journal::{
+        journal_path, load_session_in_dir, save_session_in_dir, SaveMode, SessionPersistence,
+    };
+    use agent_core::core::ui_types::MARK_KEY;
+    use serde_json::{json, Value};
+
+    fn mark(n: u8) -> Value {
+        json!({"l": super::LINEAGE, "card": format!("s_{n:016x}"), "answer": format!("a_{n:016x}"),
+            "rev": 1, "status": "answered"})
+    }
+
+    fn marked(text: &str, mark: Value) -> Arc<Value> {
+        let mut m = json!({"role": "user", "content": text});
+        m.as_object_mut().unwrap().insert(MARK_KEY.into(), mark);
+        Arc::new(m)
+    }
+
+    fn session() -> Session {
+        let mut s = Session::new("claude-sonnet-4-6", "medium", Some("harness prompt"));
+        s.api_messages
+            .push(Arc::new(json!({"role": "user", "content": "go"})));
+        s.api_messages
+            .push(marked("<ui_answer>…</ui_answer>", mark(1)));
+        s
+    }
+
+    fn marks_of(s: &Session) -> Vec<Option<Value>> {
+        s.api_messages
+            .iter()
+            .map(|m| m.get(MARK_KEY).cloned())
+            .collect()
+    }
+
+    /// Saved and loaded in either mode, a mark comes back on its message;
+    /// on disk it is beside the message, never inside.
+    #[test]
+    fn marks_round_trip_in_both_modes() {
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut s = session();
+            save_session_in_dir(tmp.path(), &s, mode).unwrap();
+            let snapshot =
+                std::fs::read_to_string(tmp.path().join(format!("{}.json", s.id))).unwrap();
+            assert!(
+                snapshot.contains("\"_ui_marks\":[[1,{"),
+                "{mode:?}: {snapshot}"
+            );
+            let api = &snapshot[snapshot.find("\"api_messages\"").unwrap()
+                ..snapshot.find("\"_ui_marks\"").unwrap()];
+            assert!(!api.contains(MARK_KEY), "{mode:?}: never inside a message");
+            assert_eq!(
+                marks_of(&load_session_in_dir(tmp.path(), &s.id).unwrap()),
+                marks_of(&s),
+                "{mode:?}"
+            );
+            if mode == SessionPersistence::Journal {
+                s.api_messages
+                    .push(marked("<ui_answer>…</ui_answer>", mark(2)));
+                let receipt = save_session_in_dir(tmp.path(), &s, mode).unwrap();
+                assert_eq!(receipt.mode, SaveMode::Append { messages: 1 });
+                let journal = std::fs::read_to_string(journal_path(tmp.path(), &s.id)).unwrap();
+                let line: Value = serde_json::from_str(journal.lines().nth(1).unwrap()).unwrap();
+                assert_eq!(line["u"], mark(2));
+                assert!(line["m"].get(MARK_KEY).is_none());
+                assert_eq!(
+                    marks_of(&load_session_in_dir(tmp.path(), &s.id).unwrap()),
+                    marks_of(&s)
+                );
+            }
+        }
+    }
+
+    /// A mark stamped on a message already saved (an adoption, §3.6) is an
+    /// edit the history hash can't see: the journal save snapshots, so a
+    /// replay never applies it to a base without it.
+    #[test]
+    fn a_mark_on_a_saved_message_snapshots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = session();
+        s.api_messages.push(Arc::new(
+            json!({"role": "user", "content": [{"type": "tool_result"}]}),
+        ));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        let adopted = json!({"l": super::LINEAGE, "results": [{"card": format!("s_{:016x}", 3), "answer": null}]});
+        Arc::make_mut(&mut s.api_messages[2])
+            .as_object_mut()
+            .unwrap()
+            .insert(MARK_KEY.into(), adopted);
+        let receipt = save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        assert_eq!(receipt.mode, SaveMode::FullSnapshot);
+        assert_eq!(
+            marks_of(&load_session_in_dir(tmp.path(), &s.id).unwrap()),
+            marks_of(&s)
+        );
+        // Unchanged since: the next save appends nothing new and needs no
+        // snapshot.
+        s.api_messages
+            .push(Arc::new(json!({"role": "assistant", "content": "ok"})));
+        let receipt = save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        assert_eq!(receipt.mode, SaveMode::Append { messages: 1 });
+    }
+
+    /// A malformed mark on disk (snapshot or journal) is dropped, never
+    /// fatal: the message loads unmarked, which recovery reads as no
+    /// evidence. Well-formed marks beside it stay.
+    #[test]
+    fn malformed_marks_are_dropped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = session();
+        s.api_messages
+            .push(Arc::new(json!({"role": "assistant", "content": "ok"})));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Json).unwrap();
+        let path = tmp.path().join(format!("{}.json", s.id));
+        let mut snap: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snap["_ui_marks"] = json!([[0, {"l": "", "card": "x"}], "junk", [1, mark(1)], [2, {"l": super::LINEAGE, "results": []}]]);
+        std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        assert_eq!(marks_of(&loaded), vec![None, Some(mark(1)), None]);
+        snap["_ui_marks"] = json!({"not": "a list"});
+        std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+        assert_eq!(
+            marks_of(&load_session_in_dir(tmp.path(), &s.id).unwrap()),
+            vec![None, None, None]
+        );
+        // Journal: a malformed `u` is dropped with its message kept.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut s = session();
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        s.api_messages.push(marked(
+            "<ui_answer>…</ui_answer>",
+            json!({"l": super::LINEAGE, "rev": 9}),
+        ));
+        save_session_in_dir(tmp.path(), &s, SessionPersistence::Journal).unwrap();
+        let loaded = load_session_in_dir(tmp.path(), &s.id).unwrap();
+        assert_eq!(loaded.api_messages.len(), 3);
+        assert_eq!(marks_of(&loaded), vec![None, Some(mark(1)), None]);
+    }
+}
