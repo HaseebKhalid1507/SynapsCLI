@@ -276,6 +276,11 @@ fn sanitize_fixtures() {
 // receipts, settle, downgrade) can't grow an image: they only change those
 // fields. Identifiers are at their v3.2 #11 bounds. C2 and C3 re-run this
 // against their real types.
+//
+// A part bounded in bytes (the doc, a stored capsule) is a filler at its
+// allowance, not an example: an example only shows the bound is nearly
+// reached (Shady #439 round 2). The examples are still built and checked
+// against their allowance.
 
 const WIDE: &str = "\u{10FFFD}";
 
@@ -291,9 +296,17 @@ fn bytes(v: &Value) -> usize {
     serde_json::to_vec(v).unwrap().len()
 }
 
-/// The largest doc an input can normalize to: the max-size fixture, whose
-/// default is spelled in KELVIN SIGN and given in ASCII.
-fn worst_doc() -> CardDoc {
+/// A JSON string of exactly `n` encoded bytes: a part at its allowance.
+fn filler(n: usize) -> Value {
+    let v = json!("x".repeat(n - 2));
+    assert_eq!(bytes(&v), n);
+    v
+}
+
+/// A doc near its bound: the max-size fixture, whose default is spelled in
+/// KELVIN SIGN and given in ASCII. Its 9,554 bytes are an example; the
+/// budget allows `DOC_MAX_BYTES`, the bound `revalidate` enforces.
+fn doc_example() -> CardDoc {
     let f: Value = serde_json::from_str(
         &std::fs::read_to_string(corpus().join("valid/max_size_kelvin_default.json")).unwrap(),
     )
@@ -358,7 +371,8 @@ fn stop_kind() -> Value {
     .unwrap()
 }
 
-/// §2.2 `SurfaceState`, every field at its worst.
+/// §2.2 `SurfaceState`, every field at its worst. `doc` gives the contract
+/// (fixed length); the doc itself is `DOC_MAX_BYTES` of filler.
 fn worst_state(doc: &CardDoc) -> Value {
     json!({
         "id": format!("s_{}", hex(16)),
@@ -369,7 +383,7 @@ fn worst_state(doc: &CardDoc) -> Value {
         "mode": "waiting",
         "phase": "withdrawn",
         "offers": ["answer", "skip", "revise", "forget"],
-        "doc": doc,
+        "doc": filler(DOC_MAX_BYTES),
         "origin": {"turn": turn_id(), "task": wide(TASK_EXCERPT_MAX), "stopped": stop_kind()},
         "epoch": u32::MAX,
         "resume": false,
@@ -406,61 +420,65 @@ fn tombstone() -> Value {
     json!({"id": format!("s_{}", hex(16)), "at": rfc3339(), "log": log()})
 }
 
-/// The capsule that costs most once stored as a JSON string (Shady #439
-/// L1): built by `build_capsule` from a valid doc whose every part is `\`,
-/// which JSON doubles, and compared with the old `\u003c` model.
-fn worst_asked() -> Capsule {
+/// What a stored capsule may cost: any `Capsule` at its 1 KiB cap, every
+/// byte at serde_json's widest escape (`\u00XX`, 6 bytes), plus the quotes.
+/// `Capsule::parse` refuses `<` but not C0 controls, so a capsule read back
+/// from disk can hold them; `build_capsule` never writes one.
+const CAPSULE_STORED_ALLOWANCE: usize = 6 * CAPSULE_MAX_BYTES + 2;
+
+/// The costliest capsule `build_capsule` writes that we know of (Shady #439
+/// round 2): every part `\`, which JSON doubles, and a chosen label of `b`
+/// and 43 of them, so the line reaches 1 KiB with nothing omitted. An
+/// example; the budget uses [`CAPSULE_STORED_ALLOWANCE`].
+fn capsule_example() -> Capsule {
     let b = "\\";
+    let label = format!("b{}", b.repeat(43));
     let fields: Vec<Value> = (0..FIELDS_MAX)
         .map(|i| json!({"id": format!("f{i}"), "label": b.repeat(FIELD_LABEL_MAX)}))
         .collect();
     let d = match parse_input(
         &json!({"question": "q", "detail": b.repeat(CAPSULE_DETAIL_MAX),
-        "options": ["a", {"label": "b", "hint": b.repeat(HINT_MAX)}], "fields": fields}),
+        "options": ["a", {"label": label, "hint": b.repeat(HINT_MAX)}], "fields": fields}),
     )
     .unwrap()
     {
         UiInput::Create { doc, .. } => doc,
         UiInput::Close(_) => unreachable!(),
     };
-    let values = json!({"choice": "b", "fields": (0..FIELDS_MAX).map(|i| (format!("f{i}"), json!("v"))).collect::<serde_json::Map<String, Value>>()});
+    let values = json!({"choice": label, "fields": (0..FIELDS_MAX).map(|i| (format!("f{i}"), json!("v"))).collect::<serde_json::Map<String, Value>>()});
     let a = parse_answer(&d, &values).unwrap();
-    // The longest task that keeps every part, then every byte of it `\`.
-    let fit = (0..=TASK_EXCERPT_MAX)
+    // The longest task that keeps every part, every byte of it `\`.
+    (0..=TASK_EXCERPT_MAX)
         .rev()
         .map(|n| build_capsule(&d, &b.repeat(n), &a))
         .find(|c| !c.contains("omitted"))
-        .unwrap();
-    let mut lt = String::from("<asked during=\"\">");
-    while lt.len() + 6 + "</asked>".len() <= CAPSULE_MAX_BYTES {
-        lt.push_str("\\u003c");
-    }
-    lt.push_str("</asked>");
-    let lt = Capsule::parse(&lt).unwrap();
-    let encoded = |c: &Capsule| bytes(&json!(c));
-    assert!(fit.len() <= CAPSULE_MAX_BYTES);
-    assert!(
-        encoded(&fit) > encoded(&lt),
-        "backslashes cost more stored: {} vs {}",
-        encoded(&fit),
-        encoded(&lt)
-    );
-    fit
+        .unwrap()
 }
 
 #[test]
 fn worst_case_budget_is_measured() {
-    let doc = worst_doc();
+    let doc = doc_example();
     let doc_bytes = bytes(&serde_json::to_value(&doc).unwrap());
     revalidate(&doc).unwrap();
+    let asked = capsule_example();
+    let asked_bytes = bytes(&json!(asked));
+    assert_eq!(
+        asked.len(),
+        CAPSULE_MAX_BYTES,
+        "the example reaches the cap"
+    );
+    assert!(Capsule::parse("<asked during=\"\">\u{1}</asked>").is_some());
+    assert_eq!(
+        bytes(&json!("\u{1}")),
+        6 + 2,
+        "a C0 control stores as \\u00XX"
+    );
 
     let state = worst_state(&doc);
     let state_bytes = bytes(&state);
     let attached = Value::Array(vec![state.clone(); ATTACHED_MAX_STATES]);
     let attached_bytes = bytes(&attached);
     let tomb_bytes = bytes(&tombstone());
-    let asked = worst_asked();
-    let asked_bytes = bytes(&json!(asked));
 
     let per_record = LEDGER_MAX_VALUE_BYTES / LEDGER_MAX_RECORDS;
     let record_values = {
@@ -472,7 +490,8 @@ fn worst_case_budget_is_measured() {
     let record = json!({
         "answer_id": format!("a_{}", hex(16)), "card": format!("s_{}", hex(16)), "rev": u32::MAX,
         "status": "answered", "values": record_values, "wake": false, "epoch": u32::MAX,
-        "delivery": "in_context", "q": wide(QUESTION_MAX), "asked": asked,
+        "delivery": "in_context", "q": wide(QUESTION_MAX),
+        "asked": filler(CAPSULE_STORED_ALLOWANCE),
     });
     let binding = json!({"session_id": session_id(), "base": hex(64), "seq": u64::MAX});
     let sidecar = json!({
@@ -494,14 +513,20 @@ fn worst_case_budget_is_measured() {
     let sidecar_bytes = bytes(&sidecar);
 
     eprintln!(
-        "ui budget (measured): doc {doc_bytes} B (cap {DOC_MAX_BYTES}); SurfaceState {state_bytes} B (cap {SURFACE_STATE_MAX_BYTES}); \
+        "ui budget (measured): doc allowed {DOC_MAX_BYTES} B (example {doc_bytes} B); \
+         capsule stored allowed {CAPSULE_STORED_ALLOWANCE} B (example {} B, stored {asked_bytes} B); \
+         SurfaceState {state_bytes} B (cap {SURFACE_STATE_MAX_BYTES}); \
          Attached.surfaces {attached_bytes} B (cap {ATTACHED_MAX_BYTES}); tombstone {tomb_bytes} B (cap {TOMBSTONE_MAX_BYTES}); \
-         capsule {} B, stored {asked_bytes} B; sidecar {sidecar_bytes} B (cap {SIDECAR_MAX_BYTES})",
+         sidecar {sidecar_bytes} B (cap {SIDECAR_MAX_BYTES})",
         asked.len()
     );
     assert!(
         doc_bytes > INPUT_MAX_BYTES && doc_bytes <= DOC_MAX_BYTES,
-        "the doc is the worst case: materializing grew it past the input cap ({doc_bytes} B)"
+        "materializing grew the example past the input cap ({doc_bytes} B)"
+    );
+    assert!(
+        asked_bytes <= CAPSULE_STORED_ALLOWANCE,
+        "capsule stored {asked_bytes} B"
     );
     assert_eq!(tomb_bytes, 573, "v3.2 #10: the slim tombstone at its worst");
     assert!(
