@@ -3,7 +3,8 @@ use super::types::Event;
 /// A rendered attribute value: `"` becomes `'`, `<`, `>` and invisible
 /// format characters are dropped and control characters become spaces. A
 /// value can neither end its attribute nor close the tag nor open another one.
-fn attr(value: &str) -> String {
+/// `ui::answer` renders `<ui_answer>` attributes with it.
+pub(crate) fn attr(value: &str) -> String {
     value
         .chars()
         .filter_map(|c| match c {
@@ -20,7 +21,8 @@ fn attr(value: &str) -> String {
 /// BOM), bidi marks, embeddings, overrides and isolates (LRM, RLM, ALM,
 /// LRE..RLO, LRI..PDI), soft hyphen, variation selectors, tag characters and
 /// the like. They render as nothing, so they could hide inside a tag.
-fn is_invisible(c: char) -> bool {
+/// `ui::sanitize` drops the same set (minus ZWJ and ZWNJ) and tests parity.
+pub(crate) fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
