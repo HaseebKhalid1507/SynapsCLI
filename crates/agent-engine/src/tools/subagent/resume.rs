@@ -455,6 +455,7 @@ impl Tool for SubagentResumeTool {
         let handle_id_inner = handle_id.clone();
         let prior_handle_for_finalizer = prior_handle_id.clone();
         let child_parent_id = handle_id.clone();
+        let child_route = crate::session::child_events::worker_route(ctx.channels.tx_delta.as_ref(), &handle_id);
 
         // ── Build and register handle BEFORE spawning ─────────────────────────
         let system_prompt_for_handle = system_prompt.clone();
@@ -563,6 +564,7 @@ impl Tool for SubagentResumeTool {
                             subagent_id,
                             &label_a,
                         );
+                        runtime.set_child_route(child_route.clone());
 
                         let cancel = crate::CancellationToken::new();
                         let cancel_inner = cancel.clone();

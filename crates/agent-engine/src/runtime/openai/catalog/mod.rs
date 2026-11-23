@@ -1815,7 +1815,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod muse_warmup_tests {
+pub(crate) mod muse_warmup_tests {
     //! `ensure_muse_catalog_for`: at most one catalog GET (backed off)
     //! through the given broker, only for a well-formed `muse/` id with no
     //! live row in this process; never affects routing.
@@ -1826,9 +1826,9 @@ mod muse_warmup_tests {
     };
     use std::sync::{Arc, Mutex};
 
-    struct CatalogBroker {
+    pub(crate) struct CatalogBroker {
         body: Result<&'static str, BrokerError>,
-        seen: Mutex<Vec<ProxyRequest>>,
+        pub(crate) seen: Mutex<Vec<ProxyRequest>>,
     }
 
     #[async_trait::async_trait]
@@ -1857,7 +1857,7 @@ mod muse_warmup_tests {
         }
     }
 
-    fn broker(body: Result<&'static str, BrokerError>) -> Arc<CatalogBroker> {
+    pub(crate) fn broker(body: Result<&'static str, BrokerError>) -> Arc<CatalogBroker> {
         Arc::new(CatalogBroker {
             body,
             seen: Mutex::new(Vec::new()),
@@ -1878,7 +1878,7 @@ mod muse_warmup_tests {
         reset_muse_warmup_backoff();
     }
 
-    const CATALOG: &str = r#"{"models":[{"id":"muse-warmup-probe-zz7","display_order":1,
+    pub(crate) const CATALOG: &str = r#"{"models":[{"id":"muse-warmup-probe-zz7","display_order":1,
         "reasoning_effort_variants":[{"effort":"high"}]}]}"#;
 
     #[test]

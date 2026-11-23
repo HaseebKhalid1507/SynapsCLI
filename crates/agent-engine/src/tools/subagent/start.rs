@@ -207,6 +207,7 @@ impl Tool for SubagentStartTool {
         let parent_queue = ctx.capabilities.event_queue.clone();
         let handle_id_inner = handle_id.clone();
         let child_parent_id = handle_id.clone();
+        let child_route = crate::session::child_events::worker_route(ctx.channels.tx_delta.as_ref(), &handle_id);
 
         // ── Build and register handle BEFORE spawning ─────────────────────────
         // This closes the publish-before-register race: finalize_subagent can
@@ -321,6 +322,7 @@ impl Tool for SubagentStartTool {
                             subagent_id,
                             &label_a,
                         );
+                        runtime.set_child_route(child_route.clone());
 
                         let cancel = crate::CancellationToken::new();
                         let cancel_inner = cancel.clone();

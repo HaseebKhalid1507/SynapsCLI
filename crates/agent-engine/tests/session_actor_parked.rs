@@ -691,6 +691,7 @@ async fn reloaded_live_session(host: &Arc<agent_engine::EngineHost>) -> agent_en
         expected_clients: 1,
         next_subagent_id: 0,
         boot_id: String::new(),
+        children: Vec::new(),
     }
 }
 

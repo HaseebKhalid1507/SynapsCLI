@@ -1425,3 +1425,33 @@ async fn create_session_picks_up_config_edited_after_boot() {
     // Unchanged file: no reload churn.
     assert!(!host.reload_config_if_changed());
 }
+
+/// `thinking_options` with no model names what a new session gets: the
+/// model a session created right after carries. Both re-read a config file
+/// edited since the host's snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn new_session_model_is_what_a_created_session_gets() {
+    let _h = Home::new();
+    let config_path = std::path::PathBuf::from(std::env::var("SYNAPS_BASE_DIR").unwrap()).join("config");
+    std::fs::write(&config_path, "model = claude-haiku-4-5\n").unwrap();
+    let host = host().await;
+    let predicted = host.new_session_model();
+    assert_eq!(predicted, "claude-haiku-4-5");
+    let fresh = SessionConfig { persist: false, ..SessionConfig::default() };
+    let handle = host.create_session(fresh.clone()).await.unwrap();
+    assert_eq!(handle.meta_live().model, predicted);
+
+    // Edit after boot; bump mtime explicitly so coarse filesystems still see it.
+    std::fs::write(&config_path, "model = claude-opus-4-7\n").unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    std::fs::File::options()
+        .write(true)
+        .open(&config_path)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    assert_eq!(host.new_session_model(), "claude-opus-4-7", "the query re-reads the edited config");
+    let second = host.create_session(fresh).await.unwrap();
+    assert_eq!(second.meta_live().model, "claude-opus-4-7", "as create does");
+}

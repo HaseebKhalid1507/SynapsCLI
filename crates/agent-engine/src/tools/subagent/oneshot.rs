@@ -147,6 +147,7 @@ impl Tool for SubagentTool {
         let label_inner = label.clone();
         let model_inner = model.clone();
         let tx_events_inner = ctx.channels.tx_events.clone();
+        let child_route = crate::session::child_events::worker_route(ctx.channels.tx_delta.as_ref(), &orchestration_id);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let orchestration = ctx.capabilities.orchestration.as_ref().unwrap();
@@ -201,6 +202,7 @@ impl Tool for SubagentTool {
                         subagent_id,
                         &label_inner,
                     );
+                    runtime.set_child_route(child_route);
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();

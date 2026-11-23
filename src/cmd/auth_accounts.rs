@@ -1176,6 +1176,7 @@ mod state_tests {
                     daemon_build: "oldbld1".into(),
                     features: Vec::new(),
                     boot_id: String::new(),
+                    accepted_events: vec![],
                 });
                 w.write_all(encode_line(&welcome).unwrap().as_bytes())
                     .await
