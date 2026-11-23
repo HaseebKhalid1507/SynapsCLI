@@ -5411,7 +5411,7 @@ impl SessionActor {
             // Agent cards (T8): answers queued behind it go into history
             // now. An abort never starts a turn: every caller is a stop.
             if self.drain_queued_answers() {
-                tracing::debug!(session = %self.id, "agent cards: a queued answer's wake is dropped with the aborted compaction");
+                tracing::debug!(session = %self.id, "agent cards: a queued wake is dropped with the aborted compaction");
             }
             self.publish_presence();
         }

@@ -1599,6 +1599,9 @@ pub fn apply(sc: &mut Sidecar, op: &Op) {
                 st.epoch = epoch;
                 st.rev = st.rev.saturating_add(1);
                 let waiting = st.mode == WaitMode::Waiting;
+                // The stop that met the card open (a system stop expires
+                // it below, so this is read first).
+                let was_open = st.phase == Phase::Open;
                 match kind {
                     StopKind::User | StopKind::System if waiting => {
                         st.phase = Phase::Expired;
@@ -1627,7 +1630,7 @@ pub fn apply(sc: &mut Sidecar, op: &Op) {
                         }
                     }
                 }
-                if st.phase == Phase::Open {
+                if was_open {
                     st.origin.stopped = Some(*kind);
                 }
             }

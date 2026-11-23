@@ -116,9 +116,15 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
             assert_eq!(w.protocol_version, PROTOCOL_VERSION);
             assert_eq!(w.daemon_version, binary_version());
             assert_eq!(w.pid, std::process::id());
+            // Agent cards are advertised by the build where directory
+            // sync exists (agent-ui §1.5, §3.4), whatever the config.
+            let mut served = vec![FEATURE_OWNED_SESSIONS, FEATURE_SESSION_WORKERS, FEATURE_SESSION_PAGE];
+            if cfg!(unix) {
+                served.push(FEATURE_AGENT_SURFACES);
+            }
             assert_eq!(
                 w.features,
-                [FEATURE_OWNED_SESSIONS, FEATURE_SESSION_WORKERS, FEATURE_SESSION_PAGE],
+                served,
                 "every feature this daemon serves"
             );
         }

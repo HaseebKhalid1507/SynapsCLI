@@ -180,6 +180,16 @@ fn answer(card: &SurfaceState, action_id: &str, values: serde_json::Value) -> Se
 }
 
 /// `t`'s next `surface_result` for `action_id`.
+/// The result for `action_id`, and everything that came with it (the ack's
+/// upsert arrives just before it).
+async fn result_seen(t: &mut LocalTransport, action_id: &str) -> (SurfaceResult, Vec<Envelope>) {
+    let seen = until(t, |e| matches!(e, SessionEventWire::SurfaceResult(r) if r.action_id == action_id)).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::SurfaceResult(r) => (r.clone(), seen),
+        _ => unreachable!(),
+    }
+}
+
 async fn result_for(t: &mut LocalTransport, action_id: &str) -> SurfaceResult {
     let seen = until(t, |e| matches!(e, SessionEventWire::SurfaceResult(r) if r.action_id == action_id)).await;
     match &seen.last().unwrap().event {
@@ -222,9 +232,9 @@ async fn an_idle_answer_is_acked_delivered_once_and_starts_one_turn() {
     let _h = Home::new();
     let (handle, mut a, card, hits) = with_card(&[SSE_UI_CREATE, SSE_HI, SSE_HI]).await;
     a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
-    let r = result_for(&mut a, A1).await;
+    let (r, mut seen) = result_seen(&mut a, A1).await;
     assert_eq!((r.outcome, r.answer_rev, r.client), (SurfaceOutcome::Accepted, Some(1), a.client_id()));
-    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    seen.extend(until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await);
     assert!(seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })), "one turn: {seen:#?}");
     let receipt = cards(&seen).into_iter().find(|c| c.phase == Phase::Answered).expect("an upsert");
     assert!(receipt.rev > card.rev && receipt.offers.is_empty());
@@ -380,7 +390,12 @@ async fn retry_after_cancel_needs_new_consent() {
     a.send_from_self(fresh).await.unwrap();
     assert_eq!(result_for(&mut a, A2).await.outcome, SurfaceOutcome::Accepted);
     until(&mut a, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
-    assert!(hits.load(std::sync::atomic::Ordering::SeqCst) > before, "Answer & resume starts the turn");
+    // The turn's request reaches the model just after `TurnStarted`.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while hits.load(std::sync::atomic::Ordering::SeqCst) <= before {
+        assert!(tokio::time::Instant::now() < deadline, "Answer & resume starts the turn");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     a.send_from_self(SessionCommand::Cancel).await.unwrap();
     until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
     end(&mut a).await;
@@ -511,7 +526,12 @@ async fn remote_cancel_while_disconnected() {
     until(&mut b, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
     a.send(SessionCommand::Detach { client: a.client_id() }).await.unwrap();
     b.send_from_self(SessionCommand::Cancel).await.unwrap();
-    until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    // The stop is durable before its upsert shows it (the write rule); an
+    // attach before that would still see the old epoch.
+    if !cards(&seen).iter().any(|c| c.epoch > card.epoch) {
+        until(&mut b, |e| matches!(e, SessionEventWire::Surface(s) if s.epoch > card.epoch)).await;
+    }
     let (mut a2, snap) = LocalTransport::attach(handle.clone(), capable(ClientKind::Test)).await.unwrap();
     let now = snap.surfaces.iter().find(|c| c.id == card.id).cloned().expect("retained");
     assert!(now.epoch > card.epoch, "{now:?}");
@@ -849,8 +869,13 @@ async fn late_answer_after_compaction_capsule() {
     let flat = serde_json::to_string(&history).unwrap();
     assert!(!flat.contains("toolu_ui1") && !flat.contains("taskword"), "really gone: {flat}");
 
-    a.send_from_self(answer(&card, A1, serde_json::json!({"choice": "Refactor"}))).await.unwrap();
-    assert_eq!(result_for(&mut a, A1).await.outcome, SurfaceOutcome::Accepted);
+    // A card with fields is answered with every field (§3.3 #11).
+    let blank: serde_json::Map<String, serde_json::Value> =
+        card.doc.fields.iter().map(|f| (f.id.clone(), serde_json::json!(""))).collect();
+    let values = serde_json::json!({"choice": "Refactor", "fields": blank});
+    a.send_from_self(answer(&card, A1, values)).await.unwrap();
+    let r = result_for(&mut a, A1).await;
+    assert_eq!(r.outcome, SurfaceOutcome::Accepted, "{r:?}");
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
     let history = last_conversation(&seen).api_messages;
     let msg = history
