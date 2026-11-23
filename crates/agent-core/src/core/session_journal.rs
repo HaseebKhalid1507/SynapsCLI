@@ -1516,13 +1516,16 @@ fn journal_meta_tail_from_handle(
 
 // ─── deletion ────────────────────────────────────────────────────────────────
 
-/// Remove a session's snapshot, journal AND turn draft (`session_draft`)
-/// (compaction rollback, retention). Idempotent — missing files are not
-/// errors.
+/// Remove a session's agent-card sidecar (`<id>.ui`), snapshot, journal
+/// AND turn draft (`session_draft`) (compaction rollback, retention).
+/// Idempotent — missing files are not errors. The sidecar goes first
+/// (agent-ui §7 C2): a delete cut short leaves history without its cards,
+/// never cards without their history.
 pub fn delete_session_files_in_dir(dir: &Path, id: &str) -> std::io::Result<()> {
     let Some(handle) = open_sessions_dir(dir)? else {
         return Ok(()); // no directory — idempotently nothing to delete
     };
+    remove_artifact_if_exists(&handle, &crate::core::session_surfaces::sidecar_name(id))?;
     remove_artifact_if_exists(&handle, &format!("{id}.json"))?;
     remove_artifact_if_exists(&handle, &format!("{id}.journal"))?;
     remove_artifact_if_exists(&handle, &format!("{id}.turn"))
