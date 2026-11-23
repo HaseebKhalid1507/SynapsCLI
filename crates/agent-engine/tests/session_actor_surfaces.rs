@@ -388,7 +388,7 @@ async fn retry_after_cancel_needs_new_consent() {
 
 /// The card as a fresh capable attach sees it.
 async fn handle_card(handle: &agent_engine::session::SessionHandle) -> SurfaceState {
-    let (mut b, snap) = LocalTransport::attach(handle.clone(), capable(ClientKind::Attach)).await.unwrap();
+    let (b, snap) = LocalTransport::attach(handle.clone(), capable(ClientKind::Attach)).await.unwrap();
     b.send(SessionCommand::Detach { client: b.client_id() }).await.unwrap();
     snap.surfaces.into_iter().next().expect("the card")
 }
@@ -796,7 +796,7 @@ async fn deferred_start_then_system_stop() {
     seen.extend(drain_for(&mut a, Duration::from_millis(600)).await);
     assert!(!seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })), "zero new turns: {seen:#?}");
     assert_eq!(ui_answers(&last_conversation(&seen).api_messages, &card.id), 1, "in context once");
-    let stopped = cards(&seen).into_iter().filter(|c| c.id == card.id).last().expect("the stop's upsert");
+    let stopped = cards(&seen).into_iter().rfind(|c| c.id == card.id).expect("the stop's upsert");
     assert!(stopped.epoch > card.epoch && stopped.offers.is_empty(), "{stopped:?}");
     assert!(stopped.answer.as_ref().is_some_and(|x| x.rev == 1));
     assert_eq!(turns.load(std::sync::atomic::Ordering::SeqCst), 2);
