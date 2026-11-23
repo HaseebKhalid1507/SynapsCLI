@@ -8,8 +8,7 @@ use agent_engine::ui::answer::{
     build_capsule, format_answer_message, parse_answer, parse_answer_message, task_excerpt,
     AnswerMessage,
 };
-use agent_engine::ui::doc::parse_input;
-use agent_engine::ui::sanitize::refused_char;
+use agent_engine::ui::sanitize::{fold_key, refused_char};
 use agent_engine::ui::*;
 use serde_json::{json, Value};
 
@@ -85,7 +84,13 @@ fn valid_fixtures() {
         );
         let stored: CardDoc = serde_json::from_value(f["doc"].clone()).unwrap();
         assert_eq!(stored, doc, "{name}: the stored doc reads back");
-        doc.revalidate().unwrap_or_else(|e| panic!("{name}: {e}"));
+        revalidate(&doc).unwrap_or_else(|e| panic!("{name}: {e}"));
+        revalidate(&stored).unwrap_or_else(|e| panic!("{name}: stored: {e}"));
+        if let Some(n) = f.get("input_bytes") {
+            assert_eq!(json!(bytes(&f["input"])), *n, "{name}: input bytes");
+            assert_eq!(json!(bytes(&f["doc"])), f["doc_bytes"], "{name}: doc bytes");
+            assert!(bytes(&f["doc"]) <= DOC_MAX_BYTES, "{name}");
+        }
         assert_eq!(json!(wait), f["wait"], "{name}");
         assert_eq!(
             serde_json::to_value(doc.mode()).unwrap(),
@@ -128,18 +133,23 @@ fn valid_fixtures() {
             assert_eq!(json!(text), a["message"], "{name}: message");
             let back = parse_answer_message(&text).unwrap_or_else(|| panic!("{name}: reads back"));
             assert_eq!(format_answer_message(&back), text, "{name}: round trip");
+            // `q` reads back as its attribute projection; everything else as built.
+            assert_eq!(json!(back.q), a["q"], "{name}: q as an attribute");
             assert_eq!(
+                back,
                 AnswerMessage {
-                    q: m.q.clone(),
-                    ..back
+                    q: back.q.clone(),
+                    ..m
                 },
-                m,
                 "{name}: round trip"
             );
         }
         for bad in f["bad_answers"].as_array().into_iter().flatten() {
-            let e = parse_answer(&doc, &bad["values"]).expect_err(&name);
-            assert_eq!(json!(e.to_string()), bad["error"], "{name}");
+            let e = parse_answer(&doc, &bad["values"])
+                .expect_err(&name)
+                .to_string();
+            assert_eq!(json!(e), bad["error"], "{name}");
+            assert!(one_safe_line(&e), "{name}: {e:?}");
         }
         if let Some(r) = f.get("wait_result") {
             let a = &f["answers"][0];
@@ -159,9 +169,83 @@ fn invalid_fixtures() {
     let all = read_dir("invalid");
     assert!(all.len() >= 10);
     for (name, f) in all {
-        let e = parse_input(&f["input"]).expect_err(&name);
-        assert_eq!(json!(e.to_string()), f["error"], "{name}");
+        let e = parse_input(&f["input"]).expect_err(&name).to_string();
+        assert_eq!(json!(e), f["error"], "{name}");
+        assert!(one_safe_line(&e), "{name}: {e:?}");
     }
+}
+
+/// A refusal is one line, at most 322 characters, with nothing that can
+/// hide or reorder text (Shady #439 M1).
+fn one_safe_line(e: &str) -> bool {
+    e.chars().count() <= ERROR_PATH_MAX + 2 + ERROR_MESSAGE_MAX
+        && ui_sanitize(e, Lines::Single) == e
+        && refused_char(e).is_none()
+}
+
+/// The raw-JSON lane (Shady #439 L2): `decode_json`, then the model.
+#[test]
+fn raw_fixtures() {
+    let all = read_dir("raw");
+    assert!(all.len() >= 10);
+    for (name, f) in all {
+        let decoded = decode_json(f["text"].as_str().unwrap());
+        let v = match (decoded, f["json_error"].as_str()) {
+            (Err(e), Some(prefix)) => {
+                assert!(e.to_string().starts_with(prefix), "{name}: {e}");
+                assert!(one_safe_line(&e.to_string()), "{name}: {e:?}");
+                continue;
+            }
+            (Ok(v), None) => v,
+            (other, _) => panic!("{name}: {other:?}"),
+        };
+        match f["what"].as_str().unwrap() {
+            "input" => match parse_input(&v) {
+                Ok(UiInput::Create { doc, .. }) => {
+                    assert_eq!(serde_json::to_value(&doc).unwrap(), f["doc"], "{name}")
+                }
+                Ok(other) => panic!("{name}: {other:?}"),
+                Err(e) => assert_eq!(json!(e.to_string()), f["error"], "{name}"),
+            },
+            "answer" => {
+                let Ok(UiInput::Create { doc, .. }) = parse_input(&f["card"]) else {
+                    panic!("{name}: card")
+                };
+                match parse_answer(&doc, &v) {
+                    Ok(a) => assert_eq!(serde_json::to_value(&a).unwrap(), f["values"], "{name}"),
+                    Err(e) => assert_eq!(json!(e.to_string()), f["error"], "{name}"),
+                }
+            }
+            other => panic!("{name}: {other}"),
+        }
+    }
+}
+
+/// The label comparison key is Unicode full case folding (Shady #439 M3),
+/// pinned for every scalar value against Python's `str.casefold`.
+#[test]
+fn casefold_fixture() {
+    let f: Value =
+        serde_json::from_str(&std::fs::read_to_string(corpus().join("casefold.json")).unwrap())
+            .unwrap();
+    let table = f["differs_from_lowercase"].as_object().unwrap();
+    assert!(table.len() > 200);
+    let (major, minor, update) = char::UNICODE_VERSION;
+    let mut wrong = Vec::new();
+    for c in (0..=0x10FFFFu32).filter_map(char::from_u32) {
+        let expected = match table.get(&format!("U+{:04X}", c as u32)) {
+            Some(v) => v.as_str().unwrap().to_string(),
+            None => c.to_lowercase().collect(),
+        };
+        if fold_key(&c.to_string()) != expected {
+            wrong.push(format!("U+{:04X}", c as u32));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "fold_key differs from casefold.json (Unicode {}; this toolchain {major}.{minor}.{update}) at {wrong:?}",
+        f["unicode"]
+    );
 }
 
 #[test]
@@ -185,11 +269,13 @@ fn sanitize_fixtures() {
 //
 // Every cap full at once, in the encoding that costs most. Strings that
 // sanitize can't shrink take 4 bytes per character (a supplementary-plane
-// scalar is one character for every bound and 4 bytes in JSON; `"` and `\`
-// cost 2, controls are refused). Numbers are at their type's maximum and
-// enums at their longest spelling, so the fixed-shape transitions (epoch,
-// expiry, final receipts, settle, downgrade) can't grow an image: they only
-// change those fields. C2 and C3 re-run this against their real types.
+// scalar is one character for every bound and 4 bytes in JSON), or 2 per
+// byte where the bound is in bytes and `\` or `"` may appear (JSON writes
+// them escaped). Numbers are at their type's maximum and enums at their
+// longest spelling, so the fixed-shape transitions (epoch, expiry, final
+// receipts, settle, downgrade) can't grow an image: they only change those
+// fields. Identifiers are at their v3.2 #11 bounds. C2 and C3 re-run this
+// against their real types.
 
 const WIDE: &str = "\u{10FFFD}";
 
@@ -205,35 +291,15 @@ fn bytes(v: &Value) -> usize {
     serde_json::to_vec(v).unwrap().len()
 }
 
-/// The largest doc a valid input can normalize to: the input at its 8 KiB
-/// cap, with the shape that materializes the most (string options become
-/// `{label}`, fields omit `type`, `value` and `optional`, `multi` omitted),
-/// the rest of the budget in 4-byte characters.
+/// The largest doc an input can normalize to: the max-size fixture, whose
+/// default is spelled in KELVIN SIGN and given in ASCII.
 fn worst_doc() -> CardDoc {
-    let mut input = json!({
-        "question": "q",
-        "detail": "",
-        "options": (0..OPTIONS_MAX).map(|i| i.to_string()).collect::<Vec<_>>(),
-        "fields": (0..FIELDS_MAX).map(|i| json!({"id": format!("f{i}"), "label": "L"})).collect::<Vec<_>>(),
-    });
-    let mut left = INPUT_MAX_BYTES - bytes(&input);
-    let mut fill = |slot: &mut Value, prefix: &str, cap: usize| {
-        let room = cap - prefix.chars().count();
-        let n = (left / 4).min(room);
-        *slot = json!(format!("{prefix}{}", wide(n)));
-        left -= 4 * n;
-    };
-    fill(&mut input["detail"], "", DETAIL_MAX);
-    fill(&mut input["question"], "q", QUESTION_MAX);
-    for i in 0..OPTIONS_MAX {
-        fill(&mut input["options"][i], &i.to_string(), OPTION_LABEL_MAX);
-    }
-    for i in 0..FIELDS_MAX {
-        fill(&mut input["fields"][i]["label"], "L", FIELD_LABEL_MAX);
-    }
-    assert!(left < 4, "the input budget is spent ({left} left)");
-    assert!(bytes(&input) <= INPUT_MAX_BYTES);
-    match parse_input(&input).unwrap() {
+    let f: Value = serde_json::from_str(
+        &std::fs::read_to_string(corpus().join("valid/max_size_kelvin_default.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bytes(&f["input"]), INPUT_MAX_BYTES);
+    match parse_input(&f["input"]).unwrap() {
         UiInput::Create { doc, .. } => doc,
         UiInput::Close(_) => unreachable!(),
     }
@@ -248,21 +314,55 @@ fn worst_values() -> Value {
     v
 }
 
-/// A provider's tool_use id, a `_synaps_turn` id, a session id: not bounded
-/// by the design; modelled at 128 bytes.
-fn opaque_id() -> String {
-    "i".repeat(128)
+/// A `ui` call id at its bound, every byte one JSON escapes.
+fn call_id() -> String {
+    let id = "\\".repeat(CALL_ID_MAX_BYTES);
+    assert!(is_call_id(&id));
+    id
+}
+
+fn session_id() -> String {
+    let id = "s".repeat(SESSION_ID_MAX_BYTES);
+    assert!(is_session_id(&id));
+    id
+}
+
+fn turn_id() -> String {
+    let id = "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string();
+    assert!(is_turn_id(&id));
+    id
+}
+
+/// A roster label at its bound, every byte one JSON escapes.
+fn by() -> String {
+    let by = roster_label(&"\\".repeat(500));
+    assert!(by.len() <= BY_MAX_BYTES);
+    by
 }
 
 fn rfc3339() -> &'static str {
     "2026-11-23T05:42:00.123456789+00:00"
 }
 
+/// The longest `StopKind`.
+fn stop_kind() -> Value {
+    [
+        StopKind::User,
+        StopKind::System,
+        StopKind::Reload,
+        StopKind::Crash,
+    ]
+    .iter()
+    .map(|k| serde_json::to_value(k).unwrap())
+    .max_by_key(bytes)
+    .unwrap()
+}
+
 /// §2.2 `SurfaceState`, every field at its worst.
 fn worst_state(doc: &CardDoc) -> Value {
     json!({
         "id": format!("s_{}", hex(16)),
-        "call_id": opaque_id(),
+        "call_id": call_id(),
         "rev": u64::MAX,
         "contract": contract(doc),
         "catalog": u32::MAX,
@@ -270,7 +370,7 @@ fn worst_state(doc: &CardDoc) -> Value {
         "phase": "withdrawn",
         "offers": ["answer", "skip", "revise", "forget"],
         "doc": doc,
-        "origin": {"turn": opaque_id(), "task": wide(TASK_EXCERPT_MAX), "stopped": "driver_revoke_long"},
+        "origin": {"turn": turn_id(), "task": wide(TASK_EXCERPT_MAX), "stopped": stop_kind()},
         "epoch": u32::MAX,
         "resume": false,
         "actions": (0..ACTION_LOG_MAX).map(|_| hex(32)).collect::<Vec<_>>(),
@@ -284,50 +384,83 @@ fn worst_state(doc: &CardDoc) -> Value {
             "values": worst_values(),
             "delivery": "in_context",
             "wake": false,
-            // A roster label: a ≤32-character client name, `-N`, ` (#id)`.
-            "by": "n".repeat(96),
+            "by": by(),
             "at": rfc3339(),
         },
     })
 }
 
-/// §3.7: one action log entry. `rev` is an answer revision, at most 4.
+/// §3.7 (v3.2 #10): one action log entry, `{action_id, hash, rev}`. `hash`
+/// is hex128 like the contract; `rev` is the answer revision it produced
+/// (≤4).
 fn log_entry() -> Value {
-    json!({"action_id": hex(32), "hash": hex(64), "verb": "revise", "rev": 4, "epoch": u32::MAX, "outcome": "accepted"})
+    json!({"action_id": hex(32), "hash": hex(32), "rev": 4})
 }
 
 fn log() -> Vec<Value> {
     (0..ACTION_LOG_MAX).map(|_| log_entry()).collect()
 }
 
-/// A tombstone: what a retry still needs (§3.7): the id, when it was made
-/// (for the 7-day limit) and the full action log.
+/// A tombstone (v3.2 #10): `{id, at, log}`, what a retry still needs.
 fn tombstone() -> Value {
     json!({"id": format!("s_{}", hex(16)), "at": rfc3339(), "log": log()})
 }
 
-/// The worst encoded capsule: ≤1 KiB, with as many characters as JSON
-/// escapes again (`\u003c` → `\\u003c`, `"` → `\"`) as fit.
-fn worst_asked() -> String {
-    let mut s = String::from("<asked during=\"\">");
-    while s.len() + 6 + "</asked>".len() <= CAPSULE_MAX_BYTES {
-        s.push_str("\\u003c");
+/// The capsule that costs most once stored as a JSON string (Shady #439
+/// L1): built by `build_capsule` from a valid doc whose every part is `\`,
+/// which JSON doubles, and compared with the old `\u003c` model.
+fn worst_asked() -> Capsule {
+    let b = "\\";
+    let fields: Vec<Value> = (0..FIELDS_MAX)
+        .map(|i| json!({"id": format!("f{i}"), "label": b.repeat(FIELD_LABEL_MAX)}))
+        .collect();
+    let d = match parse_input(
+        &json!({"question": "q", "detail": b.repeat(CAPSULE_DETAIL_MAX),
+        "options": ["a", {"label": "b", "hint": b.repeat(HINT_MAX)}], "fields": fields}),
+    )
+    .unwrap()
+    {
+        UiInput::Create { doc, .. } => doc,
+        UiInput::Close(_) => unreachable!(),
+    };
+    let values = json!({"choice": "b", "fields": (0..FIELDS_MAX).map(|i| (format!("f{i}"), json!("v"))).collect::<serde_json::Map<String, Value>>()});
+    let a = parse_answer(&d, &values).unwrap();
+    // The longest task that keeps every part, then every byte of it `\`.
+    let fit = (0..=TASK_EXCERPT_MAX)
+        .rev()
+        .map(|n| build_capsule(&d, &b.repeat(n), &a))
+        .find(|c| !c.contains("omitted"))
+        .unwrap();
+    let mut lt = String::from("<asked during=\"\">");
+    while lt.len() + 6 + "</asked>".len() <= CAPSULE_MAX_BYTES {
+        lt.push_str("\\u003c");
     }
-    s.push_str("</asked>");
-    assert!(s.len() <= CAPSULE_MAX_BYTES);
-    s
+    lt.push_str("</asked>");
+    let lt = Capsule::parse(&lt).unwrap();
+    let encoded = |c: &Capsule| bytes(&json!(c));
+    assert!(fit.len() <= CAPSULE_MAX_BYTES);
+    assert!(
+        encoded(&fit) > encoded(&lt),
+        "backslashes cost more stored: {} vs {}",
+        encoded(&fit),
+        encoded(&lt)
+    );
+    fit
 }
 
 #[test]
 fn worst_case_budget_is_measured() {
     let doc = worst_doc();
     let doc_bytes = bytes(&serde_json::to_value(&doc).unwrap());
+    revalidate(&doc).unwrap();
 
     let state = worst_state(&doc);
     let state_bytes = bytes(&state);
     let attached = Value::Array(vec![state.clone(); ATTACHED_MAX_STATES]);
     let attached_bytes = bytes(&attached);
     let tomb_bytes = bytes(&tombstone());
+    let asked = worst_asked();
+    let asked_bytes = bytes(&json!(asked));
 
     let per_record = LEDGER_MAX_VALUE_BYTES / LEDGER_MAX_RECORDS;
     let record_values = {
@@ -339,20 +472,20 @@ fn worst_case_budget_is_measured() {
     let record = json!({
         "answer_id": format!("a_{}", hex(16)), "card": format!("s_{}", hex(16)), "rev": u32::MAX,
         "status": "answered", "values": record_values, "wake": false, "epoch": u32::MAX,
-        "delivery": "in_context", "q": wide(QUESTION_MAX), "asked": worst_asked(),
+        "delivery": "in_context", "q": wide(QUESTION_MAX), "asked": asked,
     });
-    let binding = json!({"session_id": opaque_id(), "base": hex(64), "seq": u64::MAX});
+    let binding = json!({"session_id": session_id(), "base": hex(64), "seq": u64::MAX});
     let sidecar = json!({
         "v": 1,
-        "session_id": opaque_id(),
+        "session_id": session_id(),
         "lineage": hex(32),
         "base": hex(64),
         "seq": u64::MAX,
         "epoch": u32::MAX,
         "checkpointed": true,
         "compacting": {"hx": hex(32), "from": binding, "to": binding},
-        "prepared": {"hx": hex(32), "parent": opaque_id(), "from_seq": u64::MAX},
-        "moved_to": {"to": opaque_id(), "hx": hex(32)},
+        "prepared": {"hx": hex(32), "parent": session_id(), "from_seq": u64::MAX},
+        "moved_to": {"to": session_id(), "hx": hex(32)},
         "cards": (0..ATTACHED_MAX_STATES).map(|_| json!({"state": state, "log": log()})).collect::<Vec<_>>(),
         "ledger": vec![record; LEDGER_MAX_RECORDS],
         "tombstones": vec![tombstone(); TOMBSTONES_MAX],
@@ -361,14 +494,16 @@ fn worst_case_budget_is_measured() {
     let sidecar_bytes = bytes(&sidecar);
 
     eprintln!(
-        "ui budget (measured): doc {doc_bytes} B; SurfaceState {state_bytes} B (cap {SURFACE_STATE_MAX_BYTES}); \
+        "ui budget (measured): doc {doc_bytes} B (cap {DOC_MAX_BYTES}); SurfaceState {state_bytes} B (cap {SURFACE_STATE_MAX_BYTES}); \
          Attached.surfaces {attached_bytes} B (cap {ATTACHED_MAX_BYTES}); tombstone {tomb_bytes} B (cap {TOMBSTONE_MAX_BYTES}); \
-         sidecar {sidecar_bytes} B (cap {SIDECAR_MAX_BYTES})"
+         capsule {} B, stored {asked_bytes} B; sidecar {sidecar_bytes} B (cap {SIDECAR_MAX_BYTES})",
+        asked.len()
     );
     assert!(
-        doc_bytes > INPUT_MAX_BYTES,
-        "the doc is the worst case: materializing grew it ({doc_bytes} B)"
+        doc_bytes > INPUT_MAX_BYTES && doc_bytes <= DOC_MAX_BYTES,
+        "the doc is the worst case: materializing grew it past the input cap ({doc_bytes} B)"
     );
+    assert_eq!(tomb_bytes, 573, "v3.2 #10: the slim tombstone at its worst");
     assert!(
         state_bytes <= SURFACE_STATE_MAX_BYTES,
         "SurfaceState {state_bytes} B"

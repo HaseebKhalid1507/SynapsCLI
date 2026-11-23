@@ -7,21 +7,34 @@
 //!   `\n` to a space);
 //! - string options are `{label}`;
 //! - `multi`, a field's `type`, `value` and `optional` are materialized;
-//! - an empty optional string (`detail`, `hint`, `placeholder`) is absent.
+//! - an empty optional string (`detail`, `hint`, `placeholder`) is absent;
+//! - a `default` is a list with `multi` and one label without it, in the
+//!   label's own spelling (v3.2 #4).
 //!
-//! Strings holding a C0/C1 control (other than `\n`/`\t`) or a bidi
-//! embedding, override or isolate are refused, not rewritten
-//! (`sanitize::refused_char`). Length bounds apply to the raw string (as
-//! JSON Schema does); "not empty" applies to the sanitized one.
+//! Order of checks: depth, then bytes (counted, never built), so a value
+//! of any size or depth is refused cheaply (Shady #439 M2). In a string,
+//! `\r\n` and `\r` become `\n` before any check (v3.2 #1). A C0/C1 control
+//! (other than `\n`/`\t`) or a bidi embedding, override or isolate is
+//! refused, not rewritten (`sanitize::refused_char`). Length bounds apply to
+//! the raw string (as JSON Schema does); "not empty", line counts and
+//! duplicates to the sanitized one. Labels are compared by
+//! `sanitize::fold_key`.
 //!
-//! Normalizing is a fixed point: a doc serialized and parsed again is the
-//! same doc ([`CardDoc::revalidate`]).
+//! Normalizing is a fixed point: [`revalidate`] checks that a stored doc is
+//! exactly what normalizing makes of it. Create and revalidate measure the
+//! same thing, the normalized doc against `DOC_MAX_BYTES`, so a doc that
+//! was accepted always revalidates (Shady #439 H1).
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::answer::FieldValue;
-use super::sanitize::{char_len, cut_chars, looks_secret, refused_char, ui_sanitize, Lines};
+pub use agent_core::core::ui_types::{
+    CardDoc, CardField, CardOption, DefaultChoice, FieldKind, FieldValue, Mode,
+};
+
+use super::sanitize::{
+    char_len, cut_chars, fold_key, looks_secret, normalize_newlines, refused_char, ui_sanitize,
+    Lines,
+};
 use super::*;
 
 /// The schema's top-level properties, sorted.
@@ -39,147 +52,44 @@ pub enum UiInput {
     Close(String),
 }
 
-/// One normalized question (§5). Exactly the contract's preimage
-/// (`contract::preimage`); `wait` is the call's mode, not part of the doc.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CardDoc {
-    pub question: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub options: Vec<CardOption>,
-    #[serde(default)]
-    pub multi: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default: Option<DefaultChoice>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fields: Vec<CardField>,
+/// The §4.7 footnote ("Don't type secrets here") applies: a field label
+/// matches the advisory secret heuristic. Never a refusal (v3.2 #14).
+pub fn secret_footnote(doc: &CardDoc) -> bool {
+    doc.fields
+        .iter()
+        .any(|f| f.kind != FieldKind::Check && looks_secret(&f.label))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CardOption {
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
-    /// The prompt of the free-text note this option asks for when picked.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-}
-
-/// The agent's recommendation: one label, or (with `multi`) a list.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum DefaultChoice {
-    One(String),
-    Many(Vec<String>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CardField {
-    pub id: String,
-    pub label: String,
-    #[serde(rename = "type")]
-    pub kind: FieldKind,
-    /// The prefill: `""` / `false` when the agent gave none.
-    pub value: FieldValue,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub placeholder: Option<String>,
-    pub optional: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FieldKind {
-    Text,
-    Long,
-    Check,
-}
-
-impl FieldKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FieldKind::Text => "text",
-            FieldKind::Long => "long",
-            FieldKind::Check => "check",
-        }
+/// Check a doc read back from storage or the wire: at most
+/// `DOC_MAX_BYTES`, and exactly what normalizing makes of it. The raw
+/// input's 8 KiB cap is not applied: it bounds a call, not a doc.
+pub fn revalidate(doc: &CardDoc) -> Result<(), UiError> {
+    if json_len_within(doc, DOC_MAX_BYTES).is_none() {
+        return Err(UiError::new("doc", format!("over {DOC_MAX_BYTES} bytes")));
     }
-
-    /// The bound on a `text` / `long` value; `None` for a check.
-    pub fn max_chars(self) -> Option<usize> {
-        match self {
-            FieldKind::Text => Some(TEXT_MAX),
-            FieldKind::Long => Some(LONG_MAX),
-            FieldKind::Check => None,
-        }
-    }
-
-    pub fn lines(self) -> Lines {
-        if self == FieldKind::Long {
-            Lines::Multi
-        } else {
-            Lines::Single
-        }
-    }
-}
-
-/// How a card is answered (§5.2), derived by the host.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    /// `options`, not `multi`, no `fields`: a click or digit answers at once.
-    Quick,
-    /// Anything else: a Send button.
-    Form,
-}
-
-impl CardDoc {
-    pub fn mode(&self) -> Mode {
-        if !self.options.is_empty() && !self.multi && self.fields.is_empty() {
-            Mode::Quick
-        } else {
-            Mode::Form
-        }
-    }
-
-    pub fn option(&self, label: &str) -> Option<&CardOption> {
-        self.options.iter().find(|o| o.label == label)
-    }
-
-    /// The §4.7 footnote ("Don't type secrets here") applies: a field label
-    /// matches the advisory secret heuristic. Never a refusal.
-    pub fn secret_footnote(&self) -> bool {
-        self.fields
-            .iter()
-            .any(|f| f.kind != FieldKind::Check && looks_secret(&f.label))
-    }
-
-    /// Check a doc read back from storage or the wire: it must be exactly
-    /// what [`parse_input`] makes of it.
-    pub fn revalidate(&self) -> Result<(), UiError> {
-        let value = serde_json::to_value(self).map_err(|e| UiError::new("doc", e.to_string()))?;
-        match parse_input(&value)? {
-            UiInput::Create { doc, .. } if doc == *self => Ok(()),
-            _ => Err(UiError::new("doc", "is not normalized")),
-        }
+    let value = serde_json::to_value(doc).map_err(|e| UiError::new("doc", e.to_string()))?;
+    let Some(obj) = value.as_object() else {
+        return Err(UiError::new("doc", "must be an object"));
+    };
+    if normalize(obj)? == *doc {
+        Ok(())
+    } else {
+        Err(UiError::new("doc", "is not normalized"))
     }
 }
 
 /// Validate and normalize one `ui` input.
 pub fn parse_input(input: &Value) -> Result<UiInput, UiError> {
-    let bytes = serde_json::to_vec(input).map_or(usize::MAX, |v| v.len());
-    if bytes > INPUT_MAX_BYTES {
-        return Err(UiError::new(
-            "input",
-            format!("at most {INPUT_MAX_BYTES} bytes (got {bytes}); shorten the detail or ask in plain text"),
-        ));
-    }
     if deeper_than(input, INPUT_MAX_DEPTH) {
         return Err(UiError::new(
             "input",
             format!("nested deeper than {INPUT_MAX_DEPTH} levels"),
+        ));
+    }
+    if json_len_within(input, INPUT_MAX_BYTES).is_none() {
+        return Err(UiError::new(
+            "input",
+            format!("over {INPUT_MAX_BYTES} bytes; shorten the detail or ask in plain text"),
         ));
     }
     let Some(obj) = input.as_object() else {
@@ -187,15 +97,20 @@ pub fn parse_input(input: &Value) -> Result<UiInput, UiError> {
     };
     if let Some(k) = obj.keys().find(|k| !TOP_KEYS_SORTED.contains(&k.as_str())) {
         return Err(UiError::new(
-            k.as_str(),
+            key_path(k),
             format!("unknown parameter; use {TOP_KEYS}"),
         ));
     }
     if let Some(close) = obj.get("close") {
-        if let Some(other) = obj.keys().find(|k| *k != "close") {
+        // v3.2 #5: a key at its schema default counts as absent.
+        let at_default = |k: &str, v: &Value| matches!(k, "wait" | "multi") && *v == false;
+        if let Some((other, _)) = obj.iter().find(|(k, v)| *k != "close" && !at_default(k, v)) {
             return Err(UiError::new(
                 "close",
-                format!("give it alone, with no other parameter (got {other})"),
+                format!(
+                    "give it alone, with no other parameter (got {})",
+                    key_path(other)
+                ),
             ));
         }
         return match close.as_str() {
@@ -207,6 +122,20 @@ pub fn parse_input(input: &Value) -> Result<UiInput, UiError> {
         };
     }
     let wait = flag(obj, "wait")?;
+    let doc = normalize(obj)?;
+    if json_len_within(&doc, DOC_MAX_BYTES).is_none() {
+        // Unreachable for an input within its cap (`NORMALIZE_GROWTH_MAX`);
+        // kept so create and revalidate can never disagree.
+        return Err(UiError::new(
+            "input",
+            format!("normalized, the card is over {DOC_MAX_BYTES} bytes; shorten the detail or ask in plain text"),
+        ));
+    }
+    Ok(UiInput::Create { doc, wait })
+}
+
+/// The doc an object with only known top-level keys describes.
+fn normalize(obj: &Map<String, Value>) -> Result<CardDoc, UiError> {
     let multi = flag(obj, "multi")?;
     let Some(question) = obj.get("question") else {
         return Err(UiError::new(
@@ -253,27 +182,14 @@ pub fn parse_input(input: &Value) -> Result<UiInput, UiError> {
         Some(v) => fields(v)?,
         None => Vec::new(),
     };
-    let doc = CardDoc {
+    Ok(CardDoc {
         question,
         detail: non_empty(detail),
         options,
         multi,
         default,
         fields,
-    };
-    Ok(UiInput::Create { doc, wait })
-}
-
-/// Whether `v` nests deeper than `limit`, scalars counted as one level.
-fn deeper_than(v: &Value, limit: usize) -> bool {
-    if limit == 0 {
-        return true;
-    }
-    match v {
-        Value::Array(a) => a.iter().any(|v| deeper_than(v, limit - 1)),
-        Value::Object(o) => o.values().any(|v| deeper_than(v, limit - 1)),
-        _ => false,
-    }
+    })
 }
 
 fn flag(obj: &Map<String, Value>, key: &str) -> Result<bool, UiError> {
@@ -288,8 +204,8 @@ fn non_empty(s: Option<String>) -> Option<String> {
     s.filter(|s| !s.is_empty())
 }
 
-/// A shown string: refused characters, the raw bound, then `ui_sanitize`
-/// and the minimum on what is left.
+/// A shown string: line endings, refused characters, the raw bound, then
+/// `ui_sanitize` and the minimum on what is left.
 fn string(
     v: &Value,
     path: &str,
@@ -298,23 +214,24 @@ fn string(
     max: usize,
     advice: &str,
 ) -> Result<String, UiError> {
-    let Some(s) = v.as_str() else {
+    let Some(raw) = v.as_str() else {
         return Err(UiError::new(path, "must be a string"));
     };
-    if let Some((c, why)) = refused_char(s) {
+    let s = normalize_newlines(raw);
+    if let Some((c, why)) = refused_char(&s) {
         return Err(UiError::new(
             path,
             format!("holds U+{:04X} ({why}); remove it", c as u32),
         ));
     }
-    let n = char_len(s);
+    let n = char_len(&s);
     if n > max {
         return Err(UiError::new(
             path,
             format!("at most {max} characters (got {n}){advice}"),
         ));
     }
-    let clean = ui_sanitize(s, lines);
+    let clean = ui_sanitize(&s, lines);
     if char_len(&clean) < min {
         let msg = if s.is_empty() {
             "must not be empty"
@@ -353,7 +270,7 @@ fn options(v: &Value, multi: bool) -> Result<Vec<CardOption>, UiError> {
         ));
     }
     let mut out: Vec<CardOption> = Vec::with_capacity(n);
-    let mut label_paths: Vec<String> = Vec::with_capacity(n);
+    let mut keys: Vec<(String, String)> = Vec::with_capacity(n);
     let mut note_at: Option<usize> = None;
     for (i, item) in items.iter().enumerate() {
         let path = format!("options[{i}]");
@@ -379,7 +296,7 @@ fn options(v: &Value, multi: bool) -> Result<Vec<CardOption>, UiError> {
             Value::Object(o) => {
                 if let Some(k) = o.keys().find(|k| !OPTION_KEYS.contains(&k.as_str())) {
                     return Err(UiError::new(
-                        format!("{path}.{k}"),
+                        format!("{path}.{}", key_path(k)),
                         "unknown key; an option takes label, hint and note",
                     ));
                 }
@@ -426,14 +343,13 @@ fn options(v: &Value, multi: bool) -> Result<Vec<CardOption>, UiError> {
                 ))
             }
         };
-        let folded = option.label.to_lowercase();
-        if let Some(j) = out.iter().position(|o| o.label.to_lowercase() == folded) {
+        let key = fold_key(&option.label);
+        if let Some((_, first)) = keys.iter().find(|(k, _)| *k == key) {
             return Err(UiError::new(
                 label_path,
                 format!(
-                    "{} duplicates {}; labels must differ (ignoring case)",
+                    "{} duplicates {first}; labels must differ (ignoring case)",
                     quote(&option.label),
-                    label_paths[j]
                 ),
             ));
         }
@@ -453,11 +369,14 @@ fn options(v: &Value, multi: bool) -> Result<Vec<CardOption>, UiError> {
             note_at = Some(i);
         }
         out.push(option);
-        label_paths.push(label_path);
+        keys.push((key, label_path));
     }
     Ok(out)
 }
 
+/// v3.2 #4: matched to a label by `fold_key` and stored in the label's
+/// spelling; a string with `multi` becomes `[label]`, a one-item list
+/// without it the label.
 fn default(v: &Value, options: &[CardOption], multi: bool) -> Result<DefaultChoice, UiError> {
     if options.is_empty() {
         return Err(UiError::new(
@@ -466,27 +385,27 @@ fn default(v: &Value, options: &[CardOption], multi: bool) -> Result<DefaultChoi
         ));
     }
     let label = |v: &Value, path: &str| -> Result<String, UiError> {
-        let l = string(v, path, Lines::Single, 0, usize::MAX, "")?;
-        if options.iter().any(|o| o.label == l) {
-            Ok(l)
-        } else {
-            Err(UiError::new(
+        let given = string(v, path, Lines::Single, 0, usize::MAX, "")?;
+        let key = fold_key(&given);
+        match options.iter().find(|o| fold_key(&o.label) == key) {
+            Some(o) => Ok(o.label.clone()),
+            None => Err(UiError::new(
                 path,
-                format!("{} is not one of the option labels", quote(&l)),
-            ))
+                format!("{} is not one of the option labels", quote(&given)),
+            )),
         }
     };
-    match v {
-        Value::String(_) if multi => Err(UiError::new(
-            "default",
-            "a list of option labels when multi is true",
-        )),
-        Value::String(_) => Ok(DefaultChoice::One(label(v, "default")?)),
-        Value::Array(_) if !multi => Err(UiError::new(
-            "default",
-            "one option label (a list only when multi is true)",
-        )),
-        Value::Array(items) => {
+    match (v, multi) {
+        (Value::String(_), false) => Ok(DefaultChoice::One(label(v, "default")?)),
+        (Value::String(_), true) => Ok(DefaultChoice::Many(vec![label(v, "default")?])),
+        (Value::Array(items), false) => match items.as_slice() {
+            [one] => Ok(DefaultChoice::One(label(one, "default[0]")?)),
+            _ => Err(UiError::new(
+                "default",
+                "one option label (a list of more than one only when multi is true)",
+            )),
+        },
+        (Value::Array(items), true) => {
             if items.len() > DEFAULT_MAX {
                 return Err(UiError::new(
                     "default",
@@ -539,7 +458,7 @@ fn fields(v: &Value) -> Result<Vec<CardField>, UiError> {
         };
         if let Some(k) = o.keys().find(|k| !FIELD_KEYS.contains(&k.as_str())) {
             return Err(UiError::new(
-                format!("{path}.{k}"),
+                format!("{path}.{}", key_path(k)),
                 "unknown key; a field takes id, label, type, value, placeholder and optional",
             ));
         }
@@ -611,8 +530,8 @@ fn fields(v: &Value) -> Result<Vec<CardField>, UiError> {
             )?)),
             None => None,
         };
-        let optional =
-            flag(o, "optional").map_err(|e| UiError::new(format!("{path}.optional"), e.message))?;
+        let optional = flag(o, "optional")
+            .map_err(|e| UiError::new(format!("{path}.optional"), e.message()))?;
         if optional && kind == FieldKind::Check {
             return Err(UiError::new(
                 format!("{path}.optional"),
@@ -897,7 +816,7 @@ mod tests {
         bound(INPUT_MAX_BYTES, "input", at);
         assert_eq!(
             err(at(8193)),
-            "input: at most 8192 bytes (got 8193); shorten the detail or ask in plain text"
+            "input: over 8192 bytes; shorten the detail or ask in plain text"
         );
 
         let deep4 = json!({"question": "q", "options": ["a", {"label": "b"}]});
@@ -905,6 +824,113 @@ mod tests {
         create(deep4);
         let deep5 = json!({"question": "q", "fields": [{"id": "a", "label": "L", "value": ["x"]}]});
         assert_eq!(err(deep5), "input: nested deeper than 4 levels");
+    }
+
+    /// Shady #439 M2: depth and size are checked before anything walks or
+    /// copies the whole value. Before, `serde_json::to_vec` ran first and
+    /// overflowed the stack on this value.
+    #[test]
+    fn a_deep_or_huge_value_is_refused_before_it_is_serialized() {
+        let mut deep = json!("x");
+        for _ in 0..200_000 {
+            deep = Value::Array(vec![deep]);
+        }
+        // Never cloned, dropped whole or put through `json!`: all recurse.
+        let mut input = Map::new();
+        input.insert("question".into(), json!("q"));
+        input.insert("options".into(), deep);
+        let input = Value::Object(input);
+        assert_eq!(
+            parse_input(&input).unwrap_err().to_string(),
+            "input: nested deeper than 4 levels"
+        );
+        let mut v = input;
+        loop {
+            match v {
+                Value::Object(mut o) => match o.remove("options") {
+                    Some(inner) => v = inner,
+                    None => break,
+                },
+                Value::Array(mut a) => match a.pop() {
+                    Some(inner) => v = inner,
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        let huge = json!({"question": "q", "detail": "x".repeat(64 << 20), "options": ["a", "b"]});
+        assert_eq!(
+            err(huge),
+            "input: over 8192 bytes; shorten the detail or ask in plain text"
+        );
+    }
+
+    /// Shady #439 H1: the largest doc an accepted input normalizes to is
+    /// over 8 KiB, and still revalidates, serialized and read back too.
+    #[test]
+    fn an_accepted_doc_always_revalidates() {
+        for input in [worst_input(false), worst_input(true)] {
+            assert_eq!(serde_json::to_vec(&input).unwrap().len(), INPUT_MAX_BYTES);
+            let doc = create(input);
+            let bytes = serde_json::to_vec(&doc).unwrap().len();
+            assert!(bytes > INPUT_MAX_BYTES && bytes <= DOC_MAX_BYTES, "{bytes}");
+            revalidate(&doc).unwrap();
+            let back: CardDoc =
+                serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
+            assert_eq!(back, doc);
+            revalidate(&back).unwrap();
+        }
+    }
+
+    /// An input of exactly 8 KiB that grows the most when normalized: every
+    /// option a string and every field bare, `multi` omitted and (with
+    /// `kelvin`) a default of nine labels spelled in KELVIN SIGN, given in
+    /// ASCII `k`.
+    fn worst_input(kelvin: bool) -> Value {
+        let k = "\u{212A}";
+        let mut input = json!({
+            "question": "q",
+            "detail": "",
+            "options": (0..OPTIONS_MAX).map(|i| i.to_string()).collect::<Vec<_>>(),
+            "fields": (0..FIELDS_MAX).map(|i| json!({"id": format!("f{i}"), "label": "L"})).collect::<Vec<_>>(),
+        });
+        if kelvin {
+            input["multi"] = json!(true);
+            for i in 0..OPTIONS_MAX {
+                input["options"][i] = json!(format!("{i}{}", k.repeat(OPTION_LABEL_MAX - 1)));
+            }
+            input["default"] = (0..DEFAULT_MAX)
+                .map(|i| format!("{i}{}", "k".repeat(OPTION_LABEL_MAX - 1)))
+                .collect();
+        }
+        let size = |v: &Value| serde_json::to_vec(v).unwrap().len();
+        let mut left = INPUT_MAX_BYTES - size(&input);
+        let mut slots: Vec<(String, &str, usize)> = vec![
+            ("/detail".into(), "", DETAIL_MAX),
+            ("/question".into(), "q", QUESTION_MAX),
+        ];
+        let digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8"];
+        if !kelvin {
+            slots.extend(
+                (0..OPTIONS_MAX).map(|i| (format!("/options/{i}"), digits[i], OPTION_LABEL_MAX)),
+            );
+        }
+        slots.extend((0..FIELDS_MAX).map(|i| (format!("/fields/{i}/label"), "L", FIELD_LABEL_MAX)));
+        for (ptr, prefix, cap) in &slots {
+            let n = (left / 4).min(cap - prefix.chars().count());
+            *input.pointer_mut(ptr).unwrap() = json!(format!("{prefix}{}", "\u{10FFFD}".repeat(n)));
+            left -= 4 * n;
+        }
+        // The last bytes in ASCII, in the first slot with room, so the
+        // input is exactly at its cap.
+        let chars = |v: &Value| v.as_str().unwrap().chars().count();
+        let (ptr, _, _) = slots
+            .iter()
+            .find(|(ptr, _, cap)| cap - chars(input.pointer(ptr).unwrap()) >= left)
+            .unwrap();
+        let slot = input.pointer_mut(ptr).unwrap();
+        *slot = json!(format!("{}{}", slot.as_str().unwrap(), "x".repeat(left)));
+        input
     }
 
     #[test]
@@ -926,12 +952,54 @@ mod tests {
             .starts_with("Question: unknown parameter"));
     }
 
+    /// Shady #439 M1: a hostile key at any level, or beside `close`, is
+    /// written escaped and cut; the refusal stays one safe, short line.
+    #[test]
+    fn hostile_keys_in_refusals() {
+        let k = "\u{1b}[31m\n\u{202E}forged\u{200B}";
+        let shown = r#""\u001b[31m\u000a\u202eforged\u200b""#;
+        let long = "k".repeat(7000);
+        let cut = format!("\"{}…\"", "k".repeat(24));
+        for (key, shown) in [(k, shown.to_string()), (long.as_str(), cut)] {
+            let mut top = json!({"question": "q", "options": ["a", "b"]});
+            top[key] = json!(1);
+            let mut opt = json!({"question": "q", "options": ["a", {"label": "b"}]});
+            opt["options"][1][key] = json!(1);
+            let mut field = json!({"question": "q", "fields": [{"id": "a", "label": "L"}]});
+            field["fields"][0][key] = json!(1);
+            let mut close = json!({"close": "s_3f2a91c0d4e2a871"});
+            close[key] = json!(1);
+            let want = [
+                format!("{shown}: unknown parameter; use {TOP_KEYS}"),
+                format!("options[1].{shown}: unknown key; an option takes label, hint and note"),
+                format!("fields[0].{shown}: unknown key; a field takes id, label, type, value, placeholder and optional"),
+                format!("{shown}: unknown parameter; use {TOP_KEYS}"),
+            ];
+            for (v, want) in [top, opt, field, close].into_iter().zip(want) {
+                let e = err(v);
+                assert_eq!(e, want);
+                assert!(crate::ui::tests::safe_line(&e), "{e:?}");
+            }
+        }
+    }
+
     #[test]
     fn duplicates() {
         assert_eq!(
             err(json!({"question": "q", "options": ["Yes", "no", "YES"]})),
             "options[2]: \"YES\" duplicates options[0]; labels must differ (ignoring case)"
         );
+        // Unicode case folding, not lowercase (Shady #439 M3).
+        assert_eq!(
+            err(json!({"question": "q", "options": ["\u{3A3}", "\u{3C2}"]})),
+            "options[1]: \"\u{3C2}\" duplicates options[0]; labels must differ (ignoring case)"
+        );
+        assert_eq!(
+            err(json!({"question": "q", "options": ["Stra\u{DF}e", "STRASSE"]})),
+            "options[1]: \"STRASSE\" duplicates options[0]; labels must differ (ignoring case)"
+        );
+        // Not canonical equivalence: é and e + U+0301 are two labels.
+        create(json!({"question": "q", "options": ["\u{E9}", "e\u{301}"]}));
         // After ui_sanitize: an invisible character doesn't make a label new.
         assert_eq!(
             err(json!({"question": "q", "options": [{"label": "Approve"}, "Ap\u{200B}prove"]})),
@@ -967,8 +1035,16 @@ mod tests {
             "options: a card needs options or fields (or both)"
         );
         assert_eq!(
-            e(json!({"close": "s_3f2a91c0d4e2a871", "wait": false})),
+            e(json!({"close": "s_3f2a91c0d4e2a871", "wait": true})),
             "close: give it alone, with no other parameter (got wait)"
+        );
+        assert_eq!(
+            e(json!({"close": "s_3f2a91c0d4e2a871", "multi": "false"})),
+            "close: give it alone, with no other parameter (got multi)"
+        );
+        assert_eq!(
+            e(json!({"close": "s_3f2a91c0d4e2a871", "detail": ""})),
+            "close: give it alone, with no other parameter (got detail)"
         );
         assert_eq!(
             e(json!({"close": "s_3F2A"})),
@@ -991,16 +1067,26 @@ mod tests {
             "default: \"c\" is not one of the option labels"
         );
         assert_eq!(
-            e(json!({"question": "q", "options": ["a", "b"], "default": "A"})),
-            "default: \"A\" is not one of the option labels"
+            e(json!({"question": "q", "options": ["a", "b"], "default": ["a", "b"]})),
+            "default: one option label (a list of more than one only when multi is true)"
         );
         assert_eq!(
-            e(json!({"question": "q", "options": ["a", "b"], "default": ["a"]})),
-            "default: one option label (a list only when multi is true)"
+            e(json!({"question": "q", "options": ["a", "b"], "default": []})),
+            "default: one option label (a list of more than one only when multi is true)"
         );
         assert_eq!(
-            e(json!({"question": "q", "options": ["a", "b"], "multi": true, "default": "a"})),
-            "default: a list of option labels when multi is true"
+            e(json!({"question": "q", "options": ["a", "b"], "default": ["c"]})),
+            "default[0]: \"c\" is not one of the option labels"
+        );
+        assert_eq!(
+            e(
+                json!({"question": "q", "options": ["a", "b"], "multi": true, "default": ["a", "A"]})
+            ),
+            "default[1]: \"a\" is listed twice"
+        );
+        assert_eq!(
+            e(json!({"question": "q", "options": ["a", "b"], "default": 1})),
+            "default: must be an option label"
         );
         assert_eq!(
             e(json!({"question": "q", "fields": [{"id": "a", "label": "L"}], "default": "a"})),
@@ -1036,6 +1122,48 @@ mod tests {
         assert_eq!(e(json!(["q"])), "input: must be a JSON object");
     }
 
+    /// v3.2 #4: `default` follows `multi`, matched ignoring case, stored in
+    /// the label's spelling.
+    #[test]
+    fn default_is_coerced_and_matched_ignoring_case() {
+        let d = |v: Value| create(v).default;
+        let one = |s: &str| Some(DefaultChoice::One(s.into()));
+        let many = |s: &[&str]| {
+            Some(DefaultChoice::Many(
+                s.iter().map(|s| s.to_string()).collect(),
+            ))
+        };
+        let opts = json!(["Yes", "No", "Stra\u{DF}e"]);
+        assert_eq!(
+            d(json!({"question": "q", "options": opts, "default": "yes"})),
+            one("Yes")
+        );
+        assert_eq!(
+            d(json!({"question": "q", "options": opts, "default": ["NO"]})),
+            one("No")
+        );
+        assert_eq!(
+            d(json!({"question": "q", "options": opts, "default": "STRASSE"})),
+            one("Stra\u{DF}e")
+        );
+        assert_eq!(
+            d(json!({"question": "q", "options": opts, "multi": true, "default": "yes"})),
+            many(&["Yes"])
+        );
+        assert_eq!(
+            d(json!({"question": "q", "options": opts, "multi": true, "default": ["no", "YES"]})),
+            many(&["No", "Yes"])
+        );
+        assert_eq!(
+            d(json!({"question": "q", "options": opts, "multi": true, "default": []})),
+            many(&[])
+        );
+        // The stored form is a fixed point.
+        let doc =
+            create(json!({"question": "q", "options": opts, "multi": true, "default": "yes"}));
+        revalidate(&doc).unwrap();
+    }
+
     #[test]
     fn normalization_materializes_defaults() {
         let doc = create(
@@ -1050,7 +1178,7 @@ mod tests {
                            {"id": "p", "label": "Publish", "type": "check", "value": false, "optional": false}]})
         );
         assert_eq!(doc.mode(), Mode::Form);
-        doc.revalidate().unwrap();
+        revalidate(&doc).unwrap();
     }
 
     /// Every string field: controls and bidi overrides are refused there,
@@ -1133,7 +1261,7 @@ mod tests {
             ),
         ];
         let refused = [
-            '\u{0}', '\u{7}', '\u{1B}', '\r', '\u{7F}', '\u{85}', '\u{9B}', '\u{202A}', '\u{202B}',
+            '\u{0}', '\u{7}', '\u{1B}', '\u{7F}', '\u{85}', '\u{9B}', '\u{202A}', '\u{202B}',
             '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
         ];
         let dropped = [
@@ -1200,13 +1328,16 @@ mod tests {
             );
             let doc = create(inject("\tx"));
             assert_eq!(read(&doc, site), format!("{prefix} x"), "{site} tab");
-            let doc = create(inject("\nx"));
             let expect = if multi_line {
                 format!("{prefix}\nx")
             } else {
                 format!("{prefix} x")
             };
-            assert_eq!(read(&doc, site), expect, "{site} newline");
+            // v3.2 #1: CRLF and a lone CR are line endings, never refused.
+            for nl in ["\n", "\r\n", "\r"] {
+                let doc = create(inject(&format!("{nl}x")));
+                assert_eq!(read(&doc, site), expect, "{site} {nl:?}");
+            }
             let url = "[x](https://e.test/?a=<b>)";
             assert_eq!(
                 read(&create(inject(url)), site),
@@ -1264,21 +1395,28 @@ mod tests {
                 wait: true
             }
         );
-        assert_eq!(
-            parse_input(&json!({"close": "s_3f2a91c0d4e2a871"})).unwrap(),
-            UiInput::Close("s_3f2a91c0d4e2a871".into())
-        );
+        // v3.2 #5: beside close, wait:false and multi:false count as absent.
+        for v in [
+            json!({"close": "s_3f2a91c0d4e2a871"}),
+            json!({"close": "s_3f2a91c0d4e2a871", "wait": false}),
+            json!({"close": "s_3f2a91c0d4e2a871", "multi": false, "wait": false}),
+        ] {
+            assert_eq!(
+                parse_input(&v).unwrap(),
+                UiInput::Close("s_3f2a91c0d4e2a871".into()),
+                "{v}"
+            );
+        }
     }
 
     #[test]
     fn secret_footnote_is_advisory() {
         let doc =
             create(json!({"question": "q", "fields": [{"id": "t", "label": "GitHub token"}]}));
-        assert!(doc.secret_footnote(), "flagged, and still a valid card");
-        assert!(
-            !create(json!({"question": "q", "fields": [{"id": "v", "label": "Version"}]}))
-                .secret_footnote()
-        );
+        assert!(secret_footnote(&doc), "flagged, and still a valid card");
+        assert!(!secret_footnote(&create(
+            json!({"question": "q", "fields": [{"id": "v", "label": "Version"}]})
+        )));
     }
 
     #[test]
@@ -1292,8 +1430,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            doc.revalidate().unwrap_err().to_string(),
+            revalidate(&doc).unwrap_err().to_string(),
             "doc: is not normalized"
+        );
+        // Over the doc cap: refused before anything else.
+        let mut big = create(json!({"question": "q", "options": opts(2)}));
+        big.detail = Some("x".repeat(DOC_MAX_BYTES));
+        assert_eq!(
+            revalidate(&big).unwrap_err().to_string(),
+            format!("doc: over {DOC_MAX_BYTES} bytes")
         );
     }
 }

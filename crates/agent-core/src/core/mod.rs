@@ -28,3 +28,6 @@ pub mod session_lock;
 mod session_save_order;
 pub mod stream_types;
 pub mod tool_spill;
+/// Agent cards: the card model's pure data types and bounds (agent-ui v3.2
+/// #12). Inert: only `agent_engine::ui` uses them.
+pub mod ui_types;

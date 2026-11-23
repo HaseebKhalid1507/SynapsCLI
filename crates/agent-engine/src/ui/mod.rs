@@ -1,21 +1,26 @@
 //! Agent cards ("surfaces"), catalog `synaps:card/1`: the card model.
 //!
-//! Phase C1 of `agent-ui/architecture.md` v3.1. **Inert:** nothing in a
+//! Phase C1 of `agent-ui/architecture.md` v3.2. **Inert:** nothing in a
 //! running session reaches this module. There is no tool, no wire type, no
 //! actor or daemon hook and no config; later phases (C2 storage, C3 wire,
 //! C4a the `ui` tool) build on it.
 //!
+//! The pure data types and every bound live in
+//! `agent_core::core::ui_types` (v3.2 #12) and are re-exported here, so
+//! paths don't change. The logic is here:
 //! - [`schema.json`](SCHEMA_JSON): the normative input schema (§5.1).
-//! - [`doc`]: validate and normalize a `ui` input into a [`CardDoc`].
-//! - [`sanitize`]: `ui_sanitize`, the one sanitizer for every card string.
+//! - [`doc`]: validate and normalize a `ui` input into a [`CardDoc`];
+//!   [`revalidate`] a stored one.
+//! - [`sanitize`]: `ui_sanitize`, the one sanitizer for every card string,
+//!   and the case-fold key labels are compared by.
 //! - [`contract`]: the contract digest over the normalized doc (§5.4).
 //! - [`answer`]: answer values, the `<ui_answer>` message, the late-answer
 //!   capsule (§3.6, §5.3).
-//! - [`fold`]: `UiMark` and folding host-proven evidence out of history
+//! - [`fold`]: folding host-proven evidence (`UiMark`) out of history
 //!   (§2.5).
 //!
-//! The corpus at `tests/fixtures/ui/` (repository root) pins all of it; the
-//! desk's D1 copies it for parity.
+//! The corpus at `crates/agent-engine/tests/fixtures/ui/` pins all of it;
+//! the desk's D1 copies it for parity.
 
 pub mod answer;
 pub mod contract;
@@ -23,11 +28,13 @@ pub mod doc;
 pub mod fold;
 pub mod sanitize;
 
-pub use answer::{Answer, AnswerStatus, Choice, FieldValue};
+pub use agent_core::core::ui_types::*;
+pub use answer::{AnswerMessage, Capsule};
 pub use contract::contract;
-pub use doc::{CardDoc, CardField, CardOption, DefaultChoice, FieldKind, Mode, UiInput};
-pub use fold::UiMark;
-pub use sanitize::{ui_sanitize, Lines};
+pub use doc::{parse_input, revalidate, secret_footnote, UiInput};
+pub use sanitize::{roster_label, ui_sanitize};
+
+use sanitize::{cut_chars, Lines as L};
 
 /// The normative input schema (§5.1). The `ui` tool's `input_schema` is
 /// this file; [`doc::parse_input`] enforces it plus the rules beyond it.
@@ -38,78 +45,39 @@ pub fn input_schema() -> serde_json::Value {
     serde_json::from_str(SCHEMA_JSON).expect("ui/schema.json is valid JSON")
 }
 
-/// The catalog major this module implements (`synaps:card/1`).
-pub const CATALOG: u32 = 1;
-/// The normalizer version folded into every contract (§5.4).
-pub const NORMALIZER: u32 = 1;
-
-// ── Bounds (§4.4, §5.1). Every one is tested at N and N+1. ───────────────
-// Character bounds count Unicode scalar values, as JSON Schema does.
-
-/// A `ui` input, serialized compactly. Refused, never truncated.
-pub const INPUT_MAX_BYTES: usize = 8 * 1024;
-/// Nesting of a `ui` input, scalars counted: `{"options":[{"label":"x"}]}`
-/// is 4.
-pub const INPUT_MAX_DEPTH: usize = 4;
-pub const QUESTION_MAX: usize = 120;
-pub const DETAIL_MAX: usize = 1500;
-pub const DETAIL_MAX_LINES: usize = 30;
-pub const OPTIONS_MIN: usize = 2;
-pub const OPTIONS_MAX: usize = 9;
-pub const OPTION_LABEL_MAX: usize = 60;
-pub const HINT_MAX: usize = 120;
-pub const NOTE_PROMPT_MAX: usize = 80;
-pub const DEFAULT_MAX: usize = 9;
-pub const FIELDS_MIN: usize = 1;
-pub const FIELDS_MAX: usize = 5;
-/// `^[a-z][a-z0-9_]{0,23}$`
-pub const FIELD_ID_MAX: usize = 24;
-pub const FIELD_LABEL_MAX: usize = 60;
-pub const PLACEHOLDER_MAX: usize = 80;
-/// A `text` value: the agent's prefill and the user's answer.
-pub const TEXT_MAX: usize = 200;
-/// A `long` value: the agent's prefill and the user's answer.
-pub const LONG_MAX: usize = 2000;
-/// A note typed for a `note` option.
-pub const NOTE_MIN: usize = 1;
-pub const NOTE_MAX: usize = 500;
-/// Answer values, serialized compactly (§3.3 #11).
-pub const ANSWER_MAX_BYTES: usize = 8 * 1024;
-/// A late answer's `<asked>` capsule, encoded (§3.6).
-pub const CAPSULE_MAX_BYTES: usize = 1024;
-/// The capsule's copy of the detail.
-pub const CAPSULE_DETAIL_MAX: usize = 400;
-/// `origin.task`: the excerpt of the message that started the card's turn.
-pub const TASK_EXCERPT_MAX: usize = 80;
-
-// ── System budget (§4.4, R2-M3). C1 measures these on worst-case images;
-// C2 (sidecar) and C3 (wire) enforce them. ────────────────────────────────
-
-pub const SURFACE_STATE_MAX_BYTES: usize = 24 * 1024;
-pub const ATTACHED_MAX_STATES: usize = 12;
-pub const ATTACHED_MAX_BYTES: usize = 288 * 1024;
-pub const LEDGER_MAX_RECORDS: usize = 16;
-pub const LEDGER_MAX_VALUE_BYTES: usize = 64 * 1024;
-pub const TOMBSTONES_MAX: usize = 128;
-pub const TOMBSTONE_MAX_BYTES: usize = 1024;
-pub const ACTION_LOG_MAX: usize = 5;
-pub const SIDECAR_MAX_BYTES: usize = 512 * 1024;
+/// The longest refusal path and message, in characters (Shady #439 M1).
+pub const ERROR_PATH_MAX: usize = 80;
+pub const ERROR_MESSAGE_MAX: usize = 240;
 
 /// A refusal: the offending path and one teaching line. `Display` is the
 /// tool error the agent reads, e.g.
 /// `options: at most 9 (got 12); ask in plain text or narrow the choices`.
+///
+/// Built only by [`UiError::new`], which puts both parts through
+/// `ui_sanitize` (single line) and bounds them, so no key or value the
+/// agent wrote can carry a control, a bidi override or a newline into the
+/// error, or make it long (§4.3). Untrusted keys are written with
+/// [`key_path`] first, so they stay readable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiError {
-    pub path: String,
-    pub message: String,
+    path: String,
+    message: String,
 }
 
 impl UiError {
-    pub(crate) fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(path: impl AsRef<str>, message: impl AsRef<str>) -> Self {
         Self {
-            path: path.into(),
-            message: message.into(),
+            path: cut_chars(&ui_sanitize(path.as_ref(), L::Single), ERROR_PATH_MAX),
+            message: cut_chars(&ui_sanitize(message.as_ref(), L::Single), ERROR_MESSAGE_MAX),
         }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -121,12 +89,148 @@ impl std::fmt::Display for UiError {
 
 impl std::error::Error for UiError {}
 
-/// `true` when `s` is `<prefix>` + 16 lowercase hex: a surface id (`s_`) or
-/// an answer id (`a_`).
-pub fn is_host_id(s: &str, prefix: &str) -> bool {
-    s.strip_prefix(prefix).is_some_and(|hex| {
-        hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
+/// A key the agent or a client wrote, as a path segment: bare when it is a
+/// plain identifier (`blocks`), else a JSON string with everything outside
+/// printable ASCII escaped (`"\u001b[31m"`), cut to 24 characters first.
+pub(crate) fn key_path(k: &str) -> String {
+    let plain = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    if !k.is_empty() && k.len() <= 24 && k.bytes().all(plain) {
+        return k.to_string();
+    }
+    let mut out = String::from("\"");
+    let n = k.chars().count();
+    for c in k.chars().take(24) {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            ' '..='~' => out.push(c),
+            c => {
+                let mut units = [0u16; 2];
+                for u in c.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{u:04x}"));
+                }
+            }
+        }
+    }
+    if n > 24 {
+        out.push('…');
+    }
+    out.push('"');
+    out
+}
+
+/// Whether `v` nests deeper than `limit`, scalars counted as one level.
+/// The recursion stops at `limit`, so a value of any depth is safe to ask
+/// about (Shady #439 M2).
+pub(crate) fn deeper_than(v: &serde_json::Value, limit: usize) -> bool {
+    use serde_json::Value;
+    if limit == 0 {
+        return true;
+    }
+    match v {
+        Value::Array(a) => a.iter().any(|v| deeper_than(v, limit - 1)),
+        Value::Object(o) => o.values().any(|v| deeper_than(v, limit - 1)),
+        _ => false,
+    }
+}
+
+/// The compact JSON size of `v` (a value already within a depth bound),
+/// counted without building it; `None` once it passes `cap`.
+pub(crate) fn json_len_within(v: &impl serde::Serialize, cap: usize) -> Option<usize> {
+    struct Count {
+        n: usize,
+        cap: usize,
+    }
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.n += buf.len();
+            if self.n > self.cap {
+                return Err(std::io::Error::other("over the cap"));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count { n: 0, cap };
+    serde_json::to_writer(&mut c, v).ok().map(|()| c.n)
+}
+
+/// Decode JSON text that will become a `ui` input or answer values: the
+/// shared ingress (Shady #439 L2). Stricter than `serde_json::from_str`:
+/// a repeated key at any level is refused, not resolved last-wins. Like
+/// `serde_json` it refuses lone surrogates, numbers out of `f64` range and
+/// nesting past 128; the model's own depth and byte caps apply after.
+pub fn decode_json(text: &str) -> Result<serde_json::Value, UiError> {
+    let mut de = serde_json::Deserializer::from_str(text);
+    let v = <Strict as serde::Deserialize>::deserialize(&mut de)
+        .and_then(|v| de.end().map(|()| v.0))
+        .map_err(|e| UiError::new("json", e.to_string()))?;
+    Ok(v)
+}
+
+/// A `Value` decoded with repeated keys refused.
+struct Strict(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for Strict {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(StrictVisitor).map(Strict)
+    }
+}
+
+struct StrictVisitor;
+
+impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+    fn visit_bool<E>(self, b: bool) -> Result<Self::Value, E> {
+        Ok(b.into())
+    }
+    fn visit_i64<E>(self, n: i64) -> Result<Self::Value, E> {
+        Ok(n.into())
+    }
+    fn visit_u64<E>(self, n: u64) -> Result<Self::Value, E> {
+        Ok(n.into())
+    }
+    fn visit_f64<E: serde::de::Error>(self, n: f64) -> Result<Self::Value, E> {
+        serde_json::Number::from_f64(n)
+            .map(Into::into)
+            .ok_or_else(|| E::custom("number out of range"))
+    }
+    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E> {
+        Ok(s.into())
+    }
+    fn visit_string<E>(self, s: String) -> Result<Self::Value, E> {
+        Ok(s.into())
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+        let mut out = Vec::new();
+        while let Some(Strict(v)) = a.next_element()? {
+            out.push(v);
+        }
+        Ok(out.into())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut m: A) -> Result<Self::Value, A::Error> {
+        let mut out = serde_json::Map::new();
+        while let Some(k) = m.next_key::<String>()? {
+            let Strict(v) = m.next_value()?;
+            if out.contains_key(&k) {
+                return Err(serde::de::Error::custom(format!(
+                    "the key {} is given twice",
+                    key_path(&k)
+                )));
+            }
+            out.insert(k, v);
+        }
+        Ok(out.into())
+    }
 }
 
 #[cfg(test)]
@@ -192,18 +296,88 @@ mod tests {
         assert_eq!(keys, doc::TOP_KEYS_SORTED);
     }
 
+    /// Shady #439 M1: whatever a key holds, a refusal is one short line
+    /// with no control, bidi control, invisible character or newline.
     #[test]
-    fn host_ids() {
-        assert!(is_host_id("s_3f2a91c0d4e2a871", "s_"));
-        assert!(is_host_id("a_6c1d2e3f4a5b6c7d", "a_"));
-        for bad in [
-            "s_3f2a91c0d4e2a87",
-            "s_3f2a91c0d4e2a8711",
-            "s_3F2A91C0D4E2A871",
-            "a_3f2a91c0d4e2a871",
-            "s_3f2a91c0d4e2a87g",
+    fn errors_are_one_safe_bounded_line() {
+        let hostile = "\u{1b}[31m\n\u{202E}forged\u{200B}\u{85}";
+        assert_eq!(
+            key_path(hostile),
+            r#""\u001b[31m\u000a\u202eforged\u200b\u0085""#
+        );
+        assert_eq!(key_path("blocks"), "blocks");
+        assert_eq!(key_path("wait-for"), "wait-for");
+        assert_eq!(key_path(""), r#""""#);
+        assert_eq!(key_path("a\"b\\c"), r#""a\"b\\c""#);
+        assert_eq!(key_path("\u{1F600}"), r#""\ud83d\ude00""#);
+        assert_eq!(
+            key_path(&"k".repeat(25)),
+            format!("\"{}…\"", "k".repeat(24))
+        );
+        let e = UiError::new(
+            format!("x{hostile}"),
+            format!("m{hostile}\r\n{}", "y".repeat(500)),
+        );
+        let shown = e.to_string();
+        assert!(safe_line(&shown), "{shown:?}");
+        assert_eq!(e.path(), "x[31m forged");
+        assert!(shown.chars().count() <= ERROR_PATH_MAX + 2 + ERROR_MESSAGE_MAX);
+    }
+
+    /// One line, bounded, nothing that can hide or reorder text.
+    pub(crate) fn safe_line(s: &str) -> bool {
+        s.chars().count() <= ERROR_PATH_MAX + 2 + ERROR_MESSAGE_MAX
+            && s.chars().all(|c| {
+                !c.is_control()
+                    && !crate::events::format::is_invisible(c)
+                    && !matches!(c, '\u{2028}' | '\u{2029}')
+            })
+    }
+
+    #[test]
+    fn json_len_stops_at_the_cap() {
+        let v = serde_json::json!({"a": "x".repeat(100)});
+        let n = serde_json::to_vec(&v).unwrap().len();
+        assert_eq!(json_len_within(&v, n), Some(n));
+        assert_eq!(json_len_within(&v, n - 1), None);
+    }
+
+    /// Shady #439 L2: the raw-JSON ingress.
+    #[test]
+    fn decode_json_is_strict() {
+        assert_eq!(
+            decode_json(r#"{"a":[1,{"b":null}],"c":"\ud83d\ude00"}"#).unwrap(),
+            serde_json::json!({"a": [1, {"b": null}], "c": "\u{1F600}"})
+        );
+        for (text, want) in [
+            (r#"{"a":1,"a":2}"#, "json: the key a is given twice"),
+            (r#"{"x":{"b":1,"b":1}}"#, "json: the key b is given twice"),
+            (
+                r#"[{"\u001b":1,"\u001b":2}]"#,
+                r#"json: the key "\u001b" is given twice"#,
+            ),
         ] {
-            assert!(!is_host_id(bad, "s_"), "{bad}");
+            assert!(
+                decode_json(text).unwrap_err().to_string().starts_with(want),
+                "{text}"
+            );
         }
+        for bad in [
+            r#""\ud83d""#,
+            r#""\ude00""#,
+            r#""\ud83dx""#,
+            "1e400",
+            "-1e400",
+            "{} {}",
+            "{\"a\":1,}",
+        ] {
+            let e = decode_json(bad).expect_err(bad);
+            assert!(e.to_string().starts_with("json: "), "{e}");
+        }
+        assert!(decode_json(&format!("{}1{}", "[".repeat(128), "]".repeat(128))).is_err());
+        assert!(decode_json(&format!("{}1{}", "[".repeat(127), "]".repeat(127))).is_ok());
+        // Big integers stay numbers (u64, then f64); the model refuses them by type.
+        assert!(decode_json("18446744073709551616").unwrap().is_f64());
+        assert!(decode_json("-9223372036854775809").unwrap().is_f64());
     }
 }

@@ -4,190 +4,43 @@
 //! - [`parse_answer`] validates what a client submits against the doc
 //!   (§3.3 #11). Values are data for the model: they are refused, never
 //!   rewritten (§4.3).
-//! - [`Answer`] serializes with its keys in a fixed order (`choice`, `note`,
-//!   `fields`) and its fields in the doc's order, whatever `serde_json`'s
-//!   map type, so the model reads what the user read.
+//! - [`Answer`] (`agent_core::core::ui_types`) serializes with its keys in
+//!   a fixed order and its fields in the doc's order.
 //! - [`format_answer_message`] builds the host-only message; attributes
 //!   follow the event renderer's breakout rules and the body writes `<` as
 //!   `\u003c`, so nothing inside can close or open a tag.
 //!   [`parse_answer_message`] reads one back (it proves nothing: only a
 //!   mark does, see `fold`).
+//! - [`Capsule`]: a late answer's `<asked>` line, only ever built by
+//!   [`build_capsule`] or checked by [`Capsule::parse`].
 
-use serde::de::{self, MapAccess, Visitor};
-use serde::ser::SerializeMap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
+
+pub use agent_core::core::ui_types::{Answer, AnswerStatus, Choice, FieldValue};
 
 use super::doc::{CardDoc, FieldKind};
 use super::sanitize::{char_len, cut_chars, ui_sanitize, value_control, Lines};
 use super::*;
 use crate::events::format::attr;
 
-/// A field's value: a prefill in the doc, or the user's answer.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum FieldValue {
-    Text(String),
-    Check(bool),
-}
-
-/// The chosen label(s).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Choice {
-    One(String),
-    Many(Vec<String>),
-}
-
-/// Exactly what the model gets (§5.3). A skip is the empty answer `{}`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Answer {
-    pub choice: Option<Choice>,
-    pub note: Option<String>,
-    /// Every field of the doc, in the doc's order.
-    pub fields: Option<Vec<(String, FieldValue)>>,
-}
-
-/// What an accepted action was (§2.2 `AnswerStatus`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AnswerStatus {
-    Answered,
-    Skipped,
-    Revised,
-}
-
-impl AnswerStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AnswerStatus::Answered => "answered",
-            AnswerStatus::Skipped => "skipped",
-            AnswerStatus::Revised => "revised",
-        }
-    }
-}
-
-impl Answer {
-    /// The answer of a skip.
-    pub fn skip() -> Self {
-        Self::default()
-    }
-
-    /// The labels chosen, in order.
-    pub fn chosen(&self) -> Vec<&str> {
-        match &self.choice {
-            None => Vec::new(),
-            Some(Choice::One(l)) => vec![l.as_str()],
-            Some(Choice::Many(ls)) => ls.iter().map(String::as_str).collect(),
-        }
-    }
-
-    /// Compact JSON, keys in answer order.
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("an answer always serializes")
-    }
-}
-
-impl Serialize for Answer {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let len = self.choice.is_some() as usize
-            + self.note.is_some() as usize
-            + self.fields.is_some() as usize;
-        let mut m = s.serialize_map(Some(len))?;
-        if let Some(c) = &self.choice {
-            m.serialize_entry("choice", c)?;
-        }
-        if let Some(n) = &self.note {
-            m.serialize_entry("note", n)?;
-        }
-        if let Some(f) = &self.fields {
-            m.serialize_entry("fields", &OrderedFields(f))?;
-        }
-        m.end()
-    }
-}
-
-struct OrderedFields<'a>(&'a [(String, FieldValue)]);
-
-impl Serialize for OrderedFields<'_> {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut m = s.serialize_map(Some(self.0.len()))?;
-        for (k, v) in self.0 {
-            m.serialize_entry(k, v)?;
-        }
-        m.end()
-    }
-}
-
-/// Reads keys in the order they come (a stored answer keeps its field
-/// order) and refuses unknown or repeated keys.
-impl<'de> Deserialize<'de> for Answer {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct AnswerVisitor;
-        impl<'de> Visitor<'de> for AnswerVisitor {
-            type Value = Answer;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("an answer object {choice?, note?, fields?}")
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Answer, A::Error> {
-                let mut a = Answer::default();
-                while let Some(k) = m.next_key::<String>()? {
-                    let dup = match k.as_str() {
-                        "choice" => a.choice.replace(m.next_value()?).is_some(),
-                        "note" => a.note.replace(m.next_value()?).is_some(),
-                        "fields" => a.fields.replace(m.next_value::<FieldList>()?.0).is_some(),
-                        other => {
-                            return Err(de::Error::unknown_field(
-                                other,
-                                &["choice", "note", "fields"],
-                            ))
-                        }
-                    };
-                    if dup {
-                        return Err(de::Error::custom(format!("duplicate key {k}")));
-                    }
-                }
-                Ok(a)
-            }
-        }
-        d.deserialize_map(AnswerVisitor)
-    }
-}
-
-struct FieldList(Vec<(String, FieldValue)>);
-
-impl<'de> Deserialize<'de> for FieldList {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct FieldsVisitor;
-        impl<'de> Visitor<'de> for FieldsVisitor {
-            type Value = FieldList;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("an object of field values")
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<FieldList, A::Error> {
-                let mut out: Vec<(String, FieldValue)> = Vec::new();
-                while let Some((k, v)) = m.next_entry::<String, FieldValue>()? {
-                    if out.iter().any(|(id, _)| *id == k) {
-                        return Err(de::Error::custom(format!("duplicate field {k}")));
-                    }
-                    out.push((k, v));
-                }
-                Ok(FieldList(out))
-            }
-        }
-        d.deserialize_map(FieldsVisitor)
-    }
-}
-
 /// Validate a client's `values` for an `answer` (or `revise`) against the
 /// doc (§3.3 #11, §5.3): types, required values, membership, lengths, no
 /// C0/C1 controls (except `\n` and `\t` in `long`), at most 8 KiB.
+///
+/// Depth, then bytes (counted, never built), before anything else (Shady
+/// #439 M2).
 pub fn parse_answer(doc: &CardDoc, values: &Value) -> Result<Answer, UiError> {
-    let bytes = serde_json::to_vec(values).map_or(usize::MAX, |v| v.len());
-    if bytes > ANSWER_MAX_BYTES {
+    if deeper_than(values, ANSWER_MAX_DEPTH) {
         return Err(UiError::new(
             "values",
-            format!("at most {ANSWER_MAX_BYTES} bytes (got {bytes})"),
+            format!("nested deeper than {ANSWER_MAX_DEPTH} levels"),
+        ));
+    }
+    if json_len_within(values, ANSWER_MAX_BYTES).is_none() {
+        return Err(UiError::new(
+            "values",
+            format!("over {ANSWER_MAX_BYTES} bytes"),
         ));
     }
     let Some(obj) = values.as_object() else {
@@ -198,7 +51,7 @@ pub fn parse_answer(doc: &CardDoc, values: &Value) -> Result<Answer, UiError> {
         .find(|k| !matches!(k.as_str(), "choice" | "note" | "fields"))
     {
         return Err(UiError::new(
-            k.as_str(),
+            key_path(k),
             "unknown key; an answer has choice, note and fields",
         ));
     }
@@ -301,7 +154,10 @@ fn fields(
         .keys()
         .find(|k| !doc.fields.iter().any(|f| f.id == **k))
     {
-        return Err(UiError::new(format!("fields.{k}"), "no such field"));
+        return Err(UiError::new(
+            format!("fields.{}", key_path(k)),
+            "no such field",
+        ));
     }
     let mut out = Vec::with_capacity(doc.fields.len());
     for f in &doc.fields {
@@ -364,8 +220,8 @@ pub struct AnswerMessage {
     /// The record's answer revision: 1, or 2–4 for a revision.
     pub rev: u32,
     pub values: Answer,
-    /// A late answer's capsule ([`build_capsule`]); `None` on time.
-    pub asked: Option<String>,
+    /// A late answer's capsule; `None` on time.
+    pub asked: Option<Capsule>,
 }
 
 /// `<ui_answer card="…" answer="…" q="…"[ status="skipped"| status="revised" rev="N"][ late="true"]>{json}[\n<asked …>…</asked>]</ui_answer>`
@@ -388,7 +244,7 @@ pub fn format_answer_message(m: &AnswerMessage) -> String {
     out.push_str(&json_body(&m.values));
     if let Some(asked) = &m.asked {
         out.push('\n');
-        out.push_str(asked);
+        out.push_str(asked.as_str());
     }
     out.push_str("</ui_answer>");
     out
@@ -440,11 +296,7 @@ pub fn parse_answer_message(text: &str) -> Option<AnswerMessage> {
     let after = &body[stream.byte_offset()..];
     let asked = match (late, after) {
         (false, "") => None,
-        (true, a) => {
-            let capsule = a.strip_prefix('\n')?;
-            parse_capsule(capsule)?;
-            Some(capsule.to_string())
-        }
+        (true, a) => Some(Capsule::parse(a.strip_prefix('\n')?)?),
         (false, _) => return None,
     };
     Some(AnswerMessage {
@@ -484,16 +336,63 @@ pub fn task_excerpt(message: &str) -> String {
     cut_chars(ui_sanitize(message, Lines::Single).trim(), TASK_EXCERPT_MAX)
 }
 
+/// A late answer's `<asked>` line (§3.6):
+/// `<asked during="…"[ omitted="…"]>text</asked>`, at most 1 KiB, with no
+/// `<` or `>` inside the tag and no `<` in the text. Only [`build_capsule`]
+/// makes one and [`Capsule::parse`] (also used to deserialize a stored one)
+/// checks one, so the message formatter can splice it in as is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Capsule(String);
+
+impl Capsule {
+    pub fn parse(s: &str) -> Option<Self> {
+        if s.len() > CAPSULE_MAX_BYTES {
+            return None;
+        }
+        let rest = s.strip_prefix("<asked ")?.strip_suffix("</asked>")?;
+        let (attrs, text) = rest.split_once('>')?;
+        let names: Vec<&str> = parse_attrs(attrs)?.iter().map(|(k, _)| *k).collect();
+        let ok = names == ["during"] || names == ["during", "omitted"];
+        (ok && !attrs.contains('<') && !text.contains('<')).then(|| Capsule(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Capsule {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<&str> for Capsule {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl<'de> Deserialize<'de> for Capsule {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Capsule::parse(&s).ok_or_else(|| serde::de::Error::custom("not an <asked> capsule"))
+    }
+}
+
 /// The `<asked>` line of a late answer, at most 1 KiB encoded (after
 /// attribute escaping and `\u003c`):
 /// `<asked during="<task>"[ omitted="…"]>detail: … · hints: label=hint, … · fields: id=label, …</asked>`.
 ///
-/// The detail is cut at 400 characters (ending in `…`). If the line is
-/// still over 1 KiB, the hints go first, then the field labels, then the
-/// detail, and `omitted` names what went. Built at acceptance and stored
-/// in the ledger record, so it outlives the card and the original
-/// messages.
-pub fn build_capsule(doc: &CardDoc, task: &str, values: &Answer) -> String {
+/// `task` is `origin.task`; it goes through [`task_excerpt`] again (which
+/// changes nothing on an excerpt), so no caller can widen it. The detail is
+/// cut at 400 characters (ending in `…`). If the line is still over 1 KiB,
+/// the hints go first, then the field labels, then the detail, and
+/// `omitted` names what went. Built at acceptance and stored in the ledger
+/// record, so it outlives the card and the original messages.
+pub fn build_capsule(doc: &CardDoc, task: &str, values: &Answer) -> Capsule {
     let detail = doc.detail.as_deref().map(|d| {
         format!(
             "detail: {}",
@@ -520,7 +419,7 @@ pub fn build_capsule(doc: &CardDoc, task: &str, values: &Answer) -> String {
     let mut parts: [(&str, Option<String>); 3] =
         [("hints", hints), ("labels", labels), ("detail", detail)];
     let mut omitted: Vec<&str> = Vec::new();
-    let during = attr(task);
+    let during = attr(&task_excerpt(task));
     let render = |parts: &[(&str, Option<String>); 3], omitted: &[&str]| -> String {
         let [h, l, d] = parts;
         let text: Vec<&str> = [d, h, l].iter().filter_map(|(_, p)| p.as_deref()).collect();
@@ -543,17 +442,7 @@ pub fn build_capsule(doc: &CardDoc, task: &str, values: &Answer) -> String {
         }
         next += 1;
     }
-    out
-}
-
-/// `<asked during="…"[ omitted="…"]>text</asked>` with no `<` in the text.
-fn parse_capsule(s: &str) -> Option<()> {
-    let rest = s.strip_prefix("<asked ")?.strip_suffix("</asked>")?;
-    let (attrs, text) = rest.split_once('>')?;
-    let attrs = parse_attrs(attrs)?;
-    let names: Vec<&str> = attrs.iter().map(|(k, _)| *k).collect();
-    let ok = names == ["during"] || names == ["during", "omitted"];
-    (ok && !text.contains('<')).then_some(())
+    Capsule::parse(&out).expect("build_capsule makes a capsule")
 }
 
 #[cfg(test)]
@@ -779,17 +668,64 @@ mod tests {
             v
         };
         parse_answer(&d, &at(ANSWER_MAX_BYTES)).unwrap();
+        assert_eq!(err(&d, at(ANSWER_MAX_BYTES + 1)), "values: over 8192 bytes");
+    }
+
+    /// Depth 3 / 4, and a value of any depth is refused before it is
+    /// serialized (Shady #439 M2).
+    #[test]
+    fn values_depth_at_n_and_n_plus_1() {
+        let multi = doc(json!({"question": "q", "options": ["a", "b"], "multi": true}));
+        parse_answer(&multi, &json!({"choice": ["a"]})).unwrap();
         assert_eq!(
-            err(&d, at(ANSWER_MAX_BYTES + 1)),
-            "values: at most 8192 bytes (got 8193)"
+            err(&multi, json!({"choice": [["a"]]})),
+            "values: nested deeper than 3 levels"
         );
+        let mut deep = json!("a");
+        for _ in 0..200_000 {
+            deep = Value::Array(vec![deep]);
+        }
+        // Never cloned, dropped whole or put through `json!`: all recurse.
+        let mut values = Map::new();
+        values.insert("choice".into(), deep);
+        let values = Value::Object(values);
+        assert_eq!(
+            parse_answer(&multi, &values).unwrap_err().to_string(),
+            "values: nested deeper than 3 levels"
+        );
+        let mut v = values;
+        while let Some(inner) = match v {
+            Value::Object(mut o) => o.remove("choice"),
+            Value::Array(mut a) => a.pop(),
+            _ => None,
+        } {
+            v = inner;
+        }
+    }
+
+    /// Shady #439 M1: a client's hostile key never reaches the error raw.
+    #[test]
+    fn hostile_answer_keys() {
+        let f = form();
+        let k = "\u{1b}]0;x\u{7}\n\u{2066}";
+        let mut top = json!({"fields": {"version": "1", "notes": "", "publish": true}});
+        top[k] = json!(1);
+        assert_eq!(
+            err(&f, top),
+            r#""\u001b]0;x\u0007\u000a\u2066": unknown key; an answer has choice, note and fields"#
+        );
+        let mut field = json!({"fields": {"version": "1", "notes": "", "publish": true}});
+        field["fields"][k] = json!(1);
+        let e = err(&f, field);
+        assert_eq!(e, r#"fields."\u001b]0;x\u0007\u000a\u2066": no such field"#);
+        assert!(crate::ui::tests::safe_line(&e));
     }
 
     fn message(
         values: Answer,
         status: AnswerStatus,
         rev: u32,
-        asked: Option<String>,
+        asked: Option<Capsule>,
     ) -> AnswerMessage {
         AnswerMessage {
             card: "s_3f2a91c0d4e2a871".into(),
@@ -993,8 +929,8 @@ mod tests {
                 built += 1;
                 let a = parse_answer(&d, &values).unwrap();
                 let c = build_capsule(&d, &task_excerpt(&task), &a);
-                assert!(c.len() <= CAPSULE_MAX_BYTES, "{} bytes: {c}", c.len());
-                assert!(parse_capsule(&c).is_some(), "{c}");
+                assert!(c.len() <= CAPSULE_MAX_BYTES, "{} bytes: {c:?}", c.len());
+                assert_eq!(Capsule::parse(&c).as_ref(), Some(&c));
             }
         }
         assert_eq!(built, 7, "every mix the input cap allows was built");
@@ -1020,8 +956,78 @@ mod tests {
         );
         assert!(
             c.starts_with("<asked during=\"t\" omitted=\"hints\">detail: xxx"),
-            "{c}"
+            "{c:?}"
         );
         assert!(c.len() <= CAPSULE_MAX_BYTES);
+    }
+
+    /// The 1 KiB bound at 1024 (everything kept) and 1025 (hints go first).
+    #[test]
+    fn capsule_at_1024_and_1025_bytes() {
+        let detail: String = (0..CAPSULE_DETAIL_MAX)
+            .map(|i| if i < 40 { '\u{20AC}' } else { 'x' })
+            .collect();
+        let fields: Vec<Value> = (0..FIELDS_MAX)
+            .map(|i| json!({"id": format!("f{i}"), "label": "L".repeat(FIELD_LABEL_MAX)}))
+            .collect();
+        let d = doc(json!({"question": "q", "detail": detail,
+            "options": ["a", {"label": "b", "hint": "h".repeat(HINT_MAX)}], "fields": fields}));
+        let values: Value = json!({"choice": "b", "fields": (0..FIELDS_MAX).map(|i| (format!("f{i}"), json!("v"))).collect::<Map<String, Value>>()});
+        let a = parse_answer(&d, &values).unwrap();
+        let base = build_capsule(&d, "", &a).len();
+        assert!(
+            base < CAPSULE_MAX_BYTES && base + TASK_EXCERPT_MAX > CAPSULE_MAX_BYTES,
+            "{base}"
+        );
+        let n = CAPSULE_MAX_BYTES - base;
+        let at = build_capsule(&d, &"t".repeat(n), &a);
+        assert_eq!(at.len(), CAPSULE_MAX_BYTES);
+        assert!(
+            !at.contains("omitted") && at.contains("hints: b="),
+            "{at:?}"
+        );
+        let over = build_capsule(&d, &"t".repeat(n + 1), &a);
+        assert!(over.starts_with(&format!(
+            "<asked during=\"{}\" omitted=\"hints\">",
+            "t".repeat(n + 1)
+        )));
+        assert!(over.len() < CAPSULE_MAX_BYTES && !over.contains("hints:"));
+    }
+
+    /// A capsule is only what the builder makes: parse and deserialize
+    /// refuse anything else.
+    #[test]
+    fn capsules_are_checked() {
+        for ok in [
+            "<asked during=\"t\"></asked>",
+            "<asked during=\"\" omitted=\"hints\">x \\u003c y</asked>",
+        ] {
+            assert!(Capsule::parse(ok).is_some(), "{ok}");
+            let c: Capsule = serde_json::from_value(json!(ok)).unwrap();
+            assert_eq!(serde_json::to_value(&c).unwrap(), json!(ok));
+        }
+        let long = format!(
+            "<asked during=\"t\">{}</asked>",
+            "x".repeat(CAPSULE_MAX_BYTES)
+        );
+        for bad in [
+            "",
+            "<asked during=\"t\">a<b</asked>",
+            "<asked during=\"<t\">a</asked>",
+            "<asked during=\"t\" late=\"true\">a</asked>",
+            "<asked omitted=\"hints\" during=\"t\">a</asked>",
+            "<asked during=\"t\">a</asked> ",
+            long.as_str(),
+        ] {
+            assert_eq!(Capsule::parse(bad), None, "{bad}");
+            assert!(serde_json::from_value::<Capsule>(json!(bad)).is_err());
+        }
+        // The builder takes the excerpt itself: a raw task can't widen it.
+        let d = doc(json!({"question": "q", "options": ["a", "b"]}));
+        let raw = format!("  {}\n<x>  ", "w".repeat(200));
+        assert_eq!(
+            build_capsule(&d, &raw, &Answer::skip()),
+            build_capsule(&d, &task_excerpt(&raw), &Answer::skip())
+        );
     }
 }

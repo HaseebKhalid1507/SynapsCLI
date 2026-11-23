@@ -9,81 +9,20 @@
 //!   lists the card (and its answer id) in the mark's `results`;
 //! - a `ui` call without that evidence is "outcome not recorded here",
 //!   never "answered"; a tool error, `unavailable`, `skipped_recently` or
-//!   `paused` result is a tool row, not a card.
+//!   `paused` result is a tool row, not a card;
+//! - a marked `unconfirmed` create keeps its card id (v3.2 #9): it renders
+//!   as "outcome not recorded" too, but a later marked answer attaches to
+//!   it, not to "carried over".
 //!
 //! Like every `_synaps_*` key, the mark never reaches a provider
 //! (`continuation::WireMessages` strips the prefix).
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub use agent_core::core::ui_types::{AnswerMark, ResultMark, ResultsMark, UiMark, MARK_KEY};
 
 use super::answer::{parse_answer, parse_answer_message, Answer, AnswerStatus};
 use super::doc::{parse_input, CardDoc, UiInput};
-use super::is_host_id;
-
-/// The in-memory message key of a mark.
-pub const MARK_KEY: &str = "_synaps_ui";
-
-/// The host's mark on a message.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum UiMark {
-    /// On a `<ui_answer>` message: `{"l","card","answer","rev","status"}`.
-    Answer(AnswerMark),
-    /// On the user message carrying `ui` tool results:
-    /// `{"l","results":[{"card","answer"|null}]}`.
-    Results(ResultsMark),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnswerMark {
-    /// The sidecar's lineage.
-    pub l: String,
-    pub card: String,
-    pub answer: String,
-    pub rev: u32,
-    pub status: AnswerStatus,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResultsMark {
-    pub l: String,
-    pub results: Vec<ResultMark>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResultMark {
-    pub card: String,
-    /// The answer a waited result delivered; `null` for `shown`,
-    /// `pending` and `closed`.
-    pub answer: Option<String>,
-}
-
-impl UiMark {
-    pub fn lineage(&self) -> &str {
-        match self {
-            UiMark::Answer(m) => &m.l,
-            UiMark::Results(m) => &m.l,
-        }
-    }
-
-    /// Well formed: a lineage, host ids, a revision in 1..=4.
-    pub fn is_valid(&self) -> bool {
-        let answer_ok = |a: &str| is_host_id(a, "a_");
-        !self.lineage().is_empty()
-            && match self {
-                UiMark::Answer(m) => {
-                    is_host_id(&m.card, "s_") && answer_ok(&m.answer) && (1..=4).contains(&m.rev)
-                }
-                UiMark::Results(m) => {
-                    !m.results.is_empty()
-                        && m.results.iter().all(|r| {
-                            is_host_id(&r.card, "s_") && r.answer.as_deref().is_none_or(answer_ok)
-                        })
-                }
-            }
-    }
-}
 
 /// The mark on `msg`, if it carries a well-formed one.
 pub fn mark_of(msg: &Value) -> Option<UiMark> {
@@ -166,6 +105,12 @@ pub enum Outcome {
     Closed {
         card: String,
     },
+    /// A create whose save outcome wasn't known at the call budget (§3.4),
+    /// proven by the results mark: "outcome not recorded" until a marked
+    /// answer or a retained card shows the card exists.
+    Unconfirmed {
+        card: String,
+    },
 }
 
 impl Outcome {
@@ -176,7 +121,8 @@ impl Outcome {
             | Outcome::Answered { card, .. }
             | Outcome::Skipped { card, .. }
             | Outcome::Pending { card }
-            | Outcome::Closed { card } => Some(card.as_str()),
+            | Outcome::Closed { card }
+            | Outcome::Unconfirmed { card } => Some(card.as_str()),
         }
     }
 }
@@ -316,6 +262,7 @@ fn result_outcome(block: &Value, marked: &[ResultMark], input: &CallInput) -> Ou
     match (status, answer_id, input) {
         ("shown", None, CallInput::Create(_)) => Outcome::Shown { card },
         ("pending", None, CallInput::Create(_)) => Outcome::Pending { card },
+        ("unconfirmed", None, CallInput::Create(_)) => Outcome::Unconfirmed { card },
         ("closed", None, CallInput::Close(id)) if *id == card => Outcome::Closed { card },
         ("answered", Some(answer_id), CallInput::Create(doc)) => {
             match parse_answer(doc, &result["answer"]) {
@@ -533,6 +480,40 @@ mod tests {
         assert_eq!(f.calls[3].input, CallInput::Invalid);
         assert_eq!(f.unmatched.len(), 1);
         assert_eq!(f.unmatched[0].card, "s_0000000000000009");
+    }
+
+    /// v3.2 #9: a marked `unconfirmed` create keeps its card, and a later
+    /// marked answer attaches to it. Unmarked, or for a close, it proves
+    /// nothing.
+    #[test]
+    fn unconfirmed_creates_keep_their_card() {
+        let unconfirmed = json!({"status": "unconfirmed", "id": CARD, "note": "Not confirmed yet"});
+        let marked = json!({"l": "9b1f", "results": [{"card": CARD, "answer": null}]});
+        let f = fold_history(&[
+            call("t1", a1()),
+            result("t1", unconfirmed.clone(), Some(marked.clone())),
+            answer_msg(Some(mark("answered", 1)), &text(AnswerStatus::Answered, 1)),
+        ]);
+        assert_eq!(
+            f.calls[0].outcome,
+            Outcome::Unconfirmed { card: CARD.into() }
+        );
+        assert_eq!(f.calls[0].answers.len(), 1, "attached to this call");
+        assert!(f.unmatched.is_empty(), "not carried over");
+
+        let f = fold_history(&[
+            call("t1", a1()),
+            result("t1", unconfirmed.clone(), None),
+            answer_msg(Some(mark("answered", 1)), &text(AnswerStatus::Answered, 1)),
+        ]);
+        assert_eq!(f.calls[0].outcome, Outcome::NotRecorded);
+        assert_eq!(f.unmatched.len(), 1);
+
+        let f = fold_history(&[
+            call("t2", json!({"close": CARD})),
+            result("t2", unconfirmed, Some(marked)),
+        ]);
+        assert_eq!(f.calls[0].outcome, Outcome::NotRecorded);
     }
 
     #[test]
