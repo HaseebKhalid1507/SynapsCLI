@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_engine::session::{
-    AttachMode, CheckpointReason, ClientKind, ClientMeta, ClientTransport, EndReason, HostEvent,
-    LocalTransport, SessionCommand, SessionConfig, SessionHandle, SessionLifecycle, SessionQuery,
-    SessionSetting,
+    AttachMode, CheckpointReason, ClientKind, ClientMeta, ClientTransport, EndReason, Envelope,
+    HostEvent, LocalTransport, SessionCommand, SessionConfig, SessionHandle, SessionLifecycle,
+    SessionQuery, SessionSetting,
 };
 use axum::response::IntoResponse;
 use serial_test::serial;
@@ -2177,6 +2177,104 @@ async fn a_model_switch_leaves_the_cache_cold() {
     let c = status(&mut t, 1307).await["cache"].clone();
     assert!(secs(&c, "expires_in_secs") >= 3540, "a fresh countdown: {c}");
     end(&mut t).await;
+}
+
+/// A session nobody has attached to or sent anything: an event wakes its
+/// first turn (on `MODEL`, cached 1h). Only the host's broadcast is
+/// watched, so no command reaches the actor before the caller's first one
+/// (Shady #436 R6-1: that first command must not be what seeds the fence).
+async fn an_event_turn_before_any_command(
+    config: &str,
+) -> (Home, SessionHandle, tokio::sync::broadcast::Receiver<Envelope>, Arc<agent_engine::EngineHost>) {
+    let h = Home::new();
+    write_config(&h, config);
+    let (url, _bodies) = scripted_stub(Script::new()).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (handle, task) = host.create_session_unspawned(cfg()).await.unwrap();
+    let queue = task.event_queue();
+    let mut rx = handle.subscribe();
+    tokio::spawn(task.run());
+    queue
+        .push(agent_engine::events::Event::simple("watcher", "build finished", None))
+        .unwrap();
+    watch(&mut rx, |e| matches!(e, agent_engine::session::SessionEventWire::TurnStarted { .. })).await;
+    watch(&mut rx, |e| matches!(e, agent_engine::session::SessionEventWire::Idle)).await;
+    (h, handle, rx, host)
+}
+
+/// The next broadcast event that `pred` accepts.
+async fn watch(
+    rx: &mut tokio::sync::broadcast::Receiver<Envelope>,
+    pred: impl Fn(&agent_engine::session::SessionEventWire) -> bool,
+) -> agent_engine::session::SessionEventWire {
+    loop {
+        let env = tokio::time::timeout(PATIENCE, rx.recv()).await.expect("timely").expect("alive");
+        if pred(&env.event) {
+            return env.event;
+        }
+    }
+}
+
+/// `Set{Model}` sent by the host (no client), its broadcast confirmation.
+async fn host_set_model(handle: &SessionHandle, rx: &mut tokio::sync::broadcast::Receiver<Envelope>, id: u64, model: &str) {
+    handle
+        .send(SessionCommand::Set {
+            id,
+            setting: SessionSetting::Model { model: model.into() },
+        })
+        .await
+        .unwrap();
+    match watch(rx, |e| matches!(e, agent_engine::session::SessionEventWire::SettingChanged(a) if a.id == id)).await {
+        agent_engine::session::SessionEventWire::SettingChanged(a) => assert!(a.ok, "{model}: {:?}", a.message),
+        _ => unreachable!(),
+    }
+}
+
+/// `Status{cache: true}` asked by the host: the answer is broadcast.
+async fn host_status(handle: &SessionHandle, rx: &mut tokio::sync::broadcast::Receiver<Envelope>, id: u64) -> serde_json::Value {
+    handle
+        .send(SessionCommand::Query {
+            id,
+            query: SessionQuery::Status { cache: true },
+        })
+        .await
+        .unwrap();
+    match watch(rx, |e| matches!(e, agent_engine::session::SessionEventWire::QueryResult { id: i, .. } if *i == id)).await {
+        agent_engine::session::SessionEventWire::QueryResult { value, .. } => value,
+        _ => unreachable!(),
+    }
+}
+
+/// An event turn on A before any command, then the first command switches
+/// to B: B's cache is cold (A's write is not B's), and B's own turn warms
+/// it (Shady #436 R6-1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_first_command_switch_after_an_event_turn_is_cold() {
+    let (_h, handle, mut rx, _host) = an_event_turn_before_any_command(NO_KEEPWARM_1H).await;
+    host_set_model(&handle, &mut rx, 1490, "claude-opus-4-6").await;
+    let st = host_status(&handle, &mut rx, 1491).await;
+    assert_eq!(st["model"], "claude-opus-4-6", "{st}");
+    assert!(st["cache"].is_null(), "A's write is not B's: {st}");
+    handle.send(submit("on B")).await.unwrap();
+    watch(&mut rx, |e| matches!(e, agent_engine::session::SessionEventWire::TurnStarted { .. })).await;
+    watch(&mut rx, |e| matches!(e, agent_engine::session::SessionEventWire::Idle)).await;
+    let st = host_status(&handle, &mut rx, 1492).await;
+    assert_eq!(st["cache"]["ttl"], "1h", "B's own write: {st}");
+}
+
+/// The same, but the first command sets the model it already has: A's own
+/// event-turn write is kept (the fence is not just thrown away first).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_first_command_same_model_set_after_an_event_turn_keeps_the_cache() {
+    let (_h, handle, mut rx, _host) = an_event_turn_before_any_command(NO_KEEPWARM_1H).await;
+    host_set_model(&handle, &mut rx, 1495, MODEL).await;
+    let st = host_status(&handle, &mut rx, 1496).await;
+    assert_eq!(st["model"], MODEL, "{st}");
+    assert_eq!(st["cache"]["ttl"], "1h", "A's own event-turn write: {st}");
+    assert!(secs(&st["cache"], "expires_in_secs") >= 3540, "{st}");
 }
 
 /// A keep-warm ping whose answer cached nothing: the cache is not warm,
