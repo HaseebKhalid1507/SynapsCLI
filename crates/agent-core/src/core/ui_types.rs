@@ -5,7 +5,8 @@
 //! `ui_sanitize`, the contract, answer parsing, the fold) stays in
 //! `agent_engine::ui`, which re-exports everything below under its old
 //! paths. C2 adds `SurfaceState`, `AnswerState`, `LogEntry`, `Tombstone`
-//! and `LedgerRecord` here.
+//! and `LedgerRecord` here (with `Phase`, `WaitMode`, `Verb`, `Downgrade`,
+//! `Delivery` and `Origin`); `session_surfaces` persists them.
 //!
 //! Nothing here validates a doc: a [`CardDoc`] read back from storage or
 //! the wire must go through `agent_engine::ui::revalidate`.
@@ -493,6 +494,170 @@ impl UiMark {
                 }
             }
     }
+}
+
+// ── Retained state (C2: §2.2, §3.7, §3.11) ─────────────────────────────
+// The sidecar's and the wire's card state. `session_surfaces` stores it;
+// nothing here is wired to a session yet.
+
+/// What the user sees of a card (§3.1). `Unknown`: recovery couldn't tell
+/// (a restored or foreign history, §3.11 step 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    Open,
+    Answered,
+    Skipped,
+    Withdrawn,
+    Expired,
+    Closed,
+    Unknown,
+}
+
+impl Phase {
+    /// Nothing more can be answered on it (a revisable receipt is not
+    /// terminal: its `offers` say so).
+    pub fn is_open(self) -> bool {
+        self == Phase::Open
+    }
+}
+
+/// Is a tool blocked on the card now (§3.1 mode)? Named `WaitMode`
+/// because C1's [`Mode`] is the answer mode (quick or form).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaitMode {
+    Live,
+    Waiting,
+}
+
+/// A client verb a card offers (§2.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verb {
+    Answer,
+    Skip,
+    Revise,
+}
+
+/// Why a waiting card became live (T13, T14, T17, T21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Downgrade {
+    Timeout,
+    Abandoned,
+    Reload,
+    Crash,
+}
+
+/// An answer's delivery (§3.1), per ledger record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    Queued,
+    Handed,
+    InContext,
+    Recorded,
+    Settled,
+    Unknown,
+}
+
+/// Where a card came from (§2.2, §3.6, §3.9).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Origin {
+    /// The `_synaps_turn` uuid of the turn that raised it; `None`: its
+    /// answers count as late.
+    pub turn: Option<String>,
+    /// The first [`TASK_EXCERPT_MAX`] characters of the message that
+    /// started that turn, persisted at create (R3-M1).
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<StopKind>,
+}
+
+/// One retained card (§2.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceState {
+    /// `s_` + 16 hex.
+    pub id: String,
+    pub call_id: String,
+    /// +1 on every change; clients upsert by `(id, rev)`.
+    pub rev: u64,
+    pub contract: String,
+    pub catalog: u32,
+    pub mode: WaitMode,
+    pub phase: Phase,
+    pub offers: Vec<Verb>,
+    pub doc: CardDoc,
+    pub origin: Origin,
+    /// The session's stop epoch when this state was drawn.
+    pub epoch: u32,
+    pub resume: bool,
+    /// Durably accepted action ids on this card (≤ [`ACTION_LOG_MAX`]).
+    pub actions: Vec<String>,
+    pub raised_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downgraded: Option<Downgrade>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<AnswerState>,
+}
+
+/// A view of a card's latest ledger record (§2.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnswerState {
+    pub rev: u32,
+    pub action_id: String,
+    pub answer_id: String,
+    pub status: AnswerStatus,
+    pub values: Answer,
+    pub delivery: Delivery,
+    pub wake: bool,
+    pub by: String,
+    pub at: String,
+}
+
+/// One durably accepted action (§3.7, v3.2 #10): its payload hash
+/// (`hex128(sha256(verb, expect_rev, epoch, values))`) and the answer
+/// revision it produced. Only accepted actions are logged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogEntry {
+    pub action_id: String,
+    pub hash: String,
+    pub rev: u32,
+}
+
+/// What is left of a card that left the retained set (§3.7, §4.4): its id,
+/// when, and its action log for retries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tombstone {
+    pub id: String,
+    pub at: String,
+    pub log: Vec<LogEntry>,
+}
+
+/// One accepted answer, skip or revision, until it is settled (§3.11).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerRecord {
+    pub answer_id: String,
+    pub card: String,
+    pub rev: u32,
+    pub status: AnswerStatus,
+    pub values: Answer,
+    /// Consent to start a turn, for `epoch` only (§3.9).
+    pub wake: bool,
+    pub epoch: u32,
+    pub delivery: Delivery,
+    /// The sanitized question, kept for a late delivery (R3-M1).
+    pub q: String,
+    /// The built `<asked>` capsule (≤ [`CAPSULE_MAX_BYTES`]), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked: Option<String>,
 }
 
 #[cfg(test)]

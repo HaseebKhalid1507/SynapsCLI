@@ -26,6 +26,9 @@ pub mod session_index;
 pub mod session_journal;
 pub mod session_lock;
 mod session_save_order;
+/// Agent cards' durability: the `.ui` sidecar, its store and recovery
+/// (agent-ui v3.2, C2). Inert: nothing is wired to a session yet.
+pub mod session_surfaces;
 pub mod stream_types;
 pub mod tool_spill;
 /// Agent cards: the card model's pure data types and bounds (agent-ui v3.2
