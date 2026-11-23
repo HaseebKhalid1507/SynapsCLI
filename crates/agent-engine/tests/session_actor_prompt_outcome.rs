@@ -245,18 +245,21 @@ async fn an_older_client_answering_late_hears_no_refusal() {
     answer(&a, pid, Some("n")).await;
     let a_id = a.client_id();
     let old_id = old.client_id();
-    let seen = until(&mut old, |e| matches!(e, SessionEventWire::Refused { client, .. } if *client == a_id)).await;
+    // The current client's refusal and the turn's Idle come in either order
+    // (the turn may end before the late answers are handled): read the
+    // older client's stream until it has seen both.
+    let (mut barrier, mut idle, mut seen) = (false, false, Vec::new());
+    while !(barrier && idle) {
+        let env = next(&mut old).await;
+        barrier |= matches!(env.event, SessionEventWire::Refused { client, .. } if client == a_id);
+        idle |= matches!(env.event, SessionEventWire::Idle);
+        seen.push(env);
+    }
     assert!(
         !seen.iter().any(|e| matches!(e.event, SessionEventWire::Refused { client, .. } if client == old_id)),
         "the older client hears no refusal: {seen:#?}"
     );
     assert_eq!(answer_refusal(&mut a).await, format!("prompt {pid} was already resolved: allowed"));
-
-    let seen = until(&mut old, |e| matches!(e, SessionEventWire::Idle)).await;
-    assert!(
-        !seen.iter().any(|e| matches!(e.event, SessionEventWire::Refused { client, .. } if client == old_id)),
-        "nor later in its turn: {seen:#?}"
-    );
     assert_eq!(tool_results(&last_conversation(&seen)), vec!["allowed".to_string()], "the late answers changed nothing");
     end(&mut a).await;
 }
