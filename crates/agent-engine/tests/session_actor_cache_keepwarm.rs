@@ -2392,6 +2392,37 @@ async fn a_parked_session_says_nothing_about_its_cache() {
     assert!(st.get("cache").is_none(), "unknown, not cold: {st}");
 }
 
+/// Both opt-ins (#435's `ModelOptions`, this `Status{cache: true}`) answer
+/// only the client that asked; the ordinary queries keep their old path,
+/// the answer every attached client sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn only_the_opted_in_answers_are_addressed() {
+    use agent_engine::session::SessionEventWire as E;
+    let (_h, _script, _bodies, handle, mut a, _host) = scripted(NO_KEEPWARM_1H).await;
+    let (mut b, _) = LocalTransport::attach_with(handle.clone(), ClientMeta::new(ClientKind::Tui), AttachMode::Mirror)
+        .await
+        .unwrap();
+    turn(&mut a, "hello").await;
+    for (id, query, shared) in [
+        (1450, SessionQuery::Status { cache: false }, true),
+        (1451, SessionQuery::View, true),
+        (1452, SessionQuery::Messages, true),
+        (1453, SessionQuery::Status { cache: true }, false),
+        (1454, SessionQuery::ModelOptions, false),
+    ] {
+        a.send_from_self(SessionCommand::Query { id, query }).await.unwrap();
+        query_result(&mut a, id).await;
+        // Answered before b's own query: b saw it by then, or never will.
+        let mark = id + 100;
+        b.send_from_self(SessionCommand::Query { id: mark, query: SessionQuery::View }).await.unwrap();
+        let seen = until(&mut b, |e| matches!(e, E::QueryResult { id: m, .. } if *m == mark)).await;
+        let got = seen.iter().any(|e| matches!(e.event, E::QueryResult { id: i, .. } | E::QueryReply { id: i, .. } if i == id));
+        assert_eq!(got, shared, "query {id}: the other client saw it: {got}");
+    }
+    end(&mut a).await;
+}
+
 /// Gated as `catalog_page`: a client opts in by asking (`Status{cache}`,
 /// after `Welcome.features` lists `cache_expiry`). A plain `Status` (an older
 /// client's) never carries the field, nor does `/keepwarm status`; the
