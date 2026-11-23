@@ -56,9 +56,13 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// `EndReason::OwnerGone`.
 pub const FEATURE_OWNED_SESSIONS: &str = "owned_sessions";
 
+/// `Welcome.features` entry: this daemon answers `SkillsReload` and
+/// `SkillsStatus` (skills v1). The protocol stays 3.
+pub const FEATURE_SKILLS_V1: &str = "skills_v1";
+
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
-    vec![FEATURE_OWNED_SESSIONS.to_string()]
+    vec![FEATURE_OWNED_SESSIONS.to_string(), FEATURE_SKILLS_V1.to_string()]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
@@ -206,6 +210,26 @@ pub enum ClientFrame {
     ReloadExtension {
         extension: String,
     },
+    /// Control frame (no session; an unattached connection only, refused
+    /// on an attached one like `Reload`): walk the skill roots again with
+    /// the skill keys read fresh from the config file and swap the new set
+    /// in (`skills.reload`). Reply: `SkillsResult` (match it by `id`), or a
+    /// session-less `Error`. Feature "skills_v1"; an older daemon answers
+    /// `Error` "malformed frame: unknown variant `skills_reload`, ...".
+    SkillsReload {
+        /// Echoed in the reply.
+        #[serde(default)]
+        id: Option<u64>,
+    },
+    /// Control query (no session, also on an attached connection): the
+    /// report of this daemon's last skill discovery pass, boot or reload
+    /// (`skills.status`); no disk walk. Reply: `SkillsResult`. Feature
+    /// "skills_v1".
+    SkillsStatus {
+        /// Echoed in the reply.
+        #[serde(default)]
+        id: Option<u64>,
+    },
     Bye,
 }
 
@@ -251,6 +275,8 @@ impl std::fmt::Debug for ClientFrame {
                 .debug_struct("ReloadExtension")
                 .field("extension", extension)
                 .finish(),
+            Self::SkillsReload { id } => f.debug_struct("SkillsReload").field("id", id).finish(),
+            Self::SkillsStatus { id } => f.debug_struct("SkillsStatus").field("id", id).finish(),
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -469,6 +495,12 @@ pub enum DaemonFrame {
     /// never token material, emails, account ids or identity hashes.
     AuthState {
         report: agent_core::auth::AuthStateReport,
+    },
+    /// Answer to `SkillsReload` and `SkillsStatus`. Only sent on request.
+    SkillsResult {
+        #[serde(default)]
+        id: Option<u64>,
+        report: crate::skills::status::SkillsReport,
     },
 }
 
@@ -2000,6 +2032,8 @@ mod tests {
                 clear: true,
             }),
             ClientFrame::ReloadExtension { extension: "subconscious".into() },
+            ClientFrame::SkillsReload { id: Some(11) },
+            ClientFrame::SkillsStatus { id: None },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -2075,6 +2109,10 @@ mod tests {
             DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
             DaemonFrame::AuthState { report: auth_state_report() },
+            DaemonFrame::SkillsResult {
+                id: Some(11),
+                report: skills_report_sample(),
+            },
         ];
         for f in frames {
             let line = encode_line(&f).unwrap();
@@ -2331,6 +2369,91 @@ mod tests {
         w.features = daemon_features();
         let new: Welcome = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
         assert!(new.supports(FEATURE_OWNED_SESSIONS));
+    }
+
+    #[test]
+    fn the_daemon_lists_the_skills_v1_feature() {
+        assert!(daemon_features().iter().any(|f| f == FEATURE_SKILLS_V1));
+    }
+
+    fn skills_report_sample() -> crate::skills::status::SkillsReport {
+        use crate::skills::loader::RootKind;
+        use crate::skills::status::{ShadowedReport, SkillsReport, SkillsRootReport};
+        SkillsReport {
+            generation: 2,
+            at_unix_ms: 1_762_000_000_000,
+            roots: vec![SkillsRootReport {
+                kind: RootKind::Extra,
+                configured: Some("/Users/j/Library/Application Support/p/skills/current".into()),
+                resolved: None,
+                plugins: 1,
+                skills: 3,
+            }],
+            skills_total: 3,
+            skills_cap: 2048,
+            metadata_bytes: 900,
+            metadata_cap: 4194304,
+            skipped: 0,
+            disabled: 1,
+            shadowed: vec![ShadowedReport {
+                plugin: None,
+                name: "x".into(),
+                kept_root_kind: RootKind::Extra,
+                dropped_root_kind: RootKind::HomeSkills,
+            }],
+            shadowed_total: 1,
+            ignored_non_skill: 2,
+            ignored_non_skill_names: vec!["extra-skills:commands".into(), "extra-skills:mcp".into()],
+        }
+    }
+
+    /// `skills_reload` / `skills_status` (feature "skills_v1"; the protocol
+    /// stays 3): the frames and their reply round-trip, a missing id
+    /// decodes as `None`, and a daemon that predates them rejects them as
+    /// unknown variants (conn answers `Error` and keeps the connection).
+    #[test]
+    fn skills_frames_round_trip_and_are_additive() {
+        let line = encode_line(&ClientFrame::SkillsReload { id: Some(3) }).unwrap();
+        assert_eq!(line.trim_end(), r#"{"type":"skills_reload","id":3}"#);
+        assert!(matches!(
+            decode_line::<ClientFrame>(r#"{"type":"skills_status"}"#).unwrap(),
+            ClientFrame::SkillsStatus { id: None }
+        ));
+        let reply = DaemonFrame::SkillsResult {
+            id: Some(3),
+            report: skills_report_sample(),
+        };
+        let line = encode_line(&reply).unwrap();
+        assert!(
+            line.starts_with(r#"{"type":"skills_result","id":3,"report":{"generation":2,"#),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                r#""configured":"/Users/j/Library/Application Support/p/skills/current""#
+            ),
+            "{line}"
+        );
+        match decode_line::<DaemonFrame>(line.trim_end()).unwrap() {
+            DaemonFrame::SkillsResult { id, report } => {
+                assert_eq!((id, report), (Some(3), skills_report_sample()))
+            }
+            other => panic!("{other:?}"),
+        }
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldClientFrame {
+            Ping,
+        }
+        for frame in [
+            ClientFrame::SkillsReload { id: None },
+            ClientFrame::SkillsStatus { id: Some(1) },
+        ] {
+            let err =
+                decode_line::<OldClientFrame>(encode_line(&frame).unwrap().trim_end()).unwrap_err();
+            assert!(err.contains("unknown variant"), "{err}");
+        }
     }
 }
 

@@ -82,6 +82,42 @@ pub fn predates_auth_state(message: &str) -> bool {
     message.starts_with("malformed frame: unknown variant `auth_state`")
 }
 
+/// What `synaps skills status|reload` got from the daemon.
+#[derive(Debug)]
+pub enum SkillsReply {
+    Report(crate::skills::status::SkillsReport),
+    /// The daemon answered a session-less `Error`: it refused or failed the
+    /// request (the last pass stays published).
+    Refused(String),
+    /// The daemon predates skills v1: its `Welcome` does not list the
+    /// feature, or it answered the frame as an old daemon answers any frame
+    /// it cannot decode. Its version and build, from its `Welcome`.
+    DaemonPredates {
+        daemon_version: String,
+        daemon_build: String,
+    },
+}
+
+/// An old daemon's reply to `SkillsReload` or `SkillsStatus`
+/// (daemon/conn.rs `Read::Bad`), and nothing else.
+pub fn predates_skills(message: &str) -> bool {
+    ["skills_reload", "skills_status"]
+        .iter()
+        .any(|frame| message.starts_with(&format!("malformed frame: unknown variant `{frame}`")))
+}
+
+/// Why a control query with one deadline for the whole exchange got no
+/// answer.
+#[derive(Debug, thiserror::Error)]
+pub enum QueryError {
+    /// Nothing came back by the deadline (connect, handshake and reply
+    /// together): the daemon is busy or silent.
+    #[error("no answer by the deadline")]
+    TimedOut,
+    #[error(transparent)]
+    Transport(TransportError),
+}
+
 /// Reused line buffer for `read_frame`: a big `Attached`/`MessageHistory`
 /// frame grows it once; after any frame > 1 MiB it shrinks back to 64 KiB so
 /// the peak is not retained for the life of the connection (§2.1 #1).
@@ -246,6 +282,61 @@ impl Connected {
             }
             DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
             other => Err(TransportError::Protocol(format!("expected auth state, got {other:?}"))),
+        }
+    }
+
+    /// `SkillsReload` (`reload`) or `SkillsStatus` → the daemon's skills
+    /// report, by `deadline`. A daemon whose `Welcome` lacks "skills_v1" is
+    /// not asked. The answer is the result with this `id`; a session-less
+    /// `Error` is [`SkillsReply::Refused`]. Any other frame is an error that
+    /// does not echo its payload.
+    pub async fn skills(
+        &mut self,
+        reload: bool,
+        id: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<SkillsReply, QueryError> {
+        let (daemon_version, daemon_build) = (
+            self.welcome.daemon_version.clone(),
+            self.welcome.daemon_build.clone(),
+        );
+        let predates = move || SkillsReply::DaemonPredates {
+            daemon_version,
+            daemon_build,
+        };
+        if !self.welcome.supports(crate::session::wire::FEATURE_SKILLS_V1) {
+            return Ok(predates());
+        }
+        let frame = if reload {
+            ClientFrame::SkillsReload { id: Some(id) }
+        } else {
+            ClientFrame::SkillsStatus { id: Some(id) }
+        };
+        self.writer
+            .send(frame)
+            .await
+            .map_err(|_| QueryError::Transport(TransportError::Closed))?;
+        let reply = tokio::time::timeout_at(deadline, read_frame(&mut self.reader, &mut self.buf))
+            .await
+            .map_err(|_| QueryError::TimedOut)?
+            .map_err(QueryError::Transport)?
+            .ok_or(QueryError::Transport(TransportError::Closed))?;
+        match reply {
+            DaemonFrame::SkillsResult {
+                id: Some(got),
+                report,
+            } if got == id => Ok(SkillsReply::Report(report)),
+            DaemonFrame::Error {
+                session_id: None,
+                message,
+            } if predates_skills(&message) => Ok(predates()),
+            DaemonFrame::Error {
+                session_id: None,
+                message,
+            } => Ok(SkillsReply::Refused(message)),
+            _ => Err(QueryError::Transport(TransportError::Protocol(format!(
+                "expected skills result {id}, got another frame"
+            )))),
         }
     }
 
@@ -778,6 +869,26 @@ impl SocketTransport {
         let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
         let reply = c.auth_state(query).await;
         c.bye().await;
+        reply
+    }
+
+    /// `SkillsReload` (`reload`) or `SkillsStatus` on a control connection
+    /// (see [`Connected::skills`]). `deadline` bounds connect, handshake
+    /// and reply; past it the answer is [`QueryError::TimedOut`] and the
+    /// connection is dropped.
+    pub async fn skills(
+        path: &Path,
+        reload: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<SkillsReply, QueryError> {
+        let mut c = tokio::time::timeout_at(deadline, Connected::connect(path, Hello::new(ClientKind::Attach)))
+            .await
+            .map_err(|_| QueryError::TimedOut)?
+            .map_err(QueryError::Transport)?;
+        let reply = c.skills(reload, 1, deadline).await;
+        if !matches!(reply, Err(QueryError::TimedOut)) {
+            c.bye().await;
+        }
         reply
     }
 

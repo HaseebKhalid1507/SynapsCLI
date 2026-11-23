@@ -1,7 +1,8 @@
 //! Skills and plugins subsystem.
 //!
-//! Discovers plugins under `.synaps-cli/plugins/` (project-local) and
-//! `~/.synaps-cli/plugins/` (global), registers each skill as a dynamic
+//! Discovers plugins under `.synaps-cli/plugins/` (project-local),
+//! `skills.extra_root` (one configured path) and `~/.synaps-cli/plugins/`
+//! (global), registers each skill as a dynamic
 //! slash command, and exposes the same skills to the model via the
 //! `load_skill` tool. Submodules: `manifest` (plugin/marketplace JSON
 //! parsing), `loader` (discovery walk + frontmatter parsing), `config`
@@ -19,6 +20,7 @@ pub mod plugin_index;
 pub mod post_install;
 pub mod registry;
 pub mod state;
+pub mod status;
 pub mod tool;
 pub mod trust;
 pub mod update_diff;
@@ -248,6 +250,43 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "watch",
 ];
 
+/// One filtered discovery pass over [`loader::discovery_roots`].
+pub struct Discovered {
+    /// The pass, with the disable filters applied to its `plugins` and
+    /// `skills` (its per-root counts are from before them).
+    pub pass: loader::DiscoveryPass,
+    /// Skills the disable filters removed.
+    pub disabled: usize,
+}
+
+/// Walk the five discovery roots for `keys` and apply its disable lists to
+/// the skills and to the plugins (commands, keybinds, help).
+pub fn discover(keys: &agent_core::config::SkillsKeys) -> Discovered {
+    let roots = loader::discovery_roots(keys.extra_root.as_deref());
+    let mut pass = loader::load_all_reported(&roots);
+    let found = pass.skills.len();
+    pass.skills = config::filter_disabled(
+        std::mem::take(&mut pass.skills),
+        &keys.disabled_plugins,
+        &keys.disabled_skills,
+    );
+    let disabled = found - pass.skills.len();
+    if !keys.disabled_plugins.is_empty() {
+        pass.plugins
+            .retain(|p| !keys.disabled_plugins.iter().any(|d| d == &p.name));
+    }
+    Discovered { pass, disabled }
+}
+
+/// What [`register_reported`] built.
+pub struct Registered {
+    pub commands: Arc<CommandRegistry>,
+    pub keybinds: Arc<std::sync::RwLock<keybinds::KeybindRegistry>>,
+    /// The boot pass's report (generation 1), for `skills.status` and
+    /// `skills.reload`.
+    pub state: status::SkillsState,
+}
+
 /// Load all skills, apply disable filters, build the command registry,
 /// build the keybind registry, and register the `load_skill` tool.
 /// Returns (command_registry, keybind_registry).
@@ -262,20 +301,29 @@ pub async fn register(
     Arc<CommandRegistry>,
     Arc<std::sync::RwLock<keybinds::KeybindRegistry>>,
 ) {
+    let Registered {
+        commands, keybinds, ..
+    } = register_reported(tools, config).await;
+    (commands, keybinds)
+}
+
+/// [`register`], keeping the boot pass's report and the reload state (the
+/// daemon host's `skills.status` / `skills.reload`).
+pub async fn register_reported(
+    tools: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
+    config: &crate::SynapsConfig,
+) -> Registered {
     // The fs-walk (read_dir + read_to_string + canonicalize across multiple roots)
     // is fully synchronous std::fs; do it on a blocking pool so we don't park a
     // tokio worker during boot. Behavior is identical — same inputs, same output.
-    let (mut plugins, mut skills) =
-        tokio::task::spawn_blocking(|| loader::load_all(&loader::default_roots()))
-            .await
-            .expect("skills::loader::load_all panicked");
-    skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
-
-    // Filter disabled plugins from commands, keybinds, and help too — not just skills
-    if !config.disabled_plugins.is_empty() {
-        plugins.retain(|p| !config.disabled_plugins.iter().any(|d| d == &p.name));
-    }
-
+    let keys = config.skills_keys();
+    let found = tokio::task::spawn_blocking(move || discover(&keys))
+        .await
+        .expect("skills::loader::load_all panicked");
+    let state = status::SkillsState::new(status::SkillsReport::of(1, &found));
+    let loader::DiscoveryPass {
+        plugins, skills, ..
+    } = found.pass;
     tracing::info!(
         plugins = plugins.len(),
         skills = skills.len(),
@@ -297,7 +345,11 @@ pub async fn register(
         // compact descriptions only; no bodies, no source paths).
         tools.register(Arc::new(tool::SearchSkillsTool::new(registry.clone())));
     }
-    (registry, Arc::new(std::sync::RwLock::new(kb_registry)))
+    Registered {
+        commands: registry,
+        keybinds: Arc::new(std::sync::RwLock::new(kb_registry)),
+        state,
+    }
 }
 
 /// Keybinds from plugin manifests, then the user's `keybinds` config on top.
@@ -328,11 +380,9 @@ fn build_keybind_registry(
 /// Re-walks discovery roots and swaps in the new skill set atomically.
 /// Built-ins and the existing `load_skill` tool registration are unchanged.
 pub fn reload_registry(registry: &CommandRegistry, config: &crate::SynapsConfig) {
-    let (mut plugins, mut skills) = loader::load_all(&loader::default_roots());
-    skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
-    if !config.disabled_plugins.is_empty() {
-        plugins.retain(|p| !config.disabled_plugins.iter().any(|d| d == &p.name));
-    }
+    let loader::DiscoveryPass {
+        plugins, skills, ..
+    } = discover(&config.skills_keys()).pass;
     tracing::info!(skills = skills.len(), "reloaded skills");
     registry.rebuild_with_plugins(skills, plugins);
 }
@@ -341,6 +391,7 @@ pub fn reload_registry(registry: &CommandRegistry, config: &crate::SynapsConfig)
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use crate::skills::registry::Resolution;
 
     /// The sidecar system is gone: core binds no toggle key (F8 was the
     /// old default), and an empty install binds nothing at all.
@@ -349,5 +400,196 @@ mod tests {
         let reg = build_keybind_registry(&[], &std::collections::HashMap::new());
         assert!(reg.match_key(KeyCode::F(8), KeyModifiers::NONE).is_none());
         assert!(reg.custom_binds().is_empty(), "core added a bind of its own");
+    }
+
+    fn write_skill(dir: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(
+            dir.join(name).join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d\n---\nBody"),
+        )
+        .unwrap();
+    }
+
+    /// `disabled_plugins` (and `disabled_skills`) apply
+    /// to the plugins and skills of `skills.extra_root` like any other root.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn disable_lists_apply_to_the_extra_root() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let extra = tempfile::TempDir::new().unwrap();
+        let plugin = extra.path().join("extra-skills");
+        std::fs::create_dir_all(plugin.join(".synaps-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".synaps-plugin").join("plugin.json"),
+            r#"{"name":"extra-skills"}"#,
+        )
+        .unwrap();
+        write_skill(&plugin.join("skills"), "a");
+        write_skill(&plugin.join("skills"), "b");
+        write_skill(extra.path(), "loose");
+        write_skill(extra.path(), "other");
+        let mut keys = agent_core::config::SkillsKeys {
+            extra_root: Some(extra.path().to_path_buf()),
+            ..Default::default()
+        };
+        let all = discover(&keys);
+        assert_eq!(all.pass.skills.len(), 4);
+        assert_eq!(all.disabled, 0);
+        assert_eq!(all.pass.plugins.len(), 1);
+
+        keys.disabled_plugins = vec!["extra-skills".into()];
+        keys.disabled_skills = vec!["other".into()];
+        let found = discover(&keys);
+        let names: Vec<&str> = found.pass.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["loose"]);
+        assert!(
+            found.pass.plugins.is_empty(),
+            "the disabled plugin is gone too"
+        );
+        assert_eq!(found.disabled, 3);
+        let extra_root = &found.pass.roots[2];
+        assert_eq!(extra_root.kind, loader::RootKind::Extra);
+        assert_eq!(
+            (extra_root.plugins, extra_root.skills),
+            (1, 4),
+            "counted before the filters"
+        );
+    }
+
+    /// A plugin carrying every non-skill part, each of which would touch
+    /// `marker` if it ran: a shell command, a keybind, an extension with a
+    /// hook, a sidecar with a lifecycle claim, help, settings, MCP servers
+    /// (in plugin.json and `.mcp.json`) and Claude Code `hooks/hooks.json`.
+    fn write_full_plugin(dir: &std::path::Path, name: &str, marker: &std::path::Path) {
+        const MANIFEST: &str = r#"{
+            "name": "NAME",
+            "keybinds": [{"key": "F7", "action": "slash_command", "command": "/NAME:touch"}],
+            "commands": [{"name": "touch", "command": "touch", "args": ["MARKER"]}],
+            "extension": {
+                "protocol_version": 1, "runtime": "process",
+                "command": "touch", "args": ["MARKER"],
+                "permissions": ["tools.intercept"], "hooks": [{"hook": "before_tool_call"}]
+            },
+            "help": [{
+                "id": "NAME-help", "command": "/NAME:touch", "title": "t", "summary": "s",
+                "category": "Plugin", "topic": "Branch", "protected": false, "common": false
+            }],
+            "provides": {"sidecar": {
+                "command": "bin/sidecar", "protocol_version": 1,
+                "lifecycle": {"command": "NAMEcap", "settings_category": "NAME", "importance": 50}
+            }},
+            "settings": {"category": [{"id": "NAME", "label": "L", "fields": []}]},
+            "mcpServers": {"m": {"command": "touch", "args": ["MARKER"]}}
+        }"#;
+        let marker = marker.to_str().unwrap();
+        let manifest = MANIFEST.replace("NAME", name).replace("MARKER", marker);
+        let touch = format!(r#"{{"command": "touch", "args": ["{marker}"]}}"#);
+        let hook = format!(r#"{{"type": "command", "command": "touch {marker}"}}"#);
+        let files = [
+            (".synaps-plugin/plugin.json", manifest),
+            (
+                ".mcp.json",
+                format!(r#"{{"mcpServers": {{"m": {touch}}}}}"#),
+            ),
+            (
+                "hooks/hooks.json",
+                format!(r#"{{"hooks": {{"PreToolUse": [{{"hooks": [{hook}]}}]}}}}"#),
+            ),
+            ("bin/sidecar", format!("#!/bin/sh\ntouch {marker}\n")),
+        ];
+        for (file, content) in files {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        write_skill(&dir.join("skills"), "s1");
+    }
+
+    /// A plugin under `skills.extra_root` gives its skills only. The same
+    /// plugin under the home plugins root (the control) keeps its command,
+    /// keybind, extension, sidecar, help and settings; from the extra root
+    /// none of them reaches the command registry (so nothing can be spawned
+    /// or run) and the report names what was ignored.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn an_extra_root_plugin_gives_its_skills_only() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let extra = tempfile::TempDir::new().unwrap();
+        let marker = extra.path().join("ran");
+        write_full_plugin(&extra.path().join("remote"), "remote", &marker);
+        let home_plugins = loader::discovery_roots(None)[3].path.clone().unwrap();
+        write_full_plugin(&home_plugins.join("local"), "local", &marker);
+        let keys = agent_core::config::SkillsKeys {
+            extra_root: Some(extra.path().to_path_buf()),
+            ..Default::default()
+        };
+        let found = discover(&keys);
+        let ignored = [
+            "remote:commands",
+            "remote:keybinds",
+            "remote:extension",
+            "remote:hooks",
+            "remote:sidecar",
+            "remote:help",
+            "remote:settings",
+            "remote:mcp",
+        ];
+        assert_eq!(found.pass.ignored_non_skill, ignored.len());
+        assert_eq!(found.pass.ignored_non_skill_names, ignored);
+        let report = status::SkillsReport::of(1, &found);
+        assert_eq!(report.ignored_non_skill, ignored.len());
+        assert_eq!(report.ignored_non_skill_names, ignored);
+
+        let qualified: Vec<String> = found
+            .pass
+            .skills
+            .iter()
+            .map(|s| format!("{}:{}", s.plugin.as_deref().unwrap_or("?"), s.name))
+            .collect();
+        assert_eq!(qualified, ["remote:s1", "local:s1"]);
+        let plugin = |name: &str| found.pass.plugins.iter().find(|p| p.name == name).unwrap();
+        let remote = plugin("remote");
+        assert!(remote.extension.is_none());
+        let m = remote.manifest.as_ref().unwrap();
+        assert!(m.commands.is_empty() && m.keybinds.is_empty() && m.help_entries.is_empty());
+        assert!(m.extension.is_none() && m.settings.is_none());
+        let local = plugin("local").manifest.as_ref().unwrap();
+        assert!(
+            plugin("local").extension.is_some(),
+            "home roots are unchanged"
+        );
+        assert_eq!((local.commands.len(), local.keybinds.len()), (1, 1));
+
+        let commands = CommandRegistry::new_with_plugins(
+            BUILTIN_COMMANDS,
+            found.pass.skills,
+            found.pass.plugins,
+        );
+        assert!(matches!(
+            commands.resolve("remote:s1"),
+            Resolution::Skill(_)
+        ));
+        assert!(matches!(
+            commands.resolve("remote:touch"),
+            Resolution::Unknown
+        ));
+        assert!(matches!(
+            commands.resolve("local:touch"),
+            Resolution::PluginCommand(_)
+        ));
+        let help: Vec<Option<String>> = commands
+            .plugin_help_entries()
+            .into_iter()
+            .map(|h| h.source)
+            .collect();
+        assert_eq!(help, [Some("local".to_string())]);
+        let settings: Vec<String> = commands
+            .plugin_settings_categories()
+            .into_iter()
+            .map(|c| c.plugin)
+            .collect();
+        assert_eq!(settings, ["local"]);
+        assert!(!marker.exists(), "nothing ran");
     }
 }
