@@ -27,12 +27,20 @@
 //! flushes before anything that needs the disk to be current: parking
 //! (drops the in-memory conversation), a durable context-head checkpoint,
 //! compaction, `/resume`, checkpoint and teardown.
+//!
+//! Per-save receipts (agent-ui §3.11, R2-H3): [`Persister::save`] returns a
+//! ticket, and [`Persister::receipt`] is `Saved` only once a successful
+//! history save of that session, covering the ticket, was applied. A later
+//! save of the same id covers the earlier tickets it coalesced; a draft
+//! write and another session's save never count. Nothing uses them yet
+//! (agent cards' settle, C4a).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_core::core::session_draft::TurnDraft;
+use agent_core::core::session_surfaces::{Receipt, SaveKind, SaveReceipts, Ticket};
 use tokio::sync::{watch, Notify};
 
 use crate::core::session::Session;
@@ -44,12 +52,15 @@ enum DraftOp {
 
 #[derive(Default)]
 struct Pending {
-    /// Latest snapshot per session id, in first-request order.
-    saves: Vec<Session>,
+    /// Latest snapshot per session id, in first-request order, with the
+    /// newest ticket it covers.
+    saves: Vec<(Session, u64)>,
     /// Latest draft operation per session id, in first-request order.
     drafts: Vec<(String, DraftOp)>,
     /// Bumped on every request; `Progress::done` catches up to it.
     requested: u64,
+    /// The save tickets issued and the saves applied.
+    receipts: SaveReceipts,
     closed: bool,
 }
 
@@ -132,17 +143,27 @@ impl Persister {
         }
     }
 
-    /// Queue `session` for saving (replaces a queued snapshot of the same id).
-    pub(crate) fn save(&self, session: Session) {
-        {
+    /// Queue `session` for saving (replaces a queued snapshot of the same
+    /// id). Its ticket: [`Persister::receipt`].
+    pub(crate) fn save(&self, session: Session) -> Ticket {
+        let ticket = {
             let mut p = self.shared.lock();
-            match p.saves.iter_mut().find(|s| s.id == session.id) {
-                Some(slot) => *slot = session,
-                None => p.saves.push(session),
+            let ticket = p.receipts.request(&session.id);
+            match p.saves.iter_mut().find(|(s, _)| s.id == session.id) {
+                Some(slot) => *slot = (session, ticket.n),
+                None => p.saves.push((session, ticket.n)),
             }
             p.requested += 1;
-        }
+            ticket
+        };
         self.shared.wake.notify_one();
+        ticket
+    }
+
+    /// `Saved` once a successful history save of the ticket's session,
+    /// covering it, was applied; `NotYet` before, and after a failed one.
+    pub(crate) fn receipt(&self, ticket: &Ticket) -> Receipt {
+        self.shared.lock().receipts.receipt(ticket)
     }
 
     /// Queue a write of `id`'s turn draft.
@@ -242,17 +263,23 @@ async fn run(shared: Arc<Shared>, progress: watch::Sender<Progress>) {
         };
 
         let mut saved: HashSet<String> = HashSet::new();
-        for session in saves {
-            match session.save().await {
+        for (session, covers) in saves {
+            let ok = match session.save().await {
                 Ok(()) => {
                     failed.remove(&session.id);
                     saved.insert(session.id.clone());
+                    true
                 }
                 Err(e) => {
                     tracing::error!(session = %session.id, "failed to save session: {e}");
                     failed.insert(session.id.clone());
+                    false
                 }
-            }
+            };
+            shared
+                .lock()
+                .receipts
+                .applied(&session.id, SaveKind::History, covers, ok);
         }
 
         let mut ops: Vec<(String, DraftOp)> = Vec::new();
@@ -427,6 +454,51 @@ mod tests {
         p.save(s.clone());
         assert!(p.flush().await, "the good save clears it");
         assert_eq!(read_turn_draft(&dir, &s.id).unwrap(), None, "and releases the removal");
+    }
+
+    /// Per-save receipts (agent-ui §3.11): a ticket is `Saved` only once a
+    /// successful history save of its session covering it was applied. A
+    /// failed save, a draft write and another session's save never count;
+    /// a later save of the same id covers the tickets it coalesced.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_receipt_needs_a_successful_save_of_its_session() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let dir = agent_core::session_lock::sessions_dir();
+        let a = session_with(2);
+        let b = session_with(3);
+        let p = Persister::new(dir.clone());
+        // A burst of saves of A coalesces: every ticket is covered.
+        let burst: Vec<Ticket> = (0..5).map(|_| p.save(a.clone())).collect();
+        assert!(p.flush().await);
+        assert!(burst.iter().all(|t| p.receipt(t) == Receipt::Saved));
+        // B's save fails (a non-empty directory where `<id>.json` goes).
+        let snapshot = dir.join(format!("{}.json", b.id));
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("occupied"), b"x").unwrap();
+        let tb = p.save(b.clone());
+        assert!(!p.flush().await);
+        assert_eq!(p.receipt(&tb), Receipt::NotYet, "a failed save");
+        p.write_draft(&b.id, draft(3));
+        let ta = p.save(a.clone());
+        assert!(!p.flush().await);
+        assert_eq!(p.receipt(&tb), Receipt::NotYet, "a draft, or A's save");
+        assert_eq!(p.receipt(&ta), Receipt::Saved);
+        // B saves cleanly later: that covers the earlier ticket too.
+        std::fs::remove_dir_all(&snapshot).unwrap();
+        let tb2 = p.save(b.clone());
+        assert!(p.flush().await);
+        assert_eq!(
+            (p.receipt(&tb), p.receipt(&tb2)),
+            (Receipt::Saved, Receipt::Saved)
+        );
+        // A ticket issued after the last save isn't covered by it.
+        let later = Ticket {
+            session_id: b.id.clone(),
+            n: tb2.n + 100,
+        };
+        assert_eq!(p.receipt(&later), Receipt::NotYet);
     }
 
     /// A new turn's draft supersedes a removal that was held back.
