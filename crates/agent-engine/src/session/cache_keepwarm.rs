@@ -1209,6 +1209,10 @@ impl SessionActor {
     /// After any command: a model other than the observed one (`Set`,
     /// `/model`, a restore) is a cold cache, even if it is switched back.
     pub(crate) fn cache_model_fence(&mut self) {
+        // Parked: no runtime to ask (the park cleared the observation).
+        if self.is_parked() {
+            return;
+        }
         if self
             .cache_keepwarm
             .observed

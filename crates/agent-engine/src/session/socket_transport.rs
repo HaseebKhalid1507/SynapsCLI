@@ -1803,13 +1803,17 @@ mod tests {
             .unwrap();
         let err = t.send(SessionCommand::Query { id: 3, query: SessionQuery::Status { cache: true } }).await.unwrap_err();
         assert!(matches!(err, TransportError::DaemonTooOld { request: "cache expiry", .. }), "{err}");
+        // A plain Status goes (this fake answers it "nope"), then nothing
+        // else went out: the next command's answer is the next frame.
         t.send(SessionCommand::Query { id: 4, query: SessionQuery::Status { cache: false } }).await.unwrap();
-        // Nothing else went out: the next command's answer is the next frame.
         t.send(SessionCommand::Submit { text: "after".into(), attachments: vec![] }).await.unwrap();
-        let e = tokio::time::timeout(std::time::Duration::from_secs(2), t.next_event()).await.expect("no event");
-        match e.map(|e| e.event) {
-            Some(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(s)))) => assert_eq!(s, "after"),
-            other => panic!("{other:?}"),
+        for want in ["nope", "after"] {
+            let e = tokio::time::timeout(std::time::Duration::from_secs(2), t.next_event()).await.expect("no event");
+            match e.map(|e| e.event) {
+                Some(SessionEventWire::SystemNotice(s)) if want == "nope" => assert_eq!(s, want),
+                Some(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(s)))) => assert_eq!(s, want),
+                other => panic!("{want}: {other:?}"),
+            }
         }
         t.detach().await;
         let _ = srv.await;

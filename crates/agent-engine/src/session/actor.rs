@@ -2678,6 +2678,8 @@ impl SessionActor {
         drop(conv);
         let runtime = self.runtime.park_take();
         drop(runtime);
+        // The unparked runtime sends nothing it has confirmed yet.
+        self.cache_forget();
         // Hand the freed pages back: jemalloc otherwise keeps them as
         // dirty/muzzy for its decay window, and a parked session that
         // still shows in RssAnon buys nothing.
