@@ -394,7 +394,16 @@ mod tests {
     enum Stream {
         Blocks(Vec<Value>),
         Status(u16),
+        /// HTTP 200, then an in-stream `overloaded_error`.
+        Overloaded,
     }
+
+    const SSE_OVERLOADED: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ov\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-opus-4-7\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    );
 
     #[derive(Clone)]
     struct Mock {
@@ -491,6 +500,12 @@ mod tests {
                                 sse(blocks),
                             )
                                 .into_response(),
+                            Stream::Overloaded => (
+                                StatusCode::OK,
+                                [("content-type", "text/event-stream")],
+                                SSE_OVERLOADED.to_string(),
+                            )
+                                .into_response(),
                             Stream::Status(status) => (
                                 StatusCode::from_u16(*status).unwrap(),
                                 [("content-type", "application/json")],
@@ -542,6 +557,22 @@ mod tests {
 
     fn opus() -> Runtime {
         chat("claude-opus-4-7", ReasoningLevel::High, CacheTtl::OneHour)
+    }
+
+    /// `rt` on a subscription (OAuth) login instead of an API key.
+    fn on_a_subscription(mut rt: Runtime) -> Runtime {
+        rt.auth = Arc::new(tokio::sync::RwLock::new(super::super::types::AuthState {
+            auth_token: "oauth-test-token".to_string(),
+            auth_type: "oauth".to_string(),
+            refresh_token: None,
+            token_expires: Some(crate::epoch_millis() + 3_600_000),
+            auth_file_mtime: None,
+            bound_credential: Some(crate::runtime::auth::anthropic_binding(
+                &crate::auth::CredentialSource::Local,
+                &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
+            )),
+        }));
+        rt
     }
 
     /// A chat that has just finished a turn: its cache is warm. The history
@@ -714,18 +745,7 @@ mod tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn compaction_request_keeps_the_oauth_system_blocks() {
         let _base = crate::test_env::BaseDirGuard::new();
-        let mut rt = opus();
-        rt.auth = Arc::new(tokio::sync::RwLock::new(super::super::types::AuthState {
-            auth_token: "oauth-test-token".to_string(),
-            auth_type: "oauth".to_string(),
-            refresh_token: None,
-            token_expires: Some(crate::epoch_millis() + 3_600_000),
-            auth_file_mtime: None,
-            bound_credential: Some(crate::runtime::auth::anthropic_binding(
-                &crate::auth::CredentialSource::Local,
-                &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
-            )),
-        }));
+        let rt = on_a_subscription(opus());
         let (compaction, _) = assert_same_request_as_the_next_turn(&rt).await;
         assert_eq!(
             compaction.body["system"][0]["text"],
@@ -1124,6 +1144,26 @@ mod tests {
     async fn an_error_falls_back_once() {
         let _base = crate::test_env::BaseDirGuard::new();
         let (seen, outcome) = compact_after(opus(), vec![Stream::Status(400)], |_| {}).await;
+        assert_fell_back_once(&seen, &outcome);
+    }
+
+    /// The chat request is sent ONCE whatever fails: no header-timed 429
+    /// wait (eight of them can outlast a 5-minute cache), no 5xx retry, no
+    /// overload retry (ten on a subscription), even with retries
+    /// configured. The transcript request that follows keeps its own.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_retryable_error_is_not_retried_on_the_chat_request() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        for status in [429, 500, 529] {
+            let mut rt = opus();
+            rt.set_api_retries(3);
+            let (seen, outcome) = compact_after(rt, vec![Stream::Status(status)], |_| {}).await;
+            assert_fell_back_once(&seen, &outcome);
+        }
+        let mut rt = on_a_subscription(opus());
+        rt.set_api_retries(3);
+        let (seen, outcome) = compact_after(rt, vec![Stream::Overloaded], |_| {}).await;
         assert_fell_back_once(&seen, &outcome);
     }
 

@@ -886,13 +886,12 @@ impl Runtime {
             request_messages,
             tx,
             cancel,
-            // A ping never retries. A compaction request retries transport
-            // errors like the turn it stands in for; a refusal is not
-            // retried (the caller falls back to the transcript request).
-            match purpose {
-                NextTurnRequest::Ping(_) => 0,
-                NextTurnRequest::Compaction { .. } => self.api_retries,
-            },
+            // Neither a ping nor a compaction request retries: both retry
+            // budgets are zero, and the transport sends either exactly once
+            // (`single_attempt`: no 429 wait, no overload retry). A failed
+            // compaction request falls back to the transcript request,
+            // which keeps the normal retries.
+            0,
             0,
             &options,
             self.telemetry_level,

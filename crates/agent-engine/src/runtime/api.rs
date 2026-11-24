@@ -1790,6 +1790,10 @@ impl ApiMethods {
         // A compaction summary reads the cache of the account the chat is
         // on: it never switches either (another account's cache is cold).
         let stays_on_account = options.keepwarm.is_some() || options.compaction.is_some();
+        // Both are also sent once: no retry of any class (HTTP 429 and 5xx,
+        // network errors, in-stream errors and overloads), whatever
+        // `max_retries` says.
+        let single_attempt = stays_on_account;
         let mut sent_at_ms;
 
         loop {
@@ -2278,7 +2282,11 @@ impl ApiMethods {
 
                             // Decide whether we've exhausted retries for this error class.
                             // A keep-warm ping never retries: any error stops it.
-                            let retry_exhausted = if options.keepwarm.is_some() {
+                            // Nor does a compaction request: a header-timed
+                            // 429 wait can outlast the cache TTL it relies
+                            // on, and its caller has the transcript request
+                            // (with the normal retries) to fall back to.
+                            let retry_exhausted = if single_attempt {
                                 true
                             } else if is_429 {
                                 attempt >= MAX_429_RETRIES
@@ -2377,7 +2385,7 @@ impl ApiMethods {
                                 }
                             }
                             non_429_attempts += 1;
-                            if non_429_attempts > max_retries {
+                            if non_429_attempts > max_retries || single_attempt {
                                 if let Some(t) = tracer.take() {
                                     let terminal = t.failed_terminal("network");
                                     t.finish(clock, None, None, None, None, terminal);
@@ -2748,10 +2756,7 @@ impl ApiMethods {
                     } else {
                         non_429_attempts
                     };
-                    if retries_used >= retry_budget
-                        || cancel.is_cancelled()
-                        || options.keepwarm.is_some()
-                    {
+                    if retries_used >= retry_budget || cancel.is_cancelled() || single_attempt {
                         // Budget exhausted (or user cancelled) — surface terminally
                         // rather than silently. Still loud, never the silent stop.
                         if let Some(t) = tracer.take() {
