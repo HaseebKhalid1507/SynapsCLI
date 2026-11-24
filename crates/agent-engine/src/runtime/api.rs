@@ -1068,6 +1068,11 @@ pub(super) const COMPACTION_IDENTITY_CHANGED: &str = "cache-preserving compactio
 pub(super) const COMPACTION_HISTORY_CHANGED: &str = "cache-preserving compaction not sent: \
      the history does not start with the messages the last request sent";
 
+/// Refusal text of a compaction request whose 401 recovery came back with
+/// another account's token: the resend is not sent.
+pub(super) const COMPACTION_ACCOUNT_CHANGED: &str = "cache-preserving compaction not re-sent \
+     after a 401: the refreshed token belongs to another account";
+
 /// What a keep-warm request does once its body is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeepWarmMode {
@@ -1855,8 +1860,13 @@ impl ApiMethods {
         //   (`AuthMethods::recover_local_rejection`). A remote (broker)
         //   source re-vends the seat this request is pinned to; only under
         //   `auto`, and only when that seat cannot be vended or is cooling
-        //   down, does it select again (`AuthMethods::vend_auto`), which
-        //   is the one way a resend can reach another account;
+        //   down, does it select again (`AuthMethods::vend_auto`). A ping
+        //   is then re-sent on the newly selected account. A compaction
+        //   request is not: when the binding after the recovery is not the
+        //   one the request was built with, it ends there
+        //   (`COMPACTION_ACCOUNT_CHANGED`) and its caller sends the
+        //   transcript request. So no resend of a compaction request
+        //   reaches another account;
         // - a gzip body refused with 400 or 415 re-sends uncompressed
         //   (`request_encoding`), on the same account;
         // - with `cache_diagnostics` on and an API key, a 400 or 422 that
@@ -2030,6 +2040,19 @@ impl ApiMethods {
                                 let (n, v, _t, binding) =
                                     await_or_cancel(cancel, Self::build_auth_snapshot(auth))
                                         .await?;
+                                // A compaction request reads the cache of
+                                // the account it was built for (the binding
+                                // is part of the cache identity checked
+                                // above). When the fresh token is another
+                                // account's, the resend would write the
+                                // whole history there: it is not sent. The
+                                // caller falls back to the transcript
+                                // request, as after any other failure.
+                                if options.compaction.is_some() && binding != auth_binding {
+                                    return Err(RuntimeError::Config(
+                                        COMPACTION_ACCOUNT_CHANGED.into(),
+                                    ));
+                                }
                                 auth_header_name = n;
                                 auth_header_value = v;
                                 auth_binding = binding;
@@ -5155,6 +5178,95 @@ mod on401_tests {
             2,
             "expected exactly 2 calls to Anthropic (1×401 + 1×200)"
         );
+    }
+
+    /// A compaction request (the chat's own request, reading the cache of
+    /// the account it is bound to) that gets a 401: re-sent when the
+    /// recovered token is the same account's, NOT sent when the recovery
+    /// came back bound to another account (the resend would write the
+    /// whole history to that account's cache). A turn in the same
+    /// situation is re-sent as before.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn on401_a_compaction_request_is_not_resent_on_another_account() {
+        use crate::runtime::auth::anthropic_binding;
+        use crate::runtime::keepwarm::{CacheAnchorCell, CachedPrefix};
+        let _config = crate::test_env::BaseDirGuard::new();
+        let broker_url = spawn_mock_broker("sk-fresh-token").await;
+        let source = CredentialSource::Remote {
+            endpoint: broker_url,
+            machine_token: "machine-tok".into(),
+        };
+        // The seat a 401 recovery vends here (no selector is configured),
+        // and another one of the same broker.
+        let default = anthropic_binding(
+            &source,
+            &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
+        );
+        let other = anthropic_binding(
+            &source,
+            &crate::auth::CredentialRef::new(
+                crate::auth::OAuthProviderId::Anthropic,
+                crate::auth::Account::parse("work").unwrap(),
+            ),
+        );
+        assert_ne!(other, default);
+        let stale = || {
+            let cache = TokenCache::new();
+            cache.put(
+                "anthropic",
+                crate::auth::BrokerToken {
+                    access_token: "sk-stale".into(),
+                    expires: 9_999_999_999_999,
+                    ttl_ms: None,
+                },
+            );
+            cache
+        };
+        let bound_to = |binding: &str| {
+            let auth = auth_with_token("sk-stale");
+            auth.try_write().unwrap().bound_credential = Some(binding.to_string());
+            auth
+        };
+
+        for (bound, same_account) in [(&default, true), (&other, false)] {
+            // The cache identity of a request on this binding, as an
+            // accepted turn stamps it.
+            let (warm_url, _) = spawn_mock_anthropic(0).await;
+            let cell = Arc::new(CacheAnchorCell::default());
+            let mut turn = make_options(warm_url, source.clone(), stale());
+            turn.cache_anchor = Some(Arc::clone(&cell));
+            drive_call(bound_to(bound), turn).await.expect("turn");
+            let identity = cell.prefix().expect("stamped").identity;
+
+            // One 401, then success, for a compaction request and a turn.
+            let (url, calls) = spawn_mock_anthropic(1).await;
+            let mut compaction = make_options(url, source.clone(), stale());
+            compaction.compaction = Some(super::CompactionRequest::expecting(
+                CachedPrefix::of(identity, &[]),
+            ));
+            let auth = bound_to(bound);
+            let result = drive_call(Arc::clone(&auth), compaction).await;
+            assert_eq!(
+                auth.read().await.bound_credential.as_deref(),
+                Some(default.as_str()),
+                "the recovery vends the default seat"
+            );
+            if same_account {
+                result.expect("re-sent on the same account");
+                assert_eq!(calls.load(Ordering::SeqCst), 2, "the 401 and one resend");
+            } else {
+                let error = result.expect_err("not re-sent on another account");
+                assert!(error.to_string().contains(super::COMPACTION_ACCOUNT_CHANGED), "{error}");
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "only the request that got the 401");
+            }
+
+            let (url, calls) = spawn_mock_anthropic(1).await;
+            drive_call(bound_to(bound), make_options(url, source.clone(), stale()))
+                .await
+                .expect("a turn is re-sent either way");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
     }
 
     // ─── T2: Persistent 401 — no infinite loop ────────────────────────────────

@@ -205,8 +205,9 @@ All notable changes to this project will be documented in this file.
   or an empty reply, the transcript request is sent instead, with its usual
   retries, and a failed attempt leaves the conversation as it was. Three
   immediate resends remain, none of which waits: after a 401, with a
-  refreshed token for the same account (with a remote credential source
-  under `auto`, another account only if that one can no longer be used);
+  refreshed token for the same account (if the refresh comes back with
+  another account's token, the request is not re-sent there and the
+  transcript request is sent instead);
   uncompressed, after a refused gzip body; and without the cache-diagnosis
   header, after that header is refused. The line shown before a
   compaction says which request goes out ("sending the
