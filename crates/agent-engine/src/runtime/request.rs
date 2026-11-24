@@ -245,6 +245,39 @@ impl<'a> RequestBody<'a> {
         h.0
     }
 
+    /// The cache evidence's `stable` (`cache_evidence`): every cached part
+    /// of the request but its messages, hashed as `prefix_fingerprint`
+    /// hashes them (model, `output_config`, system, thinking, tools with
+    /// their markers, beta).
+    pub(super) fn stable_digest(&self, beta: Option<&str>) -> u64 {
+        let mut h = super::cache_evidence::Fnv::new();
+        let sep = |h: &mut super::cache_evidence::Fnv| {
+            let _ = std::io::Write::write_all(h, &[0x1f]);
+        };
+        let _ = serde_json::to_writer(&mut h, self.model);
+        sep(&mut h);
+        let _ = serde_json::to_writer(&mut h, &self.output_config);
+        sep(&mut h);
+        let _ = serde_json::to_writer(&mut h, &self.system);
+        sep(&mut h);
+        let _ = serde_json::to_writer(&mut h, &self.thinking);
+        sep(&mut h);
+        let _ = serde_json::to_writer(&mut h, &self.tools);
+        sep(&mut h);
+        let _ = serde_json::to_writer(&mut h, &beta);
+        h.0
+    }
+
+    /// The TTLs of this body's system and tool markers.
+    pub(super) fn stable_marker_ttls(&self) -> Vec<std::time::Duration> {
+        let system = self.system.as_ref().and_then(Value::as_array).into_iter().flatten();
+        system
+            .chain(self.tools.marked_last.as_ref())
+            .filter_map(|v| v.get("cache_control"))
+            .map(super::cache_evidence::marker_ttl)
+            .collect()
+    }
+
     /// Send `thinking.display = display` (`thinking_display`). Summarized
     /// leaves the body as built, byte for byte; a body without `thinking`
     /// (reasoning off) stays without it.

@@ -798,6 +798,7 @@ impl Job {
                 status: Arc::clone(&tap.status),
                 sent: Arc::clone(&tap.sent),
                 connect_failed: Arc::clone(&tap.connect_failed),
+                expiry: None,
             }),
             ..self.options.clone()
         };

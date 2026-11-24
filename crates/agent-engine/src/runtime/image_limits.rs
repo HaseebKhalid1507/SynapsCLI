@@ -313,6 +313,32 @@ fn enforce_with_retirement(
     Ok(retired_count)
 }
 
+/// A query job's projection does not wait for the decoder: with the permit
+/// held elsewhere it fails with this, and the query answers `busy`
+/// (`session::query`, v3.1 §3).
+pub const IMAGE_GATE_BUSY: &str = "image projection is busy";
+
+tokio::task_local! {
+    static NONBLOCKING: bool;
+}
+
+/// Run `f` as a query job: its image projection takes the decoder's permit
+/// without waiting, or fails [`IMAGE_GATE_BUSY`].
+pub async fn without_waiting<F: std::future::Future>(f: F) -> F::Output {
+    NONBLOCKING.scope(true, f).await
+}
+
+fn gate() -> &'static Arc<tokio::sync::Semaphore> {
+    static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+}
+
+/// Test seam: hold the process-wide decoder permit.
+#[cfg(any(test, feature = "testing"))]
+pub async fn hold_gate_for_tests() -> tokio::sync::OwnedSemaphorePermit {
+    Arc::clone(gate()).acquire_owned().await.expect("the gate is never closed")
+}
+
 /// Acquire before spawn, then MOVE the permit inside blocking work. Cancellation
 /// of the async waiter cannot admit another decoder while this one still runs.
 /// Only projected bytes/metadata survive in the process-wide bounded memo cache.
@@ -320,17 +346,15 @@ pub(super) async fn enforce_image_limits(
     messages: &mut [SharedMessage],
     retired_count: usize,
 ) -> Result<usize, String> {
-    static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     if image_slots(messages).is_empty() {
         return Ok(0);
     }
-    let permit = GATE
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| RESOURCE)?;
+    let permit = if NONBLOCKING.try_with(|n| *n).unwrap_or(false) {
+        Arc::clone(gate()).try_acquire_owned().map_err(|_| IMAGE_GATE_BUSY.to_string())?
+    } else {
+        Arc::clone(gate()).acquire_owned().await.map_err(|_| RESOURCE)?
+    };
     let mut outgoing = messages.to_vec();
     let (outgoing, omitted) = blocking_with_permit(permit, move || {
         let omitted = enforce_with_retirement(
@@ -714,6 +738,32 @@ mod tests {
             assert!(check < sanitize && sanitize < wire && wire < marker);
         }
     }
+    /// A query job (`without_waiting`) never queues on the decoder: with the
+    /// permit held it fails busy at once, while a turn's projection waits
+    /// for it (v3.1 §3; `CacheExpiry` answers `busy`).
+    #[tokio::test]
+    async fn a_query_job_s_projection_is_busy_where_a_turn_s_waits() {
+        let img = fixture(3000, 20, false);
+        let held = hold_gate_for_tests().await;
+        let mut outgoing = history(1, &img);
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            without_waiting(enforce_image_limits(&mut outgoing, 0)),
+        )
+        .await
+        .expect("never waits");
+        assert_eq!(r, Err(IMAGE_GATE_BUSY.to_string()));
+        let turn = tokio::spawn(async move {
+            let mut outgoing = history(1, &img);
+            enforce_image_limits(&mut outgoing, 0).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!turn.is_finished(), "a turn waits for the permit");
+        drop(held);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(30), turn).await.unwrap().unwrap();
+        assert!(r.is_ok(), "{r:?}");
+    }
+
     #[tokio::test]
     async fn cancelled_waiter_keeps_blocking_permit_until_work_finishes() {
         let gate = Arc::new(tokio::sync::Semaphore::new(1));

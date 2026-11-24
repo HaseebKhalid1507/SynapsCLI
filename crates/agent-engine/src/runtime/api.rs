@@ -317,6 +317,17 @@ struct EventCtx<'t> {
     /// The round's keep-warm follows this response as it streams
     /// (`ApiOptions::round_signal`).
     round_signal: Option<&'t super::tool_keepwarm::RoundSignal>,
+    /// The session's cache evidence and the accepted attempt's ticket: the
+    /// provider's usage for this response is observed against it.
+    cache_evidence: Option<(&'t super::cache_evidence::CacheEvidence, super::cache_evidence::CacheTicket)>,
+}
+
+/// The provider's parsed usage is the cache's only evidence (a booked or
+/// estimated cost never is).
+fn record_cache_evidence(ctx: &EventCtx, read: u64, write: u64, write_5m: Option<u64>, write_1h: Option<u64>) {
+    if let Some((store, ticket)) = &ctx.cache_evidence {
+        store.observe(ticket, read, write, write_5m, write_1h);
+    }
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -620,6 +631,7 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                             cache_create_5m, cache_create_1h,
                         );
                     }
+                    record_cache_evidence(ctx, cache_read, cache_create, cache_create_5m, cache_create_1h);
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
                         input_tokens: input_t,
                         output_tokens: output_t,
@@ -773,6 +785,7 @@ fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
             state.msg_start_cache_5m, state.msg_start_cache_1h,
         );
     }
+    record_cache_evidence(ctx, cache_read, cache_create, state.msg_start_cache_5m, state.msg_start_cache_1h);
     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
         input_tokens: input_t,
         output_tokens: output_t,
@@ -966,6 +979,11 @@ pub struct ApiOptions {
     /// cache entries were written or refreshed. `None` (default) records
     /// nothing; the foreground turn stream and keep-warm pings set it.
     pub cache_anchor: Option<std::sync::Arc<super::keepwarm::CacheAnchorCell>>,
+    /// This session's cache evidence (`runtime::cache_evidence`): every
+    /// attempt tickets as it is dispatched, and the accepted attempt's
+    /// parsed usage is observed against its ticket. `None` (default)
+    /// records nothing: compaction, subagents, a `CacheExpiry` probe.
+    pub cache_evidence: Option<std::sync::Arc<super::cache_evidence::CacheEvidence>>,
     /// Prompt-cache keep-warm ping (task #444). `None` on every real turn,
     /// which keeps turn requests byte-identical to the pre-feature release.
     /// When set (native Anthropic transport only — any other route fails
@@ -1012,6 +1030,11 @@ pub enum KeepWarmMode {
     /// own tools, system, thinking and options, so the prefix is that
     /// request's by construction and there is nothing to fingerprint.
     Replay,
+    /// `CacheExpiry`'s probe: the messages are the history plus one
+    /// placeholder user block, marked exactly as the next turn marks them;
+    /// the built request's evidence goes to [`KeepWarmRequest::expiry`] and
+    /// nothing is sent.
+    Expiry,
 }
 
 /// Wire knobs for a keep-warm request (see [`ApiOptions::keepwarm`]).
@@ -1029,6 +1052,8 @@ pub struct KeepWarmRequest {
     pub sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set when `send()` failed to connect (no HTTP status, nothing sent).
     pub connect_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// [`KeepWarmMode::Expiry`]: where the built request's evidence goes.
+    pub expiry: Option<std::sync::Arc<std::sync::Mutex<Option<super::cache_evidence::ProbeEvidence>>>>,
 }
 
 /// A keep-warm request body that flips `sent` when the HTTP client first
@@ -1504,6 +1529,11 @@ impl ApiMethods {
                 );
                 prefix_len
             }
+            // The `CacheExpiry` probe is the next turn: markers as a turn's.
+            Some(k) if k.mode == KeepWarmMode::Expiry => {
+                HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl);
+                cleaned_messages.len().saturating_sub(1)
+            }
             // Keep-warm: the marker goes on the last HISTORY message — the
             // durable prefix the next real turn re-sends verbatim — and the
             // trailing ping message (never persisted) rides after it as an
@@ -1560,6 +1590,42 @@ impl ApiMethods {
         if let Some(d) = &diagnostics {
             body.set_diagnostics(d.clone());
         }
+        // Endpoint resolved once — identical across retry attempts.
+        let anthropic_base = options
+            .anthropic_base_url
+            .clone()
+            .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
+            .unwrap_or_else(|| "https://api.anthropic.com".into());
+        let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
+        // Cache evidence: what this body's markers and bytes are, once; each
+        // attempt tickets it under its own namespace as it is dispatched.
+        let expiry_probe = options.keepwarm.as_ref().and_then(|k| k.expiry.as_ref().filter(|_| k.mode == KeepWarmMode::Expiry));
+        let evidence = (options.cache_evidence.is_some() || expiry_probe.is_some()).then(|| {
+            let beta = Self::build_beta_header(&auth_type, options, model);
+            super::cache_evidence::WireEvidence::of(
+                body.stable_digest(beta.as_deref()),
+                &cleaned_messages,
+                body.stable_marker_ttls(),
+            )
+        });
+        let namespace = |auth_header_value: &str| {
+            agent_core::auth::CacheNamespace::of("anthropic", &anthropic_url, &auth_type, auth_header_value)
+        };
+        if let (Some(slot), Some(ev)) = (expiry_probe, &evidence) {
+            // A runtime is credential-blind until its first request binds a
+            // credential (`Runtime::from_parts`): after a create, an unpark
+            // or a driver's commit the next request's namespace is not known
+            // yet, and no record can be said to match it.
+            let blind = auth_header_value.strip_prefix("Bearer ").unwrap_or(&auth_header_value).is_empty();
+            *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(super::cache_evidence::ProbeEvidence {
+                ns: if blind { String::new() } else { namespace(&auth_header_value).as_str().to_string() },
+                stable: ev.stable,
+                markers: ev.markers.clone(),
+                messages: cleaned_messages.clone(),
+                rollover: false,
+            });
+            return Ok(serde_json::json!({ "keepwarm_expiry": true }));
+        }
         // Keep-warm: cut the output cap (not part of the cache key), then
         // fingerprint the prefix exactly as it would go on the wire. A probe —
         // or a ping whose prefix no longer matches what is cached — returns
@@ -1569,7 +1635,7 @@ impl ApiMethods {
             let beta = Self::build_beta_header(&auth_type, options, model);
             let actual = body.prefix_fingerprint(keepwarm_prefix_len, beta.as_deref());
             let send = match keepwarm.mode {
-                KeepWarmMode::Probe => false,
+                KeepWarmMode::Probe | KeepWarmMode::Expiry => false,
                 KeepWarmMode::Send { expect } => expect == actual,
                 KeepWarmMode::Replay => true,
             };
@@ -1635,13 +1701,6 @@ impl ApiMethods {
         // separate Claude-compatible persistent budget (10 retries), because
         // these 200/SSE overload responses carry no retry headers.
         const MAX_429_RETRIES: u32 = 8;
-        // Endpoint resolved once — identical across retry attempts.
-        let anthropic_base = options
-            .anthropic_base_url
-            .clone()
-            .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
-            .unwrap_or_else(|| "https://api.anthropic.com".into());
-        let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
 
         // ═══ TRACE (Task 8): one record per actual attempt ════════════════════
         // Emission rule documented in `trace::emit`. Tracing is metadata-only
@@ -1712,6 +1771,9 @@ impl ApiMethods {
         // notice about it reaches the session.
         let keepwarm_ping = options.keepwarm.is_some();
         let mut sent_at_ms;
+        // The accepted attempt's ticket: which request its usage is
+        // evidence of (every attempt takes one as it is dispatched).
+        let mut cache_ticket: Option<super::cache_evidence::CacheTicket>;
 
         loop {
             let response = {
@@ -1749,6 +1811,14 @@ impl ApiMethods {
                         return Err(RuntimeError::Canceled);
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
+                    // This attempt's place in the send order and its send
+                    // instant, under this hop's namespace: taken now, before
+                    // any of its answer, whatever becomes of it.
+                    let attempt_ticket = options
+                        .cache_evidence
+                        .as_ref()
+                        .zip(evidence.as_ref())
+                        .map(|(store, ev)| store.ticket(namespace(&auth_header_value).as_str(), ev));
                     let sent_at = super::keepwarm::CacheAnchor::now();
                     sent_at_ms = crate::epoch_millis();
                     let req = wire.encoding_header(req);
@@ -1786,6 +1856,7 @@ impl ApiMethods {
                                 if let Some(anchor) = &options.cache_anchor {
                                     anchor.stamp(sent_at);
                                 }
+                                cache_ticket = attempt_ticket;
                                 if !anthropic_cooled.is_empty() {
                                     let served = super::auth::turn_pinned_credential(
                                         &options.credential_source,
@@ -2394,6 +2465,7 @@ impl ApiMethods {
                 usage_counters: options.usage_counters.clone(),
                 cache_diagnosis: diagnostics.is_some(),
                 round_signal: options.round_signal.as_deref(),
+                cache_evidence: options.cache_evidence.as_deref().zip(cache_ticket.clone()),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -2945,6 +3017,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_evidence: None,
         }
     }
 
@@ -2979,6 +3052,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_evidence: None,
         }
     }
 
@@ -3005,6 +3079,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_evidence: None,
         }
     }
 
@@ -4638,6 +4713,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_evidence: None,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(
@@ -5895,6 +5971,7 @@ mod anthropic_failover_tests {
                 status: Default::default(),
                 sent: Default::default(),
                 connect_failed: Default::default(),
+                expiry: None,
             }),
             ..Default::default()
         };

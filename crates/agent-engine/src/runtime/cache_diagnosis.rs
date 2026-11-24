@@ -330,6 +330,7 @@ mod tests {
                 status: Default::default(),
                 sent: Default::default(),
                 connect_failed: Default::default(),
+                expiry: None,
             }),
             ..on(&c)
         };

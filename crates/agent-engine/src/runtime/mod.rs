@@ -27,8 +27,9 @@ pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
 mod http_phases;
-mod image_limits;
+pub mod image_limits;
 mod image_retention;
+pub mod cache_evidence;
 pub mod keepwarm;
 pub mod tool_keepwarm;
 /// The cache-simulating provider of the tool-round keep-warm tests
@@ -514,6 +515,9 @@ pub struct Runtime {
     auth: Arc<RwLock<AuthState>>,
     model: String,
     tools: Arc<RwLock<ToolRegistry>>,
+    /// `tools`' change counter, read without its lock (a `CacheExpiry`
+    /// capture). Replaced together with `tools`.
+    tools_changes: Arc<std::sync::atomic::AtomicU64>,
     system_prompt: Option<String>,
     /// Compiled, content-safe effective prompt metadata retained for inspection/reload.
     effective_prompt: Option<agent_core::prompt::PromptStack>,
@@ -652,6 +656,10 @@ pub struct Runtime {
     /// request accepted (task #444 keep-warm scheduling). Fresh per clone,
     /// shared by `share_ttl_latches`, like the TTL latches above.
     cache_anchor: std::sync::Arc<keepwarm::CacheAnchorCell>,
+    /// The session's cache evidence (`cache_evidence`), installed by its
+    /// actor into every runtime it runs (create, unpark, resume) and shared
+    /// by `share_ttl_latches`; a clone gets none (it is no producer).
+    cache_evidence: Option<Arc<cache_evidence::CacheEvidence>>,
     /// Last foreground Anthropic message id (`msg_...`) — threaded into the
     /// next request's `diagnostics.previous_message_id` when diagnostics is
     /// on. Fresh per clone, shared by `share_ttl_latches`.
@@ -869,9 +877,11 @@ fn fresh_host_parts() -> Result<crate::host::HostParts> {
     let _ = trace::sweep_expired_captures(&capture_dir);
     // Same for tool-output spill dirs past their age (bound here too).
     let spill_root = sweep_spill_root();
+    let (tools, tools_changes) = ToolRegistry::new().into_shared();
     Ok(crate::host::HostParts {
         client,
-        tools: Arc::new(RwLock::new(ToolRegistry::new())),
+        tools,
+        tools_changes,
         hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
         credential_source: crate::auth::CredentialSource::Local,
         token_cache: crate::auth::TokenCache::new(),
@@ -963,6 +973,7 @@ impl Runtime {
             })),
             model: crate::models::default_model().to_string(),
             tools: host.tools,
+            tools_changes: host.tools_changes,
             system_prompt: None,
             effective_prompt: None,
             prompt_generation: 0,
@@ -1015,6 +1026,7 @@ impl Runtime {
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cache_anchor: Default::default(),
+            cache_evidence: None,
             last_msg_id: Arc::new(Mutex::new(None)),
             cache_diag_rejected: Default::default(),
             session_manager,
@@ -1077,9 +1089,11 @@ impl Runtime {
     pub fn new_headless() -> Self {
         let client = build_http_client(HTTP_READ_TIMEOUT)
             .expect("reqwest client construction is infallible with built-in roots");
+        let (tools, tools_changes) = ToolRegistry::new().into_shared();
         let host = crate::host::HostParts {
             client,
-            tools: Arc::new(RwLock::new(ToolRegistry::new())),
+            tools,
+            tools_changes,
             hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
@@ -1548,7 +1562,7 @@ impl Runtime {
     }
 
     pub fn set_tools(&mut self, tools: ToolRegistry) {
-        self.tools = Arc::new(RwLock::new(tools));
+        (self.tools, self.tools_changes) = tools.into_shared();
     }
 
     pub fn subagent_registry(&self) -> &Arc<Mutex<crate::runtime::subagent::SubagentRegistry>> {
@@ -2950,6 +2964,36 @@ impl Runtime {
         self.cache_ttl.resolve_for_auth_type(&auth.auth_type)
     }
 
+    /// Make `store` this runtime's cache evidence: its requests ticket and
+    /// are observed there (the session actor's, one per actor lifetime).
+    pub fn install_cache_evidence(&mut self, store: Arc<cache_evidence::CacheEvidence>) {
+        self.cache_evidence = Some(store);
+    }
+
+    /// The installed cache evidence, if any.
+    pub fn cache_evidence(&self) -> Option<&Arc<cache_evidence::CacheEvidence>> {
+        self.cache_evidence.as_ref()
+    }
+
+    /// What a `CacheExpiry` capture compares at completion: the tool
+    /// registry's and the session injection's change counters, and which
+    /// registry this runtime reads (lock-free; v3.1 §2).
+    pub fn request_input_generations(&self) -> (usize, u64, u64) {
+        (
+            Arc::as_ptr(&self.tools) as *const () as usize,
+            self.tools_changes.load(std::sync::atomic::Ordering::Acquire),
+            self.hook_bus.injection_generation(),
+        )
+    }
+
+    /// The context head's save is unresolved: no request may be built.
+    pub fn context_head_unresolved(&self) -> bool {
+        self.continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durability_blocked
+    }
+
     /// Thread a parent runtime's TTL atomics onto this (cloned) runtime so
     /// that a driver-owned turn shares the session's single downgrade latch
     /// instead of firing a redundant 1h→5m notice.
@@ -2957,6 +3001,7 @@ impl Runtime {
         self.ttl_downgrade_notified = parent.ttl_downgrade_notified.clone();
         self.saw_1h_honored = parent.saw_1h_honored.clone();
         self.cache_anchor = parent.cache_anchor.clone();
+        self.cache_evidence = parent.cache_evidence.clone();
         // Same session, same diagnostics chain: a driver turn continues it,
         // and a ping sees the same rejection latch (it never moves the chain).
         self.last_msg_id = parent.last_msg_id.clone();
@@ -3322,6 +3367,8 @@ impl Runtime {
             // The foreground turn's accepted requests are what keep-warm
             // schedules from.
             cache_anchor: Some(self.cache_anchor.clone()),
+            // The foreground turn is a producer: every attempt tickets.
+            cache_evidence: self.cache_evidence.clone(),
             keepwarm: None,
             // The foreground chain: the only requests that thread
             // `diagnostics.previous_message_id`.
@@ -3423,6 +3470,7 @@ impl Clone for Runtime {
             auth: Arc::clone(&self.auth),
             model: self.model.clone(),
             tools: self.tools.clone(),
+            tools_changes: Arc::clone(&self.tools_changes),
             system_prompt: self.system_prompt.clone(),
             effective_prompt: self.effective_prompt.clone(),
             prompt_generation: self.prompt_generation,
@@ -3474,6 +3522,7 @@ impl Clone for Runtime {
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cache_anchor: Default::default(),
+            cache_evidence: None,
             // Subagents start their own request chain — inheriting the parent's
             // last msg_id would produce bogus `messages_changed` diagnostics.
             last_msg_id: Arc::new(Mutex::new(None)),

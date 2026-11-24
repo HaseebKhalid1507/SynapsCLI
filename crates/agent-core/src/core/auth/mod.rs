@@ -52,7 +52,7 @@ mod xai;
 
 pub use account::{
     account_config_key, account_env_var, seat_fingerprint, Account, AccountLabel, AccountPolicy,
-    AccountSelector, AccountSummary, CredentialRef, SeatIdentity, AUTO_ACCOUNT_NAME,
+    AccountSelector, AccountSummary, CacheNamespace, CredentialRef, SeatIdentity, AUTO_ACCOUNT_NAME,
     DEFAULT_ACCOUNT_NAME,
 };
 pub use anthropic_profile::{

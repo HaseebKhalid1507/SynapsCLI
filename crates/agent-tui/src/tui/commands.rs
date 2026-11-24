@@ -424,6 +424,22 @@ async fn pin_command(cmd: &str, arg: &str, app: &mut App, link: &mut super::sess
     }
 }
 
+/// `CacheExpiry`, rendered as daemon-mode.md recommends; once more on
+/// `stale`. `None` when the daemon cannot answer it (an older one) or the
+/// query failed.
+async fn cache_expiry_line(link: &mut super::session_link::SessionLink) -> Option<String> {
+    use agent_engine::session::{decode_query_reply, render_cache_expiry, CacheExpiry, QueryErrorCode};
+    for _ in 0..2 {
+        let value = link.query(agent_engine::session::SessionQuery::CacheExpiry).await.ok()?;
+        match decode_query_reply::<CacheExpiry>(&value) {
+            Ok(c) => return Some(render_cache_expiry(&c)),
+            Err(e) if e.code == QueryErrorCode::Stale => continue,
+            Err(e) => return Some(format!("couldn't check ({e})")),
+        }
+    }
+    None
+}
+
 /// `/clients` in an in-process session: there is no daemon, only this TUI.
 pub(super) const CLIENTS_IN_PROCESS: &str = "clients: in-process session; this TUI is its only client";
 
@@ -786,10 +802,18 @@ async fn run_command(
             // `EngineCommand{keepwarm}` → status / per-session override.
             match link.engine_command("keepwarm", arg.trim()).await {
                 Ok(value) => {
-                    let text = value["text"].as_str().unwrap_or("").to_string();
+                    let mut text = value["text"].as_str().unwrap_or("").to_string();
                     if value["kind"] == "error" {
                         app.push_msg(ChatMessage::Error(text));
                     } else {
+                        // `/keepwarm` and `/keepwarm status`: the session's
+                        // cache evidence (`CacheExpiry`), in the
+                        // daemon-mode.md wording; absent from a daemon that
+                        // cannot answer it.
+                        let status = arg.trim().is_empty() || arg.trim().eq_ignore_ascii_case("status");
+                        if let Some(line) = if status { cache_expiry_line(link).await } else { None } {
+                            text.push_str(&format!("\nprompt cache: {line}"));
+                        }
                         app.push_msg(ChatMessage::System(text));
                     }
                 }

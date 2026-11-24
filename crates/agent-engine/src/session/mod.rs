@@ -9,6 +9,7 @@
 pub mod actor;
 pub mod actor_cmds;
 pub mod budgets;
+mod cache_expiry;
 pub mod cache_keepwarm;
 pub mod client_args;
 pub mod display;
@@ -18,7 +19,10 @@ mod fresh_id;
 /// `testing` feature).
 #[cfg(any(test, feature = "testing"))]
 pub use fresh_id::testing as fresh_id_testing;
+#[cfg(any(test, feature = "testing"))]
+pub use cache_expiry::testing as cache_expiry_testing;
 pub mod handle;
+pub mod query;
 pub(crate) mod owned;
 mod persister;
 pub(crate) mod session_start;
@@ -34,7 +38,9 @@ pub mod wire;
 
 pub use actor::{SessionActor, SessionTask};
 pub use display::{DisplayItem, DisplayTail};
+pub use crate::runtime::cache_evidence::{render_cache_expiry, CacheExpiry, CacheReason, CacheState};
 pub use handle::SessionHandle;
+pub use query::{decode_query_reply, QueryError, QueryErrorCode};
 pub use socket_transport::SocketTransport;
 pub use transport::{ClientTransport, LocalTransport, TransportError};
 pub use types::*;

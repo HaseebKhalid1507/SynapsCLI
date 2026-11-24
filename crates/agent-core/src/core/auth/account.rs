@@ -536,6 +536,40 @@ impl SeatIdentity {
     }
 }
 
+/// Which provider-side cache a request's entries live in, as far as this
+/// host can tell (`CacheExpiry`, arch-review-435-436-437 Contract v3 §3.2):
+/// the provider, the messages URL as sent, the auth kind and a principal.
+/// The principal is a `cred:` digest of the credential as sent in that
+/// attempt's header, so a token renewal or an account rotation starts a new
+/// namespace (never coarser than the credential). No Anthropic credential
+/// carries a provider account id today; an `id:` principal from one is a
+/// follow-up. An opaque digest: never logged with token material.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CacheNamespace(String);
+
+impl CacheNamespace {
+    pub fn of(provider: &str, url: &str, auth_kind: &str, credential_as_sent: &str) -> Self {
+        let principal = format!("cred:{}", hex_digest(&[b"synaps-cache-cred-v1", credential_as_sent.as_bytes()]));
+        Self(hex_digest(&[
+            b"synaps-cache-ns-v1",
+            provider.as_bytes(),
+            url.as_bytes(),
+            auth_kind.as_bytes(),
+            principal.as_bytes(),
+        ]))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CacheNamespace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CacheNamespace({}…)", &self.0[..self.0.len().min(8)])
+    }
+}
+
 impl fmt::Debug for SeatIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Short preview only: enough to tell two identities apart in a trace.
@@ -589,6 +623,21 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_cache_namespace_is_never_coarser_than_the_credential() {
+        let url = "https://api.anthropic.com/v1/messages";
+        let a = CacheNamespace::of("anthropic", url, "oauth", "Bearer tok-a");
+        assert_eq!(a, CacheNamespace::of("anthropic", url, "oauth", "Bearer tok-a"));
+        for other in [
+            CacheNamespace::of("anthropic", url, "oauth", "Bearer tok-b"),
+            CacheNamespace::of("anthropic", "http://127.0.0.1:9/v1/messages", "oauth", "Bearer tok-a"),
+            CacheNamespace::of("anthropic", url, "api_key", "Bearer tok-a"),
+        ] {
+            assert_ne!(a, other);
+        }
+        assert!(!format!("{a:?}").contains("tok-a"));
+    }
     use super::*;
 
     #[test]

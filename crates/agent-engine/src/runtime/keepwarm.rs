@@ -54,6 +54,10 @@ use crate::{Result, RuntimeError, SharedMessage};
 /// with thinking off / adaptive). One token: the answer is discarded.
 pub const KEEPWARM_OUTPUT_TOKENS: u64 = 1;
 
+/// `CacheExpiry`'s probe: the placeholder for the next turn's input (never
+/// sent; only its position matters).
+pub const EXPIRY_PROBE_TEXT: &str = "[cache expiry probe: the next input]";
+
 /// The trailing user message. Sits after the last cache marker, is never
 /// persisted, and asks for the shortest possible answer with no reasoning so
 /// budgeted thinking spends as little of its budget as the model allows.
@@ -199,6 +203,8 @@ pub struct PingTap {
     pub connect_failed: Arc<std::sync::atomic::AtomicBool>,
     pub status: Arc<AtomicU16>,
     pub usage: Arc<std::sync::Mutex<KeepWarmUsage>>,
+    /// A `CacheExpiry` probe's built request (`KeepWarmMode::Expiry`).
+    pub(crate) expiry: Arc<std::sync::Mutex<Option<super::cache_evidence::ProbeEvidence>>>,
 }
 
 impl PingTap {
@@ -486,6 +492,32 @@ impl Runtime {
         })
     }
 
+    /// `CacheExpiry`'s probe (Contract v3 §3.6): the next request — this
+    /// history plus one placeholder user block, marked as a turn marks it —
+    /// built by the same assembly as the ping (the same preflight, system
+    /// prompt, injection, tool projection and image retention), and the
+    /// next turn's context assessment. Sends and tickets nothing, touches no
+    /// TTL latch.
+    pub async fn cache_expiry_probe(
+        &self,
+        history: &[SharedMessage],
+    ) -> Result<super::cache_evidence::ProbeEvidence> {
+        let cancel = CancellationToken::new();
+        let tap = PingTap::default();
+        let (value, _) = self
+            .keepwarm_request(history, &cancel, KeepWarmMode::Expiry, &tap)
+            .await;
+        let value = value?;
+        let mut probe = tap
+            .expiry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| RuntimeError::Session("cache expiry probe built no request".into()))?;
+        probe.rollover = value.get("keepwarm_context_blocks").is_some();
+        Ok(probe)
+    }
+
     /// Send ONE keep-warm ping for `history` (the session's durable history,
     /// unchanged) if its freshly built prefix still hashes to `expect`.
     /// Never mutates `history`, the runtime's session state, or any persisted
@@ -605,9 +637,11 @@ impl Runtime {
         // (`image_retention::round_images`), so the retired prefix, and the
         // retention anchor the transport places from it, match the next turn.
         let mut request: Vec<SharedMessage> = history.to_vec();
-        request.push(Arc::new(
-            json!({"role": "user", "content": KEEPWARM_PING_TEXT}),
-        ));
+        request.push(Arc::new(match mode {
+            // The next turn's input: one text block, marked as a turn marks it.
+            KeepWarmMode::Expiry => json!({"role": "user", "content": [{"type": "text", "text": EXPIRY_PROBE_TEXT}]}),
+            _ => json!({"role": "user", "content": KEEPWARM_PING_TEXT}),
+        }));
         let round_images =
             super::image_retention::round_images(&self.model, self.codex_request_role(), &request)
                 .map_err(RuntimeError::Config)?;
@@ -709,11 +743,18 @@ impl Runtime {
             // A successful ping refreshes the cache: it moves the anchor the
             // next ping is scheduled from.
             cache_anchor: Some(Arc::clone(&self.cache_anchor)),
+            // A ping is a producer: it tickets and is observed. A probe is
+            // not (it sends nothing anyway).
+            cache_evidence: match mode {
+                KeepWarmMode::Expiry => None,
+                _ => self.cache_evidence.clone(),
+            },
             keepwarm: Some(KeepWarmRequest {
                 mode,
                 status: Arc::clone(&tap.status),
                 sent: Arc::clone(&tap.sent),
                 connect_failed: Arc::clone(&tap.connect_failed),
+                expiry: (mode == KeepWarmMode::Expiry).then(|| Arc::clone(&tap.expiry)),
             }),
             // Header only (cache-key parity with the turns this ping keeps
             // warm); a ping never sends `diagnostics` nor moves the chain.
@@ -741,7 +782,7 @@ impl Runtime {
         );
         let (mut result, notices) = drive_ping(call, &mut rx, tap, None).await;
         // Probe: also run the next turn's pre-request context assessment.
-        if let (Ok(value), KeepWarmMode::Probe) = (&mut result, mode) {
+        if let (Ok(value), KeepWarmMode::Probe | KeepWarmMode::Expiry) = (&mut result, mode) {
             if context_enabled {
                 if let Some(why) = self.keepwarm_context_blocks(
                     history,
