@@ -951,13 +951,10 @@ mod tests {
             assert!(body["system"].as_array().is_some_and(|blocks| !blocks.is_empty()));
             assert!(body["tools"].as_array().is_some_and(|tools| !tools.is_empty()));
             let instructions = last_message_text(body);
+            let (system, tools) = (canon(&body["system"]), canon(&body["tools"]));
             assert_eq!(
                 outcome.prompt_stack_digest,
-                prompt_stack_digest(&[
-                    &canon(&body["system"]),
-                    &canon(&body["tools"]),
-                    &instructions
-                ]),
+                prompt_stack_digest(&[system.as_str(), tools.as_str(), instructions.as_str()]),
                 "the digest covers the system blocks, tools and instructions that were sent"
             );
             // Not the bare system prompt and the instructions alone.
@@ -966,7 +963,7 @@ mod tests {
                 .unwrap();
             assert_ne!(
                 outcome.prompt_stack_digest,
-                prompt_stack_digest(&[system_text, &instructions])
+                prompt_stack_digest(&[system_text, instructions.as_str()])
             );
             assert!(outcome.excluded_classes.is_empty());
             assert_eq!(outcome.redaction_policy, RedactionPolicy::TruncationOnly);
