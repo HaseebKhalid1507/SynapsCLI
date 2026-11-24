@@ -243,6 +243,43 @@ pub async fn until(
     }
 }
 
+/// Send `cmd` as the host (`SessionHandle::send`) and read its reply
+/// `QueryResult{id}` on a host subscriber: a host's reply is the host's,
+/// never an attachment's (Contract v2 §1). `t` is then read up to the same
+/// point (a query of its own sent after the reply is answered after it),
+/// so `seen` is what `t` received in the meantime.
+pub async fn host_reply(t: &mut LocalTransport, cmd: SessionCommand, id: u64) -> (serde_json::Value, Vec<Envelope>) {
+    static BARRIER: AtomicUsize = AtomicUsize::new(0);
+    let handle = t.handle().clone();
+    let mut rx = handle.subscribe();
+    handle.send(cmd).await.unwrap();
+    let value = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match rx.recv().await {
+                Ok(env) => match env.event {
+                    SessionEventWire::QueryResult { id: rid, value }
+                        if rid == id && env.audience == agent_engine::session::Audience::Host =>
+                    {
+                        return value
+                    }
+                    _ => {}
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("host subscriber: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("the host's reply in time");
+    let barrier = (1 << 62) + BARRIER.fetch_add(1, Ordering::SeqCst) as u64;
+    t.send(SessionCommand::Query { id: barrier, query: agent_engine::session::SessionQuery::View })
+        .await
+        .unwrap();
+    let mut seen = until(t, |e| matches!(e, SessionEventWire::QueryResult { id, .. } if *id == barrier)).await;
+    seen.pop();
+    (value, seen)
+}
+
 /// Drain everything that arrives within `d` (no waiting for a terminal).
 pub async fn drain_for(t: &mut LocalTransport, d: Duration) -> Vec<Envelope> {
     let mut out = Vec::new();
@@ -276,12 +313,15 @@ pub fn last_conversation(seen: &[Envelope]) -> agent_engine::session::Conversati
         .expect("a Conversation envelope")
 }
 
+/// End the session as the host does (`SessionHandle::send`): teardown, so
+/// it works from any attachment, owner or not.
 pub async fn end(t: &mut LocalTransport) {
-    t.send(SessionCommand::End {
-        reason: EndReason::ClientQuit,
-    })
-    .await
-    .unwrap();
+    t.handle()
+        .send(SessionCommand::End {
+            reason: EndReason::ClientQuit,
+        })
+        .await
+        .unwrap();
     until(t, |e| matches!(e, SessionEventWire::Ended { .. })).await;
 }
 

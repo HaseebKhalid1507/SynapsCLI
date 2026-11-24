@@ -45,15 +45,33 @@ pub(crate) struct SessionLink {
     closed: bool,
 }
 
+/// Where request ids start when the daemon broadcasts replies (no
+/// `addressed_replies`): a random base in `[2^32, 2^62)`.
+const SHARED_ID_FLOOR: u64 = 1 << 32;
+const SHARED_ID_CEIL: u64 = 1 << 62;
+
 impl SessionLink {
     pub(crate) fn new(transport: Box<dyn ClientTransport>) -> Self {
         let view = transport.view();
-        Self {
+        let mut link = Self {
             transport,
             view,
             buffered: VecDeque::new(),
             next_id: 1,
             closed: false,
+        };
+        link.keep_ids_apart();
+        link
+    }
+
+    /// An older daemon broadcasts every reply, and every client numbers its
+    /// requests from 1: another client's `QueryResult{5}` would answer ours.
+    /// Against one, this link's ids start at a random base instead. Checked
+    /// again after a reconnect (a reload can change the daemon binary).
+    fn keep_ids_apart(&mut self) {
+        if !self.transport.addressed_replies() && self.next_id < SHARED_ID_FLOOR {
+            let r = uuid::Uuid::new_v4().as_u64_pair().0;
+            self.next_id = SHARED_ID_FLOOR + r % (SHARED_ID_CEIL - SHARED_ID_FLOOR);
         }
     }
 
@@ -86,6 +104,7 @@ impl SessionLink {
     /// Re-read the transport's published view (after `Attached`/reconnect).
     pub(crate) fn refresh_view(&mut self) {
         self.view = self.transport.view();
+        self.keep_ids_apart();
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -663,6 +682,58 @@ mod tests {
         assert!(b.waiting_confirms().is_empty());
         assert!(b.on_local_answer(4));
         assert!(!b.on_resolved(4));
+    }
+
+    /// Against a daemon that broadcasts replies (no `addressed_replies`),
+    /// request ids start at a random base in `[2^32, 2^62)`, not at 1; an
+    /// addressing daemon keeps the plain count.
+    #[tokio::test]
+    async fn request_ids_start_at_a_random_base_without_addressed_replies() {
+        let mut plain = SessionLink::new(Box::new(ScriptedTransport::new(Runtime::new_headless())));
+        assert_eq!(plain.send_query(SessionQuery::View).await.unwrap(), 1);
+        let old = || ScriptedTransport::new(Runtime::new_headless()).with_addressed_replies(false);
+        let mut a = SessionLink::new(Box::new(old()));
+        let mut b = SessionLink::new(Box::new(old()));
+        let (ia, ib) = (a.send_query(SessionQuery::View).await.unwrap(), b.send_query(SessionQuery::View).await.unwrap());
+        for id in [ia, ib] {
+            assert!((SHARED_ID_FLOOR..SHARED_ID_CEIL).contains(&id), "{id}");
+        }
+        assert_ne!(ia, ib, "two links draw apart");
+        assert_eq!(a.send_query(SessionQuery::View).await.unwrap(), ia + 1, "then count up");
+    }
+
+    /// The old-reader contract the daemon relies on: another client's
+    /// `SettingChanged`/`Resumed`, projected to `VIEW_CHANGED_SETTING_ID`,
+    /// is never taken for this link's reply, and the view still follows it.
+    #[tokio::test]
+    async fn a_view_only_setting_or_resume_is_never_taken_for_the_reply() {
+        use agent_engine::session::wire::VIEW_CHANGED_SETTING_ID;
+        let mut t = ScriptedTransport::new(Runtime::new_headless());
+        let mut theirs = (*t.view()).clone();
+        theirs.model = "their-model".into();
+        t.push_event(SessionEventWire::SettingChanged(SettingApplied {
+            id: VIEW_CHANGED_SETTING_ID,
+            setting: "model".into(),
+            ok: true,
+            message: None,
+            view: theirs,
+            clamp: None,
+        }));
+        t.push_event(SessionEventWire::Resumed {
+            id: VIEW_CHANGED_SETTING_ID,
+            old_id: "a".into(),
+            new_id: "b".into(),
+            via: None,
+            clamp_notice: None,
+        });
+        let mut link = SessionLink::new(Box::new(t));
+        let applied = link.set(SessionSetting::ApiRetries { n: 2 }).await.unwrap();
+        assert_eq!(applied.id, 1, "its own reply");
+        assert!(link.resume("x").await.is_err(), "its own (error) reply, not the view-only Resumed");
+        // Both view-only events reach the loop, in order.
+        let seen = [link.next_event().await.unwrap(), link.next_event().await.unwrap()];
+        assert!(matches!(&seen[0].event, SessionEventWire::SettingChanged(a) if a.id == VIEW_CHANGED_SETTING_ID && a.view.model == "their-model"));
+        assert!(matches!(&seen[1].event, SessionEventWire::Resumed { id, .. } if *id == VIEW_CHANGED_SETTING_ID));
     }
 
     fn refusing_link() -> SessionLink {

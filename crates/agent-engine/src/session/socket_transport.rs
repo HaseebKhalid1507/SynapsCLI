@@ -938,7 +938,7 @@ impl SocketTransport {
     }
 
     fn notice(&self, text: String) -> Envelope {
-        Envelope { session_id: self.session.clone(), seq: u64::MAX, ts: chrono::Utc::now(), event: SessionEventWire::SystemNotice(text) }
+        Envelope::new(self.session.clone(), u64::MAX, chrono::Utc::now(), SessionEventWire::SystemNotice(text))
     }
 
     /// The client's view of `api_messages` (kept current by the digest
@@ -969,12 +969,12 @@ impl SocketTransport {
             WireSessionEvent::Conversation { digest } => {
                 if digest.matches(&self.messages) {
                     let event = SessionEventWire::Conversation(digest.into_snapshot(self.messages.clone()));
-                    return Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event });
+                    return Some(Envelope::new(w.session_id, w.seq, w.ts, event));
                 }
                 if digest.messages_len == 0 {
                     self.messages.clear();
                     let event = SessionEventWire::Conversation(digest.into_snapshot(Vec::new()));
-                    return Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event });
+                    return Some(Envelope::new(w.session_id, w.seq, w.ts, event));
                 }
                 // Mirror drifted (compaction, abort repair, flushed events): re-fetch.
                 let first = self.pending_digest.is_none();
@@ -996,11 +996,11 @@ impl SocketTransport {
                     tracing::debug!("socket_transport: messages re-query still disagrees with digest; using fetched history");
                 }
                 let event = SessionEventWire::Conversation(digest.into_snapshot(self.messages.clone()));
-                Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event })
+                Some(Envelope::new(w.session_id, w.seq, w.ts, event))
             }
             WireSessionEvent::QueryResult { id, .. } if id >= RESERVED_QUERY_ID_BASE => None,
             event => {
-                let env = Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event: event.into() };
+                let env = Envelope::new(w.session_id, w.seq, w.ts, event.into());
                 match &env.event {
                     SessionEventWire::Stream(crate::StreamEvent::Session(crate::SessionEvent::MessageHistory(m))) => {
                         self.messages = m.clone();
@@ -1025,11 +1025,11 @@ impl SocketTransport {
         match w.event {
             WireSessionEvent::Conversation { digest } => {
                 let event = SessionEventWire::Conversation(digest.into_snapshot(Vec::new()));
-                Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event })
+                Some(Envelope::new(w.session_id, w.seq, w.ts, event))
             }
             WireSessionEvent::QueryResult { id, .. } if id >= RESERVED_QUERY_ID_BASE => None,
             event => {
-                let env = Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event: event.into() };
+                let env = Envelope::new(w.session_id, w.seq, w.ts, event.into());
                 if matches!(
                     env.event,
                     SessionEventWire::Stream(crate::StreamEvent::Session(crate::SessionEvent::MessageHistory(_)))
@@ -1217,6 +1217,10 @@ impl ClientTransport for SocketTransport {
 
     fn socket_path(&self) -> Option<&Path> {
         Some(&self.path)
+    }
+
+    fn addressed_replies(&self) -> bool {
+        self.welcome.supports(FEATURE_ADDRESSED_REPLIES)
     }
 }
 

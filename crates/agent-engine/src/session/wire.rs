@@ -74,6 +74,16 @@ pub const FEATURE_SESSION_WORKERS: &str = "session_workers";
 /// session that leaves the held set is pushed as its saved row).
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
 
+/// `Welcome.features` entry: replies are addressed (Contract v2 §1). A
+/// `QueryResult` reaches only the attachment whose request it answers (a
+/// host's, none); another client's `SettingChanged`/`Resumed` arrives with
+/// its id projected to [`VIEW_CHANGED_SETTING_ID`]. Nothing on the wire
+/// changes: an older client simply stops seeing replies that were never
+/// its own. Without it (an older daemon broadcasts every reply), a client
+/// keeps its request ids apart from other clients' by drawing them from a
+/// random base in `[2^32, 2^62)`.
+pub const FEATURE_ADDRESSED_REPLIES: &str = "addressed_replies";
+
 /// `CatalogPage.limit` when absent, and its ceiling.
 pub const CATALOG_PAGE_DEFAULT_LIMIT: u32 = 50;
 pub const CATALOG_PAGE_MAX_LIMIT: u32 = 200;
@@ -93,6 +103,7 @@ pub fn daemon_features() -> Vec<String> {
         FEATURE_OWNED_SESSIONS.to_string(),
         FEATURE_SESSION_WORKERS.to_string(),
         FEATURE_SESSION_PAGE.to_string(),
+        FEATURE_ADDRESSED_REPLIES.to_string(),
     ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
@@ -105,10 +116,29 @@ pub const RPC_MAX_FRAME_BYTES: usize = agent_core::core::rpc_dispatch::MAX_FRAME
 pub const DAEMON_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Alias used by the readers/writers of this protocol.
 pub const MAX_FRAME_BYTES: usize = DAEMON_MAX_FRAME_BYTES;
-/// Query ids at or above this are reserved for the transport/daemon and
-/// never surfaced to a client as `QueryResult`.
+/// Request ids come in three kinds. Every reply is addressed to the
+/// request's origin (`Audience`), so ids only need to be unique per
+/// attachment, and the daemon never dedups them.
+/// - **Application ids**, below `RESERVED_QUERY_ID_BASE`: what a client
+///   numbers its own `Query`/`Set`/`Resume`/`EngineCommand`/`PluginCommand`
+///   with. Reusable once answered.
+/// - **Transport-internal ids**: [`DIGEST_RESYNC_QUERY_ID`] alone. A
+///   `SocketTransport` sends it from its own attachment, so its reply is
+///   that attachment's (`Audience::Client`), never the host's, and the
+///   transport consumes it before its reserved-id drop. Older clients send
+///   it too; it stays valid.
+/// - **Host ids**, every other id at or above `RESERVED_QUERY_ID_BASE`: the
+///   daemon's in-process callers (idle probe, reload checkpoint, `daemon
+///   close`/`rename`, reload's setting replay). Their replies are the
+///   host's (`Audience::Host`) and never reach an attachment; a client that
+///   sends one gets its reply on its own attachment, which can never
+///   satisfy a host waiter. [`VIEW_CHANGED_SETTING_ID`] is the view-only id
+///   of a `SettingChanged`/`Resumed` that answers no request of yours.
+///
+/// Rust clients never surface a `QueryResult` at or above this id.
 pub const RESERVED_QUERY_ID_BASE: u64 = 1 << 63;
-/// `SocketTransport` re-fetches `api_messages` under this id on a digest miss.
+/// `SocketTransport` re-fetches `api_messages` under this id on a digest
+/// miss: the one transport-internal id (see [`RESERVED_QUERY_ID_BASE`]).
 pub const DIGEST_RESYNC_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE;
 /// The daemon's idle monitor probes `Status` under this id.
 pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
@@ -119,6 +149,8 @@ pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
 /// `/thinking`, …) changed the view: not a reply to any client's `Set`
 /// (client ids never reach the reserved range), only the new view, so every
 /// attached client mirrors it, not just the one that typed the command.
+/// Also the id every other client sees on a `SettingChanged`/`Resumed` that
+/// answers one client's request, and on one that answers the host's.
 pub const VIEW_CHANGED_SETTING_ID: u64 = RESERVED_QUERY_ID_BASE + 3;
 /// `synaps daemon close` sends the engine command `close` under a fresh id
 /// at or above this one per request (`daemon/close.rs`) and awaits that id's
@@ -705,14 +737,11 @@ impl From<Envelope> for WireEnvelope {
     }
 }
 
+/// Off a socket: the daemon already routed it, so it is for this reader
+/// ([`Audience::All`]).
 impl From<WireEnvelope> for Envelope {
     fn from(e: WireEnvelope) -> Self {
-        Self {
-            session_id: e.session_id,
-            seq: e.seq,
-            ts: e.ts,
-            event: e.event.into(),
-        }
+        Envelope::new(e.session_id, e.seq, e.ts, e.event.into())
     }
 }
 
@@ -1535,7 +1564,7 @@ mod tests {
     }
 
     fn env(event: SessionEventWire) -> Envelope {
-        Envelope { session_id: SessionId::from("wire-1"), seq: 9, ts: chrono::Utc::now(), event }
+        Envelope::new(SessionId::from("wire-1"), 9, chrono::Utc::now(), event)
     }
 
     fn stream_fixtures() -> Vec<StreamEvent> {
@@ -2494,12 +2523,7 @@ mod tests {
     /// a current one, and every other end reason, pass unchanged.
     #[test]
     fn owner_gone_downgrades_for_older_clients() {
-        let env = |reason| Envelope {
-            session_id: "s".into(),
-            seq: 1,
-            ts: chrono::Utc::now(),
-            event: SessionEventWire::Ended { reason },
-        };
+        let env = |reason| Envelope::new("s".into(), 1, chrono::Utc::now(), SessionEventWire::Ended { reason });
         let reason = |e: Envelope| match e.event {
             SessionEventWire::Ended { reason } => reason,
             other => panic!("{other:?}"),

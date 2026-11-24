@@ -1125,18 +1125,54 @@ impl SessionActor {
 
     // ── emit ─────────────────────────────────────────────────────────────
 
-    /// The ONLY seq++ site. Pushes to `turn_replay` while streaming, except
-    /// prompt traffic (never replayed), per-client replies, and full-history
-    /// envelopes (`MessageHistory`, `Conversation`): the engine publishes one
-    /// per round, and an attaching client already gets the LATEST history in
-    /// its snapshot's `conversation` — replaying older ones would ship the
-    /// whole history once per round and roll its mirror back to a stale
-    /// state. The ring's `TurnStarted` drops `user_text`: that prompt is
-    /// already in the snapshot's history (a replayed copy would show it
-    /// twice). Completed rounds leave the ring when their checkpoint is
-    /// adopted (`trim_replay_to_checkpoint`).
+    /// Shared state for every subscriber ([`Audience::All`]). Never a
+    /// `QueryResult`: a reply goes to its asker ([`Self::reply`]).
     pub(crate) fn emit(&mut self, event: SessionEventWire) {
+        debug_assert!(
+            !matches!(event, SessionEventWire::QueryResult { .. }),
+            "a QueryResult is a reply: use reply(from, ..)"
+        );
+        self.emit_to(Audience::All, event);
+    }
+
+    /// A reply to `from`'s request: that attachment only
+    /// ([`Audience::Client`]), or the in-process host caller when `from`
+    /// is `None` ([`Audience::Host`]).
+    pub(crate) fn reply(&mut self, from: Option<ClientId>, event: SessionEventWire) {
+        self.emit_to(from.map_or(Audience::Host, Audience::Client), event);
+    }
+
+    /// Shared state that also answers `from`'s request (`SettingChanged`,
+    /// `Resumed`): everyone gets it, and only `from` sees its request id
+    /// ([`Audience::Shared`]). A host request's id is no attachment's, so
+    /// it goes out view-only ([`super::wire::VIEW_CHANGED_SETTING_ID`]) to everyone:
+    /// a host `Set{id: 5}` must never answer a client's request 5.
+    pub(crate) fn emit_shared(&mut self, from: Option<ClientId>, mut event: SessionEventWire) {
+        match from {
+            Some(c) => self.emit_to(Audience::Shared { reply_to: c }, event),
+            None => {
+                super::types::view_only(&mut event);
+                self.emit_to(Audience::All, event);
+            }
+        }
+    }
+
+    /// The ONLY seq++ site. Pushes to `turn_replay` while streaming, except
+    /// anything not for everyone (a reply, a shared reply: the ring is
+    /// replayed to clients that never asked), prompt traffic (never
+    /// replayed), and full-history envelopes (`MessageHistory`,
+    /// `Conversation`): the engine publishes one per round, and an
+    /// attaching client already gets the LATEST history in its snapshot's
+    /// `conversation` — replaying older ones would ship the whole history
+    /// once per round and roll its mirror back to a stale state. The ring's
+    /// `TurnStarted` drops `user_text`: that prompt is already in the
+    /// snapshot's history (a replayed copy would show it twice). Completed
+    /// rounds leave the ring when their checkpoint is adopted
+    /// (`trim_replay_to_checkpoint`). `seq` stays gapless per session; a
+    /// subscriber's stream may skip the seqs not addressed to it.
+    fn emit_to(&mut self, audience: Audience, event: SessionEventWire) {
         let replay = self.streaming
+            && audience == Audience::All
             && !matches!(
                 event,
                 SessionEventWire::Prompt(_)
@@ -1148,12 +1184,7 @@ impl SessionActor {
                         SessionEvent::MessageHistory(_)
                     ))
             );
-        let env = Envelope {
-            session_id: self.id.clone(),
-            seq: self.seq,
-            ts: chrono::Utc::now(),
-            event,
-        };
+        let env = Envelope::new(self.id.clone(), self.seq, chrono::Utc::now(), event).to(audience);
         self.seq += 1;
         if replay {
             if self.turn_replay.len() >= TURN_REPLAY_CAP {
@@ -4559,7 +4590,7 @@ impl SessionActor {
 
     // ── settings / queries / engine commands ─────────────────────────────
 
-    pub(crate) async fn apply_setting(&mut self, id: u64, setting: SessionSetting) {
+    pub(crate) async fn apply_setting(&mut self, from: Option<ClientId>, id: u64, setting: SessionSetting) {
         if replayable(&setting) {
             let disc = std::mem::discriminant(&setting);
             self.settings_replay
@@ -4661,7 +4692,7 @@ impl SessionActor {
             Ok(m) => (true, m),
             Err(e) => (false, Some(e)),
         };
-        self.emit(SessionEventWire::SettingChanged(SettingApplied {
+        self.emit_shared(from, SessionEventWire::SettingChanged(SettingApplied {
             id,
             setting: name.to_string(),
             ok,
@@ -4671,7 +4702,7 @@ impl SessionActor {
         }));
     }
 
-    pub(crate) async fn query(&mut self, id: u64, query: SessionQuery) {
+    pub(crate) async fn query(&mut self, from: Option<ClientId>, id: u64, query: SessionQuery) {
         // Status/View never wake a parked session (the idle probe must not).
         if self.is_parked() {
             let value = match query {
@@ -4691,11 +4722,11 @@ impl SessionActor {
                     serde_json::json!({ "error": format!("no subagent {handle_id} in this session") })
                 }
                 _ => match self.ensure_live().await {
-                    Ok(()) => return Box::pin(self.query(id, query)).await,
+                    Ok(()) => return Box::pin(self.query(from, id, query)).await,
                     Err(e) => serde_json::json!({ "error": e }),
                 },
             };
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.reply(from, SessionEventWire::QueryResult { id, value });
             return;
         }
         let value = match query {
@@ -4789,7 +4820,7 @@ impl SessionActor {
                 }
             }
         };
-        self.emit(SessionEventWire::QueryResult { id, value });
+        self.reply(from, SessionEventWire::QueryResult { id, value });
     }
 
     // ── attach / detach ──────────────────────────────────────────────────
@@ -5010,7 +5041,7 @@ impl SessionActor {
     /// cancel any turn (partial history kept + interruption marker), abort compaction, answer
     /// pending prompts `None`, save, close PTYs. Replies on
     /// `CHECKPOINT_QUERY_ID` so `reload.rs` can await it per session.
-    pub(crate) async fn checkpoint(&mut self, reason: CheckpointReason) {
+    pub(crate) async fn checkpoint(&mut self, from: Option<ClientId>, reason: CheckpointReason) {
         let interrupt = match reason {
             CheckpointReason::Reload => crate::engine::interrupt::InterruptReason::Restart,
             CheckpointReason::HostRequest => crate::engine::interrupt::InterruptReason::Host,
@@ -5075,7 +5106,7 @@ impl SessionActor {
             });
         }
         let record = serde_json::to_value(record).unwrap_or_default();
-        self.emit(SessionEventWire::QueryResult {
+        self.reply(from, SessionEventWire::QueryResult {
             id: super::wire::CHECKPOINT_QUERY_ID,
             value: serde_json::json!({ "ok": true, "record": record }),
         });
@@ -5340,7 +5371,7 @@ impl SessionActor {
             // A host rename answers its caller only, never the whole room.
             if let SessionCommand::EngineCommand { id, name, .. } = &cmd {
                 if name == RENAME_COMMAND {
-                    self.emit(SessionEventWire::QueryResult {
+                    self.reply(from, SessionEventWire::QueryResult {
                         id: *id,
                         value: serde_json::json!({
                             "kind": "error", "code": "busy",
@@ -5375,7 +5406,7 @@ impl SessionActor {
         if is_rename_command(&cmd) {
             if let SessionCommand::EngineCommand { id, arg, .. } = cmd {
                 let value = self.host_rename(&arg).await;
-                self.emit(SessionEventWire::QueryResult { id, value });
+                self.reply(from, SessionEventWire::QueryResult { id, value });
             }
             return ControlFlow::Continue(());
         }
@@ -5415,7 +5446,7 @@ impl SessionActor {
             ) {
                 if let SessionCommand::Checkpoint { .. } = cmd {
                     let record = serde_json::to_value(self.reload_record()).unwrap_or_default();
-                    self.emit(SessionEventWire::QueryResult {
+                    self.reply(from, SessionEventWire::QueryResult {
                         id: super::wire::CHECKPOINT_QUERY_ID,
                         value: serde_json::json!({ "ok": true, "parked": true, "record": record }),
                     });
@@ -5459,7 +5490,7 @@ impl SessionActor {
                     .await;
             }
             SessionCommand::Answer { prompt_id, value } => self.answer(from, prompt_id, value),
-            SessionCommand::Set { id, setting } => self.apply_setting(id, setting).await,
+            SessionCommand::Set { id, setting } => self.apply_setting(from, id, setting).await,
             // `CompactionStarted` is the contract; no notice before it.
             SessionCommand::Compact { instructions } => {
                 self.compact(instructions, "manual").await;
@@ -5505,15 +5536,15 @@ impl SessionActor {
             SessionCommand::Save => {
                 self.save().await;
             }
-            SessionCommand::Query { id, query } => self.query(id, query).await,
+            SessionCommand::Query { id, query } => self.query(from, id, query).await,
             // `/close` ends the session, which no other engine command can.
             SessionCommand::EngineCommand { id, name, arg } if name == CLOSE_COMMAND => {
-                if let Some(reason) = self.close_command(id, &arg, from.is_none()) {
+                if let Some(reason) = self.close_command(from, id, &arg) {
                     return ControlFlow::Break(reason);
                 }
             }
             SessionCommand::EngineCommand { id, name, arg } => {
-                self.engine_command(id, name, arg).await
+                self.engine_command(from, id, name, arg).await
             }
             SessionCommand::Attach { client, mode, owner } => self.attach(client, mode, owner).await,
             SessionCommand::Detach { client } => {
@@ -5554,9 +5585,9 @@ impl SessionActor {
                 plugin,
                 name,
                 arg,
-            } => self.plugin_command(id, plugin, name, arg).await,
-            SessionCommand::Resume { id, query } => self.resume(id, query).await,
-            SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
+            } => self.plugin_command(from, id, plugin, name, arg).await,
+            SessionCommand::Resume { id, query } => self.resume(from, id, query).await,
+            SessionCommand::Checkpoint { reason } => self.checkpoint(from, reason).await,
             SessionCommand::AdoptWorkers { workers } => self.adopt_workers(workers),
             SessionCommand::RestoreToolActivations { activations } => {
                 self.restore_tool_activations(activations)

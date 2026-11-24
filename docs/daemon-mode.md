@@ -743,7 +743,7 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page"], boot_id?}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page","addressed_replies"], boot_id?}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
@@ -797,7 +797,7 @@ C: bye | socket close = Detach (turn keeps running)
   (`attach_to_session_with_history_over_1mib`), a 2 MiB `ping` is answered, a 64 MiB + 10 B frame is refused.
 - Query ids ≥ `RESERVED_QUERY_ID_BASE` (2^63) belong to the transport/daemon (`DIGEST_RESYNC_QUERY_ID`,
   `IDLE_PROBE_QUERY_ID`, `CHECKPOINT_QUERY_ID`, `CLOSE_QUERY_ID_BASE`+n); `SocketTransport` never surfaces them
-  as `QueryResult`.
+  as `QueryResult`. Who receives a reply: see "Request ids and replies" below.
 - `close` was added without a protocol bump: a daemon older than it answers the unknown frame with
   `Error{"malformed frame: unknown variant `close`…"}` and keeps the connection open, and
   `synaps daemon close` reports "daemon … predates `daemon close`; run `synaps daemon reload`" (exit 2).
@@ -845,6 +845,63 @@ C: bye | socket close = Detach (turn keeps running)
 - Saved sessions are additive the same way. `Welcome.features` lists `session_page` when the daemon
   answers `catalog_page` (see "Saved sessions"); the reply and `lifecycle: "saved"` reach only a
   client that sent the frame. `SessionMeta.updated_at` is omitted on held rows.
+
+## Negotiation
+
+Three mechanisms, three questions. None substitutes for another.
+
+| Mechanism | Answers | Set by | Read where |
+|---|---|---|---|
+| `Welcome.features` | does this daemon support contract X? | daemon | the client, before it sends a frame an older daemon would reject or ignore (`DaemonTooOld`), or to discover a filled field |
+| `ClientCapabilities` (`hello.client.capabilities`) | can this client decode output Y? | client | the wire boundary only (`wire::client_decodes`, `ended_for`, `legacy_shared` in `daemon/conn.rs`), never the actor |
+| `Envelope.audience` (never serialized) | who asked? | the actor, at emit | `session::deliver`/`delivers`, at every subscriber |
+
+A feature names a contract a client can't detect any other way. A field whose absence already reads as
+"unknown" needs no token. Old × old behaves as before and new × new gets the whole contract; the mixed
+cases:
+
+| Name | Kind | Since | What it gates | New client × old daemon | Old client × new daemon |
+|---|---|---|---|---|---|
+| `owned_sessions` | feature | 0.12.0 | `Attach::Create{owned}`, the owner re-bind, `EndReason::OwnerGone` | the client refuses to ask (an older daemon would ignore `owned` and hand back an unowned session) | never asks |
+| `session_workers` | feature | unreleased | `SessionMeta.workers` is filled | the block is always empty | the block is omitted while empty; filled rows are additive |
+| `session_page` | feature | unreleased | `catalog_page`, `Watch{saved}`, `lifecycle: saved` | `DaemonTooOld` before sending | never asks; never sees `saved` rows |
+| `addressed_replies` | feature | unreleased | replies reach only their asker (below) | every reply is still broadcast; `SessionLink` draws its request ids from a random base in `[2^32, 2^62)` so another client's reply to the same id is never taken for its own | only its own replies; host replies gone (Rust clients already dropped them); another client's `SettingChanged`/`Resumed` arrives with id `VIEW_CHANGED_SETTING_ID` (view-only) |
+| `tool_queue` | capability | 0.11.0 | `LlmEvent::ToolQueued`/`ToolStarted`, live and in the attach replay | — | never sent them |
+| `owner_reason_input` | capability | 0.11.0 | `OwnerChangeReason::Input`, `Attached.client_input` | — | a shared session is presented in owner terms (`legacy_shared`) |
+| `owner_gone` | capability | 0.12.0 | `EndReason::OwnerGone` | — | told `Ended{client_quit}` (`ended_for`) |
+
+An unknown `ev` tag decodes as `WireSessionEvent::Unknown` (`#[serde(other)]`) and the TUI shows the
+generic unknown-event notice; it does not tear down the connection. Fields are only added, with
+`#[serde(default)]`, and never change name or type.
+
+## Request ids and replies
+
+Every client numbers its own requests (`Query`, `Set`, `Resume`, `EngineCommand`, `PluginCommand`), so
+two clients' request 5 share an id. Replies are addressed to the request's origin, which the daemon takes
+from the connection (it stamps every client frame; `LocalTransport` stamps its attachment), never from
+the frame:
+
+- `QueryResult` (every query, engine/plugin command, resume error, close/rename/checkpoint reply) reaches
+  only the attachment that asked; a host's (in-process `SessionHandle::send`: idle probe, reload
+  checkpoint, `daemon close`/`rename`, the reload's setting replay) reaches no attachment.
+- `SettingChanged` (a `Set`) and `Resumed` (a `Resume`) are shared state: every client gets them, and every
+  client but the asker sees the id as `VIEW_CHANGED_SETTING_ID` ("answers no request of yours"; old
+  clients already treated it as a view change). One the host asked for is view-only for everyone.
+- The audience is applied before anything else at every subscriber: the connection pump and its reload
+  drain project each envelope for their client before filtering and converting it, so a reply is never
+  serialized to a client that did not ask. `Attached`, `AttachRefused` and `Refused{client}` are unchanged
+  (the conn sends its own `Attached`; `Refused` is still broadcast and the client filters on `client`).
+- Ids are scoped per attachment and reusable once answered; the daemon never dedups them. Three kinds:
+  **application ids** (below `RESERVED_QUERY_ID_BASE`, what a client counts with); the one
+  **transport-internal id** `DIGEST_RESYNC_QUERY_ID`, which a Full-history `SocketTransport` (old or new)
+  sends from its own attachment on a digest miss, so its reply is that attachment's and never the
+  host's; and **host ids**, every other reserved id. A client that sends a host id gets its reply on its
+  own attachment; it can never satisfy a host waiter (they accept only host-addressed replies).
+- A client id is never reused within a session's life, so a reply addressed to an attachment that is gone
+  reaches nobody, never its replacement.
+- `seq` is gapless per session at emit. A connection's stream may skip seqs (replies to others, events
+  its capabilities exclude, the actor's `Attached`): a gap is not loss. A reply never enters the
+  mid-turn replay ring.
 
 ## Security posture
 
