@@ -168,6 +168,40 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Compaction reads the history from the prompt cache instead of paying
+  for it again.** `/compact` and auto-compaction sent a request of their
+  own: a different system prompt, no tools, no cache markers and the whole
+  transcript in one user message. None of it matched what the chat had
+  cached, so the provider billed the entire history as fresh input and
+  counted it against the per-minute input limit. An Opus session at about
+  400K tokens sent one 1.6 MB request and got HTTP 429 on all 27 attempts,
+  while its own turns, larger but cached, went through. On Anthropic the
+  summary request is now the chat's own next request (same system prompt,
+  tools, thinking, effort and messages, marked like a turn) with one more
+  user message that asks for the summary, so the history is a cache read:
+  about a twentieth to a tenth of the input price, and not counted against
+  the per-minute limit. It is used when the chat's own model writes the
+  summary, `compaction_exclude` is empty, the request fits the context
+  window, and the cache is known to be warm (a request or keep-warm ping
+  within the cache TTL, with the same model, effort, thinking, system
+  prompt, tools and account). Otherwise the transcript request is sent as
+  before: with a cold cache it is the cheaper one, since writing the full
+  history to the cache costs 1.25 to 2 times the input price and the
+  transcript request truncates tool results and thinking. The tools stay
+  in the request (removing them would invalidate the cache); if the model
+  answers with a tool call, or the request fails in any way, nothing runs
+  and the transcript request is sent once instead. A failed attempt leaves
+  the conversation as it was. In the api-log such a request has
+  `"compaction": true`, and its `usage.cache_read` is the history. Other
+  providers are unchanged.
+- **A compaction request larger than the account's per-minute input limit
+  fails at once.** A 429 was retried eight times whatever the cause. When
+  the response states the limit (`anthropic-ratelimit-input-tokens-limit`,
+  sent to API keys) and the request is certainly larger, no wait can make
+  room for it: it now stops after the first attempt and says so, with the
+  two sizes. A 429 without that header, as on a subscription login, keeps
+  its retries.
+
 - **Sign-in opens the whole page on Windows.** The browser was started
   through `cmd /c start <url>`, and `cmd` ends a command at the first `&`:
   the Claude, ChatGPT, Gemini and Grok authorize URLs (all full of `&`)
