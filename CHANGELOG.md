@@ -177,26 +177,48 @@ All notable changes to this project will be documented in this file.
   400K tokens sent one 1.6 MB request and got HTTP 429 on all 27 attempts,
   while its own turns, larger but cached, went through. On Anthropic the
   summary request is now the chat's own next request (same system prompt,
-  tools, thinking, effort and messages, marked like a turn) with one more
-  user message that asks for the summary, so the history is a cache read:
-  about a twentieth to a tenth of the input price, and not counted against
-  the per-minute limit. It is used when the chat's own model writes the
-  summary, `compaction_exclude` is empty, the request fits the context
-  window, and the cache is known to be warm (a request or keep-warm ping
-  within the cache TTL, with the same model, effort, thinking, system
-  prompt, tools and account). Models older than Opus 4.5, Sonnet 4.6 and
-  Haiku 5.5 drop earlier thinking blocks, and the cached messages after
-  them, when a user message is added, so for them it is used only when the
-  history has no thinking blocks. Otherwise the transcript request is sent
-  as before: with a cold cache it is the cheaper one, since writing the full
-  history to the cache costs 1.25 to 2 times the input price and the
-  transcript request truncates tool results and thinking. The tools stay
-  in the request (removing them would invalidate the cache); if the model
-  answers with a tool call, or the request fails in any way, nothing runs
-  and the transcript request is sent once instead. A failed attempt leaves
-  the conversation as it was. In the api-log such a request has
-  `"compaction": true`, and its `usage.cache_read` is the history. Other
-  providers are unchanged.
+  tools, thinking, effort and messages) with one more user message that
+  asks for the summary, so the history is a cache read: about a twentieth
+  to a tenth of the input price, and not counted against the per-minute
+  limit. The cache marker stays on the last message of the history, so the
+  one-off instructions are not written to the cache.
+  It is used when all of this holds: the chat's own model writes the
+  summary; `compaction_exclude` is empty; the request fits the context
+  window; the cache is known to be warm (a request or keep-warm ping within
+  the cache TTL, with the same model, effort, thinking, system prompt,
+  tools and account); and the history starts with exactly the messages
+  that last request sent, so `/resume` followed by `/compact` does not send
+  the resumed history as a full cache write. Two models-specific cases keep
+  the transcript request: models other than Opus 4.5 and later, Sonnet 4.6
+  and later, Haiku 5.5, Fable and Mythos drop earlier thinking blocks (and
+  the cached messages after them) when a user message is added, so for them
+  it is used only when the history has no thinking blocks; and on Haiku
+  5.5, which bills a prompt of over 100,000 tokens at its long-context
+  rate, it is not used when the full history is over that size and the
+  transcript is not. Otherwise the transcript request is sent as before:
+  with a cold cache it is the cheaper one, since writing the full history
+  to the cache costs 1.25 to 2 times the input price and the transcript
+  request truncates tool results and thinking.
+  The tools stay in the request (removing them would invalidate the
+  cache); if the model answers with a tool call, nothing runs. The request
+  is sent once, without retries: on any failure, a tool call or an empty
+  reply, the transcript request is sent once instead, with its usual
+  retries, and a failed attempt leaves the conversation as it was. The line
+  shown before a compaction says which request goes out ("sending the
+  conversation as the chat sends it (N messages, ~T tokens, read from
+  cache) ... if that fails, a ~K KB transcript"). The saved compaction
+  record names the request that wrote the summary (`summary_request`:
+  `chat_request` or `transcript`), and for a chat request its prompt-stack
+  digest covers the system blocks, tools and instructions as sent; the
+  history went out untruncated then. A chat request that wrote more to the
+  cache than it read logs a warning with both numbers. In the api-log such
+  a request has `"compaction": true`, and its `usage.cache_read` is the
+  history. Other providers are unchanged.
+  Known, not changed: a compaction's own token spend is still not added to
+  the session's usage counters; when both requests fail, the keep-warm
+  period that ended for the compaction is not restored (the next turn
+  starts one); and a 1h-to-5m cache downgrade first seen by the compaction
+  request may not show its notice.
 - **A compaction request larger than the account's per-minute input limit
   fails at once.** A 429 was retried eight times whatever the cause. When
   the response states the limit (`anthropic-ratelimit-input-tokens-limit`,

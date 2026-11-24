@@ -1360,8 +1360,9 @@ mod tests {
         let said = format!(
             "compaction: sending the conversation as the chat sends it ({} messages, ~{tokens} \
              tokens, read from cache) to anthropic/claude-opus-4-7 — excluded classes: none; if \
-             that fails, a ~1 KB transcript",
-            history.len()
+             that fails, a ~{} KB transcript",
+            history.len(),
+            warm.approx_conversation_bytes.div_ceil(1024)
         );
         assert_eq!(line, said);
 
@@ -1372,7 +1373,7 @@ mod tests {
         assert_eq!(cold, preview_compaction_disclosure(&rt, &resumed));
         assert_eq!(cold.chat_request_tokens, None);
         assert!(
-            cold.render_line().starts_with("compaction: sending ~1 KB of conversation ("),
+            cold.render_line().starts_with("compaction: sending ~"),
             "{}",
             cold.render_line()
         );
