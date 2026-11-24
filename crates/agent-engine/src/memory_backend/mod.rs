@@ -56,6 +56,12 @@ fn legacy_write_error(e: store::MemoryError, what: &str) -> RuntimeError {
     }
 }
 
+/// The memory backend this host binds, as WELCOME reports it: "legacy", the
+/// plain-file store, which is the only one. Selection, not health.
+pub fn backend_name() -> &'static str {
+    "legacy"
+}
+
 impl MemoryBinding {
     /// The binding of a chat that runs in `cwd`: the base directory, and the
     /// project of that folder. Without a folder, or with one that has no
@@ -217,6 +223,12 @@ mod tests {
             assert!(binding.forget("mem-unknown").await.is_err());
         }
         assert_eq!(std::fs::read_dir(gone.path()).unwrap().count(), 0);
+    }
+
+    /// The plain-file store is the only backend: WELCOME reports "legacy".
+    #[test]
+    fn backend_name_reports_the_selection() {
+        assert_eq!(backend_name(), "legacy");
     }
 }
 

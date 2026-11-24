@@ -673,6 +673,16 @@ pub struct Welcome {
     /// from an older daemon.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub boot_id: String,
+    /// Canonical absolute path of the config file this daemon image read at
+    /// start. Fixed for the image's lifetime. Omitted by older daemons:
+    /// unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    /// The memory backend this daemon image bound at start: "axel",
+    /// "legacy" (the plain-file store) or "unavailable". Selection, not
+    /// health. Omitted by older daemons: unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_backend: Option<String>,
 }
 
 impl Welcome {
@@ -2115,6 +2125,8 @@ mod tests {
                 daemon_build: "abc1234".into(),
                 features: Vec::new(),
                 boot_id: String::new(),
+                config_path: Some("/home/u/.synaps-cli/config".into()),
+                memory_backend: Some("legacy".into()),
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
             DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
@@ -2403,6 +2415,8 @@ mod tests {
             daemon_build: String::new(),
             features: daemon_features(),
             boot_id: String::new(),
+            config_path: None,
+            memory_backend: None,
         };
         assert!(!serde_json::to_string(&w).unwrap().contains("boot_id"));
         w.boot_id = "9f3c61d2a07e45b1".into();
@@ -2417,6 +2431,27 @@ mod tests {
         let back: Welcome = serde_json::from_value(old).unwrap();
         assert_eq!(back.boot_id, "");
         assert!(!back.supports(FEATURE_SESSION_WORKERS));
+    }
+
+    #[test]
+    fn welcome_config_path_and_memory_backend_are_optional() {
+        // An older daemon's Welcome has neither field: both read as unknown.
+        let old = r#"{"protocol_version":3,"daemon_version":"0.9.0","pid":1,"profile":null,"sessions":[],"progressive_tool_disclosure":true}"#;
+        let mut w: Welcome = serde_json::from_str(old).unwrap();
+        assert_eq!(w.config_path, None);
+        assert_eq!(w.memory_backend, None);
+        // Unknown stays unknown on the wire: no null keys.
+        let json = serde_json::to_value(&w).unwrap();
+        assert!(json.get("config_path").is_none(), "{json}");
+        assert!(json.get("memory_backend").is_none(), "{json}");
+        w.config_path = Some("/home/u/.synaps-cli/config".into());
+        w.memory_backend = Some("legacy".into());
+        let json = serde_json::to_value(&w).unwrap();
+        assert_eq!(json["config_path"], "/home/u/.synaps-cli/config");
+        assert_eq!(json["memory_backend"], "legacy");
+        let back: Welcome = serde_json::from_value(json).unwrap();
+        assert_eq!(back.config_path.as_deref(), Some("/home/u/.synaps-cli/config"));
+        assert_eq!(back.memory_backend.as_deref(), Some("legacy"));
     }
 
     #[test]
@@ -2482,6 +2517,8 @@ mod tests {
             daemon_build: String::new(),
             features: daemon_features(),
             boot_id: String::new(),
+            config_path: Some("/home/u/.synaps-cli/config".into()),
+            memory_backend: Some("legacy".into()),
         })
         .unwrap()
         .to_lowercase();
@@ -2548,6 +2585,8 @@ mod tests {
             daemon_build: String::new(),
             features: Vec::new(),
             boot_id: String::new(),
+            config_path: None,
+            memory_backend: None,
         };
         let old: Welcome = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
         assert!(!old.supports(FEATURE_OWNED_SESSIONS));
@@ -2711,6 +2750,8 @@ mod catalog_page_tests {
                 daemon_build: String::new(),
                 features: daemon_features(),
                 boot_id: String::new(),
+                config_path: None,
+                memory_backend: None,
             })
             .unwrap();
             for row in [&list["sessions"][0], &welcome["sessions"][0], &serde_json::to_value(&m).unwrap()] {

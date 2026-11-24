@@ -247,6 +247,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         daemon_build: crate::session::wire::build_id().to_string(),
         features: crate::session::wire::daemon_features(),
         boot_id: state.boot_id.clone(),
+        config_path: state.host.started_config_path().map(str::to_owned),
+        memory_backend: Some(state.host.started_memory_backend().to_owned()),
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
