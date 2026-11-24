@@ -484,6 +484,19 @@ impl NextTurnRequest<'_> {
     }
 }
 
+/// An accepted cache-preserving compaction request
+/// ([`Runtime::compaction_cached_request`]).
+#[derive(Debug, Clone)]
+pub(super) struct ChatSummaryReply {
+    /// The reply (`content` blocks).
+    pub reply: Value,
+    /// What the provider billed for it: its cache reads and writes say
+    /// whether the history was read from the cache.
+    pub usage: KeepWarmUsage,
+    /// The system prompt the request carried.
+    pub system_prompt: Option<String>,
+}
+
 /// Run one ping's request to completion, draining its private event channel
 /// WHILE it runs: usage lands in the tap as it arrives, so an aborted ping
 /// can still be booked. Notices (and retry notes) are collected; with
@@ -648,18 +661,17 @@ impl Runtime {
     /// cache identity, or a history that does not start with the messages
     /// that request sent. Runs no tool, fires no hook, never touches
     /// `history` or any session state, and emits nothing to a frontend.
-    /// Returns the reply with the system prompt the request carried (the
-    /// summary's provenance digests it).
     pub(super) async fn compaction_cached_request(
         &self,
         history: &[SharedMessage],
         instructions: &str,
         expect: CachedPrefix,
-    ) -> Result<(Value, Option<String>)> {
+    ) -> Result<ChatSummaryReply> {
         // A remote summarization request: counted at the same seam as the
         // transcript request (`Runtime::compact_call`), before any assembly.
         self.remote_summarization_attempts
             .fetch_add(1, Ordering::SeqCst);
+        let tap = PingTap::default();
         let (result, _notices, system_prompt) = self
             .next_turn_request(
                 history,
@@ -668,10 +680,23 @@ impl Runtime {
                     instructions,
                     expect,
                 },
-                &PingTap::default(),
+                &tap,
             )
             .await?;
-        Ok((result?, system_prompt))
+        // Did it read the cache? Every check before the network said it
+        // would; the provider's usage says whether it did. Reported even
+        // when the reply is then refused: the request was billed.
+        let usage = tap.usage();
+        if let Some(warning) =
+            super::compaction_cached::cache_miss_warning(self.session_id.as_deref(), &usage)
+        {
+            tracing::warn!("{warning}");
+        }
+        Ok(ChatSummaryReply {
+            reply: result?,
+            usage,
+            system_prompt,
+        })
     }
 
     /// `Err` = refused before any request was built (nothing billed);

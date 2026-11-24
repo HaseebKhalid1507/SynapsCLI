@@ -61,7 +61,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::compaction::{CompactionOutcome, DisclosurePolicy, RenderedCompactionInput};
-use super::keepwarm::CachedPrefix;
+use super::keepwarm::{CachedPrefix, KeepWarmUsage};
 use super::Runtime;
 use crate::session::cache_keepwarm::{governing_ttl, honoured_ttl, TtlEvidence, LATE_GUARD};
 use crate::SharedMessage;
@@ -291,6 +291,24 @@ pub fn summary_from_reply(reply: &Value) -> Result<String, &'static str> {
     Ok(text)
 }
 
+/// What to say when a cache-preserving request did not read the cache:
+/// the provider wrote more of it than it read (`cache_creation` over
+/// `cache_read` in its usage), so the history was billed at the write
+/// price. `None` when it mostly read, which is the expected case (the
+/// reply after the last request is always written).
+pub fn cache_miss_warning(session: Option<&str>, usage: &KeepWarmUsage) -> Option<String> {
+    let (read, written) = (usage.cache_read_tokens, usage.cache_write_tokens);
+    (written > read).then(|| {
+        format!(
+            "cache-preserving compaction missed the prompt cache (session {}): {written} tokens \
+             written to the cache, {read} read from it. Likely cause: the cached prefix had \
+             expired before the request arrived (a TTL shorter than assumed), or a message \
+             ahead of the last one went out changed (images retired, thinking blocks dropped)",
+            session.unwrap_or("unknown")
+        )
+    })
+}
+
 /// Summarize through the chat's own next request when [`cached_path`]
 /// allows it. `None` (the conditions do not hold, or the request failed in
 /// any way) sends the caller to the transcript request; why is logged. The
@@ -316,8 +334,8 @@ pub(super) async fn summarize(
         .compaction_cached_request(history, &instructions, expect)
         .await;
     let (summary_text, system_prompt) = match reply {
-        Ok((reply, system_prompt)) => match summary_from_reply(&reply) {
-            Ok(text) => (text, system_prompt),
+        Ok(sent) => match summary_from_reply(&sent.reply) {
+            Ok(text) => (text, sent.system_prompt),
             Err(why) => {
                 tracing::warn!(
                     reason = why,
@@ -367,6 +385,9 @@ mod tests {
     const CACHED_SUMMARY: &str = "## Goal\nSUMMARY-FROM-THE-CHAT-REQUEST";
     const TRANSCRIPT_SUMMARY: &str = "## Goal\nSUMMARY-FROM-THE-TRANSCRIPT-REQUEST";
     const RESULT_SENTINEL: &str = "TOOL-RESULT-SENTINEL-9f3a";
+    /// The cache usage every streamed mock reply reports.
+    const MOCK_CACHE_READ: u64 = 1_200;
+    const MOCK_CACHE_WRITE: u64 = 30;
     /// A cached prefix with no messages (it leads any history) and an
     /// arbitrary identity, for the checks that never build a request.
     const SEVEN: CachedPrefix = CachedPrefix {
@@ -455,7 +476,8 @@ mod tests {
         };
         event(json!({"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": null},
             "usage": {"input_tokens": 10, "output_tokens": 1,
-                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}));
+                "cache_creation_input_tokens": MOCK_CACHE_WRITE,
+                "cache_read_input_tokens": MOCK_CACHE_READ}}));
         event(json!({"type": "message_stop"}));
         out
     }
@@ -1213,6 +1235,53 @@ mod tests {
         rt.set_api_retries(3);
         let (seen, outcome) = compact_after(rt, vec![Stream::Overloaded], |_| {}).await;
         assert_fell_back_once(&seen, &outcome);
+    }
+
+    /// A request that wrote more than it read is reported, with the
+    /// session and both numbers; one that mostly read is not.
+    #[test]
+    fn a_request_that_wrote_more_than_it_read_is_reported() {
+        let usage = |read, written| KeepWarmUsage {
+            cache_read_tokens: read,
+            cache_write_tokens: written,
+            ..KeepWarmUsage::default()
+        };
+        assert_eq!(cache_miss_warning(Some("s1"), &usage(400_000, 900)), None);
+        assert_eq!(cache_miss_warning(Some("s1"), &usage(0, 0)), None);
+        assert_eq!(cache_miss_warning(Some("s1"), &usage(5_000, 5_000)), None);
+        let warning = cache_miss_warning(Some("sess-42"), &usage(4_000, 396_000)).expect("a miss");
+        for part in ["sess-42", "396000 tokens written", "4000 read", "Likely cause"] {
+            assert!(warning.contains(part), "{part}: {warning}");
+        }
+        assert!(cache_miss_warning(None, &usage(0, 1)).unwrap().contains("session unknown"));
+    }
+
+    /// The usage the provider reports for the chat request reaches that
+    /// check: a reply that wrote the history is still a summary (it was
+    /// paid for), and the miss is seen.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn the_usage_of_the_chat_request_is_read() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, _mock) = spawn_mock(vec![
+            Stream::Blocks(vec![text("hi")]),
+            Stream::Blocks(vec![text(CACHED_SUMMARY)]),
+        ])
+        .await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = opus();
+        let history = warm_chat(&rt).await;
+        let expect = rt.cached_prefix().unwrap();
+        let sent = rt
+            .compaction_cached_request(&history, "summarize", expect)
+            .await
+            .expect("sent");
+        assert_eq!(
+            (sent.usage.cache_read_tokens, sent.usage.cache_write_tokens),
+            (MOCK_CACHE_READ, MOCK_CACHE_WRITE),
+            "the usage the provider reported"
+        );
+        assert!(cache_miss_warning(None, &sent.usage).is_none());
     }
 
     #[test]
