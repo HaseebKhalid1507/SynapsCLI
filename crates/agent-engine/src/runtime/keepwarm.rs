@@ -919,10 +919,14 @@ impl Runtime {
             tx,
             cancel,
             // Neither a ping nor a compaction request retries: both retry
-            // budgets are zero, and the transport sends either exactly once
-            // (`single_attempt`: no 429 wait, no overload retry). A failed
-            // compaction request falls back to the transcript request,
-            // which keeps the normal retries.
+            // budgets are zero, and the transport ends either on its first
+            // HTTP 429 or 5xx, network error, in-stream error or overload
+            // (`single_attempt`: no wait, no account switch at a limit).
+            // That is not "sent exactly once": the immediate resends listed
+            // at `single_attempt` remain (a 401, a gzip refusal, a refused
+            // cache-diagnosis header). A failed compaction request falls
+            // back to the transcript request, which keeps the normal
+            // retries.
             0,
             0,
             &options,

@@ -534,6 +534,9 @@ mod tests {
         seen: Arc<Mutex<Vec<Seen>>>,
         /// Reply to the n-th streaming request; the last entry repeats.
         streams: Arc<Vec<Stream>>,
+        /// Requests refused (HTTP 415) because their body was compressed;
+        /// they are not in `seen`.
+        compressed: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Mock {
@@ -586,13 +589,18 @@ mod tests {
         let mock = Mock {
             seen: Arc::default(),
             streams: Arc::new(streams),
+            compressed: Arc::default(),
         };
         let app = Router::new()
             .route(
                 "/v1/messages",
                 post(
-                    |State(m): State<Mock>, headers: axum::http::HeaderMap, body: String| async move {
-                        let body: Value = serde_json::from_str(&body).unwrap();
+                    |State(m): State<Mock>, headers: axum::http::HeaderMap, body: axum::body::Bytes| async move {
+                        if headers.contains_key("content-encoding") {
+                            m.compressed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+                        }
+                        let body: Value = serde_json::from_slice(&body).unwrap();
                         let stream = body["stream"] == true;
                         let nth = {
                             let mut seen = m.seen.lock().unwrap();
@@ -1572,5 +1580,34 @@ mod tests {
         }
         assert_eq!(summary_from_reply(&reply(json!([]))), Err("the reply has no text"));
         assert_eq!(summary_from_reply(&json!({})), Err("the reply has no text"));
+    }
+
+    /// What "not retried" leaves: a compaction request whose gzip body is
+    /// refused is sent again at once, uncompressed, and that reply is the
+    /// summary. (The comment at `single_attempt` in `api.rs` lists this
+    /// resend and the two others.)
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_gzip_refusal_resends_the_compaction_request_at_once() {
+        use std::sync::atomic::Ordering;
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock(vec![
+            Stream::Blocks(vec![text("hi")]),
+            Stream::Blocks(vec![text(CACHED_SUMMARY)]),
+        ])
+        .await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus();
+        let history = warm_chat(&rt).await;
+        assert_eq!(mock.compressed.load(Ordering::SeqCst), 0);
+        rt.request_compression = crate::runtime::request_encoding::RequestCompression::always();
+
+        let outcome = compact_conversation(&history, &rt, None).await.unwrap();
+        assert_eq!(mock.compressed.load(Ordering::SeqCst), 1, "the refused gzip send");
+        let seen = mock.seen().split_off(1);
+        assert_eq!(seen.len(), 1, "and one resend, uncompressed");
+        assert!(seen[0].streams(), "of the chat's own request");
+        assert_eq!(outcome.summary_text, CACHED_SUMMARY);
+        assert_eq!(outcome.summary_request, Some(agent_core::compaction::SummaryRequest::ChatRequest));
     }
 }

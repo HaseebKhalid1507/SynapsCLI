@@ -983,7 +983,9 @@ pub struct ApiOptions {
     /// as the last user message — with the message cache marker on the
     /// last HISTORY message, as a keep-warm ping has it, not on the
     /// instructions. Otherwise it differs from a turn only off the wire: it
-    /// is sent once (no retry of any class), it is refused before the network when it could not
+    /// is not retried after a 429, 5xx, network or stream error (the
+    /// immediate resends that remain are listed at `single_attempt`), it
+    /// is refused before the network when it could not
     /// read what the last accepted request left in the cache
     /// ([`CompactionRequest`]), it never switches accounts at a limit, it
     /// sends no `diagnostics` field, and its telemetry record carries
@@ -1842,9 +1844,24 @@ impl ApiMethods {
         // A compaction summary reads the cache of the account the chat is
         // on: it never switches either (another account's cache is cold).
         let stays_on_account = options.keepwarm.is_some() || options.compaction.is_some();
-        // Both are also sent once: no retry of any class (HTTP 429 and 5xx,
-        // network errors, in-stream errors and overloads), whatever
-        // `max_retries` says.
+        // Neither is retried after a failure of the request itself: an
+        // HTTP 429 or 5xx, a network error, an in-stream error or an
+        // overload ends it, whatever `max_retries` says, with no wait.
+        // It is not always ONE send, though. Three immediate resends
+        // remain, each at most once per request and none of them waiting:
+        // - a 401 on a managed credential (OAuth, or a remote source)
+        //   re-sends after obtaining a fresh token. A local source
+        //   refreshes the same bound credential
+        //   (`AuthMethods::recover_local_rejection`). A remote (broker)
+        //   source re-vends the seat this request is pinned to; only under
+        //   `auto`, and only when that seat cannot be vended or is cooling
+        //   down, does it select again (`AuthMethods::vend_auto`), which
+        //   is the one way a resend can reach another account;
+        // - a gzip body refused with 400 or 415 re-sends uncompressed
+        //   (`request_encoding`), on the same account;
+        // - with `cache_diagnostics` on and an API key, a 400 or 422 that
+        //   blames the cache-diagnosis beta header re-sends without it,
+        //   on the same account.
         let single_attempt = stays_on_account;
         let mut sent_at_ms;
 
