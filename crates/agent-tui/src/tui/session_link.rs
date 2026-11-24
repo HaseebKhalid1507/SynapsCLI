@@ -66,7 +66,9 @@ impl SessionLink {
 
     /// An older daemon broadcasts every reply, and every client numbers its
     /// requests from 1: another client's `QueryResult{5}` would answer ours.
-    /// Against one, this link's ids start at a random base instead. Checked
+    /// Against one, this link's ids start at a random base instead, which
+    /// makes an accidental collision highly unlikely (not impossible: the
+    /// replies are still broadcast). Checked
     /// again after a reconnect (a reload can change the daemon binary).
     fn keep_ids_apart(&mut self) {
         if !self.transport.addressed_replies() && self.next_id < SHARED_ID_FLOOR {
@@ -703,10 +705,10 @@ mod tests {
     }
 
     /// The old-reader contract the daemon relies on: another client's
-    /// `SettingChanged`/`Resumed`, projected to `VIEW_CHANGED_SETTING_ID`,
-    /// is never taken for this link's reply, and the view still follows it.
+    /// `SettingChanged`, projected to `VIEW_CHANGED_SETTING_ID`, is never
+    /// taken for this link's `Set` reply, and the view still follows it.
     #[tokio::test]
-    async fn a_view_only_setting_or_resume_is_never_taken_for_the_reply() {
+    async fn a_view_only_setting_is_never_taken_for_the_reply() {
         use agent_engine::session::wire::VIEW_CHANGED_SETTING_ID;
         let mut t = ScriptedTransport::new(Runtime::new_headless());
         let mut theirs = (*t.view()).clone();
@@ -719,6 +721,22 @@ mod tests {
             view: theirs,
             clamp: None,
         }));
+        let mut link = SessionLink::new(Box::new(t));
+        let applied = link.set(SessionSetting::ApiRetries { n: 2 }).await.unwrap();
+        assert_eq!(applied.id, 1, "its own reply");
+        let seen = link.next_event().await.unwrap();
+        assert!(matches!(&seen.event, SessionEventWire::SettingChanged(a) if a.id == VIEW_CHANGED_SETTING_ID && a.view.model == "their-model"));
+    }
+
+    /// The same for `Resume`: the view-only `Resumed` comes first, this
+    /// link's own reply (the scripted error) second. `resume()` sees the
+    /// view-only one first, skips it, returns its own, and leaves the
+    /// view-only one for the loop. Without the id check it would return
+    /// the other client's switch as its own.
+    #[tokio::test]
+    async fn a_view_only_resume_is_never_taken_for_the_reply() {
+        use agent_engine::session::wire::VIEW_CHANGED_SETTING_ID;
+        let mut t = ScriptedTransport::new(Runtime::new_headless());
         t.push_event(SessionEventWire::Resumed {
             id: VIEW_CHANGED_SETTING_ID,
             old_id: "a".into(),
@@ -727,13 +745,12 @@ mod tests {
             clamp_notice: None,
         });
         let mut link = SessionLink::new(Box::new(t));
-        let applied = link.set(SessionSetting::ApiRetries { n: 2 }).await.unwrap();
-        assert_eq!(applied.id, 1, "its own reply");
-        assert!(link.resume("x").await.is_err(), "its own (error) reply, not the view-only Resumed");
-        // Both view-only events reach the loop, in order.
-        let seen = [link.next_event().await.unwrap(), link.next_event().await.unwrap()];
-        assert!(matches!(&seen[0].event, SessionEventWire::SettingChanged(a) if a.id == VIEW_CHANGED_SETTING_ID && a.view.model == "their-model"));
-        assert!(matches!(&seen[1].event, SessionEventWire::Resumed { id, .. } if *id == VIEW_CHANGED_SETTING_ID));
+        match link.resume("x").await {
+            Err(e) => assert!(e.contains("scripted: no sessions on disk"), "its own reply: {e}"),
+            Ok(r) => panic!("took the view-only Resumed {} → {} for its own", r.old_id, r.new_id),
+        }
+        let seen = link.next_event().await.unwrap();
+        assert!(matches!(&seen.event, SessionEventWire::Resumed { id, new_id, .. } if *id == VIEW_CHANGED_SETTING_ID && new_id == "b"), "{seen:?}");
     }
 
     fn refusing_link() -> SessionLink {

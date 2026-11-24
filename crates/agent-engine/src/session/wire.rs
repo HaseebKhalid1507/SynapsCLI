@@ -80,8 +80,9 @@ pub const FEATURE_SESSION_PAGE: &str = "session_page";
 /// its id projected to [`VIEW_CHANGED_SETTING_ID`]. Nothing on the wire
 /// changes: an older client simply stops seeing replies that were never
 /// its own. Without it (an older daemon broadcasts every reply), a client
-/// keeps its request ids apart from other clients' by drawing them from a
-/// random base in `[2^32, 2^62)`.
+/// draws its request ids from a random base in `[2^32, 2^62)`, which makes
+/// an accidental collision with another client's ids highly unlikely (a
+/// mitigation: replies are still broadcast and equal ids still correlate).
 pub const FEATURE_ADDRESSED_REPLIES: &str = "addressed_replies";
 
 /// `CatalogPage.limit` when absent, and its ceiling.
