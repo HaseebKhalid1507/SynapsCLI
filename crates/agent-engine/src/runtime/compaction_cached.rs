@@ -39,7 +39,13 @@
 //! 4. the history, the instructions and the summary's output fit the
 //!    model's context window;
 //! 5. the cache is known to be warm, and written by a request with this
-//!    one's cache identity ([`CacheState`]).
+//!    one's cache identity ([`CacheState`]);
+//! 6. the instructions, a user message that is not a tool result, do not
+//!    make the provider strip earlier thinking: on models before Opus 4.5,
+//!    Sonnet 4.6 and Haiku 5.5 that removes every message after the first
+//!    thinking block from the cache (same page, "Non-tool results passed to
+//!    requests with thinking"), so a history holding thinking blocks would
+//!    be written again, at the write price.
 //!
 //! Any failure of the request (an error, a tool call, no text) falls back to
 //! the transcript request, once. Nothing here touches the history.
@@ -120,6 +126,7 @@ pub enum Skip {
     DoesNotFit { needed: u64, window: u64 },
     CacheCold { age: Duration, ttl: Duration },
     CacheUnknown,
+    ThinkingStripped,
 }
 
 impl std::fmt::Display for Skip {
@@ -146,6 +153,10 @@ impl std::fmt::Display for Skip {
             Skip::CacheUnknown => {
                 f.write_str("nothing is known about the prompt cache (no request yet)")
             }
+            Skip::ThinkingStripped => f.write_str(
+                "this model drops earlier thinking blocks, and the cached messages with them, \
+                 when a user message is added",
+            ),
         }
     }
 }
@@ -197,6 +208,9 @@ pub async fn cached_path(
     if !super::auth::model_is_anthropic(model) {
         return Err(Skip::NotAnthropic);
     }
+    if !crate::core::models::model_keeps_earlier_thinking(model) && holds_thinking(history) {
+        return Err(Skip::ThinkingStripped);
+    }
     // The request as it will be sent: the history plus the instructions.
     // Its footprint is the provider's own count of the last request plus an
     // estimate of what was appended, when the runtime has one.
@@ -224,6 +238,17 @@ pub async fn cached_path(
         CacheState::Cold { age, ttl } => Err(Skip::CacheCold { age, ttl }),
         CacheState::Unknown => Err(Skip::CacheUnknown),
     }
+}
+
+/// Whether any assistant message of `history` holds a thinking block.
+fn holds_thinking(history: &[SharedMessage]) -> bool {
+    history.iter().any(|message| {
+        message["content"].as_array().is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|b| matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking")))
+        })
+    })
 }
 
 /// The summary text of a cache-preserving compaction reply (`content`
@@ -859,6 +884,39 @@ mod tests {
             cached_path(&rt, &history, rt.model(), &policy, "summarize").await,
             Err(Skip::NotAnthropic)
         );
+    }
+
+    /// Condition 6: on a model that drops earlier thinking when a user
+    /// message is added, a history with thinking blocks would lose its
+    /// cached messages; one without them, or a model that keeps them, is
+    /// eligible.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_model_that_strips_earlier_thinking_is_not_eligible_with_thinking_in_the_history() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let plain = vec![user("hello"), Arc::new(json!({"role": "assistant", "content": "hi"}))];
+        let thought = vec![
+            user("hello"),
+            Arc::new(json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "hm", "signature": "sig"},
+                text("hi"),
+            ]})),
+        ];
+        let policy = DisclosurePolicy::default();
+        let eligible = |model: &'static str, history: Vec<SharedMessage>| {
+            let policy = policy.clone();
+            async move {
+                let rt = chat(model, ReasoningLevel::High, CacheTtl::FiveMinutes);
+                rt.cache_anchor.stamp_identified(CacheAnchor::now(), 7);
+                cached_path(&rt, &history, rt.model(), &policy, "summarize").await
+            }
+        };
+        assert_eq!(
+            eligible("claude-sonnet-4-5", thought.clone()).await,
+            Err(Skip::ThinkingStripped)
+        );
+        assert_eq!(eligible("claude-sonnet-4-5", plain).await, Ok(7));
+        assert_eq!(eligible("claude-sonnet-4-6", thought).await, Ok(7));
     }
 
     /// Condition 4: a history that does not fit the window with the

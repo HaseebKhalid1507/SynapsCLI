@@ -190,6 +190,44 @@ pub fn model_rejects_output_overflow(model: &str) -> bool {
     matches!(m, "claude-opus-4" | "claude-sonnet-4") || BEFORE_4_5.iter().any(|p| m.starts_with(p))
 }
 
+/// Whether `model` keeps the thinking blocks of earlier turns in context
+/// when a request adds user content that is not a tool result.
+///
+/// Anthropic's prompt-caching docs ("What invalidates the cache", the row
+/// "Non-tool results passed to requests with thinking",
+/// <https://platform.claude.com/docs/en/build-with-claude/prompt-caching#what-invalidates-the-cache>):
+/// "On Claude Opus 4.5 and later Opus models, Claude Sonnet 4.6 and later
+/// Sonnet models, Claude Haiku 5.5, and every Claude Fable and Claude Mythos
+/// model, thinking blocks are preserved by default, so the cache remains
+/// valid. On other models, all previously cached thinking blocks are
+/// stripped from context, and any messages that follow those thinking blocks
+/// are removed from the cache."
+///
+/// `false` for every other id, an unknown one included: a caller that
+/// relies on the cached messages must not assume it.
+pub fn model_keeps_earlier_thinking(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let m = m.strip_prefix("anthropic/").unwrap_or(&m);
+    if m.starts_with("claude-fable") || m.starts_with("claude-mythos") {
+        return true;
+    }
+    // `claude-<family>-<major>[-<minor>][-<date>]`; a part longer than two
+    // digits is a release date, not a minor version.
+    let version = |family: &str| -> Option<(u32, u32)> {
+        let mut parts = m.strip_prefix(family)?.split('-');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts
+            .next()
+            .filter(|p| p.len() <= 2)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        Some((major, minor))
+    };
+    version("claude-opus-").is_some_and(|v| v >= (4, 5))
+        || version("claude-sonnet-").is_some_and(|v| v >= (4, 6))
+        || version("claude-haiku-").is_some_and(|v| v >= (5, 5))
+}
+
 /// Returns the input context window size for a given model, in tokens.
 /// Used as the denominator for the chatui context-usage bar and anywhere
 /// else the client needs to know how much prompt the model will accept.
@@ -236,6 +274,41 @@ mod tests {
     }
 
     use super::*;
+
+    /// The docs' list, by id form: bare, dated, provider-qualified.
+    #[test]
+    fn earlier_thinking_is_kept_from_opus_4_5_sonnet_4_6_haiku_5_5() {
+        for m in [
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-7",
+            "anthropic/claude-opus-5-5",
+            "claude-opus-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-2",
+            "anthropic/claude-mythos-5",
+        ] {
+            assert!(model_keeps_earlier_thinking(m), "{m}");
+        }
+        for m in [
+            "claude-opus-4-1",
+            "claude-opus-4-1-20250805",
+            "claude-opus-4-20250514",
+            "claude-opus-4",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-20250514",
+            "claude-haiku-4-5",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-haiku-20241022",
+            "groq/llama-3.3-70b-versatile",
+            "gpt-6-astra",
+        ] {
+            assert!(!model_keeps_earlier_thinking(m), "{m}");
+        }
+    }
 
     #[test]
     fn default_model_is_first_entry() {

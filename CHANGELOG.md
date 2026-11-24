@@ -184,8 +184,11 @@ All notable changes to this project will be documented in this file.
   summary, `compaction_exclude` is empty, the request fits the context
   window, and the cache is known to be warm (a request or keep-warm ping
   within the cache TTL, with the same model, effort, thinking, system
-  prompt, tools and account). Otherwise the transcript request is sent as
-  before: with a cold cache it is the cheaper one, since writing the full
+  prompt, tools and account). Models older than Opus 4.5, Sonnet 4.6 and
+  Haiku 5.5 drop earlier thinking blocks, and the cached messages after
+  them, when a user message is added, so for them it is used only when the
+  history has no thinking blocks. Otherwise the transcript request is sent
+  as before: with a cold cache it is the cheaper one, since writing the full
   history to the cache costs 1.25 to 2 times the input price and the
   transcript request truncates tool results and thinking. The tools stay
   in the request (removing them would invalidate the cache); if the model
