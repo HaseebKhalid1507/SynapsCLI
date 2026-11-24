@@ -6213,6 +6213,59 @@ mod send_retry_tests {
         assert_eq!(router.reports(), vec!["openai-codex@astra1".to_string()]);
     }
 
+    /// A model refusal (403/404/400: the model isn't available on the
+    /// account the windows chose) is never an auth failure. The turn ends
+    /// with Synaps' explanation; nothing is retried or failed over, and the
+    /// router (the stream's only channel to account state) hears no report,
+    /// so no account is marked signed out, cooling or broken. The typed
+    /// outcome is an API status, never auth.
+    #[tokio::test]
+    async fn a_codex_model_refusal_is_never_an_auth_failure() {
+        use crate::extensions::session_driver::{classify_turn_error, Outcome};
+        const ENTITLEMENT: &str = r#"{"detail":"The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."}"#;
+        const NOT_FOUND: &str = r#"{"error":{"type":"invalid_request_error","code":"model_not_found","message":"The model does not exist."}}"#;
+        const NOT_ON_ACCOUNT: &str = "isn't available on the selected ChatGPT account";
+        const UNKNOWN_HERE: &str = "doesn't know this model for this account";
+        for (status, body, explains) in [
+            (StatusCode::FORBIDDEN, ENTITLEMENT, NOT_ON_ACCOUNT),
+            (StatusCode::BAD_REQUEST, ENTITLEMENT, NOT_ON_ACCOUNT),
+            (StatusCode::NOT_FOUND, NOT_FOUND, UNKNOWN_HERE),
+            (StatusCode::BAD_REQUEST, NOT_FOUND, UNKNOWN_HERE),
+        ] {
+            let (url, seen) = spawn_scripted_codex(vec![(status, vec![], body)]).await;
+            let router = ScriptedRouter::new(
+                pinned("codex2", "acct_A", true),
+                vec![Some(pinned("codex5", "acct_B", true))],
+            );
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let err = run_codex_with_router(&url, &router, 3, &tx)
+                .await
+                .expect_err("a refused model fails the turn");
+            let text = err.to_string();
+            assert!(
+                text.starts_with(&format!("codex request failed: {status}")),
+                "{text}"
+            );
+            assert!(text.contains(explains), "{status}: {text}");
+            assert_eq!(seen.lock().unwrap().len(), 1, "{status}: sent once");
+            assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0, "{status}");
+            assert!(router.reports().is_empty(), "{status}: no account marked");
+            let runtime =
+                super::super::net::provider_error_to_runtime_for("openai-codex/gpt-6-astra", err);
+            assert!(
+                matches!(runtime, crate::RuntimeError::ApiStatus(_)),
+                "{status}: {runtime:?}"
+            );
+            let (outcome, kind) =
+                classify_turn_error(&crate::runtime::helpers::turn_error_for(&runtime, "t"));
+            assert_eq!(
+                (outcome, kind.as_str()),
+                (Outcome::Blocked, "unknown"),
+                "{status}"
+            );
+        }
+    }
+
     /// A generic 429 (no exhaustion evidence) keeps the ordinary transport
     /// retry on the SAME account — it is not proof of a spent window.
     #[tokio::test]
