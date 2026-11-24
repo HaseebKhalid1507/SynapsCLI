@@ -156,8 +156,8 @@ All notable changes to this project will be documented in this file.
   (also unset or empty, the default) has the chat's own model write
   `/compact` and auto-compaction summaries; `provider-small` uses the small
   model pinned for the chat's provider on the chat's own account
-  (`claude-haiku-5-5` for Anthropic, `gpt-6-luna` for OpenAI Codex, the
-  chat's own model elsewhere); a model id names any routable model. A
+  (`claude-haiku-5-5` for Anthropic, the chat's own model elsewhere,
+  OpenAI Codex included); a model id names any routable model. A
   summary goes to another provider only when a model there is named. A
   named or pinned model that can't be used (no route, a reasoning level its
   provider refuses, a smaller context window than the chat's, no

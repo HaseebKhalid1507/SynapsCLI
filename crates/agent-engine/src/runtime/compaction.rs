@@ -1972,8 +1972,8 @@ mod disclosure_tests {
         );
         assert_eq!(
             choice(codex, small, None),
-            (codex.to_string(), unusable(luna, no_key)),
-            "signed out of the chat's own provider: never another provider's pin"
+            own(codex),
+            "no Codex pin (its usage readings don't report gpt-6-luna): match"
         );
         // Named: that model, or the chat's own model with the notice.
         assert_eq!(
@@ -2003,14 +2003,16 @@ mod disclosure_tests {
             },
         )
         .unwrap();
-        assert_eq!(choice(codex, small, None), own(luna));
+        assert_eq!(choice(codex, small, None), own(codex), "signed in: still no pin");
         assert_eq!(choice(opus, Some(luna), None), own(luna), "cross-provider");
-        // A level the pin's provider refuses for it: the chat's own model.
+        // A level the named model's provider refuses for it: the chat's own
+        // model; provider-small on Codex is the chat's own model already.
         let sol = "openai-codex/gpt-6.1-sol";
         assert_eq!(
-            choice(sol, small, Some(ReasoningLevel::Ultra)),
+            choice(sol, Some(luna), Some(ReasoningLevel::Ultra)),
             (sol.to_string(), unusable(luna, level))
         );
+        assert_eq!(choice(sol, small, Some(ReasoningLevel::Ultra)), own(sol));
         // The `anthropic/` form too, at a level only the chat's own model
         // takes (Max on Fable 5): not left to the request's preflight.
         let fable = "anthropic/claude-fable-5";
@@ -2057,6 +2059,32 @@ mod disclosure_tests {
         assert_eq!(disclosure.model, opus);
         let line = disclosure.render_line();
         assert!(line.ends_with(&unusable(groq, no_key).unwrap()), "{line}");
+    }
+
+    /// `provider-small` on a Codex chat asks the chat's own model for the
+    /// `/compact` summary, never `gpt-6-luna` (an account whose Codex usage
+    /// reading doesn't list it can't be selected for it); on an Anthropic
+    /// chat it asks Haiku, as before.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn provider_small_compaction_asks_the_codex_chats_own_model_not_luna() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        for (own, asked) in [
+            ("openai-codex/gpt-5.5", "openai-codex/gpt-5.5"),
+            ("openai-codex/gpt-6.1-sol", "openai-codex/gpt-6.1-sol"),
+            ("claude-opus-5-5", "claude-haiku-5-5"),
+        ] {
+            let mut runtime = crate::Runtime::new_headless();
+            runtime.set_model(own.to_string());
+            runtime.set_compaction_model(Some("provider-small".to_string()));
+            crate::runtime::script_summary_requests(|_| Some(Ok("SUMMARY".to_string())));
+            let outcome = compact_conversation(&sentinel_messages(), &runtime, None)
+                .await
+                .expect("the scripted summary");
+            assert_eq!(crate::runtime::scripted_summary_requests(), [asked], "{own}");
+            assert_eq!(outcome.summary_model, asked, "{own}");
+            assert_eq!(outcome.summary_text, "SUMMARY");
+        }
     }
 
     /// M7 (CP-12 review): local summaries are byte-bounded at UTF-8 char

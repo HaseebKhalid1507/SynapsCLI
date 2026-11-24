@@ -811,6 +811,46 @@ fn build_http_client(read_timeout: Duration) -> reqwest::Result<Client> {
         .build()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: every model [`Runtime::compact_call`] is asked for on the
+    /// setting thread, and the reply the script gives for it in place of
+    /// the request (`None`: the request goes ahead as usual).
+    static SCRIPTED_SUMMARY_REQUESTS: std::cell::RefCell<Option<ScriptedSummaryRequests>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ScriptedSummaryRequests {
+    requested: Vec<String>,
+    reply: fn(&str) -> Option<Result<String>>,
+}
+
+/// Scripts the compaction requests on this thread (see
+/// [`SCRIPTED_SUMMARY_REQUESTS`]); [`scripted_summary_requests`] ends it.
+#[cfg(test)]
+pub(crate) fn script_summary_requests(reply: fn(&str) -> Option<Result<String>>) {
+    SCRIPTED_SUMMARY_REQUESTS.with(|script| {
+        *script.borrow_mut() = Some(ScriptedSummaryRequests {
+            requested: Vec::new(),
+            reply,
+        });
+    });
+}
+
+/// The models asked for since [`script_summary_requests`], in order; ends
+/// the script.
+#[cfg(test)]
+pub(crate) fn scripted_summary_requests() -> Vec<String> {
+    SCRIPTED_SUMMARY_REQUESTS.with(|script| {
+        script
+            .borrow_mut()
+            .take()
+            .map(|script| script.requested)
+            .unwrap_or_default()
+    })
+}
+
 /// The `compaction_model = provider-small` pin
 /// ([`agent_core::models::PROVIDER_SMALL_MODELS`]) for the provider of
 /// `model`'s route, if it has one.
@@ -3252,6 +3292,15 @@ impl Runtime {
         // refresh, or any request assembly (CP-12 M3).
         self.remote_summarization_attempts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        if let Some(reply) = SCRIPTED_SUMMARY_REQUESTS.with(|script| {
+            let mut script = script.borrow_mut();
+            let script = script.as_mut()?;
+            script.requested.push(model.to_string());
+            (script.reply)(model)
+        }) {
+            return reply;
+        }
         self.validate_request_preflight_for(
             model,
             crate::runtime::openai::catalog::CodexRequestRole::Internal,

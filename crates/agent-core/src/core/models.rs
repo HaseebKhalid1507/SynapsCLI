@@ -17,10 +17,10 @@ pub const KNOWN_MODELS: &[(&str, &str)] = &[
 /// chat's summaries, by the provider of the chat's route, on the chat's own
 /// account. One line per pin; update a pin here. A provider without a line
 /// has its chats' summaries written by the chat's own model.
-pub const PROVIDER_SMALL_MODELS: &[(&str, &str)] = &[
-    ("anthropic", "claude-haiku-5-5"),
-    ("openai-codex", "gpt-6-luna"),
-];
+/// `openai-codex` has none until the Codex accounts' usage readings report
+/// `gpt-6-luna`: an account whose reading doesn't list it, on a free plan or
+/// with no plan named, can't be selected for it.
+pub const PROVIDER_SMALL_MODELS: &[(&str, &str)] = &[("anthropic", "claude-haiku-5-5")];
 
 pub fn default_model() -> &'static str {
     KNOWN_MODELS[0].0
