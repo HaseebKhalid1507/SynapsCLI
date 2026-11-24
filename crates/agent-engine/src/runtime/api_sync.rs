@@ -27,6 +27,39 @@ fn sync_usage_meta(json: &Value) -> Option<crate::runtime::trace::UsageMeta> {
     })
 }
 
+/// Bytes of JSON request body that are certainly more than one input token.
+/// English prose runs at 3.5 to 4 bytes a token and code or JSON at fewer;
+/// twice that leaves room for escaping and long whitespace runs, so
+/// `body bytes / 8` is a floor under the request's token count, not an
+/// estimate of it.
+const BODY_BYTES_PER_TOKEN_CEILING: u64 = 8;
+
+/// A 429 that no retry can cure: the request sends more input tokens than
+/// the account's per-minute input limit holds. `Some(message)` only when the
+/// response states that limit and even the floor under this request's size
+/// ([`BODY_BYTES_PER_TOKEN_CEILING`]) is above it. The limit is a token
+/// bucket that refills up to the limit and no further
+/// (<https://platform.claude.com/docs/en/api/rate-limits#about-rate-limits>),
+/// so waiting never makes room for such a request.
+///
+/// Only for a request that carries no cache marker, like this file's: every
+/// input token of it counts against the limit (cache reads would not).
+fn exceeds_input_rate_limit(
+    headers: &reqwest::header::HeaderMap,
+    body_len: usize,
+) -> Option<String> {
+    let limit = super::telemetry::input_tokens_limit_from_headers(headers)?;
+    let at_least = body_len as u64 / BODY_BYTES_PER_TOKEN_CEILING;
+    (at_least > limit).then(|| {
+        format!(
+            "Compaction request refused (HTTP 429) and not retried: it sends at least \
+             {at_least} input tokens, none of them cached, and this account's limit is \
+             {limit} input tokens per minute, so no retry can fit it. Set \
+             `compaction_mode = local`, or set `compaction_model` to a model with a higher limit."
+        )
+    })
+}
+
 /// Assemble the compaction request's `system` blocks together with the
 /// [`TranslationReport`](crate::runtime::transport::report::TranslationReport)
 /// that describes the assembly decision — both are produced in the same
@@ -388,7 +421,25 @@ impl ApiMethods {
                             } else {
                                 None
                             };
+                            // A 429 this request can never get past: say so
+                            // now instead of spending the whole retry budget.
+                            let never_fits = is_429
+                                .then(|| exceeds_input_rate_limit(resp.headers(), body_bytes.len()))
+                                .flatten();
                             let error_text = resp.text().await.unwrap_or_default();
+                            if let Some(message) = never_fits {
+                                let log_rid = trace_rid.clone();
+                                if let Some(t) = tracer.take() {
+                                    let terminal = t.failed_terminal("http_429_input_limit");
+                                    t.finish(clock, Some(429), trace_rid, None, None, terminal);
+                                }
+                                tracing::warn!(
+                                    request_id = log_rid.as_ref().map_or("-", |id| id.as_str()),
+                                    body_bytes = body_bytes.len(),
+                                    "compaction request exceeds the per-minute input limit (not retried)"
+                                );
+                                return Err(RuntimeError::ApiStatus(message));
+                            }
 
                             // gzip refusal fail-soft: resend once uncompressed,
                             // costing no retry budget (see `request_encoding`).
@@ -702,5 +753,112 @@ mod concat_response_text_tests {
     fn returns_empty_for_non_array_content() {
         let v = json!({"content": "stringified"});
         assert_eq!(ApiMethods::concat_response_text(&v), "");
+    }
+}
+
+#[cfg(test)]
+mod input_rate_limit_tests {
+    use super::*;
+    use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn headers(limit: Option<&str>) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        if let Some(limit) = limit {
+            h.insert(
+                "anthropic-ratelimit-input-tokens-limit",
+                limit.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    /// Only a stated limit that even the floor under the request's size
+    /// exceeds counts; anything else keeps the ordinary retry.
+    #[test]
+    fn only_a_request_certainly_over_the_stated_limit_never_fits() {
+        // 1.6 MB is at least 200,000 tokens.
+        let incident = 1_600_000;
+        let message = exceeds_input_rate_limit(&headers(Some("50000")), incident).unwrap();
+        assert!(message.contains("at least 200000 input tokens"), "{message}");
+        assert!(message.contains("50000 input tokens per minute"), "{message}");
+        assert!(message.contains("no retry can fit it"), "{message}");
+        // At the limit, or possibly under it: the provider decides.
+        assert_eq!(exceeds_input_rate_limit(&headers(Some("200000")), incident), None);
+        assert_eq!(exceeds_input_rate_limit(&headers(Some("2000000")), incident), None);
+        // No limit stated (a subscription login), or not a number.
+        assert_eq!(exceeds_input_rate_limit(&headers(None), incident), None);
+        assert_eq!(exceeds_input_rate_limit(&headers(Some("lots")), incident), None);
+    }
+
+    /// A provider that answers every request with 429 and `limit`.
+    async fn always_429(limit: Option<&'static str>) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(move |State(hits): State<Arc<AtomicUsize>>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut response = (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "0")],
+                        r#"{"type":"error","error":{"type":"rate_limit_error","message":"synthetic"}}"#,
+                    )
+                        .into_response();
+                    if let Some(limit) = limit {
+                        response.headers_mut().insert(
+                            "anthropic-ratelimit-input-tokens-limit",
+                            limit.parse().unwrap(),
+                        );
+                    }
+                    response
+                }),
+            )
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    async fn compact_against(limit: Option<&'static str>) -> (String, usize) {
+        let (url, hits) = always_429(limit).await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = crate::Runtime::new_headless();
+        // About 40 KB: at least 5,000 tokens.
+        let transcript = "a line of the transcript\n".repeat(1_600);
+        let error = rt
+            .compact_call(
+                "claude-sonnet-4-6",
+                vec![Arc::new(json!({"role": "user", "content": transcript}))],
+            )
+            .await
+            .expect_err("every attempt is refused");
+        (error.to_string(), hits.load(Ordering::SeqCst))
+    }
+
+    /// The request is larger than the whole per-minute allowance: one
+    /// attempt, and an error that says why.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_429_the_request_can_never_fit_is_not_retried() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (error, attempts) = compact_against(Some("1000")).await;
+        assert_eq!(attempts, 1, "retried a request that can never fit: {error}");
+        assert!(error.contains("1000 input tokens per minute"), "{error}");
+        assert!(error.contains("no retry can fit it"), "{error}");
+    }
+
+    /// Control: a 429 the request could get past keeps its retry budget,
+    /// with a limit above the request and with no limit stated at all.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_429_the_request_could_fit_keeps_its_retries() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        for limit in [Some("2000000"), None] {
+            let (error, attempts) = compact_against(limit).await;
+            assert_eq!(attempts, 9, "the first attempt and 8 retries: {error}");
+            assert!(!error.contains("no retry can fit it"), "{error}");
+        }
     }
 }

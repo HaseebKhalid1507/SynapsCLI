@@ -488,6 +488,16 @@ fn unified_utilization_from_headers(headers: &reqwest::header::HeaderMap) -> BTr
     windows
 }
 
+/// The per-minute input-token limit a response reports
+/// (`anthropic-ratelimit-input-tokens-limit`: "the maximum number of input
+/// tokens allowed within any rate limit period",
+/// <https://platform.claude.com/docs/en/api/rate-limits#response-headers>).
+/// `None` when the header is absent or not a number (a subscription login
+/// reports `anthropic-ratelimit-unified-*` windows instead).
+pub fn input_tokens_limit_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    header_u64(headers, "anthropic-ratelimit-input-tokens-limit")
+}
+
 /// Extract the `request-id` response header.
 pub fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
     header_string(headers, "request-id")
@@ -658,18 +668,6 @@ mod tests {
         assert!(!json.contains("\"rollover\":"), "{json}");
     }
 
-    #[test]
-    fn keepwarm_record_is_marked() {
-        let record = TelemetryRecord {
-            ts: 1,
-            model: "claude-opus-4-7".to_string(),
-            keepwarm: true,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&record).unwrap();
-        assert!(json.contains("\"keepwarm\":true"), "{json}");
-    }
-
     /// A cache-preserving compaction request is told apart in the api-log;
     /// no other record carries the field.
     #[test]
@@ -682,6 +680,18 @@ mod tests {
         assert!(json.contains("\"compaction\":true"), "{json}");
         let turn = serde_json::to_string(&TelemetryRecord::default()).unwrap();
         assert!(!turn.contains("compaction"), "{turn}");
+    }
+
+    #[test]
+    fn keepwarm_record_is_marked() {
+        let record = TelemetryRecord {
+            ts: 1,
+            model: "claude-opus-4-7".to_string(),
+            keepwarm: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"keepwarm\":true"), "{json}");
     }
 
     #[test]
