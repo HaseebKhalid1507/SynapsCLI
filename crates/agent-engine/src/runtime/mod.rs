@@ -52,6 +52,7 @@ pub mod subagent_watch;
 pub mod telemetry;
 mod read_dedupe;
 pub mod tool_spill;
+pub mod tool_call_events;
 pub mod trace;
 pub mod worker_context;
 pub(crate) mod transport;
@@ -83,13 +84,87 @@ pub async fn emit_before_tool_call(
     session_id: Option<&str>,
     cwd: Option<&Path>,
 ) -> crate::extensions::hooks::events::HookResult {
+    emit_before_tool_call_with(
+        hook_bus,
+        tool_name,
+        runtime_tool_name,
+        input,
+        &crate::extensions::hooks::events::ToolCallHookContext {
+            session_id,
+            tool_call_id: None,
+            cwd: crate::extensions::hooks::events::hook_cwd(cwd),
+        },
+    )
+    .await
+}
+
+/// [`emit_before_tool_call`] with the call's context: the owning
+/// conversation, the provider's tool call id and the resolved cwd.
+pub async fn emit_before_tool_call_with(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
+) -> crate::extensions::hooks::events::HookResult {
     let mut event = crate::extensions::hooks::events::HookEvent::before_tool_call(tool_name, input)
-        .with_session(session_id)
-        .with_cwd(cwd);
+        .with_tool_call(call);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
     hook_bus.emit(&event).await
+}
+
+/// [`emit_before_tool_call_with`] plus the call's tool-call events
+/// ([`tool_call_events`]): `called` (fp over the model's input) before any
+/// extension sees the call, then `decided` after the chain (fp over the
+/// input the chain settled on). Every dispatch site calls this; the
+/// returned recorder publishes `finished` ([`ToolCallEvents::finish`], or
+/// `cancelled` when it is dropped first). `owner` marks a worker's call.
+/// When the events are off or unsubscribed this is exactly
+/// [`emit_before_tool_call_with`].
+///
+/// [`ToolCallEvents::finish`]: tool_call_events::ToolCallEvents::finish
+pub async fn emit_before_tool_call_recorded(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
+    owner: Option<&tool_call_events::ToolCallOwner>,
+) -> (
+    crate::extensions::hooks::events::HookResult,
+    tool_call_events::ToolCallEvents,
+) {
+    use crate::extensions::hooks::events::HookResult;
+    use tool_call_events::ToolCallDecision;
+    let mut events = tool_call_events::ToolCallEvents::begin(
+        hook_bus.tool_call_hub(),
+        tool_name,
+        runtime_tool_name,
+        call,
+        owner,
+        &input,
+    );
+    let mut event = crate::extensions::hooks::events::HookEvent::before_tool_call(tool_name, input)
+        .with_tool_call(call);
+    if let Some(runtime_tool_name) = runtime_tool_name {
+        event.tool_runtime_name = Some(runtime_tool_name.to_string());
+    }
+    let (result, by) = hook_bus.emit_attributed(&event).await;
+    if events.is_active() {
+        let model_input = event.tool_input.as_ref().unwrap_or(&Value::Null);
+        let (decision, final_input) = match &result {
+            HookResult::Block { .. } => (ToolCallDecision::Block, model_input),
+            HookResult::Confirm { modified_input, .. } => {
+                (ToolCallDecision::Confirm, modified_input.as_ref().unwrap_or(model_input))
+            }
+            HookResult::Modify { input } => (ToolCallDecision::Modify, input),
+            _ => (ToolCallDecision::Allow, model_input),
+        };
+        events.decided(decision, by, final_input);
+    }
+    (result, events)
 }
 
 /// Answer the Confirm dialog sends for its "Allow all from <ext>" button.
@@ -237,6 +312,26 @@ pub async fn resolve_before_tool_call_result(
     auto_approve_confirms: bool,
     session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
 ) -> crate::extensions::hooks::events::HookResult {
+    resolve_before_tool_call_result_for_call(
+        None,
+        hook_result,
+        secret_prompt,
+        auto_approve_confirms,
+        session_allow_all,
+    )
+    .await
+}
+
+/// [`resolve_before_tool_call_result`] for the call `tool_call_id`: a
+/// Confirm prompt's `confirm_scope.tool_id` names it, so a client pairs the
+/// prompt with the call's `decided` record exactly.
+pub async fn resolve_before_tool_call_result_for_call(
+    tool_call_id: Option<&str>,
+    hook_result: crate::extensions::hooks::events::HookResult,
+    secret_prompt: Option<&crate::tools::SecretPromptHandle>,
+    auto_approve_confirms: bool,
+    session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
+) -> crate::extensions::hooks::events::HookResult {
     match hook_result {
         crate::extensions::hooks::events::HookResult::Confirm {
             message,
@@ -280,6 +375,7 @@ pub async fn resolve_before_tool_call_result(
                     } else {
                         Vec::new()
                     },
+                    tool_id: tool_call_id.map(str::to_string),
                 }
             });
             let response = prompt
@@ -336,7 +432,29 @@ pub async fn resolve_before_tool_call_decision(
     auto_approve_confirms: bool,
     session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
 ) -> BeforeToolCallDecision {
-    match resolve_before_tool_call_result(
+    resolve_before_tool_call_decision_for(
+        &Default::default(),
+        original_input,
+        hook_result,
+        secret_prompt,
+        auto_approve_confirms,
+        session_allow_all,
+    )
+    .await
+}
+
+/// [`resolve_before_tool_call_decision`] for the call in `call`: a Confirm
+/// prompt carries its tool call id (`confirm_scope.tool_id`).
+pub async fn resolve_before_tool_call_decision_for(
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
+    original_input: Value,
+    hook_result: crate::extensions::hooks::events::HookResult,
+    secret_prompt: Option<&crate::tools::SecretPromptHandle>,
+    auto_approve_confirms: bool,
+    session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
+) -> BeforeToolCallDecision {
+    match resolve_before_tool_call_result_for_call(
+        call.tool_call_id,
         hook_result,
         secret_prompt,
         auto_approve_confirms,
@@ -391,6 +509,33 @@ pub async fn emit_after_tool_call(
     session_id: Option<&str>,
     cwd: Option<&Path>,
 ) -> String {
+    emit_after_tool_call_with(
+        hook_bus,
+        tool_name,
+        runtime_tool_name,
+        input,
+        output,
+        max_tool_output,
+        &crate::extensions::hooks::events::ToolCallHookContext {
+            session_id,
+            tool_call_id: None,
+            cwd: crate::extensions::hooks::events::hook_cwd(cwd),
+        },
+    )
+    .await
+}
+
+/// [`emit_after_tool_call`] with the call's context: the owning
+/// conversation, the provider's tool call id and the resolved cwd.
+pub async fn emit_after_tool_call_with(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    output: String,
+    max_tool_output: usize,
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
+) -> String {
     emit_after_tool_call_outcome(
         hook_bus,
         tool_name,
@@ -398,8 +543,7 @@ pub async fn emit_after_tool_call(
         input,
         output,
         max_tool_output,
-        session_id,
-        cwd,
+        call,
         false,
     )
     .await
@@ -433,8 +577,7 @@ pub(super) async fn emit_after_tool_call_outcome(
     input: Value,
     output: String,
     max_tool_output: usize,
-    session_id: Option<&str>,
-    cwd: Option<&Path>,
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
     keep_uncut: bool,
 ) -> AfterToolCallOutcome {
     use crate::extensions::hooks::events::HookResult;
@@ -442,8 +585,7 @@ pub(super) async fn emit_after_tool_call_outcome(
     let original = output.clone();
     let mut event =
         crate::extensions::hooks::events::HookEvent::after_tool_call(tool_name, input, output)
-            .with_session(session_id)
-            .with_cwd(cwd);
+            .with_tool_call(call);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
@@ -698,6 +840,9 @@ pub struct Runtime {
     /// Current worker handle for bounded delegation-tree accounting. `None`
     /// for foreground roots.
     delegation_parent: Option<String>,
+    /// Whose calls a worker's tool-call records belong to (parent session +
+    /// handle). Read ONLY by the records; `None` for a session's own runtime.
+    tool_call_owner: Option<tool_call_events::ToolCallOwner>,
     /// Session-scoped, per-extension "Allow all" latch for extension
     /// `Confirm` gates (`before_tool_call`). An extension id is added when
     /// the user picks "Allow all from <ext>" in the Confirm dialog; shared by
@@ -1030,6 +1175,7 @@ impl Runtime {
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
+            tool_call_owner: None,
             session_allow_all: std::sync::Arc::new(crate::tools::SessionConfirmLatch::new()),
             mcp_runtime: None,
             mcp_session_scope: None,
@@ -1405,6 +1551,17 @@ impl Runtime {
 
     pub fn set_delegation_parent(&mut self, parent: Option<String>) {
         self.delegation_parent = parent;
+    }
+
+    /// Mark this runtime as a worker's: its tool-call records carry the
+    /// parent's session id and the worker's handle. Nothing else reads it
+    /// (the runtime's own `session_id` stays as it is).
+    pub fn set_tool_call_owner(&mut self, owner: Option<tool_call_events::ToolCallOwner>) {
+        self.tool_call_owner = owner;
+    }
+
+    pub fn tool_call_owner(&self) -> Option<&tool_call_events::ToolCallOwner> {
+        self.tool_call_owner.as_ref()
     }
 
     pub fn orchestration(&self) -> Option<&Arc<crate::orchestration::OrchestrationRuntime>> {
@@ -3377,6 +3534,7 @@ impl Runtime {
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
             delegation_parent: self.delegation_parent.clone(),
+            tool_call_owner: self.tool_call_owner.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
             tools_always_loaded: Arc::clone(&self.tools_always_loaded),
@@ -3491,6 +3649,7 @@ impl Clone for Runtime {
             deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),
+            tool_call_owner: self.tool_call_owner.clone(),
             session_allow_all: self.session_allow_all.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             // Clones SHARE the durable session scope: dropping one clone or
@@ -4510,6 +4669,7 @@ mod tests {
                     extensions: vec!["jev".into()],
                     tool: Some("bash".into()),
                     rewritten_by: vec![],
+                    tool_id: None,
                 })
             );
             assert!(first.prompt.starts_with("Extension: jev\nTool: bash\n"), "{}", first.prompt);

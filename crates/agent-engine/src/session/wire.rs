@@ -260,6 +260,16 @@ pub enum ClientFrame {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         named_only: bool,
     },
+    /// Control fast path (no session): subscribe this connection to the
+    /// tool-call records of every session of this daemon. Reply:
+    /// `ToolCallsSubscribed`, then one `ToolCall` per record until the
+    /// connection ends (`Bye`, or `Bye{Reloading}` on a reload: subscribe
+    /// again on the new image). While subscribed the connection still
+    /// answers `Ping`; any other frame is an `Error`. Refused with `Error`
+    /// (connection kept) unless `daemon.tool_call_events` is on. A daemon
+    /// that predates this frame answers `Error` "malformed frame: unknown
+    /// variant `tool_calls`, ..." and keeps the connection usable.
+    ToolCalls {},
     Bye,
 }
 
@@ -312,6 +322,7 @@ impl std::fmt::Debug for ClientFrame {
                 .field("limit", limit)
                 .field("named_only", named_only)
                 .finish(),
+            Self::ToolCalls {} => f.write_str("ToolCalls"),
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -547,6 +558,19 @@ pub enum DaemonFrame {
         next: Option<CatalogCursor>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    /// Reply to `ClientFrame::ToolCalls`: this connection now receives
+    /// `ToolCall` frames. Sent only to a connection that asked, so an older
+    /// client never sees it (nor `ToolCall`).
+    ToolCallsSubscribed {},
+    /// One tool-call record (metadata only: no input, output or command
+    /// text; the one path is `called.cwd`, the call's base directory). `seq` is daemon-wide and increasing within one daemon
+    /// image; `dropped` counts records this subscriber missed since its
+    /// previous `ToolCall` because it read too slowly.
+    ToolCall {
+        seq: u64,
+        dropped: u64,
+        record: crate::runtime::tool_call_events::ToolCallRecord,
     },
 }
 
@@ -2268,6 +2292,51 @@ mod tests {
         }
         let err = decode_line::<OldClientFrame>(r#"{"type":"pin","session_id":"s","on":true}"#).unwrap_err();
         assert!(err.contains("unknown variant `pin`"), "{err}");
+    }
+
+    /// Group 9 (wire): the subscribe and both replies round-trip in their
+    /// documented shape; a daemon built before `ToolCalls` names the tag in
+    /// its decode error (the connection stays usable: see conn.rs).
+    #[test]
+    fn tool_call_frames_round_trip_and_older_daemons_reject_the_subscribe() {
+        use crate::runtime::tool_call_events::{ToolCallPhase, ToolCallRecord, ToolCallStatus};
+        let f: ClientFrame = decode_line(r#"{"type":"tool_calls"}"#).unwrap();
+        assert!(matches!(f, ClientFrame::ToolCalls {}));
+        assert_eq!(encode_line(&ClientFrame::ToolCalls {}).unwrap().trim_end(), r#"{"type":"tool_calls"}"#);
+        assert_eq!(format!("{:?}", ClientFrame::ToolCalls {}), "ToolCalls");
+        assert_eq!(
+            serde_json::to_value(DaemonFrame::ToolCallsSubscribed {}).unwrap(),
+            serde_json::json!({"type": "tool_calls_subscribed"})
+        );
+        let record = ToolCallRecord {
+            v: 1,
+            phase: ToolCallPhase::Finished { status: ToolCallStatus::Ok, duration_ms: 12 },
+            session_id: Some("s1".into()),
+            handle_id: Some("sa_3".into()),
+            tool: "read".into(),
+            tool_runtime: "read".into(),
+            tool_id: "toolu_1".into(),
+            ts: "2026-10-24T18:00:00.123Z".into(),
+        };
+        let frame = DaemonFrame::ToolCall { seq: 7, dropped: 2, record: record.clone() };
+        let want = serde_json::json!({
+            "type": "tool_call", "seq": 7, "dropped": 2,
+            "record": {"v":1,"phase":"finished","status":"ok","duration_ms":12,"session_id":"s1",
+                       "handle_id":"sa_3","tool":"read","tool_runtime":"read","tool_id":"toolu_1",
+                       "ts":"2026-10-24T18:00:00.123Z"}
+        });
+        assert_eq!(serde_json::to_value(&frame).unwrap(), want);
+        let line = encode_line(&frame).unwrap();
+        let back: DaemonFrame = decode_line(line.trim_end()).unwrap();
+        assert!(matches!(back, DaemonFrame::ToolCall { seq: 7, dropped: 2, record: ref r } if *r == record));
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientFrame {
+            Ping,
+            Purge,
+        }
+        let err = decode_line::<OldClientFrame>(r#"{"type":"tool_calls"}"#).unwrap_err();
+        assert!(err.contains("unknown variant `tool_calls`"), "{err}");
     }
 
     #[test]
