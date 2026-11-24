@@ -201,22 +201,49 @@ All notable changes to this project will be documented in this file.
   request truncates tool results and thinking.
   The tools stay in the request (removing them would invalidate the
   cache); if the model answers with a tool call, nothing runs. The request
-  is sent once, without retries: on any failure, a tool call or an empty
-  reply, the transcript request is sent once instead, with its usual
-  retries, and a failed attempt leaves the conversation as it was. The line
-  shown before a compaction says which request goes out ("sending the
+  is not retried: on a 429, a 5xx, a network or stream error, a tool call
+  or an empty reply, the transcript request is sent instead, with its usual
+  retries, and a failed attempt leaves the conversation as it was. Three
+  immediate resends remain, none of which waits: after a 401, with a
+  refreshed token for the same account (with a remote credential source
+  under `auto`, another account only if that one can no longer be used);
+  uncompressed, after a refused gzip body; and without the cache-diagnosis
+  header, after that header is refused. The line shown before a
+  compaction says which request goes out ("sending the
   conversation as the chat sends it (N messages, ~T tokens, read from
-  cache) ... if that fails, a ~K KB transcript"). The saved compaction
-  record names the request that wrote the summary (`summary_request`:
-  `chat_request` or `transcript`), and for a chat request its prompt-stack
+  cache) ... if that fails, a ~K KB transcript"), and the compaction sends
+  what the line said: the request is chosen once, for the line. Before, it
+  was chosen again when the compaction started, so a keep-warm ping landing
+  in between could send the full history under a line that said
+  "transcript". A line that names the chat request is still checked again
+  before anything is sent, and falls back to the transcript it names. The
+  saved compaction record names the request that wrote the summary
+  (`summary_request`: `chat_request` or `transcript`), and for a chat
+  request its prompt-stack
   digest covers the system blocks, tools and instructions as sent; the
   history went out untruncated then. A chat request that wrote more to the
-  cache than it read logs a warning with both numbers. In the api-log such
-  a request has `"compaction": true`, and its `usage.cache_read` is the
-  history. Other providers are unchanged.
-  Known, not changed: a compaction's own token spend is still not added to
-  the session's usage counters; when both requests fail, the keep-warm
-  period that ended for the compaction is not restored (the next turn
+  cache than it read logs a warning with both numbers and tells the user
+  after the line above: "compaction: the summary request missed the cache
+  (wrote N, read M tokens)".
+  A compaction's own usage now counts: every summary request the provider
+  billed is added to the session's token totals and cost, once, like a
+  turn's usage. That includes a chat request whose reply was not used (a
+  tool call, an empty reply) together with the transcript request sent
+  after it. When compaction starts a successor session, the spend is saved
+  with the session that was summarized and the successor starts at zero,
+  as before. `synaps rpc` adds the tokens to its totals (it does not price
+  usage, for turns either).
+  In the api-log both summary requests have `"compaction": true` and a
+  `summary_request` field, `chat_request` or `transcript`, the same words
+  as the saved compaction record. The transcript request wrote no api-log
+  record before; it now writes one per accepted request at the same
+  telemetry levels, with model, thinking and effort as sent, attempt,
+  total time, stop reason, usage, cost, rate-limit headers (`full`) and
+  context. It has no `ttft_ms` (the request does not stream). On the chat
+  request `usage.cache_read` is the history. Other providers are
+  unchanged, and their requests are still not in the api-log.
+  Known, not changed: when both requests fail, the keep-warm period
+  that ended for the compaction is not restored (the next turn
   starts one); and a 1h-to-5m cache downgrade first seen by the compaction
   request may not show its notice.
 - **A compaction request larger than the account's per-minute input limit
