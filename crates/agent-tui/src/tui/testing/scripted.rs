@@ -298,17 +298,19 @@ impl ScriptedTransport {
 
     async fn handle(&mut self, cmd: SessionCommand) {
         if let Some(reason) = self.refuse_input.clone() {
-            let command = match &cmd {
-                SessionCommand::Submit { .. } => Some("submit"),
-                SessionCommand::Steer { .. } => Some("steer"),
-                SessionCommand::Set { .. } => Some("set"),
-                SessionCommand::EngineCommand { .. } => Some("engine_command"),
-                SessionCommand::PluginCommand { .. } => Some("plugin_command"),
-                SessionCommand::Resume { .. } => Some("resume"),
-                SessionCommand::Compact { .. } => Some("compact"),
-                SessionCommand::NewSession => Some("new_session"),
-                _ => None,
-            };
+            // Named as the actor names them.
+            let command = matches!(
+                cmd,
+                SessionCommand::Submit { .. }
+                    | SessionCommand::Steer { .. }
+                    | SessionCommand::Set { .. }
+                    | SessionCommand::EngineCommand { .. }
+                    | SessionCommand::PluginCommand { .. }
+                    | SessionCommand::Resume { .. }
+                    | SessionCommand::Compact { .. }
+                    | SessionCommand::NewSession
+            )
+            .then(|| agent_engine::session::actor::command_name(&cmd));
             if let Some(command) = command {
                 self.push_event(SessionEventWire::Refused {
                     client: ClientId(1),

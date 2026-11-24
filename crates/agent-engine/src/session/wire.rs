@@ -85,6 +85,13 @@ pub const FEATURE_SESSION_PAGE: &str = "session_page";
 /// mitigation: replies are still broadcast and equal ids still correlate).
 pub const FEATURE_ADDRESSED_REPLIES: &str = "addressed_replies";
 
+/// `Welcome.features` entry: `PromptResolved` carries `outcome`, and an
+/// `Answer` to a prompt that is not pending is answered `AnswerRefused` (to
+/// its sender). A missing refusal can't be told from a slow one, so a
+/// client checks this before relying on either; without it, it infers what
+/// it can.
+pub const FEATURE_PROMPT_OUTCOME: &str = "prompt_outcome";
+
 /// `CatalogPage.limit` when absent, and its ceiling.
 pub const CATALOG_PAGE_DEFAULT_LIMIT: u32 = 50;
 pub const CATALOG_PAGE_MAX_LIMIT: u32 = 200;
@@ -105,6 +112,7 @@ pub fn daemon_features() -> Vec<String> {
         FEATURE_SESSION_WORKERS.to_string(),
         FEATURE_SESSION_PAGE.to_string(),
         FEATURE_ADDRESSED_REPLIES.to_string(),
+        FEATURE_PROMPT_OUTCOME.to_string(),
     ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
@@ -910,7 +918,23 @@ pub enum WireSessionEvent {
     /// Digest only — see module docs.
     Conversation { digest: ConversationDigest },
     Prompt { request: PromptRequest },
-    PromptResolved { prompt_id: u64 },
+    /// `outcome`: additive and ungated. An older daemon omits it (`None`:
+    /// the client infers what it can), an older client ignores it, and an
+    /// outcome newer than this build reads as `PromptOutcome::Unknown`.
+    PromptResolved {
+        prompt_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<PromptOutcome>,
+    },
+    /// A late or unknown `Answer`, to its sender only (`outcome: None` = not
+    /// remembered). A new top-level event, so it needs no capability: an
+    /// older client decodes it as [`WireSessionEvent::Unknown`] and keeps
+    /// the connection.
+    AnswerRefused {
+        prompt_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<PromptOutcome>,
+    },
     External { event: crate::events::types::Event },
     AutoTurnCapReached { cap: u32 },
     Idle,
@@ -1242,7 +1266,8 @@ impl From<SessionEventWire> for WireSessionEvent {
             }
             S::Conversation(snapshot) => Self::Conversation { digest: ConversationDigest::of(&snapshot) },
             S::Prompt(request) => Self::Prompt { request },
-            S::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
+            S::PromptResolved { prompt_id, outcome } => Self::PromptResolved { prompt_id, outcome },
+            S::AnswerRefused { prompt_id, outcome } => Self::AnswerRefused { prompt_id, outcome },
             S::External(event) => Self::External { event },
             S::AutoTurnCapReached { cap } => Self::AutoTurnCapReached { cap },
             S::Idle => Self::Idle,
@@ -1304,7 +1329,8 @@ impl From<WireSessionEvent> for SessionEventWire {
             // its mirror before handing the envelope up.
             W::Conversation { digest } => Self::Conversation(digest.into_snapshot(Vec::new())),
             W::Prompt { request } => Self::Prompt(request),
-            W::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
+            W::PromptResolved { prompt_id, outcome } => Self::PromptResolved { prompt_id, outcome },
+            W::AnswerRefused { prompt_id, outcome } => Self::AnswerRefused { prompt_id, outcome },
             W::External { event } => Self::External(event),
             W::AutoTurnCapReached { cap } => Self::AutoTurnCapReached { cap },
             W::Idle => Self::Idle,
@@ -1652,7 +1678,8 @@ mod tests {
             S::TurnStarted { turn_baseline: 6, trigger: TurnTrigger::DriverAuto, user_text: None },
             S::Conversation(conv()),
             S::Prompt(prompt()),
-            S::PromptResolved { prompt_id: 3 },
+            S::PromptResolved { prompt_id: 3, outcome: Some(PromptOutcome::TimedOut) },
+            S::AnswerRefused { prompt_id: 3, outcome: None },
             S::External(crate::events::types::Event::simple("cli", "hello", None)),
             S::AutoTurnCapReached { cap: 5 },
             S::Idle,
@@ -1918,11 +1945,77 @@ mod tests {
         assert!(matches!(back, SessionQuery::SubagentWatch { tool_queue: true, .. }));
     }
 
+    /// `PromptResolved.outcome` both ways: an older daemon's frame (no
+    /// outcome) decodes as `None`; an outcome this build does not know
+    /// decodes as `Unknown`, not a failed event; `None` is not written, so
+    /// an older daemon's frame is unchanged; and a frame with an outcome
+    /// decodes in an older client's shape (the field is ignored).
+    #[test]
+    fn prompt_resolved_outcome_is_additive() {
+        let old: WireSessionEvent = serde_json::from_str(r#"{"ev":"prompt_resolved","prompt_id":7}"#).unwrap();
+        assert!(matches!(old, WireSessionEvent::PromptResolved { prompt_id: 7, outcome: None }), "{old:?}");
+        let newer: WireSessionEvent =
+            serde_json::from_str(r#"{"ev":"prompt_resolved","prompt_id":7,"outcome":"vetoed_by_policy"}"#).unwrap();
+        assert!(
+            matches!(newer, WireSessionEvent::PromptResolved { outcome: Some(PromptOutcome::Unknown), .. }),
+            "{newer:?}"
+        );
+        let none = serde_json::to_string(&WireSessionEvent::PromptResolved { prompt_id: 7, outcome: None }).unwrap();
+        assert_eq!(none, r#"{"ev":"prompt_resolved","prompt_id":7}"#);
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "ev", rename_all = "snake_case")]
+        enum Older {
+            PromptResolved { prompt_id: u64 },
+        }
+        for (o, name) in [
+            (PromptOutcome::Allowed, "allowed"),
+            (PromptOutcome::Denied, "denied"),
+            (PromptOutcome::Answered, "answered"),
+            (PromptOutcome::Cancelled, "cancelled"),
+            (PromptOutcome::TimedOut, "timed_out"),
+        ] {
+            let line = serde_json::to_string(&WireSessionEvent::PromptResolved { prompt_id: 7, outcome: Some(o) }).unwrap();
+            assert_eq!(line, format!(r#"{{"ev":"prompt_resolved","prompt_id":7,"outcome":"{name}"}}"#));
+            assert_eq!(o.as_str(), name);
+            let Older::PromptResolved { prompt_id } = serde_json::from_str(&line).unwrap();
+            assert_eq!(prompt_id, 7);
+        }
+    }
+
+    /// `AnswerRefused` on the wire, and as an older client reads it: its
+    /// tag is unknown there, so it decodes as `Unknown` (the generic
+    /// "unknown event" notice), not a failed frame and a reconnect.
+    #[test]
+    fn answer_refused_is_unknown_to_an_older_client() {
+        let line = serde_json::to_string(&WireSessionEvent::AnswerRefused {
+            prompt_id: 7,
+            outcome: Some(PromptOutcome::Cancelled),
+        })
+        .unwrap();
+        assert_eq!(line, r#"{"ev":"answer_refused","prompt_id":7,"outcome":"cancelled"}"#);
+        let forgotten = serde_json::to_string(&WireSessionEvent::AnswerRefused { prompt_id: 9, outcome: None }).unwrap();
+        assert_eq!(forgotten, r#"{"ev":"answer_refused","prompt_id":9}"#);
+        // An older client's enum: the variants it knew, and the fallback.
+        #[allow(dead_code)]
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(tag = "ev", rename_all = "snake_case")]
+        enum Older {
+            PromptResolved { prompt_id: u64 },
+            #[serde(other)]
+            Unknown,
+        }
+        for l in [&line, &forgotten] {
+            assert!(matches!(serde_json::from_str::<Older>(l).unwrap(), Older::Unknown), "{l}");
+            let renamed = l.replace(r#""ev":"answer_refused""#, r#""ev":"zz_from_the_future""#);
+            assert!(matches!(serde_json::from_str::<WireSessionEvent>(&renamed).unwrap(), WireSessionEvent::Unknown));
+        }
+    }
+
     #[test]
     fn wire_roundtrip_every_variant() {
         let all = fixtures();
-        // 36 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 21 StreamEvent leaves.
-        assert_eq!(all.len(), 36 + 21);
+        // 37 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 21 StreamEvent leaves.
+        assert_eq!(all.len(), 37 + 21);
         for ev in all {
             let is_conv = matches!(ev, SessionEventWire::Conversation(_));
             let e = env(ev);

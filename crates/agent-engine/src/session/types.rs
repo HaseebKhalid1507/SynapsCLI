@@ -962,14 +962,135 @@ pub const CONFIRM_PROMPT_TITLE: &str = "Confirm tool call";
 /// `Secret` (masked input).
 pub const CONFIRM_ACTIVATION_PROMPT_TITLE: &str = "Confirm tool activation";
 
-impl PromptKind {
-    /// Derive the kind from the prompt title (the actor classifies at receipt;
-    /// `SecretPromptHandle::prompt` classifies for the in-process TUI).
-    pub fn from_title(title: &str) -> Self {
-        if title == CONFIRM_PROMPT_TITLE || title == CONFIRM_ACTIVATION_PROMPT_TITLE {
-            Self::Confirm
+/// Which gate a `Confirm` prompt opens. Chosen where the prompt is raised
+/// (`SecretPromptHandle::confirm_tool_call` / `confirm_activation`), never
+/// read back from its title, and never on the wire: the gates differ in
+/// what they take, so the answer's meaning is the gate's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmGate {
+    /// The runtime's per-tool-call gate (`resolve_before_tool_call_result`):
+    /// Allow, Allow all, Deny.
+    ToolCall,
+    /// The `activate_tools` gate (`tools::discovery`): Allow or Deny. Allow
+    /// all is not an answer here.
+    Activation,
+}
+
+/// What a raised prompt is, kept by the session beside the pending
+/// [`PromptRequest`]. Its title and [`PromptKind`] are derived from it for
+/// display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptPolicy {
+    Confirm(ConfirmGate),
+    /// A masked value (an API key, a sudo password): never trimmed or parsed.
+    Secret,
+}
+
+/// What a `Confirm` answer decides, read by [`ConfirmGate::decide`]: the
+/// one reading the gates, the session's notices and the outcome share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmDecision {
+    /// Allow this call.
+    Allow,
+    /// Allow this call and latch its source extensions (tool-call gate
+    /// only; with no latch scope it allows this call only).
+    AllowAll,
+    Deny,
+}
+
+impl ConfirmGate {
+    /// The dialog title for this gate.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::ToolCall => CONFIRM_PROMPT_TITLE,
+            Self::Activation => CONFIRM_ACTIVATION_PROMPT_TITLE,
+        }
+    }
+
+    /// What `answer` decides at this gate. Trimmed, ASCII case-insensitive:
+    /// `y` / `yes` allow; at the tool-call gate
+    /// [`crate::tools::CONFIRM_ANSWER_ALLOW_ALL`] allows all; anything
+    /// else, or no answer, denies. At the activation gate Allow all denies.
+    pub fn decide(self, answer: Option<&str>) -> ConfirmDecision {
+        let Some(answer) = answer.map(str::trim) else {
+            return ConfirmDecision::Deny;
+        };
+        if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+            ConfirmDecision::Allow
+        } else if self == Self::ToolCall && answer.eq_ignore_ascii_case(crate::tools::CONFIRM_ANSWER_ALLOW_ALL) {
+            ConfirmDecision::AllowAll
         } else {
-            Self::Secret
+            ConfirmDecision::Deny
+        }
+    }
+}
+
+impl ConfirmDecision {
+    /// Whether the gate opens for this call.
+    pub fn allows(self) -> bool {
+        self != Self::Deny
+    }
+}
+
+impl PromptPolicy {
+    pub fn kind(self) -> PromptKind {
+        match self {
+            Self::Confirm(_) => PromptKind::Confirm,
+            Self::Secret => PromptKind::Secret,
+        }
+    }
+
+    /// What answering `value` applies once the waiting call has it. A
+    /// Secret's value is taken as given: `Some` (even empty) is
+    /// `Answered`, `None` is `Denied`. `Allowed` means the gate opened, not
+    /// that the tool then succeeded.
+    pub fn outcome(self, value: Option<&str>) -> PromptOutcome {
+        match self {
+            Self::Confirm(gate) if gate.decide(value).allows() => PromptOutcome::Allowed,
+            Self::Confirm(_) => PromptOutcome::Denied,
+            Self::Secret if value.is_some() => PromptOutcome::Answered,
+            Self::Secret => PromptOutcome::Denied,
+        }
+    }
+}
+
+/// What the session applied when a prompt left the pending set, carried on
+/// `PromptResolved` and `AnswerRefused`. An older daemon sends none; a newer
+/// one may send an outcome this build does not know, read as
+/// [`PromptOutcome::Unknown`] rather than failing the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOutcome {
+    /// A Confirm's gate opened (Allow, or Allow all at the tool-call gate).
+    Allowed,
+    /// A Confirm's gate stayed shut (any other answer), or a Secret was
+    /// answered with no value.
+    Denied,
+    /// A Secret prompt's value was handed to the waiting call.
+    Answered,
+    /// No answer was applied: the turn was cancelled, revoked or
+    /// checkpointed, or the session ended, while the prompt waited; or an
+    /// answer came after the waiting call had already gone. The call never
+    /// passed its gate.
+    Cancelled,
+    /// Nobody was attached to answer before the abandonment deadline
+    /// (`SYNAPS_DAEMON_PROMPT_ABANDON_SECS`): the session denied it.
+    TimedOut,
+    /// An outcome this build does not know (a newer daemon's).
+    #[serde(other)]
+    Unknown,
+}
+
+impl PromptOutcome {
+    /// Its wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::Answered => "answered",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -1505,8 +1626,15 @@ pub enum SessionEventWire {
     /// mirrors never diverge: the actor's api_messages IS the truth.
     Conversation(ConversationSnapshot),
     Prompt(PromptRequest),
-    /// So mirrors dismiss the modal.
-    PromptResolved { prompt_id: u64 },
+    /// So mirrors dismiss the modal. `outcome`: what the session applied;
+    /// `None` only from an older daemon over the wire.
+    PromptResolved { prompt_id: u64, outcome: Option<PromptOutcome> },
+    /// To its sender only, never replayed: an `Answer` to a prompt that is
+    /// not pending changed nothing. `outcome`: what applied when it closed;
+    /// `None` = not remembered (an id never raised, or older than the last
+    /// 64 closed), never "denied". Refusals of a pending prompt's answer by
+    /// policy (an observer, Allow all from a non-owner) stay `Refused`.
+    AnswerRefused { prompt_id: u64, outcome: Option<PromptOutcome> },
     /// Drained event card — presentation only.
     External(crate::events::types::Event),
     AutoTurnCapReached { cap: u32 },
@@ -1991,14 +2119,45 @@ mod tests {
         assert_eq!(sanitize_prompt_text(persian), persian, "ZWNJ intact");
     }
 
+    /// One reading for every gate: the tool-call gate takes Allow all, the
+    /// activation gate denies it; a Secret's value is never parsed.
     #[test]
-    fn prompt_kind_from_title() {
-        assert_eq!(PromptKind::from_title("Confirm tool call"), PromptKind::Confirm);
-        assert_eq!(
-            PromptKind::from_title("Confirm tool activation"),
-            PromptKind::Confirm
-        );
-        assert_eq!(PromptKind::from_title("API key"), PromptKind::Secret);
+    fn each_gate_decides_its_own_answers() {
+        use ConfirmDecision::*;
+        use ConfirmGate::*;
+        for (gate, answer, want) in [
+            (ToolCall, Some("y"), Allow),
+            (ToolCall, Some(" YES "), Allow),
+            (ToolCall, Some("always"), AllowAll),
+            (ToolCall, Some(" Always\n"), AllowAll),
+            (ToolCall, Some("n"), Deny),
+            (ToolCall, Some(""), Deny),
+            (ToolCall, Some("yess"), Deny),
+            (ToolCall, None, Deny),
+            (Activation, Some("y"), Allow),
+            (Activation, Some("Yes"), Allow),
+            (Activation, Some("always"), Deny),
+            (Activation, Some("n"), Deny),
+            (Activation, None, Deny),
+        ] {
+            assert_eq!(gate.decide(answer), want, "{gate:?} {answer:?}");
+        }
+        use PromptOutcome::*;
+        for (policy, value, want) in [
+            (PromptPolicy::Confirm(ToolCall), Some("always"), Allowed),
+            (PromptPolicy::Confirm(ToolCall), Some("y"), Allowed),
+            (PromptPolicy::Confirm(ToolCall), None, Denied),
+            (PromptPolicy::Confirm(Activation), Some("always"), Denied),
+            (PromptPolicy::Confirm(Activation), Some("yes"), Allowed),
+            (PromptPolicy::Secret, Some("hunter2"), Answered),
+            (PromptPolicy::Secret, Some(""), Answered),
+            (PromptPolicy::Secret, Some(" y "), Answered),
+            (PromptPolicy::Secret, None, Denied),
+        ] {
+            assert_eq!(policy.outcome(value), want, "{policy:?} {value:?}");
+        }
+        assert_eq!(ToolCall.title(), CONFIRM_PROMPT_TITLE);
+        assert_eq!(Activation.title(), CONFIRM_ACTIVATION_PROMPT_TITLE);
     }
 
     #[test]

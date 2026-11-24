@@ -152,15 +152,18 @@ impl SessionLink {
     }
 
     /// Send `cmd` and pull envelopes until `pick` accepts one; everything
-    /// else is buffered for the loop in arrival order. A `Refused` addressed
-    /// to this client (B1 ownership: a non-owner's setter) IS the reply —
-    /// `Err(reason)` immediately, never the 30 s timeout.
+    /// else is buffered for the loop in arrival order. A `Refused` of this
+    /// command addressed to this client (B1 ownership: a non-owner's
+    /// setter) IS the reply — `Err(reason)` immediately, never the 30 s
+    /// timeout. Another command's refusal (an `Answer` sent without a round
+    /// trip) and an `AnswerRefused` are events, buffered for the loop.
     async fn roundtrip<T>(
         &mut self,
         cmd: SessionCommand,
         mut pick: impl FnMut(&SessionEventWire) -> Option<T>,
     ) -> Result<T, String> {
         let me = self.client_id();
+        let name = agent_engine::session::actor::command_name(&cmd);
         self.send(cmd).await.map_err(|e| e.to_string())?;
         let deadline = tokio::time::Instant::now() + ROUNDTRIP_TIMEOUT;
         loop {
@@ -182,7 +185,7 @@ impl SessionLink {
                 reason,
             } = &env.event
             {
-                if *client == me {
+                if *client == me && command == name {
                     return Err(format!("{command} refused: {reason}"));
                 }
             }
@@ -360,6 +363,19 @@ pub(crate) enum ConfirmPolicy {
     ViewOnly,
 }
 
+/// The pane's policy for a prompt from the session. The session keeps the
+/// policy a prompt was raised with and never sends it; the pane needs it
+/// only to render (a Confirm's buttons), and the wire's kind and title
+/// carry that. A Confirm under any other title gets no Allow all.
+pub(crate) fn pane_policy(kind: PromptKind, title: &str) -> agent_engine::session::PromptPolicy {
+    use agent_engine::session::{ConfirmGate, PromptPolicy};
+    match kind {
+        PromptKind::Secret => PromptPolicy::Secret,
+        PromptKind::Confirm if title == ConfirmGate::ToolCall.title() => PromptPolicy::Confirm(ConfirmGate::ToolCall),
+        PromptKind::Confirm => PromptPolicy::Confirm(ConfirmGate::Activation),
+    }
+}
+
 /// `Prompt(req)` → local `SecretPromptRequest` on the SAME channel the
 /// secret-prompt pane polls; the pane's oneshot answer comes back through
 /// `answers_rx` and the loop sends `Answer{prompt_id, value}`.
@@ -438,7 +454,7 @@ impl PromptBridge {
         let _ = self
             .secret_prompt_tx
             .send(synaps_cli::tools::SecretPromptRequest {
-                kind: req.kind,
+                policy: pane_policy(req.kind, &req.title),
                 title: req.title,
                 prompt: req.prompt,
                 confirm_scope: req.confirm_scope.filter(|_| self.owns_input),
@@ -644,7 +660,7 @@ mod tests {
         let (mut b, mut pane) = bridge(ConfirmPolicy::ViewOnly);
         b.on_prompt(prompt(5, PromptKind::Secret));
         let req = pane.try_recv().expect("the pane gets the secret prompt");
-        assert_eq!(req.kind, PromptKind::Secret);
+        assert_eq!(req.kind(), PromptKind::Secret);
         assert!(b.waiting_confirms().is_empty());
         req.response_tx.send(Some("k".into())).unwrap();
         let (id, value) =
@@ -680,10 +696,25 @@ mod tests {
     async fn default_policy_answers_confirms_here() {
         let (mut b, mut pane) = bridge(ConfirmPolicy::default());
         b.on_prompt(prompt(4, PromptKind::Confirm));
-        assert_eq!(pane.try_recv().unwrap().kind, PromptKind::Confirm);
+        assert_eq!(pane.try_recv().unwrap().kind(), PromptKind::Confirm);
         assert!(b.waiting_confirms().is_empty());
         assert!(b.on_local_answer(4));
         assert!(!b.on_resolved(4));
+    }
+
+    /// The pane reads a gate from the wire's kind and title: only the
+    /// tool-call confirm may offer Allow all.
+    #[test]
+    fn the_pane_policy_comes_from_the_wire_kind_and_title() {
+        use agent_engine::session::{ConfirmGate, PromptPolicy, CONFIRM_ACTIVATION_PROMPT_TITLE, CONFIRM_PROMPT_TITLE};
+        assert_eq!(pane_policy(PromptKind::Confirm, CONFIRM_PROMPT_TITLE), PromptPolicy::Confirm(ConfirmGate::ToolCall));
+        assert_eq!(
+            pane_policy(PromptKind::Confirm, CONFIRM_ACTIVATION_PROMPT_TITLE),
+            PromptPolicy::Confirm(ConfirmGate::Activation)
+        );
+        assert_eq!(pane_policy(PromptKind::Confirm, "Something new"), PromptPolicy::Confirm(ConfirmGate::Activation));
+        assert_eq!(pane_policy(PromptKind::Secret, CONFIRM_PROMPT_TITLE), PromptPolicy::Secret);
+        assert_eq!(pane_policy(PromptKind::Secret, "API key"), PromptPolicy::Secret);
     }
 
     /// Against a daemon that broadcasts replies (no `addressed_replies`),
@@ -818,6 +849,34 @@ mod tests {
         )
         .await
         .expect("closed channel returns at once"));
+    }
+
+    /// A late `Answer` mid-`Set`: its `AnswerRefused`, and a policy
+    /// `Refused{command: "answer"}` addressed to this client, are not the
+    /// setter's reply. Both are buffered for the loop, and the setter gets
+    /// its own reply.
+    #[tokio::test]
+    async fn roundtrip_ignores_a_refused_answer() {
+        let mut t = ScriptedTransport::new(Runtime::new_headless());
+        t.push_event(SessionEventWire::AnswerRefused {
+            prompt_id: 7,
+            outcome: Some(agent_engine::session::PromptOutcome::Cancelled),
+        });
+        t.push_event(SessionEventWire::Refused {
+            client: ClientId(1),
+            command: "answer".into(),
+            reason: "only the input owner can choose Allow all".into(),
+        });
+        let mut link = SessionLink::new(Box::new(t));
+        assert_eq!(link.client_id(), ClientId(1), "addressed to this client");
+        let applied = link
+            .set(SessionSetting::ContextWindow {
+                tokens: Some(1_000_000),
+            })
+            .await
+            .expect("the setter's own reply, not the answer's refusal");
+        assert!(applied.ok, "{applied:?}");
+        assert_eq!(link.buffered.len(), 2);
     }
 
     /// A `Refused` addressed to ANOTHER client is not our reply: buffered

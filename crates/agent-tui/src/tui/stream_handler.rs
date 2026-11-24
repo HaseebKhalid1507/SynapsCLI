@@ -456,6 +456,12 @@ pub(super) fn on_auto_turn_cap(app: &mut App, cap: u32) {
     app.invalidate();
 }
 
+/// A refused `Answer`: a toast, nothing undone (it submitted nothing).
+fn answer_refused_toast(app: &mut App, reason: String) {
+    app.toasts.upsert(super::toast::Toast::new("refused", format!("answer refused: {reason}")).titled("Session"));
+    app.request_redraw();
+}
+
 /// One envelope from the session → the exact `ChatMessage`s / state
 /// mutations the inline turn machine performed (§2.4 table).
 #[allow(clippy::too_many_arguments)]
@@ -594,7 +600,7 @@ pub(super) async fn handle_session_event_arm(
             prompt_bridge.on_prompt(req);
             sync_waiting_confirms(app, prompt_bridge);
         }
-        SessionEventWire::PromptResolved { prompt_id } => {
+        SessionEventWire::PromptResolved { prompt_id, .. } => {
             if prompt_bridge.on_resolved(prompt_id) {
                 app.secret_prompts.dismiss();
                 app.invalidate();
@@ -822,6 +828,11 @@ pub(super) async fn handle_session_event_arm(
             } else if client == me && command == "take_input" {
                 // `/takeover` changes no turn and submitted nothing: no undo.
                 app.push_msg(ChatMessage::Error(format!("/takeover refused: {reason}")));
+            } else if client == me && command == "answer" {
+                // An answer this client may not give (an observer's, Allow
+                // all from a non-owner). It submitted nothing and started
+                // no turn: say so, undo nothing.
+                answer_refused_toast(app, reason);
             } else if client == me {
                 let line = format!("{command} refused: {reason}{}", takeover_hint(&reason, app.observing));
                 let presented = app.streaming && app.turn_baseline == app.api_messages_len;
@@ -849,6 +860,14 @@ pub(super) async fn handle_session_event_arm(
         }
         SessionEventWire::AttachRefused { message } => {
             app.push_msg(ChatMessage::Error(format!("attach refused: {message}")));
+        }
+        // To this client only: its answer came after the prompt closed.
+        SessionEventWire::AnswerRefused { prompt_id, outcome } => {
+            let why = match outcome {
+                Some(o) => format!("prompt {prompt_id} was already resolved: {}", o.as_str()),
+                None => format!("prompt {prompt_id} is not pending"),
+            };
+            answer_refused_toast(app, why);
         }
         SessionEventWire::Lifecycle(state) => {
             app.toasts.upsert(
