@@ -188,7 +188,7 @@ All notable changes to this project will be documented in this file.
   the cache TTL, with the same model, effort, thinking, system prompt,
   tools and account); and the history starts with exactly the messages
   that last request sent, so `/resume` followed by `/compact` does not send
-  the resumed history as a full cache write. Two models-specific cases keep
+  the resumed history as a full cache write. Two model-specific cases keep
   the transcript request: models other than Opus 4.5 and later, Sonnet 4.6
   and later, Haiku 5.5, Fable and Mythos drop earlier thinking blocks (and
   the cached messages after them) when a user message is added, so for them
