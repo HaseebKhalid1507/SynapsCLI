@@ -471,6 +471,7 @@ mod compact_disclosure_frame {
             included_classes: vec![ContentClass::UserText, ContentClass::AssistantText],
             excluded_classes: vec![ContentClass::Thinking],
             notice: None,
+            chat_request_tokens: None,
         };
 
         let frame = RpcEvent::Response {
