@@ -1801,4 +1801,159 @@ mod tests {
         assert_eq!(outcome.summary_text, CACHED_SUMMARY);
         assert_eq!(outcome.summary_request, Some(SummaryRequest::ChatRequest));
     }
+
+    /// A runtime that writes its api-log and request trace under `dir`.
+    fn observed(mut rt: Runtime, dir: &std::path::Path, level: crate::runtime::telemetry::TelemetryLevel) -> Runtime {
+        let writer = crate::runtime::telemetry::TelemetryWriter::new(
+            crate::runtime::telemetry::WriterOptions {
+                telemetry_path: Some(dir.join("api-log.jsonl")),
+                trace_path: Some(dir.join("request-trace.jsonl")),
+                ..Default::default()
+            },
+        );
+        rt.telemetry_level = level;
+        rt.install_observability_for_tests(writer);
+        rt.set_session_id(Some("20261124-000000-test".into()));
+        rt
+    }
+
+    /// Flush `rt`'s writer and read back (api-log records, trace records).
+    async fn observed_records(rt: &Runtime, dir: &std::path::Path) -> (Vec<Value>, Vec<Value>) {
+        let flushed = rt
+            .shutdown_observability_async(crate::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT)
+            .await
+            .expect("a writer");
+        assert!(flushed.is_flushed());
+        let read = |name: &str| -> Vec<Value> {
+            std::fs::read_to_string(dir.join(name))
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        (read("api-log.jsonl"), read("request-trace.jsonl"))
+    }
+
+    /// A transcript-path compaction writes one api-log record, marked as a
+    /// compaction and as the transcript request, with what the
+    /// non-streaming response gives and nothing it cannot know; the chat's
+    /// own request carries the same two fields; a turn carries neither.
+    /// Each has its request-trace record.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn both_summary_requests_are_in_the_api_log_and_say_which_they_were() {
+        use crate::runtime::telemetry::TelemetryLevel;
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, _mock) = spawn_mock(vec![
+            Stream::Blocks(vec![text("hi")]),
+            Stream::Blocks(vec![text(CACHED_SUMMARY)]),
+        ])
+        .await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let dir = tempfile::tempdir().unwrap();
+        let rt = observed(on_a_subscription(opus()), dir.path(), TelemetryLevel::Full);
+        let history = warm_chat(&rt).await;
+        // The chat's own request, then the transcript request.
+        let chat = preview_compaction_request(&rt, &history, None).await;
+        assert_eq!(chat.summary_request(), Some(SummaryRequest::ChatRequest));
+        compact_conversation(&history, &rt, None, &chat.dispatch()).await.unwrap();
+        let transcript = preview_compaction_disclosure(&rt, &history);
+        compact_conversation(&history, &rt, None, &transcript.dispatch()).await.unwrap();
+
+        let (log, trace) = observed_records(&rt, dir.path()).await;
+        assert_eq!(log.len(), 3, "turn, chat request, transcript request: {log:#?}");
+        let (turn, chat, transcript) = (&log[0], &log[1], &log[2]);
+
+        assert!(turn.get("compaction").is_none() && turn.get("summary_request").is_none());
+        assert_eq!(chat["compaction"], true);
+        assert_eq!(chat["summary_request"], "chat_request");
+        assert_eq!(chat["usage"]["cache_read"], MOCK_CACHE_READ);
+
+        let cost = crate::pricing::calculate_cost_optional_split(
+            "claude-opus-4-7",
+            TRANSCRIPT_INPUT,
+            TRANSCRIPT_OUTPUT,
+            0,
+            0,
+            None,
+            None,
+        );
+        // Whole-record comparison: a field this request cannot know
+        // (`ttft_ms`, `refusal_retries_used`, `cache_diag`) is absent, not
+        // guessed. The two times and three trace ids are checked below.
+        let mut known = transcript.clone();
+        for key in ["ts", "total_ms", "runtime_session_id", "turn_id", "trace_request_id"] {
+            assert!(known.as_object_mut().unwrap().remove(key).is_some(), "{key}");
+        }
+        assert_eq!(
+            known,
+            json!({
+                "request_id": "req_transcript",
+                "msg_id": "msg_transcript",
+                "model": "claude-opus-4-7",
+                "thinking": "adaptive",
+                "effort": "low",
+                "attempt": 1,
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input": TRANSCRIPT_INPUT,
+                    "output": TRANSCRIPT_OUTPUT,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "hit_pct": 0.0,
+                },
+                "cost_usd": cost,
+                "ratelimit": {
+                    "unified_status": "allowed",
+                    "unified_utilization": {"5h": 0.25, "7d": 0.5},
+                },
+                "context": {
+                    "messages": 1,
+                    "tools": 0,
+                    "system_bytes": COMPACTION_SYSTEM_PROMPT.len(),
+                    "breakpoints": [],
+                },
+                "compaction": true,
+                "summary_request": "transcript",
+                "session_id": "20261124-000000-test",
+            })
+        );
+        assert!(transcript["ts"].as_u64().unwrap() > 0);
+        assert!(transcript["total_ms"].is_u64());
+
+        // Both trace as any request does: one trace record each, joined to
+        // its api-log record by the request id.
+        for record in [turn, chat, transcript] {
+            let id = record["trace_request_id"].as_str().expect("a trace id");
+            let traced: Vec<&Value> = trace.iter().filter(|t| t["request_id"] == id).collect();
+            assert_eq!(traced.len(), 1, "{id}: {trace:#?}");
+            assert_eq!(traced[0]["turn_id"], record["turn_id"]);
+        }
+        assert_eq!(trace.len(), 3);
+    }
+
+    /// The transcript record follows the telemetry level like any other:
+    /// `basic` leaves the rate-limit headers out, `off` writes nothing.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn the_transcript_record_follows_the_telemetry_level() {
+        use crate::runtime::telemetry::TelemetryLevel;
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, _mock) = spawn_mock(vec![Stream::Blocks(vec![text("hi")])]).await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let history = vec![user("hello"), Arc::new(json!({"role": "assistant", "content": "hi"}))];
+        for (level, records) in [(TelemetryLevel::Basic, 1), (TelemetryLevel::Off, 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let rt = observed(opus(), dir.path(), level);
+            let dispatch = preview_compaction_disclosure(&rt, &history).dispatch();
+            compact_conversation(&history, &rt, None, &dispatch).await.unwrap();
+            let (log, _trace) = observed_records(&rt, dir.path()).await;
+            assert_eq!(log.len(), records, "{level:?}: {log:#?}");
+            for record in &log {
+                assert_eq!(record["summary_request"], "transcript");
+                assert_eq!(record["request_id"], "req_transcript");
+                assert!(record.get("ratelimit").is_none(), "{record:#?}");
+            }
+        }
+    }
 }

@@ -989,7 +989,7 @@ pub struct ApiOptions {
     /// read what the last accepted request left in the cache
     /// ([`CompactionRequest`]), it never switches accounts at a limit, it
     /// sends no `diagnostics` field, and its telemetry record carries
-    /// `"compaction": true`.
+    /// `"compaction": true` and `"summary_request": "chat_request"`.
     pub compaction: Option<CompactionRequest>,
     /// Anthropic cache diagnostics chain (`cache_diagnostics = true`).
     /// `None` (default) keeps the wire byte-identical: no header, no
@@ -2750,6 +2750,10 @@ impl ApiMethods {
                     },
                     keepwarm: options.keepwarm.is_some(),
                     compaction: options.compaction.is_some(),
+                    summary_request: options
+                        .compaction
+                        .as_ref()
+                        .map(|_| agent_core::compaction::SummaryRequest::ChatRequest),
                     worker: options.codex_request_role
                         == crate::runtime::openai::catalog::CodexRequestRole::Worker,
                     rollover_window: options.context_rollover.map(|r| r.window),

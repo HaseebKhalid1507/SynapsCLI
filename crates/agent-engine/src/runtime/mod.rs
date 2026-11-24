@@ -3350,12 +3350,17 @@ impl Runtime {
             // must not consume a user's one-shot `/trace next` arm.
             &api::ApiOptions {
                 trace: self.trace_ctx.clone(),
-                telemetry: self.telemetry_writer.clone(),
+                // The session's handle: the api-log record of this request
+                // carries the conversation id, like a turn's.
+                telemetry: self.request_telemetry(),
                 // The largest body Synaps sends: the whole transcript.
                 request_compression: self.request_compression.clone(),
                 ..api::ApiOptions::default()
             },
-            api_sync::SimpleCallReport { spend },
+            api_sync::SimpleCallReport {
+                telemetry_level: self.telemetry_level,
+                spend,
+            },
         )
         .await
     }

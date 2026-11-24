@@ -57,9 +57,34 @@ fn sync_usage_record(json: &Value) -> Option<super::telemetry::UsageRecord> {
 /// besides the reply text. The default reports nothing.
 #[derive(Default, Clone, Copy)]
 pub(super) struct SimpleCallReport<'a> {
+    /// Level of the request's api-log record, as for a streamed request:
+    /// `Off` writes none, `Full` adds the rate-limit headers.
+    pub telemetry_level: super::telemetry::TelemetryLevel,
     /// Where the usage the provider billed is booked (the session that
     /// asked for the compaction books it from there).
     pub spend: Option<&'a super::compaction::CompactionSpend>,
+}
+
+/// What the response headers of an accepted request say, read before the
+/// body consumes the response. Each only at the level that records it.
+struct AcceptedHeaders {
+    request_id: Option<String>,
+    ratelimit: Option<super::telemetry::RateLimitRecord>,
+}
+
+impl AcceptedHeaders {
+    fn read(headers: &reqwest::header::HeaderMap, level: super::telemetry::TelemetryLevel) -> Self {
+        use super::telemetry::{self, TelemetryLevel};
+        Self {
+            request_id: level
+                .enabled()
+                .then(|| telemetry::request_id_from_headers(headers))
+                .flatten(),
+            ratelimit: (level == TelemetryLevel::Full)
+                .then(|| telemetry::ratelimit_from_headers(headers))
+                .filter(|rl| !rl.is_empty()),
+        }
+    }
 }
 
 /// Bytes of JSON request body that are certainly more than one input token.
@@ -290,6 +315,16 @@ impl ApiMethods {
         if crate::core::models::model_supports_adaptive_thinking(model) {
             body["output_config"] = json!({"effort": "low"});
         }
+        // api-log: the thinking this body carries, by its level name. Not
+        // the session's level: an adaptive model is sent `adaptive` whatever
+        // that is. A budget model is sent the session's budget, which is
+        // its level's; the fallback budget (a session with none) has no
+        // level name, so the record then says nothing.
+        let sent_thinking = if adaptive {
+            Some(agent_core::reasoning::ReasoningLevel::Adaptive.as_str().to_string())
+        } else {
+            (thinking_budget != 0).then(|| reasoning_level.as_str().to_string())
+        };
 
         body["system"] = system_blocks;
 
@@ -373,6 +408,8 @@ impl ApiMethods {
                             clock.mark_headers();
                             let trace_rid =
                                 super::api::provider_request_id_from_headers(resp.headers());
+                            let accepted =
+                                AcceptedHeaders::read(resp.headers(), report.telemetry_level);
                             match resp.json::<Value>().await {
                                 Ok(j) => {
                                     if j["error"].is_object() {
@@ -401,6 +438,51 @@ impl ApiMethods {
                                         }
                                     }
                                     clock.mark_stream_end();
+                                    // ═══ TELEMETRY: the api-log record ═══
+                                    // One per accepted request, as on the
+                                    // streaming path. Only what this request
+                                    // knows: it has no first-event time
+                                    // (`ttft_ms`), no refusal retries, no
+                                    // cache diagnosis and no tools.
+                                    if report.telemetry_level.enabled() {
+                                        let usage = sync_usage_record(&j).unwrap_or_default();
+                                        let mut record = super::telemetry::TelemetryRecord {
+                                            ts: super::telemetry::TelemetryRecord::now_ms(),
+                                            request_id: accepted.request_id,
+                                            msg_id: j["id"].as_str().map(str::to_owned),
+                                            model: model.to_string(),
+                                            thinking: sent_thinking.clone(),
+                                            effort: body["output_config"]["effort"]
+                                                .as_str()
+                                                .map(str::to_owned),
+                                            attempt: attempt + 1,
+                                            total_ms: clock.stream_end_or_now_ms(),
+                                            stop_reason: j["stop_reason"]
+                                                .as_str()
+                                                .map(str::to_owned),
+                                            cost_usd: usage.cost_usd(model),
+                                            usage,
+                                            ratelimit: accepted.ratelimit,
+                                            context: super::telemetry::ContextRecord {
+                                                messages: messages.len(),
+                                                tools: 0,
+                                                system_bytes: system_prompt.len(),
+                                                breakpoints: Vec::new(),
+                                            },
+                                            compaction: true,
+                                            summary_request: Some(
+                                                agent_core::compaction::SummaryRequest::Transcript,
+                                            ),
+                                            ..Default::default()
+                                        };
+                                        record.set_correlation(
+                                            options.trace.session_id(),
+                                            tracer.as_ref().map(|t| t.correlation_ids()),
+                                        );
+                                        if let Some(writer) = options.telemetry.as_ref() {
+                                            writer.enqueue_telemetry(record);
+                                        }
+                                    }
                                     if let Some(t) = tracer.take() {
                                         let stop = j["stop_reason"].as_str().map(
                                             crate::runtime::trace::anthropic::stop_reason_from_wire,
