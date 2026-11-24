@@ -369,6 +369,13 @@ const COLD_TASK_CHARS: usize = 40_000;
 const COLD_TAIL_CHARS: usize = 60_000;
 const COLD_REPORT_CHARS: usize = 40_000;
 const COLD_TOTAL_CHARS: usize = 160_000;
+// The cold-resume envelope's header and headings. `cold_resume_task` reads an
+// earlier envelope back by these, so the writer and the reader share them.
+const COLD_HEADER_START: &str = "[Resumed by the orchestrator. Your earlier run in this task (";
+const COLD_TASK_HEADING: &str = "## Your original task\n\n";
+const COLD_WINDOWS_HEADING: &str = "## Earlier context windows of this run";
+const COLD_TAIL_HEADING: &str = "## The last steps of your earlier run";
+const COLD_REPORT_HEADING: &str = "## Your final report";
 const COLD_TOOL_INPUT_CHARS: usize = 600;
 const COLD_TOOL_RESULT_CHARS: usize = 1_500;
 /// One huge text turn must not eat the whole tail budget on its own.
@@ -538,28 +545,25 @@ fn content_text(content: &Value) -> String {
 fn cold_resume_task(content: &Value) -> Option<String> {
     let blocks = content.as_array()?;
     let header = blocks.first()?["text"].as_str()?;
-    if !header.starts_with("[Resumed by the orchestrator. Your earlier run in this task (") {
+    if !header.starts_with(COLD_HEADER_START) {
         return None;
     }
     let mut task = blocks.get(1)?["text"]
         .as_str()?
-        .strip_prefix("## Your original task\n\n")?;
-    let nested = task.starts_with("[Resumed by the orchestrator. Your earlier run in this task (");
-    while task.starts_with("[Resumed by the orchestrator. Your earlier run in this task (") {
-        let Some((_, inner)) = task.split_once("\n## Your original task\n\n") else {
+        .strip_prefix(COLD_TASK_HEADING)?;
+    let nested = task.starts_with(COLD_HEADER_START);
+    let inner_task = format!("\n{COLD_TASK_HEADING}");
+    while task.starts_with(COLD_HEADER_START) {
+        let Some((_, inner)) = task.split_once(inner_task.as_str()) else {
             break;
         };
         task = inner;
     }
     // A legacy task block concatenated all blocks of the previous envelope.
     // Once unwrapped, discard its old tail/report/instructions, not the task.
-    for heading in [
-        "\n## Earlier context windows of this run",
-        "\n## The last steps of your earlier run",
-        "\n## Your final report",
-    ] {
+    for heading in [COLD_WINDOWS_HEADING, COLD_TAIL_HEADING, COLD_REPORT_HEADING] {
         if nested {
-            if let Some((original, _)) = task.split_once(heading) {
+            if let Some((original, _)) = task.split_once(format!("\n{heading}").as_str()) {
                 task = original;
             }
         }
@@ -662,7 +666,7 @@ pub fn cold_resume_messages(
         None => "its prompt cache has expired".to_string(),
     };
     let header = format!(
-        "[Resumed by the orchestrator. Your earlier run in this task ({} messages, about {} \
+        "{COLD_HEADER_START}{} messages, about {} \
          tokens) is not replayed in full: {age}, so replaying it would rewrite all {} tokens. \
          Below are your original task, the last steps of that run and your final report, then \
          the new instructions. Re-read any file you need; don't assume details that aren't \
@@ -677,7 +681,7 @@ pub fn cold_resume_messages(
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| "(not recorded)".to_string());
     let task = format!(
-        "## Your original task\n\n{}",
+        "{COLD_TASK_HEADING}{}",
         cut_chars(&task, COLD_TASK_CHARS)
     );
     let final_message = &history[last_assistant];
@@ -691,7 +695,7 @@ pub fn cold_resume_messages(
         report = "(no text)".to_string();
     }
     let report = format!(
-        "## Your final report\n\n{}",
+        "{COLD_REPORT_HEADING}\n\n{}",
         cut_chars(&report, COLD_REPORT_CHARS)
     );
     let note = format!(
@@ -738,7 +742,7 @@ pub fn cold_resume_messages(
         }
     }
     kept.reverse();
-    let mut tail = String::from("## The last steps of your earlier run\n\n");
+    let mut tail = format!("{COLD_TAIL_HEADING}\n\n");
     if cut {
         tail.push_str("(earlier steps omitted)\n");
     }
@@ -775,9 +779,9 @@ pub fn cold_resume_messages(
 
 /// The cold-resume section listing a rolled run's saved context windows.
 fn earlier_windows_section(marker: &Value) -> String {
-    let mut out = String::from(
-        "## Earlier context windows of this run\n\nYour context rolled over during the run; \
-         the messages moved out of it are saved as plain text you can grep or read by line range:",
+    let mut out = format!(
+        "{COLD_WINDOWS_HEADING}\n\nYour context rolled over during the run; \
+         the messages moved out of it are saved as plain text you can grep or read by line range:"
     );
     for t in marker["transcripts"].as_array().into_iter().flatten() {
         out.push_str(&format!(
