@@ -981,8 +981,8 @@ pub struct ApiOptions {
     /// fails closed before a request is built) the request is assembled and
     /// marked exactly as a turn's — the caller appended the summary
     /// instructions as the last user message — and differs from a turn only
-    /// off the wire: it is refused before the network when its cache
-    /// identity is not the one the last accepted request had
+    /// off the wire: it is refused before the network when it could not
+    /// read what the last accepted request left in the cache
     /// ([`CompactionRequest`]), it never switches accounts at a limit, it
     /// sends no `diagnostics` field, and its telemetry record carries
     /// `"compaction": true`.
@@ -1012,17 +1012,25 @@ pub struct ApiOptions {
 /// [`ApiOptions::compaction`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionRequest {
-    /// Cache identity (`RequestBody::cache_identity`) of the last accepted
-    /// request of this chain. The request is sent only when its own is
-    /// equal: after a model, effort, thinking, system prompt, tool or
-    /// account change the message cache cannot be read, and the whole
-    /// history would be WRITTEN at the cache-write price instead.
-    pub expect_identity: u64,
+    /// What the last accepted request of this chain left in the cache. The
+    /// request is sent only when it can read that: its own cache identity
+    /// is equal (after a model, effort, thinking, system prompt, tool or
+    /// account change the message cache cannot be read) and its history
+    /// starts with the messages that request sent (after `/resume` in
+    /// place, or any other replacement of the history, they are not the
+    /// cached ones). Otherwise the whole history would be WRITTEN, at the
+    /// cache-write price.
+    pub expect: super::keepwarm::CachedPrefix,
 }
 
 /// Refusal text of a compaction request whose cache identity changed.
 pub(super) const COMPACTION_IDENTITY_CHANGED: &str = "cache-preserving compaction not sent: \
      the model, effort, thinking, system prompt, tools or account changed since the last request";
+
+/// Refusal text of a compaction request whose history does not start with
+/// the messages the last accepted request sent.
+pub(super) const COMPACTION_HISTORY_CHANGED: &str = "cache-preserving compaction not sent: \
+     the history does not start with the messages the last request sent";
 
 /// What a keep-warm request does once its body is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1614,20 +1622,41 @@ impl ApiMethods {
                 }));
             }
         }
-        // Cache identity of this request: stamped beside the cache anchor
-        // when it is accepted, and what a cache-preserving compaction request
-        // must match before it is sent (it returns here, before any trace,
-        // telemetry or network I/O, when it does not).
-        let cache_identity = (options.cache_anchor.is_some() || options.compaction.is_some())
+        // What this request leaves in the cache once accepted: stamped
+        // beside the cache anchor, and what a cache-preserving compaction
+        // request is checked against before it is sent (it returns here,
+        // before any trace, telemetry or network I/O, when it cannot read
+        // what the last accepted request left).
+        let cached_prefix = (options.cache_anchor.is_some() || options.compaction.is_some())
             .then(|| {
                 let beta = Self::build_beta_header(&auth_type, options, model);
-                body.cache_identity(beta.as_deref(), &auth_type, auth_binding.as_deref())
+                // The history part of `messages`: the last message of a
+                // ping (a replay's is appended above, not here) or of a
+                // compaction request is request-local, and so is a
+                // trailing context advisory.
+                let local_tail = options.compaction.is_some()
+                    || options
+                        .keepwarm
+                        .as_ref()
+                        .is_some_and(|k| k.mode != KeepWarmMode::Replay);
+                let sent = messages.len().saturating_sub(usize::from(local_tail));
+                let history = &messages[..super::request::durable_len(&messages[..sent])];
+                (
+                    body.cache_identity(beta.as_deref(), &auth_type, auth_binding.as_deref()),
+                    history,
+                )
             });
-        if let (Some(compaction), Some(actual)) = (&options.compaction, cache_identity) {
-            if compaction.expect_identity != actual {
+        if let (Some(compaction), Some((identity, history))) = (&options.compaction, cached_prefix)
+        {
+            if compaction.expect.identity != identity {
                 return Err(RuntimeError::Config(COMPACTION_IDENTITY_CHANGED.into()));
             }
+            if !compaction.expect.leads(history) {
+                return Err(RuntimeError::Config(COMPACTION_HISTORY_CHANGED.into()));
+            }
         }
+        let cached_prefix = cached_prefix
+            .map(|(identity, history)| super::keepwarm::CachedPrefix::of(identity, history));
         let translation_report = parts.report;
 
         // Did THIS request actually carry at least one 1h marker? Arms the
@@ -1837,9 +1866,9 @@ impl ApiMethods {
                                     // After an account hop the identity
                                     // built for the first seat is not this
                                     // request's: stamped as unknown.
-                                    match cache_identity.filter(|_| anthropic_failovers == 0) {
-                                        Some(identity) => {
-                                            anchor.stamp_identified(sent_at, identity)
+                                    match cached_prefix.filter(|_| anthropic_failovers == 0) {
+                                        Some(prefix) => {
+                                            anchor.stamp_identified(sent_at, prefix)
                                         }
                                         None => anchor.stamp(sent_at),
                                     }
@@ -5981,7 +6010,9 @@ mod anthropic_failover_tests {
         let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
         let auth = oauth_auth_pinned_to("claude4");
         let refused = ApiOptions {
-            compaction: Some(super::CompactionRequest { expect_identity: 0 }),
+            compaction: Some(super::CompactionRequest {
+                expect: crate::runtime::keepwarm::CachedPrefix::of(0, &[]),
+            }),
             ..Default::default()
         };
         let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, refused).await;
@@ -5989,7 +6020,6 @@ mod anthropic_failover_tests {
         assert!(error.to_string().contains(super::COMPACTION_IDENTITY_CHANGED), "{error}");
         assert_eq!(upstream.calls(), 0, "refused before the network");
 
-        // With the identity the request really has, it is sent.
         let cell = Arc::new(crate::runtime::keepwarm::CacheAnchorCell::default());
         let turn = ApiOptions {
             cache_anchor: Some(Arc::clone(&cell)),
@@ -5997,9 +6027,26 @@ mod anthropic_failover_tests {
         };
         let warm = spawn_upstream(vec![Reply::SseOk]).await;
         drive_with(&warm, Arc::clone(&auth), &router, 2, turn).await.result.expect("turn");
-        let identity = cell.identity().expect("an accepted request stamps its identity");
+        let stamped = cell.prefix().expect("an accepted request stamps what it left");
+        assert_eq!(stamped.messages, 1, "with the messages it sent");
+        // The harness sends the turn's messages again, so the last of them
+        // counts as the compaction request's own: its history is one
+        // message short of what the turn sent, and it is refused.
+        let shorter = ApiOptions {
+            compaction: Some(super::CompactionRequest { expect: stamped }),
+            ..Default::default()
+        };
+        let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, shorter).await;
+        let error = out.result.expect_err("another history is refused");
+        assert!(error.to_string().contains(super::COMPACTION_HISTORY_CHANGED), "{error}");
+        assert_eq!(upstream.calls(), 0, "refused before the network");
+
+        // With the identity the request really has and a history that
+        // starts with what was sent (nothing: an empty prefix), it is sent.
         let compaction = ApiOptions {
-            compaction: Some(super::CompactionRequest { expect_identity: identity }),
+            compaction: Some(super::CompactionRequest {
+                expect: crate::runtime::keepwarm::CachedPrefix::of(stamped.identity, &[]),
+            }),
             ..Default::default()
         };
         let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, compaction).await;

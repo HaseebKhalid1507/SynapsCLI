@@ -38,8 +38,11 @@
 //! 3. the chat is on the native Anthropic transport;
 //! 4. the history, the instructions and the summary's output fit the
 //!    model's context window;
-//! 5. the cache is known to be warm, and written by a request with this
-//!    one's cache identity ([`CacheState`]);
+//! 5. the cache is known to be warm ([`CacheState`]), written by a request
+//!    with this one's cache identity, and for this history: the history
+//!    starts with exactly the messages the last accepted request sent
+//!    ([`CachedPrefix`]). The anchor alone does not say so: `/resume` in
+//!    place swaps the history under a runtime whose anchor is minutes old;
 //! 6. the instructions, a user message that is not a tool result, do not
 //!    make the provider strip earlier thinking: on models before Opus 4.5,
 //!    Sonnet 4.6 and Haiku 5.5 that removes every message after the first
@@ -55,6 +58,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::compaction::{CompactionOutcome, DisclosurePolicy, RenderedCompactionInput};
+use super::keepwarm::CachedPrefix;
 use super::Runtime;
 use crate::session::cache_keepwarm::{governing_ttl, honoured_ttl, TtlEvidence, LATE_GUARD};
 use crate::SharedMessage;
@@ -86,17 +90,13 @@ pub fn instructions(rendered: &RenderedCompactionInput) -> String {
 /// What the runtime knows about the chat's cached prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheState {
-    /// Read or written `age` ago by a request with cache identity
-    /// `identity`, under a TTL of `ttl` that has not run out.
-    Warm {
-        identity: u64,
-        age: Duration,
-        ttl: Duration,
-    },
+    /// The last accepted request left this prefix, under a TTL that has
+    /// not run out.
+    Warm(CachedPrefix),
     /// The TTL has run out (or is within [`LATE_GUARD`] of it).
-    Cold { age: Duration, ttl: Duration },
+    Cold,
     /// No accepted request in this process yet (a resumed session), or one
-    /// whose cache identity is not known (it switched accounts mid-request).
+    /// whose cached prefix is not known (it switched accounts mid-request).
     Unknown,
 }
 
@@ -104,14 +104,14 @@ pub enum CacheState {
 /// from the START of the request that read or wrote the entry, which is
 /// when the anchor is taken; a request still has to reach the provider, so
 /// the last [`LATE_GUARD`] of the lifetime counts as gone.
-pub fn cache_state(identity: Option<u64>, age: Option<Duration>, ttl: Duration) -> CacheState {
-    match (identity, age) {
-        (Some(identity), Some(age)) if age + LATE_GUARD < ttl => CacheState::Warm {
-            identity,
-            age,
-            ttl,
-        },
-        (Some(_), Some(age)) => CacheState::Cold { age, ttl },
+pub fn cache_state(
+    prefix: Option<CachedPrefix>,
+    age: Option<Duration>,
+    ttl: Duration,
+) -> CacheState {
+    match (prefix, age) {
+        (Some(prefix), Some(age)) if age + LATE_GUARD < ttl => CacheState::Warm(prefix),
+        (Some(_), Some(_)) => CacheState::Cold,
         _ => CacheState::Unknown,
     }
 }
@@ -124,8 +124,9 @@ pub enum Skip {
     OtherModel,
     NotAnthropic,
     DoesNotFit { needed: u64, window: u64 },
-    CacheCold { age: Duration, ttl: Duration },
+    CacheCold,
     CacheUnknown,
+    HistoryChanged,
     ThinkingStripped,
 }
 
@@ -144,11 +145,9 @@ impl std::fmt::Display for Skip {
                 f,
                 "history, instructions and summary need about {needed} tokens of a {window}-token window"
             ),
-            Skip::CacheCold { age, ttl } => write!(
-                f,
-                "the prompt cache is cold ({}s since the last request, TTL {}s)",
-                age.as_secs(),
-                ttl.as_secs()
+            Skip::CacheCold => f.write_str("the prompt cache is cold"),
+            Skip::HistoryChanged => f.write_str(
+                "the history does not start with the messages the last request sent",
             ),
             Skip::CacheUnknown => {
                 f.write_str("nothing is known about the prompt cache (no request yet)")
@@ -181,20 +180,28 @@ impl Runtime {
             let wall = anchor.wall.elapsed().unwrap_or(Duration::ZERO);
             anchor.mono.elapsed().max(wall)
         });
-        cache_state(self.cache_identity(), age, ttl)
+        let state = cache_state(self.cached_prefix(), age, ttl);
+        if let (CacheState::Cold, Some(age)) = (state, age) {
+            tracing::info!(
+                age_secs = age.as_secs(),
+                ttl_secs = ttl.as_secs(),
+                "compaction: the prompt cache is cold"
+            );
+        }
+        state
     }
 }
 
-/// The cache identity the request must have, when every condition of the
-/// module docs holds; else the first one that does not. Decided locally:
-/// nothing is sent.
+/// What the request must be able to read (the cached prefix of the last
+/// accepted request), when every condition of the module docs holds; else
+/// the first one that does not. Decided locally: nothing is sent.
 pub async fn cached_path(
     runtime: &Runtime,
     history: &[SharedMessage],
     model: &str,
     policy: &DisclosurePolicy,
     instructions: &str,
-) -> Result<u64, Skip> {
+) -> Result<CachedPrefix, Skip> {
     use agent_core::compaction::CompactionMode;
     if policy.mode != CompactionMode::Remote {
         return Err(Skip::LocalOnly);
@@ -233,11 +240,18 @@ pub async fn cached_path(
             window: assessment.provider_window,
         });
     }
-    match runtime.compaction_cache_state().await {
-        CacheState::Warm { identity, .. } => Ok(identity),
-        CacheState::Cold { age, ttl } => Err(Skip::CacheCold { age, ttl }),
-        CacheState::Unknown => Err(Skip::CacheUnknown),
+    let prefix = match runtime.compaction_cache_state().await {
+        CacheState::Warm(prefix) => prefix,
+        CacheState::Cold => return Err(Skip::CacheCold),
+        CacheState::Unknown => return Err(Skip::CacheUnknown),
+    };
+    // Warm, but for which messages? The anchor outlives a history swap
+    // (`/resume` in place keeps the runtime): only a history that starts
+    // with what the last request sent reads its cache.
+    if !prefix.leads(history) {
+        return Err(Skip::HistoryChanged);
     }
+    Ok(prefix)
 }
 
 /// Whether any assistant message of `history` holds a thinking block.
@@ -288,15 +302,15 @@ pub(super) async fn summarize(
     rendered: &RenderedCompactionInput,
 ) -> Option<CompactionOutcome> {
     let instructions = instructions(rendered);
-    let identity = match cached_path(runtime, history, model, policy, &instructions).await {
-        Ok(identity) => identity,
+    let expect = match cached_path(runtime, history, model, policy, &instructions).await {
+        Ok(expect) => expect,
         Err(skip) => {
             tracing::info!(reason = %skip, "compaction: sending the transcript request");
             return None;
         }
     };
     let reply = runtime
-        .compaction_cached_request(history, &instructions, identity)
+        .compaction_cached_request(history, &instructions, expect)
         .await;
     let (summary_text, system_prompt) = match reply {
         Ok((reply, system_prompt)) => match summary_from_reply(&reply) {
@@ -350,6 +364,14 @@ mod tests {
     const CACHED_SUMMARY: &str = "## Goal\nSUMMARY-FROM-THE-CHAT-REQUEST";
     const TRANSCRIPT_SUMMARY: &str = "## Goal\nSUMMARY-FROM-THE-TRANSCRIPT-REQUEST";
     const RESULT_SENTINEL: &str = "TOOL-RESULT-SENTINEL-9f3a";
+    /// A cached prefix with no messages (it leads any history) and an
+    /// arbitrary identity, for the checks that never build a request.
+    const SEVEN: CachedPrefix = CachedPrefix {
+        identity: 7,
+        messages: 0,
+        // FNV-1a 64 offset basis: `message_prefix_digest(&[])`.
+        digest: 0xcbf2_9ce4_8422_2325,
+    };
 
     /// One request the mock received.
     #[derive(Clone)]
@@ -528,7 +550,7 @@ mod tests {
     async fn warm_chat(rt: &Runtime) -> Vec<SharedMessage> {
         let mut history = real_turn(rt, vec![user("hello")]).await;
         assert!(
-            matches!(rt.compaction_cache_state().await, CacheState::Warm { .. }),
+            matches!(rt.compaction_cache_state().await, CacheState::Warm(_)),
             "an accepted turn request leaves the cache known warm"
         );
         history.extend([
@@ -865,7 +887,7 @@ mod tests {
     #[serial_test::serial(synaps_base_dir)]
     async fn another_provider_is_not_eligible() {
         let _base = crate::test_env::BaseDirGuard::new();
-        let warm = |rt: &Runtime| rt.cache_anchor.stamp_identified(CacheAnchor::now(), 7);
+        let warm = |rt: &Runtime| rt.cache_anchor.stamp_identified(CacheAnchor::now(), SEVEN);
         let history = vec![user("hello"), Arc::new(json!({"role": "assistant", "content": "hi"}))];
         let policy = DisclosurePolicy::default();
 
@@ -873,7 +895,7 @@ mod tests {
         warm(&rt);
         assert_eq!(
             cached_path(&rt, &history, rt.model(), &policy, "summarize").await,
-            Ok(7),
+            Ok(SEVEN),
             "control: an Anthropic chat with a warm cache is eligible"
         );
 
@@ -907,7 +929,7 @@ mod tests {
             let policy = policy.clone();
             async move {
                 let rt = chat(model, ReasoningLevel::High, CacheTtl::FiveMinutes);
-                rt.cache_anchor.stamp_identified(CacheAnchor::now(), 7);
+                rt.cache_anchor.stamp_identified(CacheAnchor::now(), SEVEN);
                 cached_path(&rt, &history, rt.model(), &policy, "summarize").await
             }
         };
@@ -915,8 +937,8 @@ mod tests {
             eligible("claude-sonnet-4-5", thought.clone()).await,
             Err(Skip::ThinkingStripped)
         );
-        assert_eq!(eligible("claude-sonnet-4-5", plain).await, Ok(7));
-        assert_eq!(eligible("claude-sonnet-4-6", thought).await, Ok(7));
+        assert_eq!(eligible("claude-sonnet-4-5", plain).await, Ok(SEVEN));
+        assert_eq!(eligible("claude-sonnet-4-6", thought).await, Ok(SEVEN));
     }
 
     /// Condition 4: a history that does not fit the window with the
@@ -942,17 +964,17 @@ mod tests {
         let _base = crate::test_env::BaseDirGuard::new();
         let (seen, outcome) = compact_after(opus(), cached_reply(), |rt| {
             // The machine slept for two hours: the wall clock moved.
-            let identity = rt.cache_identity().expect("the turn stamped one");
+            let prefix = rt.cached_prefix().expect("the turn stamped one");
             rt.cache_anchor.stamp_identified(
                 CacheAnchor {
                     mono: tokio::time::Instant::now(),
                     wall: std::time::SystemTime::now() - Duration::from_secs(7_200),
                 },
-                identity,
+                prefix,
             );
             assert!(matches!(
                 futures::executor::block_on(rt.compaction_cache_state()),
-                CacheState::Cold { .. }
+                CacheState::Cold
             ));
         })
         .await;
@@ -998,19 +1020,57 @@ mod tests {
         assert_only_the_transcript_request(&seen, &outcome);
     }
 
+    /// Condition 5: the cache is warm, but for another history. `/resume`
+    /// in place swaps the history under the same runtime (same system
+    /// prompt, tools and account, an anchor seconds old); a request for the
+    /// resumed history would read none of the cached messages and write
+    /// them all. Decided before anything is sent.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_swapped_history_sends_the_transcript() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock(vec![
+            Stream::Blocks(vec![text("hi")]),
+            Stream::Blocks(vec![text(CACHED_SUMMARY)]),
+        ])
+        .await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = opus();
+        let history = warm_chat(&rt).await;
+        let policy = rt.compaction_policy();
+        assert_eq!(SEVEN, CachedPrefix::of(7, &[]));
+        let sent = rt.cached_prefix().expect("the turn stamped what it sent");
+        assert_eq!(sent.messages, 1, "the turn's request held one message");
+        assert_eq!(
+            cached_path(&rt, &history, rt.model(), &policy, "summarize").await,
+            Ok(sent),
+            "control: the chat's own history is eligible"
+        );
+
+        let mut resumed = history.clone();
+        resumed[0] = user("the first message of another session");
+        assert_eq!(
+            cached_path(&rt, &resumed, rt.model(), &policy, "summarize").await,
+            Err(Skip::HistoryChanged)
+        );
+        let outcome = compact_conversation(&resumed, &rt, None).await.unwrap();
+        assert_only_the_transcript_request(&mock.seen().split_off(1), &outcome);
+    }
+
     /// The warm/cold boundary: the lifetime counts from the anchor, and its
     /// last [`LATE_GUARD`] is not usable.
     #[test]
     fn the_cache_is_warm_until_the_guard_before_its_ttl() {
         let (m5, h1) = (Duration::from_secs(300), Duration::from_secs(3_600));
         let at = |secs| Some(Duration::from_secs(secs));
-        assert!(matches!(cache_state(Some(1), at(0), m5), CacheState::Warm { .. }));
-        assert!(matches!(cache_state(Some(1), at(284), m5), CacheState::Warm { .. }));
-        assert!(matches!(cache_state(Some(1), at(285), m5), CacheState::Cold { .. }));
-        assert!(matches!(cache_state(Some(1), at(3_584), h1), CacheState::Warm { .. }));
-        assert!(matches!(cache_state(Some(1), at(3_585), h1), CacheState::Cold { .. }));
+        let p = Some(SEVEN);
+        assert_eq!(cache_state(p, at(0), m5), CacheState::Warm(SEVEN));
+        assert_eq!(cache_state(p, at(284), m5), CacheState::Warm(SEVEN));
+        assert_eq!(cache_state(p, at(285), m5), CacheState::Cold);
+        assert_eq!(cache_state(p, at(3_584), h1), CacheState::Warm(SEVEN));
+        assert_eq!(cache_state(p, at(3_585), h1), CacheState::Cold);
         assert_eq!(cache_state(None, at(1), m5), CacheState::Unknown);
-        assert_eq!(cache_state(Some(1), None, m5), CacheState::Unknown);
+        assert_eq!(cache_state(p, None, m5), CacheState::Unknown);
     }
 
     /// The chat request was sent, failed, and the transcript request ran

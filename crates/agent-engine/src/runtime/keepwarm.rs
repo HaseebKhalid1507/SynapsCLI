@@ -82,36 +82,70 @@ impl CacheAnchor {
     }
 }
 
+/// What the last accepted Anthropic request left in the provider's prompt
+/// cache, as far as a later request can tell before it is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedPrefix {
+    /// Hash of everything ahead of the messages that the cache key covers
+    /// (model, effort, system, thinking, tools, beta header) and of the
+    /// account the request went out on (`RequestBody::cache_identity`). A
+    /// request with another identity reads nothing that request wrote.
+    pub identity: u64,
+    /// How many messages of that request belong to the history: all of
+    /// them, less the request-local last message of a keep-warm ping or of
+    /// a compaction request.
+    pub messages: usize,
+    /// `request::message_prefix_digest` of those messages.
+    pub digest: u64,
+}
+
+impl CachedPrefix {
+    /// The prefix a request with `identity` leaves when it is accepted
+    /// with `messages` as its history part.
+    pub fn of(identity: u64, messages: &[SharedMessage]) -> Self {
+        Self {
+            identity,
+            messages: messages.len(),
+            digest: super::request::message_prefix_digest(messages),
+        }
+    }
+
+    /// Whether `history` starts with exactly the messages that request
+    /// sent. When it does not (another session was resumed in place, the
+    /// history was edited or replaced), a request for `history` reads
+    /// nothing of the message cache however recent the anchor is.
+    pub fn leads(&self, history: &[SharedMessage]) -> bool {
+        history.len() >= self.messages
+            && super::request::message_prefix_digest(&history[..self.messages]) == self.digest
+    }
+}
+
 /// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]),
-/// with the cache identity of that request: a hash of everything ahead of
-/// the messages that the cache key covers (model, effort, system, thinking,
-/// tools, beta header) and of the account it went out on
-/// (`ApiMethods::cache_identity`). A later request with another identity
-/// reads nothing that request wrote.
+/// with what that request left in the cache ([`CachedPrefix`]).
 /// Runtime clones get a FRESH cell (a clone is a different request chain,
 /// like the TTL latches); `share_ttl_latches` shares it.
 #[derive(Debug, Default)]
-pub struct CacheAnchorCell(std::sync::Mutex<(Option<CacheAnchor>, Option<u64>)>);
+pub struct CacheAnchorCell(std::sync::Mutex<(Option<CacheAnchor>, Option<CachedPrefix>)>);
 
 impl CacheAnchorCell {
-    /// Stamp a request whose cache identity is not known: the identity of
-    /// an earlier request no longer describes the newest one and is dropped.
+    /// Stamp a request whose cached prefix is not known: that of an earlier
+    /// request no longer describes the newest one and is dropped.
     pub fn stamp(&self, at: CacheAnchor) {
         self.stamp_with(at, None);
     }
 
-    /// Stamp an accepted request and its cache identity.
-    pub fn stamp_identified(&self, at: CacheAnchor, identity: u64) {
-        self.stamp_with(at, Some(identity));
+    /// Stamp an accepted request and the prefix it left.
+    pub fn stamp_identified(&self, at: CacheAnchor, prefix: CachedPrefix) {
+        self.stamp_with(at, Some(prefix));
     }
 
-    fn stamp_with(&self, at: CacheAnchor, identity: Option<u64>) {
+    fn stamp_with(&self, at: CacheAnchor, prefix: Option<CachedPrefix>) {
         let mut slot = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.0.is_none_or(|prev| prev.mono <= at.mono) {
-            *slot = (Some(at), identity);
+            *slot = (Some(at), prefix);
         }
     }
 
@@ -122,8 +156,8 @@ impl CacheAnchorCell {
             .0
     }
 
-    /// Cache identity of the request [`Self::get`] returns, when known.
-    pub fn identity(&self) -> Option<u64> {
+    /// What the request [`Self::get`] returns left in the cache, when known.
+    pub fn prefix(&self) -> Option<CachedPrefix> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -421,7 +455,7 @@ enum NextTurnRequest<'a> {
     /// Cache-preserving compaction: `instructions` is the new user message.
     Compaction {
         instructions: &'a str,
-        expect_identity: u64,
+        expect: CachedPrefix,
     },
 }
 
@@ -597,10 +631,10 @@ impl Runtime {
         }
     }
 
-    /// Cache identity of this chain's last accepted Anthropic request (see
-    /// [`CacheAnchorCell`]); `None` before one, or when it is not known.
-    pub fn cache_identity(&self) -> Option<u64> {
-        self.cache_anchor.identity()
+    /// What this chain's last accepted Anthropic request left in the cache
+    /// (see [`CachedPrefix`]); `None` before one, or when it is not known.
+    pub fn cached_prefix(&self) -> Option<CachedPrefix> {
+        self.cache_anchor.prefix()
     }
 
     /// Send the chat's own next request for `history` with `instructions`
@@ -608,8 +642,10 @@ impl Runtime {
     /// return the reply's content blocks. Assembled by the same code as a
     /// keep-warm ping, hence as a turn: system, tools, thinking, effort and
     /// history are the turn's; markers are placed as a turn places them.
-    /// Refused before the network when the request's cache identity is not
-    /// `expect_identity`. Runs no tool, fires no hook, never touches
+    /// Refused before the network when the request could not read what
+    /// `expect` (the last accepted request) left in the cache: another
+    /// cache identity, or a history that does not start with the messages
+    /// that request sent. Runs no tool, fires no hook, never touches
     /// `history` or any session state, and emits nothing to a frontend.
     /// Returns the reply with the system prompt the request carried (the
     /// summary's provenance digests it).
@@ -617,7 +653,7 @@ impl Runtime {
         &self,
         history: &[SharedMessage],
         instructions: &str,
-        expect_identity: u64,
+        expect: CachedPrefix,
     ) -> Result<(Value, Option<String>)> {
         // A remote summarization request: counted at the same seam as the
         // transcript request (`Runtime::compact_call`), before any assembly.
@@ -629,7 +665,7 @@ impl Runtime {
                 &CancellationToken::new(),
                 NextTurnRequest::Compaction {
                     instructions,
-                    expect_identity,
+                    expect,
                 },
                 &PingTap::default(),
             )
@@ -827,9 +863,9 @@ impl Runtime {
             },
             compaction: match purpose {
                 NextTurnRequest::Ping(_) => None,
-                NextTurnRequest::Compaction {
-                    expect_identity, ..
-                } => Some(super::api::CompactionRequest { expect_identity }),
+                NextTurnRequest::Compaction { expect, .. } => {
+                    Some(super::api::CompactionRequest { expect })
+                }
             },
             // Header only (cache-key parity with the turns this ping keeps
             // warm); a ping never sends `diagnostics` nor moves the chain.
@@ -2211,23 +2247,79 @@ mod tests {
         );
     }
 
-    /// The identity belongs to the request the anchor names: a newer
-    /// request without one clears it, an older stamp changes nothing.
+    /// The prefix belongs to the request the anchor names: a newer request
+    /// without one clears it, an older stamp changes nothing.
     #[test]
-    fn anchor_cell_identity_follows_the_newest_request() {
+    fn anchor_cell_prefix_follows_the_newest_request() {
         let cell = CacheAnchorCell::default();
-        assert_eq!(cell.identity(), None);
+        assert_eq!(cell.prefix(), None);
         let a = CacheAnchor::now();
         let at = |secs| CacheAnchor {
             mono: a.mono + std::time::Duration::from_secs(secs),
             wall: a.wall + std::time::Duration::from_secs(secs),
         };
-        cell.stamp_identified(at(5), 42);
-        assert_eq!((cell.get(), cell.identity()), (Some(at(5)), Some(42)));
-        cell.stamp_identified(a, 7);
-        assert_eq!(cell.identity(), Some(42), "an older stamp never rewinds");
+        let (new, old) = (CachedPrefix::of(42, &[]), CachedPrefix::of(7, &[]));
+        cell.stamp_identified(at(5), new);
+        assert_eq!((cell.get(), cell.prefix()), (Some(at(5)), Some(new)));
+        cell.stamp_identified(a, old);
+        assert_eq!(cell.prefix(), Some(new), "an older stamp never rewinds");
         cell.stamp(at(9));
-        assert_eq!((cell.get(), cell.identity()), (Some(at(9)), None));
+        assert_eq!((cell.get(), cell.prefix()), (Some(at(9)), None));
+    }
+
+    /// A history is led by a request's messages only when it starts with
+    /// exactly them. The last message of the request counts in its durable
+    /// form: a turn sends its newest user message as blocks, with turn-only
+    /// context after them, and the history holds the bare string.
+    #[test]
+    fn a_cached_prefix_leads_only_a_history_that_starts_with_its_messages() {
+        let m = |role: &str, content: Value| Arc::new(json!({"role": role, "content": content}));
+        let turn_only = agent_core::core::extension_context::guard_turn("the time is 12:00");
+        assert!(super::super::stream::is_ephemeral_turn_context_block(
+            &json!({"type": "text", "text": turn_only})
+        ));
+        let sent = vec![
+            m("user", json!("one")),
+            m("assistant", json!("two")),
+            m("user", json!([{"type": "text", "text": "three"}, {"type": "text", "text": turn_only}])),
+        ];
+        let prefix = CachedPrefix::of(1, &sent);
+        assert_eq!(prefix.messages, 3);
+
+        let history = vec![
+            m("user", json!("one")),
+            m("assistant", json!("two")),
+            m("user", json!("three")),
+            m("assistant", json!("four")),
+        ];
+        assert!(prefix.leads(&history), "the same conversation, one reply on");
+        assert!(prefix.leads(&history[..3]));
+        assert!(!prefix.leads(&history[..2]), "shorter than what was sent");
+
+        let mut edited = history.clone();
+        edited[0] = m("user", json!("ONE"));
+        assert!(!prefix.leads(&edited), "an earlier message changed");
+        let mut edited = history.clone();
+        edited[2] = m("user", json!("3"));
+        assert!(!prefix.leads(&edited), "the last sent message changed");
+        let other = vec![m("user", json!("another session")); 4];
+        assert!(!prefix.leads(&other), "another conversation");
+
+        // Host keys never reach the wire and do not count.
+        let mut stamped = history.clone();
+        stamped[1] = Arc::new(json!({"role": "assistant", "content": "two", "_synaps_time": 5}));
+        assert!(prefix.leads(&stamped));
+        assert!(CachedPrefix::of(1, &[]).leads(&history), "nothing sent leads anything");
+
+        // A request-only advisory chained after the newest user message is
+        // not part of the history the request leaves cached.
+        let advisory = m("user", json!(super::super::continuation::ADVISORY_PREFIX));
+        let mut with_advisory = sent.clone();
+        with_advisory.push(advisory);
+        let durable = super::super::request::durable_len(&with_advisory);
+        assert_eq!(durable, 3);
+        assert_eq!(CachedPrefix::of(1, &with_advisory[..durable]), prefix);
+        assert_eq!(super::super::request::durable_len(&history), 4);
     }
 
     #[test]
