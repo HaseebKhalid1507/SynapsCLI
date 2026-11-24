@@ -376,17 +376,32 @@ pub fn cache_miss_warning(session: Option<&str>, usage: &KeepWarmUsage) -> Optio
     })
 }
 
+/// The line a user is shown, next to the compaction disclosure, when the
+/// chat's own request wrote more cache than it read: the history was
+/// billed at the write price, which the disclosure ("read from cache") did
+/// not say. `None` when it mostly read ([`cache_miss_warning`]'s test).
+pub fn cache_miss_notice(usage: &KeepWarmUsage) -> Option<String> {
+    let (read, written) = (usage.cache_read_tokens, usage.cache_write_tokens);
+    (written > read).then(|| {
+        format!(
+            "compaction: the summary request missed the cache (wrote {written}, read {read} tokens)"
+        )
+    })
+}
+
 /// Summarize through the chat's own next request when [`cached_path`]
 /// allows it. `None` (the conditions do not hold, or the request failed in
 /// any way) sends the caller to the transcript request; why is logged. The
 /// outcome's provenance is that of the request that was sent
-/// ([`outcome_for`]).
+/// ([`outcome_for`]). What the request was billed is booked into `spend`,
+/// whatever became of its reply.
 pub(super) async fn summarize(
     history: &[SharedMessage],
     runtime: &Runtime,
     model: &str,
     policy: &DisclosurePolicy,
     rendered: &RenderedCompactionInput,
+    spend: &super::compaction::CompactionSpend,
 ) -> Option<CompactionOutcome> {
     let instructions = instructions(rendered);
     let expect = match cached_path(
@@ -406,7 +421,7 @@ pub(super) async fn summarize(
         }
     };
     let sent = match runtime
-        .compaction_cached_request(history, &instructions, expect)
+        .compaction_cached_request(history, &instructions, expect, spend)
         .await
     {
         Ok(sent) => sent,
@@ -470,7 +485,7 @@ mod tests {
     use super::*;
     use crate::core::config::CacheTtl;
     use crate::runtime::compaction::{
-        compact_conversation, render_compaction_input, COMPACTION_SYSTEM_PROMPT,
+        compact_as_previewed, render_compaction_input, COMPACTION_SYSTEM_PROMPT,
     };
     use crate::runtime::keepwarm::CacheAnchor;
     use crate::{SessionEvent, StreamEvent};
@@ -488,6 +503,9 @@ mod tests {
     /// The cache usage every streamed mock reply reports.
     const MOCK_CACHE_READ: u64 = 1_200;
     const MOCK_CACHE_WRITE: u64 = 30;
+    /// The usage the mock's transcript (non-streaming) reply reports.
+    const TRANSCRIPT_INPUT: u64 = 10;
+    const TRANSCRIPT_OUTPUT: u64 = 5;
     /// A cached prefix with no messages (it leads any history) and an
     /// arbitrary identity, for the checks that never build a request.
     const SEVEN: CachedPrefix = CachedPrefix {
@@ -615,13 +633,28 @@ mod tests {
                         };
                         if !stream {
                             let reply = json!({
+                                "id": "msg_transcript",
+                                "model": "claude-opus-4-7",
                                 "content": [text(TRANSCRIPT_SUMMARY)],
                                 "stop_reason": "end_turn",
-                                "usage": {"input_tokens": 10, "output_tokens": 5},
+                                "usage": {
+                                    "input_tokens": TRANSCRIPT_INPUT,
+                                    "output_tokens": TRANSCRIPT_OUTPUT,
+                                    "cache_read_input_tokens": 0,
+                                    "cache_creation_input_tokens": 0,
+                                },
                             });
+                            // A subscription's usage windows ride every
+                            // accepted response.
                             return (
                                 StatusCode::OK,
-                                [("content-type", "application/json")],
+                                [
+                                    ("content-type", "application/json"),
+                                    ("request-id", "req_transcript"),
+                                    ("anthropic-ratelimit-unified-status", "allowed"),
+                                    ("anthropic-ratelimit-unified-5h-utilization", "0.25"),
+                                    ("anthropic-ratelimit-unified-7d-utilization", "0.5"),
+                                ],
                                 reply.to_string(),
                             )
                                 .into_response();
@@ -798,7 +831,7 @@ mod tests {
         let history = warm_chat(rt).await;
         let snapshot = history.clone();
 
-        let outcome = compact_conversation(&history, rt, Some("FOCUS-ON-THE-PARSER"))
+        let outcome = compact_as_previewed(&history, rt, Some("FOCUS-ON-THE-PARSER"))
             .await
             .expect("compaction");
         assert_eq!(history, snapshot, "compaction never touches the history");
@@ -1002,7 +1035,7 @@ mod tests {
         let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
         let rt = opus();
         let history = warm_chat(&rt).await;
-        let fallen = compact_conversation(&history, &rt, None).await.unwrap();
+        let fallen = compact_as_previewed(&history, &rt, None).await.unwrap();
         assert_eq!(mock.seen().len(), 3, "turn, chat request, transcript request");
         let rendered = render_compaction_input(&history, None, &rt.compaction_policy());
         assert_eq!(fallen.summary_request, Some(SummaryRequest::Transcript));
@@ -1015,7 +1048,7 @@ mod tests {
         // A local-only summary came from no request.
         let mut rt = opus();
         rt.set_compaction_mode(CompactionMode::LocalOnly);
-        let local = compact_conversation(&history, &rt, None).await.unwrap();
+        let local = compact_as_previewed(&history, &rt, None).await.unwrap();
         assert_eq!(local.summary_request, None);
     }
 
@@ -1033,7 +1066,7 @@ mod tests {
         let history = warm_chat(&rt).await;
         change(&mut rt);
         let snapshot = history.clone();
-        let outcome = compact_conversation(&history, &rt, None)
+        let outcome = compact_as_previewed(&history, &rt, None)
             .await
             .expect("compaction");
         assert_eq!(history, snapshot, "compaction never touches the history");
@@ -1224,7 +1257,7 @@ mod tests {
         let flat = cached_path(&opus, &big, opus.model(), &policy, "summarize", transcript).await;
         assert!(!matches!(flat, Err(Skip::PriceTier { .. })), "{flat:?}");
 
-        let outcome = compact_conversation(&big, &rt, None).await.unwrap();
+        let outcome = compact_as_previewed(&big, &rt, None).await.unwrap();
         assert_only_the_transcript_request(&mock.seen().split_off(1), &outcome);
     }
 
@@ -1340,7 +1373,7 @@ mod tests {
             cached_path(&rt, &resumed, rt.model(), &policy, "summarize", 0).await,
             Err(Skip::HistoryChanged)
         );
-        let outcome = compact_conversation(&resumed, &rt, None).await.unwrap();
+        let outcome = compact_as_previewed(&resumed, &rt, None).await.unwrap();
         assert_only_the_transcript_request(&mock.seen().split_off(1), &outcome);
     }
 
@@ -1547,7 +1580,7 @@ mod tests {
         let history = warm_chat(&rt).await;
         let expect = rt.cached_prefix().unwrap();
         let sent = rt
-            .compaction_cached_request(&history, "summarize", expect)
+            .compaction_cached_request(&history, "summarize", expect, &Default::default())
             .await
             .expect("sent");
         assert_eq!(
@@ -1582,6 +1615,164 @@ mod tests {
         assert_eq!(summary_from_reply(&json!({})), Err("the reply has no text"));
     }
 
+    // ── follow-ups: spend, the previewed request, resends, telemetry ─────
+
+    use crate::runtime::compaction::{
+        compact_conversation, preview_compaction_disclosure, preview_compaction_request,
+        SummaryRequestUsage,
+    };
+    use agent_core::compaction::SummaryRequest;
+
+    /// What the mock's streamed reply is booked as.
+    fn chat_request_usage() -> KeepWarmUsage {
+        KeepWarmUsage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cache_read_tokens: MOCK_CACHE_READ,
+            cache_write_tokens: MOCK_CACHE_WRITE,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            model: Some("claude-opus-4-7".into()),
+        }
+    }
+
+    fn transcript_usage() -> KeepWarmUsage {
+        KeepWarmUsage {
+            input_tokens: TRANSCRIPT_INPUT,
+            output_tokens: TRANSCRIPT_OUTPUT,
+            model: Some("claude-opus-4-7".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Every summary request the provider billed is in the dispatch's
+    /// spend, once: the chat request alone; a chat request whose reply was
+    /// refused AND the transcript request sent after it; the transcript
+    /// request alone. Local-only bills nothing. What is taken is gone.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn every_paid_summary_request_is_in_the_spend_once() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let tool_call = json!({"type": "tool_use", "id": "toolu_x", "name": "bash",
+            "input": {"command": "true"}});
+        let chat = SummaryRequestUsage {
+            request: SummaryRequest::ChatRequest,
+            usage: chat_request_usage(),
+        };
+        let transcript = SummaryRequestUsage {
+            request: SummaryRequest::Transcript,
+            usage: transcript_usage(),
+        };
+        for (reply, expect) in [
+            (vec![text(CACHED_SUMMARY)], vec![chat.clone()]),
+            // Refused (it called a tool), and paid for all the same.
+            (vec![tool_call], vec![chat.clone(), transcript.clone()]),
+        ] {
+            let (url, _mock) = spawn_mock(vec![
+                Stream::Blocks(vec![text("hi")]),
+                Stream::Blocks(reply),
+            ])
+            .await;
+            let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+            let rt = opus();
+            let history = warm_chat(&rt).await;
+            let dispatch = preview_compaction_request(&rt, &history, None).await.dispatch();
+            compact_conversation(&history, &rt, None, &dispatch).await.unwrap();
+            assert_eq!(dispatch.spend().take(), expect);
+            assert_eq!(dispatch.spend().take(), vec![], "taken once");
+        }
+
+        // The transcript request alone, and local-only.
+        let (url, _mock) = spawn_mock(vec![Stream::Blocks(vec![text("hi")])]).await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus();
+        let history = warm_chat(&rt).await;
+        let dispatch = preview_compaction_disclosure(&rt, &history).dispatch();
+        compact_conversation(&history, &rt, None, &dispatch).await.unwrap();
+        assert_eq!(dispatch.spend().take(), vec![transcript]);
+        rt.set_compaction_mode(CompactionMode::LocalOnly);
+        let dispatch = preview_compaction_request(&rt, &history, None).await.dispatch();
+        compact_conversation(&history, &rt, None, &dispatch).await.unwrap();
+        assert_eq!(dispatch.spend().take(), vec![]);
+    }
+
+    /// The user's line about a missed cache: only when more was written
+    /// than read, only for the chat's own request, with both numbers.
+    #[test]
+    fn the_miss_line_appears_only_on_a_miss() {
+        let entry = |request, read, written| SummaryRequestUsage {
+            request,
+            usage: KeepWarmUsage {
+                cache_read_tokens: read,
+                cache_write_tokens: written,
+                ..Default::default()
+            },
+        };
+        let chat = SummaryRequest::ChatRequest;
+        assert_eq!(
+            entry(chat, 4_000, 396_000).cache_miss_notice().as_deref(),
+            Some("compaction: the summary request missed the cache (wrote 396000, read 4000 tokens)")
+        );
+        assert_eq!(entry(chat, 400_000, 900).cache_miss_notice(), None);
+        assert_eq!(entry(chat, 5_000, 5_000).cache_miss_notice(), None);
+        assert_eq!(entry(chat, 0, 0).cache_miss_notice(), None);
+        // The transcript request never claims to read the cache.
+        assert_eq!(
+            entry(SummaryRequest::Transcript, 0, 396_000).cache_miss_notice(),
+            None
+        );
+    }
+
+    /// The dispatch sends what the disclosure named; it does not ask again.
+    ///
+    /// A disclosure that named the transcript (previewed while nothing was
+    /// known about the cache) is dispatched after the cache became known
+    /// warm, as when a keep-warm ping lands in between. Asked again, the
+    /// dispatch would send the full history under a line that said
+    /// "transcript". It sends the transcript.
+    ///
+    /// A disclosure that named the chat's own request is dispatched after
+    /// the conditions stopped holding: the dispatch checks them before any
+    /// network and sends the transcript, which the line named as the
+    /// fallback.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn the_dispatch_sends_the_request_the_disclosure_named() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock(vec![
+            Stream::Blocks(vec![text("hi")]),
+            Stream::Blocks(vec![text(CACHED_SUMMARY)]),
+        ])
+        .await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = opus();
+        let history = warm_chat(&rt).await;
+
+        // Previewed by a runtime that knows nothing of the cache yet.
+        let before_the_ping = rt.clone();
+        assert_eq!(before_the_ping.compaction_cache_state().await, CacheState::Unknown);
+        let said = preview_compaction_request(&before_the_ping, &history, None).await;
+        assert_eq!(said.summary_request(), Some(SummaryRequest::Transcript));
+        assert!(said.render_line().starts_with("compaction: sending ~"), "{}", said.render_line());
+        // At dispatch the chat's own request would be eligible.
+        let now = preview_compaction_request(&rt, &history, None).await;
+        assert_eq!(now.summary_request(), Some(SummaryRequest::ChatRequest));
+        let outcome = compact_conversation(&history, &rt, None, &said.dispatch())
+            .await
+            .unwrap();
+        let seen = mock.seen().split_off(1);
+        assert_only_the_transcript_request(&seen, &outcome);
+        assert_eq!(outcome.summary_request, Some(SummaryRequest::Transcript));
+
+        // The other way round: named, then no longer safe.
+        assert!(now.render_line().contains("if that fails, a ~"), "{}", now.render_line());
+        let outcome = compact_conversation(&history, &before_the_ping, None, &now.dispatch())
+            .await
+            .unwrap();
+        let seen = mock.seen().split_off(2);
+        assert_only_the_transcript_request(&seen, &outcome);
+    }
+
     /// What "not retried" leaves: a compaction request whose gzip body is
     /// refused is sent again at once, uncompressed, and that reply is the
     /// summary. (The comment at `single_attempt` in `api.rs` lists this
@@ -1602,12 +1793,12 @@ mod tests {
         assert_eq!(mock.compressed.load(Ordering::SeqCst), 0);
         rt.request_compression = crate::runtime::request_encoding::RequestCompression::always();
 
-        let outcome = compact_conversation(&history, &rt, None).await.unwrap();
+        let outcome = compact_as_previewed(&history, &rt, None).await.unwrap();
         assert_eq!(mock.compressed.load(Ordering::SeqCst), 1, "the refused gzip send");
         let seen = mock.seen().split_off(1);
         assert_eq!(seen.len(), 1, "and one resend, uncompressed");
         assert!(seen[0].streams(), "of the chat's own request");
         assert_eq!(outcome.summary_text, CACHED_SUMMARY);
-        assert_eq!(outcome.summary_request, Some(agent_core::compaction::SummaryRequest::ChatRequest));
+        assert_eq!(outcome.summary_request, Some(SummaryRequest::ChatRequest));
     }
 }

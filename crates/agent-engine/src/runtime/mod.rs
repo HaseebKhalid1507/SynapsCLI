@@ -3293,7 +3293,7 @@ impl Runtime {
         messages: Vec<crate::SharedMessage>,
     ) -> Result<String> {
         self.enter_remote_summarization();
-        self.transcript_summary_call(model, messages).await
+        self.transcript_summary_call(model, messages, None).await
     }
 
     /// The remote-summarization seam (CP-12 M3): counted BEFORE preflight,
@@ -3308,11 +3308,13 @@ impl Runtime {
     }
 
     /// [`Self::compact_call`] behind the seam: the caller has entered it
-    /// ([`Self::enter_remote_summarization`]).
+    /// ([`Self::enter_remote_summarization`]). What the request was billed
+    /// is booked into `spend`, when the caller has a session to book it to.
     pub(super) async fn transcript_summary_call(
         &self,
         model: &str,
         messages: Vec<crate::SharedMessage>,
+        spend: Option<&compaction::CompactionSpend>,
     ) -> Result<String> {
         #[cfg(test)]
         if let Some(reply) = SCRIPTED_SUMMARY_REQUESTS.with(|script| {
@@ -3353,6 +3355,7 @@ impl Runtime {
                 request_compression: self.request_compression.clone(),
                 ..api::ApiOptions::default()
             },
+            api_sync::SimpleCallReport { spend },
         )
         .await
     }

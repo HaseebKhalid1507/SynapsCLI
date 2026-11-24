@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_engine::session::{
-    ClientKind, ClientMeta, ClientTransport, CompactionPolicyWire, LocalTransport,
+    ClientKind, ClientMeta, ClientTransport, CompactionPolicyWire, Envelope, LocalTransport,
     SessionCommand, SessionConfig, SessionEventWire, SessionQuery,
 };
 use axum::response::IntoResponse;
@@ -281,7 +281,7 @@ async fn linked_successor_updates_journal_id_and_continue_target() {
     let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
         .await
         .unwrap();
-    warm(&mut a, 2).await;
+    let before = warm_conv(&mut a, 2).await;
     assert_eq!(handle.journal_id(), handle.id.as_str());
 
     a.send(SessionCommand::Compact { instructions: None }).await.unwrap();
@@ -310,6 +310,11 @@ async fn linked_successor_updates_journal_id_and_continue_target() {
     assert_eq!(succ.parent_session.as_deref(), Some(prev.as_str()));
     let parent = agent_engine::core::session::Session::load(&prev).unwrap();
     assert_eq!(parent.compacted_into.as_deref(), Some(new.as_str()));
+    // The summary request was paid for by the session it summarized: the
+    // predecessor's saved totals hold it; the successor restarts at zero.
+    assert!(before.cost > 0.0);
+    assert_close(parent.session_cost, before.cost + cost_of(10, 1, 0, 0));
+    assert_eq!(parent.total_input_tokens, before.tokens.input + 10);
 
     // `--continue <successor>` / `--continue` (latest = the successor on
     // disk) while this actor is live must attach to it, not build a second
@@ -454,5 +459,229 @@ async fn abort_and_clear_are_typed_events() {
         &e.event,
         SessionEventWire::SystemNotice(n) if n.contains("cleared") || n.starts_with("aborted")
     )));
+    end(&mut a).await;
+}
+
+// ── compaction spend in the session's totals ────────────────────────────
+
+/// What the stub's chat-request reply reports as usage, and whether the
+/// reply is a tool call (which the engine refuses: no summary).
+#[derive(Clone, Copy)]
+struct ChatReply {
+    cache_read: u64,
+    cache_write: u64,
+    tool_call: bool,
+}
+
+const CHAT_INPUT: u64 = 7;
+const CHAT_OUTPUT: u64 = 3;
+const TRANSCRIPT_INPUT: u64 = 50;
+const TRANSCRIPT_OUTPUT: u64 = 10;
+
+fn chat_sse(reply: ChatReply) -> String {
+    let usage = |output: u64| {
+        serde_json::json!({
+            "input_tokens": CHAT_INPUT, "output_tokens": output,
+            "cache_creation_input_tokens": reply.cache_write,
+            "cache_read_input_tokens": reply.cache_read,
+        })
+    };
+    let mut events = vec![serde_json::json!({"type": "message_start", "message": {
+        "id": "msg_sum", "type": "message", "role": "assistant", "content": [],
+        "model": MODEL, "stop_reason": null, "stop_sequence": null, "usage": usage(0)}})];
+    let stop = if reply.tool_call {
+        events.push(serde_json::json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "bash"}}));
+        events.push(serde_json::json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"command\":\"true\"}"}}));
+        "tool_use"
+    } else {
+        events.push(serde_json::json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}}));
+        events.push(serde_json::json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "SUMMARY: from the chat request."}}));
+        "end_turn"
+    };
+    events.push(serde_json::json!({"type": "content_block_stop", "index": 0}));
+    events.push(serde_json::json!({"type": "message_delta",
+        "delta": {"stop_reason": stop, "stop_sequence": null}, "usage": usage(CHAT_OUTPUT)}));
+    events.push(serde_json::json!({"type": "message_stop"}));
+    events.iter().map(|e| format!("data: {e}\n\n")).collect()
+}
+
+/// [`stub_compact`] with a chat-request reply of the test's choosing and
+/// known usage on both summary requests.
+async fn stub_billed(reply: ChatReply) -> (String, Summaries) {
+    let summaries = Summaries::default();
+    let s = summaries.clone();
+    let app = axum::Router::new().fallback(move |body: String| {
+        let s = s.clone();
+        async move {
+            if body.contains("\"stream\":true") {
+                let sse = if body.contains(CHAT_SUMMARY_REQUEST) {
+                    s.chat.fetch_add(1, Ordering::SeqCst);
+                    chat_sse(reply)
+                } else {
+                    SSE_HI.to_string()
+                };
+                return (
+                    axum::http::StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    sse,
+                )
+                    .into_response();
+            }
+            s.transcript.fetch_add(1, Ordering::SeqCst);
+            axum::Json(serde_json::json!({
+                "id": "msg_c", "type": "message", "role": "assistant",
+                "model": MODEL, "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "SUMMARY: from the transcript."}],
+                "usage": {"input_tokens": TRANSCRIPT_INPUT, "output_tokens": TRANSCRIPT_OUTPUT}
+            }))
+            .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), summaries)
+}
+
+/// [`warm`], returning the conversation as the last turn left it.
+async fn warm_conv(
+    t: &mut LocalTransport,
+    turns: usize,
+) -> agent_engine::session::ConversationSnapshot {
+    let mut seen = Vec::new();
+    for i in 0..turns {
+        t.send(submit(&format!("hello {i}"))).await.unwrap();
+        seen = until(t, |e| matches!(e, SessionEventWire::Idle)).await;
+    }
+    last_conversation(&seen)
+}
+
+fn cost_of(input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
+    agent_engine::pricing::calculate_cost_optional_split(
+        MODEL, input, output, cache_read, cache_write, None, None,
+    )
+}
+
+#[track_caller]
+fn assert_close(got: f64, want: f64) {
+    assert!((got - want).abs() < 1e-12, "cost {got} != {want}");
+}
+
+/// The lines a client was shown about a missed cache.
+fn miss_lines(seen: &[Envelope]) -> Vec<String> {
+    seen.iter()
+        .filter_map(|e| match &e.event {
+            SessionEventWire::SystemNotice(n) if n.contains("missed the cache") => Some(n.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A warm session on a stub answering the chat request with `reply`.
+async fn billed_session(reply: ChatReply) -> (LocalTransport, Summaries, agent_engine::session::ConversationSnapshot) {
+    let (url, summaries) = stub_billed(reply).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle, ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let before = warm_conv(&mut a, 2).await;
+    (a, summaries, before)
+}
+
+/// `/compact`, to `Idle`: what the client saw and the conversation after.
+async fn compact_once(
+    a: &mut LocalTransport,
+) -> (Vec<Envelope>, agent_engine::session::ConversationSnapshot) {
+    a.send(SessionCommand::Compact { instructions: None }).await.unwrap();
+    let seen = until(a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let conv = last_conversation(&seen);
+    (seen, conv)
+}
+
+/// A compaction's own usage is in the session's totals and cost, once, on
+/// each path: the chat's own request (a cache read), then, compacting the
+/// summary again (its history is not the cached one), the transcript
+/// request. No line about the cache: it was read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn compaction_spend_is_in_the_session_cost_once_on_each_path() {
+    let _h = Home::new();
+    let reply = ChatReply { cache_read: 4_000, cache_write: 20, tool_call: false };
+    let (mut a, summaries, before) = billed_session(reply).await;
+    assert!(before.cost > 0.0, "the turns were booked");
+
+    let (seen, chat) = compact_once(&mut a).await;
+    assert_eq!((summaries.chat.load(Ordering::SeqCst), summaries.transcript.load(Ordering::SeqCst)), (1, 0));
+    assert_close(chat.cost, before.cost + cost_of(CHAT_INPUT, CHAT_OUTPUT, 4_000, 20));
+    assert_eq!(chat.tokens.input, before.tokens.input + CHAT_INPUT);
+    assert_eq!(chat.tokens.output, before.tokens.output + CHAT_OUTPUT);
+    assert_eq!(chat.tokens.cache_read, before.tokens.cache_read + 4_000);
+    assert_eq!(chat.tokens.cache_creation, before.tokens.cache_creation + 20);
+    assert_eq!(miss_lines(&seen), Vec::<String>::new());
+
+    let (seen, transcript) = compact_once(&mut a).await;
+    assert_eq!((summaries.chat.load(Ordering::SeqCst), summaries.transcript.load(Ordering::SeqCst)), (1, 1));
+    assert_close(transcript.cost, chat.cost + cost_of(TRANSCRIPT_INPUT, TRANSCRIPT_OUTPUT, 0, 0));
+    assert_eq!(transcript.tokens.input, chat.tokens.input + TRANSCRIPT_INPUT);
+    assert_eq!(transcript.tokens.output, chat.tokens.output + TRANSCRIPT_OUTPUT);
+    assert_eq!(miss_lines(&seen), Vec::<String>::new());
+    end(&mut a).await;
+}
+
+/// A chat request whose reply is refused (it called a tool) was paid for:
+/// it is booked, and so is the transcript request sent after it. Each once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_refused_chat_request_is_booked_with_its_fallback() {
+    let _h = Home::new();
+    let reply = ChatReply { cache_read: 4_000, cache_write: 20, tool_call: true };
+    let (mut a, summaries, before) = billed_session(reply).await;
+
+    let (seen, after) = compact_once(&mut a).await;
+    assert_eq!((summaries.chat.load(Ordering::SeqCst), summaries.transcript.load(Ordering::SeqCst)), (1, 1));
+    assert!(after.api_messages[0]["content"]
+        .as_str()
+        .is_some_and(|c| c.contains("SUMMARY: from the transcript.")));
+    assert_close(
+        after.cost,
+        before.cost
+            + cost_of(CHAT_INPUT, CHAT_OUTPUT, 4_000, 20)
+            + cost_of(TRANSCRIPT_INPUT, TRANSCRIPT_OUTPUT, 0, 0),
+    );
+    assert_eq!(after.tokens.input, before.tokens.input + CHAT_INPUT + TRANSCRIPT_INPUT);
+    assert_eq!(after.tokens.output, before.tokens.output + CHAT_OUTPUT + TRANSCRIPT_OUTPUT);
+    assert_eq!(miss_lines(&seen), Vec::<String>::new());
+    end(&mut a).await;
+}
+
+/// A chat request that wrote more cache than it read is said to the user,
+/// once, after the disclosure line, with both numbers; and booked at what
+/// it cost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_missed_cache_is_said_to_the_user_once() {
+    let _h = Home::new();
+    let reply = ChatReply { cache_read: 100, cache_write: 4_000, tool_call: false };
+    let (mut a, _summaries, before) = billed_session(reply).await;
+
+    let (seen, after) = compact_once(&mut a).await;
+    assert_eq!(
+        miss_lines(&seen),
+        ["compaction: the summary request missed the cache (wrote 4000, read 100 tokens)"]
+    );
+    let position = |pred: &dyn Fn(&SessionEventWire) -> bool| {
+        seen.iter().position(|e| pred(&e.event)).expect("event")
+    };
+    let disclosed = position(&|e| matches!(e, SessionEventWire::CompactionStarted { .. }));
+    let missed = position(&|e| matches!(e, SessionEventWire::SystemNotice(n) if n.contains("missed the cache")));
+    let applied = position(&|e| matches!(e, SessionEventWire::CompactionApplied { .. }));
+    assert!(disclosed < missed && missed < applied);
+    assert_close(after.cost, before.cost + cost_of(CHAT_INPUT, CHAT_OUTPUT, 100, 4_000));
     end(&mut a).await;
 }

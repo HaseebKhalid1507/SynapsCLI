@@ -663,11 +663,15 @@ impl Runtime {
     /// cache identity, or a history that does not start with the messages
     /// that request sent. Runs no tool, fires no hook, never touches
     /// `history` or any session state, and emits nothing to a frontend.
+    /// What the provider billed is booked into `spend` (the caller's
+    /// session books it from there), also when the reply is an error or is
+    /// then refused: the request was paid for.
     pub(super) async fn compaction_cached_request(
         &self,
         history: &[SharedMessage],
         instructions: &str,
         expect: CachedPrefix,
+        spend: &super::compaction::CompactionSpend,
     ) -> Result<ChatSummaryReply> {
         let tap = PingTap::default();
         let request = super::api::CompactionRequest::expecting(expect);
@@ -686,6 +690,11 @@ impl Runtime {
         // would; the provider's usage says whether it did. Reported even
         // when the reply is then refused: the request was billed.
         let usage = tap.usage();
+        spend.record(
+            agent_core::compaction::SummaryRequest::ChatRequest,
+            &self.model,
+            usage.clone(),
+        );
         if let Some(warning) =
             super::compaction_cached::cache_miss_warning(self.session_id.as_deref(), &usage)
         {

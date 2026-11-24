@@ -467,6 +467,123 @@ impl CompactionDisclosure {
             }
         }
     }
+
+    /// The summary request this disclosure names as the one sent first:
+    /// `None` in local-only mode (no request).
+    pub fn summary_request(&self) -> Option<agent_core::compaction::SummaryRequest> {
+        use agent_core::compaction::{CompactionMode, SummaryRequest};
+        match (self.mode, self.chat_request_tokens) {
+            (CompactionMode::LocalOnly, _) => None,
+            (CompactionMode::Remote, Some(_)) => Some(SummaryRequest::ChatRequest),
+            (CompactionMode::Remote, None) => Some(SummaryRequest::Transcript),
+        }
+    }
+
+    /// The dispatch of the compaction this disclosure was shown for:
+    /// [`compact_conversation`] sends what the line says.
+    pub fn dispatch(&self) -> CompactionDispatch {
+        CompactionDispatch {
+            request: self.summary_request(),
+            spend: CompactionSpend::default(),
+        }
+    }
+}
+
+/// What a compaction is to send, as its disclosure told the user, and
+/// where it books what its requests were billed.
+///
+/// Built only from the disclosure ([`CompactionDisclosure::dispatch`]), so
+/// the line and the send cannot disagree: eligibility for the chat's own
+/// request is not decided a second time. Between the preview and the send
+/// a keep-warm ping can land and move the cache anchor; a dispatch that
+/// asked again could send the full history under a line that said
+/// "transcript".
+#[derive(Debug, Clone)]
+pub struct CompactionDispatch {
+    /// `Transcript`: the transcript request, whatever the cache looks like
+    /// now. `ChatRequest`: the chat's own request, once its safety
+    /// conditions have been checked again (before any network); when they
+    /// no longer hold, or the request fails, the transcript request, which
+    /// the line names as the fallback. `None`: the preview was local-only.
+    request: Option<agent_core::compaction::SummaryRequest>,
+    spend: CompactionSpend,
+}
+
+impl CompactionDispatch {
+    /// What the requests of this compaction were billed. A clone shares
+    /// the ledger, so a caller that spawns the compaction keeps one.
+    pub fn spend(&self) -> &CompactionSpend {
+        &self.spend
+    }
+
+    pub fn request(&self) -> Option<agent_core::compaction::SummaryRequest> {
+        self.request
+    }
+}
+
+/// What one summary request of a compaction was billed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryRequestUsage {
+    pub request: agent_core::compaction::SummaryRequest,
+    /// As the provider reported it; `model` is always set (the model the
+    /// request named when the reply named none), for pricing.
+    pub usage: super::keepwarm::KeepWarmUsage,
+}
+
+impl SummaryRequestUsage {
+    /// The one line a user is shown when the chat's own request did not
+    /// read the cache (see `compaction_cached::cache_miss_notice`).
+    pub fn cache_miss_notice(&self) -> Option<String> {
+        (self.request == agent_core::compaction::SummaryRequest::ChatRequest)
+            .then(|| super::compaction_cached::cache_miss_notice(&self.usage))
+            .flatten()
+    }
+}
+
+/// The billed usage of a compaction's requests: every request the provider
+/// answered with a usage, including a chat request whose reply was then
+/// refused (it was paid for) and the transcript request sent after it.
+///
+/// The requests do not book into any session themselves (a compaction runs
+/// on a runtime clone, off the session's event stream). The caller that
+/// owns the session's counters drains this once ([`Self::take`]) and books
+/// each entry the way it books a turn's usage.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionSpend(std::sync::Arc<std::sync::Mutex<Vec<SummaryRequestUsage>>>);
+
+impl CompactionSpend {
+    /// Book `usage` of a `request` sent to `model`. A usage of all zeros
+    /// (no reply, nothing billed) is not an entry.
+    pub fn record(
+        &self,
+        request: agent_core::compaction::SummaryRequest,
+        model: &str,
+        mut usage: super::keepwarm::KeepWarmUsage,
+    ) {
+        if usage.input_tokens == 0
+            && usage.output_tokens == 0
+            && usage.cache_read_tokens == 0
+            && usage.cache_write_tokens == 0
+        {
+            return;
+        }
+        usage.model.get_or_insert_with(|| model.to_string());
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(SummaryRequestUsage { request, usage });
+    }
+
+    /// The entries booked so far, removed: what is taken is never handed
+    /// out again, so it reaches a session's counters once.
+    pub fn take(&self) -> Vec<SummaryRequestUsage> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
 }
 
 /// Compute the disclosure summary for the next compaction WITHOUT any
@@ -640,10 +757,16 @@ fn local_summary(api_messages: &[crate::SharedMessage], policy: &DisclosurePolic
 /// `runtime::compaction_cached`); local-only mode (spec §9.4) derives the
 /// summary in-process and constructs NO network request. Called by
 /// `/compact` and every auto-compaction path.
+///
+/// `dispatch` comes from the disclosure shown for this compaction
+/// ([`CompactionDisclosure::dispatch`]): the request it names is the one
+/// sent, and what the requests were billed is booked into its
+/// [`CompactionSpend`], also when this returns an error.
 pub async fn compact_conversation(
     api_messages: &[crate::SharedMessage],
     runtime: &Runtime,
     custom_instructions: Option<&str>,
+    dispatch: &CompactionDispatch,
 ) -> Result<CompactionOutcome> {
     use agent_core::compaction::CompactionMode;
     let policy = runtime.compaction_policy();
@@ -670,22 +793,30 @@ pub async fn compact_conversation(
             // any request is assembled, whichever request carries it.
             runtime.enter_remote_summarization();
             // The chat's own next request plus the instructions, when the
-            // history can be read from the prompt cache that way; otherwise,
-            // and once after any failure of it, the transcript request below.
-            if let Some(outcome) = super::compaction_cached::summarize(
-                api_messages,
-                runtime,
-                &model,
-                &policy,
-                &rendered,
-            )
-            .await
-            {
-                return Ok(outcome);
+            // disclosure said so (the history could be read from the prompt
+            // cache when it was previewed) and the conditions still hold;
+            // otherwise, and once after any failure of it, the transcript
+            // request below. A disclosure that named the transcript gets
+            // the transcript: the question is not asked again here.
+            if dispatch.request == Some(agent_core::compaction::SummaryRequest::ChatRequest) {
+                if let Some(outcome) = super::compaction_cached::summarize(
+                    api_messages,
+                    runtime,
+                    &model,
+                    &policy,
+                    &rendered,
+                    &dispatch.spend,
+                )
+                .await
+                {
+                    return Ok(outcome);
+                }
             }
             let user_msg =
                 std::sync::Arc::new(json!({"role": "user", "content": rendered.prompt_text}));
-            let summary_text = runtime.transcript_summary_call(&model, vec![user_msg]).await?;
+            let summary_text = runtime
+                .transcript_summary_call(&model, vec![user_msg], Some(&dispatch.spend))
+                .await?;
             let mut outcome = CompactionOutcome::for_prompt_stack(
                 summary_text,
                 &model,
@@ -698,6 +829,19 @@ pub async fn compact_conversation(
             Ok(outcome)
         }
     }
+}
+
+/// Preview, then dispatch what the preview named: what `/compact` does.
+#[cfg(test)]
+pub(crate) async fn compact_as_previewed(
+    api_messages: &[crate::SharedMessage],
+    runtime: &Runtime,
+    custom_instructions: Option<&str>,
+) -> Result<CompactionOutcome> {
+    let dispatch = preview_compaction_request(runtime, api_messages, custom_instructions)
+        .await
+        .dispatch();
+    compact_conversation(api_messages, runtime, custom_instructions, &dispatch).await
 }
 
 fn redaction_for(
@@ -2242,7 +2386,7 @@ mod disclosure_tests {
             Arc::new(json!({"role": "user", "content": giant})),
             Arc::new(json!({"role": "assistant", "content": "ok"})),
         ];
-        let outcome = compact_conversation(&messages, &runtime, None)
+        let outcome = compact_as_previewed(&messages, &runtime, None)
             .await
             .expect("local-only compaction");
         assert!(
@@ -2274,7 +2418,7 @@ mod disclosure_tests {
         let mut runtime = crate::Runtime::new_headless();
         runtime.set_compaction_mode(CompactionMode::LocalOnly);
 
-        let outcome = compact_conversation(&sentinel_messages(), &runtime, None)
+        let outcome = compact_as_previewed(&sentinel_messages(), &runtime, None)
             .await
             .expect("local-only compaction must succeed offline");
 
@@ -2330,7 +2474,7 @@ mod disclosure_tests {
 
         // The mock listener never answers HTTP, so the call errors — the
         // spy only cares that the connection attempt happened.
-        let result = compact_conversation(&sentinel_messages(), &runtime, None).await;
+        let result = compact_as_previewed(&sentinel_messages(), &runtime, None).await;
         assert!(result.is_err(), "mock endpoint cannot produce a summary");
 
         // M3 seam liveness: the remote path increments the counter BEFORE

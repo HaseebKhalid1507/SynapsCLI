@@ -50,6 +50,16 @@ fn every_frontend_surfaces_disclosure_before_dispatch() {
             "{rel}: disclosure must be computed BEFORE the summarization \
              dispatch site"
         );
+        // The dispatch is handed the previewed decision (`.dispatch()` on
+        // the disclosure, the only way to build one): the request the line
+        // named is the one sent, not one chosen again at dispatch.
+        let handed_pos = src
+            .find("disclosure.dispatch()")
+            .unwrap_or_else(|| panic!("{rel}: the dispatch must come from the disclosure"));
+        assert!(
+            preview_pos < handed_pos && handed_pos < dispatch_pos,
+            "{rel}: preview, then its dispatch, then the summarization call"
+        );
     }
 
     // The RPC frontend must additionally EMIT the disclosure to the client

@@ -634,6 +634,7 @@ async fn compaction_call_api_simple_emits_one_record_from_exact_bytes() {
         &messages,
         0,
         &h.options,
+        Default::default(),
     )
     .await
     .expect("compaction call must succeed");

@@ -201,6 +201,19 @@ impl ConversationState {
             return None;
         }
         self.session.api_messages = self.api_messages.clone();
+        self.stamp_usage_totals();
+        // Legacy field: an interrupted turn now lives in `api_messages`
+        // (`engine::interrupt`); never write a recap back.
+        self.session.abort_context = None;
+        self.session.updated_at = chrono::Utc::now();
+        self.session.auto_title();
+        Some(self.session.clone())
+    }
+
+    /// Copy the running usage and cost totals into the session record, as
+    /// a save does. For a writer that saves the record itself (the
+    /// compaction transition) after usage was booked.
+    pub fn stamp_usage_totals(&mut self) {
         self.session.total_input_tokens = self.total_input_tokens;
         self.session.total_output_tokens = self.total_output_tokens;
         self.session.total_cache_read_tokens = self.total_cache_read_tokens;
@@ -208,12 +221,6 @@ impl ConversationState {
         self.session.session_cost = self.session_cost;
         self.session.keepwarm_cost = self.keepwarm_cost;
         self.session.keepwarm_tokens = persisted_keepwarm_tokens(&self.keepwarm_tokens);
-        // Legacy field: an interrupted turn now lives in `api_messages`
-        // (`engine::interrupt`); never write a recap back.
-        self.session.abort_context = None;
-        self.session.updated_at = chrono::Utc::now();
-        self.session.auto_title();
-        Some(self.session.clone())
     }
 
     /// Persist a runtime-requested head using host metadata and latest usage.

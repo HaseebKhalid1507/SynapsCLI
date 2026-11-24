@@ -354,6 +354,9 @@ pub(crate) struct CompactionJob {
     pub(crate) source: String,
     #[allow(dead_code)]
     pub(crate) started: tokio::time::Instant,
+    /// What the job's summary requests were billed, shared with the task
+    /// (`book_compaction` drains it when the job ends, however it ends).
+    pub(crate) spend: crate::runtime::compaction::CompactionSpend,
 }
 
 /// Commands that only the input owner may send (B1). Everything else
@@ -4278,11 +4281,15 @@ impl SessionActor {
             &self.conv.api_messages,
             instructions.as_deref(),
         )
-        .await
-        .render_line();
+        .await;
+        // The job sends what this line names: the request is chosen here,
+        // once, not again when the job starts (a keep-warm ping landing in
+        // between could make a second answer differ from the line).
+        let dispatch = disclosure.dispatch();
+        let spend = dispatch.spend().clone();
         self.emit(SessionEventWire::CompactionStarted {
             source: source.to_string(),
-            disclosure,
+            disclosure: disclosure.render_line(),
         });
         let msgs = self.conv.api_messages.clone();
         let mut rt: Runtime = (*self.runtime).clone();
@@ -4292,14 +4299,48 @@ impl SessionActor {
         // TTL, to decide whether the summary request can read it.
         rt.share_ttl_latches(&self.runtime);
         let task = tokio::spawn(async move {
-            compact_conversation(&msgs, &rt, instructions.as_deref()).await
+            compact_conversation(&msgs, &rt, instructions.as_deref(), &dispatch).await
         });
         self.compact = Some(CompactionJob {
             task,
             source: source.to_string(),
             started: tokio::time::Instant::now(),
+            spend,
         });
         self.update_attach_state();
+    }
+
+    /// Book what a compaction's summary requests were billed into the
+    /// conversation totals, the way a turn's usage is booked
+    /// (`record_usage`), so the session's cost includes its compactions.
+    /// Every request that was paid for is in `spend`: a chat request whose
+    /// reply was refused, and the transcript request sent after it. Drained
+    /// here, so each is booked once. A chat request that wrote more cache
+    /// than it read is also said, where the disclosure line was.
+    fn book_compaction(&mut self, spend: &crate::runtime::compaction::CompactionSpend) {
+        for entry in spend.take() {
+            let usage = &entry.usage;
+            let model = usage
+                .model
+                .clone()
+                .unwrap_or_else(|| self.runtime.model().to_string());
+            self.conv.add_usage(
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage.cache_write_5m,
+                usage.cache_write_1h,
+                &model,
+            );
+            if let Some(notice) = entry.cache_miss_notice() {
+                self.emit(SessionEventWire::SystemNotice(notice));
+            }
+        }
+        // The compaction transition saves `conv.session` as it stands (the
+        // predecessor, or the session compacted in place): its totals must
+        // hold what was just booked.
+        self.conv.stamp_usage_totals();
     }
 
     /// `select!` arm: the spawned job finished (or was aborted). Applies via
@@ -4315,6 +4356,10 @@ impl SessionActor {
         let Some(job) = self.compact.take() else {
             return;
         };
+        // Before the outcome is applied: under the linked-successor policy
+        // the totals restart with the successor, and this spend belongs to
+        // the session that was summarized. Also when the job failed.
+        self.book_compaction(&job.spend);
         let msg_count = self.conv.api_messages.len();
         match res {
             Err(join) => {
@@ -4411,19 +4456,26 @@ impl SessionActor {
     }
 
     async fn compact_inline_inner(&mut self, instructions: Option<String>, source: &str) {
+        let disclosure = preview_compaction_request(
+            &self.runtime,
+            &self.conv.api_messages,
+            instructions.as_deref(),
+        )
+        .await;
         self.emit(SessionEventWire::SystemNotice(format!(
             "[{}]",
-            preview_compaction_request(
-                &self.runtime,
-                &self.conv.api_messages,
-                instructions.as_deref(),
-            )
-            .await
-            .render_line()
+            disclosure.render_line()
         )));
-        let outcome =
-            compact_conversation(&self.conv.api_messages, &self.runtime, instructions.as_deref())
-                .await;
+        // Sends what the line names (see `compact`).
+        let dispatch = disclosure.dispatch();
+        let outcome = compact_conversation(
+            &self.conv.api_messages,
+            &self.runtime,
+            instructions.as_deref(),
+            &dispatch,
+        )
+        .await;
+        self.book_compaction(dispatch.spend());
         let applied = match outcome {
             Ok(outcome) => {
                 // Queued saves land before the transition rewrites the file.
@@ -5297,6 +5349,8 @@ impl SessionActor {
     pub(crate) fn abort_compaction(&mut self) {
         if let Some(job) = self.compact.take() {
             job.task.abort();
+            // A request that had already been answered was paid for.
+            self.book_compaction(&job.spend);
             self.emit(SessionEventWire::CompactionCancelled);
             self.publish_presence();
         }

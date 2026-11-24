@@ -27,6 +27,41 @@ fn sync_usage_meta(json: &Value) -> Option<crate::runtime::trace::UsageMeta> {
     })
 }
 
+/// The usage a non-streaming response body reports, cache-write TTL split
+/// included, for the api-log record and for booking. `None` without a
+/// `usage` object; a count the provider did not send is zero, as on the
+/// streaming path.
+fn sync_usage_record(json: &Value) -> Option<super::telemetry::UsageRecord> {
+    let usage = json.get("usage")?.as_object()?;
+    let get = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let split = |key: &str| {
+        usage
+            .get("cache_creation")
+            .and_then(|c| c.get(key))
+            .and_then(Value::as_u64)
+    };
+    let mut record = super::telemetry::UsageRecord {
+        input: get("input_tokens").unwrap_or(0),
+        output: get("output_tokens").unwrap_or(0),
+        cache_read: get("cache_read_input_tokens").unwrap_or(0),
+        cache_write: get("cache_creation_input_tokens").unwrap_or(0),
+        cache_write_5m: split("ephemeral_5m_input_tokens"),
+        cache_write_1h: split("ephemeral_1h_input_tokens"),
+        hit_pct: 0.0,
+    };
+    record.compute_hit_pct();
+    Some(record)
+}
+
+/// What [`ApiMethods::call_api_simple`] reports about the request it sent,
+/// besides the reply text. The default reports nothing.
+#[derive(Default, Clone, Copy)]
+pub(super) struct SimpleCallReport<'a> {
+    /// Where the usage the provider billed is booked (the session that
+    /// asked for the compaction books it from there).
+    pub spend: Option<&'a super::compaction::CompactionSpend>,
+}
+
 /// Bytes of JSON request body that are certainly more than one input token.
 /// English prose runs at 3.5 to 4 bytes a token and code or JSON at fewer;
 /// twice that leaves room for escaping and long whitespace runs, so
@@ -138,6 +173,7 @@ impl ApiMethods {
         messages: &[crate::SharedMessage],
         max_retries: u32,
         options: &ApiOptions,
+        report: SimpleCallReport<'_>,
     ) -> Result<String> {
         // Host-only message metadata never reaches any provider, whatever
         // history the caller passes in; strip before routing/serializing.
@@ -145,7 +181,14 @@ impl ApiMethods {
         let messages = wire_messages.as_deref().unwrap_or(messages);
         let tools_schema = Arc::new(Vec::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        // Nothing of the routed reply is shown; its usage is kept, to book.
+        let drain = tokio::spawn(async move {
+            let mut usage = super::keepwarm::KeepWarmUsage::default();
+            while let Some(event) = rx.recv().await {
+                usage.add(&event);
+            }
+            usage
+        });
         let routed_system_prompt = Some(system_prompt.to_string());
         if let Some(result) = crate::runtime::openai::try_route_with_memory_backend(
             model,
@@ -178,7 +221,14 @@ impl ApiMethods {
         .await
         {
             drop(tx);
-            let _ = drain.await;
+            // Booked whatever became of the reply: a usage was billed.
+            if let (Ok(usage), Some(spend)) = (drain.await, report.spend) {
+                spend.record(
+                    agent_core::compaction::SummaryRequest::Transcript,
+                    model,
+                    usage,
+                );
+            }
             let response = result.map_err(|e| {
                 crate::runtime::openai::net::provider_error_to_runtime_for(model, e)
             })?;
@@ -350,8 +400,8 @@ impl ApiMethods {
                                             )));
                                         }
                                     }
+                                    clock.mark_stream_end();
                                     if let Some(t) = tracer.take() {
-                                        clock.mark_stream_end();
                                         let stop = j["stop_reason"].as_str().map(
                                             crate::runtime::trace::anthropic::stop_reason_from_wire,
                                         );
@@ -561,13 +611,25 @@ impl ApiMethods {
             })?
         };
 
-        // Log usage
-        if let Some(usage) = json.get("usage") {
-            let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
-            let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
-            let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-            let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-            HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
+        // Log usage, and book it: before the reply is looked at, since an
+        // empty one was billed too.
+        if let Some(usage) = sync_usage_record(&json) {
+            HelperMethods::log_usage(usage.input, usage.cache_read, usage.cache_write, usage.output);
+            if let Some(spend) = report.spend {
+                spend.record(
+                    agent_core::compaction::SummaryRequest::Transcript,
+                    model,
+                    super::keepwarm::KeepWarmUsage {
+                        input_tokens: usage.input,
+                        output_tokens: usage.output,
+                        cache_read_tokens: usage.cache_read,
+                        cache_write_tokens: usage.cache_write,
+                        cache_write_5m: usage.cache_write_5m,
+                        cache_write_1h: usage.cache_write_1h,
+                        model: json["model"].as_str().map(str::to_owned),
+                    },
+                );
+            }
         }
 
         // Extract text content from the response (skip thinking blocks)
