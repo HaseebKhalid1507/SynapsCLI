@@ -47,8 +47,9 @@
 //!    ([`CachedPrefix`]). The anchor alone does not say so: `/resume` in
 //!    place swaps the history under a runtime whose anchor is minutes old;
 //! 6. the instructions, a user message that is not a tool result, do not
-//!    make the provider strip earlier thinking: on models before Opus 4.5,
-//!    Sonnet 4.6 and Haiku 5.5 that removes every message after the first
+//!    make the provider strip earlier thinking: on every model but the
+//!    ones the docs name (Opus 4.5 and later, Sonnet 4.6 and later, Haiku
+//!    5.5, Fable, Mythos) that removes every message after the first
 //!    thinking block from the cache (same page, "Non-tool results passed to
 //!    requests with thinking"), so a history holding thinking blocks would
 //!    be written again, at the write price.

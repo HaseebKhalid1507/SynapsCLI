@@ -203,8 +203,11 @@ pub fn model_rejects_output_overflow(model: &str) -> bool {
 /// stripped from context, and any messages that follow those thinking blocks
 /// are removed from the cache."
 ///
-/// `false` for every other id, an unknown one included: a caller that
-/// relies on the cached messages must not assume it.
+/// Only what that sentence names: "and later" is said of Opus and Sonnet,
+/// not of Haiku, so Haiku 5.5 alone counts and a later Haiku is unknown
+/// until the docs name it. `false` for every other id, an unknown one
+/// included: a caller that relies on the cached messages must not assume
+/// it.
 pub fn model_keeps_earlier_thinking(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     let m = m.strip_prefix("anthropic/").unwrap_or(&m);
@@ -225,7 +228,7 @@ pub fn model_keeps_earlier_thinking(model: &str) -> bool {
     };
     version("claude-opus-").is_some_and(|v| v >= (4, 5))
         || version("claude-sonnet-").is_some_and(|v| v >= (4, 6))
-        || version("claude-haiku-").is_some_and(|v| v >= (5, 5))
+        || version("claude-haiku-") == Some((5, 5))
 }
 
 /// Returns the input context window size for a given model, in tokens.
@@ -287,6 +290,7 @@ mod tests {
             "claude-sonnet-4-6",
             "claude-sonnet-5-5",
             "claude-haiku-5-5",
+            "claude-haiku-5-5-20261001",
             "claude-fable-5-2",
             "anthropic/claude-mythos-5",
         ] {
@@ -301,6 +305,11 @@ mod tests {
             "claude-sonnet-4-5-20250929",
             "claude-sonnet-4-20250514",
             "claude-haiku-4-5",
+            // The docs name Haiku 5.5, not "and later": unknown until named.
+            "claude-haiku-5",
+            "claude-haiku-5-6",
+            "claude-haiku-6",
+            "claude-nova-9",
             "claude-3-7-sonnet-20250219",
             "claude-3-5-haiku-20241022",
             "groq/llama-3.3-70b-versatile",
