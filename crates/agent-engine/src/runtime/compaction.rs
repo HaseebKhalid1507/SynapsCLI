@@ -118,6 +118,11 @@ impl DisclosurePolicy {
 pub struct RenderedCompactionInput {
     /// Full request text (conversation transcript + instruction template).
     pub prompt_text: String,
+    /// The part of `prompt_text` after the transcript: the instruction
+    /// template, the `/compact` focus and the file-operation records. A
+    /// cache-preserving request (`runtime::compaction_cached`) sends this
+    /// without the transcript; the history is its transcript.
+    pub instructions: String,
     /// Approximate bytes of CONVERSATION-DERIVED content that would be
     /// disclosed to the summarizer (instruction templates excluded — the
     /// disclosure line labels the figure accordingly).
@@ -338,21 +343,20 @@ pub fn render_compaction_input(
 
     let transcript_bytes = conversation_text.len() + file_section.len();
 
-    let mut prompt_text = format!("<conversation>\n{}\n</conversation>\n\n", conversation_text);
-    if let Some(instructions) = custom_instructions {
-        prompt_text.push_str(&format!(
-            "{}\n\nAdditional focus: {}",
-            base_prompt, instructions
-        ));
-    } else {
-        prompt_text.push_str(base_prompt);
-    }
+    let mut instructions = match custom_instructions {
+        Some(focus) => format!("{}\n\nAdditional focus: {}", base_prompt, focus),
+        None => base_prompt.to_string(),
+    };
     if !file_section.is_empty() {
-        prompt_text.push_str(&format!(
+        instructions.push_str(&format!(
             "\n\nAlso append these file operation records to the end of your summary:{}",
             file_section
         ));
     }
+    let prompt_text = format!(
+        "<conversation>\n{}\n</conversation>\n\n{}",
+        conversation_text, instructions
+    );
 
     if !file_section.is_empty() {
         present.insert(ContentClass::FilePaths);
@@ -370,6 +374,7 @@ pub fn render_compaction_input(
 
     RenderedCompactionInput {
         prompt_text,
+        instructions,
         transcript_bytes,
         included_classes,
         excluded_classes,
@@ -588,8 +593,6 @@ pub async fn compact_conversation(
             Ok(outcome)
         }
         CompactionMode::Remote => {
-            let user_msg =
-                std::sync::Arc::new(json!({"role": "user", "content": rendered.prompt_text}));
             // Chosen once: the model the request goes to is the one the
             // outcome names.
             let (model, _notice) = runtime.compact_model_choice();
