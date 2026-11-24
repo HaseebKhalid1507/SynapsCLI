@@ -537,13 +537,20 @@ async fn shared(d: &DaemonProc, cwd: &Path) -> (SocketTransport, AttachSnapshot)
     SocketTransport::attach(conn, Attach::create(cfg, AttachMode::Mirror)).await.unwrap()
 }
 
-/// Send `action` until it isn't refused `busy` (the outbox's backoff).
-async fn settle_result(t: &mut SocketTransport, card: &SurfaceState, action_id: &str) -> SurfaceResult {
+/// Re-send `action` while it is refused `busy` (the outbox's backoff).
+/// The final result, and every event that came meanwhile.
+async fn settle_result(t: &mut SocketTransport, card: &SurfaceState, action_id: &str) -> (SurfaceResult, Vec<SessionEventWire>) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut all = Vec::new();
     loop {
-        let r = result_for(t, action_id).await;
+        let seen = until(t, |e| matches!(e, SessionEventWire::SurfaceResult(r) if r.action_id == action_id)).await;
+        let r = match seen.last() {
+            Some(SessionEventWire::SurfaceResult(r)) => r.clone(),
+            _ => unreachable!(),
+        };
+        all.extend(seen);
         if r.reason != Some(SurfaceRefusal::Busy) || tokio::time::Instant::now() > deadline {
-            return r;
+            return (r, all);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         t.send_from_self(answer(card, action_id)).await.unwrap();
@@ -567,15 +574,21 @@ async fn two_desks_answer_at_once() {
 
     a.send_from_self(answer(&card, A1)).await.unwrap();
     b.send_from_self(answer(&card, A2)).await.unwrap();
-    let ra = settle_result(&mut a, &card, A1).await;
-    let rb = settle_result(&mut b, &card, A2).await;
+    let (ra, mut seen) = settle_result(&mut a, &card, A1).await;
+    let (rb, _) = settle_result(&mut b, &card, A2).await;
     let outcomes = [(ra.outcome, ra.reason), (rb.outcome, rb.reason)];
     assert!(
         outcomes.contains(&(SurfaceOutcome::Accepted, None))
             && outcomes.contains(&(SurfaceOutcome::Refused, Some(SurfaceRefusal::Resolved))),
         "{outcomes:?}"
     );
-    let mut seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    // The winner's turn may already be over while desk A was retrying.
+    let over = |s: &[SessionEventWire]| {
+        s.iter().skip_while(|e| !matches!(e, SessionEventWire::TurnStarted { .. })).any(|e| matches!(e, SessionEventWire::Idle))
+    };
+    if !over(&seen) {
+        seen.extend(until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await);
+    }
     seen.extend(quiet(&mut a, Duration::from_millis(300)).await);
     assert_eq!(turns(&seen), 1, "{seen:#?}");
     let (_, snap) = join(&d, a.session_id(), AttachMode::Observe).await;
