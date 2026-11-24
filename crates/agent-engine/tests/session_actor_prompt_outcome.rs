@@ -186,8 +186,30 @@ async fn a_secret_given_a_value_resolves_answered() {
     end(&mut a).await;
 }
 
-/// An empty Secret is a value, never parsed or trimmed: `answered`, and the
-/// waiting call gets `""` (not a cancel).
+/// A Secret reaches its waiting call byte for byte: never trimmed, never
+/// case-folded, never read as a confirm token. `answered`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_secret_reaches_its_call_byte_for_byte() {
+    const SECRET: &str = "  AbC x\u{00FC}Z \t";
+    let _h = Home::new();
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = prompt_host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let mut a = attach(&handle, ClientKind::Tui).await;
+    *LAST_SECRET.lock().unwrap() = None;
+    let pid = raise(&mut a).await;
+    answer(&a, pid, Some(SECRET)).await;
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert_eq!(outcome_of(&seen, pid), Some(Some(PromptOutcome::Answered)), "{seen:#?}");
+    let got = LAST_SECRET.lock().unwrap().clone().expect("the call ran").expect("a value, not a cancel");
+    assert!(got.as_bytes() == SECRET.as_bytes(), "the call got {:?} ({} bytes), not the value sent", got, got.len());
+    end(&mut a).await;
+}
+
+/// An empty Secret is a value: `answered`, and the waiting call gets `""`
+/// (not a cancel).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn an_empty_secret_resolves_answered() {
@@ -197,11 +219,13 @@ async fn an_empty_secret_resolves_answered() {
     let host = prompt_host().await;
     let handle = host.create_session(cfg()).await.unwrap();
     let mut a = attach(&handle, ClientKind::Tui).await;
+    *LAST_SECRET.lock().unwrap() = None;
     let pid = raise(&mut a).await;
     answer(&a, pid, Some("")).await;
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
     assert_eq!(outcome_of(&seen, pid), Some(Some(PromptOutcome::Answered)), "{seen:#?}");
     assert_eq!(tool_results(&last_conversation(&seen)), vec!["answered:0".to_string()]);
+    assert_eq!(*LAST_SECRET.lock().unwrap(), Some(Some(String::new())));
     end(&mut a).await;
 }
 
@@ -362,7 +386,8 @@ async fn a_hosts_late_answer_reaches_no_attachment() {
 }
 
 /// The policy refusals of a pending prompt's answer are unchanged
-/// `Refused{command: "answer"}`, and read the raw Allow-all token for every
+/// `Refused{command: "answer"}`, broadcast as on dev (the owner sees both,
+/// naming their senders), and read the raw Allow-all token for every
 /// Confirm: a non-owner's `always` on an activation prompt is refused,
 /// though that gate would deny it; an observer may not answer at all. The
 /// prompt stays pending for the owner, whose `always` there is a denial.
@@ -387,6 +412,26 @@ async fn policy_refusals_are_unchanged_and_read_the_raw_token() {
     assert_eq!(
         refused(&mut o).await,
         ("answer".to_string(), "observe-mode clients cannot answer confirm prompts".to_string())
+    );
+
+    // Both reached the owner too, unaddressed, with their senders.
+    let (bid, oid) = (b.client_id(), o.client_id());
+    let mut at_owner = Vec::new();
+    for _ in 0..2 {
+        let seen = until(&mut a, |e| matches!(e, SessionEventWire::Refused { .. })).await;
+        let env = seen.last().unwrap();
+        assert_eq!(env.audience, Audience::All, "broadcast as on dev: {env:?}");
+        match &env.event {
+            SessionEventWire::Refused { client, command, reason } => at_owner.push((*client, command.clone(), reason.clone())),
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(
+        at_owner,
+        vec![
+            (bid, "answer".to_string(), "only the input owner can choose Allow all".to_string()),
+            (oid, "answer".to_string(), "observe-mode clients cannot answer confirm prompts".to_string()),
+        ]
     );
 
     answer(&a, pid, Some("always")).await;

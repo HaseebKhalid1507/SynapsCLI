@@ -327,7 +327,12 @@ pub async fn end(t: &mut LocalTransport) {
 
 /// Builtin-origin tool that asks for a secret through the stream's
 /// `SecretPromptHandle` and reports only its length (never the value).
+/// The exact value it was handed goes to [`LAST_SECRET`], a private test
+/// channel, never into the event stream.
 pub struct PromptFixtureTool;
+
+/// What [`PromptFixtureTool`] was last handed, byte for byte.
+pub static LAST_SECRET: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
 
 #[async_trait::async_trait]
 impl agent_engine::Tool for PromptFixtureTool {
@@ -352,12 +357,12 @@ impl agent_engine::Tool for PromptFixtureTool {
             .capabilities
             .secret_prompt
             .expect("actor passes its SecretPromptHandle to the stream");
-        Ok(
-            match handle.secret("Secret".into(), "enter secret".into()).await {
-                Some(v) => format!("answered:{}", v.len()),
-                None => "cancelled".to_string(),
-            },
-        )
+        let value = handle.secret("Secret".into(), "enter secret".into()).await;
+        *LAST_SECRET.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value.clone());
+        Ok(match value {
+            Some(v) => format!("answered:{}", v.len()),
+            None => "cancelled".to_string(),
+        })
     }
 }
 
