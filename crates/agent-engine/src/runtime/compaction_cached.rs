@@ -54,6 +54,10 @@
 //!    requests with thinking"), so a history holding thinking blocks would
 //!    be written again, at the write price.
 //!
+//! 7. the request does not cross a long-context price tier that the
+//!    transcript would stay under (Haiku 5.5 bills a prompt of over
+//!    100,000 tokens, cache reads included, at five times the rate).
+//!
 //! Any failure of the request (an error, a tool call, no text) falls back to
 //! the transcript request, once. Nothing here touches the history.
 
@@ -128,6 +132,7 @@ pub enum Skip {
     OtherModel,
     NotAnthropic,
     DoesNotFit { needed: u64, window: u64 },
+    PriceTier { request: u64, transcript: u64 },
     CacheCold,
     CacheUnknown,
     HistoryChanged,
@@ -148,6 +153,11 @@ impl std::fmt::Display for Skip {
             Skip::DoesNotFit { needed, window } => write!(
                 f,
                 "history, instructions and summary need about {needed} tokens of a {window}-token window"
+            ),
+            Skip::PriceTier { request, transcript } => write!(
+                f,
+                "the whole request (about {request} tokens) is billed at a long-context price \
+                 tier that the transcript (about {transcript} tokens) stays under"
             ),
             Skip::CacheCold => f.write_str("the prompt cache is cold"),
             Skip::HistoryChanged => f.write_str(
@@ -196,6 +206,15 @@ impl Runtime {
     }
 }
 
+/// What the transcript request for `rendered` sends, in tokens: its one
+/// user message and the compaction system prompt, by the conservative
+/// estimator (the same units as a request without a provider count).
+pub fn transcript_tokens(rendered: &RenderedCompactionInput) -> u64 {
+    use super::context::conservative_token_estimate;
+    conservative_token_estimate(&rendered.prompt_text)
+        + conservative_token_estimate(super::compaction::COMPACTION_SYSTEM_PROMPT)
+}
+
 /// What the request must be able to read (the cached prefix of the last
 /// accepted request), when every condition of the module docs holds; else
 /// the first one that does not. Decided locally: nothing is sent.
@@ -205,6 +224,7 @@ pub async fn cached_path(
     model: &str,
     policy: &DisclosurePolicy,
     instructions: &str,
+    transcript_tokens: u64,
 ) -> Result<CachedPrefix, Skip> {
     use agent_core::compaction::CompactionMode;
     if policy.mode != CompactionMode::Remote {
@@ -230,6 +250,22 @@ pub async fn cached_path(
         serde_json::json!({"role": "user", "content": instructions}),
     ));
     let assessment = runtime.assess_context(&request).await;
+    // A model with a long-context price tier bills the WHOLE request at
+    // it, cache reads included, once the prompt is over the tier's size
+    // (Haiku 5.5: over 100,000 tokens). The transcript request truncates
+    // tool results and thinking; when that keeps it under a tier the full
+    // history is over, it is the cheaper request. The tiers are the price
+    // table's (`agent_core::pricing`).
+    if crate::pricing::prompt_price_tier_differs(
+        model,
+        transcript_tokens,
+        assessment.used_tokens(),
+    ) {
+        return Err(Skip::PriceTier {
+            request: assessment.used_tokens(),
+            transcript: transcript_tokens,
+        });
+    }
     // The summary's output: what one round is expected to produce, thinking
     // included (`ContextReserves`), not the `max_tokens` ceiling (a model
     // that rejects input + `max_tokens` over the window has it clamped by
@@ -324,7 +360,16 @@ pub(super) async fn summarize(
     rendered: &RenderedCompactionInput,
 ) -> Option<CompactionOutcome> {
     let instructions = instructions(rendered);
-    let expect = match cached_path(runtime, history, model, policy, &instructions).await {
+    let expect = match cached_path(
+        runtime,
+        history,
+        model,
+        policy,
+        &instructions,
+        transcript_tokens(rendered),
+    )
+    .await
+    {
         Ok(expect) => expect,
         Err(skip) => {
             tracing::info!(reason = %skip, "compaction: sending the transcript request");
@@ -985,7 +1030,7 @@ mod tests {
         let rt = opus();
         warm(&rt);
         assert_eq!(
-            cached_path(&rt, &history, rt.model(), &policy, "summarize").await,
+            cached_path(&rt, &history, rt.model(), &policy, "summarize", 0).await,
             Ok(SEVEN),
             "control: an Anthropic chat with a warm cache is eligible"
         );
@@ -994,7 +1039,7 @@ mod tests {
         rt.set_model("groq/llama-3.3-70b-versatile".to_string());
         warm(&rt);
         assert_eq!(
-            cached_path(&rt, &history, rt.model(), &policy, "summarize").await,
+            cached_path(&rt, &history, rt.model(), &policy, "summarize", 0).await,
             Err(Skip::NotAnthropic)
         );
     }
@@ -1021,7 +1066,7 @@ mod tests {
             async move {
                 let rt = chat(model, ReasoningLevel::High, CacheTtl::FiveMinutes);
                 rt.cache_anchor.stamp_identified(CacheAnchor::now(), SEVEN);
-                cached_path(&rt, &history, rt.model(), &policy, "summarize").await
+                cached_path(&rt, &history, rt.model(), &policy, "summarize", 0).await
             }
         };
         assert_eq!(
@@ -1030,6 +1075,64 @@ mod tests {
         );
         assert_eq!(eligible("claude-sonnet-4-5", plain).await, Ok(SEVEN));
         assert_eq!(eligible("claude-sonnet-4-6", thought).await, Ok(SEVEN));
+    }
+
+    /// Condition 7: Haiku 5.5 bills a prompt of over 100,000 tokens at a
+    /// long-context rate, cache reads included. A history over that size
+    /// whose transcript (tool results cut to 2,000 characters) stays under
+    /// it goes out as the transcript; when both are on the same side of
+    /// the tier the price does not decide.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_price_tier_only_the_full_request_crosses_sends_the_transcript() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock(vec![
+            Stream::Blocks(vec![text("hi")]),
+            Stream::Blocks(vec![text(CACHED_SUMMARY)]),
+        ])
+        .await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = chat("claude-haiku-5-5", ReasoningLevel::Off, CacheTtl::FiveMinutes);
+        let small = warm_chat(&rt).await;
+        let policy = rt.compaction_policy();
+        assert!(
+            cached_path(&rt, &small, rt.model(), &policy, "summarize", 2_000).await.is_ok(),
+            "control: a small Haiku chat is eligible"
+        );
+
+        // One 600 KB tool result: far over 100,000 tokens in the request,
+        // 2,000 characters in the transcript.
+        let mut big = small.clone();
+        big.extend([
+            Arc::new(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_big", "name": "read", "input": {"path": "/tmp/big"}},
+            ]})),
+            Arc::new(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_big", "content": "x".repeat(600_000)},
+            ]})),
+            Arc::new(json!({"role": "assistant", "content": [text("that is a lot of x")]})),
+        ]);
+        let rendered = render_compaction_input(&big, None, &policy);
+        let transcript = transcript_tokens(&rendered);
+        assert!(transcript < 100_000, "{transcript}");
+        let skip = cached_path(&rt, &big, rt.model(), &policy, "summarize", transcript)
+            .await
+            .expect_err("the full request crosses the tier alone");
+        assert!(
+            matches!(skip, Skip::PriceTier { request, transcript: t } if request > 100_000 && t == transcript),
+            "{skip:?}"
+        );
+        // Both over the tier: the price does not decide (the window may).
+        let both_over = cached_path(&rt, &big, rt.model(), &policy, "summarize", 150_000).await;
+        assert!(!matches!(both_over, Err(Skip::PriceTier { .. })), "{both_over:?}");
+        // The same history on a flat-priced model is not refused for it.
+        let opus = opus();
+        opus.cache_anchor.stamp_identified(CacheAnchor::now(), SEVEN);
+        let flat = cached_path(&opus, &big, opus.model(), &policy, "summarize", transcript).await;
+        assert!(!matches!(flat, Err(Skip::PriceTier { .. })), "{flat:?}");
+
+        let outcome = compact_conversation(&big, &rt, None).await.unwrap();
+        assert_only_the_transcript_request(&mock.seen().split_off(1), &outcome);
     }
 
     /// Condition 4: a history that does not fit the window with the
@@ -1133,7 +1236,7 @@ mod tests {
         let sent = rt.cached_prefix().expect("the turn stamped what it sent");
         assert_eq!(sent.messages, 1, "the turn's request held one message");
         assert_eq!(
-            cached_path(&rt, &history, rt.model(), &policy, "summarize").await,
+            cached_path(&rt, &history, rt.model(), &policy, "summarize", 0).await,
             Ok(sent),
             "control: the chat's own history is eligible"
         );
@@ -1141,7 +1244,7 @@ mod tests {
         let mut resumed = history.clone();
         resumed[0] = user("the first message of another session");
         assert_eq!(
-            cached_path(&rt, &resumed, rt.model(), &policy, "summarize").await,
+            cached_path(&rt, &resumed, rt.model(), &policy, "summarize", 0).await,
             Err(Skip::HistoryChanged)
         );
         let outcome = compact_conversation(&resumed, &rt, None).await.unwrap();
