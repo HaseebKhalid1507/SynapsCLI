@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **What a session's prompt cache looks like, from its own requests.**
+  `SessionQuery::CacheExpiry` (daemon feature `cache_expiry`) answers
+  `warm` (with about how long the latest measured matching request's proof
+  has left), `unknown{may_have_expired}` (until this session's last possible
+  refresh ends), `cold{expired|uncached}`, or `unknown` with a reason
+  (`parked`, `busy`, `no_matching_request`, …). Evidence comes only from the
+  provider's usage on this session's own sends, each keyed at dispatch by
+  its account namespace, prefix and bytes; it is not provider state. Errors
+  are typed (`busy`, `timeout`, `superseded`, `stale`). `/keepwarm status`
+  shows the line. See daemon-mode.md, "Prompt-cache evidence".
+
 - **Workers report what they used.** `subagent_status`, `subagent_collect`
   and a worker's completion event (`data.usage`) carry `usage`: provider
   requests (the worker's keep-warm pings included), input / output /
