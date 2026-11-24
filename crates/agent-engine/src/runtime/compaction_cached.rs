@@ -66,7 +66,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::compaction::{CompactionOutcome, DisclosurePolicy, RenderedCompactionInput};
-use super::keepwarm::{CachedPrefix, KeepWarmUsage};
+use super::keepwarm::{CachedPrefix, ChatSummaryReply, KeepWarmUsage};
 use super::Runtime;
 use crate::session::cache_keepwarm::{governing_ttl, honoured_ttl, TtlEvidence, LATE_GUARD};
 use crate::SharedMessage;
@@ -349,9 +349,8 @@ pub fn cache_miss_warning(session: Option<&str>, usage: &KeepWarmUsage) -> Optio
 /// Summarize through the chat's own next request when [`cached_path`]
 /// allows it. `None` (the conditions do not hold, or the request failed in
 /// any way) sends the caller to the transcript request; why is logged. The
-/// outcome's provenance is that of the request that was sent: the chat's
-/// model, and a prompt-stack digest over the system prompt it carried and
-/// the instruction message.
+/// outcome's provenance is that of the request that was sent
+/// ([`outcome_for`]).
 pub(super) async fn summarize(
     history: &[SharedMessage],
     runtime: &Runtime,
@@ -376,20 +375,11 @@ pub(super) async fn summarize(
             return None;
         }
     };
-    let reply = runtime
+    let sent = match runtime
         .compaction_cached_request(history, &instructions, expect)
-        .await;
-    let (summary_text, system_prompt) = match reply {
-        Ok(sent) => match summary_from_reply(&sent.reply) {
-            Ok(text) => (text, sent.system_prompt),
-            Err(why) => {
-                tracing::warn!(
-                    reason = why,
-                    "cache-preserving compaction failed; sending the transcript request"
-                );
-                return None;
-            }
-        },
+        .await
+    {
+        Ok(sent) => sent,
         Err(e) => {
             tracing::warn!(
                 error = %e.user_message(),
@@ -398,17 +388,51 @@ pub(super) async fn summarize(
             return None;
         }
     };
+    let summary_text = match summary_from_reply(&sent.reply) {
+        Ok(text) => text,
+        Err(why) => {
+            tracing::warn!(
+                reason = why,
+                "cache-preserving compaction failed; sending the transcript request"
+            );
+            return None;
+        }
+    };
+    tracing::info!(
+        cache_read_tokens = sent.usage.cache_read_tokens,
+        cache_write_tokens = sent.usage.cache_write_tokens,
+        input_tokens = sent.usage.input_tokens,
+        "compaction: summarized through the chat's own request"
+    );
+    Some(outcome_for(summary_text, model, &sent, &instructions, rendered))
+}
+
+/// The outcome of a summary the chat's own request produced. Its
+/// provenance describes that request, not the transcript request:
+/// `prompt_stack_digest` covers what went out ahead of the messages, as
+/// sent (`system` with the transport identity, then `tools`), and the
+/// instruction message; `summary_request` says which request it was, and
+/// with it that nothing was truncated.
+fn outcome_for(
+    summary_text: String,
+    model: &str,
+    sent: &ChatSummaryReply,
+    instructions: &str,
+    rendered: &RenderedCompactionInput,
+) -> CompactionOutcome {
+    use agent_core::compaction::{RedactionPolicy, SummaryRequest};
     let mut outcome = CompactionOutcome::new(
         summary_text,
         model,
-        &[system_prompt.as_deref().unwrap_or_default(), &instructions],
+        &[sent.system.as_str(), sent.tools.as_str(), instructions],
     );
-    // The chat's own request: every class the history holds, none excluded
-    // (condition 1), nothing truncated.
+    // Every class the history holds, none excluded (condition 1).
     outcome.included_classes = rendered.included_classes.clone();
     outcome.excluded_classes = Vec::new();
-    outcome.redaction_policy = agent_core::compaction::RedactionPolicy::TruncationOnly;
-    Some(outcome)
+    // "No class excluded"; `summary_request` says nothing was truncated.
+    outcome.redaction_policy = RedactionPolicy::TruncationOnly;
+    outcome.summary_request = Some(SummaryRequest::ChatRequest);
+    outcome
 }
 
 #[cfg(test)]
@@ -873,38 +897,65 @@ mod tests {
         assert!(!canon(&compaction.body["system"]).contains(&COMPACTION_SYSTEM_PROMPT[..40]));
     }
 
-    /// Provenance names what was sent: the chat's model, and a prompt-stack
-    /// digest over the system prompt and the instruction message as they
-    /// went on the wire. A summary that came from the transcript request
-    /// after a fallback carries the transcript request's stack instead.
+    /// Provenance names what was sent. For a summary from the chat's own
+    /// request: the chat's model, that it was the chat request (so nothing
+    /// was truncated), and a prompt-stack digest over what the request
+    /// carried ahead of the messages, read back from the wire here: the
+    /// `system` blocks (the transport identity first, on a subscription),
+    /// the `tools`, then the instruction message. A summary that came from
+    /// the transcript request after a fallback carries the transcript
+    /// request's stack and says so.
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn provenance_names_the_request_that_was_sent() {
+        use agent_core::compaction::{RedactionPolicy, SummaryRequest};
         let _base = crate::test_env::BaseDirGuard::new();
-        let rt = opus();
-        let (compaction, outcome) = assert_same_request_as_the_next_turn(&rt).await;
-        assert_eq!(outcome.summary_model, "claude-opus-4-7");
-        assert_eq!(outcome.summary_provider, "anthropic");
-        assert!(!outcome.local_only);
-        let system = compaction.body["system"].as_array().unwrap();
-        let system = system.last().unwrap()["text"].as_str().unwrap();
-        let instructions = last_message_text(&compaction.body);
-        assert_eq!(
-            outcome.prompt_stack_digest,
-            prompt_stack_digest(&[system, &instructions]),
-            "the digest covers the system prompt and instructions that were sent"
-        );
-        assert!(outcome.excluded_classes.is_empty());
-        assert_eq!(
-            outcome.included_classes,
-            vec![
-                ContentClass::UserText,
-                ContentClass::AssistantText,
-                ContentClass::ToolCalls,
-                ContentClass::ToolResults,
-                ContentClass::FilePaths,
-            ],
-            "the classes the history holds"
+        let mut digests = Vec::new();
+        for rt in [opus(), on_a_subscription(opus())] {
+            let (compaction, outcome) = assert_same_request_as_the_next_turn(&rt).await;
+            assert_eq!(outcome.summary_model, "claude-opus-4-7");
+            assert_eq!(outcome.summary_provider, "anthropic");
+            assert!(!outcome.local_only);
+            assert_eq!(outcome.summary_request, Some(SummaryRequest::ChatRequest));
+            let body = &compaction.body;
+            assert!(body["system"].as_array().is_some_and(|blocks| !blocks.is_empty()));
+            assert!(body["tools"].as_array().is_some_and(|tools| !tools.is_empty()));
+            let instructions = last_message_text(body);
+            assert_eq!(
+                outcome.prompt_stack_digest,
+                prompt_stack_digest(&[
+                    &canon(&body["system"]),
+                    &canon(&body["tools"]),
+                    &instructions
+                ]),
+                "the digest covers the system blocks, tools and instructions that were sent"
+            );
+            // Not the bare system prompt and the instructions alone.
+            let system_text = body["system"].as_array().unwrap().last().unwrap()["text"]
+                .as_str()
+                .unwrap();
+            assert_ne!(
+                outcome.prompt_stack_digest,
+                prompt_stack_digest(&[system_text, &instructions])
+            );
+            assert!(outcome.excluded_classes.is_empty());
+            assert_eq!(outcome.redaction_policy, RedactionPolicy::TruncationOnly);
+            assert_eq!(
+                outcome.included_classes,
+                vec![
+                    ContentClass::UserText,
+                    ContentClass::AssistantText,
+                    ContentClass::ToolCalls,
+                    ContentClass::ToolResults,
+                    ContentClass::FilePaths,
+                ],
+                "the classes the history holds"
+            );
+            digests.push(outcome.prompt_stack_digest);
+        }
+        assert_ne!(
+            digests[0], digests[1],
+            "the transport identity block of a subscription request is part of the stack"
         );
 
         // After a fallback the outcome describes the transcript request.
@@ -919,11 +970,18 @@ mod tests {
         let fallen = compact_conversation(&history, &rt, None).await.unwrap();
         assert_eq!(mock.seen().len(), 3, "turn, chat request, transcript request");
         let rendered = render_compaction_input(&history, None, &rt.compaction_policy());
+        assert_eq!(fallen.summary_request, Some(SummaryRequest::Transcript));
         assert_eq!(
             fallen.prompt_stack_digest,
             prompt_stack_digest(&[COMPACTION_SYSTEM_PROMPT, rendered.base_prompt])
         );
-        assert_ne!(fallen.prompt_stack_digest, outcome.prompt_stack_digest);
+        assert!(!digests.contains(&fallen.prompt_stack_digest));
+
+        // A local-only summary came from no request.
+        let mut rt = opus();
+        rt.set_compaction_mode(CompactionMode::LocalOnly);
+        let local = compact_conversation(&history, &rt, None).await.unwrap();
+        assert_eq!(local.summary_request, None);
     }
 
     /// Compact a warm chat after `change` and return what the provider saw

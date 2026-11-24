@@ -589,6 +589,7 @@ pub async fn compact_conversation(
                 CompactionOutcome::new(summary_text, LOCAL_SUMMARY_MODEL, &[LOCAL_SUMMARY_MODEL]);
             outcome.summary_provider = "local".to_string();
             outcome.local_only = true;
+            outcome.summary_request = None;
             outcome.included_classes = rendered.included_classes;
             outcome.excluded_classes = rendered.excluded_classes.clone();
             outcome.redaction_policy = redaction_for(&rendered.excluded_classes);
@@ -667,6 +668,8 @@ pub struct CompactionOutcome {
     pub included_classes: Vec<agent_core::compaction::ContentClass>,
     pub excluded_classes: Vec<agent_core::compaction::ContentClass>,
     pub redaction_policy: agent_core::compaction::RedactionPolicy,
+    /// Which request produced the summary; `None` for a local-only one.
+    pub summary_request: Option<agent_core::compaction::SummaryRequest>,
 }
 
 impl CompactionOutcome {
@@ -693,6 +696,7 @@ impl CompactionOutcome {
             ],
             excluded_classes: Vec::new(),
             redaction_policy: RedactionPolicy::TruncationOnly,
+            summary_request: Some(agent_core::compaction::SummaryRequest::Transcript),
         }
     }
 
@@ -861,6 +865,7 @@ pub async fn apply_compaction(
         excluded_classes: outcome.excluded_classes.clone(),
         redaction_policy: outcome.redaction_policy,
         prior_system_prompt: current.system_prompt.clone(),
+        summary_request: outcome.summary_request,
     };
 
     let mut extra_messages: Vec<crate::SharedMessage> = Vec::new();
@@ -1123,6 +1128,14 @@ mod transition_tests {
         assert_eq!(
             record.prior_system_prompt.as_deref(),
             Some("You are the household policy.")
+        );
+        assert_eq!(
+            record.summary_request, outcome.summary_request,
+            "the record names the request the outcome names"
+        );
+        assert_eq!(
+            record.summary_request,
+            Some(agent_core::compaction::SummaryRequest::Transcript)
         );
         assert_eq!(
             successor.session.system_prompt.as_deref(),

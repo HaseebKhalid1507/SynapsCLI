@@ -899,12 +899,12 @@ async fn api_log_marks_a_cache_preserving_compaction_request() {
     drive(ApiOptions {
         // The harness sends the turn's own messages again: only the cache
         // identity is compared here (an empty prefix leads any history).
-        compaction: Some(crate::runtime::api::CompactionRequest {
-            expect: crate::runtime::keepwarm::CachedPrefix::of(
+        compaction: Some(crate::runtime::api::CompactionRequest::expecting(
+            crate::runtime::keepwarm::CachedPrefix::of(
                 cell.prefix().expect("stamped").identity,
                 &[],
             ),
-        }),
+        )),
         ..turn
     })
     .await;

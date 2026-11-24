@@ -361,6 +361,18 @@ impl<'a> RequestBody<'a> {
         self.output_config.as_ref()?.get("effort")?.as_str()
     }
 
+    /// `system` and `tools` as this body sends them (cache markers and the
+    /// transport identity block included), each as canonical JSON (object
+    /// keys sorted): the prompt stack ahead of the messages, for the
+    /// provenance of a summary this request produces. `"null"` for an
+    /// absent `system`.
+    pub(super) fn prompt_stack(&self) -> (String, String) {
+        fn canonical<T: Serialize>(v: &T) -> String {
+            serde_json::to_value(v).map(|v| v.to_string()).unwrap_or_default()
+        }
+        (canonical(&self.system), canonical(&self.tools))
+    }
+
     /// Pre-assembly equivalent of the legacy `body["tools"]` non-empty probe.
     pub(super) fn has_tool_marker(&self) -> bool {
         !self.tools.tools.is_empty()

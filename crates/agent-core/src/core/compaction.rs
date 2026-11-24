@@ -94,13 +94,36 @@ pub enum CompactionMode {
 #[serde(rename_all = "snake_case")]
 pub enum RedactionPolicy {
     /// No content class is excluded; tool results and thinking are at most
-    /// truncated. The transcript request truncates them; a cache-preserving
-    /// request (the chat's own next request, which the provider already
-    /// holds in full) sends the history as the chat does.
+    /// truncated. Whether they were is said by
+    /// [`CompactionRecord::summary_request`]: the transcript request
+    /// truncates them, the chat's own next request (which the provider
+    /// already holds in full) sends the history as the chat does.
     TruncationOnly,
     /// Configured content classes were excluded per the session disclosure
     /// policy (spec §9.4).
     PolicyExclusions,
+}
+
+/// Which request a remote summary came from. The two send different
+/// things, so the rest of the provenance reads differently under each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryRequest {
+    /// The transcript request: the conversation flattened into one user
+    /// message under the compaction system prompt, tool results and
+    /// thinking truncated, no tools offered. `prompt_stack_digest` covers
+    /// the compaction system prompt, the instruction template and the
+    /// custom focus.
+    Transcript,
+    /// The chat's own next request with the summary instructions as its
+    /// last user message (cache-preserving compaction). The history went
+    /// out as the chat sends it: NOTHING was truncated, whatever
+    /// `redaction_policy` is called (it stays `truncation_only`, the value
+    /// for "no class excluded"). `prompt_stack_digest` covers what that
+    /// request carried ahead of the messages, as sent, and the
+    /// instructions: the `system` blocks (transport identity included),
+    /// the `tools`, both as canonical JSON, then the instruction text.
+    ChatRequest,
 }
 
 /// Typed provenance persisted with every compaction summary (spec §9.3).
@@ -132,6 +155,13 @@ pub struct CompactionRecord {
     /// embedded as a plain user message).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_system_prompt: Option<String>,
+    /// Which request produced the summary. Absent on a local-only summary
+    /// (no request) and on records written before the field existed (the
+    /// transcript request was then the only one). Additive within schema
+    /// version 1: a reader that does not know the field skips it, and one
+    /// that does reads its absence as above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_request: Option<SummaryRequest>,
 }
 
 /// SHA-256 digest over the canonical serialization of a message range.

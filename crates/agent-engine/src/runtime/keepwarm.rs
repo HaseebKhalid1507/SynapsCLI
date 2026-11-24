@@ -455,7 +455,7 @@ enum NextTurnRequest<'a> {
     /// Cache-preserving compaction: `instructions` is the new user message.
     Compaction {
         instructions: &'a str,
-        expect: CachedPrefix,
+        request: &'a super::api::CompactionRequest,
     },
 }
 
@@ -493,8 +493,10 @@ pub(super) struct ChatSummaryReply {
     /// What the provider billed for it: its cache reads and writes say
     /// whether the history was read from the cache.
     pub usage: KeepWarmUsage,
-    /// The system prompt the request carried.
-    pub system_prompt: Option<String>,
+    /// The `system` blocks and the `tools` the request carried, as sent,
+    /// each as canonical JSON (`RequestBody::prompt_stack`).
+    pub system: String,
+    pub tools: String,
 }
 
 /// Run one ping's request to completion, draining its private event channel
@@ -639,7 +641,7 @@ impl Runtime {
             .next_turn_request(history, cancel, NextTurnRequest::Ping(mode), tap)
             .await
         {
-            Ok((result, notices, _system)) => (result, notices),
+            Ok(r) => r,
             Err(e) => (Err(e), Vec::new()),
         }
     }
@@ -668,13 +670,14 @@ impl Runtime {
         expect: CachedPrefix,
     ) -> Result<ChatSummaryReply> {
         let tap = PingTap::default();
-        let (result, _notices, system_prompt) = self
+        let request = super::api::CompactionRequest::expecting(expect);
+        let (result, _notices) = self
             .next_turn_request(
                 history,
                 &CancellationToken::new(),
                 NextTurnRequest::Compaction {
                     instructions,
-                    expect,
+                    request: &request,
                 },
                 &tap,
             )
@@ -688,23 +691,31 @@ impl Runtime {
         {
             tracing::warn!("{warning}");
         }
+        let reply = result?;
+        // Set by the transport before it sends; a reply without it cannot
+        // be described, so it is not used.
+        let (system, tools) = request.sent.get().ok_or_else(|| {
+            RuntimeError::Session(
+                "cache-preserving compaction: the request left no record of what it sent".into(),
+            )
+        })?;
         Ok(ChatSummaryReply {
-            reply: result?,
+            reply,
             usage,
-            system_prompt,
+            system,
+            tools,
         })
     }
 
     /// `Err` = refused before any request was built (nothing billed);
-    /// `Ok((Err, ..))` = the request itself failed (usage, if any, is in
-    /// `tap`). The third field is the system prompt the request carried.
+    /// `Ok((Err, _))` = the request itself failed (usage, if any, is in `tap`).
     async fn next_turn_request(
         &self,
         history: &[SharedMessage],
         cancel: &CancellationToken,
         purpose: NextTurnRequest<'_>,
         tap: &PingTap,
-    ) -> Result<(Result<Value>, Vec<String>, Option<String>)> {
+    ) -> Result<(Result<Value>, Vec<String>)> {
         let what = purpose.label();
         if let Some(reason) = self.cache_keepwarm_ineligibility() {
             return Err(RuntimeError::Config(format!("{what} skipped: {reason}")));
@@ -886,9 +897,7 @@ impl Runtime {
             },
             compaction: match purpose {
                 NextTurnRequest::Ping(_) => None,
-                NextTurnRequest::Compaction { expect, .. } => {
-                    Some(super::api::CompactionRequest { expect })
-                }
+                NextTurnRequest::Compaction { request, .. } => Some(request.clone()),
             },
             // Header only (cache-key parity with the turns this ping keeps
             // warm); a ping never sends `diagnostics` nor moves the chain.
@@ -933,7 +942,7 @@ impl Runtime {
                 }
             }
         }
-        Ok((result, notices, system_prompt))
+        Ok((result, notices))
     }
 
     /// The pre-request context assessment of `run_stream_internal`, for the

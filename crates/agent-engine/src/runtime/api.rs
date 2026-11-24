@@ -1012,7 +1012,7 @@ pub struct ApiOptions {
 
 /// Wire-side knobs of a cache-preserving compaction request (see
 /// [`ApiOptions::compaction`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CompactionRequest {
     /// What the last accepted request of this chain left in the cache. The
     /// request is sent only when it can read that: its own cache identity
@@ -1023,6 +1023,38 @@ pub struct CompactionRequest {
     /// cached ones). Otherwise the whole history would be WRITTEN, at the
     /// cache-write price.
     pub expect: super::keepwarm::CachedPrefix,
+    /// Filled, once the request has passed those checks, with the prompt
+    /// stack it carries ahead of the messages (`RequestBody::prompt_stack`):
+    /// the summary's provenance digests what was sent, not what the
+    /// caller meant to send.
+    pub sent: SentPromptStack,
+}
+
+impl CompactionRequest {
+    pub fn expecting(expect: super::keepwarm::CachedPrefix) -> Self {
+        Self {
+            expect,
+            sent: SentPromptStack::default(),
+        }
+    }
+}
+
+/// `(system, tools)` of a request as sent, as canonical JSON; empty until
+/// the request is built. Shared with the caller that reads it afterwards.
+#[derive(Debug, Clone, Default)]
+pub struct SentPromptStack(Arc<std::sync::Mutex<Option<(String, String)>>>);
+
+impl SentPromptStack {
+    fn set(&self, stack: (String, String)) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stack);
+    }
+
+    pub fn get(&self) -> Option<(String, String)> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Refusal text of a compaction request whose cache identity changed.
@@ -1673,6 +1705,7 @@ impl ApiMethods {
             if !compaction.expect.leads(history) {
                 return Err(RuntimeError::Config(COMPACTION_HISTORY_CHANGED.into()));
             }
+            compaction.sent.set(body.prompt_stack());
         }
         let cached_prefix = cached_prefix
             .map(|(identity, history)| super::keepwarm::CachedPrefix::of(identity, history));
@@ -6034,9 +6067,9 @@ mod anthropic_failover_tests {
         let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
         let auth = oauth_auth_pinned_to("claude4");
         let refused = ApiOptions {
-            compaction: Some(super::CompactionRequest {
-                expect: crate::runtime::keepwarm::CachedPrefix::of(0, &[]),
-            }),
+            compaction: Some(super::CompactionRequest::expecting(
+                crate::runtime::keepwarm::CachedPrefix::of(0, &[]),
+            )),
             ..Default::default()
         };
         let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, refused).await;
@@ -6057,7 +6090,7 @@ mod anthropic_failover_tests {
         // counts as the compaction request's own: its history is one
         // message short of what the turn sent, and it is refused.
         let shorter = ApiOptions {
-            compaction: Some(super::CompactionRequest { expect: stamped }),
+            compaction: Some(super::CompactionRequest::expecting(stamped)),
             ..Default::default()
         };
         let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, shorter).await;
@@ -6068,9 +6101,9 @@ mod anthropic_failover_tests {
         // With the identity the request really has and a history that
         // starts with what was sent (nothing: an empty prefix), it is sent.
         let compaction = ApiOptions {
-            compaction: Some(super::CompactionRequest {
-                expect: crate::runtime::keepwarm::CachedPrefix::of(stamped.identity, &[]),
-            }),
+            compaction: Some(super::CompactionRequest::expecting(
+                crate::runtime::keepwarm::CachedPrefix::of(stamped.identity, &[]),
+            )),
             ..Default::default()
         };
         let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, compaction).await;
