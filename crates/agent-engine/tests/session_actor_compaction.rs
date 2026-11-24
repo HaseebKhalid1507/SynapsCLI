@@ -17,23 +17,50 @@ use agent_engine::session::{
 use axum::response::IntoResponse;
 use serial_test::serial;
 
-/// Streaming turns (`"stream":true`) → SSE_HI; the non-streaming compaction
-/// call → a JSON summary after `delay`. Counts compaction hits.
-async fn stub_compact(delay: Duration) -> (String, Arc<AtomicUsize>) {
-    let compactions = Arc::new(AtomicUsize::new(0));
-    let c = Arc::clone(&compactions);
+/// What tells a cache-preserving compaction request (the chat's own next
+/// request plus the summary instructions) from a turn.
+const CHAT_SUMMARY_REQUEST: &str = "Automated context-compaction request";
+
+/// Summary requests the stub served, by kind.
+#[derive(Clone, Default)]
+struct Summaries {
+    /// The chat's own next request plus the summary instructions.
+    chat: Arc<AtomicUsize>,
+    /// The flattened transcript (non-streaming).
+    transcript: Arc<AtomicUsize>,
+}
+
+impl Summaries {
+    fn total(&self) -> usize {
+        self.chat.load(Ordering::SeqCst) + self.transcript.load(Ordering::SeqCst)
+    }
+}
+
+/// Streaming turns (`"stream":true`) → SSE_HI. A summary request → a summary
+/// after `delay`: as SSE for the chat's own request (streaming, carrying the
+/// summary instructions), as JSON for the non-streaming transcript request.
+async fn stub_compact(delay: Duration) -> (String, Summaries) {
+    let summaries = Summaries::default();
+    let s = summaries.clone();
     let app = axum::Router::new().fallback(move |body: String| {
-        let c = Arc::clone(&c);
+        let s = s.clone();
         async move {
             if body.contains("\"stream\":true") {
+                let sse = if body.contains(CHAT_SUMMARY_REQUEST) {
+                    s.chat.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    SSE_HI.replace("\"text\":\"hi\"", "\"text\":\"SUMMARY: hello, a few times.\"")
+                } else {
+                    SSE_HI.to_string()
+                };
                 return (
                     axum::http::StatusCode::OK,
                     [("content-type", "text/event-stream")],
-                    SSE_HI.to_string(),
+                    sse,
                 )
                     .into_response();
             }
-            c.fetch_add(1, Ordering::SeqCst);
+            s.transcript.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(delay).await;
             axum::Json(serde_json::json!({
                 "id": "msg_c", "type": "message", "role": "assistant",
@@ -47,7 +74,7 @@ async fn stub_compact(delay: Duration) -> (String, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), compactions)
+    (format!("http://{addr}"), summaries)
 }
 
 /// 4+ messages so the engine has something to compact.
@@ -136,8 +163,22 @@ async fn compaction_does_not_block_attach_and_submit_is_queued_and_restored() {
     assert_eq!(applied.1, handle.id.as_str(), "InPlace keeps the id");
     assert_eq!(applied.2.as_deref(), Some("while compacting"));
     assert_eq!(applied.3, 4);
-    assert_eq!(compactions.load(Ordering::SeqCst), 1);
+    // One summary request, and it is the chat's own next request: the turns
+    // just before left the prompt cache warm, and the job's runtime (a clone)
+    // knows it. No transcript request.
+    assert_eq!(compactions.total(), 1);
+    assert_eq!(
+        compactions.chat.load(Ordering::SeqCst),
+        1,
+        "a warm chat is summarized by its own next request"
+    );
     let conv = last_conversation(&seen);
+    assert!(
+        conv.api_messages[0]["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("SUMMARY: hello, a few times.")),
+        "the reply to the chat's own request is the summary"
+    );
     assert!(conv.queued_message.is_none());
     assert!(conv.api_messages.len() < 4 + 1 || conv.api_messages.len() >= 2);
     // The queued text rides the transition as the last user message; it is

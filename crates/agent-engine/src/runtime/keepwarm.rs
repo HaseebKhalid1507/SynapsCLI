@@ -82,28 +82,52 @@ impl CacheAnchor {
     }
 }
 
-/// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]).
+/// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]),
+/// with the cache identity of that request: a hash of everything ahead of
+/// the messages that the cache key covers (model, effort, system, thinking,
+/// tools, beta header) and of the account it went out on
+/// (`ApiMethods::cache_identity`). A later request with another identity
+/// reads nothing that request wrote.
 /// Runtime clones get a FRESH cell (a clone is a different request chain,
 /// like the TTL latches); `share_ttl_latches` shares it.
 #[derive(Debug, Default)]
-pub struct CacheAnchorCell(std::sync::Mutex<Option<CacheAnchor>>);
+pub struct CacheAnchorCell(std::sync::Mutex<(Option<CacheAnchor>, Option<u64>)>);
 
 impl CacheAnchorCell {
+    /// Stamp a request whose cache identity is not known: the identity of
+    /// an earlier request no longer describes the newest one and is dropped.
     pub fn stamp(&self, at: CacheAnchor) {
+        self.stamp_with(at, None);
+    }
+
+    /// Stamp an accepted request and its cache identity.
+    pub fn stamp_identified(&self, at: CacheAnchor, identity: u64) {
+        self.stamp_with(at, Some(identity));
+    }
+
+    fn stamp_with(&self, at: CacheAnchor, identity: Option<u64>) {
         let mut slot = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.is_none_or(|prev| prev.mono <= at.mono) {
-            *slot = Some(at);
+        if slot.0.is_none_or(|prev| prev.mono <= at.mono) {
+            *slot = (Some(at), identity);
         }
     }
 
     pub fn get(&self) -> Option<CacheAnchor> {
-        *self
-            .0
+        self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+    }
+
+    /// Cache identity of the request [`Self::get`] returns, when known.
+    pub fn identity(&self) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
     }
 }
 
@@ -387,6 +411,45 @@ pub fn reply_prefix_tokens(history: &[SharedMessage]) -> u64 {
     super::context::conservative_token_estimate(&kept.to_string())
 }
 
+/// A request built on the next turn's exact prefix that is not a turn: the
+/// durable history plus one request-local trailing user message, through the
+/// turn's own request builder.
+#[derive(Debug, Clone, Copy)]
+enum NextTurnRequest<'a> {
+    /// A keep-warm ping (see the module docs).
+    Ping(KeepWarmMode),
+    /// Cache-preserving compaction: `instructions` is the new user message.
+    Compaction {
+        instructions: &'a str,
+        expect_identity: u64,
+    },
+}
+
+impl NextTurnRequest<'_> {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ping(_) => "cache keep-warm",
+            Self::Compaction { .. } => "cache-preserving compaction",
+        }
+    }
+
+    /// Whether the request is meant for the network (a probe never is; a
+    /// tool-round replay is not built here).
+    fn sends(&self) -> bool {
+        matches!(
+            self,
+            Self::Ping(KeepWarmMode::Send { .. }) | Self::Compaction { .. }
+        )
+    }
+
+    fn trailing_text(&self) -> &str {
+        match self {
+            Self::Ping(_) => KEEPWARM_PING_TEXT,
+            Self::Compaction { instructions, .. } => instructions,
+        }
+    }
+}
+
 /// Run one ping's request to completion, draining its private event channel
 /// WHILE it runs: usage lands in the tap as it arrives, so an aborted ping
 /// can still be booked. Notices (and retry notes) are collected; with
@@ -526,29 +589,71 @@ impl Runtime {
         tap: &PingTap,
     ) -> (Result<Value>, Vec<String>) {
         match self
-            .keepwarm_request_inner(history, cancel, mode, tap)
+            .next_turn_request(history, cancel, NextTurnRequest::Ping(mode), tap)
             .await
         {
-            Ok(r) => r,
+            Ok((result, notices, _system)) => (result, notices),
             Err(e) => (Err(e), Vec::new()),
         }
     }
 
+    /// Cache identity of this chain's last accepted Anthropic request (see
+    /// [`CacheAnchorCell`]); `None` before one, or when it is not known.
+    pub fn cache_identity(&self) -> Option<u64> {
+        self.cache_anchor.identity()
+    }
+
+    /// Send the chat's own next request for `history` with `instructions`
+    /// as its new user message (cache-preserving compaction, task 430) and
+    /// return the reply's content blocks. Assembled by the same code as a
+    /// keep-warm ping, hence as a turn: system, tools, thinking, effort and
+    /// history are the turn's; markers are placed as a turn places them.
+    /// Refused before the network when the request's cache identity is not
+    /// `expect_identity`. Runs no tool, fires no hook, never touches
+    /// `history` or any session state, and emits nothing to a frontend.
+    /// Returns the reply with the system prompt the request carried (the
+    /// summary's provenance digests it).
+    pub(super) async fn compaction_cached_request(
+        &self,
+        history: &[SharedMessage],
+        instructions: &str,
+        expect_identity: u64,
+    ) -> Result<(Value, Option<String>)> {
+        // A remote summarization request: counted at the same seam as the
+        // transcript request (`Runtime::compact_call`), before any assembly.
+        self.remote_summarization_attempts
+            .fetch_add(1, Ordering::SeqCst);
+        let (result, _notices, system_prompt) = self
+            .next_turn_request(
+                history,
+                &CancellationToken::new(),
+                NextTurnRequest::Compaction {
+                    instructions,
+                    expect_identity,
+                },
+                &PingTap::default(),
+            )
+            .await?;
+        Ok((result?, system_prompt))
+    }
+
     /// `Err` = refused before any request was built (nothing billed);
-    /// `Ok((Err, _))` = the request itself failed (usage, if any, is in `tap`).
-    async fn keepwarm_request_inner(
+    /// `Ok((Err, ..))` = the request itself failed (usage, if any, is in
+    /// `tap`). The third field is the system prompt the request carried.
+    async fn next_turn_request(
         &self,
         history: &[SharedMessage],
         cancel: &CancellationToken,
-        mode: KeepWarmMode,
+        purpose: NextTurnRequest<'_>,
         tap: &PingTap,
-    ) -> Result<(Result<Value>, Vec<String>)> {
+    ) -> Result<(Result<Value>, Vec<String>, Option<String>)> {
+        let what = purpose.label();
         if let Some(reason) = self.cache_keepwarm_ineligibility() {
-            return Err(RuntimeError::Config(format!(
-                "cache keep-warm skipped: {reason}"
-            )));
+            return Err(RuntimeError::Config(format!("{what} skipped: {reason}")));
         }
-        if !history_ready(history) {
+        // A ping's marker moves onto the last history message; a compaction
+        // request is marked like a turn, on its own last message.
+        if matches!(purpose, NextTurnRequest::Ping(_)) && !history_ready(history) {
             return Err(RuntimeError::Config(
                 "cache keep-warm skipped: history does not end with a finished assistant reply"
                     .into(),
@@ -562,18 +667,20 @@ impl Runtime {
             (state.durability_blocked, state.enabled())
         };
         if durability_blocked {
-            return Err(RuntimeError::Session(
-                "cache keep-warm skipped: context head save is unresolved".into(),
-            ));
+            return Err(RuntimeError::Session(format!(
+                "{what} skipped: context head save is unresolved"
+            )));
         }
 
         // Same preflight as a real turn (run_stream_tracked). A probe sends
         // nothing, so it never needs a token refresh.
         self.validate_request_preflight().await?;
         let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
-        if matches!(mode, KeepWarmMode::Send { .. }) {
+        if purpose.sends() {
             // Never selects, switches or re-binds an account; under `auto` a
             // cooling account ends the period (the ping fails before sending).
+            // A compaction request likewise stays on the account whose cache
+            // it reads.
             self.refresh_for_keepwarm().await?;
         }
 
@@ -606,7 +713,7 @@ impl Runtime {
         // retention anchor the transport places from it, match the next turn.
         let mut request: Vec<SharedMessage> = history.to_vec();
         request.push(Arc::new(
-            json!({"role": "user", "content": KEEPWARM_PING_TEXT}),
+            json!({"role": "user", "content": purpose.trailing_text()}),
         ));
         let round_images =
             super::image_retention::round_images(&self.model, self.codex_request_role(), &request)
@@ -709,12 +816,21 @@ impl Runtime {
             // A successful ping refreshes the cache: it moves the anchor the
             // next ping is scheduled from.
             cache_anchor: Some(Arc::clone(&self.cache_anchor)),
-            keepwarm: Some(KeepWarmRequest {
-                mode,
-                status: Arc::clone(&tap.status),
-                sent: Arc::clone(&tap.sent),
-                connect_failed: Arc::clone(&tap.connect_failed),
-            }),
+            keepwarm: match purpose {
+                NextTurnRequest::Ping(mode) => Some(KeepWarmRequest {
+                    mode,
+                    status: Arc::clone(&tap.status),
+                    sent: Arc::clone(&tap.sent),
+                    connect_failed: Arc::clone(&tap.connect_failed),
+                }),
+                NextTurnRequest::Compaction { .. } => None,
+            },
+            compaction: match purpose {
+                NextTurnRequest::Ping(_) => None,
+                NextTurnRequest::Compaction {
+                    expect_identity, ..
+                } => Some(super::api::CompactionRequest { expect_identity }),
+            },
             // Header only (cache-key parity with the turns this ping keeps
             // warm); a ping never sends `diagnostics` nor moves the chain.
             cache_diagnosis: self.cache_diagnosis(),
@@ -734,14 +850,20 @@ impl Runtime {
             request_messages,
             tx,
             cancel,
-            0,
+            // A ping never retries. A compaction request retries transport
+            // errors like the turn it stands in for; a refusal is not
+            // retried (the caller falls back to the transcript request).
+            match purpose {
+                NextTurnRequest::Ping(_) => 0,
+                NextTurnRequest::Compaction { .. } => self.api_retries,
+            },
             0,
             &options,
             self.telemetry_level,
         );
         let (mut result, notices) = drive_ping(call, &mut rx, tap, None).await;
         // Probe: also run the next turn's pre-request context assessment.
-        if let (Ok(value), KeepWarmMode::Probe) = (&mut result, mode) {
+        if let (Ok(value), NextTurnRequest::Ping(KeepWarmMode::Probe)) = (&mut result, purpose) {
             if context_enabled {
                 if let Some(why) = self.keepwarm_context_blocks(
                     history,
@@ -753,7 +875,7 @@ impl Runtime {
                 }
             }
         }
-        Ok((result, notices))
+        Ok((result, notices, system_prompt))
     }
 
     /// The pre-request context assessment of `run_stream_internal`, for the
@@ -2087,6 +2209,25 @@ mod tests {
             Some(later),
             "a late-arriving older stamp never rewinds"
         );
+    }
+
+    /// The identity belongs to the request the anchor names: a newer
+    /// request without one clears it, an older stamp changes nothing.
+    #[test]
+    fn anchor_cell_identity_follows_the_newest_request() {
+        let cell = CacheAnchorCell::default();
+        assert_eq!(cell.identity(), None);
+        let a = CacheAnchor::now();
+        let at = |secs| CacheAnchor {
+            mono: a.mono + std::time::Duration::from_secs(secs),
+            wall: a.wall + std::time::Duration::from_secs(secs),
+        };
+        cell.stamp_identified(at(5), 42);
+        assert_eq!((cell.get(), cell.identity()), (Some(at(5)), Some(42)));
+        cell.stamp_identified(a, 7);
+        assert_eq!(cell.identity(), Some(42), "an older stamp never rewinds");
+        cell.stamp(at(9));
+        assert_eq!((cell.get(), cell.identity()), (Some(at(9)), None));
     }
 
     #[test]

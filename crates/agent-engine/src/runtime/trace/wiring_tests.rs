@@ -868,6 +868,50 @@ async fn one_api_log_record_with_retries(h: &Harness, max_retries: u32) -> serde
     serde_json::from_str(lines[0]).unwrap()
 }
 
+/// The api-log tells a cache-preserving compaction request from a turn:
+/// its record, and no other, carries `"compaction": true`. (Its
+/// `usage.cache_read` is then the history that was not paid for as fresh
+/// input.)
+#[tokio::test]
+async fn api_log_marks_a_cache_preserving_compaction_request() {
+    use crate::runtime::telemetry::{TelemetryWriter, WriterOptions};
+    let app = Router::new().route("/v1/messages", axum_post(|| async { sse_response() }));
+    let h = harness(serve(app).await);
+    let log = h._tmp.path().join("synaps/api-log.jsonl");
+    let writer = TelemetryWriter::new(WriterOptions {
+        telemetry_path: Some(log.clone()),
+        ..WriterOptions::default()
+    });
+    // The turn before: an accepted request stamps its cache identity.
+    let cell = Arc::new(crate::runtime::keepwarm::CacheAnchorCell::default());
+    let turn = ApiOptions {
+        telemetry: Some(writer.clone()),
+        cache_anchor: Some(Arc::clone(&cell)),
+        ..h.options.clone()
+    };
+    let drive = |options: ApiOptions| async move {
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        drive_stream_full(&options, 0, &CancellationToken::new(), tx, TelemetryLevel::Basic)
+            .await
+            .expect("request");
+    };
+    drive(turn.clone()).await;
+    drive(ApiOptions {
+        compaction: Some(crate::runtime::api::CompactionRequest {
+            expect_identity: cell.identity().expect("stamped"),
+        }),
+        ..turn
+    })
+    .await;
+    assert!(writer.shutdown(Duration::from_secs(10)).is_flushed());
+    let text = std::fs::read_to_string(&log).unwrap();
+    let records: Vec<serde_json::Value> =
+        text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(records.len(), 2, "{text}");
+    assert!(records[0].get("compaction").is_none(), "a turn: {}", records[0]);
+    assert_eq!(records[1]["compaction"], true, "{}", records[1]);
+}
+
 /// Regression: `ttft_ms` was measured from an instant taken AFTER the
 /// response headers arrived, and Anthropic sends `message_start` with the
 /// headers, so 44.5K of 44.9K live records read `"ttft_ms":0` while the

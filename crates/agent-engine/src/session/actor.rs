@@ -4280,7 +4280,12 @@ impl SessionActor {
             disclosure,
         });
         let msgs = self.conv.api_messages.clone();
-        let rt: Runtime = (*self.runtime).clone();
+        let mut rt: Runtime = (*self.runtime).clone();
+        // A clone starts a request chain of its own (fresh cache anchor and
+        // TTL latches). This one summarizes THIS chat: it must know when
+        // the chat's cached prefix was last read or written, and under which
+        // TTL, to decide whether the summary request can read it.
+        rt.share_ttl_latches(&self.runtime);
         let task = tokio::spawn(async move {
             compact_conversation(&msgs, &rt, instructions.as_deref()).await
         });

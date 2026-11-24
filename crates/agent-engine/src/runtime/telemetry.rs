@@ -327,6 +327,12 @@ pub struct TelemetryRecord {
     /// can separate pings from real turns. Absent on every turn record.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub keepwarm: bool,
+    /// `true` only on a cache-preserving compaction request (task 430):
+    /// the chat's own next request plus the summary instructions. Its
+    /// `usage.cache_read` is the history it did not pay for as fresh input.
+    /// Absent on every other record.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub compaction: bool,
     /// `true` when a subagent (worker runtime) made the request, so reports
     /// can split delegated traffic from the foreground session. Absent on
     /// foreground and internal records.
@@ -662,6 +668,20 @@ mod tests {
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"keepwarm\":true"), "{json}");
+    }
+
+    /// A cache-preserving compaction request is told apart in the api-log;
+    /// no other record carries the field.
+    #[test]
+    fn compaction_record_is_marked() {
+        let record = TelemetryRecord {
+            compaction: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"compaction\":true"), "{json}");
+        let turn = serde_json::to_string(&TelemetryRecord::default()).unwrap();
+        assert!(!turn.contains("compaction"), "{turn}");
     }
 
     #[test]

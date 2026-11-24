@@ -21,6 +21,7 @@ pub mod budget;
 mod cache_diagnosis;
 pub(crate) mod cloud_invoke;
 pub mod compaction;
+pub mod compaction_cached;
 pub mod context;
 pub mod continuation;
 pub mod google_gemini;
@@ -3526,6 +3527,7 @@ impl Runtime {
             // schedules from.
             cache_anchor: Some(self.cache_anchor.clone()),
             keepwarm: None,
+            compaction: None,
             // The foreground chain: the only requests that thread
             // `diagnostics.previous_message_id`.
             cache_diagnosis: self.cache_diagnosis(),

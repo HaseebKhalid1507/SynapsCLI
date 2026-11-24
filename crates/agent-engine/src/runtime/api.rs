@@ -976,6 +976,17 @@ pub struct ApiOptions {
     /// [`KeepWarmMode`]), every retry budget is zero, and the telemetry
     /// record carries `"keepwarm": true`.
     pub keepwarm: Option<KeepWarmRequest>,
+    /// Cache-preserving compaction (task 430). `None` on every other
+    /// request. When set (native Anthropic transport only; any other route
+    /// fails closed before a request is built) the request is assembled and
+    /// marked exactly as a turn's — the caller appended the summary
+    /// instructions as the last user message — and differs from a turn only
+    /// off the wire: it is refused before the network when its cache
+    /// identity is not the one the last accepted request had
+    /// ([`CompactionRequest`]), it never switches accounts at a limit, it
+    /// sends no `diagnostics` field, and its telemetry record carries
+    /// `"compaction": true`.
+    pub compaction: Option<CompactionRequest>,
     /// Anthropic cache diagnostics chain (`cache_diagnostics = true`).
     /// `None` (default) keeps the wire byte-identical: no header, no
     /// `diagnostics` field. Set on the foreground turn stream (which threads
@@ -996,6 +1007,22 @@ pub struct ApiOptions {
     /// `message_start` is not the round's).
     pub round_signal: Option<std::sync::Arc<super::tool_keepwarm::RoundSignal>>,
 }
+
+/// Wire-side knobs of a cache-preserving compaction request (see
+/// [`ApiOptions::compaction`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionRequest {
+    /// Cache identity (`RequestBody::cache_identity`) of the last accepted
+    /// request of this chain. The request is sent only when its own is
+    /// equal: after a model, effort, thinking, system prompt, tool or
+    /// account change the message cache cannot be read, and the whole
+    /// history would be WRITTEN at the cache-write price instead.
+    pub expect_identity: u64,
+}
+
+/// Refusal text of a compaction request whose cache identity changed.
+pub(super) const COMPACTION_IDENTITY_CHANGED: &str = "cache-preserving compaction not sent: \
+     the model, effort, thinking, system prompt, tools or account changed since the last request";
 
 /// What a keep-warm request does once its body is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1236,6 +1263,13 @@ impl ApiMethods {
         if options.keepwarm.is_some() && !super::auth::model_is_anthropic(model) {
             return Err(RuntimeError::Config(
                 "cache keep-warm ping requires the native Anthropic transport".into(),
+            ));
+        }
+        // Same for a cache-preserving compaction request: another route has no
+        // prefix cache to read, and may run a tool loop of its own.
+        if options.compaction.is_some() && !super::auth::model_is_anthropic(model) {
+            return Err(RuntimeError::Config(
+                "cache-preserving compaction requires the native Anthropic transport".into(),
             ));
         }
         super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
@@ -1580,6 +1614,20 @@ impl ApiMethods {
                 }));
             }
         }
+        // Cache identity of this request: stamped beside the cache anchor
+        // when it is accepted, and what a cache-preserving compaction request
+        // must match before it is sent (it returns here, before any trace,
+        // telemetry or network I/O, when it does not).
+        let cache_identity = (options.cache_anchor.is_some() || options.compaction.is_some())
+            .then(|| {
+                let beta = Self::build_beta_header(&auth_type, options, model);
+                body.cache_identity(beta.as_deref(), &auth_type, auth_binding.as_deref())
+            });
+        if let (Some(compaction), Some(actual)) = (&options.compaction, cache_identity) {
+            if compaction.expect_identity != actual {
+                return Err(RuntimeError::Config(COMPACTION_IDENTITY_CHANGED.into()));
+            }
+        }
         let translation_report = parts.report;
 
         // Did THIS request actually carry at least one 1h marker? Arms the
@@ -1710,7 +1758,9 @@ impl ApiMethods {
         // A cache keep-warm ping: it keeps the cache of the account it is
         // on, so a limit is reported but never switches accounts, and no
         // notice about it reaches the session.
-        let keepwarm_ping = options.keepwarm.is_some();
+        // A compaction summary reads the cache of the account the chat is
+        // on: it never switches either (another account's cache is cold).
+        let stays_on_account = options.keepwarm.is_some() || options.compaction.is_some();
         let mut sent_at_ms;
 
         loop {
@@ -1784,7 +1834,15 @@ impl ApiMethods {
                                 // read or written by a request that started
                                 // no earlier than `sent_at`.
                                 if let Some(anchor) = &options.cache_anchor {
-                                    anchor.stamp(sent_at);
+                                    // After an account hop the identity
+                                    // built for the first seat is not this
+                                    // request's: stamped as unknown.
+                                    match cache_identity.filter(|_| anthropic_failovers == 0) {
+                                        Some(identity) => {
+                                            anchor.stamp_identified(sent_at, identity)
+                                        }
+                                        None => anchor.stamp(sent_at),
+                                    }
                                 }
                                 if !anthropic_cooled.is_empty() {
                                     let served = super::auth::turn_pinned_credential(
@@ -1989,7 +2047,7 @@ impl ApiMethods {
                                         // attempted set (once).
                                         anthropic_attempted.retain(|c| c != seat);
                                         anthropic_attempted.push(seat.clone());
-                                        let permitted = if keepwarm_ping {
+                                        let permitted = if stays_on_account {
                                             Err(FailoverRefusal::KeepWarmPing)
                                         } else {
                                             failover_permitted(&gate)
@@ -2096,7 +2154,7 @@ impl ApiMethods {
                                     // budget a minute at a time) or keep the existing
                                     // retry path for short/unknown resets. No text
                                     // claims another account will serve.
-                                    if !keepwarm_ping {
+                                    if !stays_on_account {
                                         let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
                                             text.no_hop(no_hop),
                                         )));
@@ -2585,6 +2643,7 @@ impl ApiMethods {
                         breakpoints,
                     },
                     keepwarm: options.keepwarm.is_some(),
+                    compaction: options.compaction.is_some(),
                     worker: options.codex_request_role
                         == crate::runtime::openai::catalog::CodexRequestRole::Worker,
                     rollover_window: options.context_rollover.map(|r| r.window),
@@ -5909,6 +5968,45 @@ mod anthropic_failover_tests {
             auth.read().await.bound_credential.as_deref(),
             Some(anthropic_binding(&CredentialSource::Local, &seat("claude4")).as_str())
         );
+    }
+
+    /// A cache-preserving compaction request reads the cache of the account
+    /// the chat is on: at a recognised limit it fails there (the caller
+    /// falls back to the transcript request) and never switches accounts.
+    /// Its cache identity, zero here, must match before anything is sent.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_compaction_request_at_a_limit_never_switches_accounts() {
+        let upstream = spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }]).await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+        let refused = ApiOptions {
+            compaction: Some(super::CompactionRequest { expect_identity: 0 }),
+            ..Default::default()
+        };
+        let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, refused).await;
+        let error = out.result.expect_err("another cache identity is refused");
+        assert!(error.to_string().contains(super::COMPACTION_IDENTITY_CHANGED), "{error}");
+        assert_eq!(upstream.calls(), 0, "refused before the network");
+
+        // With the identity the request really has, it is sent.
+        let cell = Arc::new(crate::runtime::keepwarm::CacheAnchorCell::default());
+        let turn = ApiOptions {
+            cache_anchor: Some(Arc::clone(&cell)),
+            ..Default::default()
+        };
+        let warm = spawn_upstream(vec![Reply::SseOk]).await;
+        drive_with(&warm, Arc::clone(&auth), &router, 2, turn).await.result.expect("turn");
+        let identity = cell.identity().expect("an accepted request stamps its identity");
+        let compaction = ApiOptions {
+            compaction: Some(super::CompactionRequest { expect_identity: identity }),
+            ..Default::default()
+        };
+        let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, compaction).await;
+        out.result.expect_err("the request fails on its own account");
+        assert_eq!(upstream.calls(), 1, "no request on another account");
+        assert!(router.failovers().is_empty(), "no account lookup");
+        assert_eq!(auth.read().await.auth_token, "tok-claude4");
     }
 
     /// End to end through the real `LocalBroker` (auth.json, usage reads,

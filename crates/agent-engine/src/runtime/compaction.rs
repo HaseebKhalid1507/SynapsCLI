@@ -568,7 +568,9 @@ fn local_summary(api_messages: &[crate::SharedMessage], policy: &DisclosurePolic
 
 /// Serialize the in-memory API message history into a policy-filtered
 /// transcript and produce the typed [`CompactionOutcome`]. Remote mode asks
-/// the configured summarizer model; local-only mode (spec §9.4) derives the
+/// the configured summarizer model (through the chat's own next request
+/// when that reads the history from the prompt cache, see
+/// `runtime::compaction_cached`); local-only mode (spec §9.4) derives the
 /// summary in-process and constructs NO network request. Called by
 /// `/compact` and every auto-compaction path.
 pub async fn compact_conversation(
@@ -596,6 +598,22 @@ pub async fn compact_conversation(
             // Chosen once: the model the request goes to is the one the
             // outcome names.
             let (model, _notice) = runtime.compact_model_choice();
+            // The chat's own next request plus the instructions, when the
+            // history can be read from the prompt cache that way; otherwise,
+            // and once after any failure of it, the transcript request below.
+            if let Some(outcome) = super::compaction_cached::summarize(
+                api_messages,
+                runtime,
+                &model,
+                &policy,
+                &rendered,
+            )
+            .await
+            {
+                return Ok(outcome);
+            }
+            let user_msg =
+                std::sync::Arc::new(json!({"role": "user", "content": rendered.prompt_text}));
             let summary_text = runtime.compact_call(&model, vec![user_msg]).await?;
             let mut outcome = CompactionOutcome::for_prompt_stack(
                 summary_text,

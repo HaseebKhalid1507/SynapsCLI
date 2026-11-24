@@ -93,8 +93,10 @@ pub enum CompactionMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RedactionPolicy {
-    /// Legacy behavior: tool results and thinking are truncated but no
-    /// content class is excluded.
+    /// No content class is excluded; tool results and thinking are at most
+    /// truncated. The transcript request truncates them; a cache-preserving
+    /// request (the chat's own next request, which the provider already
+    /// holds in full) sends the history as the chat does.
     TruncationOnly,
     /// Configured content classes were excluded per the session disclosure
     /// policy (spec §9.4).

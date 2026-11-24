@@ -245,6 +245,27 @@ impl<'a> RequestBody<'a> {
         h.0
     }
 
+    /// [`Self::prefix_fingerprint`] of everything ahead of the messages
+    /// (no message at all), mixed with the credential kind and the account
+    /// the request goes out on: what must be equal between two requests
+    /// for the later one to read the message cache the earlier one wrote.
+    /// Caches are per organization, so another account never shares one.
+    pub(super) fn cache_identity(
+        &self,
+        beta: Option<&str>,
+        auth_type: &str,
+        account: Option<&str>,
+    ) -> u64 {
+        let mut h = self.prefix_fingerprint(0, beta);
+        for part in [auth_type.as_bytes(), &[0x1f], account.unwrap_or("").as_bytes()] {
+            for b in part {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
     /// Send `thinking.display = display` (`thinking_display`). Summarized
     /// leaves the body as built, byte for byte; a body without `thinking`
     /// (reasoning off) stays without it.
