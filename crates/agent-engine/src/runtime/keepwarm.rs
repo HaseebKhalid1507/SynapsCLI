@@ -667,10 +667,6 @@ impl Runtime {
         instructions: &str,
         expect: CachedPrefix,
     ) -> Result<ChatSummaryReply> {
-        // A remote summarization request: counted at the same seam as the
-        // transcript request (`Runtime::compact_call`), before any assembly.
-        self.remote_summarization_attempts
-            .fetch_add(1, Ordering::SeqCst);
         let tap = PingTap::default();
         let (result, _notices, system_prompt) = self
             .next_turn_request(

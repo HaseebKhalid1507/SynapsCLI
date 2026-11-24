@@ -598,6 +598,9 @@ pub async fn compact_conversation(
             // Chosen once: the model the request goes to is the one the
             // outcome names.
             let (model, _notice) = runtime.compact_model_choice();
+            // The remote seam, entered once for this compaction and before
+            // any request is assembled, whichever request carries it.
+            runtime.enter_remote_summarization();
             // The chat's own next request plus the instructions, when the
             // history can be read from the prompt cache that way; otherwise,
             // and once after any failure of it, the transcript request below.
@@ -614,7 +617,7 @@ pub async fn compact_conversation(
             }
             let user_msg =
                 std::sync::Arc::new(json!({"role": "user", "content": rendered.prompt_text}));
-            let summary_text = runtime.compact_call(&model, vec![user_msg]).await?;
+            let summary_text = runtime.transcript_summary_call(&model, vec![user_msg]).await?;
             let mut outcome = CompactionOutcome::for_prompt_stack(
                 summary_text,
                 &model,

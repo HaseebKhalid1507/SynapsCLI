@@ -1218,6 +1218,42 @@ mod tests {
         assert_fell_back_once(&seen, &outcome);
     }
 
+    /// `remote_summarization_attempts` counts compactions that went remote,
+    /// not requests: one for a summary from the chat request, one for a
+    /// chat request that failed and its transcript request together, one
+    /// for a transcript request alone, none for local-only.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn one_remote_attempt_is_counted_per_compaction() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        // The counter is shared across clones.
+        let rt = opus();
+        let counter = rt.clone();
+        let (seen, _) = compact_after(rt, cached_reply(), |_| {}).await;
+        assert_eq!((seen.len(), counter.remote_summarization_attempts()), (1, 1));
+
+        let rt = opus();
+        let counter = rt.clone();
+        let (seen, _) = compact_after(rt, vec![Stream::Status(400)], |_| {}).await;
+        assert_eq!((seen.len(), counter.remote_summarization_attempts()), (2, 1));
+
+        let rt = opus();
+        let counter = rt.clone();
+        let (seen, _) = compact_after(rt, cached_reply(), |rt| {
+            rt.set_compaction_exclusions(vec![ContentClass::ToolResults]);
+        })
+        .await;
+        assert_eq!((seen.len(), counter.remote_summarization_attempts()), (1, 1));
+
+        let rt = opus();
+        let counter = rt.clone();
+        let (seen, _) = compact_after(rt, cached_reply(), |rt| {
+            rt.set_compaction_mode(CompactionMode::LocalOnly);
+        })
+        .await;
+        assert_eq!((seen.len(), counter.remote_summarization_attempts()), (0, 0));
+    }
+
     /// The chat request is sent ONCE whatever fails: no header-timed 429
     /// wait (eight of them can outlast a 5-minute cache), no 5xx retry, no
     /// overload retry (ten on a subscription), even with retries
