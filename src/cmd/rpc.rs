@@ -828,8 +828,10 @@ async fn handle_compact(
     // summarization dispatch — a dedicated Response frame (command
     // "compact.disclosure", same correlation id) precedes the LLM call, and
     // the disclosure also rides the final compact response.
+    // It names the request the dispatch below will send (the chat's own
+    // next request when the cache-preserving path applies).
     let disclosure =
-        synaps_cli::runtime::compaction::preview_compaction_disclosure(&runtime, &msgs);
+        synaps_cli::runtime::compaction::preview_compaction_request(&runtime, &msgs, None).await;
     tracing::info!(disclosure = %disclosure.render_line(), "compaction disclosure");
     let _ = writer_tx
         .send(RpcEvent::Response {

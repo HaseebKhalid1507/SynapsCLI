@@ -30,11 +30,18 @@ fn every_frontend_surfaces_disclosure_before_dispatch() {
     ] {
         let src = read(rel);
         assert!(
-            src.contains("preview_compaction_disclosure"),
+            src.contains("preview_compaction_request"),
             "{rel} must surface the §9.4 disclosure preview before dispatch"
         );
+        // The preview that names the request the dispatch really sends
+        // (the chat's own next request, or the transcript), not the
+        // transcript-only one.
+        assert!(
+            !src.contains("preview_compaction_disclosure"),
+            "{rel} must disclose the request that will be sent"
+        );
         // Compare CALL sites (the `(`-suffixed forms skip import lists).
-        let preview_pos = src.find("preview_compaction_disclosure(").unwrap();
+        let preview_pos = src.find("preview_compaction_request(").unwrap();
         let dispatch_pos = src
             .find("compact_conversation(")
             .expect("frontend dispatches compaction");
