@@ -10,8 +10,11 @@
 //!
 //! When the conditions below hold, the summary request is instead the chat's
 //! own next request: the same system blocks, tools, thinking, effort and
-//! messages, marked as a turn marks them, plus ONE new user message carrying
-//! the summary instructions ([`instructions`]). The history is then read
+//! messages, plus ONE new user message carrying the summary instructions
+//! ([`instructions`]). The message cache marker sits on the last history
+//! message, where a keep-warm ping puts it, not on the instructions: they
+//! are sent once, so an entry ending in them would be written (the whole
+//! request, at the write price) and never read. The history is then read
 //! from the cache: billed at the read price and not counted against the
 //! per-minute input limit
 //! (<https://platform.claude.com/docs/en/api/rate-limits#cache-aware-itpm>).
@@ -601,6 +604,15 @@ mod tests {
         serde_json::to_string(v).unwrap()
     }
 
+    /// The text of a request's last message (string content, or one block).
+    fn last_message_text(body: &Value) -> String {
+        let last = body["messages"].as_array().unwrap().last().unwrap();
+        match last["content"].as_str() {
+            Some(text) => text.to_string(),
+            None => last["content"][0]["text"].as_str().unwrap().to_string(),
+        }
+    }
+
     /// The transcript request, as it has always been sent.
     fn assert_transcript_request(seen: &Seen) {
         let body = &seen.body;
@@ -618,18 +630,28 @@ mod tests {
 
     /// THE KEY TEST. The compaction request and the chat's own next-turn
     /// request, built from the same history by one runtime, are the same
-    /// request except for the text of the appended last message.
+    /// request except for the appended last message.
     ///
     /// Everything the prompt cache keys on is asserted equal, byte for byte
     /// as sent: `model`, `tools`, `system` (transport identity included on
-    /// OAuth), `thinking`, `output_config` (effort), every history message,
-    /// the cache markers (the last message carries the turn's own marker),
-    /// and the `anthropic-beta` header. `max_tokens` and `stream` are not
-    /// part of the cache key and are equal anyway: no top-level key differs.
+    /// OAuth), `thinking`, `output_config` (effort), every history message's
+    /// content, and the `anthropic-beta` header. `max_tokens` and `stream`
+    /// are not part of the cache key and are equal anyway: no top-level key
+    /// differs.
     ///
     /// What must differ, and why:
     /// - the last message's text: the summary instructions instead of the
     ///   user's words. It is the request's uncached tail; that is the point.
+    /// - where the ONE message cache marker sits. A turn marks its new user
+    ///   message, so the next turn can read up to it. The instructions are
+    ///   never sent again, so the compaction request marks the last history
+    ///   message instead, like a keep-warm ping: nothing is written that no
+    ///   request will read. `cache_control` is not part of the cached
+    ///   content (a turn's marked tail recurs unmarked in the next request
+    ///   and is read), so with the markers taken off the history messages
+    ///   are byte-identical. (A marked message whose content is stored as
+    ///   a string goes out as a one-block array, the documented shorthand
+    ///   for the same text block; `content` below reads both alike.)
     /// - with `cache_diagnostics` on (off here and by default), the turn's
     ///   body also has a top-level `diagnostics` field threading the
     ///   previous message id; a compaction request is not a link of that
@@ -677,13 +699,51 @@ mod tests {
         let tm = turn.body["messages"].as_array().unwrap();
         assert_eq!(cm.len(), tm.len());
         assert_eq!(cm.len(), history.len() + 1, "history + one appended message");
+        // The cached content of a message: string content is shorthand for
+        // one text block, and `cache_control` only marks where an entry
+        // ends.
+        let content = |message: &Value| {
+            let mut message = message.clone();
+            if let Some(text) = message["content"].as_str().map(str::to_owned) {
+                message["content"] = json!([{"type": "text", "text": text}]);
+            }
+            for block in message["content"].as_array_mut().unwrap() {
+                block.as_object_mut().unwrap().remove("cache_control");
+            }
+            canon(&message)
+        };
+        let marked = |messages: &[Value]| -> Vec<usize> {
+            messages
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| canon(m).contains("cache_control"))
+                .map(|(i, _)| i)
+                .collect()
+        };
         let (c_last, c_history) = cm.split_last().unwrap();
         let (t_last, t_history) = tm.split_last().unwrap();
         for (i, (c, t)) in c_history.iter().zip(t_history).enumerate() {
-            assert_eq!(canon(c), canon(t), "history message {i} differs");
+            assert_eq!(content(c), content(t), "history message {i} differs");
+            if i + 1 < c_history.len() {
+                assert_eq!(canon(c), canon(t), "history message {i} differs on the wire");
+            }
         }
+        // One message marker each: the turn's on its new message, the
+        // compaction request's on the last history message.
+        assert_eq!(marked(tm), vec![history.len()], "the turn marks its new message");
+        assert_eq!(
+            marked(cm),
+            vec![history.len() - 1],
+            "the compaction request marks the last history message, not the instructions"
+        );
+        assert_eq!(
+            c_history.last().unwrap()["content"].as_array().unwrap().last().unwrap()
+                ["cache_control"],
+            t_last["content"][0]["cache_control"],
+            "the same marker (TTL included) as the turn's"
+        );
         // The appended message: the instructions, where the turn has the
-        // user's words; otherwise identical, cache marker included.
+        // user's words.
         let rendered = render_compaction_input(
             &history,
             Some("FOCUS-ON-THE-PARSER"),
@@ -695,20 +755,11 @@ mod tests {
         assert!(sent.contains("Additional focus: FOCUS-ON-THE-PARSER"));
         assert!(sent.contains("<read-files>\n/tmp/x\n</read-files>"));
         assert!(sent.ends_with(CACHED_COMPACTION_REPLY_RULE));
-        let with_text = |last: &Value, text: &str| {
-            let mut last = last.clone();
-            let blocks = last["content"].as_array_mut().expect("marked blocks");
-            assert_eq!(blocks.len(), 1);
-            assert!(blocks[0]["cache_control"].is_object(), "marked like a turn");
-            blocks[0]["text"] = json!(text);
-            last
-        };
-        assert_eq!(c_last["content"][0]["text"], sent.as_str());
-        assert_eq!(t_last["content"][0]["text"], "next question");
+        assert_eq!(c_last["role"], "user");
+        assert_eq!(content(c_last), content(&json!({"role": "user", "content": sent})));
         assert_eq!(
-            canon(&with_text(c_last, "")),
-            canon(&with_text(t_last, "")),
-            "the appended message differs beyond its text"
+            content(t_last),
+            content(&json!({"role": "user", "content": "next question"}))
         );
         (compaction.clone(), outcome)
     }
@@ -769,13 +820,10 @@ mod tests {
         assert!(!outcome.local_only);
         let system = compaction.body["system"].as_array().unwrap();
         let system = system.last().unwrap()["text"].as_str().unwrap();
-        let instructions = compaction.body["messages"].as_array().unwrap().last().unwrap()
-            ["content"][0]["text"]
-            .as_str()
-            .unwrap();
+        let instructions = last_message_text(&compaction.body);
         assert_eq!(
             outcome.prompt_stack_digest,
-            prompt_stack_digest(&[system, instructions]),
+            prompt_stack_digest(&[system, &instructions]),
             "the digest covers the system prompt and instructions that were sent"
         );
         assert!(outcome.excluded_classes.is_empty());

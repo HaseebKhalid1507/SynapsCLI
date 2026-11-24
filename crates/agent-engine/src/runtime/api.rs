@@ -978,10 +978,12 @@ pub struct ApiOptions {
     pub keepwarm: Option<KeepWarmRequest>,
     /// Cache-preserving compaction (task 430). `None` on every other
     /// request. When set (native Anthropic transport only; any other route
-    /// fails closed before a request is built) the request is assembled and
-    /// marked exactly as a turn's — the caller appended the summary
-    /// instructions as the last user message — and differs from a turn only
-    /// off the wire: it is refused before the network when it could not
+    /// fails closed before a request is built) the request is assembled
+    /// exactly as a turn's — the caller appended the summary instructions
+    /// as the last user message — with the message cache marker on the
+    /// last HISTORY message, as a keep-warm ping has it, not on the
+    /// instructions. Otherwise it differs from a turn only off the wire: it
+    /// is sent once (no retry of any class), it is refused before the network when it could not
     /// read what the last accepted request left in the cache
     /// ([`CompactionRequest`]), it never switches accounts at a limit, it
     /// sends no `diagnostics` field, and its telemetry record carries
@@ -1551,6 +1553,23 @@ impl ApiMethods {
             // trailing ping message (never persisted) rides after it as an
             // uncached tail, exactly like a real turn's newest user message.
             Some(_) if cleaned_messages.len() >= 2 => {
+                let history_len = cleaned_messages.len() - 1;
+                HelperMethods::annotate_cache_breakpoint(
+                    &mut cleaned_messages[..history_len],
+                    cache_ttl,
+                );
+                history_len
+            }
+            // Cache-preserving compaction: the same placement, for the same
+            // reason. The instruction message is sent once and its reply
+            // replaces the history, so a marker on it would write a cache
+            // entry (the whole request, at the write price) that nothing
+            // ever reads. On the last history message the lookback finds
+            // the entry the previous request wrote, and only the reply that
+            // followed it is written. (When the history ends with a user
+            // message the instructions merge into it; the marker then walks
+            // back to the last markable block before it.)
+            None if options.compaction.is_some() && cleaned_messages.len() >= 2 => {
                 let history_len = cleaned_messages.len() - 1;
                 HelperMethods::annotate_cache_breakpoint(
                     &mut cleaned_messages[..history_len],

@@ -641,7 +641,8 @@ impl Runtime {
     /// as its new user message (cache-preserving compaction, task 430) and
     /// return the reply's content blocks. Assembled by the same code as a
     /// keep-warm ping, hence as a turn: system, tools, thinking, effort and
-    /// history are the turn's; markers are placed as a turn places them.
+    /// history are the turn's; the message cache marker sits on the last
+    /// history message, as a ping's does.
     /// Refused before the network when the request could not read what
     /// `expect` (the last accepted request) left in the cache: another
     /// cache identity, or a history that does not start with the messages
@@ -687,8 +688,9 @@ impl Runtime {
         if let Some(reason) = self.cache_keepwarm_ineligibility() {
             return Err(RuntimeError::Config(format!("{what} skipped: {reason}")));
         }
-        // A ping's marker moves onto the last history message; a compaction
-        // request is marked like a turn, on its own last message.
+        // The marker of either goes on the last history message. A ping is
+        // worth sending only after a finished reply; a compaction request
+        // takes any history (the marker walks back to a markable block).
         if matches!(purpose, NextTurnRequest::Ping(_)) && !history_ready(history) {
             return Err(RuntimeError::Config(
                 "cache keep-warm skipped: history does not end with a finished assistant reply"
