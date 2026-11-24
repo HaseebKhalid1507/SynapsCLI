@@ -35,7 +35,7 @@ use crate::engine::setup::BackgroundTasks;
 use crate::extensions::invoke_output::{invoke_event_channel, InvokeOutputBudget};
 use crate::extensions::session_driver::{self as protocol, Grant, Reply};
 use crate::runtime::compaction::{
-    apply_compaction, compact_conversation, preview_compaction_disclosure, CompactionPolicy,
+    apply_compaction, compact_conversation, preview_compaction_request, CompactionPolicy,
     CompactionTransition,
 };
 use crate::tools::{SecretPromptHandle, SecretPromptRequest};
@@ -4273,8 +4273,13 @@ impl SessionActor {
             ));
             return;
         }
-        let disclosure =
-            preview_compaction_disclosure(&self.runtime, &self.conv.api_messages).render_line();
+        let disclosure = preview_compaction_request(
+            &self.runtime,
+            &self.conv.api_messages,
+            instructions.as_deref(),
+        )
+        .await
+        .render_line();
         self.emit(SessionEventWire::CompactionStarted {
             source: source.to_string(),
             disclosure,
@@ -4408,7 +4413,13 @@ impl SessionActor {
     async fn compact_inline_inner(&mut self, instructions: Option<String>, source: &str) {
         self.emit(SessionEventWire::SystemNotice(format!(
             "[{}]",
-            preview_compaction_disclosure(&self.runtime, &self.conv.api_messages).render_line()
+            preview_compaction_request(
+                &self.runtime,
+                &self.conv.api_messages,
+                instructions.as_deref(),
+            )
+            .await
+            .render_line()
         )));
         let outcome =
             compact_conversation(&self.conv.api_messages, &self.runtime, instructions.as_deref())

@@ -401,6 +401,14 @@ pub struct CompactionDisclosure {
     /// be used and the chat's own model writes the summary instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
+    /// Set when the summary request is expected to be the chat's own next
+    /// request (`runtime::compaction_cached`), which sends the history as
+    /// the chat sends it, untruncated, instead of the transcript the byte
+    /// figure above describes: about this many tokens, read from the
+    /// provider's prompt cache. The transcript is then what is sent only
+    /// if that request fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_request_tokens: Option<u64>,
 }
 
 impl CompactionDisclosure {
@@ -433,13 +441,25 @@ impl CompactionDisclosure {
                 } else {
                     format!("{}/{}", self.provider, self.model)
                 };
-                let line = format!(
-                    "compaction: sending ~{} KB of conversation ({} messages) to {} — excluded classes: {}",
-                    self.approx_conversation_bytes.div_ceil(1024),
-                    self.message_count,
-                    target,
-                    excluded
-                );
+                let line = match self.chat_request_tokens {
+                    // What is really sent: the whole history, as the chat
+                    // sends it; the transcript only as the fallback.
+                    Some(tokens) => format!(
+                        "compaction: sending the conversation as the chat sends it ({} messages, ~{} tokens, read from cache) to {} — excluded classes: {}; if that fails, a ~{} KB transcript",
+                        self.message_count,
+                        tokens,
+                        target,
+                        excluded,
+                        self.approx_conversation_bytes.div_ceil(1024),
+                    ),
+                    None => format!(
+                        "compaction: sending ~{} KB of conversation ({} messages) to {} — excluded classes: {}",
+                        self.approx_conversation_bytes.div_ceil(1024),
+                        self.message_count,
+                        target,
+                        excluded
+                    ),
+                };
                 match &self.notice {
                     Some(notice) => format!("{line} — {notice}"),
                     None => line,
@@ -456,9 +476,55 @@ pub fn preview_compaction_disclosure(
     runtime: &Runtime,
     api_messages: &[crate::SharedMessage],
 ) -> CompactionDisclosure {
-    use agent_core::compaction::CompactionMode;
     let policy = runtime.compaction_policy();
     let rendered = render_compaction_input(api_messages, None, &policy);
+    disclosure_for(runtime, api_messages, &policy, rendered)
+}
+
+/// [`preview_compaction_disclosure`] for the compaction about to run with
+/// `custom_instructions`, saying what it will really send: when the
+/// summary request will be the chat's own next request (decided exactly as
+/// the dispatch decides it, `compaction_cached::eligibility`, still
+/// without any network operation), the disclosure names that request and
+/// its size; the transcript figure is then the fallback's.
+pub async fn preview_compaction_request(
+    runtime: &Runtime,
+    api_messages: &[crate::SharedMessage],
+    custom_instructions: Option<&str>,
+) -> CompactionDisclosure {
+    use agent_core::compaction::CompactionMode;
+    let policy = runtime.compaction_policy();
+    let rendered = render_compaction_input(api_messages, custom_instructions, &policy);
+    let chat_request_tokens = match policy.mode {
+        CompactionMode::LocalOnly => None,
+        CompactionMode::Remote => {
+            let (model, _notice) = runtime.compact_model_choice();
+            super::compaction_cached::eligibility(
+                runtime,
+                api_messages,
+                &model,
+                &policy,
+                &super::compaction_cached::instructions(&rendered),
+                super::compaction_cached::transcript_tokens(&rendered),
+            )
+            .await
+            .ok()
+            .map(|eligible| eligible.request_tokens)
+        }
+    };
+    CompactionDisclosure {
+        chat_request_tokens,
+        ..disclosure_for(runtime, api_messages, &policy, rendered)
+    }
+}
+
+fn disclosure_for(
+    runtime: &Runtime,
+    api_messages: &[crate::SharedMessage],
+    policy: &DisclosurePolicy,
+    rendered: RenderedCompactionInput,
+) -> CompactionDisclosure {
+    use agent_core::compaction::CompactionMode;
     let (provider, model, notice) = match policy.mode {
         CompactionMode::LocalOnly => ("local".to_string(), LOCAL_SUMMARY_MODEL.to_string(), None),
         CompactionMode::Remote => {
@@ -475,6 +541,7 @@ pub fn preview_compaction_disclosure(
         included_classes: rendered.included_classes,
         excluded_classes: rendered.excluded_classes,
         notice,
+        chat_request_tokens: None,
     }
 }
 
@@ -1941,6 +2008,7 @@ mod disclosure_tests {
             included_classes: Vec::new(),
             excluded_classes: Vec::new(),
             notice: None,
+            chat_request_tokens: None,
         };
         let qualified = disclosure("anthropic/claude-opus-5-5").render_line();
         assert!(
@@ -1956,6 +2024,42 @@ mod disclosure_tests {
             lookalike.contains(" to anthropic/anthropicish-model "),
             "{lookalike}"
         );
+    }
+
+    /// When the chat's own request will carry the summary, the line says
+    /// that (the whole history, its size in tokens, read from cache) and
+    /// names the transcript only as the fallback. Otherwise the line is
+    /// the transcript's, unchanged.
+    #[test]
+    fn disclosure_line_says_which_request_is_sent() {
+        let mut disclosure = CompactionDisclosure {
+            mode: agent_core::compaction::CompactionMode::Remote,
+            provider: "anthropic".into(),
+            model: "claude-opus-5-5".into(),
+            approx_conversation_bytes: 300 * 1024,
+            message_count: 812,
+            included_classes: Vec::new(),
+            excluded_classes: Vec::new(),
+            notice: Some("a notice".into()),
+            chat_request_tokens: None,
+        };
+        assert_eq!(
+            disclosure.render_line(),
+            "compaction: sending ~300 KB of conversation (812 messages) to \
+             anthropic/claude-opus-5-5 — excluded classes: none — a notice"
+        );
+        disclosure.chat_request_tokens = Some(401_234);
+        assert_eq!(
+            disclosure.render_line(),
+            "compaction: sending the conversation as the chat sends it (812 messages, \
+             ~401234 tokens, read from cache) to anthropic/claude-opus-5-5 — excluded classes: \
+             none; if that fails, a ~300 KB transcript — a notice"
+        );
+        let wire = serde_json::to_value(&disclosure).unwrap();
+        assert_eq!(wire["chat_request_tokens"], 401_234);
+        disclosure.chat_request_tokens = None;
+        let wire = serde_json::to_value(&disclosure).unwrap();
+        assert!(wire.get("chat_request_tokens").is_none(), "{wire}");
     }
 
     /// `/compact` and auto-compaction summarize with the model

@@ -215,9 +215,19 @@ pub fn transcript_tokens(rendered: &RenderedCompactionInput) -> u64 {
         + conservative_token_estimate(super::compaction::COMPACTION_SYSTEM_PROMPT)
 }
 
-/// What the request must be able to read (the cached prefix of the last
-/// accepted request), when every condition of the module docs holds; else
-/// the first one that does not. Decided locally: nothing is sent.
+/// A compaction that can go out as the chat's own next request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eligible {
+    /// What the request must be able to read: the cached prefix of the
+    /// last accepted request.
+    pub expect: CachedPrefix,
+    /// About how many tokens the request sends (history and instructions;
+    /// the provider's own count of the last request plus an estimate of
+    /// what was added, when the runtime has one).
+    pub request_tokens: u64,
+}
+
+/// [`eligibility`], as the cached prefix the request must be able to read.
 pub async fn cached_path(
     runtime: &Runtime,
     history: &[SharedMessage],
@@ -226,6 +236,23 @@ pub async fn cached_path(
     instructions: &str,
     transcript_tokens: u64,
 ) -> Result<CachedPrefix, Skip> {
+    eligibility(runtime, history, model, policy, instructions, transcript_tokens)
+        .await
+        .map(|eligible| eligible.expect)
+}
+
+/// Whether every condition of the module docs holds; else the first one
+/// that does not. Decided locally: nothing is sent. The pre-compaction
+/// disclosure line asks the same question
+/// (`compaction::preview_compaction_request`).
+pub async fn eligibility(
+    runtime: &Runtime,
+    history: &[SharedMessage],
+    model: &str,
+    policy: &DisclosurePolicy,
+    instructions: &str,
+    transcript_tokens: u64,
+) -> Result<Eligible, Skip> {
     use agent_core::compaction::CompactionMode;
     if policy.mode != CompactionMode::Remote {
         return Err(Skip::LocalOnly);
@@ -291,7 +318,10 @@ pub async fn cached_path(
     if !prefix.leads(history) {
         return Err(Skip::HistoryChanged);
     }
-    Ok(prefix)
+    Ok(Eligible {
+        expect: prefix,
+        request_tokens: assessment.used_tokens(),
+    })
 }
 
 /// Whether any assistant message of `history` holds a thinking block.
@@ -1307,6 +1337,46 @@ mod tests {
         );
         let outcome = compact_conversation(&resumed, &rt, None).await.unwrap();
         assert_only_the_transcript_request(&mock.seen().split_off(1), &outcome);
+    }
+
+    /// The pre-compaction disclosure says what will be sent: the whole
+    /// history through the chat's own request when that is the path, with
+    /// the transcript named as the fallback; the transcript's own line,
+    /// unchanged, when it is not. Asking sends nothing.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn the_disclosure_names_the_request_that_will_be_sent() {
+        use crate::runtime::compaction::{preview_compaction_disclosure, preview_compaction_request};
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock(vec![Stream::Blocks(vec![text("hi")])]).await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = opus();
+        let history = warm_chat(&rt).await;
+
+        let warm = preview_compaction_request(&rt, &history, Some("FOCUS")).await;
+        let tokens = warm.chat_request_tokens.expect("the chat request will carry it");
+        assert!(tokens > 0);
+        let line = warm.render_line();
+        let said = format!(
+            "compaction: sending the conversation as the chat sends it ({} messages, ~{tokens} \
+             tokens, read from cache) to anthropic/claude-opus-4-7 — excluded classes: none; if \
+             that fails, a ~1 KB transcript",
+            history.len()
+        );
+        assert_eq!(line, said);
+
+        // Another history under the same warm runtime: the transcript.
+        let mut resumed = history.clone();
+        resumed[0] = user("the first message of another session");
+        let cold = preview_compaction_request(&rt, &resumed, None).await;
+        assert_eq!(cold, preview_compaction_disclosure(&rt, &resumed));
+        assert_eq!(cold.chat_request_tokens, None);
+        assert!(
+            cold.render_line().starts_with("compaction: sending ~1 KB of conversation ("),
+            "{}",
+            cold.render_line()
+        );
+        assert_eq!(mock.seen().len(), 1, "only the warm-up turn reached the provider");
     }
 
     /// The warm/cold boundary: the lifetime counts from the anchor, and its

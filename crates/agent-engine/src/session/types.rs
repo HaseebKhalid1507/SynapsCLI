@@ -1542,7 +1542,7 @@ pub enum SessionEventWire {
     Aborted { context_saved: bool },
     /// `/clear`. TUI: transcript.clear, counters=0, "new session started".
     Cleared { session_id: String },
-    /// (B2) `disclosure` = preview_compaction_disclosure().render_line().
+    /// (B2) `disclosure` = preview_compaction_request().render_line().
     CompactionStarted { source: String, disclosure: String },
     CompactionApplied {
         previous_session_id: String,
