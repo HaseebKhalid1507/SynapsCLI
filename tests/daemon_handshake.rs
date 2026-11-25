@@ -124,6 +124,8 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
             }
             queries.push(daemon::control_queries::FEATURE_THINKING_OPTIONS);
             let mut w = w;
+            // The prompt layer's feature is pushed last of all.
+            assert_eq!(w.features.pop().as_deref(), Some(FEATURE_EPHEMERAL_LAYER));
             let others = w.features.len().saturating_sub(queries.len());
             assert_eq!(w.features.split_off(others), queries, "the control queries, after every other feature");
             assert_eq!(

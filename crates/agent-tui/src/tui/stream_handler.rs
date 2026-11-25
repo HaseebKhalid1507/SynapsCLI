@@ -483,6 +483,7 @@ pub(super) async fn handle_session_event_arm(
     }
     app.flush_reveal();
     match env.event {
+        SessionEventWire::EphemeralLayerChanged { .. } => {},
         SessionEventWire::Stream(ev) => {
             let do_draw = needs_immediate_draw(&ev);
             let view = std::sync::Arc::clone(link.view());

@@ -165,6 +165,7 @@ pub(crate) async fn run_setup(
     .await?;
     let handle = host
         .create_session(SessionConfig {
+            ephemeral_layer_wait_ms: None,
             continue_session,
             system,
             prompt_manifest,

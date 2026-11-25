@@ -30,6 +30,7 @@ mod http_phases;
 mod image_limits;
 mod image_retention;
 pub mod keepwarm;
+pub mod ephemeral;
 pub mod tool_keepwarm;
 /// The cache-simulating provider of the tool-round keep-warm tests
 /// (`runtime::stream`, `tools::subagent`; host paths:
@@ -515,6 +516,7 @@ pub struct Runtime {
     model: String,
     tools: Arc<RwLock<ToolRegistry>>,
     system_prompt: Option<String>,
+    pub(crate) ephemeral_layer: ephemeral::Layer,
     /// Compiled, content-safe effective prompt metadata retained for inspection/reload.
     effective_prompt: Option<agent_core::prompt::PromptStack>,
     prompt_generation: u64,
@@ -968,6 +970,7 @@ impl Runtime {
             model: crate::models::default_model().to_string(),
             tools: host.tools,
             system_prompt: None,
+            ephemeral_layer: ephemeral::Layer::default(),
             effective_prompt: None,
             prompt_generation: 0,
             prompt_reload_source: None,
@@ -3355,6 +3358,7 @@ impl Runtime {
 
         let session = crate::runtime::stream::StreamSession {
             memory_backend: self.memory_backend.clone(),
+            ephemeral_layer: self.ephemeral_layer.clone(),
             turn_completion: completion,
             context_window: self.context_window(),
             continuation: self.continuation.clone(),
@@ -3447,6 +3451,7 @@ impl Clone for Runtime {
             model: self.model.clone(),
             tools: self.tools.clone(),
             system_prompt: self.system_prompt.clone(),
+            ephemeral_layer: ephemeral::Layer::default(),
             effective_prompt: self.effective_prompt.clone(),
             prompt_generation: self.prompt_generation,
             prompt_reload_source: self.prompt_reload_source.clone(),

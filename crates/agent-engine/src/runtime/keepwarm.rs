@@ -437,6 +437,9 @@ impl Runtime {
     /// Only the native Anthropic transport carries `cache_control`; every
     /// TTL (5m, 1h, hybrid) and every thinking mode is supported.
     pub fn cache_keepwarm_ineligibility(&self) -> Option<String> {
+        if self.ephemeral_layer.opted_in() {
+            return Some("request-only prompt layer: background cache warming is unavailable".into());
+        }
         if !super::auth::model_is_anthropic(&self.model) {
             return Some(format!(
                 "model {} is not on the native Anthropic transport",

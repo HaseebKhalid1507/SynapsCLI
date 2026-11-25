@@ -41,6 +41,7 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         | C::Cancel
         | C::Answer { .. }
         | C::Set { .. }
+        | C::EphemeralLayer { .. }
         | C::Compact { .. }
         | C::NewSession
         | C::Save
@@ -251,6 +252,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         boot_id: state.boot_id.clone(),
     };
     welcome.features.extend(super::control_queries::daemon_features());
+    welcome.features.push(FEATURE_EPHEMERAL_LAYER.to_string());
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
     }

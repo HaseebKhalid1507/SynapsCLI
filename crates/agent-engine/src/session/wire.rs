@@ -803,17 +803,25 @@ pub struct ChildListReply {
 /// `Hello.accepted_events`: one name per kind, no groups. Every other event
 /// goes to every attached client as before, so an old client (which shows
 /// an unknown event as "unknown event from a newer daemon") never sees one.
-pub const OPTIONAL_EVENTS: &[&str] = &[EVENT_TOOL_CHILD, EVENT_TOOL_CHILD_ENDED];
+pub const OPTIONAL_EVENTS: &[&str] =
+    &[EVENT_TOOL_CHILD, EVENT_TOOL_CHILD_ENDED, EVENT_EPHEMERAL_LAYER_CHANGED];
 
 /// A tool spawned a child process.
 pub const EVENT_TOOL_CHILD: &str = "tool_child";
 /// A tool's spawned child was reaped.
 pub const EVENT_TOOL_CHILD_ENDED: &str = "tool_child_ended";
+/// The request-only prompt layer's status changed (`runtime::ephemeral`).
+pub const EVENT_EPHEMERAL_LAYER_CHANGED: &str = "ephemeral_layer_changed";
+/// `Welcome.features` entry: this daemon takes `SessionCommand::EphemeralLayer`,
+/// `SessionQuery::EphemeralLayer`, `SessionConfig.ephemeral_layer_wait_ms` and
+/// sends `ephemeral_layer_changed` to connections that accept it.
+pub const FEATURE_EPHEMERAL_LAYER: &str = "ephemeral_layer_v1";
 
 /// The opt-in name of an optional event kind; `None` = always sent.
 pub fn optional_event_name(event: &SessionEventWire) -> Option<&'static str> {
     use super::child_events::ChildProcessEvent;
     match event {
+        SessionEventWire::EphemeralLayerChanged { .. } => Some(EVENT_EPHEMERAL_LAYER_CHANGED),
         SessionEventWire::ChildProcess(ChildProcessEvent::Spawned(_)) => Some(EVENT_TOOL_CHILD),
         SessionEventWire::ChildProcess(ChildProcessEvent::Ended { .. }) => Some(EVENT_TOOL_CHILD_ENDED),
         _ => None,
@@ -1037,6 +1045,7 @@ impl ConversationDigest {
 #[serde(tag = "ev", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)] // mirrors SessionEventWire by design
 pub enum WireSessionEvent {
+    EphemeralLayerChanged { status: crate::runtime::ephemeral::Status },
     Stream { event: WireStreamEvent },
     TurnStarted {
         turn_baseline: usize,
@@ -1394,6 +1403,7 @@ impl From<SessionEventWire> for WireSessionEvent {
     fn from(e: SessionEventWire) -> Self {
         use SessionEventWire as S;
         match e {
+            S::EphemeralLayerChanged { status } => Self::EphemeralLayerChanged { status },
             S::Stream(ev) => Self::Stream { event: ev.into() },
             S::TurnStarted { turn_baseline, trigger, user_text } => {
                 Self::TurnStarted { turn_baseline, trigger, user_text }
@@ -1487,6 +1497,7 @@ impl From<WireSessionEvent> for SessionEventWire {
             W::ExtensionNotification { extension_id, method, params } => {
                 Self::ExtensionNotification { extension_id, method, params }
             }
+            W::EphemeralLayerChanged { status } => Self::EphemeralLayerChanged { status },
             W::SettingChanged { applied } => Self::SettingChanged(applied),
             W::QueryResult { id, value } => Self::QueryResult { id, value },
             W::Attached { snapshot, .. } => {
@@ -3004,7 +3015,7 @@ mod tests {
             exit_code: None,
             signal: Some(9),
         });
-        assert_eq!(OPTIONAL_EVENTS, &["tool_child", "tool_child_ended"]);
+        assert_eq!(OPTIONAL_EVENTS, &["tool_child", "tool_child_ended", "ephemeral_layer_changed"]);
         assert_eq!(optional_event_name(&spawned), Some("tool_child"));
         assert_eq!(optional_event_name(&ended), Some("tool_child_ended"));
         assert_eq!(optional_event_name(&SessionEventWire::Idle), None);
