@@ -742,8 +742,8 @@ first's turns (last-writer-wins).
 ## Protocol summary (line-JSON over UDS or a Windows named pipe, `DAEMON_MAX_FRAME_BYTES` = 64 MiB, same framing as `synaps rpc`)
 
 ```
-C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version, accepted_events?}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page","children","thinking_options"], boot_id?, accepted_events?}
+C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page"], boot_id?}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
@@ -760,7 +760,8 @@ C: bye | socket close = Detach (turn keeps running)
 ```
 
 - Optional frames: `welcome.features` names the control frames this daemon answers (`children` on Linux,
-  `thinking_options`); check it before sending one. An older daemon answers one with `error` ("malformed
+  `thinking_options`, listed after the features above); check it before sending one. `hello` may carry
+  `accepted_events?` and `welcome` then carries `accepted_events?` (below). An older daemon answers one with `error` ("malformed
   frame: unknown variant …") and keeps the connection. The events `tool_child` / `tool_child_ended` go only
   to a connection whose `hello.accepted_events` names them; `welcome.accepted_events` echoes the ones it sends.
 - Version policy: exact match on `protocol_version` (min == max == 3) → `Refused{Version}` **loudly**

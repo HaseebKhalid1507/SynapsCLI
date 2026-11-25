@@ -1252,6 +1252,7 @@ mod tests {
                         break;
                     }
                     DaemonFrame::Welcome(Welcome {
+                        accepted_events: vec![],
                         protocol_version,
                         daemon_version: "t".into(),
                         pid: 1,
@@ -1262,7 +1263,6 @@ mod tests {
                         daemon_build: String::new(),
                         features: Vec::new(),
                         boot_id: String::new(),
-                        accepted_events: vec![],
                     })
                 }
                 ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
@@ -1620,6 +1620,7 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).await.unwrap();
             let welcome = DaemonFrame::Welcome(Welcome {
+                accepted_events: vec![],
                 protocol_version: PROTOCOL_VERSION,
                 daemon_version: "t".into(),
                 pid: 1,
@@ -1630,7 +1631,6 @@ mod tests {
                 daemon_build: String::new(),
                 features: Vec::new(),
                 boot_id: String::new(),
-                accepted_events: vec![],
             });
             w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
             line.clear();
@@ -1662,6 +1662,7 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).await.unwrap();
             let welcome = DaemonFrame::Welcome(Welcome {
+                accepted_events: vec![],
                 protocol_version: PROTOCOL_VERSION,
                 daemon_version: "t".into(),
                 pid: 1,
@@ -1672,7 +1673,6 @@ mod tests {
                 daemon_build: String::new(),
                 features: Vec::new(),
                 boot_id: String::new(),
-                accepted_events: vec![],
             });
             w.write_all(encode_line(&welcome).unwrap().as_bytes())
                 .await
@@ -1704,6 +1704,7 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let welcome = DaemonFrame::Welcome(Welcome {
+            accepted_events: vec![],
             protocol_version: PROTOCOL_VERSION,
             daemon_version: "0.0.1-old".into(),
             pid: 1,
@@ -1714,7 +1715,6 @@ mod tests {
             daemon_build: String::new(),
             features,
             boot_id: String::new(),
-            accepted_events: vec![],
         });
         w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
         let mut sent = Vec::new();

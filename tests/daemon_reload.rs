@@ -983,6 +983,12 @@ async fn children_of(paths: &registry::DaemonPaths, sid: &SessionId) -> ChildLis
     }
 }
 
+/// A plain text `submit`, built from its wire form.
+#[cfg(feature = "command-exec")]
+fn submit(text: &str) -> SessionCommand {
+    serde_json::from_value(serde_json::json!({"cmd": "submit", "text": text})).unwrap()
+}
+
 /// Across a reload: the child ledger is carried in the reload state,
 /// `features` is on the new image's Welcome, and each connection's optional
 /// events come from its own (new) Hello, never from state kept across the
@@ -1018,7 +1024,7 @@ async fn reload_carries_the_child_ledger_and_takes_the_opt_in_from_each_new_hell
     assert!(features(&t.welcome), "{:?}", t.welcome.features);
     assert_eq!(t.welcome.accepted_events, ["tool_child_ended"]);
     let sid = t.session_id().clone();
-    t.send_from_self(SessionCommand::Submit { text: "run".into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(submit("run")).await.unwrap();
     assert_eq!(child_events(&until_idle(&mut t).await, "toolu_r1"), [("tool_child_ended", Some(6))], "only what it asked for");
     let before = children_of(&d.paths, &sid).await;
     let carried = before.sessions[0].children.iter().find(|c| c.tool_id == "toolu_r1").expect("recorded").clone();
@@ -1046,7 +1052,7 @@ async fn reload_carries_the_child_ledger_and_takes_the_opt_in_from_each_new_hell
         let (c, _) = SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await.unwrap();
         joined.push(c);
     }
-    t.send_from_self(SessionCommand::Submit { text: "again".into(), attachments: vec![] }).await.unwrap();
+    t.send_from_self(submit("again")).await.unwrap();
     assert_eq!(child_events(&until_idle(&mut t).await, "toolu_r2"), [("tool_child_ended", Some(7))]);
     assert!(child_events(&until_idle(&mut joined[0]).await, "toolu_r2").is_empty(), "asked for none");
     assert_eq!(

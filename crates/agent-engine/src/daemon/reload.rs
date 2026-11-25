@@ -172,6 +172,10 @@ pub struct ReloadSession {
 /// `registry_dir()/daemon[-P].reload.json` body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReloadState {
+    /// The spawned-child ledger (`session::children`), within its caps. An
+    /// older image ignores the field; a state without it restores none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<crate::session::children::ChildRecord>,
     pub generation: u64,
     pub written_at: chrono::DateTime<chrono::Utc>,
     pub sessions: Vec<ReloadSession>,
@@ -186,10 +190,6 @@ pub struct ReloadState {
     /// (the next image mints one).
     #[serde(default)]
     pub boot_id: String,
-    /// The spawned-child ledger (`session::children`), within its caps. An
-    /// older image ignores the field; a state without it restores none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub children: Vec<crate::session::children::ChildRecord>,
 }
 
 impl ReloadState {
@@ -508,6 +508,7 @@ pub async fn prepare(
 
     // 3. reload-state (0600, atomic).
     let rs = ReloadState {
+        children: crate::session::children::snapshot_for_reload(),
         generation,
         written_at: chrono::Utc::now(),
         sessions,
@@ -515,7 +516,6 @@ pub async fn prepare(
         // After every checkpoint: no session can launch a worker any more.
         next_subagent_id: crate::tools::peek_next_subagent_id(),
         boot_id: state.boot_id.clone(),
-        children: crate::session::children::snapshot_for_reload(),
     };
     let rs_path = reload_state_path(paths);
     // If either write fails we early-return WITHOUT reaching exec() (which is the
@@ -1247,13 +1247,13 @@ mod tests {
             created_at: None,
         };
         let mut rs = ReloadState {
+            children: Vec::new(),
             generation: 10,
             written_at: chrono::Utc::now(),
             sessions: vec![session(vec![worker("sa_288"), worker("sa_286")]), session(vec![])],
             expected_clients: 0,
             next_subagent_id: 0,
             boot_id: String::new(),
-            children: Vec::new(),
         };
         assert_eq!(rs.subagent_id_floor(), 289);
         rs.next_subagent_id = 300;
@@ -1639,15 +1639,16 @@ mod tests {
             exit_code: Some(0),
             signal: None,
         };
-        let new = ReloadState {
-            generation: 3,
-            written_at: chrono::Utc::now(),
-            sessions: Vec::new(),
-            expected_clients: 1,
-            next_subagent_id: 9,
-            boot_id: String::new(),
-            children: vec![record.clone()],
-        };
+        // Built through serde so the test stays valid as fields are added.
+        let mut new: ReloadState = serde_json::from_value(serde_json::json!({
+            "generation": 3,
+            "written_at": chrono::Utc::now(),
+            "sessions": [],
+            "expected_clients": 1,
+            "next_subagent_id": 9,
+        }))
+        .unwrap();
+        new.children = vec![record.clone()];
         let body = serde_json::to_string(&new).unwrap();
         assert!(body.contains("\"children\""), "{body}");
         let back: ReloadState = serde_json::from_str(&body).unwrap();

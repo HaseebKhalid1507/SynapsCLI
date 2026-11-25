@@ -1166,6 +1166,7 @@ mod state_tests {
                     "{hello}"
                 );
                 let welcome = DaemonFrame::Welcome(Welcome {
+                    accepted_events: vec![],
                     protocol_version: PROTOCOL_VERSION,
                     daemon_version: "0.10.1".into(),
                     pid: 1,
@@ -1176,7 +1177,6 @@ mod state_tests {
                     daemon_build: "oldbld1".into(),
                     features: Vec::new(),
                     boot_id: String::new(),
-                    accepted_events: vec![],
                 });
                 w.write_all(encode_line(&welcome).unwrap().as_bytes())
                     .await

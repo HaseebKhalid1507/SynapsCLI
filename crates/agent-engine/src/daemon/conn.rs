@@ -22,50 +22,6 @@ use crate::{SessionEvent, StreamEvent};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How many distinct differing client versions one daemon image notes at
-/// info; later ones (and repeats) go to debug.
-const CLIENT_VERSION_NOTES_MAX: usize = 32;
-
-/// Client versions this daemon image has already noted at info. A reload
-/// execs a fresh image, which starts empty. Kept as hashes, so the memory
-/// is bounded whatever a client sends.
-static CLIENT_VERSION_NOTES: std::sync::Mutex<ClientVersionNotes> =
-    std::sync::Mutex::new(ClientVersionNotes { seen: Vec::new() });
-
-struct ClientVersionNotes {
-    seen: Vec<u64>,
-}
-
-impl ClientVersionNotes {
-    /// True the first time `client` is seen, while the set has room.
-    fn first_sight(&mut self, client: &str) -> bool {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        client.hash(&mut hasher);
-        let key = hasher.finish();
-        if self.seen.contains(&key) || self.seen.len() >= CLIENT_VERSION_NOTES_MAX {
-            return false;
-        }
-        self.seen.push(key);
-        true
-    }
-}
-
-/// A client on the same protocol but another binary version is allowed.
-/// Say so once per distinct version (clients may reconnect many times a
-/// minute), then at debug.
-fn note_client_version(notes: &std::sync::Mutex<ClientVersionNotes>, client: &str, daemon: &str) {
-    if client == daemon {
-        return;
-    }
-    let first = notes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).first_sight(client);
-    if first {
-        tracing::info!(client = %client, daemon = %daemon, "daemon: client binary version differs (same protocol; allowed)");
-    } else {
-        tracing::debug!(client = %client, daemon = %daemon, "daemon: client binary version differs (same protocol; allowed)");
-    }
-}
-
 type Reader = BufReader<ServerReadHalf>;
 
 /// Which `SessionCommand`s a socket client may originate (§4 MED). The UDS
@@ -281,7 +237,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     // Per connection, from this Hello only (a reconnect after a reload
     // brings its own).
     let accepted = AcceptedEvents::negotiate(&hello.accepted_events);
-    let welcome = Welcome {
+    let mut welcome = Welcome {
+        accepted_events: accepted.names(),
         protocol_version: PROTOCOL_VERSION,
         daemon_version,
         pid: std::process::id(),
@@ -292,8 +249,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         daemon_build: crate::session::wire::build_id().to_string(),
         features: crate::session::wire::daemon_features(),
         boot_id: state.boot_id.clone(),
-        accepted_events: accepted.names(),
     };
+    welcome.features.extend(super::control_queries::daemon_features());
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
     }
@@ -1035,6 +992,50 @@ fn as_owner(client: ClientId, mut snapshot: AttachSnapshot) -> AttachSnapshot {
     }
     snapshot.replay.retain(|env| !matches!(env.event, SessionEventWire::InputOwnerChanged { .. }));
     snapshot
+}
+
+/// How many distinct differing client versions one daemon image notes at
+/// info; later ones (and repeats) go to debug.
+const CLIENT_VERSION_NOTES_MAX: usize = 32;
+
+/// Client versions this daemon image has already noted at info. A reload
+/// execs a fresh image, which starts empty. Kept as hashes, so the memory
+/// is bounded whatever a client sends.
+static CLIENT_VERSION_NOTES: std::sync::Mutex<ClientVersionNotes> =
+    std::sync::Mutex::new(ClientVersionNotes { seen: Vec::new() });
+
+struct ClientVersionNotes {
+    seen: Vec<u64>,
+}
+
+impl ClientVersionNotes {
+    /// True the first time `client` is seen, while the set has room.
+    fn first_sight(&mut self, client: &str) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        client.hash(&mut hasher);
+        let key = hasher.finish();
+        if self.seen.contains(&key) || self.seen.len() >= CLIENT_VERSION_NOTES_MAX {
+            return false;
+        }
+        self.seen.push(key);
+        true
+    }
+}
+
+/// A client on the same protocol but another binary version is allowed.
+/// Say so once per distinct version (clients may reconnect many times a
+/// minute), then at debug.
+fn note_client_version(notes: &std::sync::Mutex<ClientVersionNotes>, client: &str, daemon: &str) {
+    if client == daemon {
+        return;
+    }
+    let first = notes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).first_sight(client);
+    if first {
+        tracing::info!(client = %client, daemon = %daemon, "daemon: client binary version differs (same protocol; allowed)");
+    } else {
+        tracing::debug!(client = %client, daemon = %daemon, "daemon: client binary version differs (same protocol; allowed)");
+    }
 }
 
 /// `thinking_options`: no model = what a new session gets (config as of the

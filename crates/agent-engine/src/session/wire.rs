@@ -89,13 +89,11 @@ pub struct CatalogCursor {
 
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
-    let mut features = vec![
+    vec![
         FEATURE_OWNED_SESSIONS.to_string(),
         FEATURE_SESSION_WORKERS.to_string(),
         FEATURE_SESSION_PAGE.to_string(),
-    ];
-    features.extend(crate::daemon::control_queries::daemon_features());
-    features
+    ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
@@ -243,25 +241,6 @@ pub enum ClientFrame {
     ReloadExtension {
         extension: String,
     },
-    /// Control fast path (no session): one page of the SAVED sessions, the
-    /// conversations on disk this daemon does not hold, one row per
-    /// conversation (a compacted chain is its head), newest `updated_at`
-    /// first. Reply: `DaemonFrame::CatalogPage` with the same `req`. Rows
-    /// are `SessionMeta` with `lifecycle: saved`; resume one with
-    /// `Attach::Create{config.continue_session: Some(Some(journal_id))}`.
-    /// `before` (exclusive) continues from a reply's `next`; `limit` is 50
-    /// when absent, at most 200. Gated on [`FEATURE_SESSION_PAGE`]. Not
-    /// accepted on an attached connection.
-    CatalogPage {
-        #[serde(default)]
-        req: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        before: Option<CatalogCursor>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        named_only: bool,
-    },
     /// Control query (no session, also on an attached connection): the
     /// daemon's child-process ledger. Reply: `ChildList`. Feature "children".
     Children {
@@ -293,6 +272,25 @@ pub enum ClientFrame {
         /// id with no live row (the reply then comes from a task).
         #[serde(default)]
         warm: bool,
+    },
+    /// Control fast path (no session): one page of the SAVED sessions, the
+    /// conversations on disk this daemon does not hold, one row per
+    /// conversation (a compacted chain is its head), newest `updated_at`
+    /// first. Reply: `DaemonFrame::CatalogPage` with the same `req`. Rows
+    /// are `SessionMeta` with `lifecycle: saved`; resume one with
+    /// `Attach::Create{config.continue_session: Some(Some(journal_id))}`.
+    /// `before` (exclusive) continues from a reply's `next`; `limit` is 50
+    /// when absent, at most 200. Gated on [`FEATURE_SESSION_PAGE`]. Not
+    /// accepted on an attached connection.
+    CatalogPage {
+        #[serde(default)]
+        req: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<CatalogCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        named_only: bool,
     },
     Bye,
 }
@@ -339,13 +337,6 @@ impl std::fmt::Debug for ClientFrame {
                 .debug_struct("ReloadExtension")
                 .field("extension", extension)
                 .finish(),
-            Self::CatalogPage { req, before, limit, named_only } => f
-                .debug_struct("CatalogPage")
-                .field("req", req)
-                .field("before", before)
-                .field("limit", limit)
-                .field("named_only", named_only)
-                .finish(),
             Self::Children { id, session_id, sid, members } => f
                 .debug_struct("Children")
                 .field("id", id)
@@ -358,6 +349,13 @@ impl std::fmt::Debug for ClientFrame {
                 .field("id", id)
                 .field("model", model)
                 .field("warm", warm)
+                .finish(),
+            Self::CatalogPage { req, before, limit, named_only } => f
+                .debug_struct("CatalogPage")
+                .field("req", req)
+                .field("before", before)
+                .field("limit", limit)
+                .field("named_only", named_only)
                 .finish(),
             Self::Bye => f.write_str("Bye"),
         }
@@ -442,16 +440,6 @@ impl Hello {
         self
     }
 
-    /// Opt in to optional event kinds by name (see [`OPTIONAL_EVENTS`]).
-    pub fn with_accepted_events<I, S>(mut self, names: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.accepted_events = names.into_iter().map(Into::into).collect();
-        self
-    }
-
     /// Ask for `Full` (mirror) or `Digest` (digest + display tail) history.
     pub fn with_history(mut self, history: HistoryMode) -> Self {
         self.client.history = history;
@@ -461,6 +449,16 @@ impl Hello {
     /// Display items wanted in `Attached.display_tail` / `DisplayTail` queries.
     pub fn with_tail_items(mut self, tail_items: usize) -> Self {
         self.client.tail_items = tail_items;
+        self
+    }
+
+    /// Opt in to optional event kinds by name (see [`OPTIONAL_EVENTS`]).
+    pub fn with_accepted_events<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.accepted_events = names.into_iter().map(Into::into).collect();
         self
     }
 }
@@ -590,6 +588,18 @@ pub enum DaemonFrame {
         #[serde(default)]
         reason: Option<ByeReason>,
     },
+    /// Answer to `Children`. Only sent on request, so an old client (whose
+    /// `DaemonFrame` has no catch-all) never receives one.
+    ChildList(ChildListReply),
+    /// Answer to `ThinkingOptions`. Only sent on request.
+    ThinkingOptionsResult {
+        #[serde(default)]
+        id: Option<u64>,
+        /// The id asked about (the resolved one when the query had none).
+        model: String,
+        /// `None` for a malformed id.
+        options: Option<ThinkingOptionsWire>,
+    },
     /// Reply to `ClientFrame::AuthState`. Labels, kinds and times only:
     /// never token material, emails, account ids or identity hashes.
     AuthState {
@@ -612,56 +622,6 @@ pub enum DaemonFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    /// Answer to `Children`. Only sent on request, so an old client (whose
-    /// `DaemonFrame` has no catch-all) never receives one.
-    ChildList(ChildListReply),
-    /// Answer to `ThinkingOptions`. Only sent on request.
-    ThinkingOptionsResult {
-        #[serde(default)]
-        id: Option<u64>,
-        /// The id asked about (the resolved one when the query had none).
-        model: String,
-        /// `None` for a malformed id.
-        options: Option<ThinkingOptionsWire>,
-    },
-}
-
-/// The levels a model offers, with the evidence behind them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThinkingOptionsWire {
-    /// Canonical level names, in the order the settings UI shows them.
-    pub levels: Vec<String>,
-    /// True when an exact row decided (`basis` live or static).
-    pub exact: bool,
-    pub basis: crate::runtime::openai::catalog::validation::OptionsBasis,
-    /// The level a model switch applies when none was chosen, if any.
-    #[serde(default)]
-    pub default_level: Option<String>,
-}
-
-/// The `child_list` reply: the ledger view plus what a client needs to
-/// compare identities (`boot_id`) and display start times (`clk_tck`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChildListReply {
-    #[serde(default)]
-    pub id: Option<u64>,
-    /// False off Linux (or without a boot id): no records are kept.
-    pub supported: bool,
-    #[serde(default)]
-    pub boot_id: Option<String>,
-    pub clk_tck: u64,
-    #[serde(default)]
-    pub sessions: Vec<super::children::SessionChildren>,
-    #[serde(default)]
-    pub host: Vec<super::children::HostChild>,
-    /// Records refused at a cap since this daemon image started (live spawns
-    /// and records carried across a reload).
-    #[serde(default)]
-    pub refused_records: u64,
-    /// At reply time the total cap is reached with no ended record left to
-    /// evict: the next spawn's record will be refused.
-    #[serde(default)]
-    pub ledger_full: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -763,6 +723,11 @@ pub enum RefuseReason {
 /// Auth-status *summary* only — never key material.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Welcome {
+    /// The optional events this daemon will send on this connection: the
+    /// known subset of `Hello.accepted_events`, in [`OPTIONAL_EVENTS`] order.
+    /// Omitted when empty (and by old daemons).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_events: Vec<String>,
     pub protocol_version: u32,
     pub daemon_version: String,
     pub pid: u32,
@@ -787,11 +752,6 @@ pub struct Welcome {
     /// from an older daemon.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub boot_id: String,
-    /// The optional events this daemon will send on this connection: the
-    /// known subset of `Hello.accepted_events`, in [`OPTIONAL_EVENTS`] order.
-    /// Omitted when empty (and by old daemons).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub accepted_events: Vec<String>,
 }
 
 impl Welcome {
@@ -799,6 +759,44 @@ impl Welcome {
     pub fn supports(&self, feature: &str) -> bool {
         self.features.iter().any(|f| f == feature)
     }
+}
+
+/// The levels a model offers, with the evidence behind them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingOptionsWire {
+    /// Canonical level names, in the order the settings UI shows them.
+    pub levels: Vec<String>,
+    /// True when an exact row decided (`basis` live or static).
+    pub exact: bool,
+    pub basis: crate::runtime::openai::catalog::validation::OptionsBasis,
+    /// The level a model switch applies when none was chosen, if any.
+    #[serde(default)]
+    pub default_level: Option<String>,
+}
+
+/// The `child_list` reply: the ledger view plus what a client needs to
+/// compare identities (`boot_id`) and display start times (`clk_tck`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildListReply {
+    #[serde(default)]
+    pub id: Option<u64>,
+    /// False off Linux (or without a boot id): no records are kept.
+    pub supported: bool,
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    pub clk_tck: u64,
+    #[serde(default)]
+    pub sessions: Vec<super::children::SessionChildren>,
+    #[serde(default)]
+    pub host: Vec<super::children::HostChild>,
+    /// Records refused at a cap since this daemon image started (live spawns
+    /// and records carried across a reload).
+    #[serde(default)]
+    pub refused_records: u64,
+    /// At reply time the total cap is reached with no ended record left to
+    /// evict: the next spawn's record will be refused.
+    #[serde(default)]
+    pub ledger_full: bool,
 }
 
 /// Event kinds sent only to connections that name them in
@@ -2373,6 +2371,7 @@ mod tests {
         }
         let frames = vec![
             DaemonFrame::Welcome(Welcome {
+                accepted_events: vec![],
                 protocol_version: PROTOCOL_VERSION,
                 daemon_version: "0.9.0".into(),
                 pid: 1,
@@ -2383,7 +2382,6 @@ mod tests {
                 daemon_build: "abc1234".into(),
                 features: vec!["children".into()],
                 boot_id: String::new(),
-                accepted_events: vec![],
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
             DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
@@ -2665,6 +2663,7 @@ mod tests {
     #[test]
     fn welcome_boot_id_is_additive() {
         let mut w = Welcome {
+            accepted_events: vec![],
             protocol_version: PROTOCOL_VERSION,
             daemon_version: "v".into(),
             pid: 1,
@@ -2675,7 +2674,6 @@ mod tests {
             daemon_build: String::new(),
             features: daemon_features(),
             boot_id: String::new(),
-            accepted_events: vec![],
         };
         assert!(!serde_json::to_string(&w).unwrap().contains("boot_id"));
         w.boot_id = "9f3c61d2a07e45b1".into();
@@ -2745,6 +2743,7 @@ mod tests {
     fn no_secret_bearing_fields_on_handshake_frames() {
         // Structural guard: the JSON of Welcome/Attached must not contain key-ish names.
         let w = serde_json::to_string(&Welcome {
+            accepted_events: vec![],
             protocol_version: 1,
             daemon_version: "v".into(),
             pid: 1,
@@ -2755,7 +2754,6 @@ mod tests {
             daemon_build: String::new(),
             features: daemon_features(),
             boot_id: String::new(),
-            accepted_events: vec![],
         })
         .unwrap()
         .to_lowercase();
@@ -2812,6 +2810,7 @@ mod tests {
         let rc = ClientReconnect { previous_client: ClientId(1), session_id: "s".into(), was_owner: true, generation: 2, owner: None };
         assert!(!serde_json::to_string(&rc).unwrap().contains("\"owner\""));
         let mut w = Welcome {
+            accepted_events: vec![],
             protocol_version: PROTOCOL_VERSION,
             daemon_version: "v".into(),
             pid: 1,
@@ -2822,13 +2821,26 @@ mod tests {
             daemon_build: String::new(),
             features: Vec::new(),
             boot_id: String::new(),
-            accepted_events: vec![],
         };
         let old: Welcome = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
         assert!(!old.supports(FEATURE_OWNED_SESSIONS));
         w.features = daemon_features();
         let new: Welcome = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
         assert!(new.supports(FEATURE_OWNED_SESSIONS));
+    }
+
+    /// A `Welcome` with only the required fields set, every optional one at
+    /// its default: built through serde, so it stays valid as fields are added.
+    fn bare_welcome() -> Welcome {
+        serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "daemon_version": "v",
+            "pid": 1,
+            "profile": null,
+            "sessions": [],
+            "progressive_tool_disclosure": false,
+        }))
+        .unwrap()
     }
 
     /// The names clients already decode. Changing one breaks them.
@@ -2870,17 +2882,9 @@ mod tests {
             decode_line(r#"{"type":"child_list","supported":true,"clk_tck":100,"sessions":[],"host":[]}"#).unwrap();
         assert!(matches!(old, DaemonFrame::ChildList(ChildListReply { refused_records: 0, ledger_full: false, .. })));
         let w = serde_json::to_value(&Welcome {
-            protocol_version: PROTOCOL_VERSION,
-            daemon_version: "v".into(),
-            pid: 1,
-            profile: None,
-            sessions: vec![],
-            progressive_tool_disclosure: false,
             generation: 2,
-            daemon_build: String::new(),
             features: vec![crate::daemon::control_queries::FEATURE_CHILDREN.into()],
-            boot_id: String::new(),
-            accepted_events: vec![],
+            ..bare_welcome()
         })
         .unwrap();
         assert_eq!(w["features"], serde_json::json!(["children"]));
@@ -2951,17 +2955,11 @@ mod tests {
             Bye,
         }
         let new = encode_line(&DaemonFrame::Welcome(Welcome {
-            protocol_version: PROTOCOL_VERSION,
-            daemon_version: "v".into(),
-            pid: 1,
-            profile: None,
             sessions: vec![meta()],
             progressive_tool_disclosure: true,
             generation: 3,
-            daemon_build: String::new(),
             features: vec!["children".into()],
-            boot_id: String::new(),
-            accepted_events: vec![],
+            ..bare_welcome()
         }))
         .unwrap();
         match decode_line::<OldDaemonFrame>(new.trim_end()).unwrap() {
@@ -3089,20 +3087,7 @@ mod tests {
         // Welcome: the echo is present when non-empty and omitted when empty;
         // an old Welcome decodes as no echo.
         let welcome = |accepted_events: Vec<String>| {
-            serde_json::to_value(&Welcome {
-                protocol_version: PROTOCOL_VERSION,
-                daemon_version: "v".into(),
-                pid: 1,
-                profile: None,
-                sessions: vec![],
-                progressive_tool_disclosure: false,
-                generation: 1,
-                daemon_build: String::new(),
-                features: vec![],
-                boot_id: String::new(),
-                accepted_events,
-            })
-            .unwrap()
+            serde_json::to_value(&Welcome { accepted_events, ..bare_welcome() }).unwrap()
         };
         assert_eq!(welcome(vec!["tool_child_ended".into()])["accepted_events"], serde_json::json!(["tool_child_ended"]));
         assert!(welcome(vec![]).get("accepted_events").is_none());
@@ -3258,6 +3243,7 @@ mod catalog_page_tests {
             }
             let list = serde_json::to_value(DaemonFrame::SessionList { sessions: vec![m.clone()] }).unwrap();
             let welcome = serde_json::to_value(Welcome {
+                accepted_events: vec![],
                 protocol_version: PROTOCOL_VERSION,
                 daemon_version: "v".into(),
                 pid: 1,
@@ -3268,7 +3254,6 @@ mod catalog_page_tests {
                 daemon_build: String::new(),
                 features: daemon_features(),
                 boot_id: String::new(),
-                accepted_events: vec![],
             })
             .unwrap();
             for row in [&list["sessions"][0], &welcome["sessions"][0], &serde_json::to_value(&m).unwrap()] {

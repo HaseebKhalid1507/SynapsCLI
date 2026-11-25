@@ -505,6 +505,13 @@ impl Daemon {
         });
         state.host.set_pin_sink(Arc::clone(&state.pins) as Arc<dyn crate::session::PinSink>);
 
+        // After a reload, the child ledger first, before any session is
+        // restored: restored sessions' new spawns follow the older records
+        // (see `session::children` for the drop rules).
+        if let Some(rs) = &reload_state {
+            crate::session::children::restore_after_reload(rs.children.clone());
+        }
+
         // Before any session of this image registers: drop registrations no
         // running session owns (dead owner pid). After a reload, also every
         // one naming our own pid: the old image exec'd without ending its
@@ -520,9 +527,6 @@ impl Daemon {
 
         // C3: rehydrate BEFORE accepting so a reconnecting client finds its session.
         if let Some(rs) = &reload_state {
-            // The child ledger first: restored sessions' new spawns follow
-            // the older records (see `session::children` for the drop rules).
-            crate::session::children::restore_after_reload(rs.children.clone());
             reload::rehydrate(&state, rs).await;
         }
 

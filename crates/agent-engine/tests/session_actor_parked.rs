@@ -668,6 +668,7 @@ async fn reloaded_live_session(host: &Arc<agent_engine::EngineHost>) -> agent_en
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     agent_engine::daemon::reload::ReloadState {
+        children: Vec::new(),
         generation: 2,
         written_at: chrono::Utc::now(),
         sessions: vec![agent_engine::daemon::reload::ReloadSession {
@@ -691,7 +692,6 @@ async fn reloaded_live_session(host: &Arc<agent_engine::EngineHost>) -> agent_en
         expected_clients: 1,
         next_subagent_id: 0,
         boot_id: String::new(),
-        children: Vec::new(),
     }
 }
 

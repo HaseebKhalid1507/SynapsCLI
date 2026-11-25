@@ -116,12 +116,21 @@ async fn handshake_refuses_version_mismatch_and_protocol_violations() {
             assert_eq!(w.protocol_version, PROTOCOL_VERSION);
             assert_eq!(w.daemon_version, binary_version());
             assert_eq!(w.pid, std::process::id());
-            let mut served = vec![FEATURE_OWNED_SESSIONS, FEATURE_SESSION_WORKERS, FEATURE_SESSION_PAGE];
+            // The control-query features come last: checked here, then set
+            // aside for the list of the others below.
+            let mut queries = Vec::new();
             if agent_engine::session::children::supported() {
-                served.push(daemon::control_queries::FEATURE_CHILDREN);
+                queries.push(daemon::control_queries::FEATURE_CHILDREN);
             }
-            served.push(daemon::control_queries::FEATURE_THINKING_OPTIONS);
-            assert_eq!(w.features, served, "every feature this daemon serves");
+            queries.push(daemon::control_queries::FEATURE_THINKING_OPTIONS);
+            let mut w = w;
+            let others = w.features.len().saturating_sub(queries.len());
+            assert_eq!(w.features.split_off(others), queries, "the control queries, after every other feature");
+            assert_eq!(
+                w.features,
+                [FEATURE_OWNED_SESSIONS, FEATURE_SESSION_WORKERS, FEATURE_SESSION_PAGE],
+                "every feature this daemon serves"
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -602,7 +611,7 @@ async fn optional_events_reach_only_the_connections_that_listed_them() {
     owner
         .send(&ClientFrame::Cmd {
             session_id: session_id.clone(),
-            cmd: SessionCommand::Submit { text: CHILD_EVENTS_PROMPT.into(), attachments: vec![] },
+            cmd: serde_json::from_value(serde_json::json!({"cmd": "submit", "text": CHILD_EVENTS_PROMPT})).unwrap(),
         })
         .await;
     async fn child_events_until_done(c: &mut Raw) -> Vec<&'static str> {
