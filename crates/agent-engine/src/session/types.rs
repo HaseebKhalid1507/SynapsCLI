@@ -270,6 +270,9 @@ pub struct SessionConfig {
     /// (soak F21) — `double_option` keeps the two levels apart on the wire.
     #[serde(default, with = "double_option", skip_serializing_if = "Option::is_none")]
     pub continue_session: Option<Option<String>>,
+    /// Non-content admission policy; restored before automatic turns. No layer text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_layer_wait_ms: Option<u64>,
     /// `EngineOpts.system`.
     #[serde(default)]
     pub system: Option<String>,
@@ -393,6 +396,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             continue_session: None,
+            ephemeral_layer_wait_ms: None,
             system: None,
             prompt_manifest: None,
             cwd: None,
@@ -1103,6 +1107,14 @@ pub enum SessionCommand {
     Answer { prompt_id: u64, value: Option<String> },
     /// `id` is client-chosen and echoed in `SettingChanged.id`.
     Set { id: u64, setting: SessionSetting },
+    /// Request-only material, never added to settings_replay.
+    EphemeralLayer {
+        id: u64,
+        epoch: String,
+        generation: u64,
+        #[serde(flatten)]
+        operation: crate::runtime::ephemeral::Operation,
+    },
     Compact { instructions: Option<String> },
     /// `/new`: ConversationState::clear.
     NewSession,
@@ -1258,6 +1270,7 @@ impl SessionCommand {
                 | Self::PluginCommand { .. }
                 | Self::DriverStart { .. }
                 | Self::Set { .. }
+                | Self::EphemeralLayer { .. }
                 | Self::KeepWarm { .. }
         )
     }
@@ -1301,6 +1314,7 @@ impl std::fmt::Debug for SessionCommand {
                 .field("query", &format_args!("<redacted>"))
                 .finish(),
             Self::Cancel => f.write_str("Cancel"),
+            Self::EphemeralLayer { id, .. } => f.debug_struct("EphemeralLayer").field("id", id).finish_non_exhaustive(),
             Self::Set { id, setting } => {
                 f.debug_struct("Set").field("id", id).field("setting", setting).finish()
             }
@@ -1432,6 +1446,7 @@ pub struct ReasoningClampWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "query", rename_all = "snake_case")]
 pub enum SessionQuery {
+    EphemeralLayer,
     /// {session, model, tokens, cost, streaming, auto_turns, attached, pending_prompts}
     Status,
     /// Vec<SharedMessage> (api_messages)
@@ -1489,6 +1504,7 @@ pub enum EndReason {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)] // Attached carries the full snapshot by design (§2.4)
 pub enum SessionEventWire {
+    EphemeralLayerChanged { status: crate::runtime::ephemeral::Status },
     Stream(crate::StreamEvent),
     /// Actor bookkeeping the client needs to mirror `App` fields exactly.
     /// `user_text` = the prompt that started the turn: the queued text on

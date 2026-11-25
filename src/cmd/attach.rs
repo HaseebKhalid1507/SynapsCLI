@@ -87,6 +87,7 @@ impl Client {
 
     fn render(&mut self, env: &Envelope) {
         match &env.event {
+            SessionEventWire::EphemeralLayerChanged { .. } => {},
             SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(t))) => self.out(t),
             SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Thinking(_))) => {}
             SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolUse { tool_name, .. })) => {

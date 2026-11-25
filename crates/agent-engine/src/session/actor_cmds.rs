@@ -402,6 +402,7 @@ impl SessionActor {
     /// model/reasoning/system prompt, swap conversation. Reply `Resumed{id}`
     /// then `Conversation`; error → `QueryResult{id, {kind:"error", text}}`.
     pub(crate) async fn resume(&mut self, id: u64, query: String) {
+        self.ephemeral_layer.invalidate(crate::runtime::ephemeral::Reason::NewSession);
         if self.streaming {
             self.emit(SessionEventWire::QueryResult {
                 id,

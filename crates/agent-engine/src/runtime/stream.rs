@@ -173,6 +173,7 @@ pub(super) struct StreamSession {
     // Model config
     pub(super) model: String,
     pub(super) tools: Arc<RwLock<ToolRegistry>>,
+    pub(super) ephemeral_layer: super::ephemeral::Layer,
     pub(super) system_prompt: Option<String>,
     pub(super) thinking_budget: u32,
     pub(super) reasoning_level: agent_core::reasoning::ReasoningLevel,
@@ -763,6 +764,7 @@ impl StreamMethods {
             reasoning_level,
             tx,
             cancel,
+            ephemeral_layer,
             mut steering_rx,
             max_tool_output,
             tool_spill,
@@ -1661,6 +1663,7 @@ impl StreamMethods {
                                     &memory_backend,
                                     cwd.as_deref(),
                                 )?;
+                                ephemeral_layer.invalidate(super::ephemeral::Reason::Rollover);
                                 budget_meter.start_context_segment();
                                 segment_has_provider_round = false;
                                 let window = continuation
@@ -1852,6 +1855,24 @@ impl StreamMethods {
                 request_messages
             };
 
+            // Last-mile admission: layer text reaches this request only,
+            // never history, traces or a keep-warm ping.
+            let Some(ephemeral_permit) = ephemeral_layer.admit(&cancel).await else {
+                send_history!();
+                return Ok(());
+            };
+            let request_system = ephemeral_permit.compose(&injected_system);
+            let private_options;
+            let round_options = if ephemeral_permit.has_text() {
+                private_options = super::api::ApiOptions {
+                    trace: super::trace::TraceContext::disabled(),
+                    ..round_options.clone()
+                };
+                &private_options
+            } else {
+                round_options
+            };
+
             // Keep this round's prefix warm from the moment its request goes
             // out (`runtime::tool_keepwarm`): through a response that streams
             // past the cache TTL, then through its tools. Dropped (stopped,
@@ -1859,7 +1880,7 @@ impl StreamMethods {
             // does not settle it below.
             let round_mark = super::tool_keepwarm::RoundMark::new(&usage_counters);
             let mut round_keepwarm = match (&tool_keepwarm, &round_signal) {
-                (Some(settings), Some(signal)) => {
+                (Some(settings), Some(signal)) if !ephemeral_layer.opted_in() => {
                     super::tool_keepwarm::ToolRoundKeepWarm::start(
                         settings,
                         round_mark,
@@ -1892,7 +1913,7 @@ impl StreamMethods {
                 &client,
                 &model,
                 &tools_snapshot,
-                &injected_system,
+                &request_system,
                 thinking_budget,
                 reasoning_level,
                 request_messages,
@@ -1912,6 +1933,7 @@ impl StreamMethods {
                     return Err(e);
                 }
             };
+            drop(ephemeral_permit);
             // Whether this response was cut by a cancel. Read HERE, as the
             // provider call returns: a cancel that lands later (e.g. during
             // the `on_message_complete` hook below) did not cut it, and a
@@ -4521,6 +4543,7 @@ mod rich_output_tests {
             refusal_retries: 0,
             model: model.into(),
             tools,
+            ephemeral_layer: crate::runtime::ephemeral::Layer::default(),
             system_prompt: None,
             thinking_budget: 0,
             reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
@@ -6591,6 +6614,7 @@ mod rich_output_tests {
             refusal_retries: 0,
             model: "claude-sonnet-4-6".into(),
             tools,
+            ephemeral_layer: crate::runtime::ephemeral::Layer::default(),
             system_prompt: None,
             thinking_budget: 0,
             reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,

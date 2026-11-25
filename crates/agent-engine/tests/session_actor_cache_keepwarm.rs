@@ -220,6 +220,9 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::Resume { .. }
         | SessionCommand::EngineCommand { .. }
         | SessionCommand::PluginCommand { .. } => Effect::Fingerprint,
+        // The request-only prompt layer joins the next request's system
+        // text, so it may change the prefix: the fingerprint decides.
+        SessionCommand::EphemeralLayer { .. } => Effect::Fingerprint,
         SessionCommand::Set { setting, .. } => match setting {
             SessionSetting::Model { .. }
             | SessionSetting::ReasoningLevel { .. }

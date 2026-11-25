@@ -500,6 +500,7 @@ pub(crate) fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::Cancel => "cancel",
         SessionCommand::Answer { .. } => "answer",
         SessionCommand::Set { .. } => "set",
+        SessionCommand::EphemeralLayer { .. } => "ephemeral_layer",
         SessionCommand::Compact { .. } => "compact",
         SessionCommand::NewSession => "new_session",
         SessionCommand::Save => "save",
@@ -544,6 +545,9 @@ pub struct SessionActor {
     pub(crate) event_queue: Arc<crate::events::EventQueue>,
     /// Last-wins per variant; replayed after unpark (non-persisted knobs).
     pub(crate) settings_replay: Vec<SessionSetting>,
+    pub(crate) ephemeral_layer: crate::runtime::ephemeral::Layer,
+    ephemeral_changes: tokio::sync::watch::Receiver<crate::runtime::ephemeral::Status>,
+    ephemeral_installer: Option<ClientId>,
     pub(crate) keep_warm: bool,
     /// Opt-in prompt-cache keep-warm pings while idle (task #444). Unrelated
     /// to `keep_warm` above, which only stops the session from parking.
@@ -728,6 +732,9 @@ impl SessionActor {
         host: &Arc<EngineHost>,
         mut cfg: SessionConfig,
     ) -> Result<(SessionHandle, SessionTask)> {
+        if cfg.ephemeral_layer_wait_ms.is_some_and(|ms| ms > crate::runtime::ephemeral::MAX_WAIT_MS) {
+            return Err(crate::RuntimeError::Config("ephemeral_layer_wait_ms exceeds 15000".into()));
+        }
         // cwd goes in BEFORE apply_config (inside foreground_runtime_for) so the
         // one-shot memory binding scopes to the session's project (§4).
         let mut runtime = host.foreground_runtime_for(cfg.cwd.clone()).await?;
@@ -934,6 +941,9 @@ impl SessionActor {
         // Loaded (and recovered) history keeps whatever times it carried.
         let message_stamper = crate::runtime::message_time::Stamper::new(conv.api_messages.len());
 
+        let ephemeral_layer = crate::runtime::ephemeral::Layer::configured(cfg.ephemeral_layer_wait_ms);
+        let ephemeral_changes = ephemeral_layer.subscribe();
+        runtime.ephemeral_layer = ephemeral_layer.clone();
         let view = RuntimeView::from_runtime(&runtime).await;
         let hook_bus = Arc::clone(runtime.hook_bus());
         let event_queue = Arc::clone(runtime.event_queue());
@@ -988,6 +998,9 @@ impl SessionActor {
         };
 
         let actor = SessionActor {
+            ephemeral_layer,
+            ephemeral_changes,
+            ephemeral_installer: None,
             id,
             meta,
             config: cfg,
@@ -2214,7 +2227,7 @@ impl SessionActor {
                         Err(protocol::PrepareError::Blocked(error)) => {
                             self.driver_revoke(&format!("preflight blocked: {error}"));
                         }
-                        Ok(candidate) => {
+                        Ok(mut candidate) => {
                             let validated = proposal.clone();
                             let history = super::driver::history_with_steering(
                                 &self.conv.api_messages,
@@ -2246,6 +2259,7 @@ impl SessionActor {
                                 );
                             }
                             // Apply the prepared runtime.
+                            candidate.ephemeral_layer = self.ephemeral_layer.clone();
                             *self.runtime = candidate;
                             self.conv.session.model = self.runtime.model().to_owned();
                             self.conv.session.thinking_level =
@@ -2307,6 +2321,8 @@ impl SessionActor {
                             self.steer_tx = Some(tx);
                             self.owner_steer_budget = None;
                             let mut runtime = self.runtime.clone();
+                            // Explicit same-session stream handoff, not generic clone inheritance.
+                            runtime.ephemeral_layer = self.ephemeral_layer.clone();
                             // F2: share the parent's TTL latches so the
                             // driver turn doesn't fire a redundant 1h→5m
                             // downgrade notice.
@@ -2817,6 +2833,7 @@ impl SessionActor {
                 )))
             }
         };
+        runtime.ephemeral_layer = self.ephemeral_layer.clone();
         let mut conv = ConversationState::from_resumed(sb.session);
         conv.api_messages = sb.api_messages;
         conv.total_input_tokens = sb.total_input_tokens;
@@ -4413,6 +4430,7 @@ impl SessionActor {
                         self.conv.context_head = crate::engine::session::ContextHeadPersistence::default();
                         self.runtime
                             .reset_context_continuation(&new_id, &self.conv.api_messages);
+                        self.ephemeral_layer.invalidate(crate::runtime::ephemeral::Reason::Rollover);
                         self.emit(SessionEventWire::CompactionApplied {
                             previous_session_id: previous,
                             session_id: new_id,
@@ -4713,7 +4731,45 @@ impl SessionActor {
         }));
     }
 
+    fn ephemeral_status(&self, outcome: Option<crate::runtime::ephemeral::Outcome>) -> serde_json::Value {
+        let mut value = serde_json::to_value(self.ephemeral_layer.status()).unwrap_or_default();
+        value["kind"] = serde_json::json!("ephemeral_layer");
+        value["session_id"] = serde_json::json!(self.id.as_str());
+        if let Some(outcome) = outcome { value["outcome"] = serde_json::json!(outcome); }
+        value
+    }
+
+    /// `SessionCommand::EphemeralLayer`, answered ahead of [`Self::handle`]:
+    /// only the input owner may change the layer, never during a reload
+    /// fence. Any other command comes back untouched.
+    fn ephemeral_command(&mut self, addressed: Addressed) -> Option<Addressed> {
+        use crate::runtime::ephemeral::Outcome;
+        let (from, id, epoch, generation, operation) = match addressed {
+            Addressed { from, cmd: SessionCommand::EphemeralLayer { id, epoch, generation, operation }, .. } => {
+                (from, id, epoch, generation, operation)
+            }
+            other => return Some(other),
+        };
+        let outcome = if from.is_none() || from != self.input_owner {
+            Outcome::NotOwner
+        } else if self.reload_fence.is_some() {
+            Outcome::Busy
+        } else {
+            self.ephemeral_layer.update(&epoch, generation, operation)
+        };
+        if outcome == Outcome::Applied {
+            self.ephemeral_installer = from;
+            self.config.ephemeral_layer_wait_ms = self.ephemeral_layer.wait_ms();
+        }
+        self.emit(SessionEventWire::QueryResult { id, value: self.ephemeral_status(Some(outcome)) });
+        None
+    }
+
     pub(crate) async fn query(&mut self, id: u64, query: SessionQuery) {
+        if matches!(query, SessionQuery::EphemeralLayer) {
+            self.emit(SessionEventWire::QueryResult { id, value: self.ephemeral_status(None) });
+            return;
+        }
         // Status/View never wake a parked session (the idle probe must not).
         if self.is_parked() {
             let value = match query {
@@ -4741,6 +4797,7 @@ impl SessionActor {
             return;
         }
         let value = match query {
+            SessionQuery::EphemeralLayer => self.ephemeral_status(None),
             SessionQuery::Status => {
                 // Configured + resolved prompt-cache TTL (`auto` → 1h on OAuth).
                 let cache_ttl = self.cache_ttl_status_json().await;
@@ -4994,6 +5051,10 @@ impl SessionActor {
     /// events buffer in the broadcast (§8 detach-without-abort). The owner
     /// leaving passes input to the oldest attached non-`Observe` client.
     pub(crate) fn detach(&mut self, client: ClientId) {
+        if self.ephemeral_installer == Some(client) {
+            self.ephemeral_layer.invalidate(crate::runtime::ephemeral::Reason::Disconnect);
+            self.ephemeral_installer = None;
+        }
         if self.attached.remove(&client).is_none() {
             return;
         }
@@ -5501,12 +5562,14 @@ impl SessionActor {
                     .await;
             }
             SessionCommand::Answer { prompt_id, value } => self.answer(from, prompt_id, value),
+            SessionCommand::EphemeralLayer { .. } => unreachable!("handled before dispatch"),
             SessionCommand::Set { id, setting } => self.apply_setting(id, setting).await,
             // `CompactionStarted` is the contract; no notice before it.
             SessionCommand::Compact { instructions } => {
                 self.compact(instructions, "manual").await;
             }
             SessionCommand::NewSession => {
+                self.ephemeral_layer.invalidate(crate::runtime::ephemeral::Reason::NewSession);
                 if self.driver.is_some() {
                     self.driver_revoke("session replaced");
                 }
@@ -5950,12 +6013,19 @@ impl SessionTask {
             tokio::select! {
                 cmd = actor.cmd_rx.recv() => match cmd {
                     Some(cmd) => {
+                        let Some(cmd) = actor.ephemeral_command(cmd) else { continue };
                         if let std::ops::ControlFlow::Break(reason) = actor.handle(cmd).await {
                             break reason;
                         }
                     }
                     // Every handle dropped: nobody can ever reach us again.
                     None => break EndReason::HostShutdown,
+                },
+                Ok(()) = actor.ephemeral_changes.changed() => {
+                    let status = actor.ephemeral_changes.borrow_and_update().clone();
+                    if actor.ephemeral_layer.opted_in() {
+                        actor.emit(SessionEventWire::EphemeralLayerChanged { status });
+                    }
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
                 Some(child) = actor.child_rx.recv() => actor.on_child_event(child),
