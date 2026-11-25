@@ -1401,6 +1401,126 @@ mod tests {
         assert_identity_1h(&rt).await;
     }
 
+    /// An extension tool registered while the session is idle.
+    struct LateTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for LateTool {
+        fn name(&self) -> &str {
+            "cards:ui"
+        }
+        fn description(&self) -> &str {
+            "late-registered fixture"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Extension {
+                extension_id: "cards".into(),
+            }
+        }
+        fn extension_id(&self) -> Option<&str> {
+            Some("cards")
+        }
+        async fn execute(&self, _: Value, _: crate::tools::ToolContext) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn late_tool(body: &Value) -> Option<&Value> {
+        body["tools"].as_array()?.iter().find(|t| {
+            t["name"].as_str().is_some_and(|n| n.contains("cards") && n.contains("ui"))
+        })
+    }
+
+    /// The incident of 2026-11-24: an extension loads while a session is
+    /// idle and its tool lands on the DEFERRED list. Deferred definitions
+    /// are not in the cached prefix, so the ping still goes out, and it
+    /// sends what the next real turn sends through the last breakpoint.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_tool_joining_the_deferred_list_keeps_the_ping() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus(CacheTtl::OneHour);
+        rt.progressive_tool_disclosure = true;
+        rt.deferred_tool_loading = true;
+        let history = real_turn(&rt, vec![user("hello")]).await;
+        let fp = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+
+        rt.tools.write().await.register(Arc::new(LateTool));
+        let report = rt
+            .cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &PingTap::default())
+            .await;
+        assert_eq!(report.result, Ok(PingOutcome::Sent), "{report:?}");
+        let mut next = history.clone();
+        next.push(user("next question"));
+        real_turn(&rt, next).await;
+
+        let bodies: Vec<Value> = mock
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 3, "previous turn, ping, next turn");
+        let (before, ping, real) = (&bodies[0], &bodies[1], &bodies[2]);
+        assert!(late_tool(before).is_none(), "fixture: not registered yet");
+        for body in [ping, real] {
+            let tool = late_tool(body).expect("the late tool is offered");
+            assert_eq!(tool["defer_loading"], true, "and deferred: {tool}");
+        }
+        assert_prefix_identical(ping, real, history.len(), &marker_1h(), 1);
+    }
+
+    /// The other side: a late tool that is sent WITHOUT `defer_loading` is
+    /// part of the cached prefix, so the ping must refuse. Two ways in: an
+    /// always-loaded id that joins the session core once it registers, and
+    /// no deferred loading at all (every tool is loaded).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_tool_joining_the_loaded_tools_changes_the_prefix() {
+        use crate::tools::catalog::ToolId;
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        for (always_loaded, deferred) in [(true, true), (false, false)] {
+            let mut rt = opus(CacheTtl::OneHour);
+            rt.progressive_tool_disclosure = deferred;
+            rt.deferred_tool_loading = deferred;
+            if always_loaded {
+                rt.tools_always_loaded = Arc::from([ToolId::extension("cards", "ui")]);
+            }
+            let history = real_turn(&rt, vec![user("hello")]).await;
+            let fp = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+            let sent = mock.bodies.lock().unwrap().len();
+
+            rt.tools.write().await.register(Arc::new(LateTool));
+            let report = rt
+                .cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &PingTap::default())
+                .await;
+            assert!(
+                matches!(report.result, Ok(PingOutcome::PrefixChanged { .. })),
+                "always_loaded={always_loaded} deferred={deferred}: {report:?}"
+            );
+            assert_eq!(mock.bodies.lock().unwrap().len(), sent, "nothing was sent");
+
+            let mut next = history.clone();
+            next.push(user("next question"));
+            real_turn(&rt, next).await;
+            let real: Value =
+                serde_json::from_str(mock.bodies.lock().unwrap().last().unwrap()).unwrap();
+            let tool = late_tool(&real).expect("the next turn offers the late tool");
+            assert!(
+                tool.get("defer_loading").is_none(),
+                "always_loaded={always_loaded}: it is a loaded tool: {tool}"
+            );
+        }
+    }
+
     /// A ping projects exactly what the next turn start selects — including
     /// activations handed over by a daemon reload or an unpark that the turn
     /// start has not restored yet. (The session only schedules pings after

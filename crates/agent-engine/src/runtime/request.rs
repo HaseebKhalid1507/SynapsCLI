@@ -203,13 +203,17 @@ impl<'a> RequestBody<'a> {
     }
 
     /// FNV-1a 64 over the serialized cache-key prefix of this request:
-    /// model, `output_config` (effort), `system`, `thinking`, `tools` and the
-    /// first `history_len` messages exactly as they go on the wire (cache
-    /// markers included), plus the `anthropic-beta` header (`beta`: 1M
-    /// context and the like select the serving configuration). `max_tokens`
-    /// and `stream` are excluded: neither is rendered into the prompt. Two
-    /// requests with equal fingerprints send byte-identical prefixes through
-    /// the last history breakpoint.
+    /// model, `output_config` (effort), `system`, `thinking`, the loaded
+    /// `tools` and the first `history_len` messages exactly as they go on the
+    /// wire (cache markers included), plus the `anthropic-beta` header
+    /// (`beta`: 1M context and the like select the serving configuration).
+    /// `max_tokens` and `stream` are excluded: neither is rendered into the
+    /// prompt. So are the `defer_loading` definitions: they are not part of
+    /// the cached prefix, so a tool registered late onto the deferred list
+    /// leaves the fingerprint alone (a tool that is sent without
+    /// `defer_loading` is a loaded tool and is hashed). Two requests with
+    /// equal fingerprints send byte-identical prefixes through the last
+    /// history breakpoint.
     pub(super) fn prefix_fingerprint(&self, history_len: usize, beta: Option<&str>) -> u64 {
         struct Fnv(u64);
         impl std::io::Write for Fnv {
@@ -236,7 +240,7 @@ impl<'a> RequestBody<'a> {
         sep(&mut h);
         let _ = serde_json::to_writer(&mut h, &self.thinking);
         sep(&mut h);
-        let _ = serde_json::to_writer(&mut h, &self.tools);
+        let _ = serde_json::to_writer(&mut h, &LoadedTools(&self.tools));
         sep(&mut h);
         let n = history_len.min(self.messages.0.len());
         let _ = serde_json::to_writer(&mut h, &super::continuation::WireMessages(&self.messages.0[..n]));
@@ -325,9 +329,10 @@ impl<'a> MarkedTools<'a> {
     }
 }
 
-impl Serialize for MarkedTools<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut seq = serializer.serialize_seq(Some(self.tools.len() + self.deferred.len()))?;
+impl MarkedTools<'_> {
+    fn serialize_into<S: Serializer>(&self, serializer: S, deferred: bool) -> Result<S::Ok, S::Error> {
+        let deferred = if deferred { self.deferred } else { &[] };
+        let mut seq = serializer.serialize_seq(Some(self.tools.len() + deferred.len()))?;
         match &self.marked_last {
             Some(last) => {
                 for tool in &self.tools[..self.tools.len() - 1] {
@@ -341,10 +346,26 @@ impl Serialize for MarkedTools<'_> {
                 }
             }
         }
-        for tool in self.deferred {
+        for tool in deferred {
             seq.serialize_element(tool)?;
         }
         seq.end()
+    }
+}
+
+impl Serialize for MarkedTools<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.serialize_into(serializer, true)
+    }
+}
+
+/// The cached part of a [`MarkedTools`]: the loaded tools with their marker,
+/// without the `defer_loading` tail (`RequestBody::prefix_fingerprint`).
+struct LoadedTools<'b, 'a>(&'b MarkedTools<'a>);
+
+impl Serialize for LoadedTools<'_, '_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize_into(serializer, false)
     }
 }
 

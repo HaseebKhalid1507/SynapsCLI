@@ -154,6 +154,18 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A tool that loads while a session is idle no longer ends its keep-warm.**
+  With deferred tool loading, a tool registered mid-session (e.g. an
+  extension installed live) joins the `defer_loading` list, which is not part
+  of the cached prefix. The keep-warm check still hashed that list, so the
+  next ping saw a "changed" prefix, ended the period with
+  `reason=prefix changed` and let the cache expire; the next turn wrote the
+  whole context again (over 200k tokens per session). The check now covers
+  exactly the cached bytes: the loaded tools with their cache marker, not the
+  deferred definitions. A tool that joins the loaded tools (e.g. one listed in
+  `tools.always_loaded`, or any tool without deferred loading) still ends the
+  period, as it changes what is cached.
+
 - **Sign-in opens the whole page on Windows.** The browser was started
   through `cmd /c start <url>`, and `cmd` ends a command at the first `&`:
   the Claude, ChatGPT, Gemini and Grok authorize URLs (all full of `&`)
