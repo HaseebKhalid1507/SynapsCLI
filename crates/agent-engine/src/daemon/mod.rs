@@ -14,6 +14,7 @@
 
 pub mod close;
 pub mod conn;
+pub mod control_queries;
 pub mod extension_reload;
 pub mod lifecycle;
 pub mod listener;
@@ -503,6 +504,13 @@ impl Daemon {
             saved: saved::SavedLoader::default(),
         });
         state.host.set_pin_sink(Arc::clone(&state.pins) as Arc<dyn crate::session::PinSink>);
+
+        // After a reload, the child ledger first, before any session is
+        // restored: restored sessions' new spawns follow the older records
+        // (see `session::children` for the drop rules).
+        if let Some(rs) = &reload_state {
+            crate::session::children::restore_after_reload(rs.children.clone());
+        }
 
         // Before any session of this image registers: drop registrations no
         // running session owns (dead owner pid). After a reload, also every

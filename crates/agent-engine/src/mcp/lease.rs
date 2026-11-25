@@ -572,6 +572,10 @@ impl McpRuntimeManager {
                 return Err(e);
             }
         };
+        // Host list of the `children` query (labels only).
+        if let Some(pid) = conn.pid() {
+            crate::session::children::record_host(crate::session::children::HostOwnerKind::McpServer, server, pid);
+        }
         let mut listing = HashMap::new();
         for def in &defs {
             listing.insert(def.name.clone(), SchemaDigest::of_schema(&def.input_schema));

@@ -401,6 +401,9 @@ impl ModelHistoryState {
 pub struct DeltaSender {
     tx: tokio::sync::mpsc::Sender<String>,
     shared: Arc<DeltaShared>,
+    /// Where this call reports the processes it spawns (a daemon session's
+    /// route); `None` outside a session.
+    child: Option<crate::session::child_events::ChildSink>,
 }
 
 /// Consumer half: drains the bounded channel and the coalescing overflow
@@ -475,6 +478,7 @@ pub fn delta_channel_with_budgets(
         sender: DeltaSender {
             tx,
             shared: Arc::clone(&shared),
+            child: None,
         },
         receiver: DeltaReceiver {
             rx,
@@ -499,6 +503,16 @@ fn coalesce_into(overflow: &mut String, chunk: &str, counters: &OutputCounters) 
 }
 
 impl DeltaSender {
+    /// Tag this call with the sink its spawned children are reported to.
+    pub fn set_child_sink(&mut self, sink: crate::session::child_events::ChildSink) {
+        self.child = Some(sink);
+    }
+
+    /// The sink set by [`Self::set_child_sink`].
+    pub fn child_sink(&self) -> Option<&crate::session::child_events::ChildSink> {
+        self.child.as_ref()
+    }
+
     /// Shared counters handle (also visible from the receiver/forwarder).
     pub fn counters(&self) -> Arc<OutputCounters> {
         Arc::clone(&self.shared.counters)

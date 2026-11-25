@@ -683,6 +683,12 @@ pub struct SessionActor {
     /// handed to the runtime the unpark builds (and to a reload record
     /// written while parked). Empty while live.
     pub(crate) parked_tool_activations: Vec<crate::tools::activation::CarriedActivation>,
+    // ── spawned-child events (`session::child_events`) ──
+    /// This session's route; set on every runtime the actor builds.
+    pub(crate) child_route: super::child_events::ChildRoute,
+    pub(crate) child_rx: mpsc::UnboundedReceiver<super::child_events::ChildProcessEvent>,
+    /// Holds a foreground event until its call's `tool_use` went out.
+    pub(crate) child_order: super::child_events::EventOrder,
 }
 
 /// A reload checkpoint wrote this session's reload record; until the
@@ -878,6 +884,8 @@ impl SessionActor {
             .restore_conversation
             .take()
             .filter(|r| r.journal_id == sb.session.id);
+        let (child_route, child_rx) = super::child_events::ChildRoute::channel(id.as_str());
+        runtime.set_child_route(Some(child_route.clone()));
 
         let meta = SessionMeta {
             id: id.clone(),
@@ -1057,6 +1065,9 @@ impl SessionActor {
             reload_fence: None,
             owned,
             parked_tool_activations: Vec::new(),
+            child_route,
+            child_rx,
+            child_order: Default::default(),
         };
         if actor.keep_warm {
             actor.note_pin();
@@ -1144,6 +1155,7 @@ impl SessionActor {
                     | SessionEventWire::Attached { .. }
                     | SessionEventWire::QueryResult { .. }
                     | SessionEventWire::Conversation(_)
+                    | SessionEventWire::ChildProcess(_)
                     | SessionEventWire::Stream(StreamEvent::Session(
                         SessionEvent::MessageHistory(_)
                     ))
@@ -2795,7 +2807,7 @@ impl SessionActor {
             }
             Ok::<_, crate::RuntimeError>((runtime, sb))
         };
-        let (runtime, sb) = match tokio::time::timeout(budgets::UNPARK_TIMEOUT, build).await {
+        let (mut runtime, sb) = match tokio::time::timeout(budgets::UNPARK_TIMEOUT, build).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -2815,6 +2827,7 @@ impl SessionActor {
         }
         self.message_stamper.settle(conv.api_messages.len());
         runtime.restore_tool_activations(std::mem::take(&mut self.parked_tool_activations));
+        runtime.set_child_route(Some(self.child_route.clone()));
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
         // The name comes from disk: a rename while parked wrote it there.
@@ -3116,6 +3129,11 @@ impl SessionActor {
     /// earlier, to place them after the marker). Queues the save of the
     /// turn's final history, then the draft removal (`close_turn_draft`).
     pub(crate) fn clear_stream(&mut self) {
+        // Child events still held for a `tool_use` go out with the turn.
+        self.drain_child_events();
+        for event in self.child_order.turn_ended() {
+            self.emit(SessionEventWire::ChildProcess(event));
+        }
         self.stream = None;
         self.turn_awaiting_start = None;
         self.cancel = None;
@@ -3836,6 +3854,19 @@ impl SessionActor {
         out
     }
 
+    /// A child report from this session's route (see `EventOrder`).
+    fn on_child_event(&mut self, event: super::child_events::ChildProcessEvent) {
+        if let Some(event) = self.child_order.offer(event, self.streaming) {
+            self.emit(SessionEventWire::ChildProcess(event));
+        }
+    }
+
+    fn drain_child_events(&mut self) {
+        while let Ok(event) = self.child_rx.try_recv() {
+            self.on_child_event(event);
+        }
+    }
+
     /// `SteeringDelivered`: the engine injected `message` into history.
     fn note_steering_delivered(&mut self, message: &str) {
         if self.conv.queued_message.as_deref() == Some(message) {
@@ -3990,6 +4021,9 @@ impl SessionActor {
     // ── stream events (stream_handler.rs handle_stream_event + arm tail) ──
 
     async fn on_stream_event(&mut self, event: StreamEvent) {
+        // Child reports sent before this event (a call's spawn precedes its
+        // output) go out first.
+        self.drain_child_events();
         // A turn cancelled from outside `cancel_turn` (a driver revocation):
         // its terminal events are not a normal end — the turn is finished as
         // interrupted, never through the post-turn machinery below.
@@ -4026,6 +4060,14 @@ impl SessionActor {
             StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. })
         ) {
             self.emit(SessionEventWire::Stream(event.clone()));
+        }
+        if let StreamEvent::Llm(
+            crate::LlmEvent::ToolUseStart { tool_id, .. } | crate::LlmEvent::ToolUse { tool_id, .. },
+        ) = &event
+        {
+            for child in self.child_order.announced(tool_id) {
+                self.emit(SessionEventWire::ChildProcess(child));
+            }
         }
 
         // P5: observe_feedback — feed opted-in driver turns.
@@ -5916,6 +5958,7 @@ impl SessionTask {
                     None => break EndReason::HostShutdown,
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
+                Some(child) = actor.child_rx.recv() => actor.on_child_event(child),
                 // A held wake (and its permit) stays queued.
                 _ = queue.notified(), if !actor.holds(WorkSource::QueueWake) => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => {

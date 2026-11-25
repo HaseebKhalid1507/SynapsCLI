@@ -1167,6 +1167,7 @@ mod state_tests {
                     "{hello}"
                 );
                 let welcome = DaemonFrame::Welcome(Welcome {
+                    accepted_events: vec![],
                     protocol_version: PROTOCOL_VERSION,
                     daemon_version: "0.10.1".into(),
                     pid: 1,

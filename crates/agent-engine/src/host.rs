@@ -565,6 +565,18 @@ impl EngineHost {
         Ok((handle, task))
     }
 
+    /// The model a new session on this host gets right now (no `--model`,
+    /// no `--continue`): the runtime default with the host's config snapshot
+    /// applied, the same step `foreground_runtime_for` runs for `create`.
+    /// Like `create_session`, it first re-reads a config file edited since
+    /// the snapshot ([`Self::reload_config_if_changed`]).
+    pub fn new_session_model(&self) -> String {
+        self.reload_config_if_changed();
+        let mut runtime = Runtime::from_parts(RuntimeParts::without_reaper(self.parts.clone()));
+        runtime.apply_config_model(&self.config());
+        runtime.model().to_string()
+    }
+
     /// Register a handle built elsewhere (daemon test factories). The
     /// caller owns the task; `remove_session_if` when it ends. A handle
     /// already under the same id is replaced (a placeholder by its real

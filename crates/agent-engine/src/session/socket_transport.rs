@@ -1252,6 +1252,7 @@ mod tests {
                         break;
                     }
                     DaemonFrame::Welcome(Welcome {
+                        accepted_events: vec![],
                         protocol_version,
                         daemon_version: "t".into(),
                         pid: 1,
@@ -1619,6 +1620,7 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).await.unwrap();
             let welcome = DaemonFrame::Welcome(Welcome {
+                accepted_events: vec![],
                 protocol_version: PROTOCOL_VERSION,
                 daemon_version: "t".into(),
                 pid: 1,
@@ -1660,6 +1662,7 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).await.unwrap();
             let welcome = DaemonFrame::Welcome(Welcome {
+                accepted_events: vec![],
                 protocol_version: PROTOCOL_VERSION,
                 daemon_version: "t".into(),
                 pid: 1,
@@ -1701,6 +1704,7 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let welcome = DaemonFrame::Welcome(Welcome {
+            accepted_events: vec![],
             protocol_version: PROTOCOL_VERSION,
             daemon_version: "0.0.1-old".into(),
             pid: 1,

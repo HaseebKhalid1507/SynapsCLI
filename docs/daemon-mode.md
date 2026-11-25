@@ -751,12 +751,19 @@ C: pin{session_id, on}                        → D: pinned{session_id, on} | re
 C: rename{session_id, name?, expect?}         → D: renamed{session_id, name, in_memory_only?} | rename_failed{session_id, reason, message, taken_by?, current_name?} | refused{unknown_session} (→ daemon closes)
 C: reload_extension{extension}                → D: extension_reloaded{report} | extension_reload_failed{extension, message, unloaded} | refused{busy} (→ daemon closes)
 C: catalog_page{req, before?, limit?, named_only?} → D: catalog_page{req, sessions:[SessionMeta saved], next?, error?}   (a task: other frames are answered meanwhile)
+C: children{id, session_id, sid, members}     → D: child_list{id, supported, boot_id, clk_tck, sessions:[{session_id, truncated, children:[{tool_id, tool_name, handle_id, shell_session_id, child:{pid,start_ticks,boot_id,sid,pgid}, state, exit_code, signal, members?}]}], host:[{owner_kind, owner_id, child}], refused_records, ledger_full}   (feature "children"; also on an attached connection)
+C: thinking_options{id, model, warm}          → D: thinking_options_result{id, model, options:{levels, exact, basis, default_level}}   (feature "thinking_options"; also on an attached connection)
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode, owned?:{forward_secrets?:[[k,v]]}}
 D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients, owner_token?} | error
 C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event", session_id, seq, ts, event:WireSessionEvent} …
 C: bye | socket close = Detach (turn keeps running)
 ```
 
+- Optional frames: `welcome.features` names the control frames this daemon answers (`children` on Linux,
+  `thinking_options`, listed after the features above); check it before sending one. `hello` may carry
+  `accepted_events?` and `welcome` then carries `accepted_events?` (below). An older daemon answers one with `error` ("malformed
+  frame: unknown variant …") and keeps the connection. The events `tool_child` / `tool_child_ended` go only
+  to a connection whose `hello.accepted_events` names them; `welcome.accepted_events` echoes the ones it sends.
 - Version policy: exact match on `protocol_version` (min == max == 3) → `Refused{Version}` **loudly**
   (client exit 2). Different *binary* (version, or `daemon_build`: the commit it was built from) → allowed;
   the TUI leaves a transcript notice on attach and after every reload reconnect (an attached TUI keeps
