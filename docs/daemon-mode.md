@@ -743,7 +743,7 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page","addressed_replies"], boot_id?}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page","addressed_replies","cache_expiry"], boot_id?}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
@@ -866,6 +866,7 @@ cases:
 | `session_workers` | feature | unreleased | `SessionMeta.workers` is filled | the block is always empty | the block is omitted while empty; filled rows are additive |
 | `session_page` | feature | unreleased | `catalog_page`, `Watch{saved}`, `lifecycle: saved` | `DaemonTooOld` before sending | never asks; never sees `saved` rows |
 | `addressed_replies` | feature | unreleased | replies reach only their asker (below) | replies remain broadcast; `SessionLink` draws its request ids from a random base in `[2^32, 2^62)`, which makes accidental request-id collisions with another client highly unlikely (a mitigation, not addressing: equal ids still correlate, and a peer can still pick an id it has seen) | only its own replies; host replies gone (Rust clients already dropped them); another client's `SettingChanged`/`Resumed` arrives with id `VIEW_CHANGED_SETTING_ID` (view-only) |
+| `cache_expiry` | feature | unreleased | `SessionQuery::CacheExpiry` (below) | `DaemonTooOld` before sending (an older daemon fails the frame as malformed); the TUI's `/keepwarm status` leaves the line out | never asks |
 | `tool_queue` | capability | 0.11.0 | `LlmEvent::ToolQueued`/`ToolStarted`, live and in the attach replay | — | never sent them |
 | `owner_reason_input` | capability | 0.11.0 | `OwnerChangeReason::Input`, `Attached.client_input` | — | a shared session is presented in owner terms (`legacy_shared`) |
 | `owner_gone` | capability | 0.12.0 | `EndReason::OwnerGone` | — | told `Ended{client_quit}` (`ended_for`) |
@@ -902,6 +903,63 @@ the frame:
 - `seq` is gapless per session at emit. A connection's stream may skip seqs (replies to others, events
   its capabilities exclude, the actor's `Attached`): a gap is not loss. A reply never enters the
   mid-turn replay ring.
+
+## Prompt-cache evidence (`CacheExpiry`)
+
+`Query{query: "cache_expiry"}` (feature `cache_expiry`) answers what this session's **own** requests
+show about the provider's prompt cache for its next request. It is evidence, not provider state:
+other sessions on the same account, token renewal and provider-side eviction are blind spots.
+
+**Reply** (`QueryResult.value`): `{state, reason?, warm_for_secs?, lapse_by_secs?, proof_ttl_secs?,
+requested_ttl_secs?, proof_cache_tokens?, next_ping_in_secs?}`, every field after `state` optional.
+`state` is `warm`, `cold` or `unknown`; an unknown `state` or `reason` from a newer daemon reads as
+`unknown`. Durations are whole seconds from the daemon's emit, lower bounds rounded down, upper bounds
+up.
+
+| `state` | `reason` | Means |
+|---|---|---|
+| `warm` | — | the session's last accepted request, which the next request can read, read or wrote the cache, and the TTL the server is known to honour for it (`proof_ttl_secs`) has `warm_for_secs` left |
+| `unknown` | `may_have_expired` | that TTL ran out, but the TTL requested (`requested_ttl_secs`), counted from the session's latest send, runs until `lapse_by_secs` |
+| `cold` | `expired` | no send of this session can have kept it past now |
+| `cold` | `uncached` | that request read and wrote nothing |
+| `unknown` | `unmeasured` · `no_matching_request` · `busy` · `parked` · `not_anthropic` · `head_unresolved` · `history_unsettled` · `rollover_pending` · `probe_failed` | no answer from evidence (below) |
+
+How it is computed: from the session's cache anchor, the record keep-warm scheduling and
+cache-preserving compaction read too. It holds the session's last accepted (HTTP 2xx) request, of a
+turn's rounds, a keep-warm ping or a compaction's cached request: when it was sent, its cache
+identity (model, effort, system, thinking, tools, beta header, account) and its messages, the cache
+reads and writes the provider reported for it, and when the session last sent any request. Nothing
+older is kept. The query assembles the next request through the same builder as a ping (nothing is
+sent, no latch is touched); it matches when it has the same identity and starts with that request's
+messages, and otherwise answers `no_matching_request`. The honoured TTL is the one keep-warm
+schedules by: that request's own 1h/5m write split, else the session's downgrade and 1h latches (1h
+only with evidence). Ages count on both the monotonic and the wall clock (a machine that slept wakes
+to the provider's time). A switch to model B finds no match until B's own request, and switching back
+to A finds none either: only the latest request is known. A parked session answers `parked` without
+waking; a woken one, like a reloaded one, knows no request until its next.
+
+**Errors**: `{"error": {"code", "message"?}}` with `code` `busy` (four jobs live, or the image decoder
+is in use), `timeout` (5 s), `superseded` (the same client asked again under another id), `stale`
+(the history, a setting, the tools, the injection or the cache anchor changed before the answer was
+sent: ask once more) or `unavailable`; an unknown code reads as `internal`. The answer reaches only
+the client that asked (above); a client that detaches gets nothing.
+
+**Recommended rendering** (the TUI's `/keepwarm status` uses it word for word):
+
+| Reply | Say | Never say |
+|---|---|---|
+| `warm` | "Recent cache activity · about 4m left" | "cached", "next request will hit" |
+| `unknown{may_have_expired}` | amber "May have expired"; optionally "this session's last possible refresh ends in about 40m" | a second countdown, "warm until" |
+| `cold{expired}` | "No unexpired evidence from this session" | "cache is empty" |
+| `cold{uncached}` | "Last measured request reported no cache activity" | "next request will miss" |
+| other `unknown{…}` | the reason: parked · a turn is running · last turn didn't finish · no matching request yet · last request not measured yet · next turn starts a new context · couldn't check · not tracked for this provider | `0:00` or any timer |
+| `next_ping_in_secs` | "next keep-warm attempt in about 3m" | "renews", "keeps it warm until" |
+| `proof_cache_tokens` | "N tokens read or written by the last measured request" | "N tokens cached" |
+
+A desk counts `warm_for_secs` down from receipt, prefixed "about", in a neutral colour (never green);
+at zero it switches to the amber band and asks once more. It never extends the countdown locally and
+never runs `lapse_by_secs` as a timer. It asks again on `Done`, `SettingChanged`, `Conversation` and
+`Attached`, at the zero transition, and once on `stale`; it never polls.
 
 ## Security posture
 

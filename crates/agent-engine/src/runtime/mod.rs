@@ -28,7 +28,7 @@ pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
 mod http_phases;
-mod image_limits;
+pub mod image_limits;
 mod image_retention;
 pub mod keepwarm;
 pub mod tool_keepwarm;
@@ -515,6 +515,9 @@ pub struct Runtime {
     auth: Arc<RwLock<AuthState>>,
     model: String,
     tools: Arc<RwLock<ToolRegistry>>,
+    /// `tools`' change counter, read without its lock (a `CacheExpiry`
+    /// capture). Replaced together with `tools`.
+    tools_changes: Arc<std::sync::atomic::AtomicU64>,
     system_prompt: Option<String>,
     /// Compiled, content-safe effective prompt metadata retained for inspection/reload.
     effective_prompt: Option<agent_core::prompt::PromptStack>,
@@ -935,9 +938,11 @@ fn fresh_host_parts() -> Result<crate::host::HostParts> {
     let _ = trace::sweep_expired_captures(&capture_dir);
     // Same for tool-output spill dirs past their age (bound here too).
     let spill_root = sweep_spill_root();
+    let (tools, tools_changes) = ToolRegistry::new().into_shared();
     Ok(crate::host::HostParts {
         client,
-        tools: Arc::new(RwLock::new(ToolRegistry::new())),
+        tools,
+        tools_changes,
         hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
         credential_source: crate::auth::CredentialSource::Local,
         token_cache: crate::auth::TokenCache::new(),
@@ -1029,6 +1034,7 @@ impl Runtime {
             })),
             model: crate::models::default_model().to_string(),
             tools: host.tools,
+            tools_changes: host.tools_changes,
             system_prompt: None,
             effective_prompt: None,
             prompt_generation: 0,
@@ -1143,9 +1149,11 @@ impl Runtime {
     pub fn new_headless() -> Self {
         let client = build_http_client(HTTP_READ_TIMEOUT)
             .expect("reqwest client construction is infallible with built-in roots");
+        let (tools, tools_changes) = ToolRegistry::new().into_shared();
         let host = crate::host::HostParts {
             client,
-            tools: Arc::new(RwLock::new(ToolRegistry::new())),
+            tools,
+            tools_changes,
             hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
@@ -1614,7 +1622,7 @@ impl Runtime {
     }
 
     pub fn set_tools(&mut self, tools: ToolRegistry) {
-        self.tools = Arc::new(RwLock::new(tools));
+        (self.tools, self.tools_changes) = tools.into_shared();
     }
 
     pub fn subagent_registry(&self) -> &Arc<Mutex<crate::runtime::subagent::SubagentRegistry>> {
@@ -3144,6 +3152,26 @@ impl Runtime {
         self.cache_ttl.resolve_for_auth_type(&auth.auth_type)
     }
 
+    /// What a `CacheExpiry` capture compares at completion: the tool
+    /// registry's and the session injection's change counters, and which
+    /// registry this runtime reads (lock-free; v3.1 §2).
+    pub fn request_input_generations(&self) -> (usize, u64, u64) {
+        (
+            Arc::as_ptr(&self.tools) as *const () as usize,
+            self.tools_changes
+                .load(std::sync::atomic::Ordering::Acquire),
+            self.hook_bus.injection_generation(),
+        )
+    }
+
+    /// The context head's save is unresolved: no request may be built.
+    pub fn context_head_unresolved(&self) -> bool {
+        self.continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durability_blocked
+    }
+
     /// Thread a parent runtime's TTL atomics onto this (cloned) runtime so
     /// that a driver-owned turn shares the session's single downgrade latch
     /// instead of firing a redundant 1h→5m notice.
@@ -3657,6 +3685,7 @@ impl Clone for Runtime {
             auth: Arc::clone(&self.auth),
             model: self.model.clone(),
             tools: self.tools.clone(),
+            tools_changes: Arc::clone(&self.tools_changes),
             system_prompt: self.system_prompt.clone(),
             effective_prompt: self.effective_prompt.clone(),
             prompt_generation: self.prompt_generation,

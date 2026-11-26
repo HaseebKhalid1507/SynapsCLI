@@ -1462,6 +1462,13 @@ pub enum SessionQuery {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         tool_queue: bool,
     },
+    /// [`CacheExpiry`](super::CacheExpiry): what
+    /// this session's own requests show about its prompt cache, or a
+    /// [`QueryError`](super::query::QueryError) (`busy`, `timeout`,
+    /// `superseded`, `stale`). Never wakes a parked session. Gated on
+    /// [`FEATURE_CACHE_EXPIRY`](super::wire::FEATURE_CACHE_EXPIRY): an
+    /// older daemon cannot decode it.
+    CacheExpiry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
