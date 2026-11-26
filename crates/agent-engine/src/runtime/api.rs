@@ -7947,10 +7947,12 @@ mod cancellation_tests {
         )
     }
 
-    /// Loopback only: answers request `n` (from 0) with `script(n)`, a
-    /// status and a body.
+    /// What a server answers request `n` (from 0) with: a status and a body.
+    type Script = fn(usize) -> (u16, Body);
+
+    /// Loopback only: answers request `n` (from 0) with `script(n)`.
     async fn attempts_server(
-        script: fn(usize) -> (u16, Body),
+        script: Script,
     ) -> (ApiOptions, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
@@ -8079,7 +8081,7 @@ mod cancellation_tests {
     /// keeps the accepted attempt and its usage; only the dispatch moves on.
     #[tokio::test]
     async fn a_retry_refused_before_acceptance_keeps_the_accepted_attempt() {
-        let scripts: [(&str, fn(usize) -> (u16, Body)); 2] = [
+        let scripts: [(&str, Script); 2] = [
             ("in-stream error", |n| match n {
                 0 => (200, scripted(vec![(0, START_CACHED), (0, TRANSIENT)], None)),
                 _ => bad_request(),
@@ -8116,7 +8118,7 @@ mod cancellation_tests {
     /// anchor, with its own usage, never the failed one's.
     #[tokio::test]
     async fn an_accepted_retry_replaces_the_failed_attempt_with_its_own_usage() {
-        let scripts: [(&str, fn(usize) -> (u16, Body)); 2] = [
+        let scripts: [(&str, Script); 2] = [
             ("in-stream error", |n| match n {
                 0 => (200, scripted(vec![(0, START_CACHED), (0, TRANSIENT)], None)),
                 _ => (200, scripted(vec![(0, READ_ONLY)], None)),
