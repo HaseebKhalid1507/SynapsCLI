@@ -7862,4 +7862,403 @@ mod cancellation_tests {
                 | StreamEvent::Session(SessionEvent::Retry(_))
         )));
     }
+
+    // ── The cache anchor cell after an accepted attempt's output fails ───
+    //
+    // The policy: the cache activity the provider reports for an accepted
+    // attempt (its message_start usage) is what that request did to the
+    // cache, whatever becomes of its output. A cancelled, failed or refused
+    // output keeps the attempt the anchor, measured; only a newer accepted
+    // attempt replaces it, with its own usage.
+
+    use crate::runtime::keepwarm::{CacheAnchorCell, CacheAnchorState, CacheUsage};
+
+    /// An accepted attempt's start: read 5, wrote 3 (1h), then some text.
+    const START_CACHED: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1,"cache_read_input_tokens":5,"cache_creation_input_tokens":3,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":3}}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+        "\n\n",
+    );
+
+    /// What [`START_CACHED`] reports.
+    const CACHED: CacheUsage = CacheUsage {
+        read: 5,
+        write: 3,
+        write_5m: Some(0),
+        write_1h: Some(3),
+    };
+
+    /// An in-stream error the request is not retried for.
+    const FAILED: &str = concat!(
+        r#"data: {"type":"error","error":{"type":"invalid_request_error","message":"x"}}"#,
+        "\n\n",
+    );
+
+    /// An in-stream error the request is retried for.
+    const TRANSIENT: &str = concat!(
+        r#"data: {"type":"error","error":{"type":"api_error","message":"x"}}"#,
+        "\n\n",
+    );
+
+    /// The model declined: the request is retried (`refusal_retries`).
+    const REFUSED: &str = concat!(
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+
+    /// A complete reply, "second attempt", that read 40 and wrote nothing.
+    const READ_ONLY: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1,"cache_read_input_tokens":40,"cache_creation_input_tokens":0}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"second attempt"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+
+    /// What [`READ_ONLY`] reports.
+    const READ: CacheUsage = CacheUsage {
+        read: 40,
+        write: 0,
+        write_5m: None,
+        write_1h: None,
+    };
+
+    /// A 400 before any stream: refused, not retried.
+    fn bad_request() -> (u16, Body) {
+        (
+            400,
+            Body::from(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"x"}}"#,
+            ),
+        )
+    }
+
+    /// Loopback only: answers request `n` (from 0) with `script(n)`, a
+    /// status and a body.
+    async fn attempts_server(
+        script: fn(usize) -> (u16, Body),
+    ) -> (ApiOptions, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let (status, body) = script(counter.fetch_add(1, Ordering::SeqCst));
+                async move {
+                    let kind = if status == 200 {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", kind)
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            ApiOptions {
+                anthropic_base_url: Some(url),
+                ..Default::default()
+            },
+            hits,
+            task,
+        )
+    }
+
+    /// `call` with a cache anchor cell: its result, the cell when the first
+    /// retry is announced (attempt 0 is over), and the cell at the end.
+    async fn anchored(
+        mut options: ApiOptions,
+    ) -> (Result<Value>, Option<CacheAnchorState>, CacheAnchorState) {
+        let cell = Arc::new(CacheAnchorCell::default());
+        options.cache_anchor = Some(Arc::clone(&cell));
+        let auth = test_auth();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (result, first) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(call(&auth, &cancel, tx, &options), async {
+                let mut first = None;
+                while let Some(event) = rx.recv().await {
+                    if first.is_none()
+                        && matches!(event, StreamEvent::Session(SessionEvent::Retry(_)))
+                    {
+                        first = Some(cell.state());
+                    }
+                }
+                first
+            })
+        })
+        .await
+        .expect("the request must end well within 10 s");
+        (result, first, cell.state())
+    }
+
+    /// Cancelled after the attempt's usage and some text: the attempt stays
+    /// the anchor, measured.
+    #[tokio::test]
+    async fn reported_cache_activity_survives_a_cancelled_output() {
+        let (mut options, hits, _seen, server) = stalled_server(Stall::Sse).await;
+        let cell = Arc::new(CacheAnchorCell::default());
+        options.cache_anchor = Some(Arc::clone(&cell));
+        let auth = test_auth();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(call(&auth, &cancel, tx, &options), async {
+                while let Some(event) = rx.recv().await {
+                    if matches!(event, StreamEvent::Llm(LlmEvent::Text(_))) {
+                        cancel.cancel();
+                    }
+                }
+            })
+        })
+        .await
+        .expect("cancel must finish a stalled SSE stream");
+        server.abort();
+        assert_eq!(result.unwrap()["content"][0]["text"], "partial");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let state = cell.state();
+        assert!(
+            state.anchor.is_some() && state.anchor == state.dispatched,
+            "{state:?}"
+        );
+        assert_eq!(
+            state.usage,
+            Some(CacheUsage {
+                read: 5,
+                write: 3,
+                write_5m: None,
+                write_1h: None,
+            })
+        );
+    }
+
+    /// An in-stream error after the attempt's usage, not retried: the
+    /// request fails, the attempt stays the anchor, measured.
+    #[tokio::test]
+    async fn reported_cache_activity_survives_an_in_stream_failure() {
+        let (options, hits, server) =
+            attempts_server(|_| (200, scripted(vec![(0, START_CACHED), (0, FAILED)], None))).await;
+        let (result, first, end) = anchored(options).await;
+        server.abort();
+        assert!(result.is_err());
+        assert_eq!(
+            (hits.load(Ordering::SeqCst), first),
+            (1, None),
+            "not retried"
+        );
+        assert!(
+            end.anchor.is_some() && end.anchor == end.dispatched,
+            "{end:?}"
+        );
+        assert_eq!(end.usage, Some(CACHED));
+    }
+
+    /// An accepted attempt's output fails (a transient in-stream error, or
+    /// a refusal) and the retry is refused before it is accepted: the cell
+    /// keeps the accepted attempt and its usage; only the dispatch moves on.
+    #[tokio::test]
+    async fn a_retry_refused_before_acceptance_keeps_the_accepted_attempt() {
+        let scripts: [(&str, fn(usize) -> (u16, Body)); 2] = [
+            ("in-stream error", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, TRANSIENT)], None)),
+                _ => bad_request(),
+            }),
+            ("refusal", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, REFUSED)], None)),
+                _ => bad_request(),
+            }),
+        ];
+        for (what, script) in scripts {
+            let (options, hits, server) = attempts_server(script).await;
+            let (result, first, end) = anchored(options).await;
+            server.abort();
+            assert!(result.is_err(), "{what}: the retry was refused");
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "{what}");
+            let first = first.expect("a retry");
+            assert!(
+                first.anchor.is_some() && first.usage == Some(CACHED),
+                "{what}: {first:?}"
+            );
+            assert_eq!(
+                (end.anchor, end.prefix, end.usage),
+                (first.anchor, first.prefix, first.usage),
+                "{what}: the accepted attempt stays"
+            );
+            assert!(
+                end.dispatched.unwrap().mono > end.anchor.unwrap().mono,
+                "{what}: the retry was dispatched: {end:?}"
+            );
+        }
+    }
+
+    /// The same, and the retry is accepted: the newer attempt is the
+    /// anchor, with its own usage, never the failed one's.
+    #[tokio::test]
+    async fn an_accepted_retry_replaces_the_failed_attempt_with_its_own_usage() {
+        let scripts: [(&str, fn(usize) -> (u16, Body)); 2] = [
+            ("in-stream error", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, TRANSIENT)], None)),
+                _ => (200, scripted(vec![(0, READ_ONLY)], None)),
+            }),
+            ("refusal", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, REFUSED)], None)),
+                _ => (200, scripted(vec![(0, READ_ONLY)], None)),
+            }),
+        ];
+        for (what, script) in scripts {
+            let (options, hits, server) = attempts_server(script).await;
+            let (result, first, end) = anchored(options).await;
+            server.abort();
+            assert_eq!(
+                result.unwrap()["content"][0]["text"],
+                "second attempt",
+                "{what}"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "{what}");
+            let first = first.expect("a retry");
+            assert_eq!(first.usage, Some(CACHED), "{what}: {first:?}");
+            assert!(
+                end.anchor.unwrap().mono > first.anchor.unwrap().mono
+                    && end.anchor == end.dispatched,
+                "{what}: {end:?}"
+            );
+            assert_eq!(end.usage, Some(READ), "{what}");
+        }
+    }
+
+    /// Which part of the older request [`overlap_server`] holds back.
+    #[derive(Clone, Copy, Debug)]
+    enum Held {
+        Headers,
+        Body,
+    }
+
+    /// Loopback only: request 0 (the older) answers [`START_CACHED`] then
+    /// [`FAILED`], held at `gate` before its headers or before its usage
+    /// (`held`); every later request answers [`READ_ONLY`] at once.
+    async fn overlap_server(
+        held: Held,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> (ApiOptions, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let gate = Arc::clone(&gate);
+                async move {
+                    let body = if n > 0 {
+                        scripted(vec![(0, READ_ONLY)], None)
+                    } else {
+                        if let Held::Headers = held {
+                            gate.notified().await;
+                        }
+                        let ping = futures::stream::once(async {
+                            Ok::<_, std::io::Error>(bytes::Bytes::from_static(PING.as_bytes()))
+                        });
+                        let rest = futures::stream::once(async move {
+                            if let Held::Body = held {
+                                gate.notified().await;
+                            }
+                            Ok(bytes::Bytes::from(format!("{START_CACHED}{FAILED}")))
+                        });
+                        Body::from_stream(ping.chain(rest))
+                    };
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            ApiOptions {
+                anthropic_base_url: Some(url),
+                ..Default::default()
+            },
+            hits,
+            task,
+        )
+    }
+
+    /// Two requests on one cell overlap (a turn and a keep-warm ping, say):
+    /// the later-dispatched one is accepted and measured while the older
+    /// one is open, and the older one's usage and failure land after it
+    /// (its body was held), or it is only accepted then (its headers were
+    /// held). The cell stays the newer request's, with its own usage.
+    #[tokio::test]
+    async fn an_overlapping_older_attempt_never_overwrites_the_newer_one() {
+        for held in [Held::Body, Held::Headers] {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (mut options, hits, server) = overlap_server(held, Arc::clone(&gate)).await;
+            let cell = Arc::new(CacheAnchorCell::default());
+            options.cache_anchor = Some(Arc::clone(&cell));
+            let auth = test_auth();
+            let cancel = CancellationToken::new();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let (older, (older_sent, newer, after_newer)) =
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::join!(call(&auth, &cancel, tx.clone(), &options), async {
+                        // The older request is out (and, body held, accepted).
+                        while match held {
+                            Held::Body => cell.state().anchor.is_none(),
+                            Held::Headers => hits.load(Ordering::SeqCst) == 0,
+                        } {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        let older_sent = cell.state().dispatched.unwrap();
+                        let newer = call(&auth, &cancel, tx.clone(), &options).await;
+                        let after_newer = cell.state();
+                        gate.notify_one();
+                        (older_sent, newer, after_newer)
+                    })
+                })
+                .await
+                .expect("both requests must end well within 10 s");
+            server.abort();
+            assert!(older.is_err(), "{held:?}: the older request failed");
+            assert_eq!(
+                newer.unwrap()["content"][0]["text"],
+                "second attempt",
+                "{held:?}"
+            );
+            assert!(
+                after_newer.anchor.unwrap().mono > older_sent.mono
+                    && after_newer.anchor == after_newer.dispatched
+                    && after_newer.usage == Some(READ),
+                "{held:?}: {after_newer:?}"
+            );
+            assert_eq!(
+                cell.state(),
+                after_newer,
+                "{held:?}: the older request changed nothing"
+            );
+        }
+    }
 }
