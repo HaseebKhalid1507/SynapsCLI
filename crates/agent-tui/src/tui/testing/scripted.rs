@@ -52,6 +52,8 @@ pub struct ScriptedTransport {
     input_owner: Option<ClientId>,
     /// `client_input()`; `Exclusive` (an older daemon's) unless a test sets it.
     client_input: agent_engine::session::ClientInput,
+    /// `addressed_replies()`; `true` unless a test plays an older daemon.
+    addressed_replies: bool,
 }
 
 impl ScriptedTransport {
@@ -109,6 +111,7 @@ impl ScriptedTransport {
             mode: AttachMode::Mirror,
             input_owner: Some(ClientId(1)),
             client_input: agent_engine::session::ClientInput::wire_default(),
+            addressed_replies: true,
         }
     }
 
@@ -121,6 +124,12 @@ impl ScriptedTransport {
     }
 
     /// Who may drive (`client_input()`), as the attach snapshot says.
+    /// Play a daemon without `addressed_replies` (it broadcasts replies).
+    pub fn with_addressed_replies(mut self, on: bool) -> Self {
+        self.addressed_replies = on;
+        self
+    }
+
     pub fn with_client_input(mut self, client_input: agent_engine::session::ClientInput) -> Self {
         self.client_input = client_input;
         self
@@ -173,12 +182,12 @@ impl ScriptedTransport {
 
     /// Queue an envelope for `next_event` (tape `SessionEvent` steps).
     pub fn push_event(&mut self, event: SessionEventWire) {
-        let env = Envelope {
-            session_id: self.id.clone(),
-            seq: self.seq,
-            ts: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
+        let env = Envelope::new(
+            self.id.clone(),
+            self.seq,
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
             event,
-        };
+        );
         self.seq += 1;
         self.queue.push_back(env);
     }
@@ -537,5 +546,8 @@ impl ClientTransport for ScriptedTransport {
     }
     fn daemon_pid(&self) -> u32 {
         self.daemon_pid
+    }
+    fn addressed_replies(&self) -> bool {
+        self.addressed_replies
     }
 }

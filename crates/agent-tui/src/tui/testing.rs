@@ -1200,12 +1200,12 @@ impl TestHarness {
     /// drive). After it, the tick arm's secret-prompt poll + stack reconcile
     /// run so a `Prompt` activates the pane exactly as in production.
     pub fn feed_event(&mut self, event: SessionEventWire) -> &mut Self {
-        let env = agent_engine::session::Envelope {
-            session_id: self.link.transport().session_id().clone(),
-            seq: 0,
-            ts: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
+        let env = agent_engine::session::Envelope::new(
+            self.link.transport().session_id().clone(),
+            0,
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
             event,
-        };
+        );
         let render_handle = super::render_thread::RenderHandle::headless();
         let what = "handle_session_event_arm";
         let flow = block_on_bounded(

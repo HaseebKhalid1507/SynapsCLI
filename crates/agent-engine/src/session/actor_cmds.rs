@@ -102,27 +102,27 @@ impl SessionActor {
     /// reads (`notice`/`error`/`output`/`quit`/`unhandled`); the TUI reads
     /// the structured extras (`event`, `model`, `clamp`, `level`,
     /// `config_value`) to render its own lines byte-for-byte.
-    pub(crate) async fn engine_command(&mut self, id: u64, cmd: String, arg: String) {
+    pub(crate) async fn engine_command(&mut self, from: Option<ClientId>, id: u64, cmd: String, arg: String) {
         use crate::engine::commands::CommandResult;
         // TUI-only commands that need the actor's session (it owns the
         // journal): `saveas` names/unnames + force-saves.
         if cmd == "saveas" {
             let value = self.session_name(&arg).await;
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.reply(from, SessionEventWire::QueryResult { id, value });
             return;
         }
         // `/keepwarm [status|off|auto|<N>h]`: actor-owned prompt-cache
         // keep-warm state (task #444).
         if cmd == "keepwarm" {
             let value = self.cache_keepwarm_command(&arg).await;
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.reply(from, SessionEventWire::QueryResult { id, value });
             return;
         }
         // `/auth reload` is async (broker round-trip), so it cannot live in
         // the sync `handle_engine_command`. Never echoes a token.
         if cmd == "auth" {
             let value = auth_command_reply(&arg, &self.runtime).await;
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.reply(from, SessionEventWire::QueryResult { id, value });
             return;
         }
         crate::engine::commands::prepare_engine_command(&cmd, &arg, &self.runtime).await;
@@ -166,7 +166,7 @@ impl SessionActor {
         {
             self.compact(custom_instructions, "manual").await;
         }
-        self.emit(SessionEventWire::QueryResult { id, value });
+        self.reply(from, SessionEventWire::QueryResult { id, value });
     }
 
     /// `/close [force]`: end this session in the daemon. It is saved and
@@ -184,10 +184,11 @@ impl SessionActor {
     ///
     /// Owner-only, like every engine command. Replies on the `QueryResult`
     /// (`output` / `error`) before the `Ended`. `Some(reason)` = end now.
-    /// The host (`host`) may add [`super::actor::CLOSE_UNATTACHED_ARG`]:
-    /// refused while any client is attached.
-    pub(crate) fn close_command(&mut self, id: u64, arg: &str, host: bool) -> Option<EndReason> {
-        let reply = |text: String, kind: &str| SessionEventWire::QueryResult {
+    /// The host (`from: None`) may add [`super::actor::CLOSE_UNATTACHED_ARG`]:
+    /// refused while any client is attached. Every reply is the asker's.
+    pub(crate) fn close_command(&mut self, from: Option<ClientId>, id: u64, arg: &str) -> Option<EndReason> {
+        let host = from.is_none();
+        let answer = |text: String, kind: &str| SessionEventWire::QueryResult {
             id,
             value: serde_json::json!({ "kind": kind, "text": text }),
         };
@@ -197,14 +198,14 @@ impl SessionActor {
                 "force" if !force => force = true,
                 w if host && w == super::actor::CLOSE_UNATTACHED_ARG && !unattached => unattached = true,
                 _ => {
-                    self.emit(reply("usage: /close [force]".into(), "error"));
+                    self.reply(from, answer("usage: /close [force]".into(), "error"));
                     return None;
                 }
             }
         }
         if unattached && !self.attached.is_empty() {
             let n = self.attached.len();
-            self.emit(reply(format!("not closed: attached by {n} client(s)"), "error"));
+            self.reply(from, answer(format!("not closed: attached by {n} client(s)"), "error"));
             return None;
         }
         let live = self.runtime.is_live();
@@ -244,7 +245,7 @@ impl SessionActor {
             blockers.push("an /auto run is armed".to_string());
         }
         if !blockers.is_empty() && !force {
-            self.emit(reply(
+            self.reply(from, answer(
                 format!(
                     "not closed: {}. Closing the session would stop {}. Wait, or use /close force.",
                     blockers.join("; "),
@@ -275,7 +276,7 @@ impl SessionActor {
         } else {
             format!("closing session {session}; resume it with: synaps --attach --continue {session}")
         };
-        self.emit(reply(text, "output"));
+        self.reply(from, answer(text, "output"));
         Some(EndReason::ClientQuit)
     }
 
@@ -357,7 +358,14 @@ impl SessionActor {
     /// commands.rs:123-158: tools-backed (non-interactive) plugin command on
     /// THE runtime's tool set. Reply `{kind:"plugin_output", status, stdout,
     /// stderr}` or `{kind:"error", text}`.
-    pub(crate) async fn plugin_command(&mut self, id: u64, plugin: String, name: String, arg: String) {
+    pub(crate) async fn plugin_command(
+        &mut self,
+        from: Option<ClientId>,
+        id: u64,
+        plugin: String,
+        name: String,
+        arg: String,
+    ) {
         let value = match Self::find_plugin_command(&plugin, &name) {
             None => serde_json::json!({
                 "kind": "error",
@@ -384,7 +392,7 @@ impl SessionActor {
                 Err(e) => serde_json::json!({ "kind": "error", "text": e.to_string() }),
             },
         };
-        self.emit(SessionEventWire::QueryResult { id, value });
+        self.reply(from, SessionEventWire::QueryResult { id, value });
     }
 
     fn find_plugin_command(
@@ -401,9 +409,9 @@ impl SessionActor {
     /// commands.rs:647-693 `/resume`: save current, load `query`, restore
     /// model/reasoning/system prompt, swap conversation. Reply `Resumed{id}`
     /// then `Conversation`; error → `QueryResult{id, {kind:"error", text}}`.
-    pub(crate) async fn resume(&mut self, id: u64, query: String) {
+    pub(crate) async fn resume(&mut self, from: Option<ClientId>, id: u64, query: String) {
         if self.streaming {
-            self.emit(SessionEventWire::QueryResult {
+            self.reply(from, SessionEventWire::QueryResult {
                 id,
                 value: serde_json::json!({ "kind": "error", "text": "cannot resume while streaming" }),
             });
@@ -415,7 +423,7 @@ impl SessionActor {
         let session = match crate::resolve_session(&query) {
             Ok(s) => s,
             Err(e) => {
-                self.emit(SessionEventWire::QueryResult {
+                self.reply(from, SessionEventWire::QueryResult {
                     id,
                     value: serde_json::json!({ "kind": "error", "text": e.to_string() }),
                 });
@@ -436,7 +444,7 @@ impl SessionActor {
                 Ok(lock) => Some(lock),
                 Err(e @ agent_core::session_lock::SessionLockError::Held { .. })
                 | Err(e @ agent_core::session_lock::SessionLockError::CompactedInto { .. }) => {
-                    self.emit(SessionEventWire::QueryResult {
+                    self.reply(from, SessionEventWire::QueryResult {
                         id,
                         value: serde_json::json!({
                             "kind": "error",
@@ -502,7 +510,7 @@ impl SessionActor {
         self.sync_name();
         self.publish_presence();
         self.publish_view().await;
-        self.emit(SessionEventWire::Resumed {
+        self.emit_shared(from, SessionEventWire::Resumed {
             id,
             old_id,
             new_id,

@@ -1639,13 +1639,123 @@ pub enum TurnTrigger {
 }
 
 /// Per-session, gapless `seq` assigned at the single emit site
-/// (`SessionActor::emit`); `ts` from the host clock.
+/// (`SessionActor::emit`); `ts` from the host clock. `audience` says who
+/// may receive it ([`delivers`]); it is never serialized, so the v3 wire is
+/// unchanged. Envelopes built anywhere but the actor, and every envelope
+/// decoded off a socket (the daemon already routed it), are [`Audience::All`].
 #[derive(Debug, Clone)]
 pub struct Envelope {
     pub session_id: SessionId,
     pub seq: u64,
     pub ts: chrono::DateTime<chrono::Utc>,
     pub event: SessionEventWire,
+    pub audience: Audience,
+}
+
+impl Envelope {
+    /// An envelope for everyone ([`Audience::All`]).
+    pub fn new(
+        session_id: SessionId,
+        seq: u64,
+        ts: chrono::DateTime<chrono::Utc>,
+        event: SessionEventWire,
+    ) -> Self {
+        Self { session_id, seq, ts, event, audience: Audience::All }
+    }
+
+    /// The same envelope for `audience`.
+    pub fn to(mut self, audience: Audience) -> Self {
+        self.audience = audience;
+        self
+    }
+}
+
+/// Who an [`Envelope`] is for. Set by the actor at emit, from the command's
+/// trusted origin (`Addressed.from`: the daemon stamps every client frame,
+/// `LocalTransport` stamps its attachment; `None` only from in-process host
+/// callers via `SessionHandle::send`). Never client-supplied, never on the
+/// wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Audience {
+    /// Shared state: every subscriber.
+    #[default]
+    All,
+    /// A reply to that attachment's request: it alone receives it.
+    Client(ClientId),
+    /// A reply to an in-process host caller (idle probe, reload checkpoint,
+    /// `daemon close`/`rename`): no attachment receives it.
+    Host,
+    /// Shared state that also answers `reply_to`'s request (`SettingChanged`
+    /// for a `Set`, `Resumed` for a `Resume`): everyone receives it, and
+    /// every recipient but `reply_to` sees its id as
+    /// [`VIEW_CHANGED_SETTING_ID`](super::wire::VIEW_CHANGED_SETTING_ID)
+    /// ("answers no request of yours").
+    Shared { reply_to: ClientId },
+}
+
+/// Who is reading an event stream, for [`delivers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subscriber {
+    /// An attached client (the daemon's per-connection pump, `LocalTransport`).
+    Attachment(ClientId),
+    /// An in-process host listener that sent with `SessionHandle::send`.
+    Host,
+}
+
+/// `env` as `to` may receive it, or `None` when it isn't for `to`. Every
+/// subscriber applies this BEFORE any wire conversion or capability
+/// projection, so the original envelope is never what a non-recipient
+/// gets: a [`Audience::Shared`] reply is projected per recipient
+/// (borrowed for its asker, an owned copy with the view-only id for
+/// everyone else).
+pub fn delivers(env: &Envelope, to: Subscriber) -> Option<std::borrow::Cow<'_, Envelope>> {
+    use std::borrow::Cow;
+    Some(match seen_as(env.audience, to)? {
+        Seen::AsIs => Cow::Borrowed(env),
+        Seen::ViewOnly => Cow::Owned(projected(env.clone())),
+    })
+}
+
+/// [`delivers`] for an envelope the subscriber already owns (its broadcast
+/// copy): no second copy.
+pub fn deliver(env: Envelope, to: Subscriber) -> Option<Envelope> {
+    Some(match seen_as(env.audience, to)? {
+        Seen::AsIs => env,
+        Seen::ViewOnly => projected(env),
+    })
+}
+
+enum Seen {
+    AsIs,
+    ViewOnly,
+}
+
+fn seen_as(audience: Audience, to: Subscriber) -> Option<Seen> {
+    match (audience, to) {
+        (Audience::All, _) => Some(Seen::AsIs),
+        (Audience::Client(c), Subscriber::Attachment(me)) if c == me => Some(Seen::AsIs),
+        (Audience::Client(_), _) => None,
+        (Audience::Host, Subscriber::Host) => Some(Seen::AsIs),
+        (Audience::Host, _) => None,
+        (Audience::Shared { reply_to }, Subscriber::Attachment(me)) if reply_to == me => Some(Seen::AsIs),
+        (Audience::Shared { .. }, _) => Some(Seen::ViewOnly),
+    }
+}
+
+fn projected(mut env: Envelope) -> Envelope {
+    env.audience = Audience::All;
+    view_only(&mut env.event);
+    env
+}
+
+/// A shared reply's request id, as a recipient that did not ask sees it.
+pub(crate) fn view_only(event: &mut SessionEventWire) {
+    let view = super::wire::VIEW_CHANGED_SETTING_ID;
+    match event {
+        SessionEventWire::SettingChanged(applied) => applied.id = view,
+        SessionEventWire::Resumed { id, .. } => *id = view,
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

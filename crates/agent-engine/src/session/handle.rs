@@ -294,7 +294,12 @@ impl SessionHandle {
 
     /// Send a host-originated command (`from: None`). `Backpressure` when
     /// the queue is full (never drop silently); `Closed` once the actor is
-    /// gone.
+    /// gone. A trusted in-process API (the daemon's idle probe, reload,
+    /// close, rename, pins): it bypasses input ownership, and its replies
+    /// are the host's (`Audience::Host`), so the caller reads them on its
+    /// own `subscribe()` receiver, never through an attachment. A client
+    /// sends with [`Self::send_from`] (the daemon stamps every frame,
+    /// `LocalTransport` its attachment).
     pub async fn send(&self, cmd: SessionCommand) -> Result<(), TransportError> {
         self.send_addressed(Addressed { from: None, cmd })
     }
@@ -576,12 +581,13 @@ pub mod echo {
 
     impl Echo {
         fn emit(&mut self, event: SessionEventWire) {
-            let env = Envelope {
-                session_id: self.id.clone(),
-                seq: self.seq,
-                ts: chrono::Utc::now(),
-                event,
-            };
+            self.emit_to(Audience::All, event);
+        }
+
+        /// Addressed like the real actor's replies (`SessionActor::reply`,
+        /// `emit_shared`).
+        fn emit_to(&mut self, audience: Audience, event: SessionEventWire) {
+            let env = Envelope::new(self.id.clone(), self.seq, chrono::Utc::now(), event).to(audience);
             self.seq += 1;
             // No receivers is not an error: streams are not tied to clients.
             let _ = self.events.send(env);
@@ -617,7 +623,7 @@ pub mod echo {
             }
         }
 
-        fn handle(&mut self, cmd: SessionCommand) -> bool {
+        fn handle(&mut self, from: Option<ClientId>, cmd: SessionCommand) -> bool {
             match cmd {
                 SessionCommand::Attach { client, mode, .. } => {
                     let cid = ClientId(self.next_client);
@@ -693,7 +699,7 @@ pub mod echo {
                         .unwrap_or_default(),
                         other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                     };
-                    self.emit(SessionEventWire::QueryResult { id, value });
+                    self.emit_to(from.map_or(Audience::Host, Audience::Client), SessionEventWire::QueryResult { id, value });
                 }
                 SessionCommand::Set { id, setting } => {
                     let mut view = (**self.view.load()).clone();
@@ -701,14 +707,22 @@ pub mod echo {
                         view.model = model.clone();
                     }
                     self.view.store(Arc::new(view.clone()));
-                    self.emit(SessionEventWire::SettingChanged(SettingApplied {
+                    let mut ev = SessionEventWire::SettingChanged(SettingApplied {
                         id,
                         setting: "echo".into(),
                         ok: true,
                         message: None,
                         view,
                         clamp: None,
-                    }));
+                    });
+                    let audience = match from {
+                        Some(c) => Audience::Shared { reply_to: c },
+                        None => {
+                            crate::session::types::view_only(&mut ev);
+                            Audience::All
+                        }
+                    };
+                    self.emit_to(audience, ev);
                 }
                 SessionCommand::End { reason } => {
                     self.emit(SessionEventWire::Ended { reason });
@@ -732,8 +746,8 @@ pub mod echo {
             clients: HashMap::new(),
             conv: ConversationSnapshot::default(),
         };
-        while let Some(Addressed { cmd, .. }) = ep.cmd_rx.recv().await {
-            if !echo.handle(cmd) {
+        while let Some(Addressed { from, cmd }) = ep.cmd_rx.recv().await {
+            if !echo.handle(from, cmd) {
                 break;
             }
         }
@@ -847,15 +861,13 @@ pub mod locked_placeholder {
         let mut rebind_deadline: Option<tokio::time::Instant> =
             config.owned.as_ref().map(|o| crate::session::owned::initial_rebind_deadline(o.restored));
         let mut seq: u64 = 0;
-        let emit = |seq: &mut u64, events: &broadcast::Sender<Envelope>, event: SessionEventWire| {
-            let env = Envelope {
-                session_id: id.clone(),
-                seq: *seq,
-                ts: chrono::Utc::now(),
-                event,
-            };
+        let emit_to = |seq: &mut u64, events: &broadcast::Sender<Envelope>, audience: Audience, event: SessionEventWire| {
+            let env = Envelope::new(id.clone(), *seq, chrono::Utc::now(), event).to(audience);
             *seq += 1;
             let _ = events.send(env);
+        };
+        let emit = |seq: &mut u64, events: &broadcast::Sender<Envelope>, event: SessionEventWire| {
+            emit_to(seq, events, Audience::All, event)
         };
 
         loop {
@@ -867,7 +879,7 @@ pub mod locked_placeholder {
                     break;
                 }
             };
-            let Some(Addressed { cmd, .. }) = next else { break };
+            let Some(Addressed { from, cmd }) = next else { break };
             match cmd {
                 SessionCommand::ArmOwnerRebind if config.owned.is_some() => {
                     rebind_deadline = Some(crate::session::owned::armed_rebind_deadline(rebind_deadline));
@@ -892,9 +904,10 @@ pub mod locked_placeholder {
                     emit(&mut seq, &ep.events, SessionEventWire::ClientLeft { client });
                 }
                 SessionCommand::Query { id: qid, .. } => {
-                    emit(
+                    emit_to(
                         &mut seq,
                         &ep.events,
+                        from.map_or(Audience::Host, Audience::Client),
                         SessionEventWire::QueryResult {
                             id: qid,
                             value: serde_json::json!({

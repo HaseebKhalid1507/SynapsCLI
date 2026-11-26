@@ -127,6 +127,9 @@ positioning this project stands behind.
   depend on.
 - The **configuration format** — covered by §2.
 - **Documented CLI commands and flags** — subject to the deprecation policy in §3.
+- The **daemon client protocol** — the line-JSON protocol a client (the TUI,
+  `synaps attach`, synaps-desk, a raw socket client) speaks to `synaps daemon`,
+  covered by §5.
 
 These surfaces are what you build against. They change only under the rules
 above, and breaking them requires an explicit version bump and a deprecation
@@ -148,6 +151,44 @@ runtime is the promise.
 
 ---
 
+## 5. Daemon Client Protocol
+
+The protocol between `synaps daemon` and its clients (frames, session
+commands, session events; [`daemon-mode.md`](./daemon-mode.md), "Protocol
+summary") is versioned by `PROTOCOL_VERSION` in
+`crates/agent-engine/src/session/wire.rs` (currently `3`). Daemon and client
+must match exactly; a mismatch is refused loudly at the handshake.
+
+- **Additive changes need no bump.** New frames, events, enum values, fields
+  and queries are added within a version. A breaking change (renaming or
+  retyping a field, changing what an existing message means) bumps
+  `PROTOCOL_VERSION`.
+- **Additions are negotiated, never assumed.** The daemon advertises what it
+  supports in `Welcome.features`; a client checks a feature before it sends
+  something an older daemon would reject or silently ignore. A client
+  declares in `ClientCapabilities` what it can decode; the daemon sends an
+  output an older client would mis-decode only to clients that declare it.
+  The per-feature/capability matrix is in `daemon-mode.md`, "Negotiation".
+- **Readers must tolerate what they don't know.** Event and reply enums a
+  client decodes carry `#[serde(other)]`; a raw client ignores unknown
+  event tags, fields and enum strings. Typed replies and listing rows are
+  append-only: fields are only added, with defaults, and never change name
+  or type.
+- **Replies are addressed.** A reply reaches only the client whose request
+  it answers; shared state that also answers a request (`SettingChanged`,
+  `Resumed`) reaches everyone, with the request id replaced by
+  `VIEW_CHANGED_SETTING_ID` for everyone but the asker. Request ids are the
+  client's own; ids at or above `RESERVED_QUERY_ID_BASE` belong to the
+  transport and the daemon ("Request ids and replies" in `daemon-mode.md`).
+- **A `seq` gap is not loss.** `seq` is gapless per session; a client's
+  stream skips what is not for it.
+- **Binary skew is supported.** Across `synaps daemon reload` an attached
+  client keeps its own binary while the daemon runs the new one; a client and
+  daemon of different releases on the same `PROTOCOL_VERSION` interoperate
+  through the rules above.
+
+---
+
 ## Summary
 
 | Surface | Stability | Governed by |
@@ -157,4 +198,5 @@ runtime is the promise.
 | Config format & keys | Stable within a major; breaking changes are migrated | §2 |
 | Documented CLI commands/flags | Stable; removals follow deprecation window | §3 |
 | Deprecations | Minimum one minor release of warning before removal | §3 |
+| Daemon client protocol (`PROTOCOL_VERSION`) | Stable within a version; additive via features/capabilities | §5 |
 | TUI internals | **Explicitly unstable** — reference implementation | §4 |

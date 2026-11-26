@@ -355,14 +355,20 @@ async fn takeover_steals_and_notifies_previous_owner() {
     b.send_from_self(submit("y")).await.unwrap();
     until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
 
-    // Host-originated sends bypass ownership.
-    a.send(SessionCommand::Set {
-        id: 3,
-        setting: SessionSetting::ApiRetries { n: 1 },
+    // Host-originated sends bypass ownership. A host's `Set` answers no
+    // client: every client sees it view-only.
+    a.handle()
+        .send(SessionCommand::Set {
+            id: 3,
+            setting: SessionSetting::ApiRetries { n: 1 },
+        })
+        .await
+        .unwrap();
+    until(&mut a, |e| {
+        matches!(e, SessionEventWire::SettingChanged(s)
+            if s.id == agent_engine::session::wire::VIEW_CHANGED_SETTING_ID && s.setting == "api_retries" && s.ok)
     })
-    .await
-    .unwrap();
-    until(&mut a, |e| matches!(e, SessionEventWire::SettingChanged(s) if s.id == 3)).await;
+    .await;
     end(&mut b).await;
 }
 
@@ -484,15 +490,9 @@ async fn checkpoint_cancels_turn_saves_closes_ptys_answers_prompts_none() {
     })
     .await;
 
-    a.send(SessionCommand::Checkpoint {
-        reason: CheckpointReason::Reload,
-    })
-    .await
-    .unwrap();
-    let seen = until(&mut a, |e| {
-        matches!(e, SessionEventWire::QueryResult { id, .. } if *id == CHECKPOINT_QUERY_ID)
-    })
-    .await;
+    // The daemon's reload sends it (host-only); its reply is the host's.
+    let cmd = SessionCommand::Checkpoint { reason: CheckpointReason::Reload };
+    let (_, seen) = host_reply(&mut a, cmd, CHECKPOINT_QUERY_ID).await;
     assert!(seen.iter().any(|e| matches!(
         &e.event,
         SessionEventWire::SystemNotice(n) if n.contains("daemon reloading")
@@ -580,17 +580,9 @@ async fn checkpoint_is_owner_only_from_clients() {
         _ => unreachable!(),
     }
 
-    // Host-originated checkpoint lands.
-    handle
-        .send(SessionCommand::Checkpoint {
-            reason: CheckpointReason::HostRequest,
-        })
-        .await
-        .unwrap();
-    let seen = until(&mut a, |e| {
-        matches!(e, SessionEventWire::QueryResult { id, .. } if *id == CHECKPOINT_QUERY_ID)
-    })
-    .await;
+    // Host-originated checkpoint lands; its reply is the host's.
+    let cmd = SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest };
+    let (_, seen) = host_reply(&mut a, cmd, CHECKPOINT_QUERY_ID).await;
     assert!(seen
         .iter()
         .any(|e| matches!(e.event, SessionEventWire::Aborted { .. })));

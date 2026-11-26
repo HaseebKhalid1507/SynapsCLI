@@ -590,7 +590,9 @@ pub async fn session_is_idle(handle: &SessionHandle) -> bool {
     let probe = async {
         loop {
             match rx.recv().await {
-                Ok(env) => {
+                // Only the host's own reply: a client that sends this id
+                // gets its answer on its attachment, never here.
+                Ok(env) if env.audience == crate::session::Audience::Host => {
                     if let SessionEventWire::QueryResult { id, value } = env.event {
                         if id == IDLE_PROBE_QUERY_ID {
                             // Real actor: {"streaming": bool, "pending_prompts": n}. A backend that
@@ -601,6 +603,7 @@ pub async fn session_is_idle(handle: &SessionHandle) -> bool {
                         }
                     }
                 }
+                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return true,
             }

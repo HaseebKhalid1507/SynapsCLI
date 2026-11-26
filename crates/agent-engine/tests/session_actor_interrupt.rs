@@ -1071,11 +1071,13 @@ async fn a_tool_cut_by_a_reload_says_so_not_by_user() {
         )
     })
     .await;
-    a.send(SessionCommand::Checkpoint {
-        reason: CheckpointReason::Reload,
-    })
-    .await
-    .unwrap();
+    // Host-only (the daemon's reload sends it).
+    a.handle()
+        .send(SessionCommand::Checkpoint {
+            reason: CheckpointReason::Reload,
+        })
+        .await
+        .unwrap();
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
 
     let conv = last_conversation(&seen);
