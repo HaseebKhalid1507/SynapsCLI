@@ -251,7 +251,7 @@ impl Broker {
             ));
         };
         match prompt
-            .prompt(PROMPT_TITLE.to_string(), prompt_text(&argv, &sudo_prompt))
+            .secret(PROMPT_TITLE.to_string(), prompt_text(&argv, &sudo_prompt))
             .await
         {
             Some(secret) => {

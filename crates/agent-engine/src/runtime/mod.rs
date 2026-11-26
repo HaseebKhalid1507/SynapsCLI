@@ -283,8 +283,7 @@ pub async fn resolve_before_tool_call_result(
                 }
             });
             let response = prompt
-                .prompt_scoped(
-                    crate::session::CONFIRM_PROMPT_TITLE.to_string(),
+                .confirm_tool_call(
                     confirm_prompt_body(
                         &message,
                         &sources,
@@ -295,13 +294,9 @@ pub async fn resolve_before_tool_call_result(
                 )
                 .await;
 
-            match response.as_deref().map(str::trim) {
-                Some(answer)
-                    if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") =>
-                {
-                    approved(modified_input)
-                }
-                Some(answer) if answer.eq_ignore_ascii_case(CONFIRM_ANSWER_ALLOW_ALL) => {
+            match crate::session::ConfirmGate::ToolCall.decide(response.as_deref()) {
+                crate::session::ConfirmDecision::Allow => approved(modified_input),
+                crate::session::ConfirmDecision::AllowAll => {
                     match session_allow_all {
                         Some(latch) if latch.allow(&keys) => tracing::warn!(
                             extensions = ?sources,
@@ -316,7 +311,7 @@ pub async fn resolve_before_tool_call_result(
                     }
                     approved(modified_input)
                 }
-                _ => crate::extensions::hooks::events::HookResult::Block {
+                crate::session::ConfirmDecision::Deny => crate::extensions::hooks::events::HookResult::Block {
                     reason: format!(
                         "Tool call confirmation denied: {}",
                         redact_secret_text(&crate::session::sanitize_prompt_text(&message))
@@ -4341,6 +4336,28 @@ mod tests {
             result,
             crate::extensions::hooks::events::HookResult::Continue
         ));
+    }
+
+    /// Allow all with no session latch (no scope): this call only.
+    #[tokio::test]
+    async fn confirm_prompt_allow_all_without_a_latch_allows_this_call() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let request = rx.recv().await.expect("confirm prompt request");
+            assert_eq!(request.policy, crate::session::PromptPolicy::Confirm(crate::session::ConfirmGate::ToolCall));
+            assert!(request.confirm_scope.is_none(), "no latch, no Allow all offered");
+            let _ = request.response_tx.send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
+        });
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
+            Some(&handle),
+            false,
+            None,
+        )
+        .await;
+        task.await.unwrap();
+        assert!(matches!(result, crate::extensions::hooks::events::HookResult::Continue));
     }
 
     #[tokio::test]

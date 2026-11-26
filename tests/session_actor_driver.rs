@@ -1128,7 +1128,7 @@ impl agent_engine::Tool for PromptFixtureTool {
             .capabilities
             .secret_prompt
             .expect("stream passes Some(handle)");
-        Ok(match handle.prompt("Secret".into(), "enter secret".into()).await {
+        Ok(match handle.secret("Secret".into(), "enter secret".into()).await {
             Some(v) => format!("answered:{}", v.len()),
             None => "cancelled".to_string(),
         })

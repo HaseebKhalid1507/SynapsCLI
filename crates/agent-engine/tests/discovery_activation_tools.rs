@@ -617,7 +617,7 @@ async fn activation_confirm_prompt_emits_confirm_kind_prompt() {
     let handle = agent_engine::tools::SecretPromptHandle::new(tx);
     let task = tokio::spawn(async move {
         let req = rx.recv().await.expect("prompt mode raises exactly one prompt");
-        let kind = req.kind;
+        let kind = req.kind();
         let title = req.title.clone();
         let body = req.prompt.clone();
         let _ = req.response_tx.send(Some("y".into()));
@@ -742,6 +742,26 @@ async fn activate_tools_host_prompt_no_or_absent_denies_without_mutation() {
         )
         .await
         .expect_err("host denial fails closed");
+    assert!(err.to_string().contains("confirmation"), "{err}");
+    assert_eq!(set_fingerprint(&set.read().unwrap()), before);
+
+    // Host answers Allow all: not an answer at this gate, so denied, zero
+    // mutation (the tool-call gate's Allow all never opens this one).
+    let (always_prompt, _) = fake_prompt(Some(agent_engine::tools::CONFIRM_ANSWER_ALLOW_ALL));
+    let err = ActivateToolsTool
+        .execute(
+            json!({"tools": ["builtin:beta_tool"]}),
+            ctx_with_prompt(
+                Some(capability_for_mode(
+                    &registry,
+                    &set,
+                    agent_core::config::ActivationConfirm::Prompt,
+                )),
+                Some(always_prompt),
+            ),
+        )
+        .await
+        .expect_err("Allow all is a denial at the activation gate");
     assert!(err.to_string().contains("confirmation"), "{err}");
     assert_eq!(set_fingerprint(&set.read().unwrap()), before);
 

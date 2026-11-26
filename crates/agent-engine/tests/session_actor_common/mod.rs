@@ -327,7 +327,12 @@ pub async fn end(t: &mut LocalTransport) {
 
 /// Builtin-origin tool that asks for a secret through the stream's
 /// `SecretPromptHandle` and reports only its length (never the value).
+/// The exact value it was handed goes to [`LAST_SECRET`], a private test
+/// channel, never into the event stream.
 pub struct PromptFixtureTool;
+
+/// What [`PromptFixtureTool`] was last handed, byte for byte.
+pub static LAST_SECRET: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
 
 #[async_trait::async_trait]
 impl agent_engine::Tool for PromptFixtureTool {
@@ -352,12 +357,12 @@ impl agent_engine::Tool for PromptFixtureTool {
             .capabilities
             .secret_prompt
             .expect("actor passes its SecretPromptHandle to the stream");
-        Ok(
-            match handle.prompt("Secret".into(), "enter secret".into()).await {
-                Some(v) => format!("answered:{}", v.len()),
-                None => "cancelled".to_string(),
-            },
-        )
+        let value = handle.secret("Secret".into(), "enter secret".into()).await;
+        *LAST_SECRET.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value.clone());
+        Ok(match value {
+            Some(v) => format!("answered:{}", v.len()),
+            None => "cancelled".to_string(),
+        })
     }
 }
 
@@ -496,6 +501,103 @@ pub async fn confirm_host() -> Arc<EngineHost> {
         .write()
         .await
         .register(Arc::new(ConfirmFixtureTool));
+    host
+}
+
+/// Same tool name, raising the `activate_tools` gate's Confirm
+/// (`SecretPromptHandle::confirm_activation`) and reading the answer the
+/// way that gate does.
+pub struct ActivationFixtureTool;
+
+#[async_trait::async_trait]
+impl agent_engine::Tool for ActivationFixtureTool {
+    fn name(&self) -> &str {
+        "prompt_fixture"
+    }
+    fn description(&self) -> &str {
+        "raises an activation confirm"
+    }
+    fn parameters(&self) -> agent_engine::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> agent_engine::tools::ToolOrigin {
+        agent_engine::tools::ToolOrigin::Builtin
+    }
+    async fn execute(
+        &self,
+        _params: agent_engine::Value,
+        ctx: agent_engine::ToolContext,
+    ) -> agent_engine::Result<String> {
+        let handle = ctx
+            .capabilities
+            .secret_prompt
+            .expect("actor passes its SecretPromptHandle to the stream");
+        let answer = handle.confirm_activation("activate builtin:beta_tool?".into()).await;
+        Ok(match agent_engine::session::ConfirmGate::Activation.decide(answer.as_deref()) {
+            agent_engine::session::ConfirmDecision::Allow => "allowed".to_string(),
+            _ => "blocked".to_string(),
+        })
+    }
+}
+
+pub async fn activation_host() -> Arc<EngineHost> {
+    let host = host().await;
+    host.parts().tools.write().await.register(Arc::new(ActivationFixtureTool));
+    host
+}
+
+/// Like [`ConfirmFixtureTool`], on a path with no session latch: the
+/// prompt has no scope, so Allow all approves this call only.
+pub struct UnscopedConfirmFixtureTool;
+
+#[async_trait::async_trait]
+impl agent_engine::Tool for UnscopedConfirmFixtureTool {
+    fn name(&self) -> &str {
+        "prompt_fixture"
+    }
+    fn description(&self) -> &str {
+        "raises a tool-call confirm without a latch"
+    }
+    fn parameters(&self) -> agent_engine::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> agent_engine::tools::ToolOrigin {
+        agent_engine::tools::ToolOrigin::Builtin
+    }
+    async fn execute(
+        &self,
+        _params: agent_engine::Value,
+        ctx: agent_engine::ToolContext,
+    ) -> agent_engine::Result<String> {
+        use agent_engine::extensions::hooks::events::HookResult;
+        let handle = ctx
+            .capabilities
+            .secret_prompt
+            .expect("actor passes its SecretPromptHandle to the stream");
+        let result = agent_engine::runtime::resolve_before_tool_call_result(
+            HookResult::Confirm {
+                message: "run it?".into(),
+                sources: vec!["jev".into()],
+                tool: Some("bash".into()),
+                generations: vec![],
+                modified_input: None,
+                modified_by: vec![],
+            },
+            Some(&handle),
+            false,
+            None,
+        )
+        .await;
+        Ok(match result {
+            HookResult::Continue => "allowed".to_string(),
+            _ => "blocked".to_string(),
+        })
+    }
+}
+
+pub async fn unscoped_confirm_host() -> Arc<EngineHost> {
+    let host = host().await;
+    host.parts().tools.write().await.register(Arc::new(UnscopedConfirmFixtureTool));
     host
 }
 

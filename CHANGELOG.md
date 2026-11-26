@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A resolved prompt says what was applied, and a late answer is refused.**
+  `PromptResolved` carries `outcome`: `allowed` (the gate opened),
+  `denied`, `answered` (a Secret's value), `cancelled` (the turn or session
+  ended first, or the waiting call was gone) or `timed_out` (nobody attached
+  by the abandonment deadline). A client no longer guesses from the tool's
+  result text, where a cancel at the gate reads like a denial. An `Answer`
+  to a prompt that is no longer pending gets `AnswerRefused{prompt_id,
+  outcome}`, to its sender only, instead of being dropped silently; the TUI
+  shows it as a toast and never takes it for a setting's reply. Each prompt
+  is raised for a gate (`SecretPromptHandle::confirm_tool_call`,
+  `confirm_activation`, `secret`), and one function reads an answer for it:
+  Allow all opens the tool-call gate and denies at the activation gate, as
+  each gate always did. Answers the policy refuses (an observer's, Allow all
+  from a non-owner) are the same `Refused{command: "answer"}` as before.
+  Feature `prompt_outcome`. Additive on the wire: older daemons omit the
+  field, older clients ignore it and read `AnswerRefused` as an unknown
+  event, and an outcome a client doesn't know reads as `unknown`.
+
 - **Workers report what they used.** `subagent_status`, `subagent_collect`
   and a worker's completion event (`data.usage`) carry `usage`: provider
   requests (the worker's keep-warm pings included), input / output /
