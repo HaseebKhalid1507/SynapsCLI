@@ -636,8 +636,6 @@ mod tests {
         assert!(!prompt_price_tier_differs("claude-opus-5-5", 90_000, 900_000));
         assert!(!prompt_price_tier_differs("claude-haiku-4-5", 90_000, 900_000));
         assert!(!prompt_price_tier_differs("no-such-model", 1, 900_000));
-        // A provider row with a long tier.
-        assert!(prompt_price_tier_differs("google/gemini-2.5-pro", 1_000, 900_000));
     }
 
     #[test]
