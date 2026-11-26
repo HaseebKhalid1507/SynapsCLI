@@ -672,13 +672,20 @@ impl Runtime {
         instructions: &str,
         expect: CachedPrefix,
         spend: &super::compaction::CompactionSpend,
+        cancel: &CancellationToken,
     ) -> Result<ChatSummaryReply> {
-        let tap = PingTap::default();
+        // The tap's usage IS the ledger line: usage the provider reports is
+        // booked as it arrives, so an aborted request (Cancel while the
+        // stream is still open) keeps what it was billed.
+        let tap = PingTap {
+            usage: spend.open(agent_core::compaction::SummaryRequest::ChatRequest, &self.model),
+            ..PingTap::default()
+        };
         let request = super::api::CompactionRequest::expecting(expect);
         let (result, _notices) = self
             .next_turn_request(
                 history,
-                &CancellationToken::new(),
+                cancel,
                 NextTurnRequest::Compaction {
                     instructions,
                     request: &request,
@@ -687,14 +694,9 @@ impl Runtime {
             )
             .await?;
         // Did it read the cache? Every check before the network said it
-        // would; the provider's usage says whether it did. Reported even
-        // when the reply is then refused: the request was billed.
+        // would; the provider's usage says whether it did. Already in
+        // `spend`, also when the reply is then refused: it was billed.
         let usage = tap.usage();
-        spend.record(
-            agent_core::compaction::SummaryRequest::ChatRequest,
-            &self.model,
-            usage.clone(),
-        );
         if let Some(warning) =
             super::compaction_cached::cache_miss_warning(self.session_id.as_deref(), &usage)
         {

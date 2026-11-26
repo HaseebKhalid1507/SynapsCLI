@@ -15,6 +15,7 @@ use agent_engine::session::{
     SessionCommand, SessionConfig, SessionEventWire, SessionQuery,
 };
 use axum::response::IntoResponse;
+use futures::StreamExt;
 use serial_test::serial;
 
 /// What tells a cache-preserving compaction request (the chat's own next
@@ -683,5 +684,116 @@ async fn a_missed_cache_is_said_to_the_user_once() {
     let applied = position(&|e| matches!(e, SessionEventWire::CompactionApplied { .. }));
     assert!(disclosed < missed && missed < applied);
     assert_close(after.cost, before.cost + cost_of(CHAT_INPUT, CHAT_OUTPUT, 100, 4_000));
+    end(&mut a).await;
+}
+
+/// The chat request's first event (with its usage), then the stream stays
+/// open: the provider has billed the request, and nothing ends it.
+fn chat_sse_open() -> String {
+    let start = serde_json::json!({"type": "message_start", "message": {
+        "id": "msg_sum", "type": "message", "role": "assistant", "content": [],
+        "model": MODEL, "stop_reason": null, "stop_sequence": null,
+        "usage": {"input_tokens": CHAT_INPUT, "output_tokens": 0,
+            "cache_creation_input_tokens": 20, "cache_read_input_tokens": 4_000}}});
+    format!("data: {start}\n\n")
+}
+
+/// Turns as usual; the chat request answers [`chat_sse_open`] and keeps
+/// the connection open (keep-alive comments). `opened` counts the chat
+/// requests whose usage has been sent.
+async fn stub_open_chat() -> (String, Summaries, Arc<AtomicUsize>) {
+    let summaries = Summaries::default();
+    let opened = Arc::new(AtomicUsize::new(0));
+    let (s, o) = (summaries.clone(), Arc::clone(&opened));
+    let app = axum::Router::new().fallback(move |body: String| {
+        let (s, o) = (s.clone(), Arc::clone(&o));
+        async move {
+            if body.contains("\"stream\":true") && body.contains(CHAT_SUMMARY_REQUEST) {
+                s.chat.fetch_add(1, Ordering::SeqCst);
+                let stream = futures::stream::once(async move {
+                    o.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(chat_sse_open()))
+                })
+                .chain(futures::stream::unfold((), |()| async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Some((Ok(axum::body::Bytes::from(": keep-alive\n\n")), ()))
+                }));
+                return axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap();
+            }
+            if body.contains("\"stream\":true") {
+                return (
+                    axum::http::StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    SSE_HI.to_string(),
+                )
+                    .into_response();
+            }
+            s.transcript.fetch_add(1, Ordering::SeqCst);
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), summaries, opened)
+}
+
+/// `Status`: the session's cost and token totals.
+async fn status(a: &mut LocalTransport, id: u64) -> (f64, u64, u64) {
+    a.send(SessionCommand::Query { id, query: SessionQuery::Status }).await.unwrap();
+    let seen = until(a, |e| matches!(e, SessionEventWire::QueryResult { id: got, .. } if *got == id)).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::QueryResult { value, .. } => (
+            value["cost"].as_f64().expect("cost"),
+            value["tokens"]["input"].as_u64().expect("input"),
+            value["tokens"]["output"].as_u64().expect("output"),
+        ),
+        _ => unreachable!(),
+    }
+}
+
+/// Cancel while the chat request's stream is still open, after the
+/// provider reported its usage: the request was billed, so it is booked,
+/// once, and nothing is added later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn cancel_after_the_usage_arrived_books_it_once() {
+    let _h = Home::new();
+    let (url, summaries, opened) = stub_open_chat().await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle, ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    warm(&mut a, 2).await;
+    let (cost, input, output) = status(&mut a, 1).await;
+
+    a.send(SessionCommand::Compact { instructions: None }).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::CompactionStarted { .. })).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while opened.load(Ordering::SeqCst) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the chat request was sent");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The usage is on the wire; give the client a moment to read it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.send(SessionCommand::Cancel).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(e.event, SessionEventWire::CompactionCancelled)));
+    assert_eq!((summaries.chat.load(Ordering::SeqCst), summaries.transcript.load(Ordering::SeqCst)), (1, 0));
+
+    let booked = status(&mut a, 2).await;
+    assert_close(booked.0, cost + cost_of(CHAT_INPUT, 0, 4_000, 20));
+    assert_eq!((booked.1, booked.2), (input + CHAT_INPUT, output));
+    // Nothing lands later.
+    drain_for(&mut a, Duration::from_secs(1)).await;
+    let later = status(&mut a, 3).await;
+    assert_close(later.0, booked.0);
+    assert_eq!((later.1, later.2), (booked.1, booked.2));
     end(&mut a).await;
 }

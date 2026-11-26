@@ -402,6 +402,7 @@ pub(super) async fn summarize(
     policy: &DisclosurePolicy,
     rendered: &RenderedCompactionInput,
     spend: &super::compaction::CompactionSpend,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<CompactionOutcome> {
     let instructions = instructions(rendered);
     let expect = match cached_path(
@@ -421,7 +422,7 @@ pub(super) async fn summarize(
         }
     };
     let sent = match runtime
-        .compaction_cached_request(history, &instructions, expect, spend)
+        .compaction_cached_request(history, &instructions, expect, spend, cancel)
         .await
     {
         Ok(sent) => sent,
@@ -1580,7 +1581,7 @@ mod tests {
         let history = warm_chat(&rt).await;
         let expect = rt.cached_prefix().unwrap();
         let sent = rt
-            .compaction_cached_request(&history, "summarize", expect, &Default::default())
+            .compaction_cached_request(&history, "summarize", expect, &Default::default(), &Default::default())
             .await
             .expect("sent");
         assert_eq!(

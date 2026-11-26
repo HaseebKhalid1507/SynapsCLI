@@ -485,6 +485,7 @@ impl CompactionDisclosure {
         CompactionDispatch {
             request: self.summary_request(),
             spend: CompactionSpend::default(),
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 }
@@ -507,6 +508,10 @@ pub struct CompactionDispatch {
     /// the line names as the fallback. `None`: the preview was local-only.
     request: Option<agent_core::compaction::SummaryRequest>,
     spend: CompactionSpend,
+    /// Cancels the compaction cooperatively: a request in flight ends
+    /// through its normal finalization (the usage the provider reported is
+    /// booked), and no further request is sent.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl CompactionDispatch {
@@ -518,6 +523,11 @@ impl CompactionDispatch {
 
     pub fn request(&self) -> Option<agent_core::compaction::SummaryRequest> {
         self.request
+    }
+
+    /// The compaction's cancellation, shared by clones.
+    pub fn cancel_token(&self) -> &tokio_util::sync::CancellationToken {
+        &self.cancel
     }
 }
 
@@ -549,40 +559,87 @@ impl SummaryRequestUsage {
 /// owns the session's counters drains this once ([`Self::take`]) and books
 /// each entry the way it books a turn's usage.
 #[derive(Debug, Clone, Default)]
-pub struct CompactionSpend(std::sync::Arc<std::sync::Mutex<Vec<SummaryRequestUsage>>>);
+pub struct CompactionSpend(std::sync::Arc<std::sync::Mutex<Vec<SpendEntry>>>);
+
+/// One request's line in a [`CompactionSpend`]. `usage` is shared with the
+/// request while it runs ([`CompactionSpend::open`]), so what the provider
+/// has reported is in the ledger the moment it is seen, also when the
+/// request is then aborted.
+#[derive(Debug)]
+struct SpendEntry {
+    request: agent_core::compaction::SummaryRequest,
+    model: String,
+    usage: std::sync::Arc<std::sync::Mutex<super::keepwarm::KeepWarmUsage>>,
+}
 
 impl CompactionSpend {
-    /// Book `usage` of a `request` sent to `model`. A usage of all zeros
-    /// (no reply, nothing billed) is not an entry.
+    /// Book `usage` of a `request` sent to `model`, once it is known in
+    /// full.
     pub fn record(
         &self,
         request: agent_core::compaction::SummaryRequest,
         model: &str,
-        mut usage: super::keepwarm::KeepWarmUsage,
+        usage: super::keepwarm::KeepWarmUsage,
     ) {
-        if usage.input_tokens == 0
-            && usage.output_tokens == 0
-            && usage.cache_read_tokens == 0
-            && usage.cache_write_tokens == 0
-        {
-            return;
-        }
-        usage.model.get_or_insert_with(|| model.to_string());
+        let cell = self.open(request, model);
+        *cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = usage;
+    }
+
+    /// A line for a `request` to `model` that is about to be sent: the
+    /// returned cell is the line's usage, which the request adds to as the
+    /// provider reports it. Nothing is booked twice: the line is the only
+    /// place that usage is recorded.
+    pub fn open(
+        &self,
+        request: agent_core::compaction::SummaryRequest,
+        model: &str,
+    ) -> std::sync::Arc<std::sync::Mutex<super::keepwarm::KeepWarmUsage>> {
+        let usage = std::sync::Arc::default();
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(SummaryRequestUsage { request, usage });
+            .push(SpendEntry {
+                request,
+                model: model.to_string(),
+                usage: std::sync::Arc::clone(&usage),
+            });
+        usage
     }
 
-    /// The entries booked so far, removed: what is taken is never handed
-    /// out again, so it reaches a session's counters once.
+    /// The lines booked so far, removed: what is taken is never handed out
+    /// again, so it reaches a session's counters once. A line of all zeros
+    /// (no reply, nothing billed) is not returned. Take only once the
+    /// requests have ended (the task finished or was joined): usage a
+    /// request reports after its line was taken is not booked.
     pub fn take(&self) -> Vec<SummaryRequestUsage> {
-        std::mem::take(
+        let entries = std::mem::take(
             &mut *self
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        );
+        entries
+            .into_iter()
+            .filter_map(|entry| {
+                let mut usage = entry
+                    .usage
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if usage.input_tokens == 0
+                    && usage.output_tokens == 0
+                    && usage.cache_read_tokens == 0
+                    && usage.cache_write_tokens == 0
+                {
+                    return None;
+                }
+                usage.model.get_or_insert(entry.model);
+                Some(SummaryRequestUsage {
+                    request: entry.request,
+                    usage,
+                })
+            })
+            .collect()
     }
 }
 
@@ -806,17 +863,25 @@ pub async fn compact_conversation(
                     &policy,
                     &rendered,
                     &dispatch.spend,
+                    &dispatch.cancel,
                 )
                 .await
                 {
                     return Ok(outcome);
                 }
             }
+            // A cancelled compaction sends nothing more.
+            if dispatch.cancel.is_cancelled() {
+                return Err(crate::error::RuntimeError::Session("compaction cancelled".into()));
+            }
             let user_msg =
                 std::sync::Arc::new(json!({"role": "user", "content": rendered.prompt_text}));
-            let summary_text = runtime
-                .transcript_summary_call(&model, vec![user_msg], Some(&dispatch.spend))
-                .await?;
+            let summary_text = tokio::select! {
+                text = runtime.transcript_summary_call(&model, vec![user_msg], Some(&dispatch.spend)) => text?,
+                () = dispatch.cancel.cancelled() => {
+                    return Err(crate::error::RuntimeError::Session("compaction cancelled".into()));
+                }
+            };
             let mut outcome = CompactionOutcome::for_prompt_stack(
                 summary_text,
                 &model,

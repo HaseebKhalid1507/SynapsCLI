@@ -230,7 +230,10 @@ All notable changes to this project will be documented in this file.
   billed is added to the session's token totals and cost, once, like a
   turn's usage. That includes a chat request whose reply was not used (a
   tool call, an empty reply) together with the transcript request sent
-  after it. When compaction starts a successor session, the spend is saved
+  after it, and what a request had reported when the compaction was
+  cancelled (Cancel stops the request as a turn is stopped, and waits at
+  most two seconds for the compaction to end).
+  When compaction starts a successor session, the spend is saved
   with the session that was summarized and the successor starts at zero,
   as before. `synaps rpc` adds the tokens to its totals (it does not price
   usage, for turns either).

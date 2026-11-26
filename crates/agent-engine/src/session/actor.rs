@@ -357,6 +357,8 @@ pub(crate) struct CompactionJob {
     /// What the job's summary requests were billed, shared with the task
     /// (`book_compaction` drains it when the job ends, however it ends).
     pub(crate) spend: crate::runtime::compaction::CompactionSpend,
+    /// Cancels the job cooperatively (see `stop_compaction_task`).
+    pub(crate) cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Commands that only the input owner may send (B1). Everything else
@@ -3511,7 +3513,7 @@ impl SessionActor {
     pub(crate) async fn cancel_turn(&mut self, reason: crate::engine::interrupt::InterruptReason) {
         if !self.streaming {
             if self.compact.is_some() {
-                self.abort_compaction();
+                self.abort_compaction().await;
                 if let Some(q) = self.conv.queued_message.take() {
                     self.emit(SessionEventWire::Dequeued { text: q });
                 }
@@ -4287,6 +4289,7 @@ impl SessionActor {
         // between could make a second answer differ from the line).
         let dispatch = disclosure.dispatch();
         let spend = dispatch.spend().clone();
+        let cancel = dispatch.cancel_token().clone();
         self.emit(SessionEventWire::CompactionStarted {
             source: source.to_string(),
             disclosure: disclosure.render_line(),
@@ -4306,6 +4309,7 @@ impl SessionActor {
             source: source.to_string(),
             started: tokio::time::Instant::now(),
             spend,
+            cancel,
         });
         self.update_attach_state();
     }
@@ -5105,7 +5109,7 @@ impl SessionActor {
         // any the cancelled turn registered meanwhile.
         let stopping = if reload { self.stop_workers_for_reload() } else { Vec::new() };
         let stopped_workers = await_stopped_workers(self.id.as_str(), stopping).await;
-        self.abort_compaction();
+        self.abort_compaction().await;
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
             let _ = tx.send(None);
             self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
@@ -5346,9 +5350,17 @@ impl SessionActor {
     }
 
     /// Abort the spawned job (`CompactionCancelled`); prior state intact.
-    pub(crate) fn abort_compaction(&mut self) {
+    pub(crate) async fn abort_compaction(&mut self) {
         if let Some(job) = self.compact.take() {
-            job.task.abort();
+            let budget = Duration::from_millis(budgets::CANCEL_DRAIN_TIMEOUT_MS);
+            if !stop_compaction_task(job.task, &job.cancel, budget).await {
+                tracing::warn!(
+                    session = %self.id,
+                    budget_ms = budgets::CANCEL_DRAIN_TIMEOUT_MS,
+                    "cancelled compaction did not stop within twice the drain budget; \
+                     usage it reports later is not booked"
+                );
+            }
             // A request that had already been answered was paid for.
             self.book_compaction(&job.spend);
             self.emit(SessionEventWire::CompactionCancelled);
@@ -5718,7 +5730,7 @@ impl SessionActor {
         if self.streaming {
             self.cancel_turn(interrupt).await;
         }
-        self.abort_compaction();
+        self.abort_compaction().await;
         // Outstanding prompts are cancelled (tool sees `None`).
         while let Some((pr, tx)) = self.pending_prompts.pop_front() {
             let _ = tx.send(None);
@@ -6182,6 +6194,116 @@ mod worker_cancel_scope_tests {
                 "{reason:?} stops every running worker"
             );
         }
+    }
+}
+
+/// Stop a compaction task, and wait until it has stopped, so its ledger is
+/// drained after the last entry, never before. First cooperatively
+/// (`cancel`): a request in flight ends through its normal finalization,
+/// which reports the usage the provider already sent (an aborted stream
+/// would drop it), and no further request is sent. A task that has not
+/// stopped within `budget` is aborted, and waited for once more for at
+/// most `budget`: `abort` only asks, and a task running on another worker
+/// can still be adding to its ledger. `true` once the task's future has
+/// been dropped; `false` when it did not stop in time.
+async fn stop_compaction_task<T>(
+    mut task: tokio::task::JoinHandle<T>,
+    cancel: &tokio_util::sync::CancellationToken,
+    budget: Duration,
+) -> bool {
+    cancel.cancel();
+    if tokio::time::timeout(budget, &mut task).await.is_ok() {
+        return true;
+    }
+    task.abort();
+    tokio::time::timeout(budget, task).await.is_ok()
+}
+
+#[cfg(test)]
+mod compaction_stop_tests {
+    use super::stop_compaction_task;
+    use crate::runtime::compaction::CompactionSpend;
+    use crate::runtime::keepwarm::KeepWarmUsage;
+    use agent_core::compaction::SummaryRequest;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A task in the middle of a poll when it is cancelled (here: blocked
+    /// on another worker, then booking usage before its next await) books
+    /// before the drain, and the drain hands it out once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_task_books_before_the_drain_never_after() {
+        let spend = CompactionSpend::default();
+        let started = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let spend = spend.clone();
+            let started = Arc::clone(&started);
+            async move {
+                started.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                spend.record(
+                    SummaryRequest::ChatRequest,
+                    "claude-opus-5-5",
+                    KeepWarmUsage { input_tokens: 7, cache_read_tokens: 4_000, ..Default::default() },
+                );
+                std::future::pending::<()>().await;
+            }
+        });
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let never = tokio_util::sync::CancellationToken::new();
+        assert!(stop_compaction_task(task, &never, Duration::from_millis(500)).await, "stopped");
+        let booked = spend.take();
+        assert_eq!(booked.len(), 1, "{booked:?}");
+        assert_eq!(booked[0].usage.cache_read_tokens, 4_000);
+        assert!(spend.take().is_empty(), "handed out once");
+    }
+
+    /// A task that does not stop within the budget is reported, not
+    /// waited for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_that_does_not_stop_in_time_is_not_waited_for() {
+        let started = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let started = Arc::clone(&started);
+            async move {
+                started.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(800));
+            }
+        });
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let t0 = std::time::Instant::now();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(!stop_compaction_task(task, &cancel, Duration::from_millis(100)).await);
+        assert!(t0.elapsed() < Duration::from_millis(600));
+    }
+
+    /// A task that honours the cancellation finishes on its own, booking
+    /// what its request reported while finalizing, before the drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_task_finishes_and_books_its_final_usage() {
+        let spend = CompactionSpend::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let (spend, cancel) = (spend.clone(), cancel.clone());
+            async move {
+                let line = spend.open(SummaryRequest::ChatRequest, "claude-opus-5-5");
+                cancel.cancelled().await;
+                // Finalization reports the residual usage.
+                tokio::task::yield_now().await;
+                line.lock().unwrap().input_tokens = 7;
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(stop_compaction_task(task, &cancel, Duration::from_secs(5)).await);
+        let booked = spend.take();
+        assert_eq!(booked.len(), 1, "{booked:?}");
+        assert_eq!(booked[0].usage.input_tokens, 7);
+        assert!(spend.take().is_empty(), "handed out once");
     }
 }
 
