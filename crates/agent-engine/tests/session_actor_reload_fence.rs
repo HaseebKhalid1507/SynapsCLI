@@ -152,18 +152,9 @@ fn worker_finishing_during_the_checkpoint(f: &Fixture) {
 }
 
 async fn checkpoint_for_reload(f: &mut Fixture) -> Vec<CarriedWorker> {
-    f.handle
-        .send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload })
-        .await
-        .unwrap();
-    let seen = until(&mut f.client, |e| {
-        matches!(e, SessionEventWire::QueryResult { id, .. } if *id == CHECKPOINT_QUERY_ID)
-    })
-    .await;
+    let cmd = SessionCommand::Checkpoint { reason: CheckpointReason::Reload };
+    let (value, seen) = host_reply(&mut f.client, cmd, CHECKPOINT_QUERY_ID).await;
     assert_eq!(started(&seen), 0, "no turn during the checkpoint: {seen:#?}");
-    let SessionEventWire::QueryResult { value, .. } = &seen.last().unwrap().event else {
-        unreachable!()
-    };
     serde_json::from_value(value["record"]["workers"].clone()).unwrap()
 }
 

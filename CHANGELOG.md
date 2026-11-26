@@ -262,6 +262,22 @@ All notable changes to this project will be documented in this file.
   room for it: it now stops after the first attempt and says so, with the
   two sizes. A 429 without that header, as on a subscription login, keeps
   its retries.
+- **Daemon replies reach only the client that asked** (`Welcome.features`:
+  `addressed_replies`). Every client numbers its own requests, so two
+  clients attached to one session both send request 5, and the daemon used
+  to broadcast every reply: each client could take the other's `Query`,
+  `Set`, `Resume` or command reply for its own. Now a `QueryResult` goes to
+  the attachment that asked (a daemon-internal one to nobody), and a
+  `SettingChanged`/`Resumed` still reaches every client but carries the
+  view-only id `VIEW_CHANGED_SETTING_ID` for all but the asker. The wire is
+  unchanged: an older client simply stops receiving replies that were never
+  its own. Against an older daemon (replies still broadcast) the TUI draws
+  its request ids from a random base, which makes an accidental collision
+  highly unlikely. In process, `LocalTransport::send` now sends as its
+  attachment, like a socket client (input ownership applies, replies come
+  back to it); `synaps chat` numbers its post-compaction readout like its
+  other requests. `docs/daemon-mode.md` gains "Negotiation" and "Request ids
+  and replies", and `docs/STABILITY.md` a daemon-protocol section (§5).
 
 - **Sign-in opens the whole page on Windows.** The browser was started
   through `cmd /c start <url>`, and `cmd` ends a command at the first `&`:

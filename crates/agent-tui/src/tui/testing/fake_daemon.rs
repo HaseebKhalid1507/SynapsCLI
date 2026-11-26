@@ -123,11 +123,13 @@ impl FakeDaemon {
                 .replay_text
                 .iter()
                 .flat_map(|t| {
-                    let env = |event| agent_engine::session::Envelope {
-                        session_id: agent_engine::session::SessionId(s.id.clone()),
-                        seq: 0,
-                        ts: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
-                        event,
+                    let env = |event| {
+                        agent_engine::session::Envelope::new(
+                            agent_engine::session::SessionId(s.id.clone()),
+                            0,
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
+                            event,
+                        )
                     };
                     [
                         env(agent_engine::session::SessionEventWire::TurnStarted {

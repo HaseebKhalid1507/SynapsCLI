@@ -38,10 +38,6 @@ mod actor {
     use synaps_cli::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
     use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 
-    /// Reserved query id for the post-compaction token readout (user
-    /// queries start at 1 and count up).
-    const COMPACT_TOKENS_QUERY: u64 = u64::MAX - 1;
-
     struct Render {
         is_tty: bool,
         in_thinking: bool,
@@ -54,9 +50,22 @@ mod actor {
         /// next stdin line answers it). Secret prompts are never held here:
         /// the line client has no masked input and cancels them.
         pending_confirm: Option<agent_engine::session::PromptRequest>,
+        /// This attachment's next request id. Every request, the
+        /// post-compaction readout included, takes an application id
+        /// (below `RESERVED_QUERY_ID_BASE`) from here: its reply is
+        /// addressed back to this attachment.
+        next_query: u64,
+        /// The id of the post-compaction `ContextAssessment` in flight.
+        compact_query: Option<u64>,
     }
 
     impl Render {
+        fn next_id(&mut self) -> u64 {
+            let id = self.next_query;
+            self.next_query += 1;
+            id
+        }
+
         fn end_thinking(&mut self) {
             if self.in_thinking {
                 eprintln!("\x1b[0m");
@@ -138,14 +147,17 @@ mod actor {
                 }
                 SessionEventWire::CompactionApplied { .. } => {
                     // `compacted → ~N tokens` needs the post-apply assessment.
+                    let id = self.next_id();
+                    self.compact_query = Some(id);
                     let _ = transport
                         .send(SessionCommand::Query {
-                            id: COMPACT_TOKENS_QUERY,
+                            id,
                             query: SessionQuery::ContextAssessment,
                         })
                         .await;
                 }
-                SessionEventWire::QueryResult { id, value } if id == COMPACT_TOKENS_QUERY => {
+                SessionEventWire::QueryResult { id, value } if self.compact_query == Some(id) => {
+                    self.compact_query = None;
                     eprintln!(
                         "\x1b[2m[compacted → ~{} tokens]\x1b[0m",
                         value["used_tokens"].as_u64().unwrap_or(0)
@@ -334,10 +346,11 @@ mod actor {
             cost: snap.conversation.cost,
             ended: false,
             pending_confirm: None,
+            next_query: 1,
+            compact_query: None,
         };
         let mut pending_attachments = agent_engine::attachments::PendingAttachments::default();
         let mut stdin_lines = TokioBufReader::new(tokio::io::stdin()).lines();
-        let mut next_query: u64 = 1;
         let mut prompt_shown = false;
 
         loop {
@@ -465,8 +478,7 @@ mod actor {
                     _ => {} // fall through to EngineCommand
                 }
 
-                let id = next_query;
-                next_query += 1;
+                let id = r.next_id();
                 let _ = t
                     .send(SessionCommand::EngineCommand {
                         id,
@@ -488,8 +500,7 @@ mod actor {
                             let _ = t.send(SessionCommand::NewSession).await;
                         }
                         "sessions" => {
-                            let id = next_query;
-                            next_query += 1;
+                            let id = r.next_id();
                             let _ = t
                                 .send(SessionCommand::Query {
                                     id,
@@ -516,8 +527,7 @@ mod actor {
                             }
                         }
                         "status" => {
-                            let id = next_query;
-                            next_query += 1;
+                            let id = r.next_id();
                             let _ = t
                                 .send(SessionCommand::Query {
                                     id,
@@ -525,8 +535,7 @@ mod actor {
                                 })
                                 .await;
                             let st = r.reply(&mut t, id).await;
-                            let id2 = next_query;
-                            next_query += 1;
+                            let id2 = r.next_id();
                             let _ = t
                                 .send(SessionCommand::Query {
                                     id: id2,

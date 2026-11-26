@@ -21,7 +21,7 @@ use super::DaemonState;
 use crate::session::actor::RENAME_COMMAND;
 use crate::session::actor_cmds::RenameArgs;
 use crate::session::wire::{DaemonFrame, RefuseReason, RenameRefusal, RENAME_QUERY_ID_BASE};
-use crate::session::{SessionCommand, SessionEventWire, SessionId, TransportError};
+use crate::session::{Audience, SessionCommand, SessionEventWire, SessionId, TransportError};
 
 /// How long a full command queue is retried before giving up.
 pub const RENAME_SEND_RETRY: Duration = Duration::from_secs(2);
@@ -88,7 +88,10 @@ pub async fn rename_session(
         loop {
             match rx.recv().await {
                 Ok(env) => match env.event {
-                    SessionEventWire::QueryResult { id, value } if id == query_id => return Some(value),
+                    // Only the host's reply (a client's never reaches a host waiter).
+                    SessionEventWire::QueryResult { id, value } if id == query_id && env.audience == Audience::Host => {
+                        return Some(value)
+                    }
                     SessionEventWire::Ended { .. } => return None,
                     _ => {}
                 },
