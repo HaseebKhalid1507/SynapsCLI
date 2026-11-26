@@ -2363,7 +2363,7 @@ mod disclosure_tests {
             runtime.set_model(own.to_string());
             runtime.set_compaction_model(Some("provider-small".to_string()));
             crate::runtime::script_summary_requests(|_| Some(Ok("SUMMARY".to_string())));
-            let outcome = compact_conversation(&sentinel_messages(), &runtime, None)
+            let outcome = compact_as_previewed(&sentinel_messages(), &runtime, None)
                 .await
                 .expect("the scripted summary");
             assert_eq!(crate::runtime::scripted_summary_requests(), [asked], "{own}");
