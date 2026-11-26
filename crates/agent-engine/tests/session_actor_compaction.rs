@@ -913,3 +913,56 @@ async fn a_cancelled_compaction_saves_what_it_was_billed() {
     assert_eq!(after.api_messages, before.api_messages, "the history is unchanged");
     end(&mut a).await;
 }
+
+/// Linked successor: the predecessor's `compacted_into` link is written,
+/// then advancing a named chain fails. The transition rolls back and the
+/// failure path saves the session as it was: on disk it is unlinked, with
+/// its history and the compaction's charge, its chain still points at it,
+/// and no successor is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_transition_failing_after_the_link_saves_the_session_unlinked() {
+    use agent_engine::runtime::compaction::{set_transition_failpoint, TransitionFailpoint};
+    let _h = Home::new();
+    let reply = ChatReply { cache_read: 4_000, cache_write: 20, tool_call: false };
+    let (url, summaries) = stub_billed(reply).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host
+        .create_session(SessionConfig {
+            persist: true,
+            compaction_policy: CompactionPolicyWire::LinkedSuccessor,
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    warm(&mut a, 2).await;
+    let id = handle.journal_id();
+    let before = agent_engine::core::session::Session::load(&id).unwrap();
+    agent_engine::chain::save_chain("work", &id).unwrap();
+
+    set_transition_failpoint(Some((TransitionFailpoint::AtChainAdvance, 0)));
+    a.send(SessionCommand::Compact { instructions: None }).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    set_transition_failpoint(None);
+    assert!(seen.iter().any(|e| matches!(e.event, SessionEventWire::CompactionFailed { .. })));
+    assert_eq!(summaries.chat.load(Ordering::SeqCst), 1);
+    assert_eq!(handle.journal_id(), id, "the session stays on its own journal");
+
+    let after = agent_engine::core::session::Session::load(&id).unwrap();
+    assert_eq!(after.compacted_into, None, "the link is gone");
+    assert_eq!(after.api_messages, before.api_messages, "the history is unchanged");
+    assert_close(after.session_cost, before.session_cost + cost_of(CHAT_INPUT, CHAT_OUTPUT, 4_000, 20));
+    assert_eq!(after.total_input_tokens, before.total_input_tokens + CHAT_INPUT);
+    assert_eq!(agent_engine::chain::load_chain("work").unwrap().head, id);
+    let ids: Vec<String> = agent_engine::core::session::list_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(ids, vec![id.clone()], "no successor is left");
+    end(&mut a).await;
+}
