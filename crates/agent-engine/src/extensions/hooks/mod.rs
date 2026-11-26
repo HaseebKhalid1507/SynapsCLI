@@ -289,6 +289,15 @@ impl HookBus {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// Test seam: hold the injection's write lock, as a set or a clear
+    /// holds it, until the guard drops.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn hold_session_injection(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, String>> {
+        self.session_injection.write().await
+    }
+
     /// Compatibility shim: writes under the empty key.
     #[deprecated(note = "use set_session_injection_for")]
     pub async fn set_session_injection(&self, content: String) {

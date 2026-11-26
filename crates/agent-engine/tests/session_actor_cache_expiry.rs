@@ -958,3 +958,125 @@ async fn an_active_period_names_the_next_attempt() {
     assert!(c.next_ping_in_secs.is_some(), "{c:?}");
     end(&mut f.t).await;
 }
+
+// ── the job's reads, off the loop; the answer, aged at emit ──────────────
+
+/// `Cancel` to an idle session, answered `Idle` within five seconds.
+async fn cancel_answered(t: &mut LocalTransport) {
+    t.send(SessionCommand::Cancel).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        until(t, |e| matches!(e, SessionEventWire::Idle)),
+    )
+    .await
+    .expect("the actor serviced Cancel");
+}
+
+/// A job waits for the tool registry's and the session injection's write
+/// locks (a writer holds both, then the injection's alone): the actor
+/// services `Cancel` throughout, and the job answers once both are free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_actor_services_cancel_while_the_job_waits_for_a_writer() {
+    let mut f = scripted(NO_KEEPWARM_1H).await;
+    turn(&mut f.t, "hello").await;
+    let parts = f.host.parts();
+    let hold = Hold::new().open();
+    let registry = parts.tools.write().await;
+    let injection = parts.hook_bus.hold_session_injection().await;
+    ask(&mut f.t, 140).await;
+    cancel_answered(&mut f.t).await;
+    assert_eq!(hold.reached(), 0, "the job waits for the registry");
+    drop(registry);
+    // The job reads the registry, then waits for the injection.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cancel_answered(&mut f.t).await;
+    assert_eq!(hold.reached(), 0, "the job waits for the injection");
+    drop(injection);
+    let_one_through(&hold);
+    assert_eq!(says(&reply(&mut f.t, 140).await.unwrap()), WARM);
+    drop(hold);
+    end(&mut f.t).await;
+}
+
+/// The session's injection is set while the job reads its inputs: the job
+/// has read the old injection (it was waiting at the lock before the set)
+/// and waits for the registry when the set lands. `stale`, never the old
+/// reading; asking again answers for the new injection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_injection_set_while_the_job_reads_is_stale() {
+    let mut f = scripted(NO_KEEPWARM_1H).await;
+    turn(&mut f.t, "hello").await;
+    let (status, _) = host_reply(
+        &mut f.t,
+        SessionCommand::Query {
+            id: 150,
+            query: SessionQuery::Status,
+        },
+        150,
+    )
+    .await;
+    let session = status["session"].as_str().unwrap().to_string();
+    let parts = f.host.parts();
+    let hold = Hold::new().open();
+    let injection = parts.hook_bus.hold_session_injection().await;
+    ask(&mut f.t, 151).await;
+    // The job waits for the injection; a writer takes the registry.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let registry = parts.tools.write().await;
+    drop(injection);
+    // The job reads the old injection, then waits for the registry.
+    parts
+        .hook_bus
+        .set_session_injection_for(&session, "context set mid-read".into())
+        .await;
+    assert_eq!(hold.reached(), 0, "the job is still reading");
+    drop(registry);
+    // A job that missed the set would answer from the old reading.
+    let_one_through(&hold);
+    assert_eq!(
+        reply(&mut f.t, 151).await.unwrap_err().code,
+        QueryErrorCode::Stale
+    );
+    drop(hold);
+    let c = expiry(&mut f.t, 152).await;
+    assert_eq!(
+        says(&c),
+        unknown(CacheReason::NoMatchingRequest),
+        "the injection is part of the key: {c:?}"
+    );
+    end(&mut f.t).await;
+}
+
+/// The job has its answer (a 5-minute proof, warm), and the actor emits it
+/// after the warm deadline, nothing changed: classified at emit,
+/// `may_have_expired` until the requested hour has run from the request.
+/// Tokio's clock (the monotonic one) is paused and moved on between the
+/// job's answer and the emit, hence the single-threaded runtime.
+#[tokio::test]
+#[serial]
+async fn an_answer_emitted_after_its_warm_deadline_is_aged_at_emit() {
+    let mut f = scripted(NO_KEEPWARM_1H).await;
+    f.script.turns(Reply::FiveMin);
+    turn(&mut f.t, "hello").await;
+    let hold = Hold::new().open();
+    ask(&mut f.t, 160).await;
+    reached(&hold, 1).await;
+    tokio::time::pause();
+    // Nothing runs between these two: the clock moves on before the job
+    // hands its answer to the actor.
+    let_one_through(&hold);
+    tokio::time::advance(Duration::from_secs(301)).await;
+    let c = reply(&mut f.t, 160).await.unwrap();
+    tokio::time::resume();
+    assert_eq!(says(&c), unknown(CacheReason::MayHaveExpired), "{c:?}");
+    assert_eq!(
+        (c.warm_for_secs, c.proof_ttl_secs, c.requested_ttl_secs),
+        (None, Some(300), Some(3600)),
+        "{c:?}"
+    );
+    assert!((3290..=3299).contains(&c.lapse_by_secs.unwrap()), "{c:?}");
+    drop(hold);
+    end(&mut f.t).await;
+}
