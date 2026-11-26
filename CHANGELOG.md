@@ -235,8 +235,10 @@ All notable changes to this project will be documented in this file.
   most two seconds for the compaction to end).
   When compaction starts a successor session, the spend is saved
   with the session that was summarized and the successor starts at zero,
-  as before. `synaps rpc` adds the tokens to its totals (it does not price
-  usage, for turns either).
+  as before; a compaction that failed or was cancelled saves the session
+  with its new totals and the history it had. `synaps rpc` adds the
+  tokens to its totals and saves them also when compaction fails (it does
+  not price usage, for turns either).
   In the api-log both summary requests have `"compaction": true` and a
   `summary_request` field, `chat_request` or `transcript`, the same words
   as the saved compaction record. The transcript request wrote no api-log

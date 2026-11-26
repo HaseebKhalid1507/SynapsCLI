@@ -797,3 +797,119 @@ async fn cancel_after_the_usage_arrived_books_it_once() {
     assert_eq!((later.1, later.2), (booked.1, booked.2));
     end(&mut a).await;
 }
+
+/// The chat request answers `reply`; the transcript request after it is
+/// billed and, after `delay`, answers with no text, so it fails.
+async fn stub_failing_fallback(reply: ChatReply, delay: Duration) -> (String, Summaries) {
+    let summaries = Summaries::default();
+    let s = summaries.clone();
+    let app = axum::Router::new().fallback(move |body: String| {
+        let s = s.clone();
+        async move {
+            if body.contains("\"stream\":true") {
+                let sse = if body.contains(CHAT_SUMMARY_REQUEST) {
+                    s.chat.fetch_add(1, Ordering::SeqCst);
+                    chat_sse(reply)
+                } else {
+                    SSE_HI.to_string()
+                };
+                return (
+                    axum::http::StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    sse,
+                )
+                    .into_response();
+            }
+            s.transcript.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+            axum::Json(serde_json::json!({
+                "id": "msg_c", "type": "message", "role": "assistant",
+                "model": MODEL, "stop_reason": "end_turn", "content": [],
+                "usage": {"input_tokens": TRANSCRIPT_INPUT, "output_tokens": TRANSCRIPT_OUTPUT}
+            }))
+            .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), summaries)
+}
+
+/// A warm, saved session on [`stub_failing_fallback`]; what is on disk
+/// before the compaction.
+async fn saved_session_failing_fallback(
+    delay: Duration,
+) -> (LocalTransport, Summaries, String, agent_engine::core::session::Session) {
+    let reply = ChatReply { cache_read: 4_000, cache_write: 20, tool_call: true };
+    let (url, summaries) = stub_failing_fallback(reply, delay).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host
+        .create_session(SessionConfig { persist: true, ..cfg() })
+        .await
+        .unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    warm(&mut a, 2).await;
+    let id = handle.journal_id();
+    let saved = agent_engine::core::session::Session::load(&id).expect("saved after the turns");
+    assert!(saved.session_cost > 0.0);
+    (a, summaries, id, saved)
+}
+
+/// The chat request is billed (its reply calls a tool) and the transcript
+/// request after it is billed and fails: at `Idle` the journal holds both
+/// charges, with the history it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_failed_compaction_saves_what_it_was_billed() {
+    let _h = Home::new();
+    let (mut a, summaries, id, before) = saved_session_failing_fallback(Duration::ZERO).await;
+
+    a.send(SessionCommand::Compact { instructions: None }).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(e.event, SessionEventWire::CompactionFailed { .. })));
+    assert_eq!((summaries.chat.load(Ordering::SeqCst), summaries.transcript.load(Ordering::SeqCst)), (1, 1));
+
+    let after = agent_engine::core::session::Session::load(&id).unwrap();
+    assert_close(
+        after.session_cost,
+        before.session_cost
+            + cost_of(CHAT_INPUT, CHAT_OUTPUT, 4_000, 20)
+            + cost_of(TRANSCRIPT_INPUT, TRANSCRIPT_OUTPUT, 0, 0),
+    );
+    assert_eq!(after.total_input_tokens, before.total_input_tokens + CHAT_INPUT + TRANSCRIPT_INPUT);
+    assert_eq!(after.api_messages, before.api_messages, "the history is unchanged");
+    assert_eq!(after.compacted_into, None);
+    end(&mut a).await;
+}
+
+/// Cancel after the chat request was answered (and refused) while the
+/// transcript request is still pending: at `Idle` the journal holds the
+/// chat request's charge, with the history it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_cancelled_compaction_saves_what_it_was_billed() {
+    let _h = Home::new();
+    let (mut a, summaries, id, before) =
+        saved_session_failing_fallback(Duration::from_secs(30)).await;
+
+    a.send(SessionCommand::Compact { instructions: None }).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::CompactionStarted { .. })).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while summaries.transcript.load(Ordering::SeqCst) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the fallback was sent");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    a.send(SessionCommand::Cancel).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(seen.iter().any(|e| matches!(e.event, SessionEventWire::CompactionCancelled)));
+
+    let after = agent_engine::core::session::Session::load(&id).unwrap();
+    assert_close(after.session_cost, before.session_cost + cost_of(CHAT_INPUT, CHAT_OUTPUT, 4_000, 20));
+    assert_eq!(after.total_input_tokens, before.total_input_tokens + CHAT_INPUT);
+    assert_eq!(after.api_messages, before.api_messages, "the history is unchanged");
+    end(&mut a).await;
+}

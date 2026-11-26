@@ -891,6 +891,9 @@ async fn handle_compact(
         }
         Err(e) => {
             tracing::error!(error = %e, "compaction failed");
+            // Nothing was applied, but the summary requests were billed:
+            // their totals are saved with the unchanged history.
+            state.lock().await.save_session().await;
             let _ = writer_tx
                 .send(RpcEvent::Error {
                     id: Some(id),
@@ -1735,6 +1738,90 @@ mod compaction_spend_tests {
         assert_eq!((st.total_input_tokens, st.total_output_tokens), (157, 23));
         book_compaction_spend(&mut st, &spend);
         assert_eq!((st.total_input_tokens, st.total_output_tokens), (157, 23));
+    }
+
+    /// A compaction whose summary request was billed and then failed (no
+    /// text) still saves what it was billed, with the history unchanged.
+    #[tokio::test]
+    #[serial_test::serial(base_dir)]
+    async fn a_failed_compaction_saves_its_billed_totals() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("config"), "").unwrap();
+        std::fs::write(
+            home.path().join("auth.json"),
+            "{\"anthropic\": {\"type\": \"oauth\", \"refresh\": \"r\", \"access\": \"synthetic-token\", \"expires\": 9999999999999}}",
+        )
+        .unwrap();
+        let old_base = std::env::var("SYNAPS_BASE_DIR").ok();
+        let old_url = std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok();
+        let old_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::set_var("SYNAPS_BASE_DIR", home.path());
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        let app = axum::Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({
+                "id": "msg_c", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-5", "stop_reason": "end_turn", "content": [],
+                "usage": {"input_tokens": 50, "output_tokens": 10}
+            }))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", format!("http://{addr}"));
+
+        let mut runtime = Runtime::new().await.expect("runtime");
+        runtime.set_model("claude-sonnet-4-5".to_string());
+        let mut session = Session::new("claude-sonnet-4-5", "medium", None);
+        let history: Vec<synaps_cli::SharedMessage> = (0..4)
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                Arc::new(serde_json::json!({"role": role, "content": format!("message {i}")}))
+            })
+            .collect();
+        session.api_messages = history.clone();
+        let id = session.id.clone();
+        let st = RpcState {
+            runtime,
+            session,
+            context_head: Default::default(),
+            api_messages: history.clone(),
+            total_input_tokens: 100,
+            total_output_tokens: 10,
+            session_cost: 0.0,
+            in_flight: None,
+            pending_events: Vec::new(),
+            consecutive_auto_turns: 0,
+            auto_turn_pending: false,
+            events_auto_turn: true,
+            auto_turn_cap: 5,
+            turn_budgets: Default::default(),
+            save_owed: false,
+            session_lock: None,
+        };
+        let (writer, mut frames) = mpsc::channel(8);
+        handle_compact("compact-test".into(), Arc::new(Mutex::new(st)), writer).await;
+        let mut failed = false;
+        while let Ok(frame) = frames.try_recv() {
+            failed |= matches!(frame, RpcEvent::Error { .. });
+        }
+        let saved = Session::load(&id);
+
+        match old_base {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+        match old_url {
+            Some(v) => std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", v),
+            None => std::env::remove_var("SYNAPS_ANTHROPIC_BASE_URL"),
+        }
+        if let Some(v) = old_key {
+            std::env::set_var("ANTHROPIC_API_KEY", v);
+        }
+
+        assert!(failed, "the compaction failed");
+        let saved = saved.expect("the billed totals were saved");
+        assert_eq!((saved.total_input_tokens, saved.total_output_tokens), (150, 20));
+        assert_eq!(saved.api_messages, history, "the history is unchanged");
     }
 }
 

@@ -3518,6 +3518,8 @@ impl SessionActor {
                     self.emit(SessionEventWire::Dequeued { text: q });
                 }
                 self.update_attach_state();
+                // `Idle` means saved: the cancelled compaction's charge too.
+                self.flush_saves().await;
             }
             self.emit(SessionEventWire::Idle);
             return;
@@ -4365,6 +4367,7 @@ impl SessionActor {
         // the session that was summarized. Also when the job failed.
         self.book_compaction(&job.spend);
         let msg_count = self.conv.api_messages.len();
+        let mut transitioned = false;
         match res {
             Err(join) => {
                 if !join.is_cancelled() {
@@ -4402,6 +4405,7 @@ impl SessionActor {
                 .await;
                 match applied {
                     Ok(applied) => {
+                        transitioned = true;
                         let previous = applied.previous_session_id.clone();
                         self.conv.session = applied.session;
                         self.conv.api_messages = applied.api_messages;
@@ -4444,6 +4448,15 @@ impl SessionActor {
                     }),
                 }
             }
+        }
+        // The transition saved the totals just booked (`apply_compaction`
+        // writes the predecessor, or the session compacted in place).
+        // Without one the session is as it was, and only the save queued
+        // here, before `Idle`, puts its new totals on disk. Never after a
+        // transition: this snapshot would be the successor's, and the
+        // predecessor owns the charge.
+        if !transitioned {
+            self.request_save();
         }
         self.emit_conversation();
         self.update_attach_state();
@@ -4512,10 +4525,15 @@ impl SessionActor {
                     after.used_tokens()
                 )));
             }
-            Err(e) => self.emit(SessionEventWire::SystemNotice(format!(
-                "[compaction failed: {}]",
-                e
-            ))),
+            Err(e) => {
+                // Nothing was applied: the booked totals reach the disk
+                // only through this save.
+                self.request_save();
+                self.emit(SessionEventWire::SystemNotice(format!(
+                    "[compaction failed: {}]",
+                    e
+                )));
+            }
         }
         self.emit_conversation();
     }
@@ -5361,8 +5379,10 @@ impl SessionActor {
                      usage it reports later is not booked"
                 );
             }
-            // A request that had already been answered was paid for.
+            // A request that had already been answered was paid for, and
+            // its charge is saved (the history is unchanged).
             self.book_compaction(&job.spend);
+            self.request_save();
             self.emit(SessionEventWire::CompactionCancelled);
             self.publish_presence();
         }
