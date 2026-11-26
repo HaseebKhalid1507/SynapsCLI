@@ -5370,12 +5370,13 @@ impl SessionActor {
     /// Abort the spawned job (`CompactionCancelled`); prior state intact.
     pub(crate) async fn abort_compaction(&mut self) {
         if let Some(job) = self.compact.take() {
-            let budget = Duration::from_millis(budgets::CANCEL_DRAIN_TIMEOUT_MS);
+            // `stop_compaction_task` waits up to `budget` twice.
+            let budget = Duration::from_millis(budgets::COMPACTION_STOP_TIMEOUT_MS / 2);
             if !stop_compaction_task(job.task, &job.cancel, budget).await {
                 tracing::warn!(
                     session = %self.id,
-                    budget_ms = budgets::CANCEL_DRAIN_TIMEOUT_MS,
-                    "cancelled compaction did not stop within twice the drain budget; \
+                    budget_ms = budgets::COMPACTION_STOP_TIMEOUT_MS,
+                    "cancelled compaction did not stop within its stop budget; \
                      usage it reports later is not booked"
                 );
             }

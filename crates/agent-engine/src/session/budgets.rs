@@ -27,9 +27,22 @@ pub const CANCEL_DRAIN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(CANCEL_DRAIN_TIMEOUT_MS);
 /// Whole-second ceiling of the drain, for the budget sums below/elsewhere.
 pub const CANCEL_DRAIN_TIMEOUT_SECS: u64 = CANCEL_DRAIN_TIMEOUT_MS.div_ceil(1000);
-/// Worst case of `cancel_turn`: the drain, then the bounded wait for the
-/// interrupted turn's save before it announces `Idle` (`announce_idle`).
-pub const CANCEL_TURN_TIMEOUT_SECS: u64 = CANCEL_DRAIN_TIMEOUT_SECS + SAVE_TIMEOUT_SECS;
+/// `stop_compaction_task`: a cancelled compaction gets one drain budget to
+/// stop cooperatively, then, aborted, one more to be dropped.
+pub const COMPACTION_STOP_TIMEOUT_MS: u64 = 2 * CANCEL_DRAIN_TIMEOUT_MS;
+pub const COMPACTION_STOP_TIMEOUT_SECS: u64 = 2 * CANCEL_DRAIN_TIMEOUT_SECS;
+/// Worst case of `cancel_turn`, then the bounded wait for the save before
+/// it announces `Idle`: a running turn's drain (`announce_idle`), or, while
+/// idle, stopping a compaction (`abort_compaction` + `flush_saves`). A turn
+/// and a compaction never run at once, so the longer of the two. Also
+/// covers `finish` and `checkpoint`, which stop a compaction after
+/// `cancel_turn` and save it in their own save.
+pub const CANCEL_TURN_TIMEOUT_SECS: u64 =
+    max_secs(CANCEL_DRAIN_TIMEOUT_SECS, COMPACTION_STOP_TIMEOUT_SECS) + SAVE_TIMEOUT_SECS;
+
+const fn max_secs(a: u64, b: u64) -> u64 {
+    if a > b { a } else { b }
+}
 
 /// `SessionActor::checkpoint` for a daemon reload: how long the workers it
 /// stopped get to finish stopping (cancel → the runtime's cancel-path
@@ -51,8 +64,8 @@ pub const RELOAD_FENCE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(RELOAD_FENCE_TIMEOUT_SECS);
 
 // ── daemon reload steps after the checkpoints (`daemon::reload`) ──
-/// Per-session `Checkpoint{Reload}` wait: `cancel_turn` (the drain + its
-/// bounded save) + stopping the session's workers + the checkpoint's own
+/// Per-session `Checkpoint{Reload}` wait: `cancel_turn` (the drain or a
+/// compaction stop, + its bounded save) + stopping the session's workers + the checkpoint's own
 /// bounded save + 1 s margin. Sessions checkpoint concurrently.
 pub const RELOAD_CHECKPOINT_BUDGET_SECS: u64 =
     CANCEL_TURN_TIMEOUT_SECS + WORKER_RELOAD_STOP_TIMEOUT_SECS + SAVE_TIMEOUT_SECS + 1;
@@ -85,8 +98,8 @@ const _: () = assert!(RELOAD_FENCE_TIMEOUT_SECS > 2 * RELOAD_FENCE_WORST_CASE_SE
 pub const OBSERVABILITY_FLUSH_TIMEOUT_SECS: u64 =
     crate::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT.as_secs();
 
-/// Worst case of `SessionActor::finish`: cancel a running turn, one bounded
-/// save, the `on_session_end` hooks, the observability flush.
+/// Worst case of `SessionActor::finish`: cancel a running turn or stop a
+/// compaction, one bounded save, the `on_session_end` hooks, the observability flush.
 pub const SESSION_END_TIMEOUT_SECS: u64 = CANCEL_TURN_TIMEOUT_SECS
     + SAVE_TIMEOUT_SECS
     + HOOKS_TIMEOUT_SECS

@@ -1743,7 +1743,7 @@ mod compaction_spend_tests {
     /// A compaction whose summary request was billed and then failed (no
     /// text) still saves what it was billed, with the history unchanged.
     #[tokio::test]
-    #[serial_test::serial(base_dir)]
+    #[serial_test::serial]
     async fn a_failed_compaction_saves_its_billed_totals() {
         let home = tempfile::TempDir::new().unwrap();
         std::fs::write(home.path().join("config"), "").unwrap();

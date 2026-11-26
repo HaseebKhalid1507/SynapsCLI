@@ -226,13 +226,16 @@ All notable changes to this project will be documented in this file.
   cache than it read logs a warning with both numbers and tells the user
   after the line above: "compaction: the summary request missed the cache
   (wrote N, read M tokens)".
-  A compaction's own usage now counts: every summary request the provider
-  billed is added to the session's token totals and cost, once, like a
-  turn's usage. That includes a chat request whose reply was not used (a
-  tool call, an empty reply) together with the transcript request sent
-  after it, and what a request had reported when the compaction was
-  cancelled (Cancel stops the request as a turn is stopped, and waits at
-  most two seconds for the compaction to end).
+  A compaction's own usage now counts: every summary request whose usage
+  the provider reported is added to the session's token totals and cost,
+  once, like a turn's usage. That includes a chat request whose reply was
+  not used (a tool call, an empty reply) together with the transcript
+  request sent after it, and what a chat request had reported when the
+  compaction was cancelled (Cancel stops the request as a turn is stopped,
+  waits at most two seconds for the compaction to end, then at most two
+  more for the save). A transcript request cancelled mid-flight books
+  nothing: it is not streamed, and the cancel drops it before any usage
+  arrives.
   When compaction starts a successor session, the spend is saved
   with the session that was summarized and the successor starts at zero,
   as before; a compaction that failed or was cancelled saves the session
