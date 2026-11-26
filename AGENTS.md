@@ -94,7 +94,8 @@ crates/agent-engine/src/  (crate: synaps-engine)
 ├── runtime/              — THE BRAIN
 │   ├── mod.rs            — Runtime struct, orchestration loop
 │   ├── api.rs            — Anthropic API body construction + SSE parsing
-│   ├── api_sync.rs       — non-streaming API path (used by /compact)
+│   ├── api_sync.rs       — non-streaming API path (the /compact transcript request)
+│   ├── compaction_cached.rs — /compact as the chat's own next request, read from the prompt cache; when it applies
 │   ├── request.rs        — request body assembly helpers
 │   ├── stream.rs         — tool dispatch from streamed tool_use events
 │   ├── helpers.rs        — annotate_cache_breakpoint, drain_steering, etc.

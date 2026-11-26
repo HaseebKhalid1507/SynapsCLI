@@ -116,6 +116,14 @@ pub fn has_list_price(model: &str) -> bool {
     listed_prices(model, 0).is_some()
 }
 
+/// Whether `model` bills a prompt of `larger` tokens at another price tier
+/// than one of `smaller` tokens: a long-context tier lies between them, and
+/// the WHOLE larger request (cached input and output included) pays it.
+/// `false` for a flat-priced model and for one this table does not know.
+pub fn prompt_price_tier_differs(model: &str, smaller: u64, larger: u64) -> bool {
+    listed_prices(model, smaller) != listed_prices(model, larger)
+}
+
 /// [`model_prices`] without the fallback: `None` for a model not in the table.
 fn listed_prices(model: &str, prompt_tokens: u64) -> Option<(f64, f64)> {
     Some(match model {
@@ -614,6 +622,20 @@ mod tests {
         // 0.04×0.10 + 0.05×0.01 + 0.01×0.125 = 0.004 + 0.0005 + 0.00125.
         let cost = calculate_cost_split(m, 40_000, 0, 50_000, 10_000, 0);
         assert!((cost - 0.00575).abs() < 1e-12, "${cost}");
+    }
+
+    /// The tier boundary comes from the price rows, for any tiered model.
+    #[test]
+    fn a_long_context_tier_between_two_prompt_sizes_is_seen() {
+        // Haiku 5.5: over 100,000 prompt tokens.
+        assert!(prompt_price_tier_differs("claude-haiku-5-5", 90_000, 400_000));
+        assert!(prompt_price_tier_differs("claude-haiku-5-5", 100_000, 100_001));
+        assert!(!prompt_price_tier_differs("claude-haiku-5-5", 90_000, 100_000));
+        assert!(!prompt_price_tier_differs("claude-haiku-5-5", 150_000, 400_000));
+        // Flat and unknown models have none.
+        assert!(!prompt_price_tier_differs("claude-opus-5-5", 90_000, 900_000));
+        assert!(!prompt_price_tier_differs("claude-haiku-4-5", 90_000, 900_000));
+        assert!(!prompt_price_tier_differs("no-such-model", 1, 900_000));
     }
 
     #[test]

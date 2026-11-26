@@ -27,6 +27,99 @@ fn sync_usage_meta(json: &Value) -> Option<crate::runtime::trace::UsageMeta> {
     })
 }
 
+/// The usage a non-streaming response body reports, cache-write TTL split
+/// included, for the api-log record and for booking. `None` without a
+/// `usage` object; a count the provider did not send is zero, as on the
+/// streaming path.
+fn sync_usage_record(json: &Value) -> Option<super::telemetry::UsageRecord> {
+    let usage = json.get("usage")?.as_object()?;
+    let get = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let split = |key: &str| {
+        usage
+            .get("cache_creation")
+            .and_then(|c| c.get(key))
+            .and_then(Value::as_u64)
+    };
+    let mut record = super::telemetry::UsageRecord {
+        input: get("input_tokens").unwrap_or(0),
+        output: get("output_tokens").unwrap_or(0),
+        cache_read: get("cache_read_input_tokens").unwrap_or(0),
+        cache_write: get("cache_creation_input_tokens").unwrap_or(0),
+        cache_write_5m: split("ephemeral_5m_input_tokens"),
+        cache_write_1h: split("ephemeral_1h_input_tokens"),
+        hit_pct: 0.0,
+    };
+    record.compute_hit_pct();
+    Some(record)
+}
+
+/// What [`ApiMethods::call_api_simple`] reports about the request it sent,
+/// besides the reply text. The default reports nothing.
+#[derive(Default, Clone, Copy)]
+pub(super) struct SimpleCallReport<'a> {
+    /// Level of the request's api-log record, as for a streamed request:
+    /// `Off` writes none, `Full` adds the rate-limit headers.
+    pub telemetry_level: super::telemetry::TelemetryLevel,
+    /// Where the usage the provider billed is booked (the session that
+    /// asked for the compaction books it from there).
+    pub spend: Option<&'a super::compaction::CompactionSpend>,
+}
+
+/// What the response headers of an accepted request say, read before the
+/// body consumes the response. Each only at the level that records it.
+struct AcceptedHeaders {
+    request_id: Option<String>,
+    ratelimit: Option<super::telemetry::RateLimitRecord>,
+}
+
+impl AcceptedHeaders {
+    fn read(headers: &reqwest::header::HeaderMap, level: super::telemetry::TelemetryLevel) -> Self {
+        use super::telemetry::{self, TelemetryLevel};
+        Self {
+            request_id: level
+                .enabled()
+                .then(|| telemetry::request_id_from_headers(headers))
+                .flatten(),
+            ratelimit: (level == TelemetryLevel::Full)
+                .then(|| telemetry::ratelimit_from_headers(headers))
+                .filter(|rl| !rl.is_empty()),
+        }
+    }
+}
+
+/// Bytes of JSON request body that are certainly more than one input token.
+/// English prose runs at 3.5 to 4 bytes a token and code or JSON at fewer;
+/// twice that leaves room for escaping and long whitespace runs, so
+/// `body bytes / 8` is a floor under the request's token count, not an
+/// estimate of it.
+const BODY_BYTES_PER_TOKEN_CEILING: u64 = 8;
+
+/// A 429 that no retry can cure: the request sends more input tokens than
+/// the account's per-minute input limit holds. `Some(message)` only when the
+/// response states that limit and even the floor under this request's size
+/// ([`BODY_BYTES_PER_TOKEN_CEILING`]) is above it. The limit is a token
+/// bucket that refills up to the limit and no further
+/// (<https://platform.claude.com/docs/en/api/rate-limits#about-rate-limits>),
+/// so waiting never makes room for such a request.
+///
+/// Only for a request that carries no cache marker, like this file's: every
+/// input token of it counts against the limit (cache reads would not).
+fn exceeds_input_rate_limit(
+    headers: &reqwest::header::HeaderMap,
+    body_len: usize,
+) -> Option<String> {
+    let limit = super::telemetry::input_tokens_limit_from_headers(headers)?;
+    let at_least = body_len as u64 / BODY_BYTES_PER_TOKEN_CEILING;
+    (at_least > limit).then(|| {
+        format!(
+            "Compaction request refused (HTTP 429) and not retried: it sends at least \
+             {at_least} input tokens, none of them cached, and this account's limit is \
+             {limit} input tokens per minute, so no retry can fit it. Set \
+             `compaction_mode = local`, or set `compaction_model` to a model with a higher limit."
+        )
+    })
+}
+
 /// Assemble the compaction request's `system` blocks together with the
 /// [`TranslationReport`](crate::runtime::transport::report::TranslationReport)
 /// that describes the assembly decision — both are produced in the same
@@ -105,6 +198,7 @@ impl ApiMethods {
         messages: &[crate::SharedMessage],
         max_retries: u32,
         options: &ApiOptions,
+        report: SimpleCallReport<'_>,
     ) -> Result<String> {
         // Host-only message metadata never reaches any provider, whatever
         // history the caller passes in; strip before routing/serializing.
@@ -112,7 +206,14 @@ impl ApiMethods {
         let messages = wire_messages.as_deref().unwrap_or(messages);
         let tools_schema = Arc::new(Vec::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        // Nothing of the routed reply is shown; its usage is kept, to book.
+        let drain = tokio::spawn(async move {
+            let mut usage = super::keepwarm::KeepWarmUsage::default();
+            while let Some(event) = rx.recv().await {
+                usage.add(&event);
+            }
+            usage
+        });
         let routed_system_prompt = Some(system_prompt.to_string());
         if let Some(result) = crate::runtime::openai::try_route_with_memory_backend(
             model,
@@ -145,7 +246,14 @@ impl ApiMethods {
         .await
         {
             drop(tx);
-            let _ = drain.await;
+            // Booked whatever became of the reply: a usage was billed.
+            if let (Ok(usage), Some(spend)) = (drain.await, report.spend) {
+                spend.record(
+                    agent_core::compaction::SummaryRequest::Transcript,
+                    model,
+                    usage,
+                );
+            }
             let response = result.map_err(|e| {
                 crate::runtime::openai::net::provider_error_to_runtime_for(model, e)
             })?;
@@ -207,6 +315,16 @@ impl ApiMethods {
         if crate::core::models::model_supports_adaptive_thinking(model) {
             body["output_config"] = json!({"effort": "low"});
         }
+        // api-log: the thinking this body carries, by its level name. Not
+        // the session's level: an adaptive model is sent `adaptive` whatever
+        // that is. A budget model is sent the session's budget, which is
+        // its level's; the fallback budget (a session with none) has no
+        // level name, so the record then says nothing.
+        let sent_thinking = if adaptive {
+            Some(agent_core::reasoning::ReasoningLevel::Adaptive.as_str().to_string())
+        } else {
+            (thinking_budget != 0).then(|| reasoning_level.as_str().to_string())
+        };
 
         body["system"] = system_blocks;
 
@@ -290,6 +408,8 @@ impl ApiMethods {
                             clock.mark_headers();
                             let trace_rid =
                                 super::api::provider_request_id_from_headers(resp.headers());
+                            let accepted =
+                                AcceptedHeaders::read(resp.headers(), report.telemetry_level);
                             match resp.json::<Value>().await {
                                 Ok(j) => {
                                     if j["error"].is_object() {
@@ -317,8 +437,53 @@ impl ApiMethods {
                                             )));
                                         }
                                     }
+                                    clock.mark_stream_end();
+                                    // ═══ TELEMETRY: the api-log record ═══
+                                    // One per accepted request, as on the
+                                    // streaming path. Only what this request
+                                    // knows: it has no first-event time
+                                    // (`ttft_ms`), no refusal retries, no
+                                    // cache diagnosis and no tools.
+                                    if report.telemetry_level.enabled() {
+                                        let usage = sync_usage_record(&j).unwrap_or_default();
+                                        let mut record = super::telemetry::TelemetryRecord {
+                                            ts: super::telemetry::TelemetryRecord::now_ms(),
+                                            request_id: accepted.request_id,
+                                            msg_id: j["id"].as_str().map(str::to_owned),
+                                            model: model.to_string(),
+                                            thinking: sent_thinking.clone(),
+                                            effort: body["output_config"]["effort"]
+                                                .as_str()
+                                                .map(str::to_owned),
+                                            attempt: attempt + 1,
+                                            total_ms: clock.stream_end_or_now_ms(),
+                                            stop_reason: j["stop_reason"]
+                                                .as_str()
+                                                .map(str::to_owned),
+                                            cost_usd: usage.cost_usd(model),
+                                            usage,
+                                            ratelimit: accepted.ratelimit,
+                                            context: super::telemetry::ContextRecord {
+                                                messages: messages.len(),
+                                                tools: 0,
+                                                system_bytes: system_prompt.len(),
+                                                breakpoints: Vec::new(),
+                                            },
+                                            compaction: true,
+                                            summary_request: Some(
+                                                agent_core::compaction::SummaryRequest::Transcript,
+                                            ),
+                                            ..Default::default()
+                                        };
+                                        record.set_correlation(
+                                            options.trace.session_id(),
+                                            tracer.as_ref().map(|t| t.correlation_ids()),
+                                        );
+                                        if let Some(writer) = options.telemetry.as_ref() {
+                                            writer.enqueue_telemetry(record);
+                                        }
+                                    }
                                     if let Some(t) = tracer.take() {
-                                        clock.mark_stream_end();
                                         let stop = j["stop_reason"].as_str().map(
                                             crate::runtime::trace::anthropic::stop_reason_from_wire,
                                         );
@@ -388,7 +553,25 @@ impl ApiMethods {
                             } else {
                                 None
                             };
+                            // A 429 this request can never get past: say so
+                            // now instead of spending the whole retry budget.
+                            let never_fits = is_429
+                                .then(|| exceeds_input_rate_limit(resp.headers(), body_bytes.len()))
+                                .flatten();
                             let error_text = resp.text().await.unwrap_or_default();
+                            if let Some(message) = never_fits {
+                                let log_rid = trace_rid.clone();
+                                if let Some(t) = tracer.take() {
+                                    let terminal = t.failed_terminal("http_429_input_limit");
+                                    t.finish(clock, Some(429), trace_rid, None, None, terminal);
+                                }
+                                tracing::warn!(
+                                    request_id = log_rid.as_ref().map_or("-", |id| id.as_str()),
+                                    body_bytes = body_bytes.len(),
+                                    "compaction request exceeds the per-minute input limit (not retried)"
+                                );
+                                return Err(RuntimeError::ApiStatus(message));
+                            }
 
                             // gzip refusal fail-soft: resend once uncompressed,
                             // costing no retry budget (see `request_encoding`).
@@ -510,13 +693,25 @@ impl ApiMethods {
             })?
         };
 
-        // Log usage
-        if let Some(usage) = json.get("usage") {
-            let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
-            let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
-            let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-            let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-            HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
+        // Log usage, and book it: before the reply is looked at, since an
+        // empty one was billed too.
+        if let Some(usage) = sync_usage_record(&json) {
+            HelperMethods::log_usage(usage.input, usage.cache_read, usage.cache_write, usage.output);
+            if let Some(spend) = report.spend {
+                spend.record(
+                    agent_core::compaction::SummaryRequest::Transcript,
+                    model,
+                    super::keepwarm::KeepWarmUsage {
+                        input_tokens: usage.input,
+                        output_tokens: usage.output,
+                        cache_read_tokens: usage.cache_read,
+                        cache_write_tokens: usage.cache_write,
+                        cache_write_5m: usage.cache_write_5m,
+                        cache_write_1h: usage.cache_write_1h,
+                        model: json["model"].as_str().map(str::to_owned),
+                    },
+                );
+            }
         }
 
         // Extract text content from the response (skip thinking blocks)
@@ -702,5 +897,112 @@ mod concat_response_text_tests {
     fn returns_empty_for_non_array_content() {
         let v = json!({"content": "stringified"});
         assert_eq!(ApiMethods::concat_response_text(&v), "");
+    }
+}
+
+#[cfg(test)]
+mod input_rate_limit_tests {
+    use super::*;
+    use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn headers(limit: Option<&str>) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        if let Some(limit) = limit {
+            h.insert(
+                "anthropic-ratelimit-input-tokens-limit",
+                limit.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    /// Only a stated limit that even the floor under the request's size
+    /// exceeds counts; anything else keeps the ordinary retry.
+    #[test]
+    fn only_a_request_certainly_over_the_stated_limit_never_fits() {
+        // 1.6 MB is at least 200,000 tokens.
+        let incident = 1_600_000;
+        let message = exceeds_input_rate_limit(&headers(Some("50000")), incident).unwrap();
+        assert!(message.contains("at least 200000 input tokens"), "{message}");
+        assert!(message.contains("50000 input tokens per minute"), "{message}");
+        assert!(message.contains("no retry can fit it"), "{message}");
+        // At the limit, or possibly under it: the provider decides.
+        assert_eq!(exceeds_input_rate_limit(&headers(Some("200000")), incident), None);
+        assert_eq!(exceeds_input_rate_limit(&headers(Some("2000000")), incident), None);
+        // No limit stated (a subscription login), or not a number.
+        assert_eq!(exceeds_input_rate_limit(&headers(None), incident), None);
+        assert_eq!(exceeds_input_rate_limit(&headers(Some("lots")), incident), None);
+    }
+
+    /// A provider that answers every request with 429 and `limit`.
+    async fn always_429(limit: Option<&'static str>) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(move |State(hits): State<Arc<AtomicUsize>>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut response = (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "0")],
+                        r#"{"type":"error","error":{"type":"rate_limit_error","message":"synthetic"}}"#,
+                    )
+                        .into_response();
+                    if let Some(limit) = limit {
+                        response.headers_mut().insert(
+                            "anthropic-ratelimit-input-tokens-limit",
+                            limit.parse().unwrap(),
+                        );
+                    }
+                    response
+                }),
+            )
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    async fn compact_against(limit: Option<&'static str>) -> (String, usize) {
+        let (url, hits) = always_429(limit).await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = crate::Runtime::new_headless();
+        // About 40 KB: at least 5,000 tokens.
+        let transcript = "a line of the transcript\n".repeat(1_600);
+        let error = rt
+            .compact_call(
+                "claude-sonnet-4-6",
+                vec![Arc::new(json!({"role": "user", "content": transcript}))],
+            )
+            .await
+            .expect_err("every attempt is refused");
+        (error.to_string(), hits.load(Ordering::SeqCst))
+    }
+
+    /// The request is larger than the whole per-minute allowance: one
+    /// attempt, and an error that says why.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_429_the_request_can_never_fit_is_not_retried() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (error, attempts) = compact_against(Some("1000")).await;
+        assert_eq!(attempts, 1, "retried a request that can never fit: {error}");
+        assert!(error.contains("1000 input tokens per minute"), "{error}");
+        assert!(error.contains("no retry can fit it"), "{error}");
+    }
+
+    /// Control: a 429 the request could get past keeps its retry budget,
+    /// with a limit above the request and with no limit stated at all.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_429_the_request_could_fit_keeps_its_retries() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        for limit in [Some("2000000"), None] {
+            let (error, attempts) = compact_against(limit).await;
+            assert_eq!(attempts, 9, "the first attempt and 8 retries: {error}");
+            assert!(!error.contains("no retry can fit it"), "{error}");
+        }
     }
 }

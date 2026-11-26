@@ -828,8 +828,10 @@ async fn handle_compact(
     // summarization dispatch — a dedicated Response frame (command
     // "compact.disclosure", same correlation id) precedes the LLM call, and
     // the disclosure also rides the final compact response.
+    // It names the request the dispatch below will send (the chat's own
+    // next request when the cache-preserving path applies).
     let disclosure =
-        synaps_cli::runtime::compaction::preview_compaction_disclosure(&runtime, &msgs);
+        synaps_cli::runtime::compaction::preview_compaction_request(&runtime, &msgs, None).await;
     tracing::info!(disclosure = %disclosure.render_line(), "compaction disclosure");
     let _ = writer_tx
         .send(RpcEvent::Response {
@@ -840,8 +842,20 @@ async fn handle_compact(
         .await;
 
     // 2. Long-running LLM call + engine transition — no lock held.
+    // The dispatch sends the request the disclosure frame named: it is
+    // chosen once, by the preview above.
+    let dispatch = disclosure.dispatch();
+    let outcome =
+        synaps_cli::runtime::compaction::compact_conversation(&msgs, &runtime, None, &dispatch)
+            .await;
+    // What the summary requests were billed joins the session's token
+    // totals, the way a turn's usage does here; also when compaction failed.
+    {
+        let mut st = state.lock().await;
+        book_compaction_spend(&mut st, dispatch.spend());
+    }
     let applied =
-        match synaps_cli::runtime::compaction::compact_conversation(&msgs, &runtime, None).await {
+        match outcome {
             Ok(outcome) => apply_compaction(
                 &runtime,
                 &session,
@@ -877,6 +891,9 @@ async fn handle_compact(
         }
         Err(e) => {
             tracing::error!(error = %e, "compaction failed");
+            // Nothing was applied, but the summary requests were billed:
+            // their totals are saved with the unchanged history.
+            state.lock().await.save_session().await;
             let _ = writer_tx
                 .send(RpcEvent::Error {
                     id: Some(id),
@@ -884,6 +901,19 @@ async fn handle_compact(
                 })
                 .await;
         }
+    }
+}
+
+/// Add a compaction's billed usage to the session totals, as the turn
+/// loop adds a turn's `Usage` events (input and output tokens; this
+/// frontend does not price usage). Drains the ledger: booked once.
+fn book_compaction_spend(
+    st: &mut RpcState,
+    spend: &synaps_cli::runtime::compaction::CompactionSpend,
+) {
+    for entry in spend.take() {
+        st.total_input_tokens += entry.usage.input_tokens;
+        st.total_output_tokens += entry.usage.output_tokens;
     }
 }
 
@@ -1660,6 +1690,138 @@ mod context_head_tests {
         let state = Arc::new(state);
         handle_compact("compact-test".into(), state, writer).await;
         assert!(matches!(frames.recv().await, Some(RpcEvent::Error { .. })));
+    }
+}
+
+#[cfg(test)]
+mod compaction_spend_tests {
+    use super::*;
+    use synaps_cli::core::compaction::SummaryRequest;
+    use synaps_cli::runtime::compaction::CompactionSpend;
+    use synaps_cli::runtime::keepwarm::KeepWarmUsage;
+
+    /// A compaction's billed usage joins the session's token totals as a
+    /// turn's does, once: a second booking of the same ledger adds nothing.
+    #[tokio::test]
+    async fn compaction_spend_joins_the_token_totals_once() {
+        let mut st = RpcState {
+            runtime: Runtime::new_headless(),
+            session: Session::new("synthetic", "medium", None),
+            context_head: Default::default(),
+            api_messages: Vec::new(),
+            total_input_tokens: 100,
+            total_output_tokens: 10,
+            session_cost: 0.0,
+            in_flight: None,
+            pending_events: Vec::new(),
+            consecutive_auto_turns: 0,
+            auto_turn_pending: false,
+            events_auto_turn: true,
+            auto_turn_cap: 5,
+            turn_budgets: Default::default(),
+            save_owed: false,
+            session_lock: None,
+        };
+        let spend = CompactionSpend::default();
+        let usage = |input_tokens, output_tokens| KeepWarmUsage {
+            input_tokens,
+            output_tokens,
+            ..Default::default()
+        };
+        // A refused chat request and the transcript request sent after it.
+        spend.record(SummaryRequest::ChatRequest, "synthetic", usage(7, 3));
+        spend.record(SummaryRequest::Transcript, "synthetic", usage(50, 10));
+        // Nothing billed, nothing booked.
+        spend.record(SummaryRequest::Transcript, "synthetic", usage(0, 0));
+
+        book_compaction_spend(&mut st, &spend);
+        assert_eq!((st.total_input_tokens, st.total_output_tokens), (157, 23));
+        book_compaction_spend(&mut st, &spend);
+        assert_eq!((st.total_input_tokens, st.total_output_tokens), (157, 23));
+    }
+
+    /// A compaction whose summary request was billed and then failed (no
+    /// text) still saves what it was billed, with the history unchanged.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_compaction_saves_its_billed_totals() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("config"), "").unwrap();
+        std::fs::write(
+            home.path().join("auth.json"),
+            "{\"anthropic\": {\"type\": \"oauth\", \"refresh\": \"r\", \"access\": \"synthetic-token\", \"expires\": 9999999999999}}",
+        )
+        .unwrap();
+        let old_base = std::env::var("SYNAPS_BASE_DIR").ok();
+        let old_url = std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok();
+        let old_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::set_var("SYNAPS_BASE_DIR", home.path());
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        let app = axum::Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({
+                "id": "msg_c", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-5", "stop_reason": "end_turn", "content": [],
+                "usage": {"input_tokens": 50, "output_tokens": 10}
+            }))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", format!("http://{addr}"));
+
+        let mut runtime = Runtime::new().await.expect("runtime");
+        runtime.set_model("claude-sonnet-4-5".to_string());
+        let mut session = Session::new("claude-sonnet-4-5", "medium", None);
+        let history: Vec<synaps_cli::SharedMessage> = (0..4)
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                Arc::new(serde_json::json!({"role": role, "content": format!("message {i}")}))
+            })
+            .collect();
+        session.api_messages = history.clone();
+        let id = session.id.clone();
+        let st = RpcState {
+            runtime,
+            session,
+            context_head: Default::default(),
+            api_messages: history.clone(),
+            total_input_tokens: 100,
+            total_output_tokens: 10,
+            session_cost: 0.0,
+            in_flight: None,
+            pending_events: Vec::new(),
+            consecutive_auto_turns: 0,
+            auto_turn_pending: false,
+            events_auto_turn: true,
+            auto_turn_cap: 5,
+            turn_budgets: Default::default(),
+            save_owed: false,
+            session_lock: None,
+        };
+        let (writer, mut frames) = mpsc::channel(8);
+        handle_compact("compact-test".into(), Arc::new(Mutex::new(st)), writer).await;
+        let mut failed = false;
+        while let Ok(frame) = frames.try_recv() {
+            failed |= matches!(frame, RpcEvent::Error { .. });
+        }
+        let saved = Session::load(&id);
+
+        match old_base {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+        match old_url {
+            Some(v) => std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", v),
+            None => std::env::remove_var("SYNAPS_ANTHROPIC_BASE_URL"),
+        }
+        if let Some(v) = old_key {
+            std::env::set_var("ANTHROPIC_API_KEY", v);
+        }
+
+        assert!(failed, "the compaction failed");
+        let saved = saved.expect("the billed totals were saved");
+        assert_eq!((saved.total_input_tokens, saved.total_output_tokens), (150, 20));
+        assert_eq!(saved.api_messages, history, "the history is unchanged");
     }
 }
 

@@ -82,28 +82,86 @@ impl CacheAnchor {
     }
 }
 
-/// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]).
+/// What the last accepted Anthropic request left in the provider's prompt
+/// cache, as far as a later request can tell before it is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedPrefix {
+    /// Hash of everything ahead of the messages that the cache key covers
+    /// (model, effort, system, thinking, tools, beta header) and of the
+    /// account the request went out on (`RequestBody::cache_identity`). A
+    /// request with another identity reads nothing that request wrote.
+    pub identity: u64,
+    /// How many messages of that request belong to the history: all of
+    /// them, less the request-local last message of a keep-warm ping or of
+    /// a compaction request.
+    pub messages: usize,
+    /// `request::message_prefix_digest` of those messages.
+    pub digest: u64,
+}
+
+impl CachedPrefix {
+    /// The prefix a request with `identity` leaves when it is accepted
+    /// with `messages` as its history part.
+    pub fn of(identity: u64, messages: &[SharedMessage]) -> Self {
+        Self {
+            identity,
+            messages: messages.len(),
+            digest: super::request::message_prefix_digest(messages),
+        }
+    }
+
+    /// Whether `history` starts with exactly the messages that request
+    /// sent. When it does not (another session was resumed in place, the
+    /// history was edited or replaced), a request for `history` reads
+    /// nothing of the message cache however recent the anchor is.
+    pub fn leads(&self, history: &[SharedMessage]) -> bool {
+        history.len() >= self.messages
+            && super::request::message_prefix_digest(&history[..self.messages]) == self.digest
+    }
+}
+
+/// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]),
+/// with what that request left in the cache ([`CachedPrefix`]).
 /// Runtime clones get a FRESH cell (a clone is a different request chain,
 /// like the TTL latches); `share_ttl_latches` shares it.
 #[derive(Debug, Default)]
-pub struct CacheAnchorCell(std::sync::Mutex<Option<CacheAnchor>>);
+pub struct CacheAnchorCell(std::sync::Mutex<(Option<CacheAnchor>, Option<CachedPrefix>)>);
 
 impl CacheAnchorCell {
+    /// Stamp a request whose cached prefix is not known: that of an earlier
+    /// request no longer describes the newest one and is dropped.
     pub fn stamp(&self, at: CacheAnchor) {
+        self.stamp_with(at, None);
+    }
+
+    /// Stamp an accepted request and the prefix it left.
+    pub fn stamp_identified(&self, at: CacheAnchor, prefix: CachedPrefix) {
+        self.stamp_with(at, Some(prefix));
+    }
+
+    fn stamp_with(&self, at: CacheAnchor, prefix: Option<CachedPrefix>) {
         let mut slot = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.is_none_or(|prev| prev.mono <= at.mono) {
-            *slot = Some(at);
+        if slot.0.is_none_or(|prev| prev.mono <= at.mono) {
+            *slot = (Some(at), prefix);
         }
     }
 
     pub fn get(&self) -> Option<CacheAnchor> {
-        *self
-            .0
+        self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+    }
+
+    /// What the request [`Self::get`] returns left in the cache, when known.
+    pub fn prefix(&self) -> Option<CachedPrefix> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
     }
 }
 
@@ -387,6 +445,60 @@ pub fn reply_prefix_tokens(history: &[SharedMessage]) -> u64 {
     super::context::conservative_token_estimate(&kept.to_string())
 }
 
+/// A request built on the next turn's exact prefix that is not a turn: the
+/// durable history plus one request-local trailing user message, through the
+/// turn's own request builder.
+#[derive(Debug, Clone, Copy)]
+enum NextTurnRequest<'a> {
+    /// A keep-warm ping (see the module docs).
+    Ping(KeepWarmMode),
+    /// Cache-preserving compaction: `instructions` is the new user message.
+    Compaction {
+        instructions: &'a str,
+        request: &'a super::api::CompactionRequest,
+    },
+}
+
+impl NextTurnRequest<'_> {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ping(_) => "cache keep-warm",
+            Self::Compaction { .. } => "cache-preserving compaction",
+        }
+    }
+
+    /// Whether the request is meant for the network (a probe never is; a
+    /// tool-round replay is not built here).
+    fn sends(&self) -> bool {
+        matches!(
+            self,
+            Self::Ping(KeepWarmMode::Send { .. }) | Self::Compaction { .. }
+        )
+    }
+
+    fn trailing_text(&self) -> &str {
+        match self {
+            Self::Ping(_) => KEEPWARM_PING_TEXT,
+            Self::Compaction { instructions, .. } => instructions,
+        }
+    }
+}
+
+/// An accepted cache-preserving compaction request
+/// ([`Runtime::compaction_cached_request`]).
+#[derive(Debug, Clone)]
+pub(super) struct ChatSummaryReply {
+    /// The reply (`content` blocks).
+    pub reply: Value,
+    /// What the provider billed for it: its cache reads and writes say
+    /// whether the history was read from the cache.
+    pub usage: KeepWarmUsage,
+    /// The `system` blocks and the `tools` the request carried, as sent,
+    /// each as canonical JSON (`RequestBody::prompt_stack`).
+    pub system: String,
+    pub tools: String,
+}
+
 /// Run one ping's request to completion, draining its private event channel
 /// WHILE it runs: usage lands in the tap as it arrives, so an aborted ping
 /// can still be booked. Notices (and retry notes) are collected; with
@@ -526,7 +638,7 @@ impl Runtime {
         tap: &PingTap,
     ) -> (Result<Value>, Vec<String>) {
         match self
-            .keepwarm_request_inner(history, cancel, mode, tap)
+            .next_turn_request(history, cancel, NextTurnRequest::Ping(mode), tap)
             .await
         {
             Ok(r) => r,
@@ -534,21 +646,95 @@ impl Runtime {
         }
     }
 
+    /// What this chain's last accepted Anthropic request left in the cache
+    /// (see [`CachedPrefix`]); `None` before one, or when it is not known.
+    pub fn cached_prefix(&self) -> Option<CachedPrefix> {
+        self.cache_anchor.prefix()
+    }
+
+    /// Send the chat's own next request for `history` with `instructions`
+    /// as its new user message (cache-preserving compaction, task 430) and
+    /// return the reply's content blocks. Assembled by the same code as a
+    /// keep-warm ping, hence as a turn: system, tools, thinking, effort and
+    /// history are the turn's; the message cache marker sits on the last
+    /// history message, as a ping's does.
+    /// Refused before the network when the request could not read what
+    /// `expect` (the last accepted request) left in the cache: another
+    /// cache identity, or a history that does not start with the messages
+    /// that request sent. Runs no tool, fires no hook, never touches
+    /// `history` or any session state, and emits nothing to a frontend.
+    /// What the provider billed is booked into `spend` (the caller's
+    /// session books it from there), also when the reply is an error or is
+    /// then refused: the request was paid for.
+    pub(super) async fn compaction_cached_request(
+        &self,
+        history: &[SharedMessage],
+        instructions: &str,
+        expect: CachedPrefix,
+        spend: &super::compaction::CompactionSpend,
+        cancel: &CancellationToken,
+    ) -> Result<ChatSummaryReply> {
+        // The tap's usage IS the ledger line: usage the provider reports is
+        // booked as it arrives, so an aborted request (Cancel while the
+        // stream is still open) keeps what it was billed.
+        let tap = PingTap {
+            usage: spend.open(agent_core::compaction::SummaryRequest::ChatRequest, &self.model),
+            ..PingTap::default()
+        };
+        let request = super::api::CompactionRequest::expecting(expect);
+        let (result, _notices) = self
+            .next_turn_request(
+                history,
+                cancel,
+                NextTurnRequest::Compaction {
+                    instructions,
+                    request: &request,
+                },
+                &tap,
+            )
+            .await?;
+        // Did it read the cache? Every check before the network said it
+        // would; the provider's usage says whether it did. Already in
+        // `spend`, also when the reply is then refused: it was billed.
+        let usage = tap.usage();
+        if let Some(warning) =
+            super::compaction_cached::cache_miss_warning(self.session_id.as_deref(), &usage)
+        {
+            tracing::warn!("{warning}");
+        }
+        let reply = result?;
+        // Set by the transport before it sends; a reply without it cannot
+        // be described, so it is not used.
+        let (system, tools) = request.sent.get().ok_or_else(|| {
+            RuntimeError::Session(
+                "cache-preserving compaction: the request left no record of what it sent".into(),
+            )
+        })?;
+        Ok(ChatSummaryReply {
+            reply,
+            usage,
+            system,
+            tools,
+        })
+    }
+
     /// `Err` = refused before any request was built (nothing billed);
     /// `Ok((Err, _))` = the request itself failed (usage, if any, is in `tap`).
-    async fn keepwarm_request_inner(
+    async fn next_turn_request(
         &self,
         history: &[SharedMessage],
         cancel: &CancellationToken,
-        mode: KeepWarmMode,
+        purpose: NextTurnRequest<'_>,
         tap: &PingTap,
     ) -> Result<(Result<Value>, Vec<String>)> {
+        let what = purpose.label();
         if let Some(reason) = self.cache_keepwarm_ineligibility() {
-            return Err(RuntimeError::Config(format!(
-                "cache keep-warm skipped: {reason}"
-            )));
+            return Err(RuntimeError::Config(format!("{what} skipped: {reason}")));
         }
-        if !history_ready(history) {
+        // The marker of either goes on the last history message. A ping is
+        // worth sending only after a finished reply; a compaction request
+        // takes any history (the marker walks back to a markable block).
+        if matches!(purpose, NextTurnRequest::Ping(_)) && !history_ready(history) {
             return Err(RuntimeError::Config(
                 "cache keep-warm skipped: history does not end with a finished assistant reply"
                     .into(),
@@ -562,18 +748,20 @@ impl Runtime {
             (state.durability_blocked, state.enabled())
         };
         if durability_blocked {
-            return Err(RuntimeError::Session(
-                "cache keep-warm skipped: context head save is unresolved".into(),
-            ));
+            return Err(RuntimeError::Session(format!(
+                "{what} skipped: context head save is unresolved"
+            )));
         }
 
         // Same preflight as a real turn (run_stream_tracked). A probe sends
         // nothing, so it never needs a token refresh.
         self.validate_request_preflight().await?;
         let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
-        if matches!(mode, KeepWarmMode::Send { .. }) {
+        if purpose.sends() {
             // Never selects, switches or re-binds an account; under `auto` a
             // cooling account ends the period (the ping fails before sending).
+            // A compaction request likewise stays on the account whose cache
+            // it reads.
             self.refresh_for_keepwarm().await?;
         }
 
@@ -606,7 +794,7 @@ impl Runtime {
         // retention anchor the transport places from it, match the next turn.
         let mut request: Vec<SharedMessage> = history.to_vec();
         request.push(Arc::new(
-            json!({"role": "user", "content": KEEPWARM_PING_TEXT}),
+            json!({"role": "user", "content": purpose.trailing_text()}),
         ));
         let round_images =
             super::image_retention::round_images(&self.model, self.codex_request_role(), &request)
@@ -709,12 +897,19 @@ impl Runtime {
             // A successful ping refreshes the cache: it moves the anchor the
             // next ping is scheduled from.
             cache_anchor: Some(Arc::clone(&self.cache_anchor)),
-            keepwarm: Some(KeepWarmRequest {
-                mode,
-                status: Arc::clone(&tap.status),
-                sent: Arc::clone(&tap.sent),
-                connect_failed: Arc::clone(&tap.connect_failed),
-            }),
+            keepwarm: match purpose {
+                NextTurnRequest::Ping(mode) => Some(KeepWarmRequest {
+                    mode,
+                    status: Arc::clone(&tap.status),
+                    sent: Arc::clone(&tap.sent),
+                    connect_failed: Arc::clone(&tap.connect_failed),
+                }),
+                NextTurnRequest::Compaction { .. } => None,
+            },
+            compaction: match purpose {
+                NextTurnRequest::Ping(_) => None,
+                NextTurnRequest::Compaction { request, .. } => Some(request.clone()),
+            },
             // Header only (cache-key parity with the turns this ping keeps
             // warm); a ping never sends `diagnostics` nor moves the chain.
             cache_diagnosis: self.cache_diagnosis(),
@@ -734,6 +929,16 @@ impl Runtime {
             request_messages,
             tx,
             cancel,
+            // Neither a ping nor a compaction request retries: both retry
+            // budgets are zero, and the transport ends either on its first
+            // HTTP 429 or 5xx, network error, in-stream error or overload
+            // (`single_attempt`: no wait, no account switch at a limit).
+            // That is not "sent exactly once": the immediate resends listed
+            // at `single_attempt` remain (a 401, a gzip refusal, a refused
+            // cache-diagnosis header); a compaction request's 401 resend
+            // is not sent when the fresh token is another account's. A
+            // failed compaction request falls back to the transcript
+            // request, which keeps the normal retries.
             0,
             0,
             &options,
@@ -741,7 +946,7 @@ impl Runtime {
         );
         let (mut result, notices) = drive_ping(call, &mut rx, tap, None).await;
         // Probe: also run the next turn's pre-request context assessment.
-        if let (Ok(value), KeepWarmMode::Probe) = (&mut result, mode) {
+        if let (Ok(value), NextTurnRequest::Ping(KeepWarmMode::Probe)) = (&mut result, purpose) {
             if context_enabled {
                 if let Some(why) = self.keepwarm_context_blocks(
                     history,
@@ -2207,6 +2412,81 @@ mod tests {
             Some(later),
             "a late-arriving older stamp never rewinds"
         );
+    }
+
+    /// The prefix belongs to the request the anchor names: a newer request
+    /// without one clears it, an older stamp changes nothing.
+    #[test]
+    fn anchor_cell_prefix_follows_the_newest_request() {
+        let cell = CacheAnchorCell::default();
+        assert_eq!(cell.prefix(), None);
+        let a = CacheAnchor::now();
+        let at = |secs| CacheAnchor {
+            mono: a.mono + std::time::Duration::from_secs(secs),
+            wall: a.wall + std::time::Duration::from_secs(secs),
+        };
+        let (new, old) = (CachedPrefix::of(42, &[]), CachedPrefix::of(7, &[]));
+        cell.stamp_identified(at(5), new);
+        assert_eq!((cell.get(), cell.prefix()), (Some(at(5)), Some(new)));
+        cell.stamp_identified(a, old);
+        assert_eq!(cell.prefix(), Some(new), "an older stamp never rewinds");
+        cell.stamp(at(9));
+        assert_eq!((cell.get(), cell.prefix()), (Some(at(9)), None));
+    }
+
+    /// A history is led by a request's messages only when it starts with
+    /// exactly them. The last message of the request counts in its durable
+    /// form: a turn sends its newest user message as blocks, with turn-only
+    /// context after them, and the history holds the bare string.
+    #[test]
+    fn a_cached_prefix_leads_only_a_history_that_starts_with_its_messages() {
+        let m = |role: &str, content: Value| Arc::new(json!({"role": role, "content": content}));
+        let turn_only = agent_core::core::extension_context::guard_turn("the time is 12:00");
+        assert!(super::super::stream::is_ephemeral_turn_context_block(
+            &json!({"type": "text", "text": turn_only})
+        ));
+        let sent = vec![
+            m("user", json!("one")),
+            m("assistant", json!("two")),
+            m("user", json!([{"type": "text", "text": "three"}, {"type": "text", "text": turn_only}])),
+        ];
+        let prefix = CachedPrefix::of(1, &sent);
+        assert_eq!(prefix.messages, 3);
+
+        let history = vec![
+            m("user", json!("one")),
+            m("assistant", json!("two")),
+            m("user", json!("three")),
+            m("assistant", json!("four")),
+        ];
+        assert!(prefix.leads(&history), "the same conversation, one reply on");
+        assert!(prefix.leads(&history[..3]));
+        assert!(!prefix.leads(&history[..2]), "shorter than what was sent");
+
+        let mut edited = history.clone();
+        edited[0] = m("user", json!("ONE"));
+        assert!(!prefix.leads(&edited), "an earlier message changed");
+        let mut edited = history.clone();
+        edited[2] = m("user", json!("3"));
+        assert!(!prefix.leads(&edited), "the last sent message changed");
+        let other = vec![m("user", json!("another session")); 4];
+        assert!(!prefix.leads(&other), "another conversation");
+
+        // Host keys never reach the wire and do not count.
+        let mut stamped = history.clone();
+        stamped[1] = Arc::new(json!({"role": "assistant", "content": "two", "_synaps_time": 5}));
+        assert!(prefix.leads(&stamped));
+        assert!(CachedPrefix::of(1, &[]).leads(&history), "nothing sent leads anything");
+
+        // A request-only advisory chained after the newest user message is
+        // not part of the history the request leaves cached.
+        let advisory = m("user", json!(super::super::continuation::ADVISORY_PREFIX));
+        let mut with_advisory = sent.clone();
+        with_advisory.push(advisory);
+        let durable = super::super::request::durable_len(&with_advisory);
+        assert_eq!(durable, 3);
+        assert_eq!(CachedPrefix::of(1, &with_advisory[..durable]), prefix);
+        assert_eq!(super::super::request::durable_len(&history), 4);
     }
 
     #[test]

@@ -327,6 +327,20 @@ pub struct TelemetryRecord {
     /// can separate pings from real turns. Absent on every turn record.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub keepwarm: bool,
+    /// `true` only on a compaction's summary request, of either kind
+    /// (`summary_request` below says which). On the chat's own next request
+    /// plus the summary instructions (task 430), `usage.cache_read` is the
+    /// history it did not pay for as fresh input. Absent on every other
+    /// record.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub compaction: bool,
+    /// Which summary request a compaction record is, in the words of the
+    /// saved compaction record's `summary_request`: `chat_request` (the
+    /// chat's own next request, `compaction` above) or `transcript` (the
+    /// flattened, truncated transcript under the compaction system prompt).
+    /// Both carry `"compaction": true`. Absent on every other record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_request: Option<agent_core::compaction::SummaryRequest>,
     /// `true` when a subagent (worker runtime) made the request, so reports
     /// can split delegated traffic from the foreground session. Absent on
     /// foreground and internal records.
@@ -480,6 +494,16 @@ fn unified_utilization_from_headers(headers: &reqwest::header::HeaderMap) -> BTr
         windows.insert(window.to_string(), used);
     }
     windows
+}
+
+/// The per-minute input-token limit a response reports
+/// (`anthropic-ratelimit-input-tokens-limit`: "the maximum number of input
+/// tokens allowed within any rate limit period",
+/// <https://platform.claude.com/docs/en/api/rate-limits#response-headers>).
+/// `None` when the header is absent or not a number (a subscription login
+/// reports `anthropic-ratelimit-unified-*` windows instead).
+pub fn input_tokens_limit_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    header_u64(headers, "anthropic-ratelimit-input-tokens-limit")
 }
 
 /// Extract the `request-id` response header.
@@ -650,6 +674,42 @@ mod tests {
         let json = serde_json::to_string(&later).unwrap();
         assert!(json.contains("\"rollover_window\":2"), "{json}");
         assert!(!json.contains("\"rollover\":"), "{json}");
+    }
+
+    /// A cache-preserving compaction request is told apart in the api-log;
+    /// no other record carries the field.
+    #[test]
+    fn compaction_record_is_marked() {
+        let record = TelemetryRecord {
+            compaction: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"compaction\":true"), "{json}");
+        let turn = serde_json::to_string(&TelemetryRecord::default()).unwrap();
+        assert!(!turn.contains("compaction"), "{turn}");
+        assert!(!turn.contains("summary_request"), "{turn}");
+    }
+
+    /// Both compaction records say which request they were, in the
+    /// provenance record's words.
+    #[test]
+    fn compaction_record_names_its_summary_request() {
+        use agent_core::compaction::SummaryRequest;
+        for (kind, word) in [
+            (SummaryRequest::Transcript, "transcript"),
+            (SummaryRequest::ChatRequest, "chat_request"),
+        ] {
+            let record = TelemetryRecord {
+                compaction: true,
+                summary_request: Some(kind),
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&record).unwrap();
+            assert_eq!(json["compaction"], true);
+            assert_eq!(json["summary_request"], word);
+            assert_eq!(json["summary_request"], serde_json::to_value(kind).unwrap());
+        }
     }
 
     #[test]

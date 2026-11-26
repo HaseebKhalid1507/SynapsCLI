@@ -118,6 +118,11 @@ impl DisclosurePolicy {
 pub struct RenderedCompactionInput {
     /// Full request text (conversation transcript + instruction template).
     pub prompt_text: String,
+    /// The part of `prompt_text` after the transcript: the instruction
+    /// template, the `/compact` focus and the file-operation records. A
+    /// cache-preserving request (`runtime::compaction_cached`) sends this
+    /// without the transcript; the history is its transcript.
+    pub instructions: String,
     /// Approximate bytes of CONVERSATION-DERIVED content that would be
     /// disclosed to the summarizer (instruction templates excluded — the
     /// disclosure line labels the figure accordingly).
@@ -338,21 +343,20 @@ pub fn render_compaction_input(
 
     let transcript_bytes = conversation_text.len() + file_section.len();
 
-    let mut prompt_text = format!("<conversation>\n{}\n</conversation>\n\n", conversation_text);
-    if let Some(instructions) = custom_instructions {
-        prompt_text.push_str(&format!(
-            "{}\n\nAdditional focus: {}",
-            base_prompt, instructions
-        ));
-    } else {
-        prompt_text.push_str(base_prompt);
-    }
+    let mut instructions = match custom_instructions {
+        Some(focus) => format!("{}\n\nAdditional focus: {}", base_prompt, focus),
+        None => base_prompt.to_string(),
+    };
     if !file_section.is_empty() {
-        prompt_text.push_str(&format!(
+        instructions.push_str(&format!(
             "\n\nAlso append these file operation records to the end of your summary:{}",
             file_section
         ));
     }
+    let prompt_text = format!(
+        "<conversation>\n{}\n</conversation>\n\n{}",
+        conversation_text, instructions
+    );
 
     if !file_section.is_empty() {
         present.insert(ContentClass::FilePaths);
@@ -370,6 +374,7 @@ pub fn render_compaction_input(
 
     RenderedCompactionInput {
         prompt_text,
+        instructions,
         transcript_bytes,
         included_classes,
         excluded_classes,
@@ -396,6 +401,14 @@ pub struct CompactionDisclosure {
     /// be used and the chat's own model writes the summary instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
+    /// Set when the summary request is expected to be the chat's own next
+    /// request (`runtime::compaction_cached`), which sends the history as
+    /// the chat sends it, untruncated, instead of the transcript the byte
+    /// figure above describes: about this many tokens, read from the
+    /// provider's prompt cache. The transcript is then what is sent only
+    /// if that request fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_request_tokens: Option<u64>,
 }
 
 impl CompactionDisclosure {
@@ -428,19 +441,205 @@ impl CompactionDisclosure {
                 } else {
                     format!("{}/{}", self.provider, self.model)
                 };
-                let line = format!(
-                    "compaction: sending ~{} KB of conversation ({} messages) to {} — excluded classes: {}",
-                    self.approx_conversation_bytes.div_ceil(1024),
-                    self.message_count,
-                    target,
-                    excluded
-                );
+                let line = match self.chat_request_tokens {
+                    // What is really sent: the whole history, as the chat
+                    // sends it; the transcript only as the fallback.
+                    Some(tokens) => format!(
+                        "compaction: sending the conversation as the chat sends it ({} messages, ~{} tokens, read from cache) to {} — excluded classes: {}; if that fails, a ~{} KB transcript",
+                        self.message_count,
+                        tokens,
+                        target,
+                        excluded,
+                        self.approx_conversation_bytes.div_ceil(1024),
+                    ),
+                    None => format!(
+                        "compaction: sending ~{} KB of conversation ({} messages) to {} — excluded classes: {}",
+                        self.approx_conversation_bytes.div_ceil(1024),
+                        self.message_count,
+                        target,
+                        excluded
+                    ),
+                };
                 match &self.notice {
                     Some(notice) => format!("{line} — {notice}"),
                     None => line,
                 }
             }
         }
+    }
+
+    /// The summary request this disclosure names as the one sent first:
+    /// `None` in local-only mode (no request).
+    pub fn summary_request(&self) -> Option<agent_core::compaction::SummaryRequest> {
+        use agent_core::compaction::{CompactionMode, SummaryRequest};
+        match (self.mode, self.chat_request_tokens) {
+            (CompactionMode::LocalOnly, _) => None,
+            (CompactionMode::Remote, Some(_)) => Some(SummaryRequest::ChatRequest),
+            (CompactionMode::Remote, None) => Some(SummaryRequest::Transcript),
+        }
+    }
+
+    /// The dispatch of the compaction this disclosure was shown for:
+    /// [`compact_conversation`] sends what the line says.
+    pub fn dispatch(&self) -> CompactionDispatch {
+        CompactionDispatch {
+            request: self.summary_request(),
+            spend: CompactionSpend::default(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+}
+
+/// What a compaction is to send, as its disclosure told the user, and
+/// where it books what its requests were billed.
+///
+/// Built only from the disclosure ([`CompactionDisclosure::dispatch`]), so
+/// the line and the send cannot disagree: eligibility for the chat's own
+/// request is not decided a second time. Between the preview and the send
+/// a keep-warm ping can land and move the cache anchor; a dispatch that
+/// asked again could send the full history under a line that said
+/// "transcript".
+#[derive(Debug, Clone)]
+pub struct CompactionDispatch {
+    /// `Transcript`: the transcript request, whatever the cache looks like
+    /// now. `ChatRequest`: the chat's own request, once its safety
+    /// conditions have been checked again (before any network); when they
+    /// no longer hold, or the request fails, the transcript request, which
+    /// the line names as the fallback. `None`: the preview was local-only.
+    request: Option<agent_core::compaction::SummaryRequest>,
+    spend: CompactionSpend,
+    /// Cancels the compaction cooperatively: a request in flight ends
+    /// through its normal finalization (the usage the provider reported is
+    /// booked), and no further request is sent.
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl CompactionDispatch {
+    /// What the requests of this compaction were billed. A clone shares
+    /// the ledger, so a caller that spawns the compaction keeps one.
+    pub fn spend(&self) -> &CompactionSpend {
+        &self.spend
+    }
+
+    pub fn request(&self) -> Option<agent_core::compaction::SummaryRequest> {
+        self.request
+    }
+
+    /// The compaction's cancellation, shared by clones.
+    pub fn cancel_token(&self) -> &tokio_util::sync::CancellationToken {
+        &self.cancel
+    }
+}
+
+/// What one summary request of a compaction was billed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryRequestUsage {
+    pub request: agent_core::compaction::SummaryRequest,
+    /// As the provider reported it; `model` is always set (the model the
+    /// request named when the reply named none), for pricing.
+    pub usage: super::keepwarm::KeepWarmUsage,
+}
+
+impl SummaryRequestUsage {
+    /// The one line a user is shown when the chat's own request did not
+    /// read the cache (see `compaction_cached::cache_miss_notice`).
+    pub fn cache_miss_notice(&self) -> Option<String> {
+        (self.request == agent_core::compaction::SummaryRequest::ChatRequest)
+            .then(|| super::compaction_cached::cache_miss_notice(&self.usage))
+            .flatten()
+    }
+}
+
+/// The billed usage of a compaction's requests: every request the provider
+/// answered with a usage, including a chat request whose reply was then
+/// refused (it was paid for) and the transcript request sent after it.
+///
+/// The requests do not book into any session themselves (a compaction runs
+/// on a runtime clone, off the session's event stream). The caller that
+/// owns the session's counters drains this once ([`Self::take`]) and books
+/// each entry the way it books a turn's usage.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionSpend(std::sync::Arc<std::sync::Mutex<Vec<SpendEntry>>>);
+
+/// One request's line in a [`CompactionSpend`]. `usage` is shared with the
+/// request while it runs ([`CompactionSpend::open`]), so what the provider
+/// has reported is in the ledger the moment it is seen, also when the
+/// request is then aborted.
+#[derive(Debug)]
+struct SpendEntry {
+    request: agent_core::compaction::SummaryRequest,
+    model: String,
+    usage: std::sync::Arc<std::sync::Mutex<super::keepwarm::KeepWarmUsage>>,
+}
+
+impl CompactionSpend {
+    /// Book `usage` of a `request` sent to `model`, once it is known in
+    /// full.
+    pub fn record(
+        &self,
+        request: agent_core::compaction::SummaryRequest,
+        model: &str,
+        usage: super::keepwarm::KeepWarmUsage,
+    ) {
+        let cell = self.open(request, model);
+        *cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = usage;
+    }
+
+    /// A line for a `request` to `model` that is about to be sent: the
+    /// returned cell is the line's usage, which the request adds to as the
+    /// provider reports it. Nothing is booked twice: the line is the only
+    /// place that usage is recorded.
+    pub fn open(
+        &self,
+        request: agent_core::compaction::SummaryRequest,
+        model: &str,
+    ) -> std::sync::Arc<std::sync::Mutex<super::keepwarm::KeepWarmUsage>> {
+        let usage = std::sync::Arc::default();
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(SpendEntry {
+                request,
+                model: model.to_string(),
+                usage: std::sync::Arc::clone(&usage),
+            });
+        usage
+    }
+
+    /// The lines booked so far, removed: what is taken is never handed out
+    /// again, so it reaches a session's counters once. A line of all zeros
+    /// (no reply, nothing billed) is not returned. Take only once the
+    /// requests have ended (the task finished or was joined): usage a
+    /// request reports after its line was taken is not booked.
+    pub fn take(&self) -> Vec<SummaryRequestUsage> {
+        let entries = std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        entries
+            .into_iter()
+            .filter_map(|entry| {
+                let mut usage = entry
+                    .usage
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if usage.input_tokens == 0
+                    && usage.output_tokens == 0
+                    && usage.cache_read_tokens == 0
+                    && usage.cache_write_tokens == 0
+                {
+                    return None;
+                }
+                usage.model.get_or_insert(entry.model);
+                Some(SummaryRequestUsage {
+                    request: entry.request,
+                    usage,
+                })
+            })
+            .collect()
     }
 }
 
@@ -451,9 +650,55 @@ pub fn preview_compaction_disclosure(
     runtime: &Runtime,
     api_messages: &[crate::SharedMessage],
 ) -> CompactionDisclosure {
-    use agent_core::compaction::CompactionMode;
     let policy = runtime.compaction_policy();
     let rendered = render_compaction_input(api_messages, None, &policy);
+    disclosure_for(runtime, api_messages, &policy, rendered)
+}
+
+/// [`preview_compaction_disclosure`] for the compaction about to run with
+/// `custom_instructions`, saying what it will really send: when the
+/// summary request will be the chat's own next request (decided exactly as
+/// the dispatch decides it, `compaction_cached::eligibility`, still
+/// without any network operation), the disclosure names that request and
+/// its size; the transcript figure is then the fallback's.
+pub async fn preview_compaction_request(
+    runtime: &Runtime,
+    api_messages: &[crate::SharedMessage],
+    custom_instructions: Option<&str>,
+) -> CompactionDisclosure {
+    use agent_core::compaction::CompactionMode;
+    let policy = runtime.compaction_policy();
+    let rendered = render_compaction_input(api_messages, custom_instructions, &policy);
+    let chat_request_tokens = match policy.mode {
+        CompactionMode::LocalOnly => None,
+        CompactionMode::Remote => {
+            let (model, _notice) = runtime.compact_model_choice();
+            super::compaction_cached::eligibility(
+                runtime,
+                api_messages,
+                &model,
+                &policy,
+                &super::compaction_cached::instructions(&rendered),
+                super::compaction_cached::transcript_tokens(&rendered),
+            )
+            .await
+            .ok()
+            .map(|eligible| eligible.request_tokens)
+        }
+    };
+    CompactionDisclosure {
+        chat_request_tokens,
+        ..disclosure_for(runtime, api_messages, &policy, rendered)
+    }
+}
+
+fn disclosure_for(
+    runtime: &Runtime,
+    api_messages: &[crate::SharedMessage],
+    policy: &DisclosurePolicy,
+    rendered: RenderedCompactionInput,
+) -> CompactionDisclosure {
+    use agent_core::compaction::CompactionMode;
     let (provider, model, notice) = match policy.mode {
         CompactionMode::LocalOnly => ("local".to_string(), LOCAL_SUMMARY_MODEL.to_string(), None),
         CompactionMode::Remote => {
@@ -470,6 +715,7 @@ pub fn preview_compaction_disclosure(
         included_classes: rendered.included_classes,
         excluded_classes: rendered.excluded_classes,
         notice,
+        chat_request_tokens: None,
     }
 }
 
@@ -563,13 +809,21 @@ fn local_summary(api_messages: &[crate::SharedMessage], policy: &DisclosurePolic
 
 /// Serialize the in-memory API message history into a policy-filtered
 /// transcript and produce the typed [`CompactionOutcome`]. Remote mode asks
-/// the configured summarizer model; local-only mode (spec §9.4) derives the
+/// the configured summarizer model (through the chat's own next request
+/// when that reads the history from the prompt cache, see
+/// `runtime::compaction_cached`); local-only mode (spec §9.4) derives the
 /// summary in-process and constructs NO network request. Called by
 /// `/compact` and every auto-compaction path.
+///
+/// `dispatch` comes from the disclosure shown for this compaction
+/// ([`CompactionDisclosure::dispatch`]): the request it names is the one
+/// sent, and what the requests were billed is booked into its
+/// [`CompactionSpend`], also when this returns an error.
 pub async fn compact_conversation(
     api_messages: &[crate::SharedMessage],
     runtime: &Runtime,
     custom_instructions: Option<&str>,
+    dispatch: &CompactionDispatch,
 ) -> Result<CompactionOutcome> {
     use agent_core::compaction::CompactionMode;
     let policy = runtime.compaction_policy();
@@ -582,18 +836,52 @@ pub async fn compact_conversation(
                 CompactionOutcome::new(summary_text, LOCAL_SUMMARY_MODEL, &[LOCAL_SUMMARY_MODEL]);
             outcome.summary_provider = "local".to_string();
             outcome.local_only = true;
+            outcome.summary_request = None;
             outcome.included_classes = rendered.included_classes;
             outcome.excluded_classes = rendered.excluded_classes.clone();
             outcome.redaction_policy = redaction_for(&rendered.excluded_classes);
             Ok(outcome)
         }
         CompactionMode::Remote => {
-            let user_msg =
-                std::sync::Arc::new(json!({"role": "user", "content": rendered.prompt_text}));
             // Chosen once: the model the request goes to is the one the
             // outcome names.
             let (model, _notice) = runtime.compact_model_choice();
-            let summary_text = runtime.compact_call(&model, vec![user_msg]).await?;
+            // The remote seam, entered once for this compaction and before
+            // any request is assembled, whichever request carries it.
+            runtime.enter_remote_summarization();
+            // The chat's own next request plus the instructions, when the
+            // disclosure said so (the history could be read from the prompt
+            // cache when it was previewed) and the conditions still hold;
+            // otherwise, and once after any failure of it, the transcript
+            // request below. A disclosure that named the transcript gets
+            // the transcript: the question is not asked again here.
+            if dispatch.request == Some(agent_core::compaction::SummaryRequest::ChatRequest) {
+                if let Some(outcome) = super::compaction_cached::summarize(
+                    api_messages,
+                    runtime,
+                    &model,
+                    &policy,
+                    &rendered,
+                    &dispatch.spend,
+                    &dispatch.cancel,
+                )
+                .await
+                {
+                    return Ok(outcome);
+                }
+            }
+            // A cancelled compaction sends nothing more.
+            if dispatch.cancel.is_cancelled() {
+                return Err(crate::error::RuntimeError::Session("compaction cancelled".into()));
+            }
+            let user_msg =
+                std::sync::Arc::new(json!({"role": "user", "content": rendered.prompt_text}));
+            let summary_text = tokio::select! {
+                text = runtime.transcript_summary_call(&model, vec![user_msg], Some(&dispatch.spend)) => text?,
+                () = dispatch.cancel.cancelled() => {
+                    return Err(crate::error::RuntimeError::Session("compaction cancelled".into()));
+                }
+            };
             let mut outcome = CompactionOutcome::for_prompt_stack(
                 summary_text,
                 &model,
@@ -606,6 +894,19 @@ pub async fn compact_conversation(
             Ok(outcome)
         }
     }
+}
+
+/// Preview, then dispatch what the preview named: what `/compact` does.
+#[cfg(test)]
+pub(crate) async fn compact_as_previewed(
+    api_messages: &[crate::SharedMessage],
+    runtime: &Runtime,
+    custom_instructions: Option<&str>,
+) -> Result<CompactionOutcome> {
+    let dispatch = preview_compaction_request(runtime, api_messages, custom_instructions)
+        .await
+        .dispatch();
+    compact_conversation(api_messages, runtime, custom_instructions, &dispatch).await
 }
 
 fn redaction_for(
@@ -643,6 +944,8 @@ pub struct CompactionOutcome {
     pub included_classes: Vec<agent_core::compaction::ContentClass>,
     pub excluded_classes: Vec<agent_core::compaction::ContentClass>,
     pub redaction_policy: agent_core::compaction::RedactionPolicy,
+    /// Which request produced the summary; `None` for a local-only one.
+    pub summary_request: Option<agent_core::compaction::SummaryRequest>,
 }
 
 impl CompactionOutcome {
@@ -669,6 +972,7 @@ impl CompactionOutcome {
             ],
             excluded_classes: Vec::new(),
             redaction_policy: RedactionPolicy::TruncationOnly,
+            summary_request: Some(agent_core::compaction::SummaryRequest::Transcript),
         }
     }
 
@@ -837,6 +1141,7 @@ pub async fn apply_compaction(
         excluded_classes: outcome.excluded_classes.clone(),
         redaction_policy: outcome.redaction_policy,
         prior_system_prompt: current.system_prompt.clone(),
+        summary_request: outcome.summary_request,
     };
 
     let mut extra_messages: Vec<crate::SharedMessage> = Vec::new();
@@ -1099,6 +1404,14 @@ mod transition_tests {
         assert_eq!(
             record.prior_system_prompt.as_deref(),
             Some("You are the household policy.")
+        );
+        assert_eq!(
+            record.summary_request, outcome.summary_request,
+            "the record names the request the outcome names"
+        );
+        assert_eq!(
+            record.summary_request,
+            Some(agent_core::compaction::SummaryRequest::Transcript)
         );
         assert_eq!(
             successor.session.system_prompt.as_deref(),
@@ -1904,6 +2217,7 @@ mod disclosure_tests {
             included_classes: Vec::new(),
             excluded_classes: Vec::new(),
             notice: None,
+            chat_request_tokens: None,
         };
         let qualified = disclosure("anthropic/claude-opus-5-5").render_line();
         assert!(
@@ -1919,6 +2233,42 @@ mod disclosure_tests {
             lookalike.contains(" to anthropic/anthropicish-model "),
             "{lookalike}"
         );
+    }
+
+    /// When the chat's own request will carry the summary, the line says
+    /// that (the whole history, its size in tokens, read from cache) and
+    /// names the transcript only as the fallback. Otherwise the line is
+    /// the transcript's, unchanged.
+    #[test]
+    fn disclosure_line_says_which_request_is_sent() {
+        let mut disclosure = CompactionDisclosure {
+            mode: agent_core::compaction::CompactionMode::Remote,
+            provider: "anthropic".into(),
+            model: "claude-opus-5-5".into(),
+            approx_conversation_bytes: 300 * 1024,
+            message_count: 812,
+            included_classes: Vec::new(),
+            excluded_classes: Vec::new(),
+            notice: Some("a notice".into()),
+            chat_request_tokens: None,
+        };
+        assert_eq!(
+            disclosure.render_line(),
+            "compaction: sending ~300 KB of conversation (812 messages) to \
+             anthropic/claude-opus-5-5 — excluded classes: none — a notice"
+        );
+        disclosure.chat_request_tokens = Some(401_234);
+        assert_eq!(
+            disclosure.render_line(),
+            "compaction: sending the conversation as the chat sends it (812 messages, \
+             ~401234 tokens, read from cache) to anthropic/claude-opus-5-5 — excluded classes: \
+             none; if that fails, a ~300 KB transcript — a notice"
+        );
+        let wire = serde_json::to_value(&disclosure).unwrap();
+        assert_eq!(wire["chat_request_tokens"], 401_234);
+        disclosure.chat_request_tokens = None;
+        let wire = serde_json::to_value(&disclosure).unwrap();
+        assert!(wire.get("chat_request_tokens").is_none(), "{wire}");
     }
 
     /// `/compact` and auto-compaction summarize with the model
@@ -2078,7 +2428,7 @@ mod disclosure_tests {
             runtime.set_model(own.to_string());
             runtime.set_compaction_model(Some("provider-small".to_string()));
             crate::runtime::script_summary_requests(|_| Some(Ok("SUMMARY".to_string())));
-            let outcome = compact_conversation(&sentinel_messages(), &runtime, None)
+            let outcome = compact_as_previewed(&sentinel_messages(), &runtime, None)
                 .await
                 .expect("the scripted summary");
             assert_eq!(crate::runtime::scripted_summary_requests(), [asked], "{own}");
@@ -2101,7 +2451,7 @@ mod disclosure_tests {
             Arc::new(json!({"role": "user", "content": giant})),
             Arc::new(json!({"role": "assistant", "content": "ok"})),
         ];
-        let outcome = compact_conversation(&messages, &runtime, None)
+        let outcome = compact_as_previewed(&messages, &runtime, None)
             .await
             .expect("local-only compaction");
         assert!(
@@ -2133,7 +2483,7 @@ mod disclosure_tests {
         let mut runtime = crate::Runtime::new_headless();
         runtime.set_compaction_mode(CompactionMode::LocalOnly);
 
-        let outcome = compact_conversation(&sentinel_messages(), &runtime, None)
+        let outcome = compact_as_previewed(&sentinel_messages(), &runtime, None)
             .await
             .expect("local-only compaction must succeed offline");
 
@@ -2189,7 +2539,7 @@ mod disclosure_tests {
 
         // The mock listener never answers HTTP, so the call errors — the
         // spy only cares that the connection attempt happened.
-        let result = compact_conversation(&sentinel_messages(), &runtime, None).await;
+        let result = compact_as_previewed(&sentinel_messages(), &runtime, None).await;
         assert!(result.is_err(), "mock endpoint cannot produce a summary");
 
         // M3 seam liveness: the remote path increments the counter BEFORE

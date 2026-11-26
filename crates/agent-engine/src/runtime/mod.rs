@@ -21,6 +21,7 @@ pub mod budget;
 mod cache_diagnosis;
 pub(crate) mod cloud_invoke;
 pub mod compaction;
+pub mod compaction_cached;
 pub mod context;
 pub mod continuation;
 pub mod google_gemini;
@@ -549,9 +550,11 @@ pub struct Runtime {
     /// Content classes excluded from remote compaction disclosure.
     compaction_exclusions: Vec<agent_core::compaction::ContentClass>,
     /// Transport-construction seam (spec §9.4 / CP-12 M3): incremented at
-    /// the SINGLE remote-summarization entry point before any preflight,
-    /// auth, or HTTP request construction. Shared across clones so the
-    /// local-only zero-network proof observes every path.
+    /// the SINGLE remote-summarization entry point
+    /// (`enter_remote_summarization`) before any preflight, auth, or HTTP
+    /// request construction, once per compaction that goes remote. Shared
+    /// across clones so the local-only zero-network proof observes every
+    /// path.
     remote_summarization_attempts: Arc<std::sync::atomic::AtomicU64>,
     /// Shared registry for reactive subagent handles.
     subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
@@ -2246,7 +2249,8 @@ impl Runtime {
     }
 
     /// Number of times the remote-summarization transport seam was entered
-    /// (CP-12 M3). Local-only compaction must leave this at zero.
+    /// (CP-12 M3): once per compaction that went remote, however many
+    /// requests it took. Local-only compaction must leave this at zero.
     pub fn remote_summarization_attempts(&self) -> u64 {
         self.remote_summarization_attempts
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -3283,10 +3287,30 @@ impl Runtime {
         model: &str,
         messages: Vec<crate::SharedMessage>,
     ) -> Result<String> {
-        // Transport-construction seam: counted BEFORE preflight, auth
-        // refresh, or any request assembly (CP-12 M3).
+        self.enter_remote_summarization();
+        self.transcript_summary_call(model, messages, None).await
+    }
+
+    /// The remote-summarization seam (CP-12 M3): counted BEFORE preflight,
+    /// auth refresh, or any request assembly. Entered once per remote
+    /// compaction, whichever request then carries it (the chat's own next
+    /// request, the transcript request, or the first and then the second):
+    /// `remote_summarization_attempts` counts compactions that went
+    /// remote, not HTTP requests.
+    pub(super) fn enter_remote_summarization(&self) {
         self.remote_summarization_attempts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// [`Self::compact_call`] behind the seam: the caller has entered it
+    /// ([`Self::enter_remote_summarization`]). What the request was billed
+    /// is booked into `spend`, when the caller has a session to book it to.
+    pub(super) async fn transcript_summary_call(
+        &self,
+        model: &str,
+        messages: Vec<crate::SharedMessage>,
+        spend: Option<&compaction::CompactionSpend>,
+    ) -> Result<String> {
         #[cfg(test)]
         if let Some(reply) = SCRIPTED_SUMMARY_REQUESTS.with(|script| {
             let mut script = script.borrow_mut();
@@ -3321,10 +3345,16 @@ impl Runtime {
             // must not consume a user's one-shot `/trace next` arm.
             &api::ApiOptions {
                 trace: self.trace_ctx.clone(),
-                telemetry: self.telemetry_writer.clone(),
+                // The session's handle: the api-log record of this request
+                // carries the conversation id, like a turn's.
+                telemetry: self.request_telemetry(),
                 // The largest body Synaps sends: the whole transcript.
                 request_compression: self.request_compression.clone(),
                 ..api::ApiOptions::default()
+            },
+            api_sync::SimpleCallReport {
+                telemetry_level: self.telemetry_level,
+                spend,
             },
         )
         .await
@@ -3521,6 +3551,7 @@ impl Runtime {
             // schedules from.
             cache_anchor: Some(self.cache_anchor.clone()),
             keepwarm: None,
+            compaction: None,
             // The foreground chain: the only requests that thread
             // `diagnostics.previous_message_id`.
             cache_diagnosis: self.cache_diagnosis(),
