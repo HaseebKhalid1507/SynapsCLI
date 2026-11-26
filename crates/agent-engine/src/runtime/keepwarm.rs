@@ -48,6 +48,8 @@ use tokio_util::sync::CancellationToken;
 use super::api::{ApiMethods, ApiOptions, KeepWarmMode, KeepWarmRequest};
 use super::helpers::HelperMethods;
 use super::{Runtime, SessionEvent, StreamEvent};
+#[cfg(any(test, feature = "testing"))]
+use crate::session::cache_expiry_testing::At as Probe;
 use crate::{Result, RuntimeError, SharedMessage};
 
 /// Output tokens a ping may produce on top of a thinking budget (or in total
@@ -520,6 +522,14 @@ enum NextTurnRequest<'a> {
 }
 
 impl NextTurnRequest<'_> {
+    /// Test seam: a `CacheExpiry` probe reports (and may park at) `at`.
+    #[cfg(any(test, feature = "testing"))]
+    async fn at(&self, at: Probe) {
+        if matches!(self, Self::Ping(KeepWarmMode::Expiry { .. })) {
+            crate::session::cache_expiry_testing::at(at).await;
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self {
             Self::Ping(_) => "cache keep-warm",
@@ -856,6 +866,8 @@ impl Runtime {
         }
 
         // System prompt: run_stream_tracked → run_stream_internal, verbatim.
+        #[cfg(any(test, feature = "testing"))]
+        purpose.at(Probe::SystemPrompt).await;
         let system_prompt = self.effective_system_prompt().await;
         let system_prompt = if context_enabled {
             Some(format!(
@@ -866,10 +878,14 @@ impl Runtime {
         } else {
             system_prompt
         };
+        #[cfg(any(test, feature = "testing"))]
+        purpose.at(Probe::Injection).await;
         let session_injection = match self.session_id.as_deref() {
             Some(id) => self.hook_bus.session_injection_for(id).await,
             None => None,
         };
+        #[cfg(any(test, feature = "testing"))]
+        purpose.at(Probe::InjectionRead).await;
         let system_prompt = match session_injection {
             Some(content) => Some(super::stream::wrap_extension_context(
                 system_prompt.as_deref().unwrap_or_default(),

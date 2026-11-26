@@ -458,52 +458,106 @@ impl SessionActor {
     }
 }
 
-/// Test seams: hold a job where it reads its inputs.
+/// Test seams: hold a job where it reads its inputs, and know where it is.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use tokio::sync::Semaphore;
+    use tokio::sync::{watch, Semaphore};
 
-    type Gates = (Arc<Semaphore>, Arc<Semaphore>, Arc<AtomicUsize>);
+    /// Where a job is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum At {
+        /// Its probe is about to build the system prompt, whose first read
+        /// is the tool registry's.
+        SystemPrompt,
+        /// Its probe is about to read the session injection.
+        Injection,
+        /// Its probe has read the session injection.
+        InjectionRead,
+        /// Its outcome is in (the work and its deadline are over) and not
+        /// yet handed to the actor.
+        Done,
+    }
+
+    #[derive(Clone)]
+    struct Gates {
+        start: Arc<Semaphore>,
+        selected: Arc<Semaphore>,
+        reached: Arc<AtomicUsize>,
+        seen: Arc<watch::Sender<Vec<At>>>,
+        parks: Arc<Mutex<HashMap<At, Arc<Semaphore>>>>,
+    }
 
     static GATES: Mutex<Option<Gates>> = Mutex::new(None);
 
+    fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// While held, every `CacheExpiry` job waits for a `start` permit
     /// before its probe, and for a `selected` permit once it has its answer
-    /// (one each per job). [`Hold::open`] lets jobs through `start`.
+    /// (one each per job). [`Hold::open`] lets jobs through `start`. Jobs
+    /// report each [`At`] they reach, and stop at a [`Hold::park`]ed one.
     pub struct Hold {
         pub start: Arc<Semaphore>,
         pub selected: Arc<Semaphore>,
-        reached: Arc<AtomicUsize>,
+        gates: Gates,
     }
 
     impl Hold {
         pub fn new() -> Self {
-            let (start, selected) = (Arc::new(Semaphore::new(0)), Arc::new(Semaphore::new(0)));
-            let reached = Arc::new(AtomicUsize::new(0));
-            *GATES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some((start.clone(), selected.clone(), reached.clone()));
+            let gates = Gates {
+                start: Arc::new(Semaphore::new(0)),
+                selected: Arc::new(Semaphore::new(0)),
+                reached: Arc::new(AtomicUsize::new(0)),
+                seen: Arc::new(watch::channel(Vec::new()).0),
+                parks: Arc::default(),
+            };
+            *lock(&GATES) = Some(gates.clone());
             Self {
-                start,
-                selected,
-                reached,
+                start: gates.start.clone(),
+                selected: gates.selected.clone(),
+                gates,
             }
         }
 
         /// How many jobs have their answer and wait at `selected` (or
         /// passed it).
         pub fn reached(&self) -> usize {
-            self.reached.load(Ordering::SeqCst)
+            self.gates.reached.load(Ordering::SeqCst)
         }
 
         /// Jobs pass `start` freely (they still stop at `selected`).
         pub fn open(self) -> Self {
             self.start.add_permits(Semaphore::MAX_PERMITS / 2);
             self
+        }
+
+        /// Jobs that reach `at` from now on stop there, having reported
+        /// it, until [`Hold::release`].
+        pub fn park(&self, at: At) {
+            lock(&self.gates.parks).insert(at, Arc::new(Semaphore::new(0)));
+        }
+
+        /// One job parked at `at` goes on.
+        pub fn release(&self, at: At) {
+            if let Some(park) = lock(&self.gates.parks).get(&at) {
+                park.add_permits(1);
+            }
+        }
+
+        /// A job has reached `at`.
+        pub fn has_seen(&self, at: At) -> bool {
+            self.gates.seen.borrow().contains(&at)
+        }
+
+        /// Until a job reaches `at`.
+        pub async fn seen(&self, at: At) {
+            let mut seen = self.gates.seen.subscribe();
+            let _ = seen.wait_for(|s| s.contains(&at)).await;
         }
     }
 
@@ -515,33 +569,45 @@ pub mod testing {
 
     impl Drop for Hold {
         fn drop(&mut self) {
-            *GATES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *lock(&GATES) = None;
             self.start.close();
             self.selected.close();
+            for park in lock(&self.gates.parks).values() {
+                park.close();
+            }
         }
     }
 
     fn gates() -> Option<Gates> {
-        GATES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        lock(&GATES).clone()
     }
 
     pub(super) async fn job_started() {
-        if let Some((start, _, _)) = gates() {
-            if let Ok(p) = start.acquire().await {
+        if let Some(g) = gates() {
+            if let Ok(p) = g.start.acquire().await {
                 p.forget();
             }
         }
     }
 
     pub(super) async fn job_selected() {
-        if let Some((_, selected, reached)) = gates() {
-            reached.fetch_add(1, Ordering::SeqCst);
-            if let Ok(p) = selected.acquire().await {
+        if let Some(g) = gates() {
+            g.reached.fetch_add(1, Ordering::SeqCst);
+            if let Ok(p) = g.selected.acquire().await {
+                p.forget();
+            }
+        }
+    }
+
+    /// The job is at `at`: reported, then parked there if the hold says so.
+    pub(crate) async fn at(at: At) {
+        let Some(g) = gates() else {
+            return;
+        };
+        let park = lock(&g.parks).get(&at).cloned();
+        g.seen.send_modify(|seen| seen.push(at));
+        if let Some(park) = park {
+            if let Ok(p) = park.acquire().await {
                 p.forget();
             }
         }

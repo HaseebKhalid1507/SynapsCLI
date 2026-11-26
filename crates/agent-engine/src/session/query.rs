@@ -196,6 +196,8 @@ impl<T: Send + 'static, A> QueryJobs<T, A> {
                 Ok(r) => r,
                 Err(_) => Err(QueryError::new(QueryErrorCode::Timeout)),
             };
+            #[cfg(any(test, feature = "testing"))]
+            super::cache_expiry::testing::at(super::cache_expiry::testing::At::Done).await;
             (gen, r)
         });
         self.tasks.insert(abort.id(), gen);

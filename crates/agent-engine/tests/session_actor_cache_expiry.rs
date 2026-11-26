@@ -11,7 +11,7 @@ use session_actor_common::*;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_engine::session::cache_expiry_testing::Hold;
+use agent_engine::session::cache_expiry_testing::{At, Hold};
 use agent_engine::session::{
     decode_query_reply, CacheExpiry, CacheReason, CacheState, ClientKind, ClientMeta,
     ClientTransport, Envelope, LocalTransport, QueryError, QueryErrorCode, SessionCommand,
@@ -972,6 +972,13 @@ async fn cancel_answered(t: &mut LocalTransport) {
     .expect("the actor serviced Cancel");
 }
 
+/// Until a job reaches `at`.
+async fn job_at(hold: &Hold, at: At) {
+    tokio::time::timeout(PATIENCE, hold.seen(at))
+        .await
+        .unwrap_or_else(|_| panic!("the job never reached {at:?}"));
+}
+
 /// A job waits for the tool registry's and the session injection's write
 /// locks (a writer holds both, then the injection's alone): the actor
 /// services `Cancel` throughout, and the job answers once both are free.
@@ -985,13 +992,21 @@ async fn the_actor_services_cancel_while_the_job_waits_for_a_writer() {
     let registry = parts.tools.write().await;
     let injection = parts.hook_bus.hold_session_injection().await;
     ask(&mut f.t, 140).await;
+    // Next for the job: the registry's read lock, held.
+    job_at(&hold, At::SystemPrompt).await;
     cancel_answered(&mut f.t).await;
-    assert_eq!(hold.reached(), 0, "the job waits for the registry");
+    assert!(
+        !hold.has_seen(At::Injection),
+        "the job waits for the registry"
+    );
     drop(registry);
-    // The job reads the registry, then waits for the injection.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Next for the job: the injection's read lock, held.
+    job_at(&hold, At::Injection).await;
     cancel_answered(&mut f.t).await;
-    assert_eq!(hold.reached(), 0, "the job waits for the injection");
+    assert!(
+        !hold.has_seen(At::InjectionRead),
+        "the job waits for the injection"
+    );
     drop(injection);
     let_one_through(&hold);
     assert_eq!(says(&reply(&mut f.t, 140).await.unwrap()), WARM);
@@ -999,10 +1014,9 @@ async fn the_actor_services_cancel_while_the_job_waits_for_a_writer() {
     end(&mut f.t).await;
 }
 
-/// The session's injection is set while the job reads its inputs: the job
-/// has read the old injection (it was waiting at the lock before the set)
-/// and waits for the registry when the set lands. `stale`, never the old
-/// reading; asking again answers for the new injection.
+/// The session's injection is set after the job has read it, before the
+/// job's answer: `stale`, never the old reading; asking again answers for
+/// the new injection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn an_injection_set_while_the_job_reads_is_stale() {
@@ -1018,21 +1032,17 @@ async fn an_injection_set_while_the_job_reads_is_stale() {
     )
     .await;
     let session = status["session"].as_str().unwrap().to_string();
-    let parts = f.host.parts();
     let hold = Hold::new().open();
-    let injection = parts.hook_bus.hold_session_injection().await;
+    hold.park(At::InjectionRead);
     ask(&mut f.t, 151).await;
-    // The job waits for the injection; a writer takes the registry.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let registry = parts.tools.write().await;
-    drop(injection);
-    // The job reads the old injection, then waits for the registry.
-    parts
+    // The job has read the old injection, and stops there.
+    job_at(&hold, At::InjectionRead).await;
+    f.host
+        .parts()
         .hook_bus
         .set_session_injection_for(&session, "context set mid-read".into())
         .await;
-    assert_eq!(hold.reached(), 0, "the job is still reading");
-    drop(registry);
+    hold.release(At::InjectionRead);
     // A job that missed the set would answer from the old reading.
     let_one_through(&hold);
     assert_eq!(
@@ -1049,11 +1059,12 @@ async fn an_injection_set_while_the_job_reads_is_stale() {
     end(&mut f.t).await;
 }
 
-/// The job has its answer (a 5-minute proof, warm), and the actor emits it
+/// The job's answer (a 5-minute proof, warm) is in, and the actor gets it
 /// after the warm deadline, nothing changed: classified at emit,
 /// `may_have_expired` until the requested hour has run from the request.
-/// Tokio's clock (the monotonic one) is paused and moved on between the
-/// job's answer and the emit, hence the single-threaded runtime.
+/// Tokio's clock (the monotonic one) is paused and moved on while the
+/// finished job waits to hand its outcome over, hence the single-threaded
+/// runtime.
 #[tokio::test]
 #[serial]
 async fn an_answer_emitted_after_its_warm_deadline_is_aged_at_emit() {
@@ -1061,13 +1072,13 @@ async fn an_answer_emitted_after_its_warm_deadline_is_aged_at_emit() {
     f.script.turns(Reply::FiveMin);
     turn(&mut f.t, "hello").await;
     let hold = Hold::new().open();
-    ask(&mut f.t, 160).await;
-    reached(&hold, 1).await;
-    tokio::time::pause();
-    // Nothing runs between these two: the clock moves on before the job
-    // hands its answer to the actor.
+    hold.park(At::Done);
     let_one_through(&hold);
+    ask(&mut f.t, 160).await;
+    job_at(&hold, At::Done).await;
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(301)).await;
+    hold.release(At::Done);
     let c = reply(&mut f.t, 160).await.unwrap();
     tokio::time::resume();
     assert_eq!(says(&c), unknown(CacheReason::MayHaveExpired), "{c:?}");
