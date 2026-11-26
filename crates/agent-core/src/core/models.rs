@@ -10,7 +10,17 @@ pub const KNOWN_MODELS: &[(&str, &str)] = &[
     ("claude-opus-4-7", "Opus 4.7"),
     ("claude-opus-4-6", "Opus 4.6 — previous flagship"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — fast"),
+    ("claude-haiku-5-5", "Haiku 5.5 — fast"),
 ];
+
+/// `compaction_model = provider-small`: the small model that writes a
+/// chat's summaries, by the provider of the chat's route, on the chat's own
+/// account. One line per pin; update a pin here. A provider without a line
+/// has its chats' summaries written by the chat's own model.
+/// `openai-codex` has none until the Codex accounts' usage readings report
+/// `gpt-6-luna`: an account whose reading doesn't list it, on a free plan or
+/// with no plan named, can't be selected for it.
+pub const PROVIDER_SMALL_MODELS: &[(&str, &str)] = &[("anthropic", "claude-haiku-5-5")];
 
 pub fn default_model() -> &'static str {
     KNOWN_MODELS[0].0
@@ -134,7 +144,8 @@ pub const DEFAULT_LEGACY_ADAPTIVE_FALLBACK: u32 = 16384;
 /// own claude-code logic (`modelSupports1M` in src/utils/context.ts).
 pub fn model_supports_1m(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    // Opus 4.6+, Sonnet 4 family. Newer models (5.x) assumed supported.
+    // Opus 4.6+, Sonnet 4 family. Newer models (5.x) assumed supported;
+    // Haiku 5.5's model page lists a 1M window.
     m.contains("opus-4-6")
         || m.contains("opus-4-7")
         || m.contains("opus-4-8")
@@ -142,6 +153,7 @@ pub fn model_supports_1m(model: &str) -> bool {
         || m.contains("sonnet-4")
         || m.contains("opus-5")
         || m.contains("sonnet-5")
+        || m.contains("haiku-5")
         || m.contains("fable-5")
 }
 
@@ -240,6 +252,7 @@ mod tests {
         assert!(ids.contains(&"claude-opus-4-7"));
         assert!(ids.contains(&"claude-sonnet-4-6"));
         assert!(ids.contains(&"claude-haiku-4-5-20251001"));
+        assert!(ids.contains(&"claude-haiku-5-5"));
     }
 
     #[test]
@@ -333,6 +346,8 @@ mod tests {
         assert!(model_supports_1m("claude-opus-5-0"));
         assert!(model_supports_1m("claude-sonnet-5-1"));
         assert!(model_supports_1m("claude-fable-5"));
+        assert!(model_supports_1m("claude-haiku-5-5"));
+        assert!(model_supports_1m("anthropic/claude-haiku-5-5"));
     }
 
     #[test]

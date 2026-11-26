@@ -7943,7 +7943,10 @@ mod rich_output_tests {
             rt.set_compaction_model(Some("plug:prov:model-x".to_string()));
             let summary = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
-                rt.compact_call(vec![Arc::new(json!({"role": "user", "content": "summarise"}))]),
+                rt.compact_call(
+                    "plug:prov:model-x",
+                    vec![Arc::new(json!({"role": "user", "content": "summarise"}))],
+                ),
             )
             .await;
             crate::runtime::openai::clear_extension_manager_for_routing();
