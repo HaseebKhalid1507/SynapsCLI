@@ -689,21 +689,30 @@ async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
         (true, false, _) => "stale (pid dead)",
         (false, false, _) => "not running (auto-starts on first --attach)",
     };
+    // One row per required guard (none when the config requires none).
+    let required_guards = pong.as_ref().map(|p| p.required_guards.clone()).unwrap_or_default();
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "state": state,
-                "ok": pong.is_some(),
-                "socket": paths.sock,
-                "pid": pong.as_ref().map(|p| p.pid).or(info.as_ref().map(|i| i.pid)),
-                "uptime_s": pong.as_ref().map(|p| p.uptime_s),
-                "sessions": pong.as_ref().map(|p| p.sessions),
-                "daemon_version": info.as_ref().map(|i| i.daemon_version.clone()),
-                "protocol_version": info.as_ref().map(|i| i.protocol_version),
-                "profile": info.as_ref().and_then(|i| i.profile.clone()),
-            })
-        );
+        let mut out = serde_json::json!({
+            "state": state,
+            "ok": pong.is_some(),
+            "socket": paths.sock,
+            "pid": pong.as_ref().map(|p| p.pid).or(info.as_ref().map(|i| i.pid)),
+            "uptime_s": pong.as_ref().map(|p| p.uptime_s),
+            "sessions": pong.as_ref().map(|p| p.sessions),
+            "daemon_version": info.as_ref().map(|i| i.daemon_version.clone()),
+            "protocol_version": info.as_ref().map(|i| i.protocol_version),
+            "profile": info.as_ref().and_then(|i| i.profile.clone()),
+        });
+        // Only when the daemon reports rows: without required guards the
+        // rows are absent.
+        if !required_guards.is_empty() {
+            out["required_guards"] = serde_json::json!(required_guards);
+        }
+        // Always said (`null`: no answer), so an empty or missing list
+        // reads "not configured", never "all loaded".
+        out["required_guards_configured"] =
+            serde_json::json!(pong.as_ref().map(|p| p.required_guards_configured));
+        println!("{out}");
     } else {
         println!("daemon: {state}");
         println!("socket: {}", paths.sock.display());
@@ -712,12 +721,26 @@ async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
         }
         if let Some(p) = &pong {
             println!("uptime: {}s  sessions: {}", p.uptime_s, p.sessions);
+            for line in required_guard_status(p) {
+                println!("{line}");
+            }
         }
     }
     if pong.is_none() {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `synaps daemon status`'s required-guard lines, printed after every other
+/// line so `daemon: <state>` stays first: whether the daemon requires any
+/// guard (an empty list reads "configured: no", never as all loaded), then
+/// one line per guard.
+fn required_guard_status(pong: &agent_engine::session::socket_transport::Pong) -> Vec<String> {
+    use agent_engine::extensions::required_guards::{configured_line, status_lines};
+    let mut lines = vec![configured_line(pong.required_guards_configured, pong.required_guards.len())];
+    lines.extend(status_lines(&pong.required_guards));
+    lines
 }
 
 async fn stop(profile: Option<String>, force: bool) -> anyhow::Result<()> {
@@ -969,6 +992,52 @@ mod pin_line_tests {
     fn an_offline_pin_names_its_state_and_how_to_clear_it() {
         let e = pins::PinEntry { journal_id: "j1".into(), name: Some("axon".into()), ..Default::default() };
         assert_eq!(offline_line(&e), "j1  pinned (not live)  not restored yet  name=axon  (`synaps daemon pin j1 --off` clears it)");
+    }
+}
+
+#[cfg(test)]
+mod required_guard_status_tests {
+    use super::*;
+    use agent_engine::session::socket_transport::Pong;
+    use agent_engine::session::wire::RequiredGuardHealth;
+
+    fn pong(configured: bool, rows: Vec<RequiredGuardHealth>) -> Pong {
+        Pong { pid: 1, uptime_s: 2, sessions: 0, required_guards: rows, required_guards_configured: configured }
+    }
+
+    /// No required guard reads "configured: no" and has no rows; the
+    /// daemon that predates the fields reads the same.
+    #[test]
+    fn no_required_guard_says_so() {
+        assert_eq!(required_guard_status(&pong(false, vec![])), ["required guards configured: no"]);
+    }
+
+    /// One row per guard after the count, loaded or not loaded with its cause.
+    #[test]
+    fn each_required_guard_has_a_row() {
+        let rows = vec![
+            RequiredGuardHealth { name: "example-guard".into(), loaded: true, cause: None },
+            RequiredGuardHealth {
+                name: "other-guard".into(),
+                loaded: false,
+                cause: Some("absent: no plugin folder named 'other-guard'".into()),
+            },
+        ];
+        assert_eq!(
+            required_guard_status(&pong(true, rows)),
+            [
+                "required guards configured: yes (2)",
+                "required guard: example-guard loaded",
+                "required guard: other-guard NOT LOADED (absent: no plugin folder named 'other-guard')",
+            ]
+        );
+    }
+
+    /// A list that is set but empty-after-parse never reads as all loaded:
+    /// a configured daemon with no rows still says it is configured.
+    #[test]
+    fn a_configured_daemon_is_never_read_as_none() {
+        assert_eq!(required_guard_status(&pong(true, vec![])), ["required guards configured: yes (0)"]);
     }
 }
 

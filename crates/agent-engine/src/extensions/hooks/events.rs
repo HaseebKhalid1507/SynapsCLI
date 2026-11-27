@@ -227,7 +227,10 @@ pub fn hook_cwd(cwd: Option<&Path>) -> Option<String> {
 /// `data`.
 ///
 /// `✓*` — set via [`HookEvent::with_session`] for foreground sessions; `null`
-/// for workers (no conversation id) and when `SYNAPS_HOOK_SESSION_ID=0`.
+/// for workers (no conversation id) and when `SYNAPS_HOOK_SESSION_ID=0`. A
+/// worker's `before_tool_call` is the exception: it reaches its caller's
+/// hooks with the caller's conversation id and the worker's `subagent_id`
+/// (see [`super::HookBus::worker_route`]).
 ///
 /// `✓†` — the chat whose tool call did the forgetting; `null` when the call
 /// had no chat behind it.
@@ -260,6 +263,13 @@ pub struct HookEvent {
     /// The chat's working folder ([`hook_cwd`]).
     #[serde(default)]
     pub cwd: Option<String>,
+    /// For `before_tool_call` from a worker (subagent): the worker's id, as
+    /// its caller sees it (`sa_N`, the `handle_id` of `subagent_start`).
+    /// `session_id` is then the conversation that started the worker. Set
+    /// by the worker's hook route ([`super::HookBus::worker_route`]);
+    /// omitted from the JSON on a foreground call and on every other event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
     /// Session message history for `on_session_end`.
     /// Contains the conversation transcript so extensions (like Stelline)
     /// can extract memories without reaching into runtime internals.
@@ -304,6 +314,7 @@ impl HookEvent {
             message: None,
             session_id: None,
             cwd: None,
+            subagent_id: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -335,6 +346,7 @@ impl HookEvent {
             message: None,
             session_id: None,
             cwd: None,
+            subagent_id: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -351,6 +363,7 @@ impl HookEvent {
             message: Some(message.to_string()),
             session_id: None,
             cwd: None,
+            subagent_id: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -367,6 +380,7 @@ impl HookEvent {
             message: Some(message.to_string()),
             session_id: None,
             cwd: None,
+            subagent_id: None,
             tool_runtime_name: None,
             transcript: None,
             data,
@@ -406,6 +420,7 @@ impl HookEvent {
             message: Some(summary.to_string()),
             session_id: Some(new_session_id.to_string()),
             cwd: None,
+            subagent_id: None,
             tool_runtime_name: None,
             transcript: None,
             data,
@@ -438,6 +453,7 @@ impl HookEvent {
             message: None,
             session_id: Some(session_id.to_string()),
             cwd: None,
+            subagent_id: None,
             tool_runtime_name: None,
             transcript: None,
             data: serde_json::json!({
@@ -501,6 +517,7 @@ impl HookEvent {
             message: None,
             session_id: session_id.map(str::to_string),
             cwd: None,
+            subagent_id: None,
             tool_runtime_name: None,
             transcript: None,
             data: serde_json::json!({
@@ -522,6 +539,7 @@ impl HookEvent {
             message: None,
             session_id: Some(session_id.to_string()),
             cwd: None,
+            subagent_id: None,
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
@@ -538,6 +556,7 @@ impl HookEvent {
             message: None,
             session_id: Some(session_id.to_string()),
             cwd: None,
+            subagent_id: None,
             tool_runtime_name: None,
             transcript,
             data: Value::Null,
@@ -686,6 +705,13 @@ impl HookResult {
         }
     }
 
+    /// A `Block` with `reason`.
+    pub fn block(reason: impl Into<String>) -> Self {
+        Self::Block {
+            reason: reason.into(),
+        }
+    }
+
     /// An unattributed `Confirm` (as an extension returns it, before
     /// `HookBus::emit` stamps the source).
     pub fn confirm(message: impl Into<String>) -> Self {
@@ -696,6 +722,51 @@ impl HookResult {
             tool: None,
             modified_input: None,
             modified_by: vec![],
+        }
+    }
+}
+
+/// What a hook subscription answers when its extension cannot (no reply in
+/// time, dead or stopped child, failed start or respawn): the manifest's
+/// `on_failure`. Only `before_tool_call` may fail closed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HookFailurePolicy {
+    /// The call goes ahead (fail open).
+    #[default]
+    Continue,
+    /// The call is blocked (fail closed).
+    Block,
+}
+
+impl HookFailurePolicy {
+    /// The manifest value: `"continue"` or `"block"`; anything else is `None`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "continue" => Some(Self::Continue),
+            "block" => Some(Self::Block),
+            _ => None,
+        }
+    }
+
+    /// The answer for `extension`'s handler when it did not answer.
+    pub fn unanswered(self, extension: &str) -> HookResult {
+        match self {
+            Self::Continue => HookResult::Continue,
+            Self::Block => HookResult::block(format!(
+                "guard {extension} didn't answer; the call is blocked"
+            )),
+        }
+    }
+
+    /// [`Self::unanswered`] at the 5 s hook timeout. The wait includes
+    /// queueing behind the extension's own calls in flight, so a busy guard
+    /// times out like a stopped one.
+    pub fn timed_out(self, extension: &str) -> HookResult {
+        match self {
+            Self::Continue => HookResult::Continue,
+            Self::Block => HookResult::block(format!(
+                "guard {extension} didn't answer within 5 s (busy or stopped); the call is blocked"
+            )),
         }
     }
 }

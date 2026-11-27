@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::hooks::events::HookKind;
+use super::hooks::events::{HookFailurePolicy, HookKind};
 use super::permissions::PermissionSet;
 
 /// Current extension protocol version supported by SynapsCLI.
@@ -233,7 +233,12 @@ pub enum HostContextKey {
 #[derive(Debug, Clone)]
 pub struct ValidatedExtensionManifest {
     pub permissions: PermissionSet,
-    pub subscriptions: Vec<(HookKind, Option<String>, Option<HookMatcher>)>,
+    pub subscriptions: Vec<(
+        HookKind,
+        Option<String>,
+        Option<HookMatcher>,
+        HookFailurePolicy,
+    )>,
 }
 
 impl ExtensionManifest {
@@ -318,7 +323,25 @@ impl ExtensionManifest {
                     kind.as_str(),
                 ));
             }
-            subscriptions.push((kind, sub.tool.clone(), sub.matcher.clone()));
+            let on_failure = match sub.on_failure.as_deref() {
+                None => HookFailurePolicy::Continue,
+                Some(value) => HookFailurePolicy::parse(value).ok_or_else(|| {
+                    format!(
+                        "Extension '{}' hook '{}' has unknown on_failure '{}' (supported: \"continue\", \"block\")",
+                        id,
+                        kind.as_str(),
+                        value,
+                    )
+                })?,
+            };
+            if on_failure == HookFailurePolicy::Block && kind != HookKind::BeforeToolCall {
+                return Err(format!(
+                    "Extension '{}' hook '{}' cannot use on_failure \"block\": only before_tool_call can block a call its extension did not answer",
+                    id,
+                    kind.as_str(),
+                ));
+            }
+            subscriptions.push((kind, sub.tool.clone(), sub.matcher.clone(), on_failure));
         }
 
         Ok(ValidatedExtensionManifest {
@@ -358,6 +381,10 @@ pub struct HookSubscription {
     /// Optional simple matcher conditions.
     #[serde(default, rename = "match")]
     pub matcher: Option<HookMatcher>,
+    /// What the subscription answers when the extension does not:
+    /// "continue" (default) or "block" (`before_tool_call` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -534,6 +561,7 @@ mod tests {
                 hook: "before_tool_call".to_string(),
                 tool: None,
                 matcher: None,
+                on_failure: None,
             }],
             config: vec![],
         };
@@ -577,12 +605,73 @@ mod tests {
                 hook: "on_session_start".to_string(),
                 tool: Some("bash".to_string()),
                 matcher: None,
+                on_failure: None,
             }],
             config: vec![],
         };
 
         let err = manifest.validate("bad-filter").unwrap_err();
         assert!(err.contains("does not allow a tool filter"));
+    }
+
+    fn with_hook(hook: &str, on_failure: Option<&str>) -> ExtensionManifest {
+        let mut sub = serde_json::json!({"hook": hook});
+        if let Some(value) = on_failure {
+            sub["on_failure"] = serde_json::json!(value);
+        }
+        serde_json::from_value(serde_json::json!({
+            "runtime": "process",
+            "command": "ext",
+            "permissions": ["tools.intercept", "session.lifecycle", "privacy.llm_content"],
+            "hooks": [sub]
+        }))
+        .unwrap()
+    }
+
+    /// `on_failure: "block"` is carried for `before_tool_call`; absent or
+    /// `"continue"` is the fail-open default, which never serializes.
+    #[test]
+    fn on_failure_block_is_carried_for_before_tool_call() {
+        let policy = |m: ExtensionManifest| m.validate("guard").unwrap().subscriptions[0].3;
+        assert_eq!(
+            policy(with_hook("before_tool_call", Some("block"))),
+            HookFailurePolicy::Block
+        );
+        assert_eq!(
+            policy(with_hook("before_tool_call", None)),
+            HookFailurePolicy::Continue
+        );
+        assert_eq!(
+            policy(with_hook("after_tool_call", Some("continue"))),
+            HookFailurePolicy::Continue
+        );
+        let plain = serde_json::to_value(with_hook("before_tool_call", None)).unwrap();
+        assert!(plain["hooks"][0].get("on_failure").is_none(), "{plain}");
+    }
+
+    /// Only `before_tool_call` can fail closed; unknown values are refused.
+    #[test]
+    fn validate_rejects_on_failure_block_on_other_hooks_and_unknown_values() {
+        for hook in [
+            "after_tool_call",
+            "before_message",
+            "on_session_start",
+            "on_session_end",
+        ] {
+            let err = with_hook(hook, Some("block"))
+                .validate("guard")
+                .unwrap_err();
+            assert!(
+                err.contains("cannot use on_failure \"block\"") && err.contains("before_tool_call"),
+                "{hook}: {err}"
+            );
+        }
+        for bad in ["Block", "deny", ""] {
+            let err = with_hook("before_tool_call", Some(bad))
+                .validate("guard")
+                .unwrap_err();
+            assert!(err.contains("unknown on_failure"), "'{bad}': {err}");
+        }
     }
 
     // ── Round-trip ─────────────────────────────────────────────────────────
@@ -603,6 +692,7 @@ mod tests {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
                 matcher: None,
+                on_failure: None,
             }],
             config: vec![],
         };

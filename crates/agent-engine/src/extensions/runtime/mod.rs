@@ -111,6 +111,15 @@ pub trait ExtensionHandler: Send + Sync {
         None
     }
 
+    /// Why this extension, a required guard the manager has loaded, cannot
+    /// answer a tool call now (its process exited, was killed, or was
+    /// stopped), or `None` while it is live. Waits for the brief locks that
+    /// publish a process, never for RPC I/O. Default: a handler with no
+    /// process to check is never known live, so it is down (fail closed).
+    async fn guard_down(&self) -> Option<String> {
+        Some("its handler reports no process liveness".to_string())
+    }
+
     /// Handle a hook event. Returns the handler's decision.
     async fn handle(&self, event: &HookEvent) -> HookResult;
 
@@ -127,6 +136,38 @@ pub trait ExtensionHandler: Send + Sync {
     /// [`HookBus::worker_transforms`]: crate::extensions::hooks::HookBus::worker_transforms
     async fn handle_no_spawn(&self, event: &HookEvent) -> HookResult {
         self.handle(event).await
+    }
+
+    /// [`Self::handle`] (or [`Self::handle_no_spawn`] when `no_spawn`) for a
+    /// guard that fails closed (manifest `on_failure: "block"`): when the
+    /// extension cannot answer (no reply in time, dead or stopped child,
+    /// failed start or respawn) the result is a `Block`, never `Continue`
+    /// ([`HookFailurePolicy::unanswered`]). Default: a handler with no such
+    /// failure mode answers as usual.
+    ///
+    /// [`HookFailurePolicy::unanswered`]: crate::extensions::hooks::events::HookFailurePolicy::unanswered
+    async fn handle_fail_closed(&self, event: &HookEvent, no_spawn: bool) -> HookResult {
+        if no_spawn {
+            self.handle_no_spawn(event).await
+        } else {
+            self.handle(event).await
+        }
+    }
+
+    /// One `before_tool_call` for a required guard (the config's
+    /// `required_guards`), whatever its manifest's `on_failure` says. `Ok`
+    /// is its answer; `Err` is why it gave none the bus may use, and the bus
+    /// blocks the call naming the cause
+    /// ([`no_answer_text`](crate::extensions::required_guards::no_answer_text)).
+    /// The bus's own 5 s timeout and its check of the answer's kind apply on
+    /// top. Default: [`Self::handle_fail_closed`]'s answer (a handler with no
+    /// such failure mode answers as usual).
+    async fn handle_required(
+        &self,
+        event: &HookEvent,
+        no_spawn: bool,
+    ) -> Result<HookResult, crate::extensions::required_guards::NoAnswer> {
+        Ok(self.handle_fail_closed(event, no_spawn).await)
     }
 
     /// Call an extension-provided tool on behalf of a conversation. The

@@ -1120,6 +1120,73 @@ impl ExtensionHandler for LazyExtensionHandler {
         }
     }
 
+    /// A deferred extension is live only while its lease is running; one
+    /// no event has started yet cannot answer a guard call.
+    async fn guard_down(&self) -> Option<String> {
+        match self.manager.ready_handler_scope(&self.plugin) {
+            Some(inner) => inner.handler.guard_down().await,
+            None => Some("it is deferred and not running".to_string()),
+        }
+    }
+
+    /// A deferred guard that fails closed: a child that cannot start, or
+    /// (worker path) is not running, blocks the call.
+    async fn handle_fail_closed(
+        &self,
+        event: &crate::extensions::hooks::events::HookEvent,
+        no_spawn: bool,
+    ) -> crate::extensions::hooks::events::HookResult {
+        let inner = if no_spawn {
+            self.manager
+                .ready_handler_scope(&self.plugin)
+                .ok_or_else(|| "not running".to_string())
+        } else {
+            self.live().await
+        };
+        match inner {
+            Ok(inner) => {
+                let result = inner.handler.handle_fail_closed(event, no_spawn).await;
+                Self::touch(&inner);
+                result
+            }
+            Err(error) => {
+                tracing::warn!(
+                    extension = %self.plugin,
+                    error = %error,
+                    "Deferred guard extension could not serve a hook event — blocking the call",
+                );
+                crate::extensions::hooks::events::HookFailurePolicy::Block.unanswered(&self.plugin)
+            }
+        }
+    }
+
+    /// A required guard's call: served by the running lease only. Its start
+    /// or absence is an answer the bus refuses on, never a pass-through.
+    async fn handle_required(
+        &self,
+        event: &crate::extensions::hooks::events::HookEvent,
+        no_spawn: bool,
+    ) -> Result<
+        crate::extensions::hooks::events::HookResult,
+        crate::extensions::required_guards::NoAnswer,
+    > {
+        let inner = if no_spawn {
+            self.manager
+                .ready_handler_scope(&self.plugin)
+                .ok_or_else(|| "not running".to_string())
+        } else {
+            self.live().await
+        };
+        match inner {
+            Ok(inner) => {
+                let result = inner.handler.handle_required(event, no_spawn).await;
+                Self::touch(&inner);
+                result
+            }
+            Err(error) => Err(crate::extensions::required_guards::NoAnswer::CallFailed(error)),
+        }
+    }
+
     async fn call_tool_for(
         &self,
         _name: &str,

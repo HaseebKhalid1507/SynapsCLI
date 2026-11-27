@@ -306,6 +306,22 @@ impl DaemonState {
         self.host.session_handles()
     }
 
+    /// The `Pong` reply (`Ping`, `Purge`): pid, uptime, live sessions, and
+    /// one row per required guard, its process checked live (none when the
+    /// config requires none).
+    pub async fn pong(&self) -> crate::session::wire::DaemonFrame {
+        let gate = std::sync::Arc::clone(self.host.parts().hook_bus.required_guards());
+        let required_guards = gate.health().await;
+        let required_guards_configured = gate.configured();
+        crate::session::wire::DaemonFrame::Pong {
+            pid: std::process::id(),
+            uptime_s: self.uptime_s(),
+            sessions: self.live_sessions().len(),
+            required_guards,
+            required_guards_configured,
+        }
+    }
+
     /// Listing metas with lifecycle / clients / input_owner / journal_id
     /// (B4: `EngineHost::sessions()` fills the handle cells).
     pub fn session_metas(&self) -> Vec<SessionMeta> {
@@ -423,6 +439,20 @@ pub struct Daemon {
     accept: tokio::task::JoinHandle<()>,
 }
 
+/// Log a warning, at every daemon start (a reload included), when no
+/// guard is required: `required_guards` is absent or empty in the config, so
+/// no tool call waits on a guard being loaded. `synaps daemon status` says
+/// the same to whoever asks (`required guards configured: no`); this puts it
+/// in the log of a daemon nobody asks.
+fn warn_when_no_required_guards(gate: &crate::extensions::required_guards::RequiredGuards) {
+    if !gate.configured() {
+        tracing::warn!(
+            "daemon: no required guards configured (required_guards is absent or empty in the config); \
+             no tool call waits on a guard being loaded"
+        );
+    }
+}
+
 impl Daemon {
     /// Reap stale files, take the flock, bind (dir 0700 / sock 0600), write
     /// `daemon.json`, spawn the accept loop, signal the ready fd if any.
@@ -516,6 +546,8 @@ impl Daemon {
         if swept > 0 {
             tracing::info!(swept, "daemon: removed stale session registrations");
         }
+
+        warn_when_no_required_guards(state.host.parts().hook_bus.required_guards());
 
         // C3: rehydrate BEFORE accepting so a reconnecting client finds its session.
         if let Some(rs) = &reload_state {

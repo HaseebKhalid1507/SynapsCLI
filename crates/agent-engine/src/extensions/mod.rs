@@ -32,6 +32,9 @@ pub mod manifest;
 pub mod notify_router;
 pub mod permissions;
 pub mod providers;
+pub mod required_guards;
+#[cfg(test)]
+mod required_answer_tests;
 pub mod runtime;
 #[allow(dead_code)] // merge(112): consumed by driver→actor port
 pub mod session_driver;

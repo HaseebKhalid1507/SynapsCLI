@@ -1486,6 +1486,17 @@ pub struct SynapsConfig {
     pub agent_name: Option<String>,
     pub identity: Option<String>,
     pub disabled_plugins: Vec<String>,
+    /// `required_guards`: plugin ids (comma list) of the guards this engine
+    /// must have loaded. While one of them is not loaded, for any reason (no
+    /// folder, disabled, a skip-renamed folder, a bad manifest, a failed
+    /// start, its process gone), every tool call is refused with the guard
+    /// and the cause named. Owner-set in the config file only: no in-product
+    /// write path sets it ([`OWNER_SET_CONFIG_KEYS`]) and it is not a
+    /// `/settings` row. Absent or empty: no gate (the behaviour before the
+    /// key existed). Last line wins within a file; with a profile active,
+    /// [`load_config`] holds the default file's list and the profile's
+    /// together ([`read_required_guards`]).
+    pub required_guards: Vec<String>,
     pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
     /// Opt-in progressive tool disclosure (Task 18). When false, providers
@@ -1587,6 +1598,7 @@ impl Default for SynapsConfig {
             agent_name: None,
             identity: None,
             disabled_plugins: Vec::new(),
+            required_guards: Vec::new(),
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
             progressive_tool_disclosure: false,
@@ -1716,6 +1728,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "agent_name",
     "identity",
     "disabled_plugins",
+    "required_guards",
     "favorite_models",
     "disabled_skills",
     "disabled_tools",
@@ -1970,6 +1983,15 @@ pub fn config_content_problems(content: &str) -> Vec<String> {
     problems
 }
 
+/// Whether `key = value` is one config line that sets `key` and nothing
+/// else: no line break in the key or the value (a value of
+/// `x\nrequired_guards =` would write a second line), and no `=` in the key
+/// (the parser would read the line as another key's). A `=` in the value is
+/// part of the value.
+fn is_single_line_edit(key: &str, value: &str) -> bool {
+    !key.contains(['=', '\n', '\r']) && !value.contains(['\n', '\r'])
+}
+
 /// Check a `key = value` edit before it is written (the /settings modal).
 ///
 /// Runs the real parser over the config file as it would look after
@@ -1979,9 +2001,13 @@ pub fn config_content_problems(content: &str) -> Vec<String> {
 /// concurrency vs total. A removed key is refused with its removal warning.
 /// Problems already present before the edit are not blamed on it.
 pub fn validate_config_edit(key: &str, value: &str) -> Result<(), String> {
-    if key.contains(['=', '\n', '\r'])
-        || value.contains(['\n', '\r'])
-    {
+    if is_owner_set_config_key(key) {
+        return Err(format!(
+            "{} is set by editing the config file, not by the product",
+            key.trim()
+        ));
+    }
+    if !is_single_line_edit(key, value) {
         return Err("value must be a single line".to_string());
     }
     // The file the edit lands in (profile-aware, like `write_config_value`),
@@ -1998,6 +2024,56 @@ pub fn validate_config_edit(key: &str, value: &str) -> Result<(), String> {
     }
 }
 
+/// The `required_guards` of the default config file and, with a profile
+/// active, of the profile's too (the union, default file's first), read
+/// fresh now and parsed without any diagnostics output; the caller's own
+/// config snapshot is untouched. A missing or unreadable file names no guard,
+/// like [`load_config`]: no required guards.
+///
+/// Both files, not just the one [`resolve_read_path`] picks: the product's
+/// first config write under a profile creates the profile's file holding
+/// that one key, and every other setting then reads from it instead of the
+/// default file. A guard list in the default file must not drop out of the
+/// gate at the next load because of an unrelated write.
+pub fn read_required_guards() -> Vec<String> {
+    required_guards_in(&base_dir(), get_profile().as_deref())
+}
+
+/// [`read_required_guards`] for the config files under `base` and, if
+/// `profile` is set, `base/profile`.
+fn required_guards_in(base: &std::path::Path, profile: Option<&str>) -> Vec<String> {
+    let mut files = vec![base.join("config")];
+    if let Some(profile) = profile {
+        files.push(base.join(profile).join("config"));
+    }
+    let mut names: Vec<String> = Vec::new();
+    for file in files {
+        let content = std::fs::read_to_string(file).unwrap_or_default();
+        let mut config = SynapsConfig::default();
+        apply_config_content_with(&mut config, &content, &mut |_diagnostic: String| {});
+        for name in config.required_guards {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// Config keys only the owner sets, by editing the config file. Nothing in
+/// the product writes them: [`write_config_value`] and
+/// [`validate_config_edit`] refuse them, and no `/settings` row exists for
+/// them. A guard list an agent or a settings dialog could rewrite would let
+/// the thing it guards against switch the guard off.
+pub const OWNER_SET_CONFIG_KEYS: &[&str] = &["required_guards"];
+
+/// Whether `key` is one of [`OWNER_SET_CONFIG_KEYS`] (surrounding spaces and
+/// case ignored).
+pub fn is_owner_set_config_key(key: &str) -> bool {
+    let key = key.trim();
+    OWNER_SET_CONFIG_KEYS.iter().any(|owned| owned.eq_ignore_ascii_case(key))
+}
+
 /// Parse the config file at ~/.synaps-cli/config (or profile variant).
 /// Returns default config if file doesn't exist or can't be read.
 pub fn load_config() -> SynapsConfig {
@@ -2005,10 +2081,13 @@ pub fn load_config() -> SynapsConfig {
     let mut config = SynapsConfig::default();
 
     let Ok(content) = std::fs::read_to_string(&path) else {
+        config.required_guards = read_required_guards();
         return config;
     };
 
     apply_config_content(&mut config, &content);
+    // The guard list is the default file's and the profile's together.
+    config.required_guards = read_required_guards();
 
     // Publish provider keys to the process-wide cache for the API router.
     // First writer wins (OnceLock) — subsequent load_config calls are no-ops.
@@ -2403,6 +2482,9 @@ fn apply_config_content_with(
             "disabled_plugins" => {
                 config.disabled_plugins = parse_comma_list(val);
             }
+            "required_guards" => {
+                config.required_guards = parse_comma_list(val);
+            }
             "favorite_models" => {
                 config.favorite_models = parse_comma_list(val);
             }
@@ -2685,6 +2767,21 @@ pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
 
 /// The RMW body; caller holds [`ConfigLock`].
 fn write_config_value_locked(key: &str, value: &str) -> std::io::Result<()> {
+    if is_owner_set_config_key(key) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is set by editing the config file, not by the product", key.trim()),
+        ));
+    }
+    // The writer's own check, whoever calls it: only `validate_config_edit`
+    // (the settings dialog) used to refuse a line break, so a value could
+    // write a second key's line.
+    if !is_single_line_edit(key, value) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a config key and value must be one line, and the key holds no `=`",
+        ));
+    }
     let path = resolve_write_path("config");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let out = replace_config_line(&existing, key, value);
@@ -4980,6 +5077,163 @@ context_window = 200k\n\
         let contents = std::fs::read_to_string(&cfg).unwrap();
         assert!(contents.contains("custom_thing = 42"));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// No `required_guards` line is no gate, an empty list, exactly as before
+    /// the key existed. Set, it is a trimmed comma list (empties dropped,
+    /// last line wins), a known key (no warning), and read fresh and
+    /// silently.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn required_guards_absent_is_empty_and_set_is_read_fresh() {
+        assert!(SynapsConfig::default().required_guards.is_empty());
+        assert!(load_config_from_str("disabled_plugins = a\n").required_guards.is_empty());
+        let config = load_config_from_str(
+            "required_guards = example-guard, ,other\nrequired_guards = example-guard ,  b\n",
+        );
+        assert_eq!(config.required_guards, ["example-guard", "b"]);
+        assert!(config_content_problems("required_guards = example-guard\n").is_empty());
+        let home = make_test_home("required-guards");
+        with_home(&home, || {
+            assert!(read_required_guards().is_empty());
+            std::fs::write(home.join(".synaps-cli/config"), "model = m\n").unwrap();
+            assert!(read_required_guards().is_empty());
+            std::fs::write(home.join(".synaps-cli/config"), "required_guards = example-guard\n")
+                .unwrap();
+            assert_eq!(read_required_guards(), ["example-guard"]);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `required_guards` is owner-set in the file only: the config writer
+    /// refuses it (and clearing it), whatever the spelling, and a refused
+    /// write leaves the file untouched.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn the_config_writer_refuses_required_guards() {
+        assert!(KNOWN_CONFIG_KEYS.contains(&"required_guards"));
+        assert!(OWNER_SET_CONFIG_KEYS.contains(&"required_guards"));
+        let home = make_test_home("required-guards-write");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "required_guards = example-guard\nmodel = m\n").unwrap();
+        with_home(&home, || {
+            for key in ["required_guards", " required_guards ", "Required_Guards"] {
+                for value in ["other", "", " "] {
+                    let err = write_config_value(key, value).expect_err("refused");
+                    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{key:?}");
+                }
+            }
+            // Other keys still write, and the guard list is untouched.
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+            assert_eq!(read_required_guards(), ["example-guard"]);
+        });
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert_eq!(contents, "required_guards = example-guard\nmodel = claude-sonnet-4-6\n");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The settings dialog's check refuses `required_guards` too (and
+    /// clearing it), whatever the spelling.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn the_settings_validator_refuses_required_guards() {
+        let home = make_test_home("required-guards-validate");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "required_guards = example-guard\nmodel = m\n").unwrap();
+        with_home(&home, || {
+            for key in ["required_guards", " required_guards ", "Required_Guards"] {
+                for value in ["other", "", " "] {
+                    assert!(validate_config_edit(key, value).is_err(), "{key:?} {value:?}");
+                }
+            }
+            assert!(validate_config_edit("model", "claude-sonnet-4-6").is_ok());
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The writer's own check: a value or key with a line break writes a
+    /// second line (`x\nrequired_guards =` would clear the guard list), a
+    /// key with `=` writes another key's line; both are refused whoever
+    /// calls, and the file stays as it was. A `=` in a value is part of the
+    /// value and writes.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn a_config_write_is_one_line_that_sets_one_key() {
+        let home = make_test_home("one-line-write");
+        let cfg = home.join(".synaps-cli/config");
+        let before = "required_guards = example-guard\nmodel = m\n";
+        std::fs::write(&cfg, before).unwrap();
+        with_home(&home, || {
+            let refused = [
+                ("model", "x\nrequired_guards ="),
+                ("model", "x\r\nrequired_guards ="),
+                ("model", "x\rrequired_guards ="),
+                ("model\nrequired_guards", ""),
+                ("required_guards =x", "other"),
+                ("model = other", "x"),
+                ("a\rb", "x"),
+            ];
+            for (key, value) in refused {
+                let err = write_config_value(key, value).expect_err("refused");
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{key:?} {value:?}");
+                assert!(validate_config_edit(key, value).is_err(), "{key:?} {value:?}");
+            }
+            // The list writers go through the same check.
+            assert!(add_favorite_model("a\nrequired_guards =").is_err());
+            assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
+            assert_eq!(read_required_guards(), ["example-guard"]);
+
+            // A `=` in a value is the value's.
+            write_config_value("identity", "a=b==").unwrap();
+        });
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            format!("{before}identity = a=b==\n")
+        );
+        with_home(&home, || assert_eq!(read_required_guards(), ["example-guard"]));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The guard list is read from the default folder's file and the
+    /// profile's together: the profile's file can add a guard and never
+    /// removes the default file's, and a profile's folder with no file names
+    /// none. The product's first write under a
+    /// profile creates the profile's file with that one key, and the other
+    /// settings then come from it instead of the default file, so a list
+    /// read from only that file would drop out.
+    #[test]
+    fn required_guards_are_read_from_the_default_file_and_the_profiles() {
+        let base = tempfile::tempdir().unwrap();
+        let default_file = base.path().join("config");
+        let profile_file = base.path().join("work").join("config");
+        std::fs::create_dir_all(profile_file.parent().unwrap()).unwrap();
+        let read = |profile: Option<&str>| required_guards_in(base.path(), profile);
+
+        assert!(read(None).is_empty() && read(Some("work")).is_empty());
+        std::fs::write(&default_file, "required_guards = a, b\nmodel = m\n").unwrap();
+        assert_eq!(read(None), ["a", "b"]);
+        // No profile file, a profile file with no list or an empty list,
+        // and a missing profile folder: the default file's list stands.
+        assert_eq!(read(Some("work")), ["a", "b"]);
+        assert_eq!(read(Some("other")), ["a", "b"]);
+        std::fs::write(&profile_file, "model = n\n").unwrap();
+        assert_eq!(read(Some("work")), ["a", "b"]);
+        std::fs::write(&profile_file, "required_guards =\n").unwrap();
+        assert_eq!(read(Some("work")), ["a", "b"]);
+        // The profile's list adds to it, once each; a profile that is not
+        // active adds nothing.
+        std::fs::write(&profile_file, "required_guards = c, a\n").unwrap();
+        assert_eq!(read(Some("work")), ["a", "b", "c"]);
+        assert_eq!(read(Some("other")), ["a", "b"]);
+        assert_eq!(read(None), ["a", "b"]);
+        // A guard only the profile's file names.
+        std::fs::write(&default_file, "model = m\n").unwrap();
+        assert_eq!(read(Some("work")), ["c", "a"]);
+        assert!(read(None).is_empty());
     }
 
     #[test]

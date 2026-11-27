@@ -128,7 +128,7 @@ scopes unavailable, and one WARN per slice name says so: `scope probe failed
 
 ```
 synaps daemon [--foreground|--detach] [--socket PATH] [--idle-exit SECS] [--profile P]
-synaps daemon status [--json]        # daemon.json + flock probe + Ping → state/pid/uptime/sessions (exit 1 if not answering)
+synaps daemon status [--json]        # daemon.json + flock probe + Ping → state/pid/uptime/sessions, required guards (§Required guards in status) (exit 1 if not answering)
 synaps daemon stop [--force]         # Shutdown{force} over the socket, wait for the flock; --force escalates SIGTERM (10 s) → SIGKILL (+5 s); Windows: taskkill /T /F (10 s)
 synaps daemon sessions [--json]
 synaps daemon purge                  # Purge frame → memstat::purge_arenas() in the daemon; reply Pong (bench hygiene, C2)
@@ -172,6 +172,42 @@ any `/name` line that is none of the commands below is unknown and never sent (s
 `[compacted N messages]`, `[refused cmd: reason]`, `[input owner → …]`, `[session Parked]`.
 Prompts render as `[prompt #id] title: prompt > `; `Secret` prompts turn terminal echo off.
 With no ID: attaches to the single live session, creates one if none, lists if several.
+
+### Required guards in status
+
+When the config's [`required_guards`](extensions/hooks.md#required-guards) is set,
+`synaps daemon status` ends with whether the daemon requires any guard, and a line
+for each one:
+
+```
+daemon: running
+…
+uptime: 5230s  sessions: 2
+required guards configured: yes (2)
+required guard: example-guard loaded
+required guard: other-guard NOT LOADED (disabled: 'other-guard' is listed in disabled_plugins)
+```
+
+With none configured the line reads `required guards configured: no`. It says
+"configured", and not "all loaded", on purpose: a daemon whose list was dropped
+or mistyped shows `no`, never an empty-looking success. A listed guard shows
+`loaded` only while it is loaded and its process is live; otherwise `NOT LOADED`
+with the cause (the same cause a refused tool call names), and the daemon is
+refusing every tool call until the guard is back.
+
+A daemon that starts with `required_guards` absent or empty (a reload's new
+image included) also logs a warning, so the log of a daemon nobody asks says it
+too: `daemon: no required guards configured (required_guards is absent or empty
+in the config); no tool call waits on a guard being loaded`. With a profile
+active the list is the default config file's and the profile's together, so a
+profile's own file can add a guard and never drops the default file's.
+
+`synaps daemon status --json` adds `required_guards_configured` (`true`/`false`,
+`null` when the daemon did not answer) and, when the daemon reports rows,
+`required_guards`: `[{"name", "loaded", "cause"?}]`. The `Pong` carries both
+as additive fields (no protocol bump): an older daemon sends neither, which
+reads as `no`, and an older client ignores them. The list is read when the
+daemon starts or reloads.
 
 ## Detach vs abort (F27)
 
@@ -746,7 +782,7 @@ first's turns (last-writer-wins).
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
 D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page","addressed_replies","prompt_outcome","cache_expiry"], boot_id?}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
-C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
+C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions,required_guards?,required_guards_configured?} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
 C: rename{session_id, name?, expect?}         → D: renamed{session_id, name, in_memory_only?} | rename_failed{session_id, reason, message, taken_by?, current_name?} | refused{unknown_session} (→ daemon closes)
