@@ -79,6 +79,9 @@ pub struct EngineHost {
     keybind_registry: Arc<std::sync::RwLock<crate::skills::keybinds::KeybindRegistry>>,
     ext_manager: Arc<RwLock<crate::extensions::manager::ExtensionManager>>,
     mcp_server_count: usize,
+    /// WELCOME's `config_path`: the canonical path of the config file the
+    /// boot snapshot was read from (`None`: not valid UTF-8).
+    started_config_path: Option<String>,
     /// Worker (subagent) registry template, cached by what it is built from:
     /// the shared catalog generation and the `disabled_tools` list.
     /// `worker_runtime()` clones this instead of rebuilding
@@ -179,6 +182,12 @@ impl EngineHost {
         let spill_root = crate::runtime::sweep_spill_root();
 
         let config_mtime = config_file_mtime();
+        // Fixed for this image's lifetime: what WELCOME reports as the file
+        // this daemon read at start.
+        let started_config_path = canonical_config_read_path()
+            .into_os_string()
+            .into_string()
+            .ok();
         let config = crate::config::load_config();
         let (tools, tools_changes) = ToolRegistry::new().into_shared();
         // Same point the old boot's `apply_config` disabled tools: on the
@@ -241,6 +250,7 @@ impl EngineHost {
             keybind_registry,
             ext_manager,
             mcp_server_count,
+            started_config_path,
             worker_registry: std::sync::Mutex::new(None),
             log_guard: std::sync::Mutex::new(log_guard),
             sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -379,6 +389,17 @@ impl EngineHost {
 
     pub fn mcp_server_count(&self) -> usize {
         self.mcp_server_count
+    }
+
+    /// The canonical path of the config file read at boot (WELCOME's
+    /// `config_path`); `None` when it is not valid UTF-8.
+    pub fn started_config_path(&self) -> Option<&str> {
+        self.started_config_path.as_deref()
+    }
+
+    /// The memory backend this host uses (WELCOME's `memory_backend`).
+    pub fn started_memory_backend(&self) -> &'static str {
+        crate::memory_backend::backend_name()
     }
 
     /// The foreground runtime for an interactive session: shares client,
@@ -893,6 +914,21 @@ impl EngineHost {
         }
         delivered
     }
+}
+
+/// The canonical absolute path of the config file `load_config` reads; when
+/// the file does not exist, its canonical directory joined with the name.
+fn canonical_config_read_path() -> std::path::PathBuf {
+    let path = crate::config::resolve_read_path("config");
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
+        return canonical;
+    }
+    if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(dir) = std::fs::canonicalize(dir) {
+            return dir.join(name);
+        }
+    }
+    std::path::absolute(&path).unwrap_or(path)
 }
 
 /// mtime of the config file `load_config` reads (`None` if absent).
