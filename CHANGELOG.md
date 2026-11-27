@@ -62,6 +62,9 @@ compaction model, or build a client on the daemon socket. Full notes:
   row's title.
 - **Credential broker:** upgrade a `synaps auth-broker` and its clients
   together; an older side treats one model's 429 as the whole account's.
+- **`synaps rpc` sessions no longer take shared-inbox mail** (#455). A
+  bridge or script that relied on a `synaps send` without a session
+  reaching its rpc session must send to that session instead.
 
 ### Added
 
@@ -533,6 +536,14 @@ compaction model, or build a client on the daemon socket. Full notes:
   the 500 ms connect bound cut short, now gets its full time, up to 5
   seconds (was 2), and if that runs out the error says the pipe was busy.
   With no daemon a client still fails at once. Unix is unchanged.
+
+- **`synaps rpc` never takes shared-inbox mail.** A `synaps send` without
+  a session goes to the shared inbox, and every session's watcher raced to
+  take it, so a session another program drives (`synaps rpc`, such as a
+  chat bridge) running next to your own chat could take an event meant for
+  that chat. An rpc session's watcher now never takes shared-inbox files,
+  for its whole life; events sent to its own session socket still arrive.
+  Daemon sessions already took them only while a client owned input.
 
 ### Internal
 

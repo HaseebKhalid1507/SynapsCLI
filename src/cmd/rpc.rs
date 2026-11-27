@@ -1171,6 +1171,9 @@ pub async fn run(
         prompt_manifest: None,
         profile,
         no_extensions: false,
+        // An rpc child is driven by another program (a bridge), not by the
+        // owner at a keyboard: it never takes shared-inbox mail.
+        shared_inbox: false,
     })
     .await
     .context("engine boot failed")?;
