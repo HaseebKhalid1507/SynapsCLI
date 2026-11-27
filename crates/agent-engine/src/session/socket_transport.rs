@@ -1042,6 +1042,19 @@ impl SocketTransport {
     }
 }
 
+/// The `Welcome.features` entry a command needs, if an older daemon could
+/// not decode it (it would answer the whole frame as malformed), and how a
+/// refusal names it.
+fn feature_needed(cmd: &SessionCommand) -> Option<(&'static str, &'static str)> {
+    match cmd {
+        SessionCommand::Query {
+            query: crate::session::SessionQuery::CacheExpiry,
+            ..
+        } => Some((super::wire::FEATURE_CACHE_EXPIRY, "cache expiry")),
+        _ => None,
+    }
+}
+
 #[async_trait::async_trait]
 impl ClientTransport for SocketTransport {
     fn session_id(&self) -> &SessionId {
@@ -1053,6 +1066,14 @@ impl ClientTransport for SocketTransport {
     }
 
     async fn send(&self, cmd: SessionCommand) -> Result<(), TransportError> {
+        if let Some((feature, request)) = feature_needed(&cmd) {
+            if !self.welcome.supports(feature) {
+                return Err(TransportError::DaemonTooOld {
+                    daemon_version: self.welcome.daemon_version.clone(),
+                    request,
+                });
+            }
+        }
         match self.writer.try_send(ClientFrame::Cmd { session_id: self.session.clone(), cmd }) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(TransportError::Backpressure),
@@ -1786,6 +1807,61 @@ mod tests {
         );
         conn.bye().await;
         assert_eq!(srv.await.unwrap(), vec!["Bye".to_string()], "no CatalogPage ever reached the daemon");
+    }
+
+    /// A daemon without `cache_expiry` would fail the frame as malformed:
+    /// the client never sends the query, and says why; with the feature
+    /// the query goes out (arch-review-435-436-437 Contract v3 §3).
+    #[tokio::test]
+    async fn cache_expiry_against_a_daemon_without_the_feature_is_too_old() {
+        let query = || SessionCommand::Query {
+            id: 4,
+            query: crate::session::SessionQuery::CacheExpiry,
+        };
+        for (features, sent) in [
+            // The detach is a `Cmd` and a `Bye`.
+            (
+                vec![FEATURE_ADDRESSED_REPLIES.to_string()],
+                vec!["Attach", "Cmd", "Bye"],
+            ),
+            (
+                vec![
+                    FEATURE_ADDRESSED_REPLIES.to_string(),
+                    FEATURE_CACHE_EXPIRY.to_string(),
+                ],
+                vec!["Attach", "Cmd", "Cmd", "Bye"],
+            ),
+        ] {
+            let (_d, path) = sock();
+            let l = Listener::bind(&path).unwrap();
+            let gated = !features.iter().any(|f| f == FEATURE_CACHE_EXPIRY);
+            let srv = tokio::spawn(owned_fake_daemon(l, features));
+            let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test))
+                .await
+                .unwrap();
+            let (t, _) = SocketTransport::attach(
+                conn,
+                Attach::Existing {
+                    session_id: "fake-1".into(),
+                    mode: AttachMode::Mirror,
+                },
+            )
+            .await
+            .unwrap();
+            let r = t.send(query()).await;
+            if gated {
+                let err = r.unwrap_err();
+                assert!(
+                    matches!(err, TransportError::DaemonTooOld { request: "cache expiry", ref daemon_version } if daemon_version == "0.0.1-old"),
+                    "{err}"
+                );
+            } else {
+                r.unwrap();
+            }
+            t.detach().await;
+            drop(t);
+            assert_eq!(srv.await.unwrap(), sent);
+        }
     }
 
     /// A daemon that advertises the feature but grants no owner token: the

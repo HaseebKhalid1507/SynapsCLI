@@ -48,6 +48,8 @@ use tokio_util::sync::CancellationToken;
 use super::api::{ApiMethods, ApiOptions, KeepWarmMode, KeepWarmRequest};
 use super::helpers::HelperMethods;
 use super::{Runtime, SessionEvent, StreamEvent};
+#[cfg(any(test, feature = "testing"))]
+use crate::session::cache_expiry_testing::At as Probe;
 use crate::{Result, RuntimeError, SharedMessage};
 
 /// Output tokens a ping may produce on top of a thinking budget (or in total
@@ -120,14 +122,69 @@ impl CachedPrefix {
     }
 }
 
+/// The cache part of a response's usage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheUsage {
+    pub read: u64,
+    pub write: u64,
+    /// The write's 5m and 1h parts, when the provider reports them.
+    pub write_5m: Option<u64>,
+    pub write_1h: Option<u64>,
+}
+
+/// Everything a [`CacheAnchorCell`] holds, read at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheAnchorState {
+    /// The last accepted request ([`CacheAnchorCell::get`]).
+    pub anchor: Option<CacheAnchor>,
+    /// What it left in the cache ([`CacheAnchorCell::prefix`]).
+    pub prefix: Option<CachedPrefix>,
+    /// What the provider reported that request read from and wrote to the
+    /// cache: `None` until its usage arrives (or when the response carried
+    /// none).
+    pub usage: Option<CacheUsage>,
+    /// The latest request this chain dispatched, accepted or not: the last
+    /// moment one of its requests can have refreshed the cache.
+    pub dispatched: Option<CacheAnchor>,
+}
+
 /// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]),
 /// with what that request left in the cache ([`CachedPrefix`]).
 /// Runtime clones get a FRESH cell (a clone is a different request chain,
 /// like the TTL latches); `share_ttl_latches` shares it.
 #[derive(Debug, Default)]
-pub struct CacheAnchorCell(std::sync::Mutex<(Option<CacheAnchor>, Option<CachedPrefix>)>);
+pub struct CacheAnchorCell(std::sync::Mutex<CacheAnchorState>);
 
 impl CacheAnchorCell {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheAnchorState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A request is being handed to the HTTP client at `at`, whatever
+    /// becomes of it.
+    pub fn dispatch(&self, at: CacheAnchor) {
+        let mut slot = self.lock();
+        if slot.dispatched.is_none_or(|prev| prev.mono <= at.mono) {
+            slot.dispatched = Some(at);
+        }
+    }
+
+    /// The provider's cache usage for the request accepted at `at`.
+    /// Ignored once a later request is the anchor.
+    pub fn measure(&self, at: CacheAnchor, usage: CacheUsage) {
+        let mut slot = self.lock();
+        if slot.anchor == Some(at) {
+            slot.usage = Some(usage);
+        }
+    }
+
+    /// The whole cell, from one read.
+    pub fn state(&self) -> CacheAnchorState {
+        *self.lock()
+    }
+
     /// Stamp a request whose cached prefix is not known: that of an earlier
     /// request no longer describes the newest one and is dropped.
     pub fn stamp(&self, at: CacheAnchor) {
@@ -140,29 +197,34 @@ impl CacheAnchorCell {
     }
 
     fn stamp_with(&self, at: CacheAnchor, prefix: Option<CachedPrefix>) {
-        let mut slot = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.0.is_none_or(|prev| prev.mono <= at.mono) {
-            *slot = (Some(at), prefix);
+        let mut slot = self.lock();
+        if slot.anchor.is_none_or(|prev| prev.mono <= at.mono) {
+            slot.anchor = Some(at);
+            slot.prefix = prefix;
+            slot.usage = None;
+        }
+        if slot.dispatched.is_none_or(|prev| prev.mono <= at.mono) {
+            slot.dispatched = Some(at);
         }
     }
 
     pub fn get(&self) -> Option<CacheAnchor> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .0
+        self.lock().anchor
     }
 
     /// What the request [`Self::get`] returns left in the cache, when known.
     pub fn prefix(&self) -> Option<CachedPrefix> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .1
+        self.lock().prefix
     }
+}
+
+/// What [`Runtime::cache_expiry_probe`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiryProbe {
+    /// The next request could read what the last accepted one left.
+    pub reads_cache: bool,
+    /// The next turn would roll the context over first.
+    pub rollover: bool,
 }
 
 /// Token usage of one ping, as reported by the provider.
@@ -460,6 +522,14 @@ enum NextTurnRequest<'a> {
 }
 
 impl NextTurnRequest<'_> {
+    /// Test seam: a `CacheExpiry` probe reports (and may park at) `at`.
+    #[cfg(any(test, feature = "testing"))]
+    async fn at(&self, at: Probe) {
+        if matches!(self, Self::Ping(KeepWarmMode::Expiry { .. })) {
+            crate::session::cache_expiry_testing::at(at).await;
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self {
             Self::Ping(_) => "cache keep-warm",
@@ -563,6 +633,11 @@ impl Runtime {
         self.cache_anchor.get()
     }
 
+    /// This chain's cache anchor cell, from one read (`CacheExpiry`).
+    pub fn cache_anchor_state(&self) -> CacheAnchorState {
+        self.cache_anchor.state()
+    }
+
     /// The session's silent 1h→5m downgrade latch has fired: the server
     /// honours only 5m whatever the configured TTL says.
     pub fn cache_ttl_downgraded(&self) -> bool {
@@ -595,6 +670,31 @@ impl Runtime {
             context_blocks: value["keepwarm_context_blocks"]
                 .as_str()
                 .map(str::to_string),
+        })
+    }
+
+    /// `CacheExpiry`'s probe: whether the next turn's request for `history`
+    /// could read what `expect` (the last accepted request) left in the
+    /// cache (the same cache identity, and a history that starts with the
+    /// messages that request sent), and whether that turn would roll the
+    /// context over first. Assembled by the code that builds a ping (the
+    /// turn's prefix by construction); sends nothing, touches no latch.
+    pub async fn cache_expiry_probe(
+        &self,
+        history: &[SharedMessage],
+        expect: CachedPrefix,
+    ) -> Result<ExpiryProbe> {
+        let cancel = CancellationToken::new();
+        let tap = PingTap::default();
+        let (value, _) = self
+            .keepwarm_request(history, &cancel, KeepWarmMode::Expiry { expect }, &tap)
+            .await;
+        let value = value?;
+        Ok(ExpiryProbe {
+            reads_cache: value["reads_cache"].as_bool().ok_or_else(|| {
+                RuntimeError::Session("cache expiry probe built no request".into())
+            })?,
+            rollover: value.get("keepwarm_context_blocks").is_some(),
         })
     }
 
@@ -766,6 +866,8 @@ impl Runtime {
         }
 
         // System prompt: run_stream_tracked → run_stream_internal, verbatim.
+        #[cfg(any(test, feature = "testing"))]
+        purpose.at(Probe::SystemPrompt).await;
         let system_prompt = self.effective_system_prompt().await;
         let system_prompt = if context_enabled {
             Some(format!(
@@ -776,10 +878,14 @@ impl Runtime {
         } else {
             system_prompt
         };
+        #[cfg(any(test, feature = "testing"))]
+        purpose.at(Probe::Injection).await;
         let session_injection = match self.session_id.as_deref() {
             Some(id) => self.hook_bus.session_injection_for(id).await,
             None => None,
         };
+        #[cfg(any(test, feature = "testing"))]
+        purpose.at(Probe::InjectionRead).await;
         let system_prompt = match session_injection {
             Some(content) => Some(super::stream::wrap_extension_context(
                 system_prompt.as_deref().unwrap_or_default(),
@@ -946,7 +1052,11 @@ impl Runtime {
         );
         let (mut result, notices) = drive_ping(call, &mut rx, tap, None).await;
         // Probe: also run the next turn's pre-request context assessment.
-        if let (Ok(value), NextTurnRequest::Ping(KeepWarmMode::Probe)) = (&mut result, purpose) {
+        if let (
+            Ok(value),
+            NextTurnRequest::Ping(KeepWarmMode::Probe | KeepWarmMode::Expiry { .. }),
+        ) = (&mut result, purpose)
+        {
             if context_enabled {
                 if let Some(why) = self.keepwarm_context_blocks(
                     history,
@@ -2432,6 +2542,53 @@ mod tests {
         assert_eq!(cell.prefix(), Some(new), "an older stamp never rewinds");
         cell.stamp(at(9));
         assert_eq!((cell.get(), cell.prefix()), (Some(at(9)), None));
+    }
+
+    /// `CacheExpiry`'s fields: the latest dispatch only moves forward and
+    /// an acceptance counts as one; usage is measured for the anchor's own
+    /// request only, and a newer acceptance clears it.
+    #[test]
+    fn anchor_cell_dispatch_and_measure() {
+        let cell = CacheAnchorCell::default();
+        let a = CacheAnchor::now();
+        let at = |secs| CacheAnchor {
+            mono: a.mono + std::time::Duration::from_secs(secs),
+            wall: a.wall + std::time::Duration::from_secs(secs),
+        };
+        cell.dispatch(at(3));
+        cell.dispatch(a);
+        assert_eq!(cell.state().dispatched, Some(at(3)), "never rewinds");
+        let used = |read| CacheUsage {
+            read,
+            ..CacheUsage::default()
+        };
+        cell.measure(at(3), used(9));
+        assert_eq!(cell.state().usage, None, "no request accepted at 3");
+        cell.stamp_identified(at(5), CachedPrefix::of(1, &[]));
+        assert_eq!(
+            cell.state().dispatched,
+            Some(at(5)),
+            "an accepted request was dispatched"
+        );
+        cell.measure(at(5), used(20));
+        cell.measure(at(3), used(9));
+        assert_eq!(
+            cell.state().usage,
+            Some(used(20)),
+            "only the anchor's own usage"
+        );
+        cell.dispatch(at(8));
+        assert_eq!(cell.state().usage, Some(used(20)), "a dispatch keeps it");
+        cell.stamp_identified(at(8), CachedPrefix::of(1, &[]));
+        assert_eq!(
+            cell.state(),
+            CacheAnchorState {
+                anchor: Some(at(8)),
+                prefix: Some(CachedPrefix::of(1, &[])),
+                usage: None,
+                dispatched: Some(at(8)),
+            }
+        );
     }
 
     /// A history is led by a request's messages only when it starts with

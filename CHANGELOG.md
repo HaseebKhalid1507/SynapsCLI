@@ -24,6 +24,19 @@ All notable changes to this project will be documented in this file.
   field, older clients ignore it and read `AnswerRefused` as an unknown
   event, and an outcome a client doesn't know reads as `unknown`.
 
+- **What a session's prompt cache looks like, from its own requests.**
+  `SessionQuery::CacheExpiry` (daemon feature `cache_expiry`) answers
+  `warm` (with about how long the last accepted request's entry has left),
+  `unknown{may_have_expired}` (until this session's last possible refresh
+  ends), `cold{expired|uncached}`, or `unknown` with a reason (`parked`,
+  `busy`, `no_matching_request`, …). It reads the session's cache anchor,
+  the record keep-warm and cache-preserving compaction read: the last
+  accepted request, its cache identity and messages, the cache usage the
+  provider reported for it, and the latest send. It is not provider state.
+  Errors are typed (`busy`, `timeout`, `superseded`, `stale`).
+  `/keepwarm status` shows the line. See daemon-mode.md, "Prompt-cache
+  evidence".
+
 - **Workers report what they used.** `subagent_status`, `subagent_collect`
   and a worker's completion event (`data.usage`) carry `usage`: provider
   requests (the worker's keep-warm pings included), input / output /

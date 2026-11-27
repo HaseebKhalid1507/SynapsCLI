@@ -705,6 +705,13 @@ pub struct SessionActor {
     /// handed to the runtime the unpark builds (and to a reload record
     /// written while parked). Empty while live.
     pub(crate) parked_tool_activations: Vec<crate::tools::activation::CarriedActivation>,
+    /// Advanced by every change a query job's inputs could miss: a view
+    /// publish (every `Set`, prompt reload, turn start), a history
+    /// replacement, a compaction applied, a driver armed or revoked, a
+    /// lifecycle change (`session::cache_expiry`).
+    pub(crate) prefix_rev: u64,
+    /// `CacheExpiry` jobs (`session::query`).
+    pub(crate) expiry_jobs: super::cache_expiry::ExpiryJobs,
 }
 
 /// A reload checkpoint wrote this session's reload record; until the
@@ -1080,6 +1087,8 @@ impl SessionActor {
             reload_fence: None,
             owned,
             parked_tool_activations: Vec::new(),
+            prefix_rev: 0,
+            expiry_jobs: Default::default(),
         };
         if actor.keep_warm {
             actor.note_pin();
@@ -1194,6 +1203,21 @@ impl SessionActor {
     /// (`trim_replay_to_checkpoint`). `seq` stays gapless per session; a
     /// subscriber's stream may skip the seqs not addressed to it.
     fn emit_to(&mut self, audience: Audience, event: SessionEventWire) {
+        if matches!(
+            event,
+            SessionEventWire::TurnStarted { .. }
+                | SessionEventWire::Conversation(_)
+                | SessionEventWire::SettingChanged(_)
+                | SessionEventWire::Cleared { .. }
+                | SessionEventWire::CompactionApplied { .. }
+                | SessionEventWire::Resumed { .. }
+                | SessionEventWire::Lifecycle(_)
+                | SessionEventWire::DriverArmed { .. }
+                | SessionEventWire::DriverRevoked { .. }
+                | SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
+        ) {
+            self.prefix_rev += 1;
+        }
         let replay = self.streaming
             && audience == Audience::All
             && !matches!(
@@ -1263,6 +1287,7 @@ impl SessionActor {
     pub(crate) async fn publish_view(&mut self) {
         let v = RuntimeView::from_runtime(&self.runtime).await;
         self.view.store(Arc::new(v));
+        self.prefix_rev += 1;
     }
 
     /// Queue a save of the current conversation. Never waits: the write
@@ -4835,6 +4860,10 @@ impl SessionActor {
     }
 
     pub(crate) async fn query(&mut self, from: Option<ClientId>, id: u64, query: SessionQuery) {
+        // Never awaits; a parked session answers `parked` without waking.
+        if let SessionQuery::CacheExpiry = query {
+            return self.ask_cache_expiry(from, id);
+        }
         // Status/View never wake a parked session (the idle probe must not).
         if self.is_parked() {
             let value = match query {
@@ -4951,6 +4980,7 @@ impl SessionActor {
                     other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                 }
             }
+            SessionQuery::CacheExpiry => return self.ask_cache_expiry(from, id),
         };
         self.reply(from, SessionEventWire::QueryResult { id, value });
     }
@@ -5118,6 +5148,8 @@ impl SessionActor {
         if self.attached.remove(&client).is_none() {
             return;
         }
+        // Its query jobs end without a reply.
+        self.expiry_jobs.client_gone(client);
         self.update_attach_state();
         self.emit(SessionEventWire::ClientLeft { client });
         if self.input_owner == Some(client) {
@@ -6111,6 +6143,7 @@ impl SessionTask {
                     actor.on_cache_keepwarm_done(res);
                 }
                 res = poll_compaction(&mut actor.compact) => actor.on_compaction_done(res).await,
+                (gen, res) = actor.expiry_jobs.next() => actor.finish_cache_expiry(gen, res),
                 ran = session_start_task(&mut actor.session_start) => {
                     actor.session_start_finished(ran).await;
                 },

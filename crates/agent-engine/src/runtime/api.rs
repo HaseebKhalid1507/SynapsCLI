@@ -317,6 +317,12 @@ struct EventCtx<'t> {
     /// The round's keep-warm follows this response as it streams
     /// (`ApiOptions::round_signal`).
     round_signal: Option<&'t super::tool_keepwarm::RoundSignal>,
+    /// The cache anchor this response was stamped into, and its stamp: the
+    /// provider's cache reads and writes for it are measured there.
+    cache_anchor: Option<(
+        &'t super::keepwarm::CacheAnchorCell,
+        super::keepwarm::CacheAnchor,
+    )>,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -670,6 +676,17 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 if state.msg_start_cache_1h.unwrap_or(0) > 0 {
                     ctx.saw_1h_honored
                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some((cell, at)) = ctx.cache_anchor {
+                    cell.measure(
+                        at,
+                        super::keepwarm::CacheUsage {
+                            read: usage.cache_read_input_tokens,
+                            write: usage.cache_creation_input_tokens,
+                            write_5m: state.msg_start_cache_5m,
+                            write_1h: state.msg_start_cache_1h,
+                        },
+                    );
                 }
                 // The prefix this request read from or wrote to the cache,
                 // known here and not booked until the response ends.
@@ -1088,6 +1105,13 @@ pub enum KeepWarmMode {
     /// own tools, system, thinking and options, so the prefix is that
     /// request's by construction and there is nothing to fingerprint.
     Replay,
+    /// `CacheExpiry`'s probe: [`Self::Probe`], plus `"reads_cache"`:
+    /// whether the request could read what `expect` (the last accepted
+    /// request) left in the cache, as a compaction request is checked
+    /// ([`CompactionRequest`]). Sends nothing.
+    Expiry {
+        expect: super::keepwarm::CachedPrefix,
+    },
 }
 
 /// Wire knobs for a keep-warm request (see [`ApiOptions::keepwarm`]).
@@ -1660,6 +1684,24 @@ impl ApiMethods {
         if let Some(d) = &diagnostics {
             body.set_diagnostics(d.clone());
         }
+        // The cache identity of `body` and the history part of `messages`:
+        // the last message of a ping (a replay's is appended above, not
+        // here) or of a compaction request is request-local, and so is a
+        // trailing context advisory.
+        let identify = |body: &super::request::RequestBody<'_>| {
+            let beta = Self::build_beta_header(&auth_type, options, model);
+            let local_tail = options.compaction.is_some()
+                || options
+                    .keepwarm
+                    .as_ref()
+                    .is_some_and(|k| k.mode != KeepWarmMode::Replay);
+            let sent = messages.len().saturating_sub(usize::from(local_tail));
+            let history = &messages[..super::request::durable_len(&messages[..sent])];
+            (
+                body.cache_identity(beta.as_deref(), &auth_type, auth_binding.as_deref()),
+                history,
+            )
+        };
         // Keep-warm: cut the output cap (not part of the cache key), then
         // fingerprint the prefix exactly as it would go on the wire. A probe —
         // or a ping whose prefix no longer matches what is cached — returns
@@ -1669,15 +1711,21 @@ impl ApiMethods {
             let beta = Self::build_beta_header(&auth_type, options, model);
             let actual = body.prefix_fingerprint(keepwarm_prefix_len, beta.as_deref());
             let send = match keepwarm.mode {
-                KeepWarmMode::Probe => false,
+                KeepWarmMode::Probe | KeepWarmMode::Expiry { .. } => false,
                 KeepWarmMode::Send { expect } => expect == actual,
                 KeepWarmMode::Replay => true,
             };
             if !send {
-                return Ok(serde_json::json!({
+                let mut out = serde_json::json!({
                     "keepwarm_prefix": actual,
                     "keepwarm_max_tokens": body.max_tokens(),
-                }));
+                });
+                if let KeepWarmMode::Expiry { expect } = keepwarm.mode {
+                    let (identity, history) = identify(&body);
+                    out["reads_cache"] =
+                        Value::Bool(expect.identity == identity && expect.leads(history));
+                }
+                return Ok(out);
             }
         }
         // What this request leaves in the cache once accepted: stamped
@@ -1686,24 +1734,7 @@ impl ApiMethods {
         // before any trace, telemetry or network I/O, when it cannot read
         // what the last accepted request left).
         let cached_prefix = (options.cache_anchor.is_some() || options.compaction.is_some())
-            .then(|| {
-                let beta = Self::build_beta_header(&auth_type, options, model);
-                // The history part of `messages`: the last message of a
-                // ping (a replay's is appended above, not here) or of a
-                // compaction request is request-local, and so is a
-                // trailing context advisory.
-                let local_tail = options.compaction.is_some()
-                    || options
-                        .keepwarm
-                        .as_ref()
-                        .is_some_and(|k| k.mode != KeepWarmMode::Replay);
-                let sent = messages.len().saturating_sub(usize::from(local_tail));
-                let history = &messages[..super::request::durable_len(&messages[..sent])];
-                (
-                    body.cache_identity(beta.as_deref(), &auth_type, auth_binding.as_deref()),
-                    history,
-                )
-            });
+            .then(|| identify(&body));
         if let (Some(compaction), Some((identity, history))) = (&options.compaction, cached_prefix)
         {
             if compaction.expect.identity != identity {
@@ -1874,6 +1905,8 @@ impl ApiMethods {
         //   on the same account.
         let single_attempt = stays_on_account;
         let mut sent_at_ms;
+        // The accepted attempt's stamp in `options.cache_anchor`.
+        let mut accepted_at = None;
 
         loop {
             let response = {
@@ -1912,6 +1945,9 @@ impl ApiMethods {
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
                     let sent_at = super::keepwarm::CacheAnchor::now();
+                    if let Some(anchor) = &options.cache_anchor {
+                        anchor.dispatch(sent_at);
+                    }
                     sent_at_ms = crate::epoch_millis();
                     let req = wire.encoding_header(req);
                     let req = match &options.keepwarm {
@@ -1955,6 +1991,7 @@ impl ApiMethods {
                                         }
                                         None => anchor.stamp(sent_at),
                                     }
+                                    accepted_at = Some(sent_at);
                                 }
                                 if !anthropic_cooled.is_empty() {
                                     let served = super::auth::turn_pinned_credential(
@@ -2581,6 +2618,7 @@ impl ApiMethods {
                 usage_counters: options.usage_counters.clone(),
                 cache_diagnosis: diagnostics.is_some(),
                 round_signal: options.round_signal.as_deref(),
+                cache_anchor: options.cache_anchor.as_deref().zip(accepted_at),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -3134,6 +3172,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_anchor: None,
         }
     }
 
@@ -3168,6 +3207,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_anchor: None,
         }
     }
 
@@ -3194,6 +3234,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_anchor: None,
         }
     }
 
@@ -4827,6 +4868,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_anchor: None,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(
@@ -5177,6 +5219,45 @@ mod on401_tests {
             counter.load(Ordering::SeqCst),
             2,
             "expected exactly 2 calls to Anthropic (1×401 + 1×200)"
+        );
+    }
+
+    /// The cache anchor cell (`CacheExpiry`): every attempt is a dispatch,
+    /// whatever becomes of it; only an accepted one is the anchor, and the
+    /// response's cache usage is measured against it.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn the_anchor_cell_sees_every_dispatch_and_measures_the_accepted_one() {
+        use crate::runtime::keepwarm::{CacheAnchorCell, CacheUsage};
+        let _config = crate::test_env::BaseDirGuard::new();
+        let source = CredentialSource::Remote {
+            endpoint: spawn_mock_broker("sk-fresh-token").await,
+            machine_token: "machine-tok".into(),
+        };
+        let cell = Arc::new(CacheAnchorCell::default());
+        let call = |url: String| {
+            let mut options = make_options(url, source.clone(), TokenCache::new());
+            options.cache_anchor = Some(Arc::clone(&cell));
+            drive_call(auth_with_token("sk-stale"), options)
+        };
+        let (refused, _) = spawn_mock_anthropic(usize::MAX).await;
+        call(refused).await.expect_err("every attempt gets a 401");
+        let state = cell.state();
+        assert!(state.dispatched.is_some(), "dispatched: {state:?}");
+        assert_eq!((state.anchor, state.usage), (None, None), "never accepted");
+
+        let (url, calls) = spawn_mock_anthropic(1).await;
+        call(url).await.expect("a 401, then accepted");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let state = cell.state();
+        assert!(
+            state.anchor.is_some() && state.anchor == state.dispatched,
+            "{state:?}"
+        );
+        assert_eq!(
+            state.usage,
+            Some(CacheUsage::default()),
+            "read and wrote nothing"
         );
     }
 
@@ -7780,5 +7861,406 @@ mod cancellation_tests {
             StreamEvent::Llm(LlmEvent::ResponseReset)
                 | StreamEvent::Session(SessionEvent::Retry(_))
         )));
+    }
+
+    // ── The cache anchor cell after an accepted attempt's output fails ───
+    //
+    // The policy: the cache activity the provider reports for an accepted
+    // attempt (its message_start usage) is what that request did to the
+    // cache, whatever becomes of its output. A cancelled, failed or refused
+    // output keeps the attempt the anchor, measured; only a newer accepted
+    // attempt replaces it, with its own usage.
+
+    use crate::runtime::keepwarm::{CacheAnchorCell, CacheAnchorState, CacheUsage};
+
+    /// An accepted attempt's start: read 5, wrote 3 (1h), then some text.
+    const START_CACHED: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1,"cache_read_input_tokens":5,"cache_creation_input_tokens":3,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":3}}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+        "\n\n",
+    );
+
+    /// What [`START_CACHED`] reports.
+    const CACHED: CacheUsage = CacheUsage {
+        read: 5,
+        write: 3,
+        write_5m: Some(0),
+        write_1h: Some(3),
+    };
+
+    /// An in-stream error the request is not retried for.
+    const FAILED: &str = concat!(
+        r#"data: {"type":"error","error":{"type":"invalid_request_error","message":"x"}}"#,
+        "\n\n",
+    );
+
+    /// An in-stream error the request is retried for.
+    const TRANSIENT: &str = concat!(
+        r#"data: {"type":"error","error":{"type":"api_error","message":"x"}}"#,
+        "\n\n",
+    );
+
+    /// The model declined: the request is retried (`refusal_retries`).
+    const REFUSED: &str = concat!(
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+
+    /// A complete reply, "second attempt", that read 40 and wrote nothing.
+    const READ_ONLY: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1,"cache_read_input_tokens":40,"cache_creation_input_tokens":0}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"second attempt"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+
+    /// What [`READ_ONLY`] reports.
+    const READ: CacheUsage = CacheUsage {
+        read: 40,
+        write: 0,
+        write_5m: None,
+        write_1h: None,
+    };
+
+    /// A 400 before any stream: refused, not retried.
+    fn bad_request() -> (u16, Body) {
+        (
+            400,
+            Body::from(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"x"}}"#,
+            ),
+        )
+    }
+
+    /// What a server answers request `n` (from 0) with: a status and a body.
+    type Script = fn(usize) -> (u16, Body);
+
+    /// Loopback only: answers request `n` (from 0) with `script(n)`.
+    async fn attempts_server(
+        script: Script,
+    ) -> (ApiOptions, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let (status, body) = script(counter.fetch_add(1, Ordering::SeqCst));
+                async move {
+                    let kind = if status == 200 {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", kind)
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            ApiOptions {
+                anthropic_base_url: Some(url),
+                ..Default::default()
+            },
+            hits,
+            task,
+        )
+    }
+
+    /// `call` with a cache anchor cell: its result, the cell when the first
+    /// retry is announced (attempt 0 is over), and the cell at the end.
+    async fn anchored(
+        mut options: ApiOptions,
+    ) -> (Result<Value>, Option<CacheAnchorState>, CacheAnchorState) {
+        let cell = Arc::new(CacheAnchorCell::default());
+        options.cache_anchor = Some(Arc::clone(&cell));
+        let auth = test_auth();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (result, first) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(call(&auth, &cancel, tx, &options), async {
+                let mut first = None;
+                while let Some(event) = rx.recv().await {
+                    if first.is_none()
+                        && matches!(event, StreamEvent::Session(SessionEvent::Retry(_)))
+                    {
+                        first = Some(cell.state());
+                    }
+                }
+                first
+            })
+        })
+        .await
+        .expect("the request must end well within 10 s");
+        (result, first, cell.state())
+    }
+
+    /// Cancelled after the attempt's usage and some text: the attempt stays
+    /// the anchor, measured.
+    #[tokio::test]
+    async fn reported_cache_activity_survives_a_cancelled_output() {
+        let (mut options, hits, _seen, server) = stalled_server(Stall::Sse).await;
+        let cell = Arc::new(CacheAnchorCell::default());
+        options.cache_anchor = Some(Arc::clone(&cell));
+        let auth = test_auth();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(call(&auth, &cancel, tx, &options), async {
+                while let Some(event) = rx.recv().await {
+                    if matches!(event, StreamEvent::Llm(LlmEvent::Text(_))) {
+                        cancel.cancel();
+                    }
+                }
+            })
+        })
+        .await
+        .expect("cancel must finish a stalled SSE stream");
+        server.abort();
+        assert_eq!(result.unwrap()["content"][0]["text"], "partial");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let state = cell.state();
+        assert!(
+            state.anchor.is_some() && state.anchor == state.dispatched,
+            "{state:?}"
+        );
+        assert_eq!(
+            state.usage,
+            Some(CacheUsage {
+                read: 5,
+                write: 3,
+                write_5m: None,
+                write_1h: None,
+            })
+        );
+    }
+
+    /// An in-stream error after the attempt's usage, not retried: the
+    /// request fails, the attempt stays the anchor, measured.
+    #[tokio::test]
+    async fn reported_cache_activity_survives_an_in_stream_failure() {
+        let (options, hits, server) =
+            attempts_server(|_| (200, scripted(vec![(0, START_CACHED), (0, FAILED)], None))).await;
+        let (result, first, end) = anchored(options).await;
+        server.abort();
+        assert!(result.is_err());
+        assert_eq!(
+            (hits.load(Ordering::SeqCst), first),
+            (1, None),
+            "not retried"
+        );
+        assert!(
+            end.anchor.is_some() && end.anchor == end.dispatched,
+            "{end:?}"
+        );
+        assert_eq!(end.usage, Some(CACHED));
+    }
+
+    /// An accepted attempt's output fails (a transient in-stream error, or
+    /// a refusal) and the retry is refused before it is accepted: the cell
+    /// keeps the accepted attempt and its usage; only the dispatch moves on.
+    #[tokio::test]
+    async fn a_retry_refused_before_acceptance_keeps_the_accepted_attempt() {
+        let scripts: [(&str, Script); 2] = [
+            ("in-stream error", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, TRANSIENT)], None)),
+                _ => bad_request(),
+            }),
+            ("refusal", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, REFUSED)], None)),
+                _ => bad_request(),
+            }),
+        ];
+        for (what, script) in scripts {
+            let (options, hits, server) = attempts_server(script).await;
+            let (result, first, end) = anchored(options).await;
+            server.abort();
+            assert!(result.is_err(), "{what}: the retry was refused");
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "{what}");
+            let first = first.expect("a retry");
+            assert!(
+                first.anchor.is_some() && first.usage == Some(CACHED),
+                "{what}: {first:?}"
+            );
+            assert_eq!(
+                (end.anchor, end.prefix, end.usage),
+                (first.anchor, first.prefix, first.usage),
+                "{what}: the accepted attempt stays"
+            );
+            assert!(
+                end.dispatched.unwrap().mono > end.anchor.unwrap().mono,
+                "{what}: the retry was dispatched: {end:?}"
+            );
+        }
+    }
+
+    /// The same, and the retry is accepted: the newer attempt is the
+    /// anchor, with its own usage, never the failed one's.
+    #[tokio::test]
+    async fn an_accepted_retry_replaces_the_failed_attempt_with_its_own_usage() {
+        let scripts: [(&str, Script); 2] = [
+            ("in-stream error", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, TRANSIENT)], None)),
+                _ => (200, scripted(vec![(0, READ_ONLY)], None)),
+            }),
+            ("refusal", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, REFUSED)], None)),
+                _ => (200, scripted(vec![(0, READ_ONLY)], None)),
+            }),
+        ];
+        for (what, script) in scripts {
+            let (options, hits, server) = attempts_server(script).await;
+            let (result, first, end) = anchored(options).await;
+            server.abort();
+            assert_eq!(
+                result.unwrap()["content"][0]["text"],
+                "second attempt",
+                "{what}"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "{what}");
+            let first = first.expect("a retry");
+            assert_eq!(first.usage, Some(CACHED), "{what}: {first:?}");
+            assert!(
+                end.anchor.unwrap().mono > first.anchor.unwrap().mono
+                    && end.anchor == end.dispatched,
+                "{what}: {end:?}"
+            );
+            assert_eq!(end.usage, Some(READ), "{what}");
+        }
+    }
+
+    /// Which part of the older request [`overlap_server`] holds back.
+    #[derive(Clone, Copy, Debug)]
+    enum Held {
+        Headers,
+        Body,
+    }
+
+    /// Loopback only: request 0 (the older) answers [`START_CACHED`] then
+    /// [`FAILED`], held at `gate` before its headers or before its usage
+    /// (`held`); every later request answers [`READ_ONLY`] at once.
+    async fn overlap_server(
+        held: Held,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> (ApiOptions, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let gate = Arc::clone(&gate);
+                async move {
+                    let body = if n > 0 {
+                        scripted(vec![(0, READ_ONLY)], None)
+                    } else {
+                        if let Held::Headers = held {
+                            gate.notified().await;
+                        }
+                        let ping = futures::stream::once(async {
+                            Ok::<_, std::io::Error>(bytes::Bytes::from_static(PING.as_bytes()))
+                        });
+                        let rest = futures::stream::once(async move {
+                            if let Held::Body = held {
+                                gate.notified().await;
+                            }
+                            Ok(bytes::Bytes::from(format!("{START_CACHED}{FAILED}")))
+                        });
+                        Body::from_stream(ping.chain(rest))
+                    };
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            ApiOptions {
+                anthropic_base_url: Some(url),
+                ..Default::default()
+            },
+            hits,
+            task,
+        )
+    }
+
+    /// Two requests on one cell overlap (a turn and a keep-warm ping, say):
+    /// the later-dispatched one is accepted and measured while the older
+    /// one is open, and the older one's usage and failure land after it
+    /// (its body was held), or it is only accepted then (its headers were
+    /// held). The cell stays the newer request's, with its own usage.
+    #[tokio::test]
+    async fn an_overlapping_older_attempt_never_overwrites_the_newer_one() {
+        for held in [Held::Body, Held::Headers] {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (mut options, hits, server) = overlap_server(held, Arc::clone(&gate)).await;
+            let cell = Arc::new(CacheAnchorCell::default());
+            options.cache_anchor = Some(Arc::clone(&cell));
+            let auth = test_auth();
+            let cancel = CancellationToken::new();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let (older, (older_sent, newer, after_newer)) =
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::join!(call(&auth, &cancel, tx.clone(), &options), async {
+                        // The older request is out (and, body held, accepted).
+                        while match held {
+                            Held::Body => cell.state().anchor.is_none(),
+                            Held::Headers => hits.load(Ordering::SeqCst) == 0,
+                        } {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        let older_sent = cell.state().dispatched.unwrap();
+                        let newer = call(&auth, &cancel, tx.clone(), &options).await;
+                        let after_newer = cell.state();
+                        gate.notify_one();
+                        (older_sent, newer, after_newer)
+                    })
+                })
+                .await
+                .expect("both requests must end well within 10 s");
+            server.abort();
+            assert!(older.is_err(), "{held:?}: the older request failed");
+            assert_eq!(
+                newer.unwrap()["content"][0]["text"],
+                "second attempt",
+                "{held:?}"
+            );
+            assert!(
+                after_newer.anchor.unwrap().mono > older_sent.mono
+                    && after_newer.anchor == after_newer.dispatched
+                    && after_newer.usage == Some(READ),
+                "{held:?}: {after_newer:?}"
+            );
+            assert_eq!(
+                cell.state(),
+                after_newer,
+                "{held:?}: the older request changed nothing"
+            );
+        }
     }
 }

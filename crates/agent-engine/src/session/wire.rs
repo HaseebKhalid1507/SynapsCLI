@@ -92,6 +92,13 @@ pub const FEATURE_ADDRESSED_REPLIES: &str = "addressed_replies";
 /// it can.
 pub const FEATURE_PROMPT_OUTCOME: &str = "prompt_outcome";
 
+/// `Welcome.features` entry: this daemon answers `SessionQuery::CacheExpiry`
+/// (arch-review-435-436-437 Contract v3 §3). An older daemon fails the
+/// frame as malformed, so a client checks this first
+/// ([`SocketTransport`](super::SocketTransport) refuses to send it:
+/// `DaemonTooOld`).
+pub const FEATURE_CACHE_EXPIRY: &str = "cache_expiry";
+
 /// `CatalogPage.limit` when absent, and its ceiling.
 pub const CATALOG_PAGE_DEFAULT_LIMIT: u32 = 50;
 pub const CATALOG_PAGE_MAX_LIMIT: u32 = 200;
@@ -113,6 +120,7 @@ pub fn daemon_features() -> Vec<String> {
         FEATURE_SESSION_PAGE.to_string(),
         FEATURE_ADDRESSED_REPLIES.to_string(),
         FEATURE_PROMPT_OUTCOME.to_string(),
+        FEATURE_CACHE_EXPIRY.to_string(),
     ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).

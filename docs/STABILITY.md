@@ -180,6 +180,10 @@ must match exactly; a mismatch is refused loudly at the handshake.
   `VIEW_CHANGED_SETTING_ID` for everyone but the asker. Request ids are the
   client's own; ids at or above `RESERVED_QUERY_ID_BASE` belong to the
   transport and the daemon ("Request ids and replies" in `daemon-mode.md`).
+- **Typed query replies.** A typed query (`cache_expiry`) answers its
+  struct or `{"error": {"code", "message"?}}`; codes are append-only and an
+  unknown one reads as `internal`. A reply's enums (`state`, `reason`) read
+  an unknown value as `unknown`.
 - **A `seq` gap is not loss.** `seq` is gapless per session; a client's
   stream skips what is not for it.
 - **Binary skew is supported.** Across `synaps daemon reload` an attached
