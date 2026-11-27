@@ -63,24 +63,6 @@ pub const PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const ANTHROPIC_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 
-/// Pinned Code Assist host for the broker-only Google Gemini proxy runtime.
-/// The service is treated as experimental and only the exact `v1internal`
-/// method paths reviewed in the spec are permitted (setup + streaming).
-pub const GOOGLE_GEMINI_CODE_ASSIST_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
-
-/// Exhaustive allowlist of `cloudcode-pa` methods the broker may proxy.
-/// Deliberately narrow: setup uses loadCodeAssist + onboardUser + operations
-/// polling, runtime uses streamGenerateContent. Anything else is denied.
-pub(crate) fn is_allowed_google_gemini_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1internal:loadCodeAssist"
-            | "/v1internal:onboardUser"
-            | "/v1internal:streamGenerateContent"
-            | "/v1internal:countTokens"
-    ) || path.starts_with("/v1internal/operations/")
-}
-
 /// Pinned ChatGPT backend host for OpenAI Codex catalog traffic.
 pub const OPENAI_CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api";
 
@@ -386,7 +368,6 @@ impl ProxyRequest {
         if provider != LOCAL_PROVIDER_KEY
             && provider != "xai-auth"
             && provider != "github-copilot"
-            && provider != "google-gemini"
             && provider != "openai-codex"
             && provider != "anthropic"
             && provider != "kimi-code"
@@ -412,7 +393,6 @@ impl ProxyRequest {
                     self.path.as_str(),
                     "/models" | "/chat/completions" | "/responses"
                 )
-            || provider == "google-gemini" && is_allowed_google_gemini_path(&self.path)
             // Managed Kimi Code endpoint allowlist: chat inference plus the
             // read-only catalog/profile/quota surfaces the official CLI uses.
             || provider == "kimi-code"
@@ -1762,8 +1742,6 @@ pub struct LocalBroker {
     local_base_url: Option<String>,
     /// Test seam: overrides the pinned Anthropic usage URL.
     anthropic_usage_url: Option<String>,
-    /// Test seam: overrides the pinned cloudcode-pa base URL.
-    google_gemini_base_url: Option<String>,
     /// Test seam: overrides the pinned ChatGPT backend base URL.
     openai_codex_base_url: Option<String>,
     /// Test seam: overrides the pinned Meta Muse API origin.
@@ -2027,14 +2005,9 @@ const MAX_COOLDOWN: Duration = Duration::from_secs(8 * 24 * 60 * 60);
 pub const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
 
 /// Idle timeout between bytes on the broker's per-request no-redirect
-/// client (Muse, Kimi, Gemini, Codex/Anthropic catalog). Matches the runtime
+/// client (Muse, Kimi, Codex/Anthropic catalog). Matches the runtime
 /// client's 90s read timeout that xAI streams already get.
 pub const BROKER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// Gemini (Code Assist) sends no data chunk while it thinks (thought
-/// streaming is off), and a hard prompt can think silently for minutes;
-/// its stream has no retry, so it gets a longer idle limit.
-pub const GEMINI_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Next per-process broker number for the usage-read log line.
 fn next_broker_instance() -> u64 {
@@ -2049,7 +2022,6 @@ impl LocalBroker {
             http,
             local_base_url: None,
             anthropic_usage_url: None,
-            google_gemini_base_url: None,
             openai_codex_base_url: None,
             muse_base_url: None,
             refresh_endpoints: Default::default(),
@@ -2144,16 +2116,7 @@ impl LocalBroker {
         self
     }
 
-    /// Idle (between-bytes) limit for `provider_key`'s no-redirect client.
-    fn stream_idle_timeout_for(&self, provider_key: &str) -> Duration {
-        if provider_key == "google-gemini" {
-            GEMINI_STREAM_IDLE_TIMEOUT.max(self.stream_idle_timeout)
-        } else {
-            self.stream_idle_timeout
-        }
-    }
-
-    /// Test seam: shorten [`BROKER_STREAM_IDLE_TIMEOUT`] (not Gemini's).
+    /// Test seam: shorten [`BROKER_STREAM_IDLE_TIMEOUT`].
     #[doc(hidden)]
     pub fn with_stream_idle_timeout_for_tests(mut self, idle: Duration) -> Self {
         self.stream_idle_timeout = idle;
@@ -3431,20 +3394,6 @@ impl LocalBroker {
         }
     }
 
-    /// Test seam: point the pinned Google Code Assist host at a loopback fake.
-    /// Production code must never call this — it only relaxes the base URL,
-    /// not any of the path allowlist / bearer / redirect-denial invariants.
-    #[doc(hidden)]
-    pub fn with_google_gemini_base_url_for_tests(
-        http: reqwest::Client,
-        base_url: impl Into<String>,
-    ) -> Self {
-        Self {
-            google_gemini_base_url: Some(base_url.into().trim_end_matches('/').to_string()),
-            ..Self::new(http)
-        }
-    }
-
     /// Test seam: point the pinned Anthropic usage operation at a fake server.
     #[doc(hidden)]
     pub fn with_anthropic_usage_url(mut self, url: impl Into<String>) -> Self {
@@ -3557,14 +3506,6 @@ impl LocalBroker {
                 bearer(&pinned)?,
                 super::github_copilot_models_base_url().to_string(),
             )
-        } else if provider_key == "google-gemini" {
-            // Google Gemini (Code Assist) is broker-proxy-only. Refresh stays
-            // broker-owned; runtime never receives it.
-            let base = self
-                .google_gemini_base_url
-                .clone()
-                .unwrap_or_else(|| GOOGLE_GEMINI_CODE_ASSIST_BASE_URL.to_string());
-            (bearer(&pinned)?, base)
         } else if provider_key == "openai-codex" {
             // Catalog-only OAuth proxy for ChatGPT backend models. Access token
             // never leaves the broker; account header is derived broker-side.
@@ -3673,10 +3614,9 @@ impl LocalBroker {
         pinned: &Option<PinnedToken>,
     ) -> Result<reqwest::Response, BrokerError> {
         let url = format!("{base}{}", request.path);
-        // Deny redirects for credential-bearing OAuth catalog traffic and
-        // google-gemini: a 3xx must not replay the bearer token off-origin.
-        let mut builder = if provider_key == "google-gemini"
-            || provider_key == "openai-codex"
+        // Deny redirects for credential-bearing OAuth catalog traffic: a 3xx
+        // must not replay the bearer token off-origin.
+        let mut builder = if provider_key == "openai-codex"
             || provider_key == "anthropic"
             || provider_key == "kimi-code"
             || provider_key == "muse"
@@ -3687,7 +3627,7 @@ impl LocalBroker {
             let no_redirect = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
-                .read_timeout(self.stream_idle_timeout_for(provider_key))
+                .read_timeout(self.stream_idle_timeout)
                 .build()
                 .map_err(|e| BrokerError::Transport(format!("client build failed: {e}")))?;
             match request.method {
@@ -3744,15 +3684,6 @@ impl LocalBroker {
                     .header("Openai-Intent", "conversation-edits")
                     .header("X-Initiator", "agent");
             }
-        }
-        if provider_key == "google-gemini" {
-            // The Code Assist reference client uses `?alt=sse` for streaming.
-            // Match that so upstream returns line-delimited SSE frames rather
-            // than JSON-in-one-response.
-            if request.stream && request.path == "/v1internal:streamGenerateContent" {
-                builder = builder.query(&[("alt", "sse")]);
-            }
-            builder = builder.header("user-agent", "SynapsCLI/0.6.0 (google-gemini)");
         }
         if provider_key == "muse" {
             // API-key requests need only Authorization (verified); identify
@@ -6148,51 +6079,25 @@ mod tests {
         assert!(is_allowed_anthropic_path(page1));
     }
 
-    /// google-gemini is pinned to the reviewed cloudcode-pa v1internal methods.
+    /// The broker no longer proxies the removed Gemini Code Assist provider:
+    /// every path, named account or not, is an unknown provider.
     #[test]
-    fn proxy_allows_only_pinned_google_gemini_paths() {
-        for path in [
-            "/v1internal:loadCodeAssist",
-            "/v1internal:onboardUser",
-            "/v1internal:streamGenerateContent",
-            "/v1internal:countTokens",
-            "/v1internal/operations/op-12345",
-        ] {
-            let req = ProxyRequest {
-                provider: "google-gemini".into(),
-                method: ProxyMethod::Post,
-                path: path.into(),
-                body: None,
-                stream: false,
-                body_bytes: None,
-            };
-            assert!(req.validate().is_ok(), "{path} must be allowed");
-        }
-        for path in [
-            // No arbitrary same-host methods.
-            "/v1internal:listExperiments",
-            "/v1internal:fetchAdminControls",
-            "/v1internal:setCodeAssistGlobalUserSetting",
-            "/v1internal:generateContent",
-            // No unrelated versions.
-            "/v2/models",
-            "/v1beta/models",
-            // No path traversal or root probe.
-            "/",
-            "/v1internal:",
-        ] {
-            let req = ProxyRequest {
-                provider: "google-gemini".into(),
-                method: ProxyMethod::Post,
-                path: path.into(),
-                body: None,
-                stream: false,
-                body_bytes: None,
-            };
-            assert!(
-                matches!(req.validate(), Err(BrokerError::Denied(_))),
-                "{path} must be denied"
-            );
+    fn proxy_refuses_the_removed_google_gemini_provider() {
+        for provider in ["google-gemini", "google-gemini@work"] {
+            for path in ["/", "/models", "/chat/completions", "/v1beta/models"] {
+                let req = ProxyRequest {
+                    provider: provider.into(),
+                    method: ProxyMethod::Post,
+                    path: path.into(),
+                    body: None,
+                    stream: false,
+                    body_bytes: None,
+                };
+                assert!(
+                    matches!(req.validate(), Err(BrokerError::UnknownProvider(_))),
+                    "{provider} {path} must be an unknown provider"
+                );
+            }
         }
     }
 
@@ -6525,8 +6430,7 @@ mod tests {
 
     /// LocalBroker::proxy_stream: a non-2xx upstream body must never enter the
     /// error, while the stable `provider request failed: {status}` prefix and
-    /// typed Transport category are retained for engine-side classification
-    /// (including Gemini 429 detection on the status reason phrase).
+    /// typed Transport category are retained for engine-side classification.
     #[tokio::test]
     async fn local_broker_stream_error_omits_upstream_body() {
         use axum::routing::post;
@@ -6826,21 +6730,6 @@ mod tests {
             assert!(msg.contains(&status.to_string()), "status lost: {msg}");
             assert_no_hostile_bytes(&msg);
         }
-    }
-
-    /// R2-I1: Gemini can think silently for minutes before its first data
-    /// chunk, so its no-redirect client idles longer than everyone else's.
-    #[test]
-    fn gemini_gets_the_longer_stream_idle_timeout() {
-        let broker = LocalBroker::new(reqwest::Client::new());
-        assert_eq!(broker.stream_idle_timeout_for("google-gemini"), Duration::from_secs(300));
-        for key in ["muse", "kimi-code", "openai-codex", "anthropic"] {
-            assert_eq!(broker.stream_idle_timeout_for(key), Duration::from_secs(90), "{key}");
-        }
-        let short = LocalBroker::new(reqwest::Client::new())
-            .with_stream_idle_timeout_for_tests(Duration::from_millis(10));
-        assert_eq!(short.stream_idle_timeout_for("muse"), Duration::from_millis(10));
-        assert!(short.stream_idle_timeout_for("google-gemini") >= Duration::from_secs(300));
     }
 
     async fn spawn_remote_broker_body(status: u16, body: String) -> RemoteBroker {

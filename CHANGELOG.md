@@ -197,6 +197,21 @@ All notable changes to this project will be documented in this file.
   value warns at load and is `match`. Haiku 5.5 and GPT-6-Luna join the
   known models.
 
+### Removed
+
+- **The Gemini Code Assist sign-in (`google-gemini`) is removed.** It
+  was built on Gemini CLI's internal Code Assist API and sign-in flow,
+  which Google's terms do not permit third-party tools to use. `synaps login --provider google-gemini`
+  (or `gemini`, `gemini-cli`, `gemini-code-assist`) now refuses and names
+  the replacement: a Google AI Studio API key,
+  `synaps login --provider google`, then a `google/...` model.
+  `google-gemini/...` models no longer route, and the
+  `SYNAPS_GOOGLE_GEMINI_CLIENT_ID` / `_SECRET` variables are no longer
+  read. A saved `google-gemini` sign-in is dropped from `auth.json` when
+  synaps starts, by name and without reading its value, with one log line,
+  "removed saved google-gemini sign-in". AI Studio keys and Vertex are
+  unchanged.
+
 ### Fixed
 
 - **Daemon replies reach only the client that asked** (`Welcome.features`:

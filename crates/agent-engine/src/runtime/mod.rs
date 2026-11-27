@@ -24,7 +24,6 @@ pub mod compaction;
 pub mod compaction_cached;
 pub mod context;
 pub mod continuation;
-pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
 mod http_phases;
@@ -2399,7 +2398,6 @@ impl Runtime {
             crate::runtime::openai::AuthPolicy::BrokerProxy => {
                 let oauth = match route.provider.as_str() {
                     "github-copilot" => Some(OAuthProviderId::GitHubCopilot),
-                    "google-gemini" => Some(OAuthProviderId::GoogleGemini),
                     "kimi-code" => Some(OAuthProviderId::KimiCode),
                     "muse" => Some(OAuthProviderId::Muse),
                     _ => None,

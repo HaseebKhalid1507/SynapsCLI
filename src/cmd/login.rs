@@ -48,6 +48,15 @@ pub async fn run(
     provider_key: Option<String>,
     account: Option<String>,
 ) -> Result<(), String> {
+    // The removed Gemini Code Assist sign-in is refused by name, before any
+    // profile, log, store or provider flow; never a fallback.
+    if let Some(refusal) = provider_key
+        .as_deref()
+        .and_then(auth::provider::removed_provider_refusal)
+    {
+        eprintln!("error: {refusal}");
+        return Err(refusal.to_string());
+    }
     if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
@@ -686,6 +695,12 @@ fn filtered_provider_indices(providers: &[LoginProvider], query: &str) -> Vec<us
         .collect()
 }
 
+/// A removed provider name typed into the picker's search gets the plain
+/// refusal (the picker offers no such provider to select).
+fn picker_refusal(query: &str) -> Option<&'static str> {
+    auth::provider::removed_provider_refusal(query)
+}
+
 fn render_provider_picker(
     providers: &[LoginProvider],
     visible: &[usize],
@@ -703,6 +718,9 @@ fn render_provider_picker(
     eprint!("{}◇ Select provider\r\n", LOGIN_PICKER_PADDING);
     eprint!("{}│\r\n", LOGIN_PICKER_PADDING);
     eprint!("{}│ Search: {}\r\n", LOGIN_PICKER_PADDING, query);
+    if let Some(refusal) = picker_refusal(query) {
+        eprint!("{}│ \x1b[33m{}\x1b[0m\r\n", LOGIN_PICKER_PADDING, refusal);
+    }
     if visible.is_empty() {
         eprint!(
             "{}│ \x1b[2mNo providers match your search.\x1b[0m\r\n",
@@ -884,7 +902,7 @@ mod tests {
         for (prefix, text) in [
             ("Sign in with ", "Meta Muse"),
             ("", "Meta account device OAuth for Muse Code (experimental)"),
-            ("", "Google account OAuth for Gemini CLI / Code Assist (experimental)"),
+            ("", "Google AI Studio API key for Gemini models (static provider route)"),
             ("Account: ", "default"),
             ("", ""),
             ("", &"x".repeat(80)),
@@ -936,20 +954,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn login_providers_include_google_gemini_from_descriptor() {
+    /// The login list has no Gemini Code Assist entry; every removed name
+    /// given to `synaps login --provider` gets the plain AI Studio refusal
+    /// and starts no flow (it returns before profile, log, store or provider
+    /// work); the picker's search shows the same refusal. The AI Studio
+    /// API-key entry stays reachable at `google`.
+    #[tokio::test]
+    async fn removed_gemini_code_assist_names_are_refused_at_login_and_in_the_picker() {
         let providers = login_providers();
-        let found = find_provider(&providers, "google-gemini")
-            .expect("descriptor-driven login must surface google-gemini");
-        assert_eq!(found.key(), "google-gemini");
-        assert_eq!(
-            found.target,
-            LoginTarget::OAuth(auth::OAuthProviderId::GoogleGemini)
-        );
-        assert_eq!(found.name, "Google Gemini (Code Assist)");
-        assert!(!found.recommended);
-        // Storage key is canonical.
-        assert_eq!(oauth_storage_key(found), "google-gemini");
+        assert!(providers.iter().all(|p| p.key() != "google-gemini"));
+        assert!(providers
+            .iter()
+            .all(|p| !p.name.contains("Code Assist") && !p.description.contains("Code Assist")));
+        for name in ["google-gemini", "gemini", "gemini-cli", "gemini-code-assist", "GEMINI"] {
+            assert!(find_provider(&providers, name).is_none(), "{name}");
+            let err = run(None, Some(name.to_string()), None).await.unwrap_err();
+            assert_eq!(err, auth::provider::REMOVED_GEMINI_CODE_ASSIST_REFUSAL, "{name}");
+            assert_eq!(
+                picker_refusal(name),
+                Some(auth::provider::REMOVED_GEMINI_CODE_ASSIST_REFUSAL),
+                "{name}"
+            );
+        }
+        // Refused even with --account: no other path is tried.
+        let err = run(None, Some("gemini".into()), Some("work".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, auth::provider::REMOVED_GEMINI_CODE_ASSIST_REFUSAL);
+        assert!(err.contains("synaps login --provider google"));
         // The static Google AI Studio API-key entry stays reachable at "google".
         let ai_studio = find_provider(&providers, "google")
             .expect("Google AI Studio API-key entry must remain reachable");
@@ -957,14 +989,8 @@ mod tests {
             ai_studio.target,
             LoginTarget::Static(StaticProviderId("google"))
         );
-        // CLI aliases route to google-gemini except the reserved "google".
-        assert_eq!(
-            auth::provider::parse_cli_provider("gemini")
-                .unwrap()
-                .as_str(),
-            "google-gemini"
-        );
-        assert!(auth::provider::parse_cli_provider("google").is_err());
+        assert_eq!(picker_refusal("google"), None);
+        assert_eq!(picker_refusal("gem"), None);
     }
 
     #[test]

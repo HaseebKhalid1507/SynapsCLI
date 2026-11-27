@@ -386,7 +386,7 @@ mod tests {
             "claude-fable-5-1",
             "claude-sonnet-9-0",
             "gpt-5.5",
-            "google-gemini/gemini-2.5-pro",
+            "google/gemini-2.5-pro",
         ] {
             assert!(!model_rejects_output_overflow(m), "{m}");
         }

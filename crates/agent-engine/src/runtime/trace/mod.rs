@@ -21,8 +21,8 @@
 //! (the normalized IR / `TranslationReport` arrive in Task 9; the bounded
 //! persistence writer in Task 11). Task 10A extends the seam to the
 //! OpenAI-compatible transports — Chat Completions and Responses/Codex —
-//! via [`openai`]; Task 10B covers Gemini/Vertex and the cloud-invoke
-//! routes via [`google`]; Task 10C completes the set with extension-hosted
+//! via [`openai`]; Task 10B covers the cloud-invoke routes (Bedrock, Azure,
+//! Vertex) via [`google`]; Task 10C completes the set with extension-hosted
 //! providers via [`extension`].
 //! Serde contract (deliberate): optional metrics serialize as **absent** —
 //! never fabricated zeros — and both absent and explicit `null` deserialize

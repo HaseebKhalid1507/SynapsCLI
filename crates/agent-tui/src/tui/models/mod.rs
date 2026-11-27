@@ -41,11 +41,6 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
             auth_kind: DevProviderAuth::OAuth("github-copilot"),
         },
         DevProviderSelection {
-            key: "google-gemini",
-            name: "Google Gemini (Code Assist)",
-            auth_kind: DevProviderAuth::OAuth("google-gemini"),
-        },
-        DevProviderSelection {
             key: "kimi-code",
             name: "Kimi Code",
             auth_kind: DevProviderAuth::OAuth("kimi-code"),
@@ -541,7 +536,6 @@ fn logged_in_oauth_providers() -> BTreeSet<&'static str> {
         synaps_cli::auth::OAuthProviderId::OpenAiCodex,
         synaps_cli::auth::OAuthProviderId::Xai,
         synaps_cli::auth::OAuthProviderId::GitHubCopilot,
-        synaps_cli::auth::OAuthProviderId::GoogleGemini,
         synaps_cli::auth::OAuthProviderId::KimiCode,
         synaps_cli::auth::OAuthProviderId::Muse,
     ]
@@ -806,19 +800,6 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
                 (model.id, model.label.unwrap_or_default(), tier.to_string())
             })
             .collect(),
-        "google-gemini" => {
-            synaps_cli::runtime::openai::catalog::google_gemini_static_catalog_models()
-                .into_iter()
-                .map(|model| {
-                    let tier = match model.id.as_str() {
-                        "gemini-2.5-pro" => "S",
-                        "gemini-2.5-flash" => "A",
-                        _ => "",
-                    };
-                    (model.id, model.label.unwrap_or_default(), tier.to_string())
-                })
-                .collect()
-        }
         "kimi-code" => synaps_cli::runtime::openai::catalog::kimi_code_static_catalog_models()
             .into_iter()
             .map(|model| {
@@ -1848,8 +1829,11 @@ mod tests {
         assert!(!ids.contains(&"auto"));
     }
 
+    /// The model picker has no Gemini Code Assist section, even
+    /// with a stale `google-gemini` login or a `google-gemini/*` current
+    /// model; no row offers a `google-gemini/` id.
     #[test]
-    fn google_gemini_section_lists_conservative_catalog_when_logged_in() {
+    fn removed_google_gemini_never_gets_a_picker_section() {
         let state = ModelsModalState {
             cursor: 0,
             search: String::new(),
@@ -1863,60 +1847,18 @@ mod tests {
             "google-gemini/gemini-2.5-pro",
             &state,
             &ProviderAvailability::default(),
-            &BTreeSet::from(["google-gemini"]),
-        );
-        let gemini = sections
-            .iter()
-            .find(|section| section.provider_key == "google-gemini")
-            .expect("logged-in Google Gemini section");
-        let ids: Vec<_> = gemini
-            .entries
-            .iter()
-            .map(|entry| entry.display_id.as_str())
-            .collect();
-        assert_eq!(
-            ids,
-            vec![
-                "gemini-3.1-pro-preview",
-                "gemini-3-pro-preview",
-                "gemini-3.5-flash",
-                "gemini-3-flash-preview",
-                "gemini-3.1-flash-lite",
-                "gemini-2.5-pro",
-                "gemini-2.5-flash",
-            ]
-        );
-        assert!(gemini
-            .entries
-            .iter()
-            .all(|entry| entry.id.starts_with("google-gemini/")));
-        // Routing aliases and non-chat models never leak into the TUI.
-        for banned in ["auto-gemini-2.5", "auto-gemini-3", "text-embedding-004"] {
-            assert!(!ids.contains(&banned));
-        }
-    }
-
-    #[test]
-    fn google_gemini_section_hidden_when_not_logged_in() {
-        let state = ModelsModalState {
-            cursor: 0,
-            search: String::new(),
-            view: ModelsView::All,
-            collapsed: HashSet::new(),
-            favorites: BTreeSet::new(),
-            expanded: None,
-            provider_catalog_overrides: std::collections::BTreeMap::new(),
-        };
-        // No login for google-gemini in the logged_in set.
-        let sections = build_sections_from_parts(
-            "claude/sonnet-4.5",
-            &state,
-            &ProviderAvailability::default(),
-            &BTreeSet::from(["claude"]),
+            &BTreeSet::from(["google-gemini", "claude"]),
         );
         assert!(sections
             .iter()
             .all(|section| section.provider_key != "google-gemini"));
+        assert!(sections
+            .iter()
+            .flat_map(|section| section.entries.iter())
+            .all(|entry| !entry.id.starts_with("google-gemini/")));
+        assert!(dev_model_providers()
+            .iter()
+            .all(|provider| provider.key != "google-gemini"));
     }
 
     #[test]

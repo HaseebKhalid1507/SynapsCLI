@@ -9,7 +9,7 @@ SynapsCLI is a terminal-native AI agent runtime written in Rust. ~210K LOC acros
 - `synaps-tui` (`crates/agent-tui/`) — the ratatui TUI
 - `synaps` (`src/main.rs`) — the binary; CLI dispatch
 
-Each crate has `extern crate self as synaps_cli;` and re-exports its dependencies, so internal `synaps_cli::` paths still resolve for contributors navigating older references. Talks to Anthropic, OpenAI Codex, xAI, GitHub Copilot, Google Gemini, Azure OpenAI, Amazon Bedrock, Google Vertex AI, and Kimi natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, OpenRouter, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
+Each crate has `extern crate self as synaps_cli;` and re-exports its dependencies, so internal `synaps_cli::` paths still resolve for contributors navigating older references. Talks to Anthropic, OpenAI Codex, xAI, GitHub Copilot, Azure OpenAI, Amazon Bedrock, Google Vertex AI, and Kimi natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, OpenRouter, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
 
 ---
 
@@ -114,7 +114,7 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │       ├── stream.rs     — call_oai_stream_inner (streaming path)
 │       ├── ping.rs       — /ping health check (parallel, non-blocking)
 │       ├── account_routing.rs — Codex account selection + one-hop failover
-│       └── catalog/      — per-provider model catalogs (anthropic, codex, xai, copilot, gemini, groq, kimi, muse, nvidia, openrouter)
+│       └── catalog/      — per-provider model catalogs (anthropic, codex, xai, copilot, groq, kimi, muse, nvidia, openrouter)
 ├── events/               — event bus (per-session unix socket, inbox watcher, queue, registry)
 ├── tools/                — built-in tools, each impls the Tool trait
 │   ├── mod.rs            — Tool trait, ToolContext
@@ -209,7 +209,7 @@ This is the single most important flow to understand.
 
 Typed auth flows live in `crates/agent-core/src/core/auth/`. Three flow families:
 
-- **OAuth PKCE** — Anthropic, OpenAI Codex, xAI, GitHub Copilot, Google Gemini. Browser-based device flow with PKCE challenge, refresh token rotation.
+- **OAuth PKCE** — Anthropic, OpenAI Codex, xAI, GitHub Copilot. Browser-based device flow with PKCE challenge, refresh token rotation.
 - **OAuth device flow** — Meta Muse (`muse.rs`): the Meta login mints a Model API key; broker-proxy only, the runtime never holds either.
 - **Cloud identity** — Azure OpenAI (Azure CLI/managed identity), AWS Bedrock (STS/profile), Google Vertex AI (gcloud ADC). Cloud secrets never leave the broker.
 - **Static keys** — Groq, Cerebras, NVIDIA, OpenRouter, Kimi. Env var or config-file discovery, broker-owned.
