@@ -2,7 +2,66 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.13.0] — 2026-11-27
+
+Several clients can share a daemon session safely: a reply reaches only the
+client that asked, a resolved prompt says what was applied, and the session
+list shows a session's background workers and, over the socket, the saved
+conversations on disk. Extension context from `before_message` is saved in
+the conversation by default. Compaction summaries are written by the chat's
+own model, and on a warm Anthropic cache they read the history from the
+cache instead of paying for it again. Workers report what they used and can
+default to a model of their own, every provider's models are priced at
+their own list price, and a limit on one Claude model no longer blocks the
+whole account. GPT-6.2 Sol and GPT-6.2 Astra join the Codex models; the
+Gemini Code Assist sign-in is removed.
+
+Read the Upgrade notes first if you write an extension with a
+`before_message` hook, signed in with `google-gemini`, relied on the old
+compaction model, or build a client on the daemon socket. Full notes:
+[docs/upgrading/0.13.0.md](docs/upgrading/0.13.0.md).
+
+### Upgrade notes
+
+- **Reload the daemon after installing:** `synaps daemon reload`, then
+  restart attached TUIs. A reload stops running subagents (they can be
+  resumed), so let them finish first. Daemon protocol (v3) and extension
+  protocol (1) are unchanged; the new daemon contracts are additive
+  features in `Welcome.features`.
+- **Extensions: `before_message` inject is saved by default** (#425).
+  Content an extension injects is now written into the stored conversation
+  and stays in history. Content meant for one turn only (recall, status
+  lines) must set `"forget": true`; it is then shown for every request of
+  that turn, never stored, and leaves a one-line marker. A saved part over
+  16 KiB is handled as `forget`. Hosts announce this with
+  `features: ["inject.forget"]` in `initialize`.
+- **`google-gemini` is removed** (#460). `synaps login --provider
+  google-gemini` refuses, `google-gemini/...` models no longer route, and a
+  saved `google-gemini` sign-in is dropped from `auth.json` at start. Use a
+  Google AI Studio API key instead: `synaps login --provider google`, then
+  a `google/...` model. Change any `model`, `subagent_model`,
+  `compaction_model` or favorite that names a `google-gemini/...` model.
+- **`compaction_model` no longer defaults to or falls back to
+  `claude-sonnet-4-6`.** Unset, empty or `match` (the default) has the
+  chat's own model write summaries, so an Opus chat compacts with Opus.
+  Set `compaction_model = claude-sonnet-4-6` to keep the old model,
+  or `provider-small` for the provider's small model (Haiku 5.5 on
+  Anthropic). Any other value warns at load and is `match`.
+- **Daemon replies reach only the client that asked** (#448). A client that
+  read another client's `QueryResult` (or a command reply) off the shared
+  stream no longer gets it and has to ask itself. `SettingChanged` and
+  `Resumed` still reach every client, with the id
+  `VIEW_CHANGED_SETTING_ID` for all but the asker.
+- **New session ids end in 8 hex characters, not 4**
+  (`20261117-015328-1f2e3d4c`). Ids from before stay valid; a script that
+  matches exactly 4 needs `{4,}`.
+- **`synaps daemon sessions --json` prints the daemon's rows as sent**:
+  keys in alphabetical order, fields an older daemon doesn't send left out
+  instead of defaulted, and fields a newer daemon adds (`workers`) kept.
+  `created_at` is when the conversation began, and `title` is the saved
+  row's title.
+- **Credential broker:** upgrade a `synaps auth-broker` and its clients
+  together; an older side treats one model's 429 as the whole account's.
 
 ### Added
 
@@ -117,6 +176,18 @@ All notable changes to this project will be documented in this file.
   `SocketTransport::catalog_page` asks for one page.
   [docs/daemon-mode.md](docs/daemon-mode.md#saved-sessions-catalog_page)
 
+- **GPT-6.2 Sol and GPT-6.2 Astra on OpenAI Codex** (ChatGPT sign-in),
+  listed first in the picker. Each copies its predecessor's reasoning levels
+  and default (Sol as GPT-6.1 Sol, default `low`; Astra as GPT-6 Astra,
+  default `medium`; both up to Ultra) and has a 1,050,000-token context
+  window. Their API refuses `reasoning.effort: none`, so Off is sent as
+  `low`; the system prompt goes as the first developer message in `input`
+  instead of top-level `instructions`, so it stays ahead of the
+  conversation; no `service_tier` is sent. Requests still ask for at most
+  64,000 output tokens. Neither has a list price in synaps yet: their cost
+  reads at the Sonnet fallback, and a worker on one reports no `cost_usd`.
+  Other Codex models are unchanged.
+
 ### Changed
 
 - **A held session's listing title is its saved row's title**: the header
@@ -147,7 +218,7 @@ All notable changes to this project will be documented in this file.
   kept, and an older daemon's missing fields are left out, not defaulted.
 
 - **Behaviour change for extensions: `before_message` inject is saved by
-  default (#414).** Injected content used to be shown for one request and
+  default (#425, for #414).** Injected content used to be shown for one request and
   never kept, so the model disowned answers it had given from it and lost
   it after its first tool call. Now each part is written once into the
   stored conversation on the user message the hook ran for, fenced with the
@@ -360,7 +431,7 @@ All notable changes to this project will be documented in this file.
 
 - **Sign-in opens the whole page on Windows.** The browser was started
   through `cmd /c start <url>`, and `cmd` ends a command at the first `&`:
-  the Claude, ChatGPT, Gemini and Grok authorize URLs (all full of `&`)
+  the Claude, ChatGPT and Grok authorize URLs (all full of `&`)
   opened cut short, a broken page and a stray `cmd` window with it. The URL
   now goes straight to `ShellExecuteW`, unchanged, and only `http(s)` URLs
   with no quote, space or control character are opened. Linux and macOS are
@@ -442,6 +513,31 @@ All notable changes to this project will be documented in this file.
   limit that still holds meets the ping with a 429, at most one per
   keep-warm period, which ends keep-warm and bills no tokens. Under `auto` a
   cooling account still stops the ping (the next request leaves it).
+
+- **A Codex model the usage reading doesn't list can be used on a paid
+  plan.** The reading lists only the models Codex gates one by one (GPT-6
+  Astra), and every other requested model counted as unknown, so an
+  ordinary model such as GPT-6.1 Sol failed account selection on every
+  account, even on a paid plan with room in its windows. On a paid plan
+  (`plus`, `pro`, `team`, `business`, `enterprise`, `edu`) such a model is
+  now judged by the plan's windows, from a fresh reading or the last good
+  one, with one INFO log line per choice. A model gated per model, and any
+  unlisted model on a free, unknown or missing plan, still needs the
+  reading to list it.
+
+- **Windows: a client connecting to a busy daemon waits for the pipe.** A
+  named pipe has one listening instance, so when several clients connected
+  at once (a TUI and `synaps daemon status`, clients racing an auto-spawn,
+  reconnects after a reload) one could fail with `connect: protocol:
+  connect timed out` while the daemon was busy. The pipe-busy retry, which
+  the 500 ms connect bound cut short, now gets its full time, up to 5
+  seconds (was 2), and if that runs out the error says the pipe was busy.
+  With no daemon a client still fails at once. Unix is unchanged.
+
+### Internal
+
+- The README introduces Capri, a desktop client built on the daemon
+  socket (#418).
 
 ## [0.12.0] — 2026-11-14
 
