@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-pub use crate::session::{ConfirmScope, PromptKind};
+pub use crate::session::{ConfirmGate, ConfirmScope, PromptKind, PromptPolicy};
 
 /// UI-only secret prompt plumbing for interactive tools.
 ///
@@ -17,22 +17,35 @@ impl SecretPromptHandle {
         Self { tx }
     }
 
-    pub async fn prompt(&self, title: String, prompt: String) -> Option<String> {
-        self.prompt_scoped(title, prompt, None).await
+    /// The runtime's tool-call gate ([`ConfirmGate::ToolCall`]). `scope`
+    /// names the source extension(s) and the reach of "Allow all" before
+    /// the user answers; without one Allow all is not offered.
+    pub async fn confirm_tool_call(&self, body: String, scope: Option<ConfirmScope>) -> Option<String> {
+        let gate = ConfirmGate::ToolCall;
+        self.raise(PromptPolicy::Confirm(gate), gate.title().to_string(), body, scope).await
     }
 
-    /// Like [`Self::prompt`], carrying the extension tool-call confirm scope
-    /// so the dialog can name the source extension(s) and the reach of
-    /// "Allow all" before the user answers.
-    pub async fn prompt_scoped(
+    /// The `activate_tools` gate ([`ConfirmGate::Activation`]): Allow or Deny.
+    pub async fn confirm_activation(&self, body: String) -> Option<String> {
+        let gate = ConfirmGate::Activation;
+        self.raise(PromptPolicy::Confirm(gate), gate.title().to_string(), body, None).await
+    }
+
+    /// A masked value (an API key, a sudo password), whatever its title.
+    pub async fn secret(&self, title: String, body: String) -> Option<String> {
+        self.raise(PromptPolicy::Secret, title, body, None).await
+    }
+
+    async fn raise(
         &self,
+        policy: PromptPolicy,
         title: String,
         prompt: String,
         confirm_scope: Option<ConfirmScope>,
     ) -> Option<String> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let request = SecretPromptRequest {
-            kind: PromptKind::from_title(&title),
+            policy,
             title,
             prompt,
             confirm_scope,
@@ -44,15 +57,23 @@ impl SecretPromptHandle {
 }
 
 pub struct SecretPromptRequest {
-    /// `Confirm` renders as a y/n dialog (body visible), `Secret` as a masked
-    /// field. Derived from the title by `SecretPromptHandle::prompt`; carried
-    /// verbatim from the wire `PromptRequest` by the daemon PromptBridge.
-    pub kind: PromptKind,
+    /// What the prompt is: chosen by the `SecretPromptHandle` method that
+    /// raised it, or by the TUI's PromptBridge from a wire `PromptRequest`.
+    /// `Confirm` renders as a y/n dialog (body visible), `Secret` as a
+    /// masked field.
+    pub policy: PromptPolicy,
+    /// Display only (a `Confirm`'s is its gate's).
     pub title: String,
     pub prompt: String,
     /// Extension tool-call confirms only (see [`ConfirmScope`]).
     pub confirm_scope: Option<ConfirmScope>,
     pub response_tx: tokio::sync::oneshot::Sender<Option<String>>,
+}
+
+impl SecretPromptRequest {
+    pub fn kind(&self) -> PromptKind {
+        self.policy.kind()
+    }
 }
 
 /// Which button of a `Confirm` dialog is focused / was chosen.
@@ -82,6 +103,8 @@ pub const CONFIRM_ANSWER_ALLOW_ALL: &str = "always";
 pub const CONFIRM_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
 pub struct PendingSecretPrompt {
+    pub policy: PromptPolicy,
+    /// `policy.kind()`.
     pub kind: PromptKind,
     pub title: String,
     pub prompt: String,
@@ -107,12 +130,11 @@ impl PendingSecretPrompt {
     }
 
     /// Whether the "Allow all" button is offered: only the runtime's
-    /// per-tool-call gate (`Confirm tool call`) with a known source scope,
-    /// never the `activate_tools` gate (its runtime only accepts y/yes) and
-    /// never an unattributed confirm (the latch could not be scoped).
+    /// per-tool-call gate with a known source scope, never the
+    /// `activate_tools` gate (it denies Allow all) and never an
+    /// unattributed confirm (the latch could not be scoped).
     pub fn offers_allow_all(&self) -> bool {
-        self.kind == PromptKind::Confirm
-            && self.title == crate::session::types::CONFIRM_PROMPT_TITLE
+        self.policy == PromptPolicy::Confirm(ConfirmGate::ToolCall)
             && self
                 .confirm_scope
                 .as_ref()
@@ -166,7 +188,8 @@ impl SecretPromptQueue {
         }
         if let Some(req) = self.pending.pop_front() {
             self.active = Some(PendingSecretPrompt {
-                kind: req.kind,
+                policy: req.policy,
+                kind: req.policy.kind(),
                 title: req.title,
                 prompt: req.prompt,
                 confirm_scope: req.confirm_scope,
@@ -388,8 +411,8 @@ mod tests {
         let rx = Arc::new(Mutex::new(rx));
         let (tx1, mut rx1) = tokio::sync::oneshot::channel();
         let (tx2, mut rx2) = tokio::sync::oneshot::channel();
-        tx.send(SecretPromptRequest { kind: PromptKind::Secret, title: "a".into(), prompt: "p".into(), confirm_scope: None, response_tx: tx1 }).unwrap();
-        tx.send(SecretPromptRequest { kind: PromptKind::Secret, title: "b".into(), prompt: "p".into(), confirm_scope: None, response_tx: tx2 }).unwrap();
+        tx.send(SecretPromptRequest { policy: PromptPolicy::Secret, title: "a".into(), prompt: "p".into(), confirm_scope: None, response_tx: tx1 }).unwrap();
+        tx.send(SecretPromptRequest { policy: PromptPolicy::Secret, title: "b".into(), prompt: "p".into(), confirm_scope: None, response_tx: tx2 }).unwrap();
         let mut q = SecretPromptQueue::new();
         q.poll_requests(&rx);
         assert_eq!(q.active().unwrap().title, "a");
@@ -406,13 +429,13 @@ mod tests {
         assert!(!q.is_active());
     }
 
-    fn confirm(title: &str, scope: Option<ConfirmScope>) -> SecretPromptQueue {
+    fn confirm(gate: ConfirmGate, scope: Option<ConfirmScope>) -> SecretPromptQueue {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let rx = Arc::new(Mutex::new(rx));
         let (response_tx, _rx) = tokio::sync::oneshot::channel();
         tx.send(SecretPromptRequest {
-            kind: PromptKind::Confirm,
-            title: title.into(),
+            policy: PromptPolicy::Confirm(gate),
+            title: gate.title().into(),
             prompt: "p".into(),
             confirm_scope: scope,
             response_tx,
@@ -426,7 +449,7 @@ mod tests {
     #[test]
     fn allow_all_requires_an_attributed_tool_call_confirm() {
         let scope = ConfirmScope { extensions: vec!["jev".into()], tool: Some("bash".into()), rewritten_by: vec![] };
-        let title = crate::session::CONFIRM_PROMPT_TITLE;
+        let title = ConfirmGate::ToolCall;
         assert!(confirm(title, Some(scope.clone())).confirm_offers_allow_all());
         assert!(
             !confirm(title, None).confirm_offers_allow_all(),
@@ -437,7 +460,7 @@ mod tests {
             Some(ConfirmScope { extensions: vec![], tool: None, rewritten_by: vec![] })
         )
         .confirm_offers_allow_all());
-        assert!(!confirm(crate::session::CONFIRM_ACTIVATION_PROMPT_TITLE, Some(scope))
+        assert!(!confirm(ConfirmGate::Activation, Some(scope))
             .confirm_offers_allow_all());
         // Without a scope, AllowAll does nothing (no silent single Allow).
         let mut q = confirm(title, None);
@@ -448,7 +471,7 @@ mod tests {
     #[test]
     fn focus_does_not_wrap_and_allow_all_needs_two_enters() {
         let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None, rewritten_by: vec![] };
-        let mut q = confirm(crate::session::CONFIRM_PROMPT_TITLE, Some(scope));
+        let mut q = confirm(ConfirmGate::ToolCall, Some(scope));
         q.arm_now_for_tests();
         q.move_confirm_focus(true);
         assert_eq!(q.confirm_focus(), ConfirmChoice::Deny, "no wrap past the end");
@@ -475,7 +498,7 @@ mod tests {
             let (response_tx, r) = tokio::sync::oneshot::channel();
             keep.push(r);
             tx.send(SecretPromptRequest {
-                kind: PromptKind::Confirm,
+                policy: PromptPolicy::Confirm(ConfirmGate::ToolCall),
                 title: crate::session::CONFIRM_PROMPT_TITLE.into(),
                 prompt: "p".into(),
                 confirm_scope: scope(),
@@ -496,7 +519,7 @@ mod tests {
     #[test]
     fn dropping_allow_all_moves_focus_off_it() {
         let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None, rewritten_by: vec![] };
-        let mut q = confirm(crate::session::CONFIRM_PROMPT_TITLE, Some(scope));
+        let mut q = confirm(ConfirmGate::ToolCall, Some(scope));
         q.move_confirm_focus(false);
         assert_eq!(q.confirm_focus(), ConfirmChoice::AllowAll);
         q.drop_allow_all();
@@ -509,7 +532,7 @@ mod tests {
     #[test]
     fn confirm_ignores_input_until_armed_secret_never_waits() {
         let scope = ConfirmScope { extensions: vec!["jev".into()], tool: None, rewritten_by: vec![] };
-        let mut q = confirm(crate::session::CONFIRM_PROMPT_TITLE, Some(scope));
+        let mut q = confirm(ConfirmGate::ToolCall, Some(scope));
         assert!(!q.input_armed(), "a fresh confirm is not armed");
         q.arm_now_for_tests();
         assert!(q.input_armed());

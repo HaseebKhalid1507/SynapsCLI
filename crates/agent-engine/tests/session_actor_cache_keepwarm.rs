@@ -1563,18 +1563,10 @@ async fn park_while_a_ping_waits_for_the_hook_withdraws_both() {
 // goes out, not that exactly one ever does.
 
 /// Fence `handle` as a reload's checkpoint does (host-sent).
-async fn fence_for_reload(t: &mut LocalTransport, handle: &SessionHandle) {
+async fn fence_for_reload(t: &mut LocalTransport, _handle: &SessionHandle) {
     use agent_engine::session::wire::CHECKPOINT_QUERY_ID;
-    handle
-        .send(SessionCommand::Checkpoint {
-            reason: agent_engine::session::CheckpointReason::Reload,
-        })
-        .await
-        .unwrap();
-    until(t, |e| {
-        matches!(e, agent_engine::session::SessionEventWire::QueryResult { id, .. } if *id == CHECKPOINT_QUERY_ID)
-    })
-    .await;
+    let cmd = SessionCommand::Checkpoint { reason: agent_engine::session::CheckpointReason::Reload };
+    host_reply(t, cmd, CHECKPOINT_QUERY_ID).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

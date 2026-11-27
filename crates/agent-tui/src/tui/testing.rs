@@ -782,7 +782,7 @@ impl TestHarness {
     }
 
     /// P7.8: inject and activate an async secret prompt — the harness
-    /// equivalent of a tool calling `SecretPromptHandle::prompt`. Sends a
+    /// equivalent of a tool calling `SecretPromptHandle::secret`. Sends a
     /// request through a throwaway channel, drains it into `app.secret_prompts`
     /// via the same `poll_requests` the tick arm uses, then reconciles the modal
     /// stack exactly as production does. The response receiver is dropped: the
@@ -841,7 +841,7 @@ impl TestHarness {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         tx.send(SecretPromptRequest {
-            kind,
+            policy: crate::tui::session_link::pane_policy(kind, title),
             title: title.to_string(),
             prompt: prompt.to_string(),
             confirm_scope,
@@ -869,7 +869,7 @@ impl TestHarness {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         tx.send(SecretPromptRequest {
-            kind: synaps_cli::tools::PromptKind::Confirm,
+            policy: agent_engine::session::PromptPolicy::Confirm(agent_engine::session::ConfirmGate::ToolCall),
             title: agent_engine::session::CONFIRM_PROMPT_TITLE.to_string(),
             prompt: prompt.to_string(),
             confirm_scope: Some(agent_engine::session::ConfirmScope {
@@ -1200,12 +1200,12 @@ impl TestHarness {
     /// drive). After it, the tick arm's secret-prompt poll + stack reconcile
     /// run so a `Prompt` activates the pane exactly as in production.
     pub fn feed_event(&mut self, event: SessionEventWire) -> &mut Self {
-        let env = agent_engine::session::Envelope {
-            session_id: self.link.transport().session_id().clone(),
-            seq: 0,
-            ts: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
+        let env = agent_engine::session::Envelope::new(
+            self.link.transport().session_id().clone(),
+            0,
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
             event,
-        };
+        );
         let render_handle = super::render_thread::RenderHandle::headless();
         let what = "handle_session_event_arm";
         let flow = block_on_bounded(

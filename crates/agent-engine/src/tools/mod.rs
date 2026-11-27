@@ -79,8 +79,8 @@ pub use respond::RespondTool;
 pub use confirm_latch::{latch_keys, LatchKey, SessionConfirmLatch};
 pub use secret_prompt::SecretPromptQueue;
 pub use secret_prompt::{
-    ConfirmChoice, ConfirmScope, PromptKind, SecretPromptHandle, SecretPromptRequest,
-    CONFIRM_ANSWER_ALLOW_ALL,
+    ConfirmChoice, ConfirmGate, ConfirmScope, PromptKind, PromptPolicy, SecretPromptHandle,
+    SecretPromptRequest, CONFIRM_ANSWER_ALLOW_ALL,
 };
 pub use send_channel::SendChannelTool;
 

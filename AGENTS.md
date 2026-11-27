@@ -9,7 +9,7 @@ SynapsCLI is a terminal-native AI agent runtime written in Rust. ~210K LOC acros
 - `synaps-tui` (`crates/agent-tui/`) — the ratatui TUI
 - `synaps` (`src/main.rs`) — the binary; CLI dispatch
 
-Each crate has `extern crate self as synaps_cli;` and re-exports its dependencies, so internal `synaps_cli::` paths still resolve for contributors navigating older references. Talks to Anthropic, OpenAI Codex, xAI, GitHub Copilot, Google Gemini, Azure OpenAI, Amazon Bedrock, Google Vertex AI, and Kimi natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, OpenRouter, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
+Each crate has `extern crate self as synaps_cli;` and re-exports its dependencies, so internal `synaps_cli::` paths still resolve for contributors navigating older references. Talks to Anthropic, OpenAI Codex, xAI, GitHub Copilot, Azure OpenAI, Amazon Bedrock, Google Vertex AI, and Kimi natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, OpenRouter, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
 
 ---
 
@@ -94,7 +94,8 @@ crates/agent-engine/src/  (crate: synaps-engine)
 ├── runtime/              — THE BRAIN
 │   ├── mod.rs            — Runtime struct, orchestration loop
 │   ├── api.rs            — Anthropic API body construction + SSE parsing
-│   ├── api_sync.rs       — non-streaming API path (used by /compact)
+│   ├── api_sync.rs       — non-streaming API path (the /compact transcript request)
+│   ├── compaction_cached.rs — /compact as the chat's own next request, read from the prompt cache; when it applies
 │   ├── request.rs        — request body assembly helpers
 │   ├── stream.rs         — tool dispatch from streamed tool_use events
 │   ├── helpers.rs        — annotate_cache_breakpoint, drain_steering, etc.
@@ -113,7 +114,7 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │       ├── stream.rs     — call_oai_stream_inner (streaming path)
 │       ├── ping.rs       — /ping health check (parallel, non-blocking)
 │       ├── account_routing.rs — Codex account selection + one-hop failover
-│       └── catalog/      — per-provider model catalogs (anthropic, codex, xai, copilot, gemini, groq, kimi, muse, nvidia, openrouter)
+│       └── catalog/      — per-provider model catalogs (anthropic, codex, xai, copilot, groq, kimi, muse, nvidia, openrouter)
 ├── events/               — event bus (per-session unix socket, inbox watcher, queue, registry)
 ├── tools/                — built-in tools, each impls the Tool trait
 │   ├── mod.rs            — Tool trait, ToolContext
@@ -208,7 +209,7 @@ This is the single most important flow to understand.
 
 Typed auth flows live in `crates/agent-core/src/core/auth/`. Three flow families:
 
-- **OAuth PKCE** — Anthropic, OpenAI Codex, xAI, GitHub Copilot, Google Gemini. Browser-based device flow with PKCE challenge, refresh token rotation.
+- **OAuth PKCE** — Anthropic, OpenAI Codex, xAI, GitHub Copilot. Browser-based device flow with PKCE challenge, refresh token rotation.
 - **OAuth device flow** — Meta Muse (`muse.rs`): the Meta login mints a Model API key; broker-proxy only, the runtime never holds either.
 - **Cloud identity** — Azure OpenAI (Azure CLI/managed identity), AWS Bedrock (STS/profile), Google Vertex AI (gcloud ADC). Cloud secrets never leave the broker.
 - **Static keys** — Groq, Cerebras, NVIDIA, OpenRouter, Kimi. Env var or config-file discovery, broker-owned.
@@ -459,7 +460,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `identity` | string | SynapsCLI default | System prompt preamble injected as the first message in the system block. Defines who the agent is. |
 | `agent_name` | string | — | Display name for the agent in the TUI |
 | `theme` | string | — | TUI color theme (21 built-in + user TOML) |
-| `compaction_model` | string | claude-sonnet-4-6 | Model used for `/compact` |
+| `compaction_model` | string | match | Who writes `/compact` and auto-compaction summaries: `match` (also unset or empty: the chat's own model), `provider-small` (the small model pinned for the chat's provider, on the chat's own account: `claude-haiku-5-5` for Anthropic, the chat's own model for any other provider, OpenAI Codex included; pins in `crates/agent-core/src/core/models.rs::PROVIDER_SMALL_MODELS`), or a model id. A summary goes to another provider only when a model there is named. A named or pinned model that can't be used (no route, its provider refuses the chat's reasoning level, a smaller context window than the chat's, no credential) gives way to the chat's own model, and the compaction line says so. Any other value warns at load and is `match` |
 | `max_tool_output` | int | 30000 | Max bytes per tool output |
 | `tool_output_spill_bytes` | int | 12288 | Tool output virtualisation: a text result of an output-dump tool (`bash`, `grep`, `find`, `ls`, shell and subagent tools, MCP/extension/plugin tools) bigger than this is saved whole to `<base>/spill/<session>/<tool_use_id>.txt` (0700/0600) and history gets a head + tail preview naming the file and the omitted line range; a default-range `read` points back at the file instead. `0` = off (history exactly as before). Spill dirs go with their session (retention) or after 7 idle days |
 | `tool_output_spill_head_bytes` | int | 4096 | Bytes from the start of a virtualised result kept in history (cut at a line boundary when possible) |

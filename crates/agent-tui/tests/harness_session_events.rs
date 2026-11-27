@@ -140,7 +140,7 @@ fn session_prompt_activates_pane_and_resolution_by_other_dismisses() {
         },
     )]);
     assert!(h.secret_prompt_active(), "Prompt must activate the pane");
-    h.feed_events(&[agent_engine::session::SessionEventWire::PromptResolved { prompt_id: 7 }]);
+    h.feed_events(&[agent_engine::session::SessionEventWire::PromptResolved { prompt_id: 7, outcome: None }]);
     assert!(!h.secret_prompt_active(), "foreign resolution dismisses");
 }
 
@@ -178,7 +178,7 @@ fn no_confirm_answers_lists_a_confirm_and_never_opens_the_pane() {
         h.sent_commands()
     );
 
-    h.feed_events(&[SessionEventWire::PromptResolved { prompt_id: 7 }]);
+    h.feed_events(&[SessionEventWire::PromptResolved { prompt_id: 7, outcome: None }]);
     let frame = h.snapshot();
     assert!(!frame.contains("Approval waiting"), "cleared: {frame}");
 
@@ -203,6 +203,40 @@ fn session_refused_is_rendered_only_for_me() {
         reason: "input owned by client #2".into(),
     }]);
     assert!(!theirs.contains("refused"), "{theirs}");
+}
+
+/// An answer the policy refuses is said in a toast and undoes nothing: a
+/// turn this client presented keeps streaming (the generic refusal undoes
+/// a refused `Submit`'s presentation and gives its text back).
+#[test]
+fn a_refused_answer_undoes_nothing() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.set_streaming(true);
+    h.feed_event(
+        W::Refused {
+            client: ClientId(1),
+            command: "answer".into(),
+            reason: "only the input owner can choose Allow all".into(),
+        }
+        .into(),
+    );
+    let frame = h.snapshot();
+    assert!(frame.contains("answer refused"), "{frame}");
+    assert!(h.is_streaming(), "the turn is not ended: {frame}");
+}
+
+/// A late answer's `AnswerRefused` says what applied, in a toast, and
+/// undoes nothing.
+#[test]
+fn a_late_answer_is_said_in_a_toast_and_undoes_nothing() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    h.set_streaming(true);
+    h.feed_event(
+        W::AnswerRefused { prompt_id: 7, outcome: Some(agent_engine::session::PromptOutcome::Cancelled) }.into(),
+    );
+    let frame = h.snapshot();
+    assert!(frame.contains("prompt 7 was already resolved: cancelled"), "{frame}");
+    assert!(h.is_streaming(), "the turn is not ended: {frame}");
 }
 
 #[test]

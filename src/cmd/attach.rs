@@ -115,7 +115,14 @@ impl Client {
                 self.pending.push(p.clone());
                 self.out(&render_prompt_line(p));
             }
-            SessionEventWire::PromptResolved { prompt_id } => self.pending.retain(|p| p.id != *prompt_id),
+            SessionEventWire::PromptResolved { prompt_id, .. } => self.pending.retain(|p| p.id != *prompt_id),
+            SessionEventWire::AnswerRefused { prompt_id, outcome } => {
+                self.pending.retain(|p| p.id != *prompt_id);
+                match outcome {
+                    Some(o) => self.out(&format!("[answer refused: prompt {prompt_id} was already resolved: {}]\n", o.as_str())),
+                    None => self.out(&format!("[answer refused: prompt {prompt_id} is not pending]\n")),
+                }
+            }
             SessionEventWire::SystemNotice(s) => self.out(&format!("[system] {s}\n")),
             SessionEventWire::Steered { text, delivered } => {
                 self.out(&format!("{} {text}\n", if *delivered { "→ steering:" } else { "queued:" }))

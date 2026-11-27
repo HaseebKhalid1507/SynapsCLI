@@ -22,6 +22,9 @@ pub struct HostParts {
     pub client: reqwest::Client,
     /// THE shared catalog.
     pub tools: Arc<RwLock<ToolRegistry>>,
+    /// `tools`' change counter, read without its lock
+    /// ([`ToolRegistry::change_handle`]).
+    pub tools_changes: Arc<std::sync::atomic::AtomicU64>,
     pub hook_bus: Arc<HookBus>,
     /// Resolved once from config.
     pub credential_source: crate::auth::CredentialSource,
@@ -164,6 +167,11 @@ impl EngineHost {
             crate::config::set_profile(Some(prof.clone()));
         }
         let log_guard = crate::logging::init_logging();
+        // A saved sign-in of the removed Gemini Code Assist provider
+        // is dropped by name at startup, after logging so its one fixed line
+        // ("removed saved google-gemini sign-in") lands; nothing saved, no
+        // line. Failure is not fatal: the entry is inert (no provider reads it).
+        let _ = crate::auth::remove_legacy_google_gemini_sign_in();
 
         let client = crate::runtime::build_host_http_client()?;
         let capture_dir = crate::runtime::trace::default_capture_dir();
@@ -172,7 +180,7 @@ impl EngineHost {
 
         let config_mtime = config_file_mtime();
         let config = crate::config::load_config();
-        let tools = Arc::new(RwLock::new(ToolRegistry::new()));
+        let (tools, tools_changes) = ToolRegistry::new().into_shared();
         // Same point the old boot's `apply_config` disabled tools: on the
         // fresh registry, before skills/MCP register anything.
         if !config.disabled_tools.is_empty() {
@@ -213,6 +221,7 @@ impl EngineHost {
         let parts = HostParts {
             client,
             tools,
+            tools_changes,
             hook_bus,
             credential_source: config.auth.credential_source(),
             token_cache: crate::auth::TokenCache::new(),
@@ -411,7 +420,7 @@ impl EngineHost {
         let mut host = self.parts.clone();
         host.client = crate::runtime::build_host_http_client()?;
         host.hook_bus = self.worker_hook_bus();
-        host.tools = Arc::new(RwLock::new(self.worker_registry().await));
+        (host.tools, host.tools_changes) = self.worker_registry().await.into_shared();
         host.mcp_runtime = None;
         host.extension_runtime = None;
         // `Runtime::new()` value. Workers never ran `apply_config`, so they

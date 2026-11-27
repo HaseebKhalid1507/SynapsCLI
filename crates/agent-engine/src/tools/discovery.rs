@@ -179,22 +179,13 @@ async fn confirm_activation_with_host(
         ids.len(),
         ids.join("\n")
     );
-    match prompt
-        .prompt(
-            crate::session::CONFIRM_ACTIVATION_PROMPT_TITLE.to_string(),
-            question,
-        )
-        .await
-    {
-        Some(answer) => {
-            let normalized = answer.trim().to_ascii_lowercase();
-            if normalized == "y" || normalized == "yes" {
-                ActivationAuthority::ModelConfirmed
-            } else {
-                ActivationAuthority::Unauthorized
-            }
+    let answer = prompt.confirm_activation(question).await;
+    // Allow all is not an answer at this gate: it denies.
+    match crate::session::ConfirmGate::Activation.decide(answer.as_deref()) {
+        crate::session::ConfirmDecision::Allow => ActivationAuthority::ModelConfirmed,
+        crate::session::ConfirmDecision::AllowAll | crate::session::ConfirmDecision::Deny => {
+            ActivationAuthority::Unauthorized
         }
-        None => ActivationAuthority::Unauthorized,
     }
 }
 

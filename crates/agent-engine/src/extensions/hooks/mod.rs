@@ -169,6 +169,9 @@ pub struct HookBus {
     /// Keyed by conversation session id: one process may host N sessions
     /// (Phase 2 daemon), and each must read only its own injection.
     session_injection: RwLock<HashMap<String, String>>,
+    /// Advanced under `session_injection`'s write guard by every set and
+    /// clear ([`Self::injection_generation`]): a lock-free change counter.
+    injection_gen: std::sync::atomic::AtomicU64,
     /// `Some(host)`: this bus is a subagent worker's view of `host`
     /// ([`Self::worker_transforms`]) and has no handlers of its own.
     transforms_of: Option<Arc<HookBus>>,
@@ -183,6 +186,7 @@ impl HookBus {
         Self {
             handlers: RwLock::new(HashMap::new()),
             session_injection: RwLock::new(HashMap::new()),
+            injection_gen: std::sync::atomic::AtomicU64::new(0),
             generations: std::sync::Mutex::new(HashMap::new()),
             transforms_of: None,
             notify_slots: Arc::new(tokio::sync::Semaphore::new(NOTIFY_MAX_IN_FLIGHT)),
@@ -258,10 +262,17 @@ impl HookBus {
     /// after extensions have loaded. Later calls for the same id replace the
     /// stored value.
     pub async fn set_session_injection_for(&self, session_id: &str, content: String) {
-        self.session_injection
-            .write()
-            .await
-            .insert(session_id.to_string(), content);
+        let mut map = self.session_injection.write().await;
+        map.insert(session_id.to_string(), content);
+        self.injection_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The injection change counter, read without the lock (a `CacheExpiry`
+    /// capture), compared again after the reads it guards.
+    pub fn injection_generation(&self) -> u64 {
+        self.injection_gen
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Context injected at session start for `session_id`, if any. Read on
@@ -272,7 +283,19 @@ impl HookBus {
 
     /// Drop the injection recorded for `session_id` (session teardown).
     pub async fn clear_session_injection(&self, session_id: &str) {
-        self.session_injection.write().await.remove(session_id);
+        let mut map = self.session_injection.write().await;
+        map.remove(session_id);
+        self.injection_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Test seam: hold the injection's write lock, as a set or a clear
+    /// holds it, until the guard drops.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn hold_session_injection(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, String>> {
+        self.session_injection.write().await
     }
 
     /// Compatibility shim: writes under the empty key.

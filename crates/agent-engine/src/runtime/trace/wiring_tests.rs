@@ -634,6 +634,7 @@ async fn compaction_call_api_simple_emits_one_record_from_exact_bytes() {
         &messages,
         0,
         &h.options,
+        Default::default(),
     )
     .await
     .expect("compaction call must succeed");
@@ -866,6 +867,55 @@ async fn one_api_log_record_with_retries(h: &Harness, max_retries: u32) -> serde
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 1, "one api-log record per request: {text}");
     serde_json::from_str(lines[0]).unwrap()
+}
+
+/// The api-log tells a cache-preserving compaction request from a turn:
+/// its record, and no other, carries `"compaction": true`. (Its
+/// `usage.cache_read` is then the history that was not paid for as fresh
+/// input.)
+#[tokio::test]
+async fn api_log_marks_a_cache_preserving_compaction_request() {
+    use crate::runtime::telemetry::{TelemetryWriter, WriterOptions};
+    let app = Router::new().route("/v1/messages", axum_post(|| async { sse_response() }));
+    let h = harness(serve(app).await);
+    let log = h._tmp.path().join("synaps/api-log.jsonl");
+    let writer = TelemetryWriter::new(WriterOptions {
+        telemetry_path: Some(log.clone()),
+        ..WriterOptions::default()
+    });
+    // The turn before: an accepted request stamps its cache identity.
+    let cell = Arc::new(crate::runtime::keepwarm::CacheAnchorCell::default());
+    let turn = ApiOptions {
+        telemetry: Some(writer.clone()),
+        cache_anchor: Some(Arc::clone(&cell)),
+        ..h.options.clone()
+    };
+    let drive = |options: ApiOptions| async move {
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        drive_stream_full(&options, 0, &CancellationToken::new(), tx, TelemetryLevel::Basic)
+            .await
+            .expect("request");
+    };
+    drive(turn.clone()).await;
+    drive(ApiOptions {
+        // The harness sends the turn's own messages again: only the cache
+        // identity is compared here (an empty prefix leads any history).
+        compaction: Some(crate::runtime::api::CompactionRequest::expecting(
+            crate::runtime::keepwarm::CachedPrefix::of(
+                cell.prefix().expect("stamped").identity,
+                &[],
+            ),
+        )),
+        ..turn
+    })
+    .await;
+    assert!(writer.shutdown(Duration::from_secs(10)).is_flushed());
+    let text = std::fs::read_to_string(&log).unwrap();
+    let records: Vec<serde_json::Value> =
+        text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(records.len(), 2, "{text}");
+    assert!(records[0].get("compaction").is_none(), "a turn: {}", records[0]);
+    assert_eq!(records[1]["compaction"], true, "{}", records[1]);
 }
 
 /// Regression: `ttft_ms` was measured from an instant taken AFTER the

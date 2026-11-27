@@ -21,13 +21,13 @@ pub mod budget;
 mod cache_diagnosis;
 pub(crate) mod cloud_invoke;
 pub mod compaction;
+pub mod compaction_cached;
 pub mod context;
 pub mod continuation;
-pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
 mod http_phases;
-mod image_limits;
+pub mod image_limits;
 mod image_retention;
 pub mod keepwarm;
 pub mod tool_keepwarm;
@@ -283,8 +283,7 @@ pub async fn resolve_before_tool_call_result(
                 }
             });
             let response = prompt
-                .prompt_scoped(
-                    crate::session::CONFIRM_PROMPT_TITLE.to_string(),
+                .confirm_tool_call(
                     confirm_prompt_body(
                         &message,
                         &sources,
@@ -295,13 +294,9 @@ pub async fn resolve_before_tool_call_result(
                 )
                 .await;
 
-            match response.as_deref().map(str::trim) {
-                Some(answer)
-                    if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") =>
-                {
-                    approved(modified_input)
-                }
-                Some(answer) if answer.eq_ignore_ascii_case(CONFIRM_ANSWER_ALLOW_ALL) => {
+            match crate::session::ConfirmGate::ToolCall.decide(response.as_deref()) {
+                crate::session::ConfirmDecision::Allow => approved(modified_input),
+                crate::session::ConfirmDecision::AllowAll => {
                     match session_allow_all {
                         Some(latch) if latch.allow(&keys) => tracing::warn!(
                             extensions = ?sources,
@@ -316,7 +311,7 @@ pub async fn resolve_before_tool_call_result(
                     }
                     approved(modified_input)
                 }
-                _ => crate::extensions::hooks::events::HookResult::Block {
+                crate::session::ConfirmDecision::Deny => crate::extensions::hooks::events::HookResult::Block {
                     reason: format!(
                         "Tool call confirmation denied: {}",
                         redact_secret_text(&crate::session::sanitize_prompt_text(&message))
@@ -514,6 +509,9 @@ pub struct Runtime {
     auth: Arc<RwLock<AuthState>>,
     model: String,
     tools: Arc<RwLock<ToolRegistry>>,
+    /// `tools`' change counter, read without its lock (a `CacheExpiry`
+    /// capture). Replaced together with `tools`.
+    tools_changes: Arc<std::sync::atomic::AtomicU64>,
     system_prompt: Option<String>,
     /// Compiled, content-safe effective prompt metadata retained for inspection/reload.
     effective_prompt: Option<agent_core::prompt::PromptStack>,
@@ -545,16 +543,20 @@ pub struct Runtime {
     /// archive directory (see `worker_context`). Inert by default and on
     /// every foreground runtime.
     worker_context: worker_context::WorkerContext,
-    /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
+    /// `compaction_model` as configured: who writes compaction summaries
+    /// (`None` or empty: `match`, the chat's own model; see
+    /// [`Self::compact_model_choice`]).
     compaction_model: Option<String>,
     /// Where compaction summarization runs (spec §9.4).
     compaction_mode: agent_core::compaction::CompactionMode,
     /// Content classes excluded from remote compaction disclosure.
     compaction_exclusions: Vec<agent_core::compaction::ContentClass>,
     /// Transport-construction seam (spec §9.4 / CP-12 M3): incremented at
-    /// the SINGLE remote-summarization entry point before any preflight,
-    /// auth, or HTTP request construction. Shared across clones so the
-    /// local-only zero-network proof observes every path.
+    /// the SINGLE remote-summarization entry point
+    /// (`enter_remote_summarization`) before any preflight, auth, or HTTP
+    /// request construction, once per compaction that goes remote. Shared
+    /// across clones so the local-only zero-network proof observes every
+    /// path.
     remote_summarization_attempts: Arc<std::sync::atomic::AtomicU64>,
     /// Shared registry for reactive subagent handles.
     subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
@@ -809,6 +811,67 @@ fn build_http_client(read_timeout: Duration) -> reqwest::Result<Client> {
         .build()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: every model [`Runtime::compact_call`] is asked for on the
+    /// setting thread, and the reply the script gives for it in place of
+    /// the request (`None`: the request goes ahead as usual).
+    static SCRIPTED_SUMMARY_REQUESTS: std::cell::RefCell<Option<ScriptedSummaryRequests>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ScriptedSummaryRequests {
+    requested: Vec<String>,
+    reply: fn(&str) -> Option<Result<String>>,
+}
+
+/// Scripts the compaction requests on this thread (see
+/// [`SCRIPTED_SUMMARY_REQUESTS`]); [`scripted_summary_requests`] ends it.
+#[cfg(test)]
+pub(crate) fn script_summary_requests(reply: fn(&str) -> Option<Result<String>>) {
+    SCRIPTED_SUMMARY_REQUESTS.with(|script| {
+        *script.borrow_mut() = Some(ScriptedSummaryRequests {
+            requested: Vec::new(),
+            reply,
+        });
+    });
+}
+
+/// The models asked for since [`script_summary_requests`], in order; ends
+/// the script.
+#[cfg(test)]
+pub(crate) fn scripted_summary_requests() -> Vec<String> {
+    SCRIPTED_SUMMARY_REQUESTS.with(|script| {
+        script
+            .borrow_mut()
+            .take()
+            .map(|script| script.requested)
+            .unwrap_or_default()
+    })
+}
+
+/// The `compaction_model = provider-small` pin
+/// ([`agent_core::models::PROVIDER_SMALL_MODELS`]) for the provider of
+/// `model`'s route, if it has one.
+fn provider_small_model(model: &str) -> Option<&'static str> {
+    let provider = known_model_route(model)?.provider;
+    agent_core::models::PROVIDER_SMALL_MODELS
+        .iter()
+        .find(|(key, _)| *key == provider)
+        .map(|(_, pin)| *pin)
+}
+
+/// `model`'s provider route, when it is a model id synaps knows how to
+/// route: `provider/model` with a known provider, or a bare `claude-` id
+/// (a bare id is never another provider's model, nor an extension's).
+fn known_model_route(model: &str) -> Option<crate::runtime::openai::ResolvedRoute> {
+    if !model.contains('/') && !model.starts_with("claude-") {
+        return None;
+    }
+    crate::runtime::openai::resolve_route(model)
+}
+
 /// The process-global HTTP client for `EngineHost` (same builder as
 /// `Runtime::new`).
 /// The host's HTTP client builder (also used by the attach-TUI client, A4).
@@ -869,9 +932,11 @@ fn fresh_host_parts() -> Result<crate::host::HostParts> {
     let _ = trace::sweep_expired_captures(&capture_dir);
     // Same for tool-output spill dirs past their age (bound here too).
     let spill_root = sweep_spill_root();
+    let (tools, tools_changes) = ToolRegistry::new().into_shared();
     Ok(crate::host::HostParts {
         client,
-        tools: Arc::new(RwLock::new(ToolRegistry::new())),
+        tools,
+        tools_changes,
         hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
         credential_source: crate::auth::CredentialSource::Local,
         token_cache: crate::auth::TokenCache::new(),
@@ -963,6 +1028,7 @@ impl Runtime {
             })),
             model: crate::models::default_model().to_string(),
             tools: host.tools,
+            tools_changes: host.tools_changes,
             system_prompt: None,
             effective_prompt: None,
             prompt_generation: 0,
@@ -1077,9 +1143,11 @@ impl Runtime {
     pub fn new_headless() -> Self {
         let client = build_http_client(HTTP_READ_TIMEOUT)
             .expect("reqwest client construction is infallible with built-in roots");
+        let (tools, tools_changes) = ToolRegistry::new().into_shared();
         let host = crate::host::HostParts {
             client,
-            tools: Arc::new(RwLock::new(ToolRegistry::new())),
+            tools,
+            tools_changes,
             hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
             credential_source: crate::auth::CredentialSource::Local,
             token_cache: crate::auth::TokenCache::new(),
@@ -1548,7 +1616,7 @@ impl Runtime {
     }
 
     pub fn set_tools(&mut self, tools: ToolRegistry) {
-        self.tools = Arc::new(RwLock::new(tools));
+        (self.tools, self.tools_changes) = tools.into_shared();
     }
 
     pub fn subagent_registry(&self) -> &Arc<Mutex<crate::runtime::subagent::SubagentRegistry>> {
@@ -2188,7 +2256,8 @@ impl Runtime {
     }
 
     /// Number of times the remote-summarization transport seam was entered
-    /// (CP-12 M3). Local-only compaction must leave this at zero.
+    /// (CP-12 M3): once per compaction that went remote, however many
+    /// requests it took. Local-only compaction must leave this at zero.
     pub fn remote_summarization_attempts(&self) -> u64 {
         self.remote_summarization_attempts
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -2212,14 +2281,140 @@ impl Runtime {
         self.context_window_override
     }
 
-    /// Effective context window for the current model — user override if set,
-    /// otherwise the model's native window from `models::context_window_for_model`.
+    /// `compaction_model` as the session shows it: `match` when unset or
+    /// empty, else the word (`provider-small`) or the model id as written.
+    /// Never a model nobody configured.
     pub fn compaction_model(&self) -> &str {
-        self.compaction_model
-            .as_deref()
-            .unwrap_or("claude-sonnet-4-6")
+        match self.compaction_model.as_deref().map(str::trim) {
+            None | Some("") => agent_core::config::COMPACTION_MODEL_MATCH,
+            Some(value) => value,
+        }
     }
 
+    /// The model `compaction_model` names for summaries of a chat on `own`:
+    /// `None` under `match` (the chat's own model writes them), under
+    /// `provider-small` for a provider without a pin, and when the model
+    /// named is `own` itself. A pin keeps the chat's provider and the form
+    /// of its id (`anthropic/claude-x` gets `anthropic/claude-haiku-5-5`).
+    fn compaction_policy_model(&self, own: &str) -> Option<String> {
+        use agent_core::config::{COMPACTION_MODEL_MATCH, COMPACTION_MODEL_PROVIDER_SMALL};
+        let model = match self.compaction_model() {
+            COMPACTION_MODEL_MATCH => return None,
+            COMPACTION_MODEL_PROVIDER_SMALL => {
+                let pin = provider_small_model(own)?;
+                match own.split_once('/') {
+                    Some((prefix, _)) => format!("{prefix}/{pin}"),
+                    None => pin.to_owned(),
+                }
+            }
+            named => named.to_owned(),
+        };
+        let same = model == own
+            || matches!(
+                (known_model_route(&model), known_model_route(own)),
+                (Some(a), Some(b)) if a == b
+            );
+        (!same).then_some(model)
+    }
+
+    /// The model `/compact` and auto-compaction summarize with, and the
+    /// notice (said in the compaction disclosure line) when the model
+    /// `compaction_model` names can't be used: that model when it is
+    /// usable, else the chat's own model, as under `match`. A summary goes
+    /// to another provider only when `compaction_model` names a model there.
+    pub fn compact_model_choice(&self) -> (String, Option<String>) {
+        let Some(model) = self.compaction_policy_model(&self.model) else {
+            return (self.model.clone(), None);
+        };
+        match self.compact_model_unusable(&model) {
+            None => (model, None),
+            Some(reason) => (
+                self.model.clone(),
+                Some(format!(
+                    "The summary model {model} can't be used ({reason}); the chat's own model wrote this summary."
+                )),
+            ),
+        }
+    }
+
+    /// Why `model` can't write a compaction summary for this chat: no known
+    /// route, a reasoning level its provider refuses for it, a context
+    /// window smaller than the chat's, or no credential for its provider.
+    /// All decided locally, before anything is sent.
+    fn compact_model_unusable(&self, model: &str) -> Option<&'static str> {
+        let Some(route) = known_model_route(model) else {
+            return Some("no provider route is known for it");
+        };
+        if self.compact_level_refused(model) {
+            return Some("its provider refuses the chat's reasoning level for it");
+        }
+        if crate::models::context_window_for_model(model) < self.context_window() {
+            return Some("its context window is smaller than the chat's");
+        }
+        if self.compact_credentials_missing(&route) {
+            return Some("no credential is configured for its provider");
+        }
+        None
+    }
+
+    /// Whether `model`'s provider refuses this chat's reasoning level for
+    /// it, decided from the capability rows as the request's preflight
+    /// ([`Self::validate_request_preflight_for`]) decides it: a Codex
+    /// model's execution plan, else `validate_reasoning_mutation`, which
+    /// covers Anthropic's Max, Ultra and UltraCode rows (bare and
+    /// `anthropic/` ids alike). Only the orchestration prerequisites of
+    /// UltraCode and Codex Ultra are left to the request.
+    fn compact_level_refused(&self, model: &str) -> bool {
+        use crate::runtime::openai::catalog;
+        let level = self.reasoning_level();
+        if model.starts_with("openai-codex/") {
+            catalog::plan_codex_execution(model, level, catalog::CodexRequestRole::Internal, None)
+                .is_err()
+        } else {
+            catalog::validation::validate_reasoning_mutation(model, level).is_err()
+        }
+    }
+
+    /// True only when the route's credential is known to be missing. A
+    /// remote broker owns credentials this process can't inspect: never
+    /// missing.
+    fn compact_credentials_missing(&self, route: &crate::runtime::openai::ResolvedRoute) -> bool {
+        use crate::auth::broker;
+        use crate::auth::OAuthProviderId;
+        if self.credential_source.is_remote() {
+            return false;
+        }
+        match route.auth {
+            crate::runtime::openai::AuthPolicy::OAuthAccessToken(OAuthProviderId::Anthropic) => {
+                let in_memory = self.auth.try_read().map_or(true, |auth| {
+                    auth.auth_type != "none"
+                        && (auth.auth_type != "oauth" || !auth.auth_token.is_empty())
+                });
+                !in_memory && !broker::anthropic_credential_available()
+            }
+            crate::runtime::openai::AuthPolicy::OAuthAccessToken(provider) => {
+                !broker::oauth_provider_logged_in(provider)
+            }
+            crate::runtime::openai::AuthPolicy::BrokerProxy => {
+                let oauth = match route.provider.as_str() {
+                    "github-copilot" => Some(OAuthProviderId::GitHubCopilot),
+                    "kimi-code" => Some(OAuthProviderId::KimiCode),
+                    "muse" => Some(OAuthProviderId::Muse),
+                    _ => None,
+                };
+                match oauth {
+                    Some(provider) => {
+                        !broker::oauth_provider_logged_in(provider)
+                            && !broker::static_key_configured(&route.provider)
+                    }
+                    None => !broker::static_key_configured(&route.provider),
+                }
+            }
+        }
+    }
+
+    /// Effective context window for the current model — user override if set,
+    /// otherwise the model's native window from `models::context_window_for_model`.
     pub fn context_window(&self) -> u64 {
         self.context_window_override
             .unwrap_or_else(|| crate::models::context_window_for_model(&self.model))
@@ -2950,6 +3145,26 @@ impl Runtime {
         self.cache_ttl.resolve_for_auth_type(&auth.auth_type)
     }
 
+    /// What a `CacheExpiry` capture compares at completion: the tool
+    /// registry's and the session injection's change counters, and which
+    /// registry this runtime reads (lock-free; v3.1 §2).
+    pub fn request_input_generations(&self) -> (usize, u64, u64) {
+        (
+            Arc::as_ptr(&self.tools) as *const () as usize,
+            self.tools_changes
+                .load(std::sync::atomic::Ordering::Acquire),
+            self.hook_bus.injection_generation(),
+        )
+    }
+
+    /// The context head's save is unresolved: no request may be built.
+    pub fn context_head_unresolved(&self) -> bool {
+        self.continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durability_blocked
+    }
+
     /// Thread a parent runtime's TTL atomics onto this (cloned) runtime so
     /// that a driver-owned turn shares the session's single downgrade latch
     /// instead of firing a redundant 1h→5m notice.
@@ -3087,17 +3302,50 @@ impl Runtime {
         .await
     }
 
-    /// Make a simple non-streaming API call for compaction (no tools).
+    /// Make a simple non-streaming API call for compaction (no tools) on
+    /// `model`, the one [`Self::compact_model_choice`] picked.
     ///
     /// Uses a dedicated summarization system prompt (not the user's), omits
     /// all tools, and returns the raw text response. Caller supplies the
     /// full message array including the serialized conversation.
-    pub async fn compact_call(&self, messages: Vec<crate::SharedMessage>) -> Result<String> {
-        // Transport-construction seam: counted BEFORE preflight, auth
-        // refresh, or any request assembly (CP-12 M3).
+    pub async fn compact_call(
+        &self,
+        model: &str,
+        messages: Vec<crate::SharedMessage>,
+    ) -> Result<String> {
+        self.enter_remote_summarization();
+        self.transcript_summary_call(model, messages, None).await
+    }
+
+    /// The remote-summarization seam (CP-12 M3): counted BEFORE preflight,
+    /// auth refresh, or any request assembly. Entered once per remote
+    /// compaction, whichever request then carries it (the chat's own next
+    /// request, the transcript request, or the first and then the second):
+    /// `remote_summarization_attempts` counts compactions that went
+    /// remote, not HTTP requests.
+    pub(super) fn enter_remote_summarization(&self) {
         self.remote_summarization_attempts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let model = self.compaction_model();
+    }
+
+    /// [`Self::compact_call`] behind the seam: the caller has entered it
+    /// ([`Self::enter_remote_summarization`]). What the request was billed
+    /// is booked into `spend`, when the caller has a session to book it to.
+    pub(super) async fn transcript_summary_call(
+        &self,
+        model: &str,
+        messages: Vec<crate::SharedMessage>,
+        spend: Option<&compaction::CompactionSpend>,
+    ) -> Result<String> {
+        #[cfg(test)]
+        if let Some(reply) = SCRIPTED_SUMMARY_REQUESTS.with(|script| {
+            let mut script = script.borrow_mut();
+            let script = script.as_mut()?;
+            script.requested.push(model.to_string());
+            (script.reply)(model)
+        }) {
+            return reply;
+        }
         self.validate_request_preflight_for(
             model,
             crate::runtime::openai::catalog::CodexRequestRole::Internal,
@@ -3123,10 +3371,16 @@ impl Runtime {
             // must not consume a user's one-shot `/trace next` arm.
             &api::ApiOptions {
                 trace: self.trace_ctx.clone(),
-                telemetry: self.telemetry_writer.clone(),
+                // The session's handle: the api-log record of this request
+                // carries the conversation id, like a turn's.
+                telemetry: self.request_telemetry(),
                 // The largest body Synaps sends: the whole transcript.
                 request_compression: self.request_compression.clone(),
                 ..api::ApiOptions::default()
+            },
+            api_sync::SimpleCallReport {
+                telemetry_level: self.telemetry_level,
+                spend,
             },
         )
         .await
@@ -3323,6 +3577,7 @@ impl Runtime {
             // schedules from.
             cache_anchor: Some(self.cache_anchor.clone()),
             keepwarm: None,
+            compaction: None,
             // The foreground chain: the only requests that thread
             // `diagnostics.previous_message_id`.
             cache_diagnosis: self.cache_diagnosis(),
@@ -3423,6 +3678,7 @@ impl Clone for Runtime {
             auth: Arc::clone(&self.auth),
             model: self.model.clone(),
             tools: self.tools.clone(),
+            tools_changes: Arc::clone(&self.tools_changes),
             system_prompt: self.system_prompt.clone(),
             effective_prompt: self.effective_prompt.clone(),
             prompt_generation: self.prompt_generation,
@@ -4341,6 +4597,28 @@ mod tests {
             result,
             crate::extensions::hooks::events::HookResult::Continue
         ));
+    }
+
+    /// Allow all with no session latch (no scope): this call only.
+    #[tokio::test]
+    async fn confirm_prompt_allow_all_without_a_latch_allows_this_call() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let request = rx.recv().await.expect("confirm prompt request");
+            assert_eq!(request.policy, crate::session::PromptPolicy::Confirm(crate::session::ConfirmGate::ToolCall));
+            assert!(request.confirm_scope.is_none(), "no latch, no Allow all offered");
+            let _ = request.response_tx.send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
+        });
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
+            Some(&handle),
+            false,
+            None,
+        )
+        .await;
+        task.await.unwrap();
+        assert!(matches!(result, crate::extensions::hooks::events::HookResult::Continue));
     }
 
     #[tokio::test]
@@ -5707,8 +5985,7 @@ mod codex_execution_preflight_tests {
 
     #[tokio::test]
     async fn compaction_preflight_validates_target_before_credentials() {
-        let mut runtime = ultra_runtime();
-        runtime.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
+        let runtime = ultra_runtime();
         {
             let mut auth = runtime.auth.write().await;
             auth.auth_token.clear();
@@ -5718,12 +5995,33 @@ mod codex_execution_preflight_tests {
         }
 
         let error = runtime
-            .compact_call(Vec::new())
+            .compact_call("claude-sonnet-4-6", Vec::new())
             .await
             .expect_err("Codex Ultra cannot silently cross into Anthropic compaction");
         assert!(
             error.to_string().contains("authoritative exact-model"),
             "preflight must reject the target before auth access: {error}"
+        );
+    }
+
+    /// A named compaction model the chat's reasoning level can't be sent to
+    /// (Ultra on Anthropic) is not chosen: the chat's own model writes the
+    /// summary, and the disclosure says why. Decided before any credential
+    /// or network access.
+    #[test]
+    fn compaction_at_a_level_the_named_model_refuses_uses_the_chats_own_model() {
+        let mut runtime = ultra_runtime();
+        assert_eq!(runtime.compaction_model(), "match");
+        assert_eq!(
+            runtime.compact_model_choice(),
+            ("openai-codex/gpt-5.6-sol".to_string(), None)
+        );
+        runtime.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
+        let (model, notice) = runtime.compact_model_choice();
+        assert_eq!(model, "openai-codex/gpt-5.6-sol");
+        assert_eq!(
+            notice.as_deref(),
+            Some("The summary model claude-sonnet-4-6 can't be used (its provider refuses the chat's reasoning level for it); the chat's own model wrote this summary.")
         );
     }
 }

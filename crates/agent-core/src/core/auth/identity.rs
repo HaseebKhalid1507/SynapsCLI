@@ -95,7 +95,6 @@ pub async fn resolve_seat(
         }
         OAuthProviderId::Xai
         | OAuthProviderId::GitHubCopilot
-        | OAuthProviderId::GoogleGemini
         | OAuthProviderId::KimiCode
         | OAuthProviderId::Muse => SeatResolution::Unsupported,
     }
@@ -123,7 +122,6 @@ mod tests {
         for p in [
             OAuthProviderId::Xai,
             OAuthProviderId::GitHubCopilot,
-            OAuthProviderId::GoogleGemini,
             OAuthProviderId::KimiCode,
             OAuthProviderId::Muse,
         ] {
@@ -186,7 +184,6 @@ mod tests {
         for p in [
             OAuthProviderId::Xai,
             OAuthProviderId::GitHubCopilot,
-            OAuthProviderId::GoogleGemini,
             OAuthProviderId::KimiCode,
         ] {
             assert_eq!(

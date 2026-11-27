@@ -10,8 +10,8 @@ use tokio::sync::broadcast;
 
 use super::handle::SessionHandle;
 use super::types::{
-    AttachMode, AttachSnapshot, ClientId, ClientInput, ClientMeta, Envelope, Roster, SessionCommand,
-    SessionEventWire, SessionId, SessionMeta,
+    deliver, AttachMode, AttachSnapshot, ClientId, ClientInput, ClientMeta, Envelope, Roster,
+    SessionCommand, SessionEventWire, SessionId, SessionMeta, Subscriber,
 };
 use super::view::RuntimeView;
 
@@ -58,7 +58,12 @@ pub enum TransportError {
 pub trait ClientTransport: Send {
     fn session_id(&self) -> &SessionId;
     fn meta(&self) -> &SessionMeta;
-    /// Host-originated send (`from: None`; bypasses input ownership).
+    /// Send as this attachment: the command is stamped with its client id,
+    /// so input ownership applies (B1) and replies come back to it alone.
+    /// Over a socket the daemon stamps every frame; `LocalTransport` stamps
+    /// its attachment (≡ [`Self::send_from_self`]). A host action that must
+    /// bypass ownership uses `SessionHandle::send` and a host subscriber
+    /// (its replies never reach an attachment).
     async fn send(&self, cmd: SessionCommand) -> Result<(), TransportError>;
     /// Send stamped with this client's id (the TUI uses this; ownership is
     /// enforced by the actor, B1).
@@ -110,6 +115,14 @@ pub trait ClientTransport: Send {
     /// connections (session list, pin, close) to the same daemon.
     fn socket_path(&self) -> Option<&std::path::Path> {
         None
+    }
+    /// Whether replies reach only the client that asked (`Welcome.features`
+    /// lists [`addressed_replies`](super::wire::FEATURE_ADDRESSED_REPLIES)).
+    /// An older daemon broadcasts every reply, so a client that can tell
+    /// keeps its request ids apart from other clients' (`SessionLink` draws
+    /// them from a random base). Always `true` in-process (same build).
+    fn addressed_replies(&self) -> bool {
+        true
     }
 }
 
@@ -298,8 +311,11 @@ impl ClientTransport for LocalTransport {
         &self.meta
     }
 
+    /// Stamped with this attachment, like a socket client's frames: its
+    /// replies come back here and ownership applies. A host action goes
+    /// through [`LocalTransport::handle`]`.send()`.
     async fn send(&self, cmd: SessionCommand) -> Result<(), TransportError> {
-        self.handle.send(cmd).await
+        self.handle.send_from(self.client, cmd).await
     }
 
     async fn send_from_self(&self, cmd: SessionCommand) -> Result<(), TransportError> {
@@ -312,17 +328,28 @@ impl ClientTransport for LocalTransport {
         }
         // The handle itself holds a broadcast sender, so `Closed` never
         // fires on its own: end-of-stream is `Ended` or the actor going away
-        // (drain what it left behind first).
-        let recv = tokio::select! {
-            biased;
-            r = self.rx.recv() => r,
-            _ = self.handle.closed() => match self.rx.try_recv() {
-                Ok(env) => Ok(env),
-                Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    Err(broadcast::error::RecvError::Lagged(n))
-                }
-                Err(_) => Err(broadcast::error::RecvError::Closed),
-            },
+        // (drain what it left behind first). Another attachment's reply, or
+        // the host's, is not ours: skip it; a shared reply arrives projected
+        // for this attachment.
+        let recv = loop {
+            let recv = tokio::select! {
+                biased;
+                r = self.rx.recv() => r,
+                _ = self.handle.closed() => match self.rx.try_recv() {
+                    Ok(env) => Ok(env),
+                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        Err(broadcast::error::RecvError::Lagged(n))
+                    }
+                    Err(_) => Err(broadcast::error::RecvError::Closed),
+                },
+            };
+            match recv {
+                Ok(env) => match deliver(env, Subscriber::Attachment(self.client)) {
+                    Some(env) => break Ok(env),
+                    None => continue,
+                },
+                Err(e) => break Err(e),
+            }
         };
         match recv {
             Ok(env) => {
@@ -336,14 +363,12 @@ impl ClientTransport for LocalTransport {
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 // server.rs Lagged pattern: warn, tell the client once, keep going.
                 tracing::warn!(session = %self.handle.id, dropped = n, "session event stream lagged");
-                Some(Envelope {
-                    session_id: self.handle.id.clone(),
-                    seq: u64::MAX,
-                    ts: chrono::Utc::now(),
-                    event: SessionEventWire::SystemNotice(format!(
-                        "event stream lagged; {n} dropped"
-                    )),
-                })
+                Some(Envelope::new(
+                    self.handle.id.clone(),
+                    u64::MAX,
+                    chrono::Utc::now(),
+                    SessionEventWire::SystemNotice(format!("event stream lagged; {n} dropped")),
+                ))
             }
             Err(broadcast::error::RecvError::Closed) => {
                 self.ended = true;

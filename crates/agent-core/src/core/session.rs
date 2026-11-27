@@ -965,6 +965,7 @@ mod tests {
             excluded_classes: Vec::new(),
             redaction_policy: crate::compaction::RedactionPolicy::TruncationOnly,
             prior_system_prompt: parent.system_prompt.clone(),
+            summary_request: None,
         }
     }
 

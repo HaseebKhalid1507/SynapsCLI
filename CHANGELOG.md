@@ -6,6 +6,37 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A resolved prompt says what was applied, and a late answer is refused.**
+  `PromptResolved` carries `outcome`: `allowed` (the gate opened),
+  `denied`, `answered` (a Secret's value), `cancelled` (the turn or session
+  ended first, or the waiting call was gone) or `timed_out` (nobody attached
+  by the abandonment deadline). A client no longer guesses from the tool's
+  result text, where a cancel at the gate reads like a denial. An `Answer`
+  to a prompt that is no longer pending gets `AnswerRefused{prompt_id,
+  outcome}`, to its sender only, instead of being dropped silently; the TUI
+  shows it as a toast and never takes it for a setting's reply. Each prompt
+  is raised for a gate (`SecretPromptHandle::confirm_tool_call`,
+  `confirm_activation`, `secret`), and one function reads an answer for it:
+  Allow all opens the tool-call gate and denies at the activation gate, as
+  each gate always did. Answers the policy refuses (an observer's, Allow all
+  from a non-owner) are the same `Refused{command: "answer"}` as before.
+  Feature `prompt_outcome`. Additive on the wire: older daemons omit the
+  field, older clients ignore it and read `AnswerRefused` as an unknown
+  event, and an outcome a client doesn't know reads as `unknown`.
+
+- **What a session's prompt cache looks like, from its own requests.**
+  `SessionQuery::CacheExpiry` (daemon feature `cache_expiry`) answers
+  `warm` (with about how long the last accepted request's entry has left),
+  `unknown{may_have_expired}` (until this session's last possible refresh
+  ends), `cold{expired|uncached}`, or `unknown` with a reason (`parked`,
+  `busy`, `no_matching_request`, …). It reads the session's cache anchor,
+  the record keep-warm and cache-preserving compaction read: the last
+  accepted request, its cache identity and messages, the cache usage the
+  provider reported for it, and the latest send. It is not provider state.
+  Errors are typed (`busy`, `timeout`, `superseded`, `stale`).
+  `/keepwarm status` shows the line. See daemon-mode.md, "Prompt-cache
+  evidence".
+
 - **Workers report what they used.** `subagent_status`, `subagent_collect`
   and a worker's completion event (`data.usage`) carry `usage`: provider
   requests (the worker's keep-warm pings included), input / output /
@@ -152,7 +183,180 @@ All notable changes to this project will be documented in this file.
   optional key, counted over the stored blocks).
   Migration: `docs/extensions/protocol.md` §`inject`.
 
+- **`compaction_model` chooses who writes compaction summaries.** `match`
+  (also unset or empty, the default) has the chat's own model write
+  `/compact` and auto-compaction summaries; `provider-small` uses the small
+  model pinned for the chat's provider on the chat's own account
+  (`claude-haiku-5-5` for Anthropic, the chat's own model elsewhere,
+  OpenAI Codex included); a model id names any routable model. A
+  summary goes to another provider only when a model there is named. A
+  named or pinned model that can't be used (no route, a reasoning level its
+  provider refuses, a smaller context window than the chat's, no
+  credential) gives way to the chat's own model, and the compaction line
+  says so. The `claude-sonnet-4-6` default and fallback are gone; any other
+  value warns at load and is `match`. Haiku 5.5 and GPT-6-Luna join the
+  known models.
+
+### Removed
+
+- **The Gemini Code Assist sign-in (`google-gemini`) is removed.** It
+  was built on Gemini CLI's internal Code Assist API and sign-in flow,
+  which Google's terms do not permit third-party tools to use. `synaps login --provider google-gemini`
+  (or `gemini`, `gemini-cli`, `gemini-code-assist`) now refuses and names
+  the replacement: a Google AI Studio API key,
+  `synaps login --provider google`, then a `google/...` model.
+  `google-gemini/...` models no longer route, and the
+  `SYNAPS_GOOGLE_GEMINI_CLIENT_ID` / `_SECRET` variables are no longer
+  read. A saved `google-gemini` sign-in is dropped from `auth.json` when
+  synaps starts, by name and without reading its value, with one log line,
+  "removed saved google-gemini sign-in". AI Studio keys and Vertex are
+  unchanged.
+
 ### Fixed
+
+- **Daemon replies reach only the client that asked** (`Welcome.features`:
+  `addressed_replies`). Every client numbers its own requests, so two
+  clients attached to one session both send request 5, and the daemon used
+  to broadcast every reply: each client could take the other's `Query`,
+  `Set`, `Resume` or command reply for its own. Now a `QueryResult` goes to
+  the attachment that asked (a daemon-internal one to nobody), and a
+  `SettingChanged`/`Resumed` still reaches every client but carries the
+  view-only id `VIEW_CHANGED_SETTING_ID` for all but the asker. The wire is
+  unchanged: an older client simply stops receiving replies that were never
+  its own. Against an older daemon (replies still broadcast) the TUI draws
+  its request ids from a random base, which makes an accidental collision
+  highly unlikely. In process, `LocalTransport::send` now sends as its
+  attachment, like a socket client (input ownership applies, replies come
+  back to it); `synaps chat` numbers its post-compaction readout like its
+  other requests. `docs/daemon-mode.md` gains "Negotiation" and "Request ids
+  and replies", and `docs/STABILITY.md` a daemon-protocol section (§5).
+
+- **A tool that loads while a session is idle no longer ends its keep-warm.**
+  With deferred tool loading, a tool registered mid-session (e.g. an
+  extension installed live) joins the `defer_loading` list, which is not part
+  of the cached prefix. The keep-warm check still hashed that list, so the
+  next ping saw a "changed" prefix, ended the period with
+  `reason=prefix changed` and let the cache expire; the next turn wrote the
+  whole context again (over 200k tokens per session). The check now covers
+  exactly the cached bytes: the loaded tools with their cache marker, not the
+  deferred definitions. A tool that joins the loaded tools (e.g. one listed in
+  `tools.always_loaded`, or any tool without deferred loading) still ends the
+  period, as it changes what is cached.
+
+- **Compaction reads the history from the prompt cache instead of paying
+  for it again.** `/compact` and auto-compaction sent a request of their
+  own: a different system prompt, no tools, no cache markers and the whole
+  transcript in one user message. None of it matched what the chat had
+  cached, so the provider billed the entire history as fresh input and
+  counted it against the per-minute input limit. An Opus session at about
+  400K tokens sent one 1.6 MB request and got HTTP 429 on all 27 attempts,
+  while its own turns, larger but cached, went through. On Anthropic the
+  summary request is now the chat's own next request (same system prompt,
+  tools, thinking, effort and messages) with one more user message that
+  asks for the summary, so the history is a cache read: about a twentieth
+  to a tenth of the input price, and not counted against the per-minute
+  limit. The cache marker stays on the last message of the history, so the
+  one-off instructions are not written to the cache.
+  It is used when all of this holds: the chat's own model writes the
+  summary; `compaction_exclude` is empty; the request fits the context
+  window; the cache is known to be warm (a request or keep-warm ping within
+  the cache TTL, with the same model, effort, thinking, system prompt,
+  tools and account); and the history starts with exactly the messages
+  that last request sent, so `/resume` followed by `/compact` does not send
+  the resumed history as a full cache write. Two model-specific cases keep
+  the transcript request: models other than Opus 4.5 and later, Sonnet 4.6
+  and later, Haiku 5.5, Fable and Mythos drop earlier thinking blocks (and
+  the cached messages after them) when a user message is added, so for them
+  it is used only when the history has no thinking blocks; and on Haiku
+  5.5, which bills a prompt of over 100,000 tokens at its long-context
+  rate, it is not used when the full history is over that size and the
+  transcript is not. Otherwise the transcript request is sent as before:
+  with a cold cache it is the cheaper one, since writing the full history
+  to the cache costs 1.25 to 2 times the input price and the transcript
+  request truncates tool results and thinking.
+  The tools stay in the request (removing them would invalidate the
+  cache); if the model answers with a tool call, nothing runs. The request
+  is not retried: on a 429, a 5xx, a network or stream error, a tool call
+  or an empty reply, the transcript request is sent instead, with its usual
+  retries, and a failed attempt leaves the conversation as it was. Three
+  immediate resends remain, none of which waits: after a 401, with a
+  refreshed token for the same account (if the refresh comes back with
+  another account's token, the request is not re-sent there and the
+  transcript request is sent instead);
+  uncompressed, after a refused gzip body; and without the cache-diagnosis
+  header, after that header is refused. The line shown before a
+  compaction says which request goes out ("sending the
+  conversation as the chat sends it (N messages, ~T tokens, read from
+  cache) ... if that fails, a ~K KB transcript"), and the compaction sends
+  what the line said: the request is chosen once, for the line. Before, it
+  was chosen again when the compaction started, so a keep-warm ping landing
+  in between could send the full history under a line that said
+  "transcript". A line that names the chat request is still checked again
+  before anything is sent, and falls back to the transcript it names. The
+  saved compaction record names the request that wrote the summary
+  (`summary_request`: `chat_request` or `transcript`), and for a chat
+  request its prompt-stack
+  digest covers the system blocks, tools and instructions as sent; the
+  history went out untruncated then. A chat request that wrote more to the
+  cache than it read logs a warning with both numbers and tells the user
+  after the line above: "compaction: the summary request missed the cache
+  (wrote N, read M tokens)".
+  A compaction's own usage now counts: every summary request whose usage
+  the provider reported is added to the session's token totals and cost,
+  once, like a turn's usage. That includes a chat request whose reply was
+  not used (a tool call, an empty reply) together with the transcript
+  request sent after it, and what a chat request had reported when the
+  compaction was cancelled (Cancel stops the request as a turn is stopped,
+  waits at most two seconds for the compaction to end, then at most two
+  more for the save). A transcript request cancelled mid-flight books
+  nothing: it is not streamed, and the cancel drops it before any usage
+  arrives.
+  When compaction starts a successor session, the spend is saved
+  with the session that was summarized and the successor starts at zero,
+  as before; a compaction that failed or was cancelled saves the session
+  with its new totals and the history it had. `synaps rpc` adds the
+  tokens to its totals and saves them also when compaction fails (it does
+  not price usage, for turns either).
+  In the api-log both summary requests have `"compaction": true` and a
+  `summary_request` field, `chat_request` or `transcript`, the same words
+  as the saved compaction record. The transcript request wrote no api-log
+  record before; it now writes one per accepted request at the same
+  telemetry levels, with model, thinking and effort as sent, attempt,
+  total time, stop reason, usage, cost, rate-limit headers (`full`) and
+  context. It has no `ttft_ms` (the request does not stream). On the chat
+  request `usage.cache_read` is the history. Other providers are
+  unchanged, and their requests are still not in the api-log.
+  Known, not changed: when both requests fail, the keep-warm period
+  that ended for the compaction is not restored (the next turn
+  starts one); and a 1h-to-5m cache downgrade first seen by the compaction
+  request may not show its notice.
+- **A compaction request larger than the account's per-minute input limit
+  fails at once.** A 429 was retried eight times whatever the cause. When
+  the response states the limit (`anthropic-ratelimit-input-tokens-limit`,
+  sent to API keys) and the request is certainly larger, no wait can make
+  room for it: it now stops after the first attempt and says so, with the
+  two sizes. A 429 without that header, as on a subscription login, keeps
+  its retries.
+
+- **OpenAI, Gemini, Grok, Groq and Kimi models cost their own list price.**
+  Every model the pricing table didn't know was billed at Sonnet's $3 / $15
+  per million tokens, with Anthropic's 0.1× cache-read rate. Synaps's own
+  table now has the provider's input, output and cached-input price for the
+  models it offers (Codex and Copilot models at the OpenAI API price of the
+  same model), and the long-context tier where the provider has one (GPT
+  over 272k, Gemini Pro over 200k, Grok from 200k prompt tokens). Claude
+  prices are unchanged, and a model with no published price still falls
+  back to Sonnet's. No new dependency.
+
+- **A worker resumed cold many times keeps one copy of its task.** A cold
+  resume (the worker's cache had expired, so it gets a summary instead of a
+  replay) took "your original task" from the worker's first message, which
+  after one cold resume is the previous summary. Each further resume wrapped
+  the whole earlier summary inside the task again, so a worker resumed five
+  or ten times carried every earlier summary, nested. The task is now read
+  out of the earlier summary, so it appears once however often the worker is
+  resumed, and the previous resume's instructions stay in the summary's
+  recent steps. Archives that are already nested are unwrapped the same way.
 
 - **Sign-in opens the whole page on Windows.** The browser was started
   through `cmd /c start <url>`, and `cmd` ends a command at the first `&`:

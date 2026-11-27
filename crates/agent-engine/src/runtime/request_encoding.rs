@@ -775,6 +775,7 @@ mod transport_tests {
                 &near,
                 0,
                 &opts,
+                Default::default(),
             )
             .await
             .expect("compaction");
@@ -814,6 +815,7 @@ mod transport_tests {
         .expect("stream");
         ApiMethods::call_api_simple(
             &auth(), &reqwest::Client::new(), model, "summarize", 0, level, &messages(), 0, &opts,
+            Default::default(),
         )
         .await
         .expect("compaction");
@@ -836,6 +838,7 @@ mod transport_tests {
             &messages(),
             0,
             &options(&url, c.clone()),
+            Default::default(),
         )
         .await
         .expect("compaction survives the refusal");

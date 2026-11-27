@@ -28,7 +28,8 @@ use synaps_cli::core::session_journal::{
     journal_path, load_session_in_dir, save_session_in_dir, SaveMode, SessionPersistence,
 };
 use synaps_cli::runtime::compaction::{
-    apply_compaction, compact_conversation, CompactionPolicy, CompactionTransition,
+    apply_compaction, compact_conversation, preview_compaction_request, CompactionPolicy,
+    CompactionTransition,
 };
 use synaps_cli::runtime::context::{
     assess, conservative_token_estimate, ContextBudgetInputs, MIN_COMPACTION_MESSAGES,
@@ -77,6 +78,17 @@ fn history() -> Vec<SharedMessage> {
         msg("user", "also keep the chains protected"),
         msg("assistant", "chain heads resolve first and fail closed"),
     ]
+}
+
+/// Preview, then dispatch what the preview named, as every frontend does.
+async fn compact_as_previewed(
+    messages: &[SharedMessage],
+    runtime: &Runtime,
+) -> synaps_cli::Result<synaps_cli::runtime::compaction::CompactionOutcome> {
+    let dispatch = preview_compaction_request(runtime, messages, None)
+        .await
+        .dispatch();
+    compact_conversation(messages, runtime, None, &dispatch).await
 }
 
 fn transition(policy: CompactionPolicy) -> CompactionTransition {
@@ -131,7 +143,7 @@ async fn s9_1_transition_entry_is_typed_counted_and_sole_producer() {
 
     // Summarization WITHOUT a transition must not count as one.
     let before_summarize = transitions_applied();
-    let outcome = compact_conversation(&history(), &runtime, None)
+    let outcome = compact_as_previewed(&history(), &runtime)
         .await
         .expect("local-only summarization");
     assert_eq!(
@@ -211,7 +223,7 @@ async fn s9_1_linked_and_inplace_policies_produce_equivalent_logical_history() {
 
     // One canonical outcome (the same engine summarization op every
     // frontend calls) applied under both transition policies.
-    let outcome = compact_conversation(&history(), &runtime, None)
+    let outcome = compact_as_previewed(&history(), &runtime)
         .await
         .expect("local-only summarization");
 
@@ -443,7 +455,7 @@ async fn s9_3_local_only_compaction_performs_zero_network_operations() {
     let result = async {
         let mut runtime = Runtime::new().await.expect("runtime");
         runtime.set_compaction_mode(agent_core::compaction::CompactionMode::LocalOnly);
-        let outcome = compact_conversation(&history(), &runtime, None)
+        let outcome = compact_as_previewed(&history(), &runtime)
             .await
             .expect("local-only compaction must succeed offline");
         assert_eq!(outcome.summary_provider, "local");

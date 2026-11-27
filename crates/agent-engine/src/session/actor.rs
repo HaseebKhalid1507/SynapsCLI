@@ -35,7 +35,7 @@ use crate::engine::setup::BackgroundTasks;
 use crate::extensions::invoke_output::{invoke_event_channel, InvokeOutputBudget};
 use crate::extensions::session_driver::{self as protocol, Grant, Reply};
 use crate::runtime::compaction::{
-    apply_compaction, compact_conversation, preview_compaction_disclosure, CompactionPolicy,
+    apply_compaction, compact_conversation, preview_compaction_request, CompactionPolicy,
     CompactionTransition,
 };
 use crate::tools::{SecretPromptHandle, SecretPromptRequest};
@@ -54,6 +54,18 @@ pub type ActiveStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent
 
 /// `turn_replay` cap (envelopes). §6 #9: the 2 MiB text bound is day 3.
 const TURN_REPLAY_CAP: usize = 4096;
+
+/// How many closed prompts the actor remembers, so a late `Answer` is
+/// refused with what applied. Older ids are refused as not remembered.
+const RESOLVED_PROMPTS_KEPT: usize = 64;
+
+/// A raised prompt waiting for its answer: what the clients see, the
+/// policy it was raised with (never on the wire), and the waiting call.
+pub(crate) struct PendingPrompt {
+    pub(crate) req: PromptRequest,
+    pub(crate) policy: PromptPolicy,
+    pub(crate) tx: oneshot::Sender<Option<String>>,
+}
 
 /// The in-flight turn draft (`sessions/<id>.turn`, see
 /// `agent_core::core::session_draft`): what the actor last knew about the
@@ -354,6 +366,11 @@ pub(crate) struct CompactionJob {
     pub(crate) source: String,
     #[allow(dead_code)]
     pub(crate) started: tokio::time::Instant,
+    /// What the job's summary requests were billed, shared with the task
+    /// (`book_compaction` drains it when the job ends, however it ends).
+    pub(crate) spend: crate::runtime::compaction::CompactionSpend,
+    /// Cancels the job cooperatively (see `stop_compaction_task`).
+    pub(crate) cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Commands that only the input owner may send (B1). Everything else
@@ -491,7 +508,9 @@ fn is_rename_command(cmd: &SessionCommand) -> bool {
     matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND)
 }
 
-pub(crate) fn command_name(cmd: &SessionCommand) -> &'static str {
+/// The name a `Refused{command}` gives `cmd`, so a client can tell its
+/// request's refusal from another command's.
+pub fn command_name(cmd: &SessionCommand) -> &'static str {
     match cmd {
         SessionCommand::Submit { .. } => "submit",
         SessionCommand::SubmitPrepared { .. } => "submit_prepared",
@@ -599,8 +618,11 @@ pub struct SessionActor {
     pub(crate) secret_prompt_handle: SecretPromptHandle,
     pub(crate) secret_prompt_rx: mpsc::UnboundedReceiver<SecretPromptRequest>,
     /// Held across detach; replayed in `AttachSnapshot.pending_prompts`.
-    pub(crate) pending_prompts: VecDeque<(PromptRequest, oneshot::Sender<Option<String>>)>,
+    pub(crate) pending_prompts: VecDeque<PendingPrompt>,
     pub(crate) next_prompt_id: u64,
+    /// The last [`RESOLVED_PROMPTS_KEPT`] prompts closed and what each
+    /// applied, so a late `Answer` is refused with it.
+    pub(crate) resolved_prompts: VecDeque<(u64, PromptOutcome)>,
     // ── clients ──
     pub(crate) cmd_rx: mpsc::Receiver<Addressed>,
     pub(crate) events: broadcast::Sender<Envelope>,
@@ -683,6 +705,13 @@ pub struct SessionActor {
     /// handed to the runtime the unpark builds (and to a reload record
     /// written while parked). Empty while live.
     pub(crate) parked_tool_activations: Vec<crate::tools::activation::CarriedActivation>,
+    /// Advanced by every change a query job's inputs could miss: a view
+    /// publish (every `Set`, prompt reload, turn start), a history
+    /// replacement, a compaction applied, a driver armed or revoked, a
+    /// lifecycle change (`session::cache_expiry`).
+    pub(crate) prefix_rev: u64,
+    /// `CacheExpiry` jobs (`session::query`).
+    pub(crate) expiry_jobs: super::cache_expiry::ExpiryJobs,
 }
 
 /// A reload checkpoint wrote this session's reload record; until the
@@ -1018,6 +1047,7 @@ impl SessionActor {
             secret_prompt_rx,
             pending_prompts: VecDeque::new(),
             next_prompt_id: 1,
+            resolved_prompts: VecDeque::new(),
             cmd_rx,
             events,
             view,
@@ -1057,6 +1087,8 @@ impl SessionActor {
             reload_fence: None,
             owned,
             parked_tool_activations: Vec::new(),
+            prefix_rev: 0,
+            expiry_jobs: Default::default(),
         };
         if actor.keep_warm {
             actor.note_pin();
@@ -1125,18 +1157,69 @@ impl SessionActor {
 
     // ── emit ─────────────────────────────────────────────────────────────
 
-    /// The ONLY seq++ site. Pushes to `turn_replay` while streaming, except
-    /// prompt traffic (never replayed), per-client replies, and full-history
-    /// envelopes (`MessageHistory`, `Conversation`): the engine publishes one
-    /// per round, and an attaching client already gets the LATEST history in
-    /// its snapshot's `conversation` — replaying older ones would ship the
-    /// whole history once per round and roll its mirror back to a stale
-    /// state. The ring's `TurnStarted` drops `user_text`: that prompt is
-    /// already in the snapshot's history (a replayed copy would show it
-    /// twice). Completed rounds leave the ring when their checkpoint is
-    /// adopted (`trim_replay_to_checkpoint`).
+    /// Shared state for every subscriber ([`Audience::All`]). Never a
+    /// `QueryResult`: a reply goes to its asker ([`Self::reply`]).
     pub(crate) fn emit(&mut self, event: SessionEventWire) {
+        debug_assert!(
+            !matches!(event, SessionEventWire::QueryResult { .. }),
+            "a QueryResult is a reply: use reply(from, ..)"
+        );
+        self.emit_to(Audience::All, event);
+    }
+
+    /// A reply to `from`'s request: that attachment only
+    /// ([`Audience::Client`]), or the in-process host caller when `from`
+    /// is `None` ([`Audience::Host`]).
+    pub(crate) fn reply(&mut self, from: Option<ClientId>, event: SessionEventWire) {
+        self.emit_to(from.map_or(Audience::Host, Audience::Client), event);
+    }
+
+    /// Shared state that also answers `from`'s request (`SettingChanged`,
+    /// `Resumed`): everyone gets it, and only `from` sees its request id
+    /// ([`Audience::Shared`]). A host request's id is no attachment's, so
+    /// it goes out view-only ([`super::wire::VIEW_CHANGED_SETTING_ID`]) to everyone:
+    /// a host `Set{id: 5}` must never answer a client's request 5.
+    pub(crate) fn emit_shared(&mut self, from: Option<ClientId>, mut event: SessionEventWire) {
+        match from {
+            Some(c) => self.emit_to(Audience::Shared { reply_to: c }, event),
+            None => {
+                super::types::view_only(&mut event);
+                self.emit_to(Audience::All, event);
+            }
+        }
+    }
+
+    /// The ONLY seq++ site. Pushes to `turn_replay` while streaming, except
+    /// anything not for everyone (a reply, a shared reply: the ring is
+    /// replayed to clients that never asked), prompt traffic (never
+    /// replayed), and full-history envelopes (`MessageHistory`,
+    /// `Conversation`): the engine publishes one per round, and an
+    /// attaching client already gets the LATEST history in its snapshot's
+    /// `conversation` — replaying older ones would ship the whole history
+    /// once per round and roll its mirror back to a stale state. The ring's
+    /// `TurnStarted` drops `user_text`: that prompt is already in the
+    /// snapshot's history (a replayed copy would show it twice). Completed
+    /// rounds leave the ring when their checkpoint is adopted
+    /// (`trim_replay_to_checkpoint`). `seq` stays gapless per session; a
+    /// subscriber's stream may skip the seqs not addressed to it.
+    fn emit_to(&mut self, audience: Audience, event: SessionEventWire) {
+        if matches!(
+            event,
+            SessionEventWire::TurnStarted { .. }
+                | SessionEventWire::Conversation(_)
+                | SessionEventWire::SettingChanged(_)
+                | SessionEventWire::Cleared { .. }
+                | SessionEventWire::CompactionApplied { .. }
+                | SessionEventWire::Resumed { .. }
+                | SessionEventWire::Lifecycle(_)
+                | SessionEventWire::DriverArmed { .. }
+                | SessionEventWire::DriverRevoked { .. }
+                | SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
+        ) {
+            self.prefix_rev += 1;
+        }
         let replay = self.streaming
+            && audience == Audience::All
             && !matches!(
                 event,
                 SessionEventWire::Prompt(_)
@@ -1148,12 +1231,7 @@ impl SessionActor {
                         SessionEvent::MessageHistory(_)
                     ))
             );
-        let env = Envelope {
-            session_id: self.id.clone(),
-            seq: self.seq,
-            ts: chrono::Utc::now(),
-            event,
-        };
+        let env = Envelope::new(self.id.clone(), self.seq, chrono::Utc::now(), event).to(audience);
         self.seq += 1;
         if replay {
             if self.turn_replay.len() >= TURN_REPLAY_CAP {
@@ -1209,6 +1287,7 @@ impl SessionActor {
     pub(crate) async fn publish_view(&mut self) {
         let v = RuntimeView::from_runtime(&self.runtime).await;
         self.view.store(Arc::new(v));
+        self.prefix_rev += 1;
     }
 
     /// Queue a save of the current conversation. Never waits: the write
@@ -2568,9 +2647,8 @@ impl SessionActor {
             return;
         }
         let had_prompts = !self.pending_prompts.is_empty();
-        while let Some((pr, tx)) = self.pending_prompts.pop_front() {
-            let _ = tx.send(None);
-            self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+        while let Some(p) = self.pending_prompts.pop_front() {
+            self.close_prompt(p, None, PromptOutcome::TimedOut);
         }
         if had_prompts {
             tracing::info!(session = %self.id, "pending prompt abandoned (no clients before deadline) — denied");
@@ -3508,11 +3586,13 @@ impl SessionActor {
     pub(crate) async fn cancel_turn(&mut self, reason: crate::engine::interrupt::InterruptReason) {
         if !self.streaming {
             if self.compact.is_some() {
-                self.abort_compaction();
+                self.abort_compaction().await;
                 if let Some(q) = self.conv.queued_message.take() {
                     self.emit(SessionEventWire::Dequeued { text: q });
                 }
                 self.update_attach_state();
+                // `Idle` means saved: the cancelled compaction's charge too.
+                self.flush_saves().await;
             }
             self.emit(SessionEventWire::Idle);
             return;
@@ -3735,9 +3815,8 @@ impl SessionActor {
         if self.pending_prompts.is_empty() {
             return;
         }
-        while let Some((pr, tx)) = self.pending_prompts.pop_front() {
-            let _ = tx.send(None);
-            self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+        while let Some(p) = self.pending_prompts.pop_front() {
+            self.close_prompt(p, None, PromptOutcome::Cancelled);
         }
         self.publish_presence();
         self.rearm_prompt_abandon();
@@ -4273,23 +4352,73 @@ impl SessionActor {
             ));
             return;
         }
-        let disclosure =
-            preview_compaction_disclosure(&self.runtime, &self.conv.api_messages).render_line();
+        let disclosure = preview_compaction_request(
+            &self.runtime,
+            &self.conv.api_messages,
+            instructions.as_deref(),
+        )
+        .await;
+        // The job sends what this line names: the request is chosen here,
+        // once, not again when the job starts (a keep-warm ping landing in
+        // between could make a second answer differ from the line).
+        let dispatch = disclosure.dispatch();
+        let spend = dispatch.spend().clone();
+        let cancel = dispatch.cancel_token().clone();
         self.emit(SessionEventWire::CompactionStarted {
             source: source.to_string(),
-            disclosure,
+            disclosure: disclosure.render_line(),
         });
         let msgs = self.conv.api_messages.clone();
-        let rt: Runtime = (*self.runtime).clone();
+        let mut rt: Runtime = (*self.runtime).clone();
+        // A clone starts a request chain of its own (fresh cache anchor and
+        // TTL latches). This one summarizes THIS chat: it must know when
+        // the chat's cached prefix was last read or written, and under which
+        // TTL, to decide whether the summary request can read it.
+        rt.share_ttl_latches(&self.runtime);
         let task = tokio::spawn(async move {
-            compact_conversation(&msgs, &rt, instructions.as_deref()).await
+            compact_conversation(&msgs, &rt, instructions.as_deref(), &dispatch).await
         });
         self.compact = Some(CompactionJob {
             task,
             source: source.to_string(),
             started: tokio::time::Instant::now(),
+            spend,
+            cancel,
         });
         self.update_attach_state();
+    }
+
+    /// Book what a compaction's summary requests were billed into the
+    /// conversation totals, the way a turn's usage is booked
+    /// (`record_usage`), so the session's cost includes its compactions.
+    /// Every request that was paid for is in `spend`: a chat request whose
+    /// reply was refused, and the transcript request sent after it. Drained
+    /// here, so each is booked once. A chat request that wrote more cache
+    /// than it read is also said, where the disclosure line was.
+    fn book_compaction(&mut self, spend: &crate::runtime::compaction::CompactionSpend) {
+        for entry in spend.take() {
+            let usage = &entry.usage;
+            let model = usage
+                .model
+                .clone()
+                .unwrap_or_else(|| self.runtime.model().to_string());
+            self.conv.add_usage(
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage.cache_write_5m,
+                usage.cache_write_1h,
+                &model,
+            );
+            if let Some(notice) = entry.cache_miss_notice() {
+                self.emit(SessionEventWire::SystemNotice(notice));
+            }
+        }
+        // The compaction transition saves `conv.session` as it stands (the
+        // predecessor, or the session compacted in place): its totals must
+        // hold what was just booked.
+        self.conv.stamp_usage_totals();
     }
 
     /// `select!` arm: the spawned job finished (or was aborted). Applies via
@@ -4305,7 +4434,12 @@ impl SessionActor {
         let Some(job) = self.compact.take() else {
             return;
         };
+        // Before the outcome is applied: under the linked-successor policy
+        // the totals restart with the successor, and this spend belongs to
+        // the session that was summarized. Also when the job failed.
+        self.book_compaction(&job.spend);
         let msg_count = self.conv.api_messages.len();
+        let mut transitioned = false;
         match res {
             Err(join) => {
                 if !join.is_cancelled() {
@@ -4343,6 +4477,7 @@ impl SessionActor {
                 .await;
                 match applied {
                     Ok(applied) => {
+                        transitioned = true;
                         let previous = applied.previous_session_id.clone();
                         self.conv.session = applied.session;
                         self.conv.api_messages = applied.api_messages;
@@ -4386,6 +4521,15 @@ impl SessionActor {
                 }
             }
         }
+        // The transition saved the totals just booked (`apply_compaction`
+        // writes the predecessor, or the session compacted in place).
+        // Without one the session is as it was, and only the save queued
+        // here, before `Idle`, puts its new totals on disk. Never after a
+        // transition: this snapshot would be the successor's, and the
+        // predecessor owns the charge.
+        if !transitioned {
+            self.request_save();
+        }
         self.emit_conversation();
         self.update_attach_state();
         self.announce_idle().await;
@@ -4401,13 +4545,26 @@ impl SessionActor {
     }
 
     async fn compact_inline_inner(&mut self, instructions: Option<String>, source: &str) {
+        let disclosure = preview_compaction_request(
+            &self.runtime,
+            &self.conv.api_messages,
+            instructions.as_deref(),
+        )
+        .await;
         self.emit(SessionEventWire::SystemNotice(format!(
             "[{}]",
-            preview_compaction_disclosure(&self.runtime, &self.conv.api_messages).render_line()
+            disclosure.render_line()
         )));
-        let outcome =
-            compact_conversation(&self.conv.api_messages, &self.runtime, instructions.as_deref())
-                .await;
+        // Sends what the line names (see `compact`).
+        let dispatch = disclosure.dispatch();
+        let outcome = compact_conversation(
+            &self.conv.api_messages,
+            &self.runtime,
+            instructions.as_deref(),
+            &dispatch,
+        )
+        .await;
+        self.book_compaction(dispatch.spend());
         let applied = match outcome {
             Ok(outcome) => {
                 // Queued saves land before the transition rewrites the file.
@@ -4440,10 +4597,15 @@ impl SessionActor {
                     after.used_tokens()
                 )));
             }
-            Err(e) => self.emit(SessionEventWire::SystemNotice(format!(
-                "[compaction failed: {}]",
-                e
-            ))),
+            Err(e) => {
+                // Nothing was applied: the booked totals reach the disk
+                // only through this save.
+                self.request_save();
+                self.emit(SessionEventWire::SystemNotice(format!(
+                    "[compaction failed: {}]",
+                    e
+                )));
+            }
         }
         self.emit_conversation();
     }
@@ -4455,13 +4617,13 @@ impl SessionActor {
         self.next_prompt_id += 1;
         let pr = PromptRequest {
             id,
-            kind: PromptKind::from_title(&req.title),
+            kind: req.policy.kind(),
             title: req.title,
             prompt: req.prompt,
             raised_at: chrono::Utc::now(),
             confirm_scope: req.confirm_scope,
         };
-        self.pending_prompts.push_back((pr.clone(), req.response_tx));
+        self.pending_prompts.push_back(PendingPrompt { req: pr.clone(), policy: req.policy, tx: req.response_tx });
         self.publish_presence();
         self.emit(SessionEventWire::Prompt(pr));
         // A prompt can be raised while already detached (a turn running with no
@@ -4492,10 +4654,32 @@ impl SessionActor {
         None
     }
 
+    /// Close `p`: hand `value` to its waiting call, then remember and
+    /// announce what that applied (`PromptResolved.outcome`). `outcome` is
+    /// what the value means; a call that is already gone took nothing, so
+    /// that is `Cancelled` whatever the value was.
+    fn close_prompt(&mut self, p: PendingPrompt, value: Option<String>, outcome: PromptOutcome) -> PromptOutcome {
+        let applied = if p.tx.send(value).is_ok() { outcome } else { PromptOutcome::Cancelled };
+        if self.resolved_prompts.len() >= RESOLVED_PROMPTS_KEPT {
+            self.resolved_prompts.pop_front();
+        }
+        self.resolved_prompts.push_back((p.req.id, applied));
+        self.emit(SessionEventWire::PromptResolved { prompt_id: p.req.id, outcome: Some(applied) });
+        applied
+    }
+
     fn answer(&mut self, from: Option<ClientId>, prompt_id: u64, value: Option<String>) {
-        let Some(pos) = self.pending_prompts.iter().position(|(p, _)| p.id == prompt_id) else {
-            return; // unknown or already answered — dedup on id
+        let Some(pos) = self.pending_prompts.iter().position(|p| p.req.id == prompt_id) else {
+            // Unknown or already resolved (dedup on id): it changed nothing.
+            // Its sender alone is told, with what applied if remembered, so
+            // a client that missed the `PromptResolved` learns it.
+            let outcome = self.resolved_prompts.iter().rev().find(|(id, _)| *id == prompt_id).map(|(_, o)| *o);
+            self.reply(from, SessionEventWire::AnswerRefused { prompt_id, outcome });
+            return;
         };
+        // The raw token, for every Confirm: the policy refusals below read
+        // it as they always have (a non-owner's `always` is refused on an
+        // activation prompt too, though that gate would deny it).
         let allow_all = value.as_deref().is_some_and(|v| {
             v.trim()
                 .eq_ignore_ascii_case(crate::tools::CONFIRM_ANSWER_ALLOW_ALL)
@@ -4506,7 +4690,7 @@ impl SessionActor {
         if let Some(c) = from {
             self.note_input(c);
         }
-        if let Some(reason) = self.confirm_answer_refusal(from, &self.pending_prompts[pos].0, allow_all) {
+        if let Some(reason) = self.confirm_answer_refusal(from, &self.pending_prompts[pos].req, allow_all) {
             if let Some(c) = from {
                 self.emit(SessionEventWire::Refused {
                     client: c,
@@ -4516,15 +4700,19 @@ impl SessionActor {
             }
             return; // the prompt stays pending for an eligible client
         }
-        let approved = allow_all
-            || value
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|v| v.eq_ignore_ascii_case("y") || v.eq_ignore_ascii_case("yes"));
-        let (prompt, tx) = self.pending_prompts.remove(pos).expect("position");
-        let _ = tx.send(value);
+        let p = self.pending_prompts.remove(pos).expect("position");
+        let (prompt, policy) = (p.req.clone(), p.policy);
+        // What the gate decides, read the way the gate reads it.
+        let decision = match policy {
+            PromptPolicy::Confirm(gate) => Some(gate.decide(value.as_deref())),
+            PromptPolicy::Secret => None,
+        };
+        let outcome = policy.outcome(value.as_deref());
+        // The notices below are about what was applied: a call already gone
+        // took no approval and armed no latch.
+        let approved = self.close_prompt(p, value, outcome) == PromptOutcome::Allowed;
         self.publish_presence();
-        self.emit(SessionEventWire::PromptResolved { prompt_id });
+        let tool_call = policy == PromptPolicy::Confirm(ConfirmGate::ToolCall);
         let by = match from {
             Some(c) => self.client_label(c),
             None => "the host".to_string(),
@@ -4532,7 +4720,7 @@ impl SessionActor {
         // prA N3: the tool card shows the model's original input; when the
         // approved call runs input rewritten by an extension, every client's
         // transcript records that (the prompt showed the final input).
-        if approved && prompt.title == CONFIRM_PROMPT_TITLE {
+        if approved && tool_call {
             if let Some(scope) = prompt.confirm_scope.as_ref().filter(|s| !s.rewritten_by.is_empty()) {
                 self.emit(SessionEventWire::SystemNotice(format!(
                     "Approved by {by}: {} runs with input rewritten by {} (not the input shown \
@@ -4544,7 +4732,7 @@ impl SessionActor {
         }
         // Arming the latch is announced to every attached client, not just
         // the one that pressed the key.
-        if allow_all && prompt.title == CONFIRM_PROMPT_TITLE {
+        if approved && decision == Some(ConfirmDecision::AllowAll) {
             if let Some(scope) = prompt.confirm_scope.as_ref().filter(|s| !s.extensions.is_empty()) {
                 self.emit(SessionEventWire::SystemNotice(format!(
                     "Allow all armed by {by}: tool-call confirms from {} are auto-approved \
@@ -4559,7 +4747,7 @@ impl SessionActor {
 
     // ── settings / queries / engine commands ─────────────────────────────
 
-    pub(crate) async fn apply_setting(&mut self, id: u64, setting: SessionSetting) {
+    pub(crate) async fn apply_setting(&mut self, from: Option<ClientId>, id: u64, setting: SessionSetting) {
         if replayable(&setting) {
             let disc = std::mem::discriminant(&setting);
             self.settings_replay
@@ -4661,7 +4849,7 @@ impl SessionActor {
             Ok(m) => (true, m),
             Err(e) => (false, Some(e)),
         };
-        self.emit(SessionEventWire::SettingChanged(SettingApplied {
+        self.emit_shared(from, SessionEventWire::SettingChanged(SettingApplied {
             id,
             setting: name.to_string(),
             ok,
@@ -4671,7 +4859,11 @@ impl SessionActor {
         }));
     }
 
-    pub(crate) async fn query(&mut self, id: u64, query: SessionQuery) {
+    pub(crate) async fn query(&mut self, from: Option<ClientId>, id: u64, query: SessionQuery) {
+        // Never awaits; a parked session answers `parked` without waking.
+        if let SessionQuery::CacheExpiry = query {
+            return self.ask_cache_expiry(from, id);
+        }
         // Status/View never wake a parked session (the idle probe must not).
         if self.is_parked() {
             let value = match query {
@@ -4691,11 +4883,11 @@ impl SessionActor {
                     serde_json::json!({ "error": format!("no subagent {handle_id} in this session") })
                 }
                 _ => match self.ensure_live().await {
-                    Ok(()) => return Box::pin(self.query(id, query)).await,
+                    Ok(()) => return Box::pin(self.query(from, id, query)).await,
                     Err(e) => serde_json::json!({ "error": e }),
                 },
             };
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.reply(from, SessionEventWire::QueryResult { id, value });
             return;
         }
         let value = match query {
@@ -4788,8 +4980,9 @@ impl SessionActor {
                     other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                 }
             }
+            SessionQuery::CacheExpiry => return self.ask_cache_expiry(from, id),
         };
-        self.emit(SessionEventWire::QueryResult { id, value });
+        self.reply(from, SessionEventWire::QueryResult { id, value });
     }
 
     // ── attach / detach ──────────────────────────────────────────────────
@@ -4801,7 +4994,7 @@ impl SessionActor {
             conversation: self.conv.snapshot(self.consecutive_auto_turns),
             streaming: self.streaming,
             replay: self.turn_replay.iter().cloned().collect(),
-            pending_prompts: self.pending_prompts.iter().map(|(p, _)| p.clone()).collect(),
+            pending_prompts: self.pending_prompts.iter().map(|p| p.req.clone()).collect(),
             clients: self.attached.iter().map(|(c, a)| (*c, a.meta.kind)).collect(),
             roster: self.roster(),
             client_input: self.client_input,
@@ -4955,6 +5148,8 @@ impl SessionActor {
         if self.attached.remove(&client).is_none() {
             return;
         }
+        // Its query jobs end without a reply.
+        self.expiry_jobs.client_gone(client);
         self.update_attach_state();
         self.emit(SessionEventWire::ClientLeft { client });
         if self.input_owner == Some(client) {
@@ -4996,9 +5191,8 @@ impl SessionActor {
         if self.attached.is_empty() && (self.driver.is_some() || self.driver_pending.is_some()) {
             self.driver_revoke("no clients attached");
             let had_prompts = !self.pending_prompts.is_empty();
-            while let Some((pr, tx)) = self.pending_prompts.pop_front() {
-                let _ = tx.send(None);
-                self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+            while let Some(p) = self.pending_prompts.pop_front() {
+                self.close_prompt(p, None, PromptOutcome::Cancelled);
             }
             if had_prompts {
                 self.publish_presence();
@@ -5010,7 +5204,7 @@ impl SessionActor {
     /// cancel any turn (partial history kept + interruption marker), abort compaction, answer
     /// pending prompts `None`, save, close PTYs. Replies on
     /// `CHECKPOINT_QUERY_ID` so `reload.rs` can await it per session.
-    pub(crate) async fn checkpoint(&mut self, reason: CheckpointReason) {
+    pub(crate) async fn checkpoint(&mut self, from: Option<ClientId>, reason: CheckpointReason) {
         let interrupt = match reason {
             CheckpointReason::Reload => crate::engine::interrupt::InterruptReason::Restart,
             CheckpointReason::HostRequest => crate::engine::interrupt::InterruptReason::Host,
@@ -5037,10 +5231,9 @@ impl SessionActor {
         // any the cancelled turn registered meanwhile.
         let stopping = if reload { self.stop_workers_for_reload() } else { Vec::new() };
         let stopped_workers = await_stopped_workers(self.id.as_str(), stopping).await;
-        self.abort_compaction();
-        while let Some((pr, tx)) = self.pending_prompts.pop_front() {
-            let _ = tx.send(None);
-            self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+        self.abort_compaction().await;
+        while let Some(p) = self.pending_prompts.pop_front() {
+            self.close_prompt(p, None, PromptOutcome::Cancelled);
         }
         // One bounded wait covers the cancelled turn's save too (queued, not
         // awaited, by `cancel_turn`).
@@ -5075,7 +5268,7 @@ impl SessionActor {
             });
         }
         let record = serde_json::to_value(record).unwrap_or_default();
-        self.emit(SessionEventWire::QueryResult {
+        self.reply(from, SessionEventWire::QueryResult {
             id: super::wire::CHECKPOINT_QUERY_ID,
             value: serde_json::json!({ "ok": true, "record": record }),
         });
@@ -5278,9 +5471,22 @@ impl SessionActor {
     }
 
     /// Abort the spawned job (`CompactionCancelled`); prior state intact.
-    pub(crate) fn abort_compaction(&mut self) {
+    pub(crate) async fn abort_compaction(&mut self) {
         if let Some(job) = self.compact.take() {
-            job.task.abort();
+            // `stop_compaction_task` waits up to `budget` twice.
+            let budget = Duration::from_millis(budgets::COMPACTION_STOP_TIMEOUT_MS / 2);
+            if !stop_compaction_task(job.task, &job.cancel, budget).await {
+                tracing::warn!(
+                    session = %self.id,
+                    budget_ms = budgets::COMPACTION_STOP_TIMEOUT_MS,
+                    "cancelled compaction did not stop within its stop budget; \
+                     usage it reports later is not booked"
+                );
+            }
+            // A request that had already been answered was paid for, and
+            // its charge is saved (the history is unchanged).
+            self.book_compaction(&job.spend);
+            self.request_save();
             self.emit(SessionEventWire::CompactionCancelled);
             self.publish_presence();
         }
@@ -5340,7 +5546,7 @@ impl SessionActor {
             // A host rename answers its caller only, never the whole room.
             if let SessionCommand::EngineCommand { id, name, .. } = &cmd {
                 if name == RENAME_COMMAND {
-                    self.emit(SessionEventWire::QueryResult {
+                    self.reply(from, SessionEventWire::QueryResult {
                         id: *id,
                         value: serde_json::json!({
                             "kind": "error", "code": "busy",
@@ -5375,7 +5581,7 @@ impl SessionActor {
         if is_rename_command(&cmd) {
             if let SessionCommand::EngineCommand { id, arg, .. } = cmd {
                 let value = self.host_rename(&arg).await;
-                self.emit(SessionEventWire::QueryResult { id, value });
+                self.reply(from, SessionEventWire::QueryResult { id, value });
             }
             return ControlFlow::Continue(());
         }
@@ -5415,7 +5621,7 @@ impl SessionActor {
             ) {
                 if let SessionCommand::Checkpoint { .. } = cmd {
                     let record = serde_json::to_value(self.reload_record()).unwrap_or_default();
-                    self.emit(SessionEventWire::QueryResult {
+                    self.reply(from, SessionEventWire::QueryResult {
                         id: super::wire::CHECKPOINT_QUERY_ID,
                         value: serde_json::json!({ "ok": true, "parked": true, "record": record }),
                     });
@@ -5459,7 +5665,7 @@ impl SessionActor {
                     .await;
             }
             SessionCommand::Answer { prompt_id, value } => self.answer(from, prompt_id, value),
-            SessionCommand::Set { id, setting } => self.apply_setting(id, setting).await,
+            SessionCommand::Set { id, setting } => self.apply_setting(from, id, setting).await,
             // `CompactionStarted` is the contract; no notice before it.
             SessionCommand::Compact { instructions } => {
                 self.compact(instructions, "manual").await;
@@ -5505,15 +5711,15 @@ impl SessionActor {
             SessionCommand::Save => {
                 self.save().await;
             }
-            SessionCommand::Query { id, query } => self.query(id, query).await,
+            SessionCommand::Query { id, query } => self.query(from, id, query).await,
             // `/close` ends the session, which no other engine command can.
             SessionCommand::EngineCommand { id, name, arg } if name == CLOSE_COMMAND => {
-                if let Some(reason) = self.close_command(id, &arg, from.is_none()) {
+                if let Some(reason) = self.close_command(from, id, &arg) {
                     return ControlFlow::Break(reason);
                 }
             }
             SessionCommand::EngineCommand { id, name, arg } => {
-                self.engine_command(id, name, arg).await
+                self.engine_command(from, id, name, arg).await
             }
             SessionCommand::Attach { client, mode, owner } => self.attach(client, mode, owner).await,
             SessionCommand::Detach { client } => {
@@ -5554,9 +5760,9 @@ impl SessionActor {
                 plugin,
                 name,
                 arg,
-            } => self.plugin_command(id, plugin, name, arg).await,
-            SessionCommand::Resume { id, query } => self.resume(id, query).await,
-            SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
+            } => self.plugin_command(from, id, plugin, name, arg).await,
+            SessionCommand::Resume { id, query } => self.resume(from, id, query).await,
+            SessionCommand::Checkpoint { reason } => self.checkpoint(from, reason).await,
             SessionCommand::AdoptWorkers { workers } => self.adopt_workers(workers),
             SessionCommand::RestoreToolActivations { activations } => {
                 self.restore_tool_activations(activations)
@@ -5648,11 +5854,10 @@ impl SessionActor {
         if self.streaming {
             self.cancel_turn(interrupt).await;
         }
-        self.abort_compaction();
+        self.abort_compaction().await;
         // Outstanding prompts are cancelled (tool sees `None`).
-        while let Some((pr, tx)) = self.pending_prompts.pop_front() {
-            let _ = tx.send(None);
-            self.emit(SessionEventWire::PromptResolved { prompt_id: pr.id });
+        while let Some(p) = self.pending_prompts.pop_front() {
+            self.close_prompt(p, None, PromptOutcome::Cancelled);
         }
 
         let parked = !self.conv.is_live();
@@ -5938,6 +6143,7 @@ impl SessionTask {
                     actor.on_cache_keepwarm_done(res);
                 }
                 res = poll_compaction(&mut actor.compact) => actor.on_compaction_done(res).await,
+                (gen, res) = actor.expiry_jobs.next() => actor.finish_cache_expiry(gen, res),
                 ran = session_start_task(&mut actor.session_start) => {
                     actor.session_start_finished(ran).await;
                 },
@@ -6112,6 +6318,116 @@ mod worker_cancel_scope_tests {
                 "{reason:?} stops every running worker"
             );
         }
+    }
+}
+
+/// Stop a compaction task, and wait until it has stopped, so its ledger is
+/// drained after the last entry, never before. First cooperatively
+/// (`cancel`): a request in flight ends through its normal finalization,
+/// which reports the usage the provider already sent (an aborted stream
+/// would drop it), and no further request is sent. A task that has not
+/// stopped within `budget` is aborted, and waited for once more for at
+/// most `budget`: `abort` only asks, and a task running on another worker
+/// can still be adding to its ledger. `true` once the task's future has
+/// been dropped; `false` when it did not stop in time.
+async fn stop_compaction_task<T>(
+    mut task: tokio::task::JoinHandle<T>,
+    cancel: &tokio_util::sync::CancellationToken,
+    budget: Duration,
+) -> bool {
+    cancel.cancel();
+    if tokio::time::timeout(budget, &mut task).await.is_ok() {
+        return true;
+    }
+    task.abort();
+    tokio::time::timeout(budget, task).await.is_ok()
+}
+
+#[cfg(test)]
+mod compaction_stop_tests {
+    use super::stop_compaction_task;
+    use crate::runtime::compaction::CompactionSpend;
+    use crate::runtime::keepwarm::KeepWarmUsage;
+    use agent_core::compaction::SummaryRequest;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A task in the middle of a poll when it is cancelled (here: blocked
+    /// on another worker, then booking usage before its next await) books
+    /// before the drain, and the drain hands it out once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_task_books_before_the_drain_never_after() {
+        let spend = CompactionSpend::default();
+        let started = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let spend = spend.clone();
+            let started = Arc::clone(&started);
+            async move {
+                started.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                spend.record(
+                    SummaryRequest::ChatRequest,
+                    "claude-opus-5-5",
+                    KeepWarmUsage { input_tokens: 7, cache_read_tokens: 4_000, ..Default::default() },
+                );
+                std::future::pending::<()>().await;
+            }
+        });
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let never = tokio_util::sync::CancellationToken::new();
+        assert!(stop_compaction_task(task, &never, Duration::from_millis(500)).await, "stopped");
+        let booked = spend.take();
+        assert_eq!(booked.len(), 1, "{booked:?}");
+        assert_eq!(booked[0].usage.cache_read_tokens, 4_000);
+        assert!(spend.take().is_empty(), "handed out once");
+    }
+
+    /// A task that does not stop within the budget is reported, not
+    /// waited for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_that_does_not_stop_in_time_is_not_waited_for() {
+        let started = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let started = Arc::clone(&started);
+            async move {
+                started.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(800));
+            }
+        });
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let t0 = std::time::Instant::now();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(!stop_compaction_task(task, &cancel, Duration::from_millis(100)).await);
+        assert!(t0.elapsed() < Duration::from_millis(600));
+    }
+
+    /// A task that honours the cancellation finishes on its own, booking
+    /// what its request reported while finalizing, before the drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_task_finishes_and_books_its_final_usage() {
+        let spend = CompactionSpend::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let (spend, cancel) = (spend.clone(), cancel.clone());
+            async move {
+                let line = spend.open(SummaryRequest::ChatRequest, "claude-opus-5-5");
+                cancel.cancelled().await;
+                // Finalization reports the residual usage.
+                tokio::task::yield_now().await;
+                line.lock().unwrap().input_tokens = 7;
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(stop_compaction_task(task, &cancel, Duration::from_secs(5)).await);
+        let booked = spend.take();
+        assert_eq!(booked.len(), 1, "{booked:?}");
+        assert_eq!(booked[0].usage.input_tokens, 7);
+        assert!(spend.take().is_empty(), "handed out once");
     }
 }
 

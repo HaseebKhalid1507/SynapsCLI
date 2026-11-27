@@ -137,7 +137,7 @@ The example batch is four calls: `read` and `grep` (ReadOnly), then `bash` and `
 - Anything else blocks with "Tool call confirmation denied".
 - With no interactive prompt available at all, the call is blocked.
 
-**Answers race.** Several clients can answer, and the first answer wins. `answer` dedups on the prompt id, and `PromptResolved` dismisses the dialog everywhere else.
+**Answers race.** Several clients can answer, and the first answer wins. `answer` dedups on the prompt id, and `PromptResolved` dismisses the dialog everywhere else. `PromptResolved.outcome` says what applied (`allowed`, `denied`, `answered`, `cancelled`, `timed_out`), read by the gate the prompt was raised for (the activation gate denies Allow all). A later answer changes nothing and is answered `AnswerRefused` to its sender alone, with that outcome.
 
 **Nobody attached.** abandon `⟨1 h⟩`: when a prompt is pending, no client is attached and no driver is armed, every pending prompt is denied after `daemon.prompt_abandon_secs` (default 3600, env `SYNAPS_DAEMON_PROMPT_ABANDON_SECS`). That makes `can_park` true again.
 

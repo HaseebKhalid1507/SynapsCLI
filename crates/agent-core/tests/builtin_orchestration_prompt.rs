@@ -75,7 +75,7 @@ fn non_codex_models_pass_base_through_byte_identical() {
     for model in [
         "anthropic/claude-fable-5",
         "xai-auth/grok-4.5-latest",
-        "google-gemini/gemini-2.5-pro",
+        "google/gemini-2.5-pro",
         "openrouter/z-ai/glm-5.1",
     ] {
         assert_eq!(

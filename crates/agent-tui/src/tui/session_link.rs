@@ -45,15 +45,35 @@ pub(crate) struct SessionLink {
     closed: bool,
 }
 
+/// Where request ids start when the daemon broadcasts replies (no
+/// `addressed_replies`): a random base in `[2^32, 2^62)`.
+const SHARED_ID_FLOOR: u64 = 1 << 32;
+const SHARED_ID_CEIL: u64 = 1 << 62;
+
 impl SessionLink {
     pub(crate) fn new(transport: Box<dyn ClientTransport>) -> Self {
         let view = transport.view();
-        Self {
+        let mut link = Self {
             transport,
             view,
             buffered: VecDeque::new(),
             next_id: 1,
             closed: false,
+        };
+        link.keep_ids_apart();
+        link
+    }
+
+    /// An older daemon broadcasts every reply, and every client numbers its
+    /// requests from 1: another client's `QueryResult{5}` would answer ours.
+    /// Against one, this link's ids start at a random base instead, which
+    /// makes an accidental collision highly unlikely (not impossible: the
+    /// replies are still broadcast). Checked
+    /// again after a reconnect (a reload can change the daemon binary).
+    fn keep_ids_apart(&mut self) {
+        if !self.transport.addressed_replies() && self.next_id < SHARED_ID_FLOOR {
+            let r = uuid::Uuid::new_v4().as_u64_pair().0;
+            self.next_id = SHARED_ID_FLOOR + r % (SHARED_ID_CEIL - SHARED_ID_FLOOR);
         }
     }
 
@@ -86,6 +106,7 @@ impl SessionLink {
     /// Re-read the transport's published view (after `Attached`/reconnect).
     pub(crate) fn refresh_view(&mut self) {
         self.view = self.transport.view();
+        self.keep_ids_apart();
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -131,15 +152,18 @@ impl SessionLink {
     }
 
     /// Send `cmd` and pull envelopes until `pick` accepts one; everything
-    /// else is buffered for the loop in arrival order. A `Refused` addressed
-    /// to this client (B1 ownership: a non-owner's setter) IS the reply —
-    /// `Err(reason)` immediately, never the 30 s timeout.
+    /// else is buffered for the loop in arrival order. A `Refused` of this
+    /// command addressed to this client (B1 ownership: a non-owner's
+    /// setter) IS the reply — `Err(reason)` immediately, never the 30 s
+    /// timeout. Another command's refusal (an `Answer` sent without a round
+    /// trip) and an `AnswerRefused` are events, buffered for the loop.
     async fn roundtrip<T>(
         &mut self,
         cmd: SessionCommand,
         mut pick: impl FnMut(&SessionEventWire) -> Option<T>,
     ) -> Result<T, String> {
         let me = self.client_id();
+        let name = agent_engine::session::actor::command_name(&cmd);
         self.send(cmd).await.map_err(|e| e.to_string())?;
         let deadline = tokio::time::Instant::now() + ROUNDTRIP_TIMEOUT;
         loop {
@@ -161,7 +185,7 @@ impl SessionLink {
                 reason,
             } = &env.event
             {
-                if *client == me {
+                if *client == me && command == name {
                     return Err(format!("{command} refused: {reason}"));
                 }
             }
@@ -339,6 +363,19 @@ pub(crate) enum ConfirmPolicy {
     ViewOnly,
 }
 
+/// The pane's policy for a prompt from the session. The session keeps the
+/// policy a prompt was raised with and never sends it; the pane needs it
+/// only to render (a Confirm's buttons), and the wire's kind and title
+/// carry that. A Confirm under any other title gets no Allow all.
+pub(crate) fn pane_policy(kind: PromptKind, title: &str) -> agent_engine::session::PromptPolicy {
+    use agent_engine::session::{ConfirmGate, PromptPolicy};
+    match kind {
+        PromptKind::Secret => PromptPolicy::Secret,
+        PromptKind::Confirm if title == ConfirmGate::ToolCall.title() => PromptPolicy::Confirm(ConfirmGate::ToolCall),
+        PromptKind::Confirm => PromptPolicy::Confirm(ConfirmGate::Activation),
+    }
+}
+
 /// `Prompt(req)` → local `SecretPromptRequest` on the SAME channel the
 /// secret-prompt pane polls; the pane's oneshot answer comes back through
 /// `answers_rx` and the loop sends `Answer{prompt_id, value}`.
@@ -417,7 +454,7 @@ impl PromptBridge {
         let _ = self
             .secret_prompt_tx
             .send(synaps_cli::tools::SecretPromptRequest {
-                kind: req.kind,
+                policy: pane_policy(req.kind, &req.title),
                 title: req.title,
                 prompt: req.prompt,
                 confirm_scope: req.confirm_scope.filter(|_| self.owns_input),
@@ -623,7 +660,7 @@ mod tests {
         let (mut b, mut pane) = bridge(ConfirmPolicy::ViewOnly);
         b.on_prompt(prompt(5, PromptKind::Secret));
         let req = pane.try_recv().expect("the pane gets the secret prompt");
-        assert_eq!(req.kind, PromptKind::Secret);
+        assert_eq!(req.kind(), PromptKind::Secret);
         assert!(b.waiting_confirms().is_empty());
         req.response_tx.send(Some("k".into())).unwrap();
         let (id, value) =
@@ -659,10 +696,92 @@ mod tests {
     async fn default_policy_answers_confirms_here() {
         let (mut b, mut pane) = bridge(ConfirmPolicy::default());
         b.on_prompt(prompt(4, PromptKind::Confirm));
-        assert_eq!(pane.try_recv().unwrap().kind, PromptKind::Confirm);
+        assert_eq!(pane.try_recv().unwrap().kind(), PromptKind::Confirm);
         assert!(b.waiting_confirms().is_empty());
         assert!(b.on_local_answer(4));
         assert!(!b.on_resolved(4));
+    }
+
+    /// The pane reads a gate from the wire's kind and title: only the
+    /// tool-call confirm may offer Allow all.
+    #[test]
+    fn the_pane_policy_comes_from_the_wire_kind_and_title() {
+        use agent_engine::session::{ConfirmGate, PromptPolicy, CONFIRM_ACTIVATION_PROMPT_TITLE, CONFIRM_PROMPT_TITLE};
+        assert_eq!(pane_policy(PromptKind::Confirm, CONFIRM_PROMPT_TITLE), PromptPolicy::Confirm(ConfirmGate::ToolCall));
+        assert_eq!(
+            pane_policy(PromptKind::Confirm, CONFIRM_ACTIVATION_PROMPT_TITLE),
+            PromptPolicy::Confirm(ConfirmGate::Activation)
+        );
+        assert_eq!(pane_policy(PromptKind::Confirm, "Something new"), PromptPolicy::Confirm(ConfirmGate::Activation));
+        assert_eq!(pane_policy(PromptKind::Secret, CONFIRM_PROMPT_TITLE), PromptPolicy::Secret);
+        assert_eq!(pane_policy(PromptKind::Secret, "API key"), PromptPolicy::Secret);
+    }
+
+    /// Against a daemon that broadcasts replies (no `addressed_replies`),
+    /// request ids start at a random base in `[2^32, 2^62)`, not at 1; an
+    /// addressing daemon keeps the plain count.
+    #[tokio::test]
+    async fn request_ids_start_at_a_random_base_without_addressed_replies() {
+        let mut plain = SessionLink::new(Box::new(ScriptedTransport::new(Runtime::new_headless())));
+        assert_eq!(plain.send_query(SessionQuery::View).await.unwrap(), 1);
+        let old = || ScriptedTransport::new(Runtime::new_headless()).with_addressed_replies(false);
+        let mut a = SessionLink::new(Box::new(old()));
+        let mut b = SessionLink::new(Box::new(old()));
+        let (ia, ib) = (a.send_query(SessionQuery::View).await.unwrap(), b.send_query(SessionQuery::View).await.unwrap());
+        for id in [ia, ib] {
+            assert!((SHARED_ID_FLOOR..SHARED_ID_CEIL).contains(&id), "{id}");
+        }
+        assert_ne!(ia, ib, "two links draw apart");
+        assert_eq!(a.send_query(SessionQuery::View).await.unwrap(), ia + 1, "then count up");
+    }
+
+    /// The old-reader contract the daemon relies on: another client's
+    /// `SettingChanged`, projected to `VIEW_CHANGED_SETTING_ID`, is never
+    /// taken for this link's `Set` reply, and the view still follows it.
+    #[tokio::test]
+    async fn a_view_only_setting_is_never_taken_for_the_reply() {
+        use agent_engine::session::wire::VIEW_CHANGED_SETTING_ID;
+        let mut t = ScriptedTransport::new(Runtime::new_headless());
+        let mut theirs = (*t.view()).clone();
+        theirs.model = "their-model".into();
+        t.push_event(SessionEventWire::SettingChanged(SettingApplied {
+            id: VIEW_CHANGED_SETTING_ID,
+            setting: "model".into(),
+            ok: true,
+            message: None,
+            view: theirs,
+            clamp: None,
+        }));
+        let mut link = SessionLink::new(Box::new(t));
+        let applied = link.set(SessionSetting::ApiRetries { n: 2 }).await.unwrap();
+        assert_eq!(applied.id, 1, "its own reply");
+        let seen = link.next_event().await.unwrap();
+        assert!(matches!(&seen.event, SessionEventWire::SettingChanged(a) if a.id == VIEW_CHANGED_SETTING_ID && a.view.model == "their-model"));
+    }
+
+    /// The same for `Resume`: the view-only `Resumed` comes first, this
+    /// link's own reply (the scripted error) second. `resume()` sees the
+    /// view-only one first, skips it, returns its own, and leaves the
+    /// view-only one for the loop. Without the id check it would return
+    /// the other client's switch as its own.
+    #[tokio::test]
+    async fn a_view_only_resume_is_never_taken_for_the_reply() {
+        use agent_engine::session::wire::VIEW_CHANGED_SETTING_ID;
+        let mut t = ScriptedTransport::new(Runtime::new_headless());
+        t.push_event(SessionEventWire::Resumed {
+            id: VIEW_CHANGED_SETTING_ID,
+            old_id: "a".into(),
+            new_id: "b".into(),
+            via: None,
+            clamp_notice: None,
+        });
+        let mut link = SessionLink::new(Box::new(t));
+        match link.resume("x").await {
+            Err(e) => assert!(e.contains("scripted: no sessions on disk"), "its own reply: {e}"),
+            Ok(r) => panic!("took the view-only Resumed {} → {} for its own", r.old_id, r.new_id),
+        }
+        let seen = link.next_event().await.unwrap();
+        assert!(matches!(&seen.event, SessionEventWire::Resumed { id, new_id, .. } if *id == VIEW_CHANGED_SETTING_ID && new_id == "b"), "{seen:?}");
     }
 
     fn refusing_link() -> SessionLink {
@@ -730,6 +849,34 @@ mod tests {
         )
         .await
         .expect("closed channel returns at once"));
+    }
+
+    /// A late `Answer` mid-`Set`: its `AnswerRefused`, and a policy
+    /// `Refused{command: "answer"}` addressed to this client, are not the
+    /// setter's reply. Both are buffered for the loop, and the setter gets
+    /// its own reply.
+    #[tokio::test]
+    async fn roundtrip_ignores_a_refused_answer() {
+        let mut t = ScriptedTransport::new(Runtime::new_headless());
+        t.push_event(SessionEventWire::AnswerRefused {
+            prompt_id: 7,
+            outcome: Some(agent_engine::session::PromptOutcome::Cancelled),
+        });
+        t.push_event(SessionEventWire::Refused {
+            client: ClientId(1),
+            command: "answer".into(),
+            reason: "only the input owner can choose Allow all".into(),
+        });
+        let mut link = SessionLink::new(Box::new(t));
+        assert_eq!(link.client_id(), ClientId(1), "addressed to this client");
+        let applied = link
+            .set(SessionSetting::ContextWindow {
+                tokens: Some(1_000_000),
+            })
+            .await
+            .expect("the setter's own reply, not the answer's refusal");
+        assert!(applied.ok, "{applied:?}");
+        assert_eq!(link.buffered.len(), 2);
     }
 
     /// A `Refused` addressed to ANOTHER client is not our reply: buffered

@@ -74,6 +74,31 @@ pub const FEATURE_SESSION_WORKERS: &str = "session_workers";
 /// session that leaves the held set is pushed as its saved row).
 pub const FEATURE_SESSION_PAGE: &str = "session_page";
 
+/// `Welcome.features` entry: replies are addressed (Contract v2 §1). A
+/// `QueryResult` reaches only the attachment whose request it answers (a
+/// host's, none); another client's `SettingChanged`/`Resumed` arrives with
+/// its id projected to [`VIEW_CHANGED_SETTING_ID`]. Nothing on the wire
+/// changes: an older client simply stops seeing replies that were never
+/// its own. Without it (an older daemon broadcasts every reply), a client
+/// draws its request ids from a random base in `[2^32, 2^62)`, which makes
+/// an accidental collision with another client's ids highly unlikely (a
+/// mitigation: replies are still broadcast and equal ids still correlate).
+pub const FEATURE_ADDRESSED_REPLIES: &str = "addressed_replies";
+
+/// `Welcome.features` entry: `PromptResolved` carries `outcome`, and an
+/// `Answer` to a prompt that is not pending is answered `AnswerRefused` (to
+/// its sender). A missing refusal can't be told from a slow one, so a
+/// client checks this before relying on either; without it, it infers what
+/// it can.
+pub const FEATURE_PROMPT_OUTCOME: &str = "prompt_outcome";
+
+/// `Welcome.features` entry: this daemon answers `SessionQuery::CacheExpiry`
+/// (arch-review-435-436-437 Contract v3 §3). An older daemon fails the
+/// frame as malformed, so a client checks this first
+/// ([`SocketTransport`](super::SocketTransport) refuses to send it:
+/// `DaemonTooOld`).
+pub const FEATURE_CACHE_EXPIRY: &str = "cache_expiry";
+
 /// `CatalogPage.limit` when absent, and its ceiling.
 pub const CATALOG_PAGE_DEFAULT_LIMIT: u32 = 50;
 pub const CATALOG_PAGE_MAX_LIMIT: u32 = 200;
@@ -93,6 +118,9 @@ pub fn daemon_features() -> Vec<String> {
         FEATURE_OWNED_SESSIONS.to_string(),
         FEATURE_SESSION_WORKERS.to_string(),
         FEATURE_SESSION_PAGE.to_string(),
+        FEATURE_ADDRESSED_REPLIES.to_string(),
+        FEATURE_PROMPT_OUTCOME.to_string(),
+        FEATURE_CACHE_EXPIRY.to_string(),
     ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
@@ -105,10 +133,29 @@ pub const RPC_MAX_FRAME_BYTES: usize = agent_core::core::rpc_dispatch::MAX_FRAME
 pub const DAEMON_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Alias used by the readers/writers of this protocol.
 pub const MAX_FRAME_BYTES: usize = DAEMON_MAX_FRAME_BYTES;
-/// Query ids at or above this are reserved for the transport/daemon and
-/// never surfaced to a client as `QueryResult`.
+/// Request ids come in three kinds. Every reply is addressed to the
+/// request's origin (`Audience`), so ids only need to be unique per
+/// attachment, and the daemon never dedups them.
+/// - **Application ids**, below `RESERVED_QUERY_ID_BASE`: what a client
+///   numbers its own `Query`/`Set`/`Resume`/`EngineCommand`/`PluginCommand`
+///   with. Reusable once answered.
+/// - **Transport-internal ids**: [`DIGEST_RESYNC_QUERY_ID`] alone. A
+///   `SocketTransport` sends it from its own attachment, so its reply is
+///   that attachment's (`Audience::Client`), never the host's, and the
+///   transport consumes it before its reserved-id drop. Older clients send
+///   it too; it stays valid.
+/// - **Host ids**, every other id at or above `RESERVED_QUERY_ID_BASE`: the
+///   daemon's in-process callers (idle probe, reload checkpoint, `daemon
+///   close`/`rename`, reload's setting replay). Their replies are the
+///   host's (`Audience::Host`) and never reach an attachment; a client that
+///   sends one gets its reply on its own attachment, which can never
+///   satisfy a host waiter. [`VIEW_CHANGED_SETTING_ID`] is the view-only id
+///   of a `SettingChanged`/`Resumed` that answers no request of yours.
+///
+/// Rust clients never surface a `QueryResult` at or above this id.
 pub const RESERVED_QUERY_ID_BASE: u64 = 1 << 63;
-/// `SocketTransport` re-fetches `api_messages` under this id on a digest miss.
+/// `SocketTransport` re-fetches `api_messages` under this id on a digest
+/// miss: the one transport-internal id (see [`RESERVED_QUERY_ID_BASE`]).
 pub const DIGEST_RESYNC_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE;
 /// The daemon's idle monitor probes `Status` under this id.
 pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
@@ -119,6 +166,8 @@ pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
 /// `/thinking`, …) changed the view: not a reply to any client's `Set`
 /// (client ids never reach the reserved range), only the new view, so every
 /// attached client mirrors it, not just the one that typed the command.
+/// Also the id every other client sees on a `SettingChanged`/`Resumed` that
+/// answers one client's request, and on one that answers the host's.
 pub const VIEW_CHANGED_SETTING_ID: u64 = RESERVED_QUERY_ID_BASE + 3;
 /// `synaps daemon close` sends the engine command `close` under a fresh id
 /// at or above this one per request (`daemon/close.rs`) and awaits that id's
@@ -705,14 +754,11 @@ impl From<Envelope> for WireEnvelope {
     }
 }
 
+/// Off a socket: the daemon already routed it, so it is for this reader
+/// ([`Audience::All`]).
 impl From<WireEnvelope> for Envelope {
     fn from(e: WireEnvelope) -> Self {
-        Self {
-            session_id: e.session_id,
-            seq: e.seq,
-            ts: e.ts,
-            event: e.event.into(),
-        }
+        Envelope::new(e.session_id, e.seq, e.ts, e.event.into())
     }
 }
 
@@ -880,7 +926,23 @@ pub enum WireSessionEvent {
     /// Digest only — see module docs.
     Conversation { digest: ConversationDigest },
     Prompt { request: PromptRequest },
-    PromptResolved { prompt_id: u64 },
+    /// `outcome`: additive and ungated. An older daemon omits it (`None`:
+    /// the client infers what it can), an older client ignores it, and an
+    /// outcome newer than this build reads as `PromptOutcome::Unknown`.
+    PromptResolved {
+        prompt_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<PromptOutcome>,
+    },
+    /// A late or unknown `Answer`, to its sender only (`outcome: None` = not
+    /// remembered). A new top-level event, so it needs no capability: an
+    /// older client decodes it as [`WireSessionEvent::Unknown`] and keeps
+    /// the connection.
+    AnswerRefused {
+        prompt_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<PromptOutcome>,
+    },
     External { event: crate::events::types::Event },
     AutoTurnCapReached { cap: u32 },
     Idle,
@@ -1212,7 +1274,8 @@ impl From<SessionEventWire> for WireSessionEvent {
             }
             S::Conversation(snapshot) => Self::Conversation { digest: ConversationDigest::of(&snapshot) },
             S::Prompt(request) => Self::Prompt { request },
-            S::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
+            S::PromptResolved { prompt_id, outcome } => Self::PromptResolved { prompt_id, outcome },
+            S::AnswerRefused { prompt_id, outcome } => Self::AnswerRefused { prompt_id, outcome },
             S::External(event) => Self::External { event },
             S::AutoTurnCapReached { cap } => Self::AutoTurnCapReached { cap },
             S::Idle => Self::Idle,
@@ -1274,7 +1337,8 @@ impl From<WireSessionEvent> for SessionEventWire {
             // its mirror before handing the envelope up.
             W::Conversation { digest } => Self::Conversation(digest.into_snapshot(Vec::new())),
             W::Prompt { request } => Self::Prompt(request),
-            W::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
+            W::PromptResolved { prompt_id, outcome } => Self::PromptResolved { prompt_id, outcome },
+            W::AnswerRefused { prompt_id, outcome } => Self::AnswerRefused { prompt_id, outcome },
             W::External { event } => Self::External(event),
             W::AutoTurnCapReached { cap } => Self::AutoTurnCapReached { cap },
             W::Idle => Self::Idle,
@@ -1535,7 +1599,7 @@ mod tests {
     }
 
     fn env(event: SessionEventWire) -> Envelope {
-        Envelope { session_id: SessionId::from("wire-1"), seq: 9, ts: chrono::Utc::now(), event }
+        Envelope::new(SessionId::from("wire-1"), 9, chrono::Utc::now(), event)
     }
 
     fn stream_fixtures() -> Vec<StreamEvent> {
@@ -1622,7 +1686,8 @@ mod tests {
             S::TurnStarted { turn_baseline: 6, trigger: TurnTrigger::DriverAuto, user_text: None },
             S::Conversation(conv()),
             S::Prompt(prompt()),
-            S::PromptResolved { prompt_id: 3 },
+            S::PromptResolved { prompt_id: 3, outcome: Some(PromptOutcome::TimedOut) },
+            S::AnswerRefused { prompt_id: 3, outcome: None },
             S::External(crate::events::types::Event::simple("cli", "hello", None)),
             S::AutoTurnCapReached { cap: 5 },
             S::Idle,
@@ -1888,11 +1953,77 @@ mod tests {
         assert!(matches!(back, SessionQuery::SubagentWatch { tool_queue: true, .. }));
     }
 
+    /// `PromptResolved.outcome` both ways: an older daemon's frame (no
+    /// outcome) decodes as `None`; an outcome this build does not know
+    /// decodes as `Unknown`, not a failed event; `None` is not written, so
+    /// an older daemon's frame is unchanged; and a frame with an outcome
+    /// decodes in an older client's shape (the field is ignored).
+    #[test]
+    fn prompt_resolved_outcome_is_additive() {
+        let old: WireSessionEvent = serde_json::from_str(r#"{"ev":"prompt_resolved","prompt_id":7}"#).unwrap();
+        assert!(matches!(old, WireSessionEvent::PromptResolved { prompt_id: 7, outcome: None }), "{old:?}");
+        let newer: WireSessionEvent =
+            serde_json::from_str(r#"{"ev":"prompt_resolved","prompt_id":7,"outcome":"vetoed_by_policy"}"#).unwrap();
+        assert!(
+            matches!(newer, WireSessionEvent::PromptResolved { outcome: Some(PromptOutcome::Unknown), .. }),
+            "{newer:?}"
+        );
+        let none = serde_json::to_string(&WireSessionEvent::PromptResolved { prompt_id: 7, outcome: None }).unwrap();
+        assert_eq!(none, r#"{"ev":"prompt_resolved","prompt_id":7}"#);
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "ev", rename_all = "snake_case")]
+        enum Older {
+            PromptResolved { prompt_id: u64 },
+        }
+        for (o, name) in [
+            (PromptOutcome::Allowed, "allowed"),
+            (PromptOutcome::Denied, "denied"),
+            (PromptOutcome::Answered, "answered"),
+            (PromptOutcome::Cancelled, "cancelled"),
+            (PromptOutcome::TimedOut, "timed_out"),
+        ] {
+            let line = serde_json::to_string(&WireSessionEvent::PromptResolved { prompt_id: 7, outcome: Some(o) }).unwrap();
+            assert_eq!(line, format!(r#"{{"ev":"prompt_resolved","prompt_id":7,"outcome":"{name}"}}"#));
+            assert_eq!(o.as_str(), name);
+            let Older::PromptResolved { prompt_id } = serde_json::from_str(&line).unwrap();
+            assert_eq!(prompt_id, 7);
+        }
+    }
+
+    /// `AnswerRefused` on the wire, and as an older client reads it: its
+    /// tag is unknown there, so it decodes as `Unknown` (the generic
+    /// "unknown event" notice), not a failed frame and a reconnect.
+    #[test]
+    fn answer_refused_is_unknown_to_an_older_client() {
+        let line = serde_json::to_string(&WireSessionEvent::AnswerRefused {
+            prompt_id: 7,
+            outcome: Some(PromptOutcome::Cancelled),
+        })
+        .unwrap();
+        assert_eq!(line, r#"{"ev":"answer_refused","prompt_id":7,"outcome":"cancelled"}"#);
+        let forgotten = serde_json::to_string(&WireSessionEvent::AnswerRefused { prompt_id: 9, outcome: None }).unwrap();
+        assert_eq!(forgotten, r#"{"ev":"answer_refused","prompt_id":9}"#);
+        // An older client's enum: the variants it knew, and the fallback.
+        #[allow(dead_code)]
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(tag = "ev", rename_all = "snake_case")]
+        enum Older {
+            PromptResolved { prompt_id: u64 },
+            #[serde(other)]
+            Unknown,
+        }
+        for l in [&line, &forgotten] {
+            assert!(matches!(serde_json::from_str::<Older>(l).unwrap(), Older::Unknown), "{l}");
+            let renamed = l.replace(r#""ev":"answer_refused""#, r#""ev":"zz_from_the_future""#);
+            assert!(matches!(serde_json::from_str::<WireSessionEvent>(&renamed).unwrap(), WireSessionEvent::Unknown));
+        }
+    }
+
     #[test]
     fn wire_roundtrip_every_variant() {
         let all = fixtures();
-        // 36 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 21 StreamEvent leaves.
-        assert_eq!(all.len(), 36 + 21);
+        // 37 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 21 StreamEvent leaves.
+        assert_eq!(all.len(), 37 + 21);
         for ev in all {
             let is_conv = matches!(ev, SessionEventWire::Conversation(_));
             let e = env(ev);
@@ -2494,12 +2625,7 @@ mod tests {
     /// a current one, and every other end reason, pass unchanged.
     #[test]
     fn owner_gone_downgrades_for_older_clients() {
-        let env = |reason| Envelope {
-            session_id: "s".into(),
-            seq: 1,
-            ts: chrono::Utc::now(),
-            event: SessionEventWire::Ended { reason },
-        };
+        let env = |reason| Envelope::new("s".into(), 1, chrono::Utc::now(), SessionEventWire::Ended { reason });
         let reason = |e: Envelope| match e.event {
             SessionEventWire::Ended { reason } => reason,
             other => panic!("{other:?}"),

@@ -341,13 +341,16 @@ async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
     let wait = async {
         loop {
             match rx.recv().await {
-                Ok(env) => {
+                // The checkpoint the reload sent (host-originated); never a
+                // reply addressed to an attachment.
+                Ok(env) if env.audience == crate::session::Audience::Host => {
                     if let SessionEventWire::QueryResult { id, value } = env.event {
                         if id == CHECKPOINT_QUERY_ID {
                             return serde_json::from_value(value["record"].clone()).ok();
                         }
                     }
                 }
+                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }

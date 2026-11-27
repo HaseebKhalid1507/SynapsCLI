@@ -3332,7 +3332,6 @@ mod secret_env_allowlist_tests {
         for must in [
             "crates/agent-core/src/core/auth/muse.rs",
             "crates/agent-core/src/core/config.rs",
-            "crates/agent-engine/src/runtime/google_gemini/runtime.rs",
             "crates/agent-engine/src/session/types.rs",
             "crates/agent-engine/src/daemon/mod.rs",
             "crates/agent-tui/src/lib.rs",
