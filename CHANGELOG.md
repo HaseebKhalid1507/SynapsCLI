@@ -333,6 +333,16 @@ All notable changes to this project will be documented in this file.
   prices are unchanged, and a model with no published price still falls
   back to Sonnet's. No new dependency.
 
+- **A worker resumed cold many times keeps one copy of its task.** A cold
+  resume (the worker's cache had expired, so it gets a summary instead of a
+  replay) took "your original task" from the worker's first message, which
+  after one cold resume is the previous summary. Each further resume wrapped
+  the whole earlier summary inside the task again, so a worker resumed five
+  or ten times carried every earlier summary, nested. The task is now read
+  out of the earlier summary, so it appears once however often the worker is
+  resumed, and the previous resume's instructions stay in the summary's
+  recent steps. Archives that are already nested are unwrapped the same way.
+
 - **Sign-in opens the whole page on Windows.** The browser was started
   through `cmd /c start <url>`, and `cmd` ends a command at the first `&`:
   the Claude, ChatGPT, Gemini and Grok authorize URLs (all full of `&`)
