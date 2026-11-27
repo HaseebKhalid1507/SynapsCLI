@@ -323,6 +323,16 @@ All notable changes to this project will be documented in this file.
   two sizes. A 429 without that header, as on a subscription login, keeps
   its retries.
 
+- **OpenAI, Gemini, Grok, Groq and Kimi models cost their own list price.**
+  Every model the pricing table didn't know was billed at Sonnet's $3 / $15
+  per million tokens, with Anthropic's 0.1× cache-read rate. Synaps's own
+  table now has the provider's input, output and cached-input price for the
+  models it offers (Codex and Copilot models at the OpenAI API price of the
+  same model), and the long-context tier where the provider has one (GPT
+  over 272k, Gemini Pro over 200k, Grok from 200k prompt tokens). Claude
+  prices are unchanged, and a model with no published price still falls
+  back to Sonnet's. No new dependency.
+
 - **Sign-in opens the whole page on Windows.** The browser was started
   through `cmd /c start <url>`, and `cmd` ends a command at the first `&`:
   the Claude, ChatGPT, Gemini and Grok authorize URLs (all full of `&`)

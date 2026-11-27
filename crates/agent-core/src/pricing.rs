@@ -1,4 +1,4 @@
-//! Centralised pricing logic for Anthropic models.
+//! Centralised pricing logic for Anthropic and other providers' models.
 //!
 //! All cost calculations live here so that the engine, TUI, and any future
 //! consumer share a single source of truth. Update this file — and only this
@@ -49,11 +49,159 @@
 //!   per-model multiplier (see [`cache_read_multiplier`])
 //! - Cache write (5m):  1.25× input price  (5-minute TTL, the default)
 //! - Cache write (1h):  2.00× input price  (1-hour TTL, opt-in via `cache_ttl`)
+//!
+//! **Other providers** (OpenAI, Google Gemini, xAI, Groq, Kimi) are priced from
+//! [`provider_rates`]: exact model IDs under the route prefix Synaps uses
+//! (`openai-codex/gpt-5.5`, `google/gemini-2.5-flash`, `groq/openai/gpt-oss-20b`,
+//! ...), each with its own input, output and cached-input list price and, where
+//! the provider publishes one, a long-context tier. Subscription routes (Codex,
+//! Copilot, Gemini Code Assist) show the API list price of the same model ID.
+//! Any other model keeps the Sonnet fallback.
 
 /// Haiku 5.5 bills a prompt of more than this many tokens at the higher tier
 /// (<https://platform.claude.com/docs/en/about-claude/pricing>, "Long context
 /// pricing").
 const HAIKU_5_5_TIER_TOKENS: u64 = 100_000;
+
+/// USD per million tokens for one non-Anthropic price row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rates {
+    input: f64,
+    output: f64,
+    cached: f64,
+}
+
+const fn rates(input: f64, output: f64, cached: f64) -> Rates {
+    Rates {
+        input,
+        output,
+        cached,
+    }
+}
+
+/// A non-Anthropic model's list price: base rates, plus the rates a request
+/// whose prompt is at least `.0` tokens pays instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ProviderRow {
+    base: Rates,
+    long: Option<(u64, Rates)>,
+}
+
+const fn flat(input: f64, output: f64, cached: f64) -> ProviderRow {
+    ProviderRow {
+        base: rates(input, output, cached),
+        long: None,
+    }
+}
+
+const fn tiered(base: Rates, long_from: u64, long: Rates) -> ProviderRow {
+    ProviderRow {
+        base,
+        long: Some((long_from, long)),
+    }
+}
+
+// OpenAI, Standard tier: <https://developers.openai.com/api/docs/pricing>
+// (read 2026-11-23). "Long" is ">272K input tokens", so 272_001 and up.
+// gpt-5.6-sol is the page's current (promotional, to 2026-11-30) price;
+// gpt-5.3-codex and gpt-5-mini are listed as deprecated.
+fn openai_row(id: &str) -> Option<ProviderRow> {
+    const LONG: u64 = 272_001;
+    Some(match id {
+        "gpt-6.1-sol" => tiered(rates(2.0, 10.0, 0.1), LONG, rates(4.0, 15.0, 0.2)),
+        "gpt-6-astra" => tiered(rates(10.0, 50.0, 1.0), LONG, rates(20.0, 75.0, 2.0)),
+        "gpt-5.6-sol" => tiered(rates(4.0, 20.0, 0.4), LONG, rates(8.0, 30.0, 0.8)),
+        "gpt-5.6-terra" => tiered(rates(2.0, 12.0, 0.2), LONG, rates(4.0, 18.0, 0.4)),
+        "gpt-5.6-luna" => tiered(rates(0.2, 1.2, 0.02), LONG, rates(0.4, 1.8, 0.04)),
+        "gpt-5.5" => tiered(rates(5.0, 30.0, 0.5), LONG, rates(10.0, 45.0, 1.0)),
+        "gpt-5.4" => tiered(rates(2.5, 15.0, 0.25), LONG, rates(5.0, 22.5, 0.5)),
+        "gpt-5.4-mini" => flat(0.75, 4.5, 0.075),
+        "gpt-5.3-codex" => flat(1.75, 14.0, 0.175),
+        "gpt-5-mini" => flat(0.25, 2.0, 0.025),
+        _ => return None,
+    })
+}
+
+// Google Gemini API, Standard paid tier, text input:
+// <https://aistudio.google.com/docs/pricing> (ai.google.dev/gemini-api/docs/pricing
+// redirects there; read 2026-11-23). Long tier is "prompts > 200k tokens".
+fn gemini_row(id: &str) -> Option<ProviderRow> {
+    const LONG: u64 = 200_001;
+    Some(match id {
+        "gemini-3.1-pro-preview" => tiered(rates(2.0, 12.0, 0.2), LONG, rates(4.0, 18.0, 0.4)),
+        "gemini-3-flash-preview" => flat(0.5, 3.0, 0.05),
+        "gemini-3.1-flash-lite" => flat(0.25, 1.5, 0.025),
+        "gemini-2.5-pro" => tiered(rates(1.25, 10.0, 0.125), LONG, rates(2.5, 15.0, 0.25)),
+        "gemini-2.5-flash" => flat(0.3, 2.5, 0.03),
+        _ => return None,
+    })
+}
+
+// xAI: <https://docs.x.ai/developers/pricing> (read 2026-11-23); `-latest`
+// aliases from <https://docs.x.ai/developers/models>. Long tier is
+// "≥ 200k prompt tokens".
+fn xai_row(id: &str) -> Option<ProviderRow> {
+    const LONG: u64 = 200_000;
+    Some(match id {
+        "grok-4.7" | "grok-4.6" => tiered(rates(2.0, 6.0, 0.5), LONG, rates(4.0, 12.0, 1.0)),
+        "grok-4.5" | "grok-4.5-latest" => tiered(rates(2.0, 6.0, 0.3), LONG, rates(4.0, 12.0, 0.6)),
+        "grok-4.3"
+        | "grok-4.3-latest"
+        | "grok-4.20-0309-reasoning"
+        | "grok-4.20-0309-non-reasoning"
+        | "grok-4.20-multi-agent-0309" => tiered(rates(1.25, 2.5, 0.2), LONG, rates(2.5, 5.0, 0.4)),
+        _ => return None,
+    })
+}
+
+// Groq: <https://console.groq.com/docs/models> (read 2026-11-23); cached
+// input is "a 50% discount" per <https://console.groq.com/docs/prompt-caching>.
+fn groq_row(id: &str) -> Option<ProviderRow> {
+    Some(match id {
+        "openai/gpt-oss-120b" => flat(0.15, 0.6, 0.075),
+        "openai/gpt-oss-20b" => flat(0.075, 0.3, 0.0375),
+        _ => return None,
+    })
+}
+
+// Kimi (Moonshot AI) API: <https://platform.kimi.ai/docs/pricing/chat>
+// (platform.moonshot.ai redirects there; read 2026-11-23).
+fn kimi_row(id: &str) -> Option<ProviderRow> {
+    Some(match id {
+        "kimi-k3.1-pro" => flat(2.0, 10.0, 0.2),
+        "kimi-k3.1-pro-highspeed" => flat(4.0, 20.0, 0.2),
+        "kimi-k3" => flat(3.0, 15.0, 0.3),
+        "kimi-k2.7-code" => flat(0.95, 4.0, 0.19),
+        "kimi-k2.7-code-highspeed" => flat(1.9, 8.0, 0.38),
+        "kimi-k2.6" => flat(0.95, 4.0, 0.16),
+        _ => return None,
+    })
+}
+
+/// The non-Anthropic price row for a full Synaps model string. The route
+/// prefix picks the provider (the same ID can cost differently elsewhere, e.g.
+/// `groq/openai/gpt-oss-20b`); a bare or unknown-prefix ID has no row.
+fn provider_row(model: &str) -> Option<ProviderRow> {
+    let (prefix, id) = model.split_once('/')?;
+    match prefix {
+        "openai-codex" => openai_row(id),
+        "github-copilot" => openai_row(id).or_else(|| gemini_row(id)),
+        "google" | "google-gemini" => gemini_row(id),
+        "xai-auth" => xai_row(id),
+        "groq" => groq_row(id),
+        "kimi" => kimi_row(id),
+        _ => None,
+    }
+}
+
+/// [`provider_row`] at the tier this request's prompt size selects.
+fn provider_rates(model: &str, prompt_tokens: u64) -> Option<Rates> {
+    let row = provider_row(model)?;
+    Some(match row.long {
+        Some((from, long)) if prompt_tokens >= from => long,
+        _ => row.base,
+    })
+}
 
 /// Match a complete version, accepting dotted and hyphenated minor versions.
 /// Only documented ID suffix shapes are stripped: snapshot dates, Vertex dates,
@@ -126,6 +274,14 @@ pub fn prompt_price_tier_differs(model: &str, smaller: u64, larger: u64) -> bool
 
 /// [`model_prices`] without the fallback: `None` for a model not in the table.
 fn listed_prices(model: &str, prompt_tokens: u64) -> Option<(f64, f64)> {
+    anthropic_prices(model, prompt_tokens).or_else(|| {
+        let r = provider_rates(model, prompt_tokens)?;
+        Some((r.input, r.output))
+    })
+}
+
+/// The Anthropic (and InferX) arms; these take precedence over provider rows.
+fn anthropic_prices(model: &str, prompt_tokens: u64) -> Option<(f64, f64)> {
     Some(match model {
         // InferX publishes DeepSeek V4 Flash at $0/M input and output.
         // Keep this exact ID before generic DeepSeek entries are ever added.
@@ -164,8 +320,9 @@ fn listed_prices(model: &str, prompt_tokens: u64) -> Option<(f64, f64)> {
 /// (<https://platform.claude.com/docs/en/about-claude/pricing>, "Prompt
 /// caching"). The docs list 0.025×
 /// for Fable 5.1 / 5.2 and Mythos 5.1 / 5.2 and 0.05× for Opus 5.5 / Sonnet 5.5; every
-/// other model uses the standard 0.1× (also the conservative default for
-/// models this table does not know).
+/// other Anthropic model uses the standard 0.1× (also the conservative default
+/// for models this table does not know). Other providers' rows use their own
+/// cached-input price over their input price (base tier).
 pub fn cache_read_multiplier(model: &str) -> f64 {
     match model {
         m if is_version(m, "fable-5-1")
@@ -176,7 +333,8 @@ pub fn cache_read_multiplier(model: &str) -> f64 {
             0.025
         }
         m if is_version(m, "opus-5-5") || is_version(m, "sonnet-5-5") => 0.05,
-        _ => 0.1,
+        m if anthropic_prices(m, 0).is_some() => 0.1,
+        m => provider_row(m).map_or(0.1, |r| r.base.cached / r.base.input),
     }
 }
 
@@ -232,6 +390,16 @@ pub fn calculate_cost_split(
         .saturating_add(cache_read)
         .saturating_add(cache_write_5m)
         .saturating_add(cache_write_1h);
+    if anthropic_prices(model, prompt).is_none() {
+        if let Some(r) = provider_rates(model, prompt) {
+            // Cached input at the row's own listed price for this tier.
+            return (input_tokens as f64 / 1_000_000.0) * r.input
+                + (cache_read as f64 / 1_000_000.0) * r.cached
+                + (cache_write_5m as f64 / 1_000_000.0) * r.input * 1.25
+                + (cache_write_1h as f64 / 1_000_000.0) * r.input * 2.0
+                + (output_tokens as f64 / 1_000_000.0) * r.output;
+        }
+    }
     let (input_price, output_price) = model_prices(model, prompt);
     (input_tokens as f64 / 1_000_000.0) * input_price
         + (cache_read as f64 / 1_000_000.0) * input_price * cache_read_multiplier(model)
@@ -636,6 +804,8 @@ mod tests {
         assert!(!prompt_price_tier_differs("claude-opus-5-5", 90_000, 900_000));
         assert!(!prompt_price_tier_differs("claude-haiku-4-5", 90_000, 900_000));
         assert!(!prompt_price_tier_differs("no-such-model", 1, 900_000));
+        // A provider row with a long tier.
+        assert!(prompt_price_tier_differs("google/gemini-2.5-pro", 1_000, 900_000));
     }
 
     #[test]
@@ -651,5 +821,146 @@ mod tests {
         let cost = calculate_cost_split(m, 1_000, 1_000_000, 90_000, 0, 10_000);
         let want = 0.0005 + 0.0045 + 0.01 + 2.5;
         assert!((cost - want).abs() < 1e-12, "${cost} != ${want}");
+    }
+
+    /// `(model, input, output, cached)` per 1M at the base tier, measured on a
+    /// 100k-token prompt (below every long-context threshold).
+    fn assert_rates(cases: &[(&str, f64, f64, f64)]) {
+        for &(m, input, output, cached) in cases {
+            let i = calculate_cost(m, 100_000, 0, 0, 0) * 10.0;
+            let o = calculate_cost(m, 0, 1_000_000, 0, 0);
+            let c = calculate_cost(m, 0, 0, 100_000, 0) * 10.0;
+            assert!((i - input).abs() < 1e-9, "{m}: input ${i} != ${input}");
+            assert!((o - output).abs() < 1e-9, "{m}: output ${o} != ${output}");
+            assert!((c - cached).abs() < 1e-9, "{m}: cached ${c} != ${cached}");
+            assert!(
+                (cache_read_multiplier(m) - cached / input).abs() < 1e-12,
+                "{m}"
+            );
+            assert!(has_list_price(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn openai_rows_at_api_list_price() {
+        assert_rates(&[
+            ("openai-codex/gpt-5.5", 5.0, 30.0, 0.5),
+            ("openai-codex/gpt-6.1-sol", 2.0, 10.0, 0.1),
+            ("openai-codex/gpt-6-astra", 10.0, 50.0, 1.0),
+            ("openai-codex/gpt-5.6-luna", 0.2, 1.2, 0.02),
+            ("openai-codex/gpt-5.4-mini", 0.75, 4.5, 0.075),
+            ("github-copilot/gpt-5.4", 2.5, 15.0, 0.25),
+            ("github-copilot/gpt-5.3-codex", 1.75, 14.0, 0.175),
+            ("github-copilot/gpt-5-mini", 0.25, 2.0, 0.025),
+        ]);
+    }
+
+    #[test]
+    fn gemini_rows_at_api_list_price() {
+        assert_rates(&[
+            ("google/gemini-2.5-flash", 0.3, 2.5, 0.03),
+            ("google-gemini/gemini-2.5-pro", 1.25, 10.0, 0.125),
+            ("google-gemini/gemini-3-flash-preview", 0.5, 3.0, 0.05),
+            ("google-gemini/gemini-3.1-flash-lite", 0.25, 1.5, 0.025),
+            ("github-copilot/gemini-3.1-pro-preview", 2.0, 12.0, 0.2),
+        ]);
+    }
+
+    #[test]
+    fn xai_groq_and_kimi_rows_at_list_price() {
+        assert_rates(&[
+            ("xai-auth/grok-4.7", 2.0, 6.0, 0.5),
+            ("xai-auth/grok-4.5-latest", 2.0, 6.0, 0.3),
+            ("xai-auth/grok-4.20-0309-non-reasoning", 1.25, 2.5, 0.2),
+            ("groq/openai/gpt-oss-120b", 0.15, 0.6, 0.075),
+            ("groq/openai/gpt-oss-20b", 0.075, 0.3, 0.0375),
+            ("kimi/kimi-k3.1-pro", 2.0, 10.0, 0.2),
+            ("kimi/kimi-k3", 3.0, 15.0, 0.3),
+            ("kimi/kimi-k2.6", 0.95, 4.0, 0.16),
+        ]);
+    }
+
+    #[test]
+    fn long_context_tier_moves_the_whole_request() {
+        // (model, last base-tier prompt, base (in, out, cached), long (in, out, cached))
+        for (m, edge, base, long) in [
+            (
+                "openai-codex/gpt-5.5",
+                272_000,
+                (5.0, 30.0, 0.5),
+                (10.0, 45.0, 1.0),
+            ),
+            (
+                "google-gemini/gemini-2.5-pro",
+                200_000,
+                (1.25, 10.0, 0.125),
+                (2.5, 15.0, 0.25),
+            ),
+            (
+                "github-copilot/gemini-3.1-pro-preview",
+                200_000,
+                (2.0, 12.0, 0.2),
+                (4.0, 18.0, 0.4),
+            ),
+            (
+                "xai-auth/grok-4.7",
+                199_999,
+                (2.0, 6.0, 0.5),
+                (4.0, 12.0, 1.0),
+            ),
+        ] {
+            for (prompt, (i, o, c)) in [(edge, base), (edge + 1, long)] {
+                // Half the prompt cached; 1M output.
+                let read = prompt / 2;
+                let fresh = prompt - read;
+                let want = fresh as f64 / 1e6 * i + read as f64 / 1e6 * c + o;
+                let cost = calculate_cost(m, fresh, 1_000_000, read, 0);
+                assert!(
+                    (cost - want).abs() < 1e-9,
+                    "{m} @ {prompt}: ${cost} != ${want}"
+                );
+            }
+        }
+        // A flat row never changes tier.
+        let m = "openai-codex/gpt-5.4-mini";
+        let cost = calculate_cost(m, 1_000_000, 0, 0, 0);
+        assert!((cost - 0.75).abs() < 1e-9, "${cost}");
+    }
+
+    #[test]
+    fn unlisted_or_misrouted_provider_ids_keep_the_fallback() {
+        for m in [
+            // Offered by Synaps but not on the provider's price page.
+            "openai-codex/gpt-5.3-codex-spark",
+            "google-gemini/gemini-3.5-flash",
+            "google-gemini/gemini-3-pro-preview",
+            "xai-auth/grok-latest",
+            "groq/llama-3.3-70b-versatile",
+            "kimi-code/kimi-for-coding",
+            // Right ID, wrong or missing route prefix.
+            "openai/gpt-oss-120b",
+            "gpt-5.5",
+            "openrouter/openai/gpt-5.5",
+            "kimi/gpt-5.5",
+        ] {
+            assert!(!has_list_price(m), "{m}");
+            let cost = calculate_cost(m, 1_000_000, 1_000_000, 1_000_000, 0);
+            assert!((cost - 18.3).abs() < 1e-9, "{m}: ${cost}");
+            assert_eq!(cache_read_multiplier(m), 0.1, "{m}");
+        }
+    }
+
+    #[test]
+    fn claude_prices_unchanged_on_provider_routes() {
+        for (m, want) in [
+            ("github-copilot/claude-opus-4.8", 30.0),
+            ("github-copilot/claude-sonnet-4.6", 18.0),
+            ("anthropic/claude-sonnet-5", 12.0),
+            ("claude-haiku-4-5", 6.0),
+        ] {
+            let cost = calculate_cost(m, 1_000_000, 1_000_000, 0, 0);
+            assert!((cost - want).abs() < 1e-9, "{m}: ${cost}");
+            assert_eq!(cache_read_multiplier(m), 0.1, "{m}");
+        }
     }
 }
