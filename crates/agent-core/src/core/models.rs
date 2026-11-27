@@ -244,8 +244,17 @@ pub fn model_keeps_earlier_thinking(model: &str) -> bool {
 /// Use [`model_supports_1m`] to check whether a model *can* opt into 1M;
 /// the actual decision happens at request time based on the user's
 /// `context_window` setting.
-pub fn context_window_for_model(_model: &str) -> u64 {
-    200_000
+///
+/// Exception: models whose only published window is larger and that need no
+/// opt-in header. GPT-6.2 Astra and Sol publish a 1,050,000-token context
+/// window (922,000 max input, 128,000 max output). Exact ids only, bare or
+/// `openai-codex/`-qualified.
+pub fn context_window_for_model(model: &str) -> u64 {
+    match model {
+        "gpt-6.2-astra" | "openai-codex/gpt-6.2-astra" => 1_050_000,
+        "gpt-6.2-sol" | "openai-codex/gpt-6.2-sol" => 1_050_000,
+        _ => 200_000,
+    }
 }
 
 #[cfg(test)]
@@ -457,6 +466,27 @@ mod tests {
     fn context_window_unknown_defaults_200k() {
         assert_eq!(context_window_for_model("some-future-model"), 200_000);
         assert_eq!(context_window_for_model(""), 200_000);
+    }
+
+    #[test]
+    fn context_window_gpt_6_2_is_exact_1_05m() {
+        for model in [
+            "gpt-6.2-astra",
+            "openai-codex/gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "openai-codex/gpt-6.2-sol",
+        ] {
+            assert_eq!(context_window_for_model(model), 1_050_000, "{model}");
+        }
+        for model in [
+            "gpt-6.2-sol-preview",
+            "other/gpt-6.2-astra",
+            "gpt-6.1-sol",
+            "openai-codex/gpt-6.1-sol",
+            "gpt-6-astra",
+        ] {
+            assert_eq!(context_window_for_model(model), 200_000, "{model}");
+        }
     }
 
     #[test]
