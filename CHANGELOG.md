@@ -443,6 +443,14 @@ All notable changes to this project will be documented in this file.
   keep-warm period, which ends keep-warm and bills no tokens. Under `auto` a
   cooling account still stops the ping (the next request leaves it).
 
+- **`synaps rpc` never takes shared-inbox mail.** A `synaps send` without
+  a session goes to the shared inbox, and every session's watcher raced to
+  take it, so a session another program drives (`synaps rpc`, such as a
+  chat bridge) running next to your own chat could take an event meant for
+  that chat. An rpc session's watcher now never takes shared-inbox files,
+  for its whole life; events sent to its own session socket still arrive.
+  Daemon sessions already took them only while a client owned input.
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel

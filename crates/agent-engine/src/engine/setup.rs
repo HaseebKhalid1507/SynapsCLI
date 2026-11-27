@@ -292,7 +292,9 @@ pub(crate) fn resolve_session_and_prompt(
 /// Inbox watcher + per-session UDS listener + registry registration (code
 /// motion from `boot()`). Fails loudly when registration fails. The inbox
 /// gate starts open (tests only; `boot` sets the gate from `EngineOpts`).
-#[cfg(test)]
+/// Unix only: its two callers are unix tests, so a Windows test build would
+/// warn it is unused.
+#[cfg(all(test, unix))]
 pub(crate) fn spawn_session_background(
     runtime: &Runtime,
     session: &Session,
