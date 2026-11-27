@@ -814,6 +814,71 @@ mod tier1 {
         // shared_home dropped here — after both children are gone.
         drop(shared_home);
     }
+
+    /// An rpc child never takes shared-inbox mail, even after its client has
+    /// sent input: a session another program drives must not take events
+    /// meant for the owner's own chat. A second watcher on the same inbox
+    /// still gets the event.
+    #[tokio::test]
+    async fn rpc_child_never_takes_shared_inbox_mail() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use synaps_cli::events::{watch_inbox, Event, EventQueue, Severity};
+
+        let (mut child, ready) = spawn_and_ready().await.expect("spawn");
+        assert_eq!(ready["type"], "ready");
+
+        // The client drives the child: one prompt (it fails, no LLM).
+        child
+            .send(&json!({"type": "prompt", "id": "p1", "message": "hello"}))
+            .await
+            .expect("prompt send");
+        let mut answered = false;
+        for _ in 0..10 {
+            let frame = child
+                .recv_timeout(Duration::from_secs(10))
+                .await
+                .expect("frame after prompt");
+            if frame["type"] == "response" && frame["command"] == "prompt" {
+                answered = true;
+                break;
+            }
+        }
+        assert!(answered, "prompt response frame never arrived");
+
+        let inbox = child._home.path().join(".synaps-cli").join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let event = Event::simple("test", "for the owner's chat", Some(Severity::High));
+        let path = inbox.join(format!("{}.json", event.id));
+        let tmp = inbox.join(format!("{}.json.tmp", event.id));
+        std::fs::write(&tmp, serde_json::to_vec(&event).unwrap()).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+
+        // Three of the watcher's 2 s rescans.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(path.exists(), "the rpc child took a shared-inbox event");
+
+        let queue = Arc::new(EventQueue::new(4));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let watcher = tokio::spawn(watch_inbox(
+            inbox.clone(),
+            Arc::clone(&queue),
+            Arc::clone(&shutdown),
+        ));
+        let mut taken = false;
+        for _ in 0..50 {
+            if queue.len() == 1 && !path.exists() {
+                taken = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = timeout(Duration::from_secs(5), watcher).await;
+        assert!(taken, "the other watcher did not take the event");
+
+        child.shutdown().await.expect("clean shutdown");
+    }
 }
 
 // ---------------------------------------------------------------------------

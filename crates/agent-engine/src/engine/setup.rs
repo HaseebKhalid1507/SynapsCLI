@@ -18,6 +18,11 @@ pub struct EngineOpts {
     /// built once and later boots reuse it, profile included.
     pub profile: Option<String>,
     pub no_extensions: bool,
+    /// Whether this session's inbox watcher takes shared-inbox files. Off for
+    /// a session another program drives (`synaps rpc`): it must never take
+    /// mail meant for the owner's own chat. Its gate stays shut for its whole
+    /// life; events sent to its own session socket still arrive.
+    pub shared_inbox: bool,
 }
 
 /// Background tasks spawned during boot. Aborts on drop.
@@ -154,7 +159,11 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     // Session was resolved before policy compilation so its model is the immutable
     // foreground identity used by worker inheritance and authorization.
 
-    let background = spawn_session_background(&runtime, &sb.session)?;
+    let background = spawn_session_background_gated(
+        &runtime,
+        &sb.session,
+        Arc::new(std::sync::atomic::AtomicBool::new(opts.shared_inbox)),
+    )?;
 
     finish_session_setup(&mut runtime, &config, &sb.session, None, IndexRecord::Start);
 
@@ -282,7 +291,10 @@ pub(crate) fn resolve_session_and_prompt(
 
 /// Inbox watcher + per-session UDS listener + registry registration (code
 /// motion from `boot()`). Fails loudly when registration fails. The inbox
-/// gate starts open: an in-process session always has its user at hand.
+/// gate starts open (tests only; `boot` sets the gate from `EngineOpts`).
+/// Unix only: its two callers are unix tests, so a Windows test build would
+/// warn it is unused.
+#[cfg(all(test, unix))]
 pub(crate) fn spawn_session_background(
     runtime: &Runtime,
     session: &Session,
@@ -294,7 +306,7 @@ pub(crate) fn spawn_session_background(
     )
 }
 
-/// [`spawn_session_background`] whose inbox watcher takes shared-inbox files
+/// Inbox watcher + socket + registration, whose inbox watcher takes shared-inbox files
 /// only while `inbox_gate` is true. The per-session socket is not gated:
 /// events addressed to this session always arrive.
 pub(crate) fn spawn_session_background_gated(
