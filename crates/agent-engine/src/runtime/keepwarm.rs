@@ -48,6 +48,8 @@ use tokio_util::sync::CancellationToken;
 use super::api::{ApiMethods, ApiOptions, KeepWarmMode, KeepWarmRequest};
 use super::helpers::HelperMethods;
 use super::{Runtime, SessionEvent, StreamEvent};
+#[cfg(any(test, feature = "testing"))]
+use crate::session::cache_expiry_testing::At as Probe;
 use crate::{Result, RuntimeError, SharedMessage};
 
 /// Output tokens a ping may produce on top of a thinking budget (or in total
@@ -82,29 +84,147 @@ impl CacheAnchor {
     }
 }
 
-/// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]).
+/// What the last accepted Anthropic request left in the provider's prompt
+/// cache, as far as a later request can tell before it is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedPrefix {
+    /// Hash of everything ahead of the messages that the cache key covers
+    /// (model, effort, system, thinking, tools, beta header) and of the
+    /// account the request went out on (`RequestBody::cache_identity`). A
+    /// request with another identity reads nothing that request wrote.
+    pub identity: u64,
+    /// How many messages of that request belong to the history: all of
+    /// them, less the request-local last message of a keep-warm ping or of
+    /// a compaction request.
+    pub messages: usize,
+    /// `request::message_prefix_digest` of those messages.
+    pub digest: u64,
+}
+
+impl CachedPrefix {
+    /// The prefix a request with `identity` leaves when it is accepted
+    /// with `messages` as its history part.
+    pub fn of(identity: u64, messages: &[SharedMessage]) -> Self {
+        Self {
+            identity,
+            messages: messages.len(),
+            digest: super::request::message_prefix_digest(messages),
+        }
+    }
+
+    /// Whether `history` starts with exactly the messages that request
+    /// sent. When it does not (another session was resumed in place, the
+    /// history was edited or replaced), a request for `history` reads
+    /// nothing of the message cache however recent the anchor is.
+    pub fn leads(&self, history: &[SharedMessage]) -> bool {
+        history.len() >= self.messages
+            && super::request::message_prefix_digest(&history[..self.messages]) == self.digest
+    }
+}
+
+/// The cache part of a response's usage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheUsage {
+    pub read: u64,
+    pub write: u64,
+    /// The write's 5m and 1h parts, when the provider reports them.
+    pub write_5m: Option<u64>,
+    pub write_1h: Option<u64>,
+}
+
+/// Everything a [`CacheAnchorCell`] holds, read at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheAnchorState {
+    /// The last accepted request ([`CacheAnchorCell::get`]).
+    pub anchor: Option<CacheAnchor>,
+    /// What it left in the cache ([`CacheAnchorCell::prefix`]).
+    pub prefix: Option<CachedPrefix>,
+    /// What the provider reported that request read from and wrote to the
+    /// cache: `None` until its usage arrives (or when the response carried
+    /// none).
+    pub usage: Option<CacheUsage>,
+    /// The latest request this chain dispatched, accepted or not: the last
+    /// moment one of its requests can have refreshed the cache.
+    pub dispatched: Option<CacheAnchor>,
+}
+
+/// Shared "last accepted Anthropic request" slot (see [`CacheAnchor`]),
+/// with what that request left in the cache ([`CachedPrefix`]).
 /// Runtime clones get a FRESH cell (a clone is a different request chain,
 /// like the TTL latches); `share_ttl_latches` shares it.
 #[derive(Debug, Default)]
-pub struct CacheAnchorCell(std::sync::Mutex<Option<CacheAnchor>>);
+pub struct CacheAnchorCell(std::sync::Mutex<CacheAnchorState>);
 
 impl CacheAnchorCell {
-    pub fn stamp(&self, at: CacheAnchor) {
-        let mut slot = self
-            .0
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheAnchorState> {
+        self.0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.is_none_or(|prev| prev.mono <= at.mono) {
-            *slot = Some(at);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A request is being handed to the HTTP client at `at`, whatever
+    /// becomes of it.
+    pub fn dispatch(&self, at: CacheAnchor) {
+        let mut slot = self.lock();
+        if slot.dispatched.is_none_or(|prev| prev.mono <= at.mono) {
+            slot.dispatched = Some(at);
+        }
+    }
+
+    /// The provider's cache usage for the request accepted at `at`.
+    /// Ignored once a later request is the anchor.
+    pub fn measure(&self, at: CacheAnchor, usage: CacheUsage) {
+        let mut slot = self.lock();
+        if slot.anchor == Some(at) {
+            slot.usage = Some(usage);
+        }
+    }
+
+    /// The whole cell, from one read.
+    pub fn state(&self) -> CacheAnchorState {
+        *self.lock()
+    }
+
+    /// Stamp a request whose cached prefix is not known: that of an earlier
+    /// request no longer describes the newest one and is dropped.
+    pub fn stamp(&self, at: CacheAnchor) {
+        self.stamp_with(at, None);
+    }
+
+    /// Stamp an accepted request and the prefix it left.
+    pub fn stamp_identified(&self, at: CacheAnchor, prefix: CachedPrefix) {
+        self.stamp_with(at, Some(prefix));
+    }
+
+    fn stamp_with(&self, at: CacheAnchor, prefix: Option<CachedPrefix>) {
+        let mut slot = self.lock();
+        if slot.anchor.is_none_or(|prev| prev.mono <= at.mono) {
+            slot.anchor = Some(at);
+            slot.prefix = prefix;
+            slot.usage = None;
+        }
+        if slot.dispatched.is_none_or(|prev| prev.mono <= at.mono) {
+            slot.dispatched = Some(at);
         }
     }
 
     pub fn get(&self) -> Option<CacheAnchor> {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.lock().anchor
     }
+
+    /// What the request [`Self::get`] returns left in the cache, when known.
+    pub fn prefix(&self) -> Option<CachedPrefix> {
+        self.lock().prefix
+    }
+}
+
+/// What [`Runtime::cache_expiry_probe`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiryProbe {
+    /// The next request could read what the last accepted one left.
+    pub reads_cache: bool,
+    /// The next turn would roll the context over first.
+    pub rollover: bool,
 }
 
 /// Token usage of one ping, as reported by the provider.
@@ -387,6 +507,68 @@ pub fn reply_prefix_tokens(history: &[SharedMessage]) -> u64 {
     super::context::conservative_token_estimate(&kept.to_string())
 }
 
+/// A request built on the next turn's exact prefix that is not a turn: the
+/// durable history plus one request-local trailing user message, through the
+/// turn's own request builder.
+#[derive(Debug, Clone, Copy)]
+enum NextTurnRequest<'a> {
+    /// A keep-warm ping (see the module docs).
+    Ping(KeepWarmMode),
+    /// Cache-preserving compaction: `instructions` is the new user message.
+    Compaction {
+        instructions: &'a str,
+        request: &'a super::api::CompactionRequest,
+    },
+}
+
+impl NextTurnRequest<'_> {
+    /// Test seam: a `CacheExpiry` probe reports (and may park at) `at`.
+    #[cfg(any(test, feature = "testing"))]
+    async fn at(&self, at: Probe) {
+        if matches!(self, Self::Ping(KeepWarmMode::Expiry { .. })) {
+            crate::session::cache_expiry_testing::at(at).await;
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ping(_) => "cache keep-warm",
+            Self::Compaction { .. } => "cache-preserving compaction",
+        }
+    }
+
+    /// Whether the request is meant for the network (a probe never is; a
+    /// tool-round replay is not built here).
+    fn sends(&self) -> bool {
+        matches!(
+            self,
+            Self::Ping(KeepWarmMode::Send { .. }) | Self::Compaction { .. }
+        )
+    }
+
+    fn trailing_text(&self) -> &str {
+        match self {
+            Self::Ping(_) => KEEPWARM_PING_TEXT,
+            Self::Compaction { instructions, .. } => instructions,
+        }
+    }
+}
+
+/// An accepted cache-preserving compaction request
+/// ([`Runtime::compaction_cached_request`]).
+#[derive(Debug, Clone)]
+pub(super) struct ChatSummaryReply {
+    /// The reply (`content` blocks).
+    pub reply: Value,
+    /// What the provider billed for it: its cache reads and writes say
+    /// whether the history was read from the cache.
+    pub usage: KeepWarmUsage,
+    /// The `system` blocks and the `tools` the request carried, as sent,
+    /// each as canonical JSON (`RequestBody::prompt_stack`).
+    pub system: String,
+    pub tools: String,
+}
+
 /// Run one ping's request to completion, draining its private event channel
 /// WHILE it runs: usage lands in the tap as it arrives, so an aborted ping
 /// can still be booked. Notices (and retry notes) are collected; with
@@ -451,6 +633,11 @@ impl Runtime {
         self.cache_anchor.get()
     }
 
+    /// This chain's cache anchor cell, from one read (`CacheExpiry`).
+    pub fn cache_anchor_state(&self) -> CacheAnchorState {
+        self.cache_anchor.state()
+    }
+
     /// The session's silent 1h→5m downgrade latch has fired: the server
     /// honours only 5m whatever the configured TTL says.
     pub fn cache_ttl_downgraded(&self) -> bool {
@@ -483,6 +670,31 @@ impl Runtime {
             context_blocks: value["keepwarm_context_blocks"]
                 .as_str()
                 .map(str::to_string),
+        })
+    }
+
+    /// `CacheExpiry`'s probe: whether the next turn's request for `history`
+    /// could read what `expect` (the last accepted request) left in the
+    /// cache (the same cache identity, and a history that starts with the
+    /// messages that request sent), and whether that turn would roll the
+    /// context over first. Assembled by the code that builds a ping (the
+    /// turn's prefix by construction); sends nothing, touches no latch.
+    pub async fn cache_expiry_probe(
+        &self,
+        history: &[SharedMessage],
+        expect: CachedPrefix,
+    ) -> Result<ExpiryProbe> {
+        let cancel = CancellationToken::new();
+        let tap = PingTap::default();
+        let (value, _) = self
+            .keepwarm_request(history, &cancel, KeepWarmMode::Expiry { expect }, &tap)
+            .await;
+        let value = value?;
+        Ok(ExpiryProbe {
+            reads_cache: value["reads_cache"].as_bool().ok_or_else(|| {
+                RuntimeError::Session("cache expiry probe built no request".into())
+            })?,
+            rollover: value.get("keepwarm_context_blocks").is_some(),
         })
     }
 
@@ -526,7 +738,7 @@ impl Runtime {
         tap: &PingTap,
     ) -> (Result<Value>, Vec<String>) {
         match self
-            .keepwarm_request_inner(history, cancel, mode, tap)
+            .next_turn_request(history, cancel, NextTurnRequest::Ping(mode), tap)
             .await
         {
             Ok(r) => r,
@@ -534,21 +746,95 @@ impl Runtime {
         }
     }
 
+    /// What this chain's last accepted Anthropic request left in the cache
+    /// (see [`CachedPrefix`]); `None` before one, or when it is not known.
+    pub fn cached_prefix(&self) -> Option<CachedPrefix> {
+        self.cache_anchor.prefix()
+    }
+
+    /// Send the chat's own next request for `history` with `instructions`
+    /// as its new user message (cache-preserving compaction, task 430) and
+    /// return the reply's content blocks. Assembled by the same code as a
+    /// keep-warm ping, hence as a turn: system, tools, thinking, effort and
+    /// history are the turn's; the message cache marker sits on the last
+    /// history message, as a ping's does.
+    /// Refused before the network when the request could not read what
+    /// `expect` (the last accepted request) left in the cache: another
+    /// cache identity, or a history that does not start with the messages
+    /// that request sent. Runs no tool, fires no hook, never touches
+    /// `history` or any session state, and emits nothing to a frontend.
+    /// What the provider billed is booked into `spend` (the caller's
+    /// session books it from there), also when the reply is an error or is
+    /// then refused: the request was paid for.
+    pub(super) async fn compaction_cached_request(
+        &self,
+        history: &[SharedMessage],
+        instructions: &str,
+        expect: CachedPrefix,
+        spend: &super::compaction::CompactionSpend,
+        cancel: &CancellationToken,
+    ) -> Result<ChatSummaryReply> {
+        // The tap's usage IS the ledger line: usage the provider reports is
+        // booked as it arrives, so an aborted request (Cancel while the
+        // stream is still open) keeps what it was billed.
+        let tap = PingTap {
+            usage: spend.open(agent_core::compaction::SummaryRequest::ChatRequest, &self.model),
+            ..PingTap::default()
+        };
+        let request = super::api::CompactionRequest::expecting(expect);
+        let (result, _notices) = self
+            .next_turn_request(
+                history,
+                cancel,
+                NextTurnRequest::Compaction {
+                    instructions,
+                    request: &request,
+                },
+                &tap,
+            )
+            .await?;
+        // Did it read the cache? Every check before the network said it
+        // would; the provider's usage says whether it did. Already in
+        // `spend`, also when the reply is then refused: it was billed.
+        let usage = tap.usage();
+        if let Some(warning) =
+            super::compaction_cached::cache_miss_warning(self.session_id.as_deref(), &usage)
+        {
+            tracing::warn!("{warning}");
+        }
+        let reply = result?;
+        // Set by the transport before it sends; a reply without it cannot
+        // be described, so it is not used.
+        let (system, tools) = request.sent.get().ok_or_else(|| {
+            RuntimeError::Session(
+                "cache-preserving compaction: the request left no record of what it sent".into(),
+            )
+        })?;
+        Ok(ChatSummaryReply {
+            reply,
+            usage,
+            system,
+            tools,
+        })
+    }
+
     /// `Err` = refused before any request was built (nothing billed);
     /// `Ok((Err, _))` = the request itself failed (usage, if any, is in `tap`).
-    async fn keepwarm_request_inner(
+    async fn next_turn_request(
         &self,
         history: &[SharedMessage],
         cancel: &CancellationToken,
-        mode: KeepWarmMode,
+        purpose: NextTurnRequest<'_>,
         tap: &PingTap,
     ) -> Result<(Result<Value>, Vec<String>)> {
+        let what = purpose.label();
         if let Some(reason) = self.cache_keepwarm_ineligibility() {
-            return Err(RuntimeError::Config(format!(
-                "cache keep-warm skipped: {reason}"
-            )));
+            return Err(RuntimeError::Config(format!("{what} skipped: {reason}")));
         }
-        if !history_ready(history) {
+        // The marker of either goes on the last history message. A ping is
+        // worth sending only after a finished reply; a compaction request
+        // takes any history (the marker walks back to a markable block).
+        if matches!(purpose, NextTurnRequest::Ping(_)) && !history_ready(history) {
             return Err(RuntimeError::Config(
                 "cache keep-warm skipped: history does not end with a finished assistant reply"
                     .into(),
@@ -562,22 +848,26 @@ impl Runtime {
             (state.durability_blocked, state.enabled())
         };
         if durability_blocked {
-            return Err(RuntimeError::Session(
-                "cache keep-warm skipped: context head save is unresolved".into(),
-            ));
+            return Err(RuntimeError::Session(format!(
+                "{what} skipped: context head save is unresolved"
+            )));
         }
 
         // Same preflight as a real turn (run_stream_tracked). A probe sends
         // nothing, so it never needs a token refresh.
         self.validate_request_preflight().await?;
         let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
-        if matches!(mode, KeepWarmMode::Send { .. }) {
-            // Never selects, switches or re-binds an account; a cooling
-            // account ends the period (the ping fails before sending).
+        if purpose.sends() {
+            // Never selects, switches or re-binds an account; under `auto` a
+            // cooling account ends the period (the ping fails before sending).
+            // A compaction request likewise stays on the account whose cache
+            // it reads.
             self.refresh_for_keepwarm().await?;
         }
 
         // System prompt: run_stream_tracked → run_stream_internal, verbatim.
+        #[cfg(any(test, feature = "testing"))]
+        purpose.at(Probe::SystemPrompt).await;
         let system_prompt = self.effective_system_prompt().await;
         let system_prompt = if context_enabled {
             Some(format!(
@@ -588,10 +878,14 @@ impl Runtime {
         } else {
             system_prompt
         };
+        #[cfg(any(test, feature = "testing"))]
+        purpose.at(Probe::Injection).await;
         let session_injection = match self.session_id.as_deref() {
             Some(id) => self.hook_bus.session_injection_for(id).await,
             None => None,
         };
+        #[cfg(any(test, feature = "testing"))]
+        purpose.at(Probe::InjectionRead).await;
         let system_prompt = match session_injection {
             Some(content) => Some(super::stream::wrap_extension_context(
                 system_prompt.as_deref().unwrap_or_default(),
@@ -606,7 +900,7 @@ impl Runtime {
         // retention anchor the transport places from it, match the next turn.
         let mut request: Vec<SharedMessage> = history.to_vec();
         request.push(Arc::new(
-            json!({"role": "user", "content": KEEPWARM_PING_TEXT}),
+            json!({"role": "user", "content": purpose.trailing_text()}),
         ));
         let round_images =
             super::image_retention::round_images(&self.model, self.codex_request_role(), &request)
@@ -709,12 +1003,19 @@ impl Runtime {
             // A successful ping refreshes the cache: it moves the anchor the
             // next ping is scheduled from.
             cache_anchor: Some(Arc::clone(&self.cache_anchor)),
-            keepwarm: Some(KeepWarmRequest {
-                mode,
-                status: Arc::clone(&tap.status),
-                sent: Arc::clone(&tap.sent),
-                connect_failed: Arc::clone(&tap.connect_failed),
-            }),
+            keepwarm: match purpose {
+                NextTurnRequest::Ping(mode) => Some(KeepWarmRequest {
+                    mode,
+                    status: Arc::clone(&tap.status),
+                    sent: Arc::clone(&tap.sent),
+                    connect_failed: Arc::clone(&tap.connect_failed),
+                }),
+                NextTurnRequest::Compaction { .. } => None,
+            },
+            compaction: match purpose {
+                NextTurnRequest::Ping(_) => None,
+                NextTurnRequest::Compaction { request, .. } => Some(request.clone()),
+            },
             // Header only (cache-key parity with the turns this ping keeps
             // warm); a ping never sends `diagnostics` nor moves the chain.
             cache_diagnosis: self.cache_diagnosis(),
@@ -734,6 +1035,16 @@ impl Runtime {
             request_messages,
             tx,
             cancel,
+            // Neither a ping nor a compaction request retries: both retry
+            // budgets are zero, and the transport ends either on its first
+            // HTTP 429 or 5xx, network error, in-stream error or overload
+            // (`single_attempt`: no wait, no account switch at a limit).
+            // That is not "sent exactly once": the immediate resends listed
+            // at `single_attempt` remain (a 401, a gzip refusal, a refused
+            // cache-diagnosis header); a compaction request's 401 resend
+            // is not sent when the fresh token is another account's. A
+            // failed compaction request falls back to the transcript
+            // request, which keeps the normal retries.
             0,
             0,
             &options,
@@ -741,7 +1052,11 @@ impl Runtime {
         );
         let (mut result, notices) = drive_ping(call, &mut rx, tap, None).await;
         // Probe: also run the next turn's pre-request context assessment.
-        if let (Ok(value), KeepWarmMode::Probe) = (&mut result, mode) {
+        if let (
+            Ok(value),
+            NextTurnRequest::Ping(KeepWarmMode::Probe | KeepWarmMode::Expiry { .. }),
+        ) = (&mut result, purpose)
+        {
             if context_enabled {
                 if let Some(why) = self.keepwarm_context_blocks(
                     history,
@@ -918,7 +1233,7 @@ mod tests {
         (format!("http://{addr}"), mock)
     }
 
-    /// `before_message` hook that counts its calls and injects per-turn text.
+    /// `before_message` hook that counts its calls and injects turn-only text.
     struct CountingInject(Arc<AtomicUsize>);
     #[async_trait::async_trait]
     impl crate::extensions::runtime::ExtensionHandler for CountingInject {
@@ -927,8 +1242,12 @@ mod tests {
         }
         async fn handle(&self, _event: &HookEvent) -> HookResult {
             self.0.fetch_add(1, Ordering::SeqCst);
+            // Turn-only (#414): saved context is durable history, which a
+            // ping replays like any other; turn-only context never is.
             HookResult::Inject {
                 content: "PER-TURN-INJECTED-CONTEXT".into(),
+                forget: true,
+                parts: Vec::new(),
             }
         }
         async fn shutdown(&self) {}
@@ -1397,6 +1716,126 @@ mod tests {
         assert_identity_1h(&rt).await;
     }
 
+    /// An extension tool registered while the session is idle.
+    struct LateTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for LateTool {
+        fn name(&self) -> &str {
+            "cards:ui"
+        }
+        fn description(&self) -> &str {
+            "late-registered fixture"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Extension {
+                extension_id: "cards".into(),
+            }
+        }
+        fn extension_id(&self) -> Option<&str> {
+            Some("cards")
+        }
+        async fn execute(&self, _: Value, _: crate::tools::ToolContext) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn late_tool(body: &Value) -> Option<&Value> {
+        body["tools"].as_array()?.iter().find(|t| {
+            t["name"].as_str().is_some_and(|n| n.contains("cards") && n.contains("ui"))
+        })
+    }
+
+    /// The incident of 2026-11-24: an extension loads while a session is
+    /// idle and its tool lands on the DEFERRED list. Deferred definitions
+    /// are not in the cached prefix, so the ping still goes out, and it
+    /// sends what the next real turn sends through the last breakpoint.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_tool_joining_the_deferred_list_keeps_the_ping() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus(CacheTtl::OneHour);
+        rt.progressive_tool_disclosure = true;
+        rt.deferred_tool_loading = true;
+        let history = real_turn(&rt, vec![user("hello")]).await;
+        let fp = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+
+        rt.tools.write().await.register(Arc::new(LateTool));
+        let report = rt
+            .cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &PingTap::default())
+            .await;
+        assert_eq!(report.result, Ok(PingOutcome::Sent), "{report:?}");
+        let mut next = history.clone();
+        next.push(user("next question"));
+        real_turn(&rt, next).await;
+
+        let bodies: Vec<Value> = mock
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 3, "previous turn, ping, next turn");
+        let (before, ping, real) = (&bodies[0], &bodies[1], &bodies[2]);
+        assert!(late_tool(before).is_none(), "fixture: not registered yet");
+        for body in [ping, real] {
+            let tool = late_tool(body).expect("the late tool is offered");
+            assert_eq!(tool["defer_loading"], true, "and deferred: {tool}");
+        }
+        assert_prefix_identical(ping, real, history.len(), &marker_1h(), 1);
+    }
+
+    /// The other side: a late tool that is sent WITHOUT `defer_loading` is
+    /// part of the cached prefix, so the ping must refuse. Two ways in: an
+    /// always-loaded id that joins the session core once it registers, and
+    /// no deferred loading at all (every tool is loaded).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_tool_joining_the_loaded_tools_changes_the_prefix() {
+        use crate::tools::catalog::ToolId;
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        for (always_loaded, deferred) in [(true, true), (false, false)] {
+            let mut rt = opus(CacheTtl::OneHour);
+            rt.progressive_tool_disclosure = deferred;
+            rt.deferred_tool_loading = deferred;
+            if always_loaded {
+                rt.tools_always_loaded = Arc::from([ToolId::extension("cards", "ui")]);
+            }
+            let history = real_turn(&rt, vec![user("hello")]).await;
+            let fp = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+            let sent = mock.bodies.lock().unwrap().len();
+
+            rt.tools.write().await.register(Arc::new(LateTool));
+            let report = rt
+                .cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &PingTap::default())
+                .await;
+            assert!(
+                matches!(report.result, Ok(PingOutcome::PrefixChanged { .. })),
+                "always_loaded={always_loaded} deferred={deferred}: {report:?}"
+            );
+            assert_eq!(mock.bodies.lock().unwrap().len(), sent, "nothing was sent");
+
+            let mut next = history.clone();
+            next.push(user("next question"));
+            real_turn(&rt, next).await;
+            let real: Value =
+                serde_json::from_str(mock.bodies.lock().unwrap().last().unwrap()).unwrap();
+            let tool = late_tool(&real).expect("the next turn offers the late tool");
+            assert!(
+                tool.get("defer_loading").is_none(),
+                "always_loaded={always_loaded}: it is a loaded tool: {tool}"
+            );
+        }
+    }
+
     /// A ping projects exactly what the next turn start selects — including
     /// activations handed over by a daemon reload or an unpark that the turn
     /// start has not restored yet. (The session only schedules pings after
@@ -1524,13 +1963,17 @@ mod tests {
         }));
     }
 
-    /// Review fix 2: an idle keep-warm ping never selects, switches or
-    /// re-binds an account. The session's account cooling down (a limit met
-    /// elsewhere) stops it before anything is sent, saying so; the session
-    /// stays bound to its account.
+    /// An idle keep-warm ping never selects, switches or re-binds an
+    /// account. Under the default selector (an explicit account) the
+    /// session's account cooling down does not stop it: the session cannot
+    /// leave that account, and the cooldown is account-wide (fail-closed or
+    /// stale) or this model's own, a limit the ping meets as a 429 at most.
+    /// The ping goes on the same account and the session stays bound to it.
+    /// (Under `auto` a cooling account stops it: auth.rs
+    /// `keepwarm_refresh_keeps_the_bound_seat_and_never_selects`.)
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
-    async fn an_idle_ping_on_a_cooling_account_sends_nothing() {
+    async fn an_idle_ping_on_a_cooling_account_it_cannot_leave_still_pings() {
         let _base = crate::test_env::BaseDirGuard::new();
         let (url, mock) = spawn_mock().await;
         let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
@@ -1549,13 +1992,10 @@ mod tests {
         let report = rt
             .cache_keepwarm_ping(&history, fingerprint, &CancellationToken::new(), &tap)
             .await;
-        match &report.result {
-            Err(PingFailure::Fatal(why)) => assert!(why.contains("account cooling"), "{why}"),
-            other => panic!("the ping stops on the cooling account: {other:?}"),
-        }
-        assert!(!tap.was_sent());
+        assert_eq!(report.result, Ok(PingOutcome::Sent), "{report:?}");
+        assert!(tap.was_sent());
         assert!(report.notices.is_empty(), "{:?}", report.notices);
-        assert_eq!(mock.bodies.lock().unwrap().len(), 1, "only the turn was sent");
+        assert_eq!(mock.bodies.lock().unwrap().len(), 2, "the turn, then the ping");
         assert_eq!(rt.auth.read().await.bound_credential, bound, "not re-bound");
         assert_eq!(rt.auth.read().await.auth_token, "oauth-test-token");
     }
@@ -2082,6 +2522,128 @@ mod tests {
             Some(later),
             "a late-arriving older stamp never rewinds"
         );
+    }
+
+    /// The prefix belongs to the request the anchor names: a newer request
+    /// without one clears it, an older stamp changes nothing.
+    #[test]
+    fn anchor_cell_prefix_follows_the_newest_request() {
+        let cell = CacheAnchorCell::default();
+        assert_eq!(cell.prefix(), None);
+        let a = CacheAnchor::now();
+        let at = |secs| CacheAnchor {
+            mono: a.mono + std::time::Duration::from_secs(secs),
+            wall: a.wall + std::time::Duration::from_secs(secs),
+        };
+        let (new, old) = (CachedPrefix::of(42, &[]), CachedPrefix::of(7, &[]));
+        cell.stamp_identified(at(5), new);
+        assert_eq!((cell.get(), cell.prefix()), (Some(at(5)), Some(new)));
+        cell.stamp_identified(a, old);
+        assert_eq!(cell.prefix(), Some(new), "an older stamp never rewinds");
+        cell.stamp(at(9));
+        assert_eq!((cell.get(), cell.prefix()), (Some(at(9)), None));
+    }
+
+    /// `CacheExpiry`'s fields: the latest dispatch only moves forward and
+    /// an acceptance counts as one; usage is measured for the anchor's own
+    /// request only, and a newer acceptance clears it.
+    #[test]
+    fn anchor_cell_dispatch_and_measure() {
+        let cell = CacheAnchorCell::default();
+        let a = CacheAnchor::now();
+        let at = |secs| CacheAnchor {
+            mono: a.mono + std::time::Duration::from_secs(secs),
+            wall: a.wall + std::time::Duration::from_secs(secs),
+        };
+        cell.dispatch(at(3));
+        cell.dispatch(a);
+        assert_eq!(cell.state().dispatched, Some(at(3)), "never rewinds");
+        let used = |read| CacheUsage {
+            read,
+            ..CacheUsage::default()
+        };
+        cell.measure(at(3), used(9));
+        assert_eq!(cell.state().usage, None, "no request accepted at 3");
+        cell.stamp_identified(at(5), CachedPrefix::of(1, &[]));
+        assert_eq!(
+            cell.state().dispatched,
+            Some(at(5)),
+            "an accepted request was dispatched"
+        );
+        cell.measure(at(5), used(20));
+        cell.measure(at(3), used(9));
+        assert_eq!(
+            cell.state().usage,
+            Some(used(20)),
+            "only the anchor's own usage"
+        );
+        cell.dispatch(at(8));
+        assert_eq!(cell.state().usage, Some(used(20)), "a dispatch keeps it");
+        cell.stamp_identified(at(8), CachedPrefix::of(1, &[]));
+        assert_eq!(
+            cell.state(),
+            CacheAnchorState {
+                anchor: Some(at(8)),
+                prefix: Some(CachedPrefix::of(1, &[])),
+                usage: None,
+                dispatched: Some(at(8)),
+            }
+        );
+    }
+
+    /// A history is led by a request's messages only when it starts with
+    /// exactly them. The last message of the request counts in its durable
+    /// form: a turn sends its newest user message as blocks, with turn-only
+    /// context after them, and the history holds the bare string.
+    #[test]
+    fn a_cached_prefix_leads_only_a_history_that_starts_with_its_messages() {
+        let m = |role: &str, content: Value| Arc::new(json!({"role": role, "content": content}));
+        let turn_only = agent_core::core::extension_context::guard_turn("the time is 12:00");
+        assert!(super::super::stream::is_ephemeral_turn_context_block(
+            &json!({"type": "text", "text": turn_only})
+        ));
+        let sent = vec![
+            m("user", json!("one")),
+            m("assistant", json!("two")),
+            m("user", json!([{"type": "text", "text": "three"}, {"type": "text", "text": turn_only}])),
+        ];
+        let prefix = CachedPrefix::of(1, &sent);
+        assert_eq!(prefix.messages, 3);
+
+        let history = vec![
+            m("user", json!("one")),
+            m("assistant", json!("two")),
+            m("user", json!("three")),
+            m("assistant", json!("four")),
+        ];
+        assert!(prefix.leads(&history), "the same conversation, one reply on");
+        assert!(prefix.leads(&history[..3]));
+        assert!(!prefix.leads(&history[..2]), "shorter than what was sent");
+
+        let mut edited = history.clone();
+        edited[0] = m("user", json!("ONE"));
+        assert!(!prefix.leads(&edited), "an earlier message changed");
+        let mut edited = history.clone();
+        edited[2] = m("user", json!("3"));
+        assert!(!prefix.leads(&edited), "the last sent message changed");
+        let other = vec![m("user", json!("another session")); 4];
+        assert!(!prefix.leads(&other), "another conversation");
+
+        // Host keys never reach the wire and do not count.
+        let mut stamped = history.clone();
+        stamped[1] = Arc::new(json!({"role": "assistant", "content": "two", "_synaps_time": 5}));
+        assert!(prefix.leads(&stamped));
+        assert!(CachedPrefix::of(1, &[]).leads(&history), "nothing sent leads anything");
+
+        // A request-only advisory chained after the newest user message is
+        // not part of the history the request leaves cached.
+        let advisory = m("user", json!(super::super::continuation::ADVISORY_PREFIX));
+        let mut with_advisory = sent.clone();
+        with_advisory.push(advisory);
+        let durable = super::super::request::durable_len(&with_advisory);
+        assert_eq!(durable, 3);
+        assert_eq!(CachedPrefix::of(1, &with_advisory[..durable]), prefix);
+        assert_eq!(super::super::request::durable_len(&history), 4);
     }
 
     #[test]

@@ -563,13 +563,26 @@ pub enum HookResult {
     Continue,
     /// Prevent the hooked operation. The `reason` is surfaced to the user.
     Block { reason: String },
-    /// Inject context — the extension provides text for the current request.
-    /// Placement depends on the hook (#297): `on_session_start` content is
-    /// appended to the system prompt (session-stable, cache-safe);
-    /// `before_message` content is attached to the newest user message on the
-    /// outgoing request as an ephemeral trailing block positioned AFTER the
-    /// conversational cache marker (per-turn, uncached tail, cache-neutral).
-    Inject { content: String },
+    /// Inject context. Placement depends on the hook: `on_session_start`
+    /// `content` is appended to the system prompt (session-stable,
+    /// cache-safe; `forget`/`parts` are ignored there). On `before_message`
+    /// (#414) every part is SAVED by default: written once into durable
+    /// history on the user message the hook ran for. A part with
+    /// `forget: true` is shown at the tail of every request of the turn
+    /// instead, never saved, and a marker is saved in its place.
+    ///
+    /// `parts`, when present and non-empty, replaces `content` (which stays
+    /// required, so an older host still parses the result and injects
+    /// `content` the old way). After `HookBus::emit` the result carries every
+    /// extension's parts, each stamped with its host-known source.
+    Inject {
+        content: String,
+        /// Whether `content` is turn-only (ignored when `parts` is used).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        forget: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<InjectPart>,
+    },
     /// Ask the runtime to get explicit user confirmation before proceeding.
     /// Only valid on before_tool_call hooks.
     ///
@@ -623,7 +636,56 @@ pub enum HookResult {
     ContextPhase { phase: String },
 }
 
+/// One piece of `before_message` injected context.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InjectPart {
+    #[serde(default)]
+    pub content: String,
+    /// Turn-only: shown for this turn, never saved; a marker is saved.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forget: bool,
+    /// Host-stamped extension id (`HookBus::emit`). Never read from or
+    /// written to the extension wire, so no extension can speak as another.
+    #[serde(skip)]
+    pub source: Option<String>,
+}
+
+impl InjectPart {
+    pub fn saved(content: impl Into<String>) -> Self {
+        Self { content: content.into(), ..Self::default() }
+    }
+
+    pub fn forget(content: impl Into<String>) -> Self {
+        Self { content: content.into(), forget: true, source: None }
+    }
+
+    pub fn from_source(mut self, source: &str) -> Self {
+        self.source = Some(source.to_string());
+        self
+    }
+}
+
 impl HookResult {
+    /// A plain saved `Inject` of `content` (the wire's `{"action":"inject",
+    /// "content":…}`).
+    pub fn inject(content: impl Into<String>) -> Self {
+        Self::Inject { content: content.into(), forget: false, parts: Vec::new() }
+    }
+
+    /// The parts an `Inject` stands for: `parts` when non-empty, else one
+    /// part from `content`/`forget`. Empty for any other result.
+    pub fn inject_parts(&self) -> Vec<InjectPart> {
+        match self {
+            Self::Inject { parts, .. } if !parts.is_empty() => parts.clone(),
+            Self::Inject { content, forget, .. } => vec![InjectPart {
+                content: content.clone(),
+                forget: *forget,
+                source: None,
+            }],
+            _ => Vec::new(),
+        }
+    }
+
     /// An unattributed `Confirm` (as an extension returns it, before
     /// `HookBus::emit` stamps the source).
     pub fn confirm(message: impl Into<String>) -> Self {
@@ -715,9 +777,7 @@ mod tests {
             !HookKind::OnMessageComplete.allows_result(&HookResult::Block { reason: "r".into() })
         );
         assert!(
-            !HookKind::OnMessageComplete.allows_result(&HookResult::Inject {
-                content: "c".into()
-            })
+            !HookKind::OnMessageComplete.allows_result(&HookResult::inject("c"))
         );
     }
 
@@ -858,7 +918,7 @@ mod tests {
             assert!(kind.allows_result(&HookResult::Continue));
             for refused in [
                 HookResult::Block { reason: "r".into() },
-                HookResult::Inject { content: "c".into() },
+                HookResult::inject("c"),
                 HookResult::confirm("m"),
                 HookResult::Modify { input: json!({}) },
                 HookResult::Replace { output: "o".into() },
@@ -1075,6 +1135,25 @@ mod tests {
         assert_eq!(ev.session_id.as_deref(), Some("sess-abc-123"));
         assert!(ev.tool_name.is_none());
         assert!(ev.message.is_none());
+    }
+
+    /// #414 review: the `on_session_end` transcript is what the model saw:
+    /// saved blocks and markers stay, and each hooked message carries the
+    /// host's count (`_synaps_hooked`) so an extension can tell them from
+    /// what the user typed (protocol.md, "Transcripts and history").
+    #[test]
+    fn session_end_transcript_carries_saved_blocks_and_the_count() {
+        use agent_core::core::extension_context as ec;
+        let mut prompt = json!({"role": "user", "content": [
+            {"type": "text", "text": "go"},
+            {"type": "text", "text": ec::marker_text("axel")},
+        ]});
+        ec::set_hooked(&mut prompt, 1);
+        let ev = HookEvent::on_session_end("s", Some(vec![std::sync::Arc::new(prompt)]));
+        let wire = serde_json::to_value(&ev).unwrap();
+        let sent = &wire["transcript"][0];
+        assert_eq!(sent[ec::HOOKED_KEY], 1);
+        assert_eq!(sent["content"][1]["text"], ec::marker_text("axel"));
     }
 
     /// HookEvent is round-trippable through JSON without loss.
@@ -1305,9 +1384,7 @@ mod tests {
             ("replace", HookResult::Replace { output: "o".into() }),
             (
                 "inject",
-                HookResult::Inject {
-                    content: "c".into(),
-                },
+                HookResult::inject("c"),
             ),
             (
                 "context_phase",
@@ -1331,5 +1408,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── before_message inject wire (#414) ─────────────────────────────────
+
+    /// `HookResult` as 0.12.0 (0b5dc48c) declared it, frozen: what an older
+    /// host parses an extension's result with.
+    #[derive(Debug, PartialEq, Deserialize)]
+    #[serde(tag = "action", rename_all = "snake_case")]
+    enum HookResultV0_12_0 {
+        Continue,
+        Inject { content: String },
+    }
+
+    #[test]
+    fn todays_deserializer_ignores_forget_and_parts() {
+        for wire in [
+            json!({"action": "inject", "content": "T", "forget": true}),
+            json!({"action": "inject", "content": "fallback",
+                   "parts": [{"content": "A"}, {"content": "B", "forget": true}]}),
+            json!({"action": "inject", "content": "T", "future": {"x": 1}}),
+        ] {
+            let old: HookResultV0_12_0 = serde_json::from_value(wire.clone()).unwrap();
+            let content = wire["content"].as_str().unwrap().to_string();
+            assert_eq!(old, HookResultV0_12_0::Inject { content }, "{wire}");
+        }
+    }
+
+    #[test]
+    fn content_only_is_one_saved_part() {
+        let r: HookResult =
+            serde_json::from_value(json!({"action": "inject", "content": "T"})).unwrap();
+        assert_eq!(r, HookResult::inject("T"));
+        assert_eq!(r.inject_parts(), vec![InjectPart::saved("T")]);
+        // Serializes back to exactly the old shape.
+        assert_eq!(serde_json::to_value(&r).unwrap(), json!({"action": "inject", "content": "T"}));
+    }
+
+    #[test]
+    fn forget_flag_marks_the_content_part() {
+        let r: HookResult =
+            serde_json::from_value(json!({"action": "inject", "content": "T", "forget": true}))
+                .unwrap();
+        assert_eq!(r.inject_parts(), vec![InjectPart::forget("T")]);
+    }
+
+    #[test]
+    fn parts_override_content_and_unknown_fields_are_tolerated() {
+        let r: HookResult = serde_json::from_value(json!({
+            "action": "inject", "content": "fallback", "forget": true, "extra": 1,
+            "parts": [{"content": "A", "x": 2}, {"content": "B", "forget": true}]
+        }))
+        .unwrap();
+        assert_eq!(
+            r.inject_parts(),
+            vec![InjectPart::saved("A"), InjectPart::forget("B")]
+        );
+        // Empty `parts` falls back to `content`.
+        let r: HookResult = serde_json::from_value(
+            json!({"action": "inject", "content": "fallback", "parts": []}),
+        )
+        .unwrap();
+        assert_eq!(r.inject_parts(), vec![InjectPart::saved("fallback")]);
+    }
+
+    #[test]
+    fn a_source_on_the_wire_is_never_read() {
+        let r: HookResult = serde_json::from_value(json!({
+            "action": "inject", "content": "c",
+            "parts": [{"content": "A", "source": "someone-else"}]
+        }))
+        .unwrap();
+        assert_eq!(r.inject_parts()[0].source, None);
+        let wire = serde_json::to_value(InjectPart::saved("A").from_source("me")).unwrap();
+        assert_eq!(wire, json!({"content": "A"}));
     }
 }

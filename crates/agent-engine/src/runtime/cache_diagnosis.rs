@@ -90,9 +90,10 @@ pub(super) struct DiagnosticsParam {
 }
 
 /// `diagnostics` for a request with these options: `None` when the setting
-/// is off, latched off, or the request is a keep-warm ping.
+/// is off, latched off, or the request is a keep-warm ping or a compaction
+/// summary (neither is a link of the foreground chain).
 pub(super) fn diagnostics_for(options: &super::api::ApiOptions) -> Option<DiagnosticsParam> {
-    if options.keepwarm.is_some() {
+    if options.keepwarm.is_some() || options.compaction.is_some() {
         return None;
     }
     let chain = options.cache_diagnosis.as_ref().filter(|c| c.active())?;

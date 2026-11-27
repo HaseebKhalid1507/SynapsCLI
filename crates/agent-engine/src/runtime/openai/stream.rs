@@ -1239,6 +1239,23 @@ pub(crate) fn build_codex_body(
     max_tokens: Option<u32>,
     prompt_cache_key: &str,
 ) -> serde_json::Value {
+    // GPT-6.2 appends the top-level `instructions` field AFTER `input`, so the
+    // system prompt goes in as the first `developer` input message (keeps the
+    // ordering and the cached prefix) and no top-level field is sent.
+    let gpt_6_2 = crate::runtime::openai::catalog::is_gpt_6_2_model(model);
+    let mut input = input;
+    if gpt_6_2 && !instructions.is_empty() {
+        if let Some(items) = input.as_array_mut() {
+            items.insert(
+                0,
+                json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{ "type": "input_text", "text": instructions }],
+                }),
+            );
+        }
+    }
     let mut body = json!({
         "model": model,
         "store": false,
@@ -1251,6 +1268,11 @@ pub(crate) fn build_codex_body(
         "text": { "verbosity": "medium" },
         "prompt_cache_key": prompt_cache_key,
     });
+    if gpt_6_2 {
+        if let Some(map) = body.as_object_mut() {
+            map.remove("instructions");
+        }
+    }
     if let Some(effort) = plan.wire_effort {
         body["reasoning"] = json!({ "effort": effort.as_str() });
     }
@@ -5100,6 +5122,88 @@ mod codex_wire_tests {
         }
     }
 
+    /// GPT-6.2 request shape for one model: exact model id, reasoning.effort
+    /// with Off -> low, never flex/service_tier, and the system prompt as the
+    /// first `developer` input message instead of top-level `instructions`.
+    fn assert_gpt_6_2_request_shape(model: &str) {
+        let user = serde_json::json!({"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"hi"}]});
+        for (level, effort) in [
+            (ReasoningLevel::Off, "low"),
+            (ReasoningLevel::Low, "low"),
+            (ReasoningLevel::Medium, "medium"),
+            (ReasoningLevel::High, "high"),
+            (ReasoningLevel::XHigh, "xhigh"),
+            (ReasoningLevel::Max, "max"),
+            (ReasoningLevel::Ultra, "xhigh"),
+        ] {
+            let body = body_for_level(
+                model,
+                level,
+                serde_json::json!([user.clone()]),
+                "You are Synaps.".to_string(),
+                vec![],
+                None,
+                None,
+            );
+            assert_eq!(body["model"], model);
+            assert_eq!(body["reasoning"]["effort"], effort, "{model} {level:?}");
+            assert!(body.get("instructions").is_none(), "{model}: {body}");
+            assert!(body.get("service_tier").is_none(), "{model}: never flex");
+            assert!(!body.to_string().contains("flex"), "{model}");
+            let input = body["input"].as_array().expect("input");
+            assert_eq!(input.len(), 2, "{model}");
+            assert_eq!(input[0]["type"], "message");
+            assert_eq!(input[0]["role"], "developer");
+            assert_eq!(input[0]["content"][0]["type"], "input_text");
+            assert_eq!(input[0]["content"][0]["text"], "You are Synaps.");
+            assert_eq!(input[1], user);
+        }
+    }
+
+    #[test]
+    fn gpt_6_2_astra_body_leads_with_developer_prompt_and_never_sends_none_or_flex() {
+        assert_gpt_6_2_request_shape("gpt-6.2-astra");
+    }
+
+    #[test]
+    fn gpt_6_2_sol_body_leads_with_developer_prompt_and_never_sends_none_or_flex() {
+        assert_gpt_6_2_request_shape("gpt-6.2-sol");
+    }
+
+    /// GPT-6.1 Sol is unchanged: top-level `instructions`, untouched input,
+    /// Off omits reasoning, no service tier.
+    #[test]
+    fn gpt_6_1_sol_body_keeps_top_level_instructions_and_omitted_off() {
+        let user = serde_json::json!({"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"hi"}]});
+        let body = body_for_level(
+            "gpt-6.1-sol",
+            ReasoningLevel::Off,
+            serde_json::json!([user.clone()]),
+            "You are Synaps.".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(body["model"], "gpt-6.1-sol");
+        assert_eq!(body["instructions"], "You are Synaps.");
+        assert_eq!(body["input"], serde_json::json!([user]));
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("service_tier").is_none());
+        let low = body_for_level(
+            "gpt-6.1-sol",
+            ReasoningLevel::Low,
+            serde_json::json!([]),
+            "You are Synaps.".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(low["reasoning"]["effort"], "low");
+        assert_eq!(low["instructions"], "You are Synaps.");
+    }
+
     #[test]
     fn body_always_sets_model_and_stream_and_include() {
         let body = body_for_level(
@@ -6211,6 +6315,59 @@ mod send_retry_tests {
         assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
         // The cooldown is still reported so the broker stops advertising A.
         assert_eq!(router.reports(), vec!["openai-codex@astra1".to_string()]);
+    }
+
+    /// A model refusal (403/404/400: the model isn't available on the
+    /// account the windows chose) is never an auth failure. The turn ends
+    /// with Synaps' explanation; nothing is retried or failed over, and the
+    /// router (the stream's only channel to account state) hears no report,
+    /// so no account is marked signed out, cooling or broken. The typed
+    /// outcome is an API status, never auth.
+    #[tokio::test]
+    async fn a_codex_model_refusal_is_never_an_auth_failure() {
+        use crate::extensions::session_driver::{classify_turn_error, Outcome};
+        const ENTITLEMENT: &str = r#"{"detail":"The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."}"#;
+        const NOT_FOUND: &str = r#"{"error":{"type":"invalid_request_error","code":"model_not_found","message":"The model does not exist."}}"#;
+        const NOT_ON_ACCOUNT: &str = "isn't available on the selected ChatGPT account";
+        const UNKNOWN_HERE: &str = "doesn't know this model for this account";
+        for (status, body, explains) in [
+            (StatusCode::FORBIDDEN, ENTITLEMENT, NOT_ON_ACCOUNT),
+            (StatusCode::BAD_REQUEST, ENTITLEMENT, NOT_ON_ACCOUNT),
+            (StatusCode::NOT_FOUND, NOT_FOUND, UNKNOWN_HERE),
+            (StatusCode::BAD_REQUEST, NOT_FOUND, UNKNOWN_HERE),
+        ] {
+            let (url, seen) = spawn_scripted_codex(vec![(status, vec![], body)]).await;
+            let router = ScriptedRouter::new(
+                pinned("codex2", "acct_A", true),
+                vec![Some(pinned("codex5", "acct_B", true))],
+            );
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let err = run_codex_with_router(&url, &router, 3, &tx)
+                .await
+                .expect_err("a refused model fails the turn");
+            let text = err.to_string();
+            assert!(
+                text.starts_with(&format!("codex request failed: {status}")),
+                "{text}"
+            );
+            assert!(text.contains(explains), "{status}: {text}");
+            assert_eq!(seen.lock().unwrap().len(), 1, "{status}: sent once");
+            assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0, "{status}");
+            assert!(router.reports().is_empty(), "{status}: no account marked");
+            let runtime =
+                super::super::net::provider_error_to_runtime_for("openai-codex/gpt-6-astra", err);
+            assert!(
+                matches!(runtime, crate::RuntimeError::ApiStatus(_)),
+                "{status}: {runtime:?}"
+            );
+            let (outcome, kind) =
+                classify_turn_error(&crate::runtime::helpers::turn_error_for(&runtime, "t"));
+            assert_eq!(
+                (outcome, kind.as_str()),
+                (Outcome::Blocked, "unknown"),
+                "{status}"
+            );
+        }
     }
 
     /// A generic 429 (no exhaustion evidence) keeps the ordinary transport

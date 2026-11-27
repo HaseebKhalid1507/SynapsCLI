@@ -30,6 +30,13 @@ struct JsonRpcRequest {
     id: u64,
 }
 
+/// Optional host behaviours an extension may rely on, advertised in the
+/// `initialize` params (`features`). Extensions must ignore names they do
+/// not know; a host without the list has none of them.
+/// - `inject.forget`: `before_message` inject is saved by default and
+///   honours `forget` and `parts` (#414).
+pub const HOST_FEATURES: &[&str] = &["inject.forget"];
+
 #[derive(Serialize)]
 struct InitializeParams {
     synaps_version: &'static str,
@@ -37,6 +44,7 @@ struct InitializeParams {
     plugin_id: String,
     plugin_root: Option<String>,
     config: Value,
+    features: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1412,6 +1420,7 @@ impl ProcessExtension {
                 .or_else(|| self.cwd.clone())
                 .map(|path| path.to_string_lossy().to_string()),
             config,
+            features: HOST_FEATURES,
         };
         let value = self
             .call_no_restart(
@@ -1733,6 +1742,7 @@ impl ProcessExtension {
                 .clone()
                 .map(|path| path.to_string_lossy().to_string()),
             config,
+            features: HOST_FEATURES,
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let value = tokio::time::timeout(
@@ -2589,6 +2599,22 @@ impl ExtensionHandler for ProcessExtension {
 mod tool_call_params_tests {
     use super::*;
     use serde_json::json;
+
+    /// #414: the host tells extensions it saves `before_message` inject by
+    /// default and honours `forget`/`parts`.
+    #[test]
+    fn initialize_params_advertise_host_features() {
+        let params = InitializeParams {
+            synaps_version: "0",
+            extension_protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
+            plugin_id: "p".into(),
+            plugin_root: None,
+            config: json!({}),
+            features: HOST_FEATURES,
+        };
+        let value = serde_json::to_value(params).unwrap();
+        assert_eq!(value["features"], json!(["inject.forget"]));
+    }
 
     /// A folder in the host's own path shape; it need not exist.
     fn chat_dir() -> PathBuf {

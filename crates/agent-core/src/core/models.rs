@@ -10,7 +10,17 @@ pub const KNOWN_MODELS: &[(&str, &str)] = &[
     ("claude-opus-4-7", "Opus 4.7"),
     ("claude-opus-4-6", "Opus 4.6 — previous flagship"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — fast"),
+    ("claude-haiku-5-5", "Haiku 5.5 — fast"),
 ];
+
+/// `compaction_model = provider-small`: the small model that writes a
+/// chat's summaries, by the provider of the chat's route, on the chat's own
+/// account. One line per pin; update a pin here. A provider without a line
+/// has its chats' summaries written by the chat's own model.
+/// `openai-codex` has none until the Codex accounts' usage readings report
+/// `gpt-6-luna`: an account whose reading doesn't list it, on a free plan or
+/// with no plan named, can't be selected for it.
+pub const PROVIDER_SMALL_MODELS: &[(&str, &str)] = &[("anthropic", "claude-haiku-5-5")];
 
 pub fn default_model() -> &'static str {
     KNOWN_MODELS[0].0
@@ -134,7 +144,8 @@ pub const DEFAULT_LEGACY_ADAPTIVE_FALLBACK: u32 = 16384;
 /// own claude-code logic (`modelSupports1M` in src/utils/context.ts).
 pub fn model_supports_1m(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    // Opus 4.6+, Sonnet 4 family. Newer models (5.x) assumed supported.
+    // Opus 4.6+, Sonnet 4 family. Newer models (5.x) assumed supported;
+    // Haiku 5.5's model page lists a 1M window.
     m.contains("opus-4-6")
         || m.contains("opus-4-7")
         || m.contains("opus-4-8")
@@ -142,6 +153,7 @@ pub fn model_supports_1m(model: &str) -> bool {
         || m.contains("sonnet-4")
         || m.contains("opus-5")
         || m.contains("sonnet-5")
+        || m.contains("haiku-5")
         || m.contains("fable-5")
 }
 
@@ -178,6 +190,47 @@ pub fn model_rejects_output_overflow(model: &str) -> bool {
     matches!(m, "claude-opus-4" | "claude-sonnet-4") || BEFORE_4_5.iter().any(|p| m.starts_with(p))
 }
 
+/// Whether `model` keeps the thinking blocks of earlier turns in context
+/// when a request adds user content that is not a tool result.
+///
+/// Anthropic's prompt-caching docs ("What invalidates the cache", the row
+/// "Non-tool results passed to requests with thinking",
+/// <https://platform.claude.com/docs/en/build-with-claude/prompt-caching#what-invalidates-the-cache>):
+/// "On Claude Opus 4.5 and later Opus models, Claude Sonnet 4.6 and later
+/// Sonnet models, Claude Haiku 5.5, and every Claude Fable and Claude Mythos
+/// model, thinking blocks are preserved by default, so the cache remains
+/// valid. On other models, all previously cached thinking blocks are
+/// stripped from context, and any messages that follow those thinking blocks
+/// are removed from the cache."
+///
+/// Only what that sentence names: "and later" is said of Opus and Sonnet,
+/// not of Haiku, so Haiku 5.5 alone counts and a later Haiku is unknown
+/// until the docs name it. `false` for every other id, an unknown one
+/// included: a caller that relies on the cached messages must not assume
+/// it.
+pub fn model_keeps_earlier_thinking(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let m = m.strip_prefix("anthropic/").unwrap_or(&m);
+    if m.starts_with("claude-fable") || m.starts_with("claude-mythos") {
+        return true;
+    }
+    // `claude-<family>-<major>[-<minor>][-<date>]`; a part longer than two
+    // digits is a release date, not a minor version.
+    let version = |family: &str| -> Option<(u32, u32)> {
+        let mut parts = m.strip_prefix(family)?.split('-');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts
+            .next()
+            .filter(|p| p.len() <= 2)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        Some((major, minor))
+    };
+    version("claude-opus-").is_some_and(|v| v >= (4, 5))
+        || version("claude-sonnet-").is_some_and(|v| v >= (4, 6))
+        || version("claude-haiku-") == Some((5, 5))
+}
+
 /// Returns the input context window size for a given model, in tokens.
 /// Used as the denominator for the chatui context-usage bar and anywhere
 /// else the client needs to know how much prompt the model will accept.
@@ -191,8 +244,17 @@ pub fn model_rejects_output_overflow(model: &str) -> bool {
 /// Use [`model_supports_1m`] to check whether a model *can* opt into 1M;
 /// the actual decision happens at request time based on the user's
 /// `context_window` setting.
-pub fn context_window_for_model(_model: &str) -> u64 {
-    200_000
+///
+/// Exception: models whose only published window is larger and that need no
+/// opt-in header. GPT-6.2 Astra and Sol publish a 1,050,000-token context
+/// window (922,000 max input, 128,000 max output). Exact ids only, bare or
+/// `openai-codex/`-qualified.
+pub fn context_window_for_model(model: &str) -> u64 {
+    match model {
+        "gpt-6.2-astra" | "openai-codex/gpt-6.2-astra" => 1_050_000,
+        "gpt-6.2-sol" | "openai-codex/gpt-6.2-sol" => 1_050_000,
+        _ => 200_000,
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +287,47 @@ mod tests {
 
     use super::*;
 
+    /// The docs' list, by id form: bare, dated, provider-qualified.
+    #[test]
+    fn earlier_thinking_is_kept_from_opus_4_5_sonnet_4_6_haiku_5_5() {
+        for m in [
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-7",
+            "anthropic/claude-opus-5-5",
+            "claude-opus-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-haiku-5-5-20261001",
+            "claude-fable-5-2",
+            "anthropic/claude-mythos-5",
+        ] {
+            assert!(model_keeps_earlier_thinking(m), "{m}");
+        }
+        for m in [
+            "claude-opus-4-1",
+            "claude-opus-4-1-20250805",
+            "claude-opus-4-20250514",
+            "claude-opus-4",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-20250514",
+            "claude-haiku-4-5",
+            // The docs name Haiku 5.5, not "and later": unknown until named.
+            "claude-haiku-5",
+            "claude-haiku-5-6",
+            "claude-haiku-6",
+            "claude-nova-9",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-haiku-20241022",
+            "groq/llama-3.3-70b-versatile",
+            "gpt-6-astra",
+        ] {
+            assert!(!model_keeps_earlier_thinking(m), "{m}");
+        }
+    }
+
     #[test]
     fn default_model_is_first_entry() {
         assert_eq!(default_model(), KNOWN_MODELS[0].0);
@@ -240,6 +343,7 @@ mod tests {
         assert!(ids.contains(&"claude-opus-4-7"));
         assert!(ids.contains(&"claude-sonnet-4-6"));
         assert!(ids.contains(&"claude-haiku-4-5-20251001"));
+        assert!(ids.contains(&"claude-haiku-5-5"));
     }
 
     #[test]
@@ -291,7 +395,7 @@ mod tests {
             "claude-fable-5-1",
             "claude-sonnet-9-0",
             "gpt-5.5",
-            "google-gemini/gemini-2.5-pro",
+            "google/gemini-2.5-pro",
         ] {
             assert!(!model_rejects_output_overflow(m), "{m}");
         }
@@ -333,6 +437,8 @@ mod tests {
         assert!(model_supports_1m("claude-opus-5-0"));
         assert!(model_supports_1m("claude-sonnet-5-1"));
         assert!(model_supports_1m("claude-fable-5"));
+        assert!(model_supports_1m("claude-haiku-5-5"));
+        assert!(model_supports_1m("anthropic/claude-haiku-5-5"));
     }
 
     #[test]
@@ -360,6 +466,27 @@ mod tests {
     fn context_window_unknown_defaults_200k() {
         assert_eq!(context_window_for_model("some-future-model"), 200_000);
         assert_eq!(context_window_for_model(""), 200_000);
+    }
+
+    #[test]
+    fn context_window_gpt_6_2_is_exact_1_05m() {
+        for model in [
+            "gpt-6.2-astra",
+            "openai-codex/gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "openai-codex/gpt-6.2-sol",
+        ] {
+            assert_eq!(context_window_for_model(model), 1_050_000, "{model}");
+        }
+        for model in [
+            "gpt-6.2-sol-preview",
+            "other/gpt-6.2-astra",
+            "gpt-6.1-sol",
+            "openai-codex/gpt-6.1-sol",
+            "gpt-6-astra",
+        ] {
+            assert_eq!(context_window_for_model(model), 200_000, "{model}");
+        }
     }
 
     #[test]

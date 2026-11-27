@@ -22,6 +22,9 @@ pub struct HostParts {
     pub client: reqwest::Client,
     /// THE shared catalog.
     pub tools: Arc<RwLock<ToolRegistry>>,
+    /// `tools`' change counter, read without its lock
+    /// ([`ToolRegistry::change_handle`]).
+    pub tools_changes: Arc<std::sync::atomic::AtomicU64>,
     pub hook_bus: Arc<HookBus>,
     /// Resolved once from config.
     pub credential_source: crate::auth::CredentialSource,
@@ -67,6 +70,11 @@ struct WorkerRegistryKey {
 pub struct EngineHost {
     parts: HostParts,
     config: arc_swap::ArcSwap<crate::SynapsConfig>,
+    /// Modification time of the config file the snapshot in `config` was
+    /// read from (`None` = no file / unreadable). A long-lived host (the
+    /// daemon) compares it on every `create_session` so a config edited
+    /// after boot reaches new sessions instead of the boot-time snapshot.
+    config_mtime: std::sync::Mutex<Option<std::time::SystemTime>>,
     command_registry: Arc<crate::skills::registry::CommandRegistry>,
     keybind_registry: Arc<std::sync::RwLock<crate::skills::keybinds::KeybindRegistry>>,
     ext_manager: Arc<RwLock<crate::extensions::manager::ExtensionManager>>,
@@ -159,14 +167,20 @@ impl EngineHost {
             crate::config::set_profile(Some(prof.clone()));
         }
         let log_guard = crate::logging::init_logging();
+        // A saved sign-in of the removed Gemini Code Assist provider
+        // is dropped by name at startup, after logging so its one fixed line
+        // ("removed saved google-gemini sign-in") lands; nothing saved, no
+        // line. Failure is not fatal: the entry is inert (no provider reads it).
+        let _ = crate::auth::remove_legacy_google_gemini_sign_in();
 
         let client = crate::runtime::build_host_http_client()?;
         let capture_dir = crate::runtime::trace::default_capture_dir();
         let _ = crate::runtime::trace::sweep_expired_captures(&capture_dir);
         let spill_root = crate::runtime::sweep_spill_root();
 
+        let config_mtime = config_file_mtime();
         let config = crate::config::load_config();
-        let tools = Arc::new(RwLock::new(ToolRegistry::new()));
+        let (tools, tools_changes) = ToolRegistry::new().into_shared();
         // Same point the old boot's `apply_config` disabled tools: on the
         // fresh registry, before skills/MCP register anything.
         if !config.disabled_tools.is_empty() {
@@ -207,6 +221,7 @@ impl EngineHost {
         let parts = HostParts {
             client,
             tools,
+            tools_changes,
             hook_bus,
             credential_source: config.auth.credential_source(),
             token_cache: crate::auth::TokenCache::new(),
@@ -221,6 +236,7 @@ impl EngineHost {
         Ok(Arc::new(Self {
             parts,
             config: arc_swap::ArcSwap::from_pointee(config),
+            config_mtime: std::sync::Mutex::new(config_mtime),
             command_registry,
             keybind_registry,
             ext_manager,
@@ -404,7 +420,7 @@ impl EngineHost {
         let mut host = self.parts.clone();
         host.client = crate::runtime::build_host_http_client()?;
         host.hook_bus = self.worker_hook_bus();
-        host.tools = Arc::new(RwLock::new(self.worker_registry().await));
+        (host.tools, host.tools_changes) = self.worker_registry().await.into_shared();
         host.mcp_runtime = None;
         host.extension_runtime = None;
         // `Runtime::new()` value. Workers never ran `apply_config`, so they
@@ -460,8 +476,40 @@ impl EngineHost {
     /// Re-read config from disk into the host's snapshot. Phase 1 callers
     /// keep `load_config()` where they use it today.
     pub fn reload_config(&self) {
+        let mtime = config_file_mtime();
         self.config
             .store(Arc::new(crate::config::load_config()));
+        *self.config_mtime.lock().unwrap_or_else(|e| e.into_inner()) = mtime;
+    }
+
+    /// [`Self::reload_config`] only when the config file's mtime changed
+    /// since the snapshot was taken. Returns whether it reloaded. Runs at the
+    /// top of every `create_session`, so the new snapshot reaches more than
+    /// the session being created:
+    /// 1. New sessions: everything `apply_config` reads (model, thinking,
+    ///    `context_window`, `context_management.*`, cache settings, …).
+    ///    Live sessions too, for what they read from the snapshot at use
+    ///    time: the extensions-ready timeout, turn budgets,
+    ///    `events.auto_turn` and `auto_turn_cap`. A parked session that
+    ///    wakes takes the new snapshot.
+    /// 2. Workers of every session, live or new: the retry config
+    ///    (`worker_runtime`) and `disabled_tools` (`worker_registry` is
+    ///    rebuilt with the new list, while each foreground registry keeps
+    ///    the list it booted with).
+    /// 3. Restart-only: provider keys and identity (first-writer-wins
+    ///    process globals in `load_config`), MCP, skills,
+    ///    `progressive_tool_disclosure` and the foreground `disabled_tools`.
+    /// 4. A changed `auth.*` credential source swaps the process-wide broker
+    ///    at the next create, while live sessions keep their old source:
+    ///    restart after changing it.
+    pub fn reload_config_if_changed(&self) -> bool {
+        let now = config_file_mtime();
+        let stale = *self.config_mtime.lock().unwrap_or_else(|e| e.into_inner()) != now;
+        if stale {
+            tracing::info!("config changed on disk since host boot — reloading for new session");
+            self.reload_config();
+        }
+        stale
     }
 
     // ── sessions (Phase 2) ────────────────────────────────────────────────
@@ -480,6 +528,11 @@ impl EngineHost {
     /// override, …) are ignored in that case — the live session wins.
     pub async fn create_session(self: &Arc<Self>, cfg: SessionConfig) -> Result<SessionHandle> {
         let _serial = self.create_lock.lock().await;
+        // A daemon host outlives config edits: without this every session it
+        // creates runs on the boot-time snapshot (e.g. `context_window = 1m`
+        // added later is silently ignored — the runtime budgets and the
+        // footer bar measure against 200k).
+        self.reload_config_if_changed();
         if let Some(live) = self.live_continue_target(&cfg.continue_session) {
             tracing::info!(session = %live.id, "create_session: target is live — attaching");
             return Ok(live);
@@ -488,6 +541,7 @@ impl EngineHost {
         let id = handle.id.clone();
         self.adopt_session(handle.clone());
         let host = Arc::clone(self);
+        let own = handle.session_ref();
         tokio::spawn(async move {
             // A panicking actor must still leave the map (§6 #12): the
             // handle would otherwise be listed forever and attach → Closed.
@@ -499,7 +553,9 @@ impl EngineHost {
             {
                 tracing::error!(session = %id, "session actor panicked");
             }
-            host.remove_session(&id);
+            // Only this actor's entry: a resume of the same id may have been
+            // adopted after `finish` freed the journal lock.
+            host.remove_session_if(&id, &own);
         });
         Ok(handle)
     }
@@ -519,7 +575,9 @@ impl EngineHost {
     }
 
     /// Register a handle built elsewhere (daemon test factories). The
-    /// caller owns the task; `remove_session` when it ends.
+    /// caller owns the task; `remove_session_if` when it ends. A handle
+    /// already under the same id is replaced (a placeholder by its real
+    /// session, F23).
     pub fn adopt_session(&self, handle: SessionHandle) {
         self.sessions
             .lock()
@@ -529,7 +587,7 @@ impl EngineHost {
 
     /// Every registered handle (B4: THE session map; `DaemonState`
     /// delegates here). Dead handles are dropped defensively: the actor
-    /// task drops `cmd_rx` when `run()` returns and `remove_session` runs
+    /// task drops `cmd_rx` when `run()` returns and `remove_session_if` runs
     /// *after* — a listing in that window sees `is_alive() == false`. That
     /// is an ordering window, not an invariant violation, so it is logged
     /// at debug, never asserted.
@@ -547,12 +605,15 @@ impl EngineHost {
     }
 
     /// Resolve a `continue_session` request against the LIVE sessions
-    /// first — actor id, current journal id (a LinkedSuccessor compaction
-    /// moves it off the actor id), or name (`--name` / `saveas`, which may
-    /// not be on disk yet) — then the way `setup::resolve_or_create_session`
-    /// will (chain → name → partial id; `Some(None)` = latest by mtime) and
-    /// match the resolved id against id *and* journal id. Anything that is
-    /// not running here returns `None` so the real boot path builds/reports.
+    /// first — the conversation an actor holds ([`SessionHandle::holds`]:
+    /// its journal id or one it compacted away from; never the bare actor
+    /// id, which a `/clear` leaves on another conversation), or name
+    /// (`--name` / `saveas`, which may not be on disk yet) — then the way
+    /// `setup::resolve_or_create_session` will (chain → name → partial id;
+    /// `Some(None)` = latest by mtime) and match the resolved id by `holds`.
+    /// Anything that is not running here returns `None` so the real boot
+    /// path builds/reports. A placeholder being retried is skipped: the
+    /// retry is what builds the real session.
     ///
     /// The daemon's `Attach::Create{continue}` goes through here too
     /// (`host_factory` → `create_session`): a live journal is always one
@@ -567,24 +628,19 @@ impl EngineHost {
                 .sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            sessions.values().filter(|h| h.is_alive()).cloned().collect()
+            sessions
+                .values()
+                .filter(|h| h.is_alive() && !h.retrying())
+                .cloned()
+                .collect()
         };
         if handles.is_empty() {
             return None;
         }
-        let by_id = |id: &str| {
-            handles
-                .iter()
-                .find(|h| h.id.as_str() == id || h.journal_id() == id)
-                .cloned()
-        };
         let id = match query {
             Some(q) => {
-                if let Some(h) = by_id(q) {
+                if let Some(h) = live_match(&handles, q) {
                     return Some(h);
-                }
-                if let Some(h) = handles.iter().find(|h| h.name().as_deref() == Some(q.as_str())) {
-                    return Some(h.clone());
                 }
                 // F24: resolve on disk and follow compacted_into so
                 // `--continue <old>` finds the live successor.
@@ -598,7 +654,47 @@ impl EngineHost {
                 resolved.session.id
             }
         };
-        by_id(&id)
+        holder(&handles, &id)
+    }
+
+    /// The actor id a new session on `journal` takes: the journal id,
+    /// unless an alive session already has that id — after `/clear` the
+    /// cleared actor keeps its id while its old conversation is resumed —
+    /// then a minted one. A placeholder being retried for `journal` does
+    /// not count: its real session replaces it under its id
+    /// ([`keeps_id`]). Called under `create_lock`.
+    pub(crate) fn actor_id_for(&self, journal: &str) -> SessionId {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = |id: &str| {
+            sessions
+                .get(&SessionId::from(id))
+                .is_some_and(|h| keeps_id(h, journal))
+        };
+        if !taken(journal) {
+            return SessionId::from(journal);
+        }
+        loop {
+            let id = crate::core::session::mint_session_id(chrono::Utc::now());
+            if !taken(&id) {
+                tracing::info!(journal, actor = %id, "create_session: the journal id is another live actor's id — minted one");
+                return SessionId::from(id);
+            }
+        }
+    }
+
+    /// Register a session built outside [`Self::create_session`] (a reload's
+    /// lock-held placeholder) under the id a real session on `journal`
+    /// would take ([`Self::actor_id_for`]), under the create lock: it never
+    /// replaces a session already registered, whatever id that one took.
+    pub(crate) async fn adopt_for_journal(
+        &self,
+        journal: &str,
+        build: impl FnOnce(SessionId) -> SessionHandle,
+    ) -> SessionHandle {
+        let _serial = self.create_lock.lock().await;
+        let handle = build(self.actor_id_for(journal));
+        self.adopt_session(handle.clone());
+        handle
     }
 
     /// Handle for a live session, if any.
@@ -619,18 +715,28 @@ impl EngineHost {
             .collect()
     }
 
-    /// Drop the host's handle for a session (the actor keeps running until
-    /// its command queue closes or it receives `End`).
-    pub fn remove_session(&self, id: &SessionId) -> Option<SessionHandle> {
-        let handle = self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
+    /// Drop the host's handle for `which` session (the actor keeps
+    /// running until its command queue closes or it receives `End`) — only
+    /// if the entry under `id` IS that session. Another session adopted
+    /// under the same id meanwhile (a resume after `finish` freed the
+    /// journal lock, a placeholder's real session) stays.
+    pub fn remove_session_if(
+        &self,
+        id: &SessionId,
+        which: &crate::session::handle::SessionRef,
+    ) -> Option<SessionHandle> {
+        let removed = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            match sessions.get(id) {
+                Some(h) if h.is_session(which) => sessions.remove(id),
+                _ => None,
+            }
+        };
         // E-P2: release any driver grants held by this session.
-        if handle.is_some() {
+        if removed.is_some() {
             self.release_all_driver_grants(id);
         }
-        handle
+        removed
     }
 
     // ── driver single-tenancy (E-P2, §3 S2/S5) ──────────────────────────
@@ -667,7 +773,9 @@ impl EngineHost {
         }
     }
 
-    /// Release all driver grants held by `session` (called from `remove_session`).
+    /// Release all driver grants held by `session` (called from
+    /// `remove_session_if`, only once that session's entry is removed: grants
+    /// are keyed by id, and a newcomer adopted under the same id keeps its own).
     fn release_all_driver_grants(&self, session: &SessionId) {
         let mut grants = self.driver_grants.lock().unwrap_or_else(|e| e.into_inner());
         grants.retain(|_, s| s != session);
@@ -787,12 +895,43 @@ impl EngineHost {
     }
 }
 
+/// mtime of the config file `load_config` reads (`None` if absent).
+fn config_file_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(crate::config::resolve_read_path("config"))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
 /// Print `config.warnings` to stderr and the log (headless hosts).
 pub fn report_config_warnings(config: &crate::SynapsConfig) {
     for warning in &config.warnings {
         tracing::warn!(%warning, "config warning");
         eprintln!("synaps: config warning: {warning}");
     }
+}
+
+/// A live session for `q`: the one holding conversation `q`
+/// ([`SessionHandle::holds`]), else the one named `q`.
+fn live_match(handles: &[SessionHandle], q: &str) -> Option<SessionHandle> {
+    holder(handles, q).or_else(|| {
+        handles
+            .iter()
+            .find(|h| h.name().as_deref() == Some(q))
+            .cloned()
+    })
+}
+
+/// The live session holding conversation `c`.
+fn holder(handles: &[SessionHandle], c: &str) -> Option<SessionHandle> {
+    handles.iter().find(|h| h.holds(c)).cloned()
+}
+
+/// Whether `h` keeps the id it is registered under from a new actor on
+/// `journal`: it is alive, unless it is a placeholder being retried for
+/// that very conversation (its real session replaces it under its id).
+/// A retrying placeholder still keeps its id from any other conversation.
+fn keeps_id(h: &SessionHandle, journal: &str) -> bool {
+    h.is_alive() && !(h.retrying() && h.holds(journal))
 }
 
 #[cfg(test)]
@@ -897,5 +1036,102 @@ mod driver_grant_tests {
         release_all(&grants, &a);
         assert_eq!(grants.lock().unwrap().len(), 1);
         assert!(grants.lock().unwrap().contains_key("plugin2"));
+    }
+}
+
+#[cfg(test)]
+mod keeps_id_tests {
+    use super::keeps_id;
+    use crate::session::{SessionConfig, SessionId};
+
+    /// A placeholder for `N` registered under `A`, being retried: its id is
+    /// free for `N`'s real session only, never for a create of `A`.
+    #[tokio::test]
+    async fn a_retrying_placeholder_frees_its_id_for_its_own_conversation_only() {
+        let (placeholder, _task) = crate::session::handle::locked_placeholder::spawn(
+            SessionId::from("A"),
+            SessionConfig {
+                continue_session: Some(Some("N".into())),
+                ..SessionConfig::default()
+            },
+            "pid 1 (tui)".into(),
+        );
+        assert!(keeps_id(&placeholder, "A") && keeps_id(&placeholder, "N"));
+        let _retrying = placeholder.retry_guard();
+        assert!(
+            !keeps_id(&placeholder, "N"),
+            "its real session takes the id"
+        );
+        assert!(keeps_id(&placeholder, "A"), "another conversation does not");
+    }
+}
+
+#[cfg(test)]
+mod live_match_tests {
+    use super::*;
+    use crate::session::handle::{echo, JournalMove, SessionEndpoints};
+
+    fn actor(id: &str, name: Option<&str>) -> (SessionHandle, SessionEndpoints) {
+        let mut meta = echo::meta_for(&SessionId::from(id));
+        meta.name = name.map(Into::into);
+        SessionHandle::new(meta, echo::view_for())
+    }
+
+    fn moved(ep: &SessionEndpoints, to: &str, why: JournalMove) {
+        let cell = ep.journal.load_full();
+        ep.journal
+            .store(Arc::new(cell.moved(to.into(), why, chrono::Utc::now())));
+    }
+
+    fn resolves(handles: &[SessionHandle], q: &str) -> Option<String> {
+        live_match(handles, q).map(|h| h.id.0)
+    }
+
+    /// §3.1: actor `A` on `A`; after compaction `A → B` it holds both; after
+    /// `/clear` it holds only the new conversation, never its own id.
+    #[test]
+    fn the_three_states_resolve_by_the_conversation_held() {
+        let (a, ep) = actor("A", None);
+        let hs = [a];
+        assert_eq!(resolves(&hs, "A").as_deref(), Some("A"));
+
+        moved(&ep, "B", JournalMove::Compaction);
+        assert_eq!(resolves(&hs, "A").as_deref(), Some("A"), "it still holds A");
+        assert_eq!(resolves(&hs, "B").as_deref(), Some("A"));
+
+        moved(&ep, "N", JournalMove::Clear);
+        assert_eq!(
+            resolves(&hs, "A"),
+            None,
+            "the actor id is not a conversation it holds"
+        );
+        assert_eq!(resolves(&hs, "B"), None);
+        assert_eq!(resolves(&hs, "N").as_deref(), Some("A"));
+    }
+
+    /// `/clear` unnames the actor (`sync_name`): the old name resolves on
+    /// disk to the old conversation, not to the cleared actor.
+    #[test]
+    fn a_cleared_actors_old_name_no_longer_resolves() {
+        let (a, ep) = actor("A", Some("axel"));
+        let hs = [a];
+        assert_eq!(resolves(&hs, "axel").as_deref(), Some("A"));
+        moved(&ep, "N", JournalMove::Clear);
+        ep.name.store(Arc::new(None));
+        assert_eq!(resolves(&hs, "axel"), None);
+    }
+
+    /// A conversation held by one actor never resolves to another actor
+    /// that merely has its id.
+    #[test]
+    fn the_holder_wins_over_an_actor_with_that_id() {
+        let (cleared, ep) = actor("A", None);
+        moved(&ep, "N", JournalMove::Clear);
+        let mut meta = echo::meta_for(&SessionId::from("M"));
+        meta.journal_id = "A".into();
+        let (resumed, _ep2) = SessionHandle::new(meta, echo::view_for());
+        let hs = [cleared, resumed];
+        assert_eq!(resolves(&hs, "A").as_deref(), Some("M"));
+        assert_eq!(resolves(&hs, "N").as_deref(), Some("A"));
     }
 }

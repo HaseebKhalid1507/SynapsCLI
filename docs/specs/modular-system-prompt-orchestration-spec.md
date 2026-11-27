@@ -59,7 +59,7 @@ Examples:
 - `anthropic/claude-sonnet-5`
 - `openai-codex/gpt-5.6-sol`
 - `xai-auth/grok-4.5-latest`
-- `google-gemini/gemini-3.1-pro-preview`
+- `google/gemini-3.1-pro-preview`
 - `openrouter/z-ai/glm-5.2`
 - `openrouter/moonshotai/kimi-k2.7-code`
 
@@ -542,7 +542,7 @@ Provider errors should include bounded, redacted structural diagnostics sufficie
 Example Gemini diagnostic:
 
 ```text
-provider: google-gemini
+provider: google-vertex
 model: gemini-3.1-pro-preview
 turn_roles: [user, model, user]
 part_kinds: [text, functionCall, functionResponse]

@@ -12,7 +12,7 @@ crates/
 The session daemon hosts one `EngineHost` (extensions, MCP, and providers shared
 across sessions) and a `SessionActor` per session. The TUI, `synaps attach`, and
 headless clients connect to it over a Unix socket. Native Anthropic, OpenAI
-Responses/chat, Gemini Code Assist, and cloud-provider transports all emit the
+Responses/chat, and cloud-provider transports all emit the
 same `StreamEvent`, so the TUI and the tool loop stay provider-blind.
 Provider-qualified identities and pre-authorized execution plans stay typed
 through routing.

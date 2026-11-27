@@ -41,9 +41,15 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// Additive `ClientFrame` variants that only a new client sends follow this
 /// rule; `Closed` only ever answers `Close`, so old clients never see it.
 /// `Pin`/`Pinned` (`synaps daemon pin`) follow the same rule, and so does
-/// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it).
+/// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it),
+/// `SessionMeta.workers` (gated on [`FEATURE_SESSION_WORKERS`]) and
+/// `Welcome.boot_id`. `WorkerRow` is append-only: fields are only ever
+/// added, with `#[serde(default)]`, and an existing one never changes
+/// name or type (one unreadable row fails a Rust client's whole listing).
 /// `ReloadExtension` and its two replies (`ExtensionReloaded`,
-/// `ExtensionReloadFailed`) follow it too.
+/// `ExtensionReloadFailed`) follow it too, and so does `CatalogPage`
+/// (gated on [`FEATURE_SESSION_PAGE`]; the reply and `lifecycle: saved`
+/// reach only a client that sent it).
 /// Owned sessions (`Attach::Create{owned}`) are additive as well, but an
 /// older daemon would IGNORE the unknown field and hand back an unowned
 /// session, so they are gated on [`FEATURE_OWNED_SESSIONS`] in
@@ -56,9 +62,66 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// `EndReason::OwnerGone`.
 pub const FEATURE_OWNED_SESSIONS: &str = "owned_sessions";
 
+/// `Welcome.features` entry: `SessionMeta.workers` is filled (the workers
+/// that hold each session's park). Without it the block is always empty.
+pub const FEATURE_SESSION_WORKERS: &str = "session_workers";
+
+/// `Welcome.features` entry: this daemon answers `ClientFrame::CatalogPage`
+/// with `DaemonFrame::CatalogPage` (saved sessions, `lifecycle: saved`). An
+/// older daemon answers that frame with `Error{"malformed frame: unknown
+/// variant `catalog_page`…"}`, so a client checks this first.
+/// PR 3: with `session_watch` it also grants `Watch{saved: true}` (a
+/// session that leaves the held set is pushed as its saved row).
+pub const FEATURE_SESSION_PAGE: &str = "session_page";
+
+/// `Welcome.features` entry: replies are addressed (Contract v2 §1). A
+/// `QueryResult` reaches only the attachment whose request it answers (a
+/// host's, none); another client's `SettingChanged`/`Resumed` arrives with
+/// its id projected to [`VIEW_CHANGED_SETTING_ID`]. Nothing on the wire
+/// changes: an older client simply stops seeing replies that were never
+/// its own. Without it (an older daemon broadcasts every reply), a client
+/// draws its request ids from a random base in `[2^32, 2^62)`, which makes
+/// an accidental collision with another client's ids highly unlikely (a
+/// mitigation: replies are still broadcast and equal ids still correlate).
+pub const FEATURE_ADDRESSED_REPLIES: &str = "addressed_replies";
+
+/// `Welcome.features` entry: `PromptResolved` carries `outcome`, and an
+/// `Answer` to a prompt that is not pending is answered `AnswerRefused` (to
+/// its sender). A missing refusal can't be told from a slow one, so a
+/// client checks this before relying on either; without it, it infers what
+/// it can.
+pub const FEATURE_PROMPT_OUTCOME: &str = "prompt_outcome";
+
+/// `Welcome.features` entry: this daemon answers `SessionQuery::CacheExpiry`
+/// (arch-review-435-436-437 Contract v3 §3). An older daemon fails the
+/// frame as malformed, so a client checks this first
+/// ([`SocketTransport`](super::SocketTransport) refuses to send it:
+/// `DaemonTooOld`).
+pub const FEATURE_CACHE_EXPIRY: &str = "cache_expiry";
+
+/// `CatalogPage.limit` when absent, and its ceiling.
+pub const CATALOG_PAGE_DEFAULT_LIMIT: u32 = 50;
+pub const CATALOG_PAGE_MAX_LIMIT: u32 = 200;
+
+/// A position in the saved-session order (`updated_at` descending, then
+/// `id` descending). `CatalogPage.before` is exclusive; a reply's `next` is
+/// its last row's cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogCursor {
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub id: String,
+}
+
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
-    vec![FEATURE_OWNED_SESSIONS.to_string()]
+    vec![
+        FEATURE_OWNED_SESSIONS.to_string(),
+        FEATURE_SESSION_WORKERS.to_string(),
+        FEATURE_SESSION_PAGE.to_string(),
+        FEATURE_ADDRESSED_REPLIES.to_string(),
+        FEATURE_PROMPT_OUTCOME.to_string(),
+        FEATURE_CACHE_EXPIRY.to_string(),
+    ]
 }
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
@@ -70,10 +133,29 @@ pub const RPC_MAX_FRAME_BYTES: usize = agent_core::core::rpc_dispatch::MAX_FRAME
 pub const DAEMON_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Alias used by the readers/writers of this protocol.
 pub const MAX_FRAME_BYTES: usize = DAEMON_MAX_FRAME_BYTES;
-/// Query ids at or above this are reserved for the transport/daemon and
-/// never surfaced to a client as `QueryResult`.
+/// Request ids come in three kinds. Every reply is addressed to the
+/// request's origin (`Audience`), so ids only need to be unique per
+/// attachment, and the daemon never dedups them.
+/// - **Application ids**, below `RESERVED_QUERY_ID_BASE`: what a client
+///   numbers its own `Query`/`Set`/`Resume`/`EngineCommand`/`PluginCommand`
+///   with. Reusable once answered.
+/// - **Transport-internal ids**: [`DIGEST_RESYNC_QUERY_ID`] alone. A
+///   `SocketTransport` sends it from its own attachment, so its reply is
+///   that attachment's (`Audience::Client`), never the host's, and the
+///   transport consumes it before its reserved-id drop. Older clients send
+///   it too; it stays valid.
+/// - **Host ids**, every other id at or above `RESERVED_QUERY_ID_BASE`: the
+///   daemon's in-process callers (idle probe, reload checkpoint, `daemon
+///   close`/`rename`, reload's setting replay). Their replies are the
+///   host's (`Audience::Host`) and never reach an attachment; a client that
+///   sends one gets its reply on its own attachment, which can never
+///   satisfy a host waiter. [`VIEW_CHANGED_SETTING_ID`] is the view-only id
+///   of a `SettingChanged`/`Resumed` that answers no request of yours.
+///
+/// Rust clients never surface a `QueryResult` at or above this id.
 pub const RESERVED_QUERY_ID_BASE: u64 = 1 << 63;
-/// `SocketTransport` re-fetches `api_messages` under this id on a digest miss.
+/// `SocketTransport` re-fetches `api_messages` under this id on a digest
+/// miss: the one transport-internal id (see [`RESERVED_QUERY_ID_BASE`]).
 pub const DIGEST_RESYNC_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE;
 /// The daemon's idle monitor probes `Status` under this id.
 pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
@@ -84,6 +166,8 @@ pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
 /// `/thinking`, …) changed the view: not a reply to any client's `Set`
 /// (client ids never reach the reserved range), only the new view, so every
 /// attached client mirrors it, not just the one that typed the command.
+/// Also the id every other client sees on a `SettingChanged`/`Resumed` that
+/// answers one client's request, and on one that answers the host's.
 pub const VIEW_CHANGED_SETTING_ID: u64 = RESERVED_QUERY_ID_BASE + 3;
 /// `synaps daemon close` sends the engine command `close` under a fresh id
 /// at or above this one per request (`daemon/close.rs`) and awaits that id's
@@ -206,6 +290,25 @@ pub enum ClientFrame {
     ReloadExtension {
         extension: String,
     },
+    /// Control fast path (no session): one page of the SAVED sessions, the
+    /// conversations on disk this daemon does not hold, one row per
+    /// conversation (a compacted chain is its head), newest `updated_at`
+    /// first. Reply: `DaemonFrame::CatalogPage` with the same `req`. Rows
+    /// are `SessionMeta` with `lifecycle: saved`; resume one with
+    /// `Attach::Create{config.continue_session: Some(Some(journal_id))}`.
+    /// `before` (exclusive) continues from a reply's `next`; `limit` is 50
+    /// when absent, at most 200. Gated on [`FEATURE_SESSION_PAGE`]. Not
+    /// accepted on an attached connection.
+    CatalogPage {
+        #[serde(default)]
+        req: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<CatalogCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        named_only: bool,
+    },
     Bye,
 }
 
@@ -250,6 +353,13 @@ impl std::fmt::Debug for ClientFrame {
             Self::ReloadExtension { extension } => f
                 .debug_struct("ReloadExtension")
                 .field("extension", extension)
+                .finish(),
+            Self::CatalogPage { req, before, limit, named_only } => f
+                .debug_struct("CatalogPage")
+                .field("req", req)
+                .field("before", before)
+                .field("limit", limit)
+                .field("named_only", named_only)
                 .finish(),
             Self::Bye => f.write_str("Bye"),
         }
@@ -470,6 +580,23 @@ pub enum DaemonFrame {
     AuthState {
         report: agent_core::auth::AuthStateReport,
     },
+    /// Reply to `ClientFrame::CatalogPage` (same `req`). `sessions`: saved
+    /// rows (`lifecycle: saved`, `updated_at` set), newest first. `next`:
+    /// the cursor for the following page, absent at the end. `error`: the
+    /// page could not be served (the sessions dir is unreadable, or too
+    /// many pages are in flight on this connection); `sessions` is empty.
+    /// On a plain control connection a pipelining client matches this by
+    /// type and `req`: a later request can be answered first.
+    CatalogPage {
+        #[serde(default)]
+        req: u64,
+        #[serde(default)]
+        sessions: Vec<SessionMeta>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<CatalogCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,6 +717,11 @@ pub struct Welcome {
     /// Empty from an older daemon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// Minted at the daemon's cold start and carried across reloads: a new
+    /// value means a cold start (worker handle ids `sa_N` start over). Empty
+    /// from an older daemon.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_id: String,
 }
 
 impl Welcome {
@@ -622,14 +754,11 @@ impl From<Envelope> for WireEnvelope {
     }
 }
 
+/// Off a socket: the daemon already routed it, so it is for this reader
+/// ([`Audience::All`]).
 impl From<WireEnvelope> for Envelope {
     fn from(e: WireEnvelope) -> Self {
-        Self {
-            session_id: e.session_id,
-            seq: e.seq,
-            ts: e.ts,
-            event: e.event.into(),
-        }
+        Envelope::new(e.session_id, e.seq, e.ts, e.event.into())
     }
 }
 
@@ -797,7 +926,23 @@ pub enum WireSessionEvent {
     /// Digest only — see module docs.
     Conversation { digest: ConversationDigest },
     Prompt { request: PromptRequest },
-    PromptResolved { prompt_id: u64 },
+    /// `outcome`: additive and ungated. An older daemon omits it (`None`:
+    /// the client infers what it can), an older client ignores it, and an
+    /// outcome newer than this build reads as `PromptOutcome::Unknown`.
+    PromptResolved {
+        prompt_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<PromptOutcome>,
+    },
+    /// A late or unknown `Answer`, to its sender only (`outcome: None` = not
+    /// remembered). A new top-level event, so it needs no capability: an
+    /// older client decodes it as [`WireSessionEvent::Unknown`] and keeps
+    /// the connection.
+    AnswerRefused {
+        prompt_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<PromptOutcome>,
+    },
     External { event: crate::events::types::Event },
     AutoTurnCapReached { cap: u32 },
     Idle,
@@ -1129,7 +1274,8 @@ impl From<SessionEventWire> for WireSessionEvent {
             }
             S::Conversation(snapshot) => Self::Conversation { digest: ConversationDigest::of(&snapshot) },
             S::Prompt(request) => Self::Prompt { request },
-            S::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
+            S::PromptResolved { prompt_id, outcome } => Self::PromptResolved { prompt_id, outcome },
+            S::AnswerRefused { prompt_id, outcome } => Self::AnswerRefused { prompt_id, outcome },
             S::External(event) => Self::External { event },
             S::AutoTurnCapReached { cap } => Self::AutoTurnCapReached { cap },
             S::Idle => Self::Idle,
@@ -1191,7 +1337,8 @@ impl From<WireSessionEvent> for SessionEventWire {
             // its mirror before handing the envelope up.
             W::Conversation { digest } => Self::Conversation(digest.into_snapshot(Vec::new())),
             W::Prompt { request } => Self::Prompt(request),
-            W::PromptResolved { prompt_id } => Self::PromptResolved { prompt_id },
+            W::PromptResolved { prompt_id, outcome } => Self::PromptResolved { prompt_id, outcome },
+            W::AnswerRefused { prompt_id, outcome } => Self::AnswerRefused { prompt_id, outcome },
             W::External { event } => Self::External(event),
             W::AutoTurnCapReached { cap } => Self::AutoTurnCapReached { cap },
             W::Idle => Self::Idle,
@@ -1345,7 +1492,12 @@ mod tests {
                 label: "a".into(),
                 identity: IdentityKind::Stable,
                 access_expires_ms: Some(1_800_000_600_000),
-                cooldown: Some(CooldownState { until_ms: 1_800_003_600_000, reason: CooldownReason::AnthropicQuotaExhausted }),
+                cooldown: Some(CooldownState { until_ms: 1_800_003_600_000, reason: CooldownReason::AnthropicQuotaExhausted, model: None }),
+                model_cooldowns: vec![CooldownState {
+                    until_ms: 1_800_007_200_000,
+                    reason: CooldownReason::AnthropicQuotaExhausted,
+                    model: Some("claude-fable-5".into()),
+                }],
                 last_usage: Some(ObservedOutcome { at_ms: 1_799_999_990_000, failure: Some(usage_429.clone()) }),
                 last_usage_ok_ms: Some(1_799_999_000_000),
                 last_refresh: Some(ObservedOutcome { at_ms: 1_799_999_500_000, failure: None }),
@@ -1369,6 +1521,7 @@ mod tests {
                         retry_after_s: Some(120),
                         until_ms: None,
                         cooling_down: false,
+                        cooldown_model: None,
                     }],
                     earliest_reset_ms: None,
                     usage_read_retry_ms: None,
@@ -1446,7 +1599,7 @@ mod tests {
     }
 
     fn env(event: SessionEventWire) -> Envelope {
-        Envelope { session_id: SessionId::from("wire-1"), seq: 9, ts: chrono::Utc::now(), event }
+        Envelope::new(SessionId::from("wire-1"), 9, chrono::Utc::now(), event)
     }
 
     fn stream_fixtures() -> Vec<StreamEvent> {
@@ -1533,7 +1686,8 @@ mod tests {
             S::TurnStarted { turn_baseline: 6, trigger: TurnTrigger::DriverAuto, user_text: None },
             S::Conversation(conv()),
             S::Prompt(prompt()),
-            S::PromptResolved { prompt_id: 3 },
+            S::PromptResolved { prompt_id: 3, outcome: Some(PromptOutcome::TimedOut) },
+            S::AnswerRefused { prompt_id: 3, outcome: None },
             S::External(crate::events::types::Event::simple("cli", "hello", None)),
             S::AutoTurnCapReached { cap: 5 },
             S::Idle,
@@ -1799,11 +1953,77 @@ mod tests {
         assert!(matches!(back, SessionQuery::SubagentWatch { tool_queue: true, .. }));
     }
 
+    /// `PromptResolved.outcome` both ways: an older daemon's frame (no
+    /// outcome) decodes as `None`; an outcome this build does not know
+    /// decodes as `Unknown`, not a failed event; `None` is not written, so
+    /// an older daemon's frame is unchanged; and a frame with an outcome
+    /// decodes in an older client's shape (the field is ignored).
+    #[test]
+    fn prompt_resolved_outcome_is_additive() {
+        let old: WireSessionEvent = serde_json::from_str(r#"{"ev":"prompt_resolved","prompt_id":7}"#).unwrap();
+        assert!(matches!(old, WireSessionEvent::PromptResolved { prompt_id: 7, outcome: None }), "{old:?}");
+        let newer: WireSessionEvent =
+            serde_json::from_str(r#"{"ev":"prompt_resolved","prompt_id":7,"outcome":"vetoed_by_policy"}"#).unwrap();
+        assert!(
+            matches!(newer, WireSessionEvent::PromptResolved { outcome: Some(PromptOutcome::Unknown), .. }),
+            "{newer:?}"
+        );
+        let none = serde_json::to_string(&WireSessionEvent::PromptResolved { prompt_id: 7, outcome: None }).unwrap();
+        assert_eq!(none, r#"{"ev":"prompt_resolved","prompt_id":7}"#);
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "ev", rename_all = "snake_case")]
+        enum Older {
+            PromptResolved { prompt_id: u64 },
+        }
+        for (o, name) in [
+            (PromptOutcome::Allowed, "allowed"),
+            (PromptOutcome::Denied, "denied"),
+            (PromptOutcome::Answered, "answered"),
+            (PromptOutcome::Cancelled, "cancelled"),
+            (PromptOutcome::TimedOut, "timed_out"),
+        ] {
+            let line = serde_json::to_string(&WireSessionEvent::PromptResolved { prompt_id: 7, outcome: Some(o) }).unwrap();
+            assert_eq!(line, format!(r#"{{"ev":"prompt_resolved","prompt_id":7,"outcome":"{name}"}}"#));
+            assert_eq!(o.as_str(), name);
+            let Older::PromptResolved { prompt_id } = serde_json::from_str(&line).unwrap();
+            assert_eq!(prompt_id, 7);
+        }
+    }
+
+    /// `AnswerRefused` on the wire, and as an older client reads it: its
+    /// tag is unknown there, so it decodes as `Unknown` (the generic
+    /// "unknown event" notice), not a failed frame and a reconnect.
+    #[test]
+    fn answer_refused_is_unknown_to_an_older_client() {
+        let line = serde_json::to_string(&WireSessionEvent::AnswerRefused {
+            prompt_id: 7,
+            outcome: Some(PromptOutcome::Cancelled),
+        })
+        .unwrap();
+        assert_eq!(line, r#"{"ev":"answer_refused","prompt_id":7,"outcome":"cancelled"}"#);
+        let forgotten = serde_json::to_string(&WireSessionEvent::AnswerRefused { prompt_id: 9, outcome: None }).unwrap();
+        assert_eq!(forgotten, r#"{"ev":"answer_refused","prompt_id":9}"#);
+        // An older client's enum: the variants it knew, and the fallback.
+        #[allow(dead_code)]
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(tag = "ev", rename_all = "snake_case")]
+        enum Older {
+            PromptResolved { prompt_id: u64 },
+            #[serde(other)]
+            Unknown,
+        }
+        for l in [&line, &forgotten] {
+            assert!(matches!(serde_json::from_str::<Older>(l).unwrap(), Older::Unknown), "{l}");
+            let renamed = l.replace(r#""ev":"answer_refused""#, r#""ev":"zz_from_the_future""#);
+            assert!(matches!(serde_json::from_str::<WireSessionEvent>(&renamed).unwrap(), WireSessionEvent::Unknown));
+        }
+    }
+
     #[test]
     fn wire_roundtrip_every_variant() {
         let all = fixtures();
-        // 36 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 21 StreamEvent leaves.
-        assert_eq!(all.len(), 36 + 21);
+        // 37 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 21 StreamEvent leaves.
+        assert_eq!(all.len(), 37 + 21);
         for ev in all {
             let is_conv = matches!(ev, SessionEventWire::Conversation(_));
             let e = env(ev);
@@ -2000,6 +2220,13 @@ mod tests {
                 clear: true,
             }),
             ClientFrame::ReloadExtension { extension: "subconscious".into() },
+            ClientFrame::CatalogPage { req: 7, before: None, limit: None, named_only: false },
+            ClientFrame::CatalogPage {
+                req: 8,
+                before: Some(CatalogCursor { updated_at: chrono::Utc::now(), id: "x".into() }),
+                limit: Some(50),
+                named_only: true,
+            },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -2018,6 +2245,7 @@ mod tests {
                 generation: 1,
                 daemon_build: "abc1234".into(),
                 features: Vec::new(),
+                boot_id: String::new(),
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
             DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
@@ -2075,6 +2303,13 @@ mod tests {
             DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
             DaemonFrame::AuthState { report: auth_state_report() },
+            DaemonFrame::CatalogPage { req: 7, sessions: vec![meta()], next: None, error: None },
+            DaemonFrame::CatalogPage {
+                req: 8,
+                sessions: vec![],
+                next: Some(CatalogCursor { updated_at: chrono::Utc::now(), id: "x".into() }),
+                error: Some("e".into()),
+            },
         ];
         for f in frames {
             let line = encode_line(&f).unwrap();
@@ -2198,6 +2433,123 @@ mod tests {
         assert!(back.pinned);
     }
 
+    fn worker_row(handle: &str, status: &str) -> WorkerRow {
+        WorkerRow {
+            handle_id: handle.into(),
+            subagent_id: handle.trim_start_matches("sa_").parse().unwrap(),
+            agent_name: "shady".into(),
+            model: String::new(),
+            status: status.into(),
+            cancel_requested: false,
+            started_at: "2026-11-16T06:41:10Z".parse().unwrap(),
+            finished_at: None,
+            step: String::new(),
+            tools: 0,
+        }
+    }
+
+    /// `SessionMeta.workers` is additive: omitted while empty (a session
+    /// without workers encodes exactly as before), round-trips, and an older
+    /// daemon's meta (no key) decodes as no workers. The pinned shape.
+    #[test]
+    fn session_meta_workers_are_additive() {
+        let plain = serde_json::to_value(meta()).unwrap();
+        assert!(
+            plain.get("workers").is_none(),
+            "no workers, no key: {plain}"
+        );
+
+        let mut m = meta();
+        let mut done = worker_row("sa_11", "completed");
+        done.finished_at = Some("2026-11-16T06:40:30Z".parse().unwrap());
+        m.workers = SessionWorkers {
+            running: 1,
+            rows: vec![worker_row("sa_12", "running"), done],
+            more: 0,
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            v["workers"],
+            serde_json::json!({"running": 1, "rows": [
+                {"handle_id": "sa_12", "subagent_id": 12, "agent_name": "shady", "status": "running",
+                 "started_at": "2026-11-16T06:41:10Z"},
+                {"handle_id": "sa_11", "subagent_id": 11, "agent_name": "shady", "status": "completed",
+                 "started_at": "2026-11-16T06:41:10Z", "finished_at": "2026-11-16T06:40:30Z"}]})
+        );
+        let back: SessionMeta = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back, m);
+
+        let mut old = v;
+        old.as_object_mut().unwrap().remove("workers");
+        let m: SessionMeta = serde_json::from_value(old).unwrap();
+        assert!(m.workers.is_empty());
+        assert_eq!(m.workers_tag(), "");
+        // A row from a newer daemon: unknown fields and a new status string.
+        let row: WorkerRow = serde_json::from_value(serde_json::json!({
+            "handle_id": "sa_1", "subagent_id": 1, "agent_name": "a", "status": "paused",
+            "started_at": "2026-11-16T06:41:10Z", "expires_at": "2026-11-16T07:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(row.status, "paused");
+    }
+
+    /// `SessionLifecycle::Unknown` takes any lifecycle a newer daemon adds;
+    /// the known ones are unchanged.
+    #[test]
+    fn an_unknown_lifecycle_decodes_as_unknown() {
+        let l: SessionLifecycle = serde_json::from_str("\"archived\"").unwrap();
+        assert_eq!(l, SessionLifecycle::Unknown);
+        for (s, l) in [
+            ("live", SessionLifecycle::Live),
+            ("parking", SessionLifecycle::Parking),
+            ("parked", SessionLifecycle::Parked),
+            ("ending", SessionLifecycle::Ending),
+            ("saved", SessionLifecycle::Saved),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<SessionLifecycle>(&format!("\"{s}\"")).unwrap(),
+                l
+            );
+            assert_eq!(serde_json::to_string(&l).unwrap(), format!("\"{s}\""));
+        }
+        let mut v = serde_json::to_value(meta()).unwrap();
+        v["lifecycle"] = "archived".into();
+        let m: SessionMeta = serde_json::from_value(v).unwrap();
+        assert_eq!(m.lifecycle, SessionLifecycle::Unknown);
+    }
+
+    /// `Welcome.boot_id` is additive: omitted while empty, round-trips, and
+    /// an older daemon's `Welcome` (no key) decodes as empty. The daemon
+    /// advertises `session_workers`.
+    #[test]
+    fn welcome_boot_id_is_additive() {
+        let mut w = Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "v".into(),
+            pid: 1,
+            profile: None,
+            sessions: vec![],
+            progressive_tool_disclosure: false,
+            generation: 1,
+            daemon_build: String::new(),
+            features: daemon_features(),
+            boot_id: String::new(),
+        };
+        assert!(!serde_json::to_string(&w).unwrap().contains("boot_id"));
+        w.boot_id = "9f3c61d2a07e45b1".into();
+        let v = serde_json::to_value(&w).unwrap();
+        assert_eq!(v["boot_id"], "9f3c61d2a07e45b1");
+        let back: Welcome = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.boot_id, "9f3c61d2a07e45b1");
+        assert!(back.supports(FEATURE_SESSION_WORKERS));
+        let mut old = v;
+        old.as_object_mut().unwrap().remove("boot_id");
+        old.as_object_mut().unwrap().remove("features");
+        let back: Welcome = serde_json::from_value(old).unwrap();
+        assert_eq!(back.boot_id, "");
+        assert!(!back.supports(FEATURE_SESSION_WORKERS));
+    }
+
     #[test]
     fn debug_redacts_answer_and_submit_bodies() {
         let secret = "hunter2-very-secret";
@@ -2260,6 +2612,7 @@ mod tests {
             generation: 1,
             daemon_build: String::new(),
             features: daemon_features(),
+            boot_id: String::new(),
         })
         .unwrap()
         .to_lowercase();
@@ -2272,12 +2625,7 @@ mod tests {
     /// a current one, and every other end reason, pass unchanged.
     #[test]
     fn owner_gone_downgrades_for_older_clients() {
-        let env = |reason| Envelope {
-            session_id: "s".into(),
-            seq: 1,
-            ts: chrono::Utc::now(),
-            event: SessionEventWire::Ended { reason },
-        };
+        let env = |reason| Envelope::new("s".into(), 1, chrono::Utc::now(), SessionEventWire::Ended { reason });
         let reason = |e: Envelope| match e.event {
             SessionEventWire::Ended { reason } => reason,
             other => panic!("{other:?}"),
@@ -2325,6 +2673,7 @@ mod tests {
             generation: 1,
             daemon_build: String::new(),
             features: Vec::new(),
+            boot_id: String::new(),
         };
         let old: Welcome = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
         assert!(!old.supports(FEATURE_OWNED_SESSIONS));
@@ -2351,5 +2700,153 @@ mod float_roundtrip_tests {
         let back: ConversationDigest = decode_line(line.trim_end()).unwrap();
         assert_eq!(back.cost.to_bits(), cost.to_bits(), "{line}");
         assert_eq!(format!("{:.4}", back.cost), format!("{:.4}", cost));
+    }
+}
+
+#[cfg(test)]
+mod catalog_page_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(d: u32, h: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(2026, 11, d, h, 0, 0).unwrap()
+    }
+
+    fn saved_meta() -> SessionMeta {
+        let id = "20261110-202033-64fb";
+        let mut m = crate::session::handle::echo::meta_for(&SessionId::from(id));
+        m.journal_id = id.into();
+        m.lifecycle = SessionLifecycle::Saved;
+        m.name = Some("axel".into());
+        m.model = "claude-opus-4-6".into();
+        m.cwd = Some(PathBuf::from("/home/u/Projects/x"));
+        m.created_at = at(10, 20);
+        m.updated_at = Some(at(12, 4));
+        m.host_pid = 0;
+        m.state_since = None;
+        m.title = Some("wire the desktop app".into());
+        m.cost_usd = 4.5;
+        m.messages = 40;
+        m
+    }
+
+    /// The thin-client contract (synaps-desktop decodes these shapes).
+    #[test]
+    fn catalog_page_frames_have_the_pinned_shape() {
+        assert_eq!(FEATURE_SESSION_PAGE, "session_page");
+        assert!(daemon_features().iter().any(|f| f == FEATURE_SESSION_PAGE), "advertised");
+        let req = ClientFrame::CatalogPage {
+            req: 7,
+            before: Some(CatalogCursor { updated_at: at(12, 4), id: "20261110-202033-64fb".into() }),
+            limit: Some(50),
+            named_only: false,
+        };
+        assert_eq!(
+            encode_line(&req).unwrap().trim_end(),
+            r#"{"type":"catalog_page","req":7,"before":{"updated_at":"2026-11-12T04:00:00Z","id":"20261110-202033-64fb"},"limit":50}"#
+        );
+        match decode_line::<ClientFrame>(r#"{"type":"catalog_page"}"#).unwrap() {
+            ClientFrame::CatalogPage { req: 0, before: None, limit: None, named_only: false } => {}
+            other => panic!("{other:?}"),
+        }
+        let dbg = format!("{:?}", ClientFrame::CatalogPage { req: 1, before: None, limit: Some(5), named_only: true });
+        assert_eq!(dbg, "CatalogPage { req: 1, before: None, limit: Some(5), named_only: true }");
+
+        let reply = DaemonFrame::CatalogPage {
+            req: 7,
+            sessions: vec![saved_meta()],
+            next: Some(CatalogCursor { updated_at: at(12, 4), id: "20261110-202033-64fb".into() }),
+            error: None,
+        };
+        assert_eq!(
+            encode_line(&reply).unwrap().trim_end(),
+            concat!(
+                r#"{"type":"catalog_page","req":7,"sessions":[{"id":"20261110-202033-64fb","name":"axel","#,
+                r#""model":"claude-opus-4-6","cwd":"/home/u/Projects/x","created_at":"2026-11-10T20:00:00Z","#,
+                r#""continued":false,"continue_info":null,"host_pid":0,"lifecycle":"saved","clients":0,"#,
+                r#""input_owner":null,"awaiting_input":0,"journal_id":"20261110-202033-64fb","pinned":false,"#,
+                r#""busy":false,"state_since":null,"park_due":null,"evict_due":null,"#,
+                r#""title":"wire the desktop app","cost_usd":4.5,"messages":40,"#,
+                r#""updated_at":"2026-11-12T04:00:00Z"}],"#,
+                r#""next":{"updated_at":"2026-11-12T04:00:00Z","id":"20261110-202033-64fb"}}"#,
+            )
+        );
+        let err = DaemonFrame::CatalogPage { req: 3, sessions: vec![], next: None, error: Some("busy".into()) };
+        assert_eq!(
+            encode_line(&err).unwrap().trim_end(),
+            r#"{"type":"catalog_page","req":3,"sessions":[],"error":"busy"}"#
+        );
+        match decode_line::<DaemonFrame>(r#"{"type":"catalog_page","req":9}"#).unwrap() {
+            DaemonFrame::CatalogPage { req: 9, sessions, next: None, error: None } => assert!(sessions.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `updated_at` is additive: omitted on held rows; an older meta decodes.
+    #[test]
+    fn updated_at_is_additive() {
+        let held = crate::session::handle::echo::meta_for(&SessionId::from("h"));
+        assert!(!serde_json::to_string(&held).unwrap().contains("updated_at"));
+        let v = serde_json::to_value(saved_meta()).unwrap();
+        assert_eq!(v["updated_at"], "2026-11-12T04:00:00Z");
+        let mut old = v;
+        old.as_object_mut().unwrap().remove("updated_at");
+        let m: SessionMeta = serde_json::from_value(old).unwrap();
+        assert_eq!(m.updated_at, None);
+    }
+
+    /// 0.12.0's `SessionLifecycle`: no `saved`, no fallback variant.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum OldLifecycle {
+        Live,
+        Parking,
+        Parked,
+        Ending,
+    }
+
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    struct OldMeta {
+        lifecycle: OldLifecycle,
+    }
+
+    /// `saved` never reaches a listing an old client decodes: `Welcome`,
+    /// `SessionList` and `Attached.meta` are built from handles, whose
+    /// lifecycle cell never reads as `Saved`, whatever it holds.
+    #[tokio::test]
+    async fn saved_never_encodes_into_listings_or_attached_meta() {
+        assert!(serde_json::from_value::<OldMeta>(serde_json::json!({"lifecycle": "saved"})).is_err());
+        for v in 0..=u8::MAX {
+            let mut m = crate::session::handle::echo::meta_for(&SessionId::from("h"));
+            m.lifecycle = SessionLifecycle::from_u8(v);
+            if m.lifecycle == SessionLifecycle::Unknown {
+                // Never stored by an actor (wire.rs PR 2); not a listing value.
+                continue;
+            }
+            let list = serde_json::to_value(DaemonFrame::SessionList { sessions: vec![m.clone()] }).unwrap();
+            let welcome = serde_json::to_value(Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "v".into(),
+                pid: 1,
+                profile: None,
+                sessions: vec![m.clone()],
+                progressive_tool_disclosure: false,
+                generation: 1,
+                daemon_build: String::new(),
+                features: daemon_features(),
+                boot_id: String::new(),
+            })
+            .unwrap();
+            for row in [&list["sessions"][0], &welcome["sessions"][0], &serde_json::to_value(&m).unwrap()] {
+                assert_ne!(row["lifecycle"], "saved", "cell {v}");
+                serde_json::from_value::<OldMeta>(row.clone()).unwrap_or_else(|e| panic!("cell {v}: {e}"));
+            }
+        }
+        // The frozen create-time meta (`Attached.meta`) starts `live`.
+        let (h, _task) = crate::session::SessionHandle::echo_for_test(SessionId::from("h"));
+        assert_eq!(h.meta().lifecycle, SessionLifecycle::Live);
+        assert_eq!(h.meta_live().lifecycle, SessionLifecycle::Live);
     }
 }

@@ -74,7 +74,7 @@ async fn time_extension_injects_timestamp() {
     let result = handler.handle(&event).await;
 
     match result {
-        HookResult::Inject { content } => {
+        HookResult::Inject { content, .. } => {
             assert!(
                 content.contains("Current date and time"),
                 "Expected timestamp in injected content, got: {}",
@@ -107,7 +107,7 @@ async fn time_extension_injects_timestamp() {
     let result = bus.emit(&event).await;
 
     match result {
-        HookResult::Inject { content } => {
+        HookResult::Inject { content, .. } => {
             assert!(content.contains("Current date and time"));
             eprintln!("✓ HookBus dispatched inject: {}", content);
         }
@@ -1873,7 +1873,7 @@ async fn on_session_start_injection_reaches_the_session() {
 
     // (2) the action survives the hook's result filter
     let content = match result {
-        HookResult::Inject { content } => content,
+        HookResult::Inject { content, .. } => content,
         other => panic!(
             "on_session_start must accept `inject`; got {other:?} \
              (regression of #291 defect 1)"

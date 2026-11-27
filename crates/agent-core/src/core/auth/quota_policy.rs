@@ -121,11 +121,17 @@ pub enum WindowVerdict {
     Unknown,
 }
 
-/// Whether a provider availability/window entry (`sonnet`, `gpt-6-astra`)
-/// names the requested model id (`claude-sonnet-4-6`). Exact
-/// (case-insensitive) match, or the entry equals one `-`/`_`/`/`/`:`/`.`
-/// separated token of the request — the same rule the usage adapter uses.
+/// Whether a provider availability/window entry (`sonnet`, `opus-4-7`,
+/// `gpt-6-astra`) names the requested model id (`claude-sonnet-4-6`).
+/// Exact (case-insensitive) match, or the entry's `-`/`_`/`/`/`:`/`.`
+/// separated tokens are a contiguous run of the request's tokens that
+/// ends the request or is followed only by a date (`opus-4-7` names
+/// `claude-opus-4-7` and `claude-opus-4-7-20261101`, not
+/// `claude-opus-4-6`; `gpt-5` does not name `gpt-5.5` or `gpt-5-mini`, and
+/// `gpt-6-astra` does not name `gpt-6-astra-mini`). A single-token entry
+/// equals any one token of the request, as before.
 pub fn model_matches(entry: &str, requested: &str) -> bool {
+    const SEPS: [char; 5] = ['-', '_', '/', ':', '.'];
     let entry = entry.trim().to_ascii_lowercase();
     let req = requested.trim().to_ascii_lowercase();
     if entry.is_empty() || req.is_empty() {
@@ -134,17 +140,33 @@ pub fn model_matches(entry: &str, requested: &str) -> bool {
     if entry == req {
         return true;
     }
-    req.split(['-', '_', '/', ':', '.']).any(|tok| tok == entry)
+    let want: Vec<&str> = entry.split(SEPS).collect();
+    let have: Vec<&str> = req.split(SEPS).collect();
+    if want.len() == 1 {
+        return have.contains(&want[0]);
+    }
+    let is_date = |t: &str| t.len() == 8 && t.bytes().all(|b| b.is_ascii_digit());
+    have.windows(want.len()).enumerate().any(|(i, run)| {
+        run == want.as_slice() && {
+            let rest = &have[i + want.len()..];
+            rest.is_empty() || (rest.len() == 1 && is_date(rest[0]))
+        }
+    })
 }
 
 impl WindowLimit {
-    /// Whether this window constrains `model` (`None` = any model).
+    /// Whether this window constrains `model` (`None` = no model named).
+    ///
+    /// A model-scoped window constrains only a request that names its
+    /// model. A caller that names none (a usage read, `auth plan` without
+    /// `--model`, an old broker client) is not refused an account because
+    /// ONE model's limit is used up: the account still serves the others
+    /// (2026-11-15: Fable's weekly limit at 100 % refused Opus and Sonnet).
+    /// Account-wide windows always apply.
     pub fn applies_to(&self, model: Option<&str>) -> bool {
         match (&self.models, model) {
             (None, _) => true,
-            // A model-scoped window cannot be matched without a model; treat
-            // it as applicable so an unknown model never bypasses a limit.
-            (Some(_), None) => true,
+            (Some(_), None) => false,
             (Some(list), Some(m)) => list.iter().any(|x| model_matches(x, m)),
         }
     }
@@ -245,11 +267,21 @@ pub struct AccountCapacity {
     /// Client-side cooldown (e.g. after a provider limit response). Epoch ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_until_ms: Option<u64>,
+    /// The model that cooldown covers, when it covers the requested model
+    /// only (the account still serves other models); `None`: the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_model: Option<String>,
     /// Why there is no reading, when the read itself failed (a usage 429,
     /// a refresh timeout, …). Never capacity; carried into the rejection
     /// so the failure can be named instead of a bare "quota unknown".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<ObservationFailure>,
+    /// The plan the reading names (Codex `plan_type`), if any. Never
+    /// capacity: on Codex it only decides whether a plan's generic windows
+    /// may judge a requested model the reading doesn't list (the broker's
+    /// requested-model guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
 }
 
 impl AccountCapacity {
@@ -260,7 +292,9 @@ impl AccountCapacity {
             observed_at_ms: None,
             observation: QuotaObservation::Unknown,
             cooldown_until_ms: None,
+            cooldown_model: None,
             failure: None,
+            plan: None,
         }
     }
 
@@ -493,7 +527,8 @@ pub enum Strategy {
 #[derive(Debug, Clone)]
 pub struct SelectionRequest<'a> {
     pub provider: OAuthProviderId,
-    /// Model the request is for; `None` = any (model-scoped windows still apply).
+    /// Model the request is for; `None` = none named (only account-wide
+    /// windows apply, see [`WindowLimit::applies_to`]).
     pub model: Option<&'a str>,
     pub now_ms: u64,
     /// Observations older than this are stale (not capacity).
@@ -588,6 +623,9 @@ pub enum RejectReason {
     AuthError,
     CoolingDown {
         until_ms: u64,
+        /// The model the cooldown covers; `None`: the whole account.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Exhausted {
         window: String,
@@ -633,7 +671,11 @@ impl std::fmt::Display for RejectReason {
             Self::Unknown => write!(f, "quota unknown"),
             Self::Unsupported => write!(f, "usage unsupported"),
             Self::AuthError => write!(f, "auth error"),
-            Self::CoolingDown { until_ms } => write!(f, "cooling down until {until_ms}"),
+            Self::CoolingDown {
+                until_ms,
+                model: Some(model),
+            } => write!(f, "cooling down for {model} until {until_ms}"),
+            Self::CoolingDown { until_ms, .. } => write!(f, "cooling down until {until_ms}"),
             Self::Exhausted {
                 window,
                 resets_at_ms: Some(r),
@@ -698,6 +740,10 @@ pub struct AccountFailure {
     /// `kind` says about its last observation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cooling_down: bool,
+    /// The model the cooldown covers when it covers one model only (the
+    /// account still serves the others).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_model: Option<String>,
 }
 
 impl AccountFailure {
@@ -714,6 +760,10 @@ impl AccountFailure {
             retry_after_s: None,
             until_ms: rejection.usable_after_ms,
             cooling_down: matches!(rejection.reason, RejectReason::CoolingDown { .. }),
+            cooldown_model: match &rejection.reason {
+                RejectReason::CoolingDown { model, .. } => model.clone(),
+                _ => None,
+            },
         };
         if let RejectReason::Outranked { .. } = rejection.reason {
             return None;
@@ -1047,7 +1097,10 @@ pub fn evaluate(
     // same either way.
     if let Some(until) = cap.cooldown_until_ms {
         if until > req.now_ms {
-            return Err(RejectReason::CoolingDown { until_ms: until });
+            return Err(RejectReason::CoolingDown {
+                until_ms: until,
+                model: cap.cooldown_model.clone(),
+            });
         }
     }
     if req
@@ -1171,6 +1224,7 @@ fn evaluate_graced(
     };
     let reading = AccountCapacity {
         cooldown_until_ms: cap.cooldown_until_ms,
+        cooldown_model: cap.cooldown_model.clone(),
         ..good.clone()
     };
     evaluate(&graced_req, &reading)
@@ -1575,7 +1629,9 @@ mod tests {
                 models: None,
             },
             cooldown_until_ms: None,
+            cooldown_model: None,
             failure: None,
+            plan: None,
         }
     }
 
@@ -1905,10 +1961,11 @@ mod tests {
             Selection::Selected { utilization, .. } => assert_eq!(utilization, Some(99.0)),
             other => panic!("unexpected {other:?}"),
         }
-        // no model given: scoped windows still apply (never bypass a limit)
+        // no model given: one model's used-up window does not refuse the
+        // account, which still serves every other model
         assert!(select(&req(), std::slice::from_ref(&acct))
             .selected()
-            .is_none());
+            .is_some());
         // model listed as unavailable
         let mut unavailable = acct;
         if let QuotaObservation::Ok { models, .. } = &mut unavailable.observation {
@@ -2117,8 +2174,11 @@ mod tests {
         };
         assert!(w.applies_to(Some("claude-sonnet-4-6")));
         assert!(!w.applies_to(Some("claude-opus-4-6")));
-        assert!(w.applies_to(None));
+        // No model named: one model's used-up window does not refuse the
+        // account (it still serves the others).
+        assert!(!w.applies_to(None));
         let acct = ok("a", vec![win("seven_day", 7 * DAY, 1.0, NOW + DAY), w]);
+        assert!(select(&req(), std::slice::from_ref(&acct)).selected().is_some());
         let r = SelectionRequest {
             model: Some("claude-sonnet-4-6"),
             ..req()
@@ -2129,6 +2189,28 @@ mod tests {
             ..req()
         };
         assert!(select(&r, std::slice::from_ref(&acct)).selected().is_some());
+    }
+
+    /// A multi-token entry (a display name such as `Opus 4.7`, normalised
+    /// to `opus-4-7`) names a request whose tokens contain it as a
+    /// contiguous run that ends the request (or is followed by a date only);
+    /// single-token entries behave as before.
+    #[test]
+    fn a_multi_token_entry_matches_a_contiguous_run_of_the_request() {
+        assert!(model_matches("opus-4-7", "claude-opus-4-7"));
+        assert!(model_matches("opus-4-7", "claude-opus-4-7-20261101"));
+        assert!(!model_matches("opus-4-7", "claude-opus-4-6"));
+        assert!(!model_matches("opus-4-7", "claude-4-7-opus"));
+        assert!(!model_matches("opus-4", "claude-opus"));
+        assert!(model_matches("fable", "claude-fable-5"));
+        assert!(!model_matches("fab", "claude-fable-5"));
+        assert!(model_matches("4", "claude-opus-4-7"), "single token: as before");
+        // A run followed by more than a date names another model.
+        assert!(!model_matches("gpt-5", "gpt-5.5"));
+        assert!(!model_matches("gpt-5", "gpt-5-mini"));
+        assert!(!model_matches("gpt-6-astra", "gpt-6-astra-mini"));
+        assert!(!model_matches("opus-4", "claude-opus-4-7"));
+        assert!(model_matches("gpt-5", "openai/gpt-5"));
     }
 
     #[test]

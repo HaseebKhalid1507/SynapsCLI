@@ -40,6 +40,55 @@ fn record_for(source: &Session) -> CompactionRecord {
         excluded_classes: vec![ContentClass::EventData],
         redaction_policy: RedactionPolicy::TruncationOnly,
         prior_system_prompt: source.system_prompt.clone(),
+        summary_request: None,
+    }
+}
+
+/// `summary_request` is additive within schema version 1: a record
+/// without it still loads (as "not said"), a record that has none does not
+/// grow a key, and a reader built before the field existed (it does not
+/// reject unknown fields) loads a record that carries it.
+#[test]
+fn summary_request_is_additive_within_schema_version_1() {
+    use agent_core::compaction::SummaryRequest;
+
+    /// `CompactionRecord` as it was before the field.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct RecordBeforeTheField {
+        schema_version: u32,
+        source_session: String,
+        source_message_count: usize,
+        source_range_digest: String,
+        summary_provider: String,
+        summary_model: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+        prompt_stack_digest: String,
+        included_classes: Vec<ContentClass>,
+        excluded_classes: Vec<ContentClass>,
+        redaction_policy: RedactionPolicy,
+        #[serde(default)]
+        prior_system_prompt: Option<String>,
+    }
+
+    let parent = parent_session();
+    let mut record = record_for(&parent);
+    let without = serde_json::to_value(&record).unwrap();
+    assert!(without.get("summary_request").is_none(), "{without}");
+    let reread: CompactionRecord = serde_json::from_value(without).unwrap();
+    assert_eq!(reread.summary_request, None);
+
+    for (request, name) in [
+        (SummaryRequest::ChatRequest, "chat_request"),
+        (SummaryRequest::Transcript, "transcript"),
+    ] {
+        record.summary_request = Some(request);
+        let with = serde_json::to_value(&record).unwrap();
+        assert_eq!(with["summary_request"], name);
+        assert_eq!(with["schema_version"], COMPACTION_SUMMARY_SCHEMA_VERSION);
+        let old: RecordBeforeTheField = serde_json::from_value(with.clone()).unwrap();
+        assert_eq!(old.schema_version, COMPACTION_SUMMARY_SCHEMA_VERSION);
+        assert_eq!(serde_json::from_value::<CompactionRecord>(with).unwrap(), record);
     }
 }
 

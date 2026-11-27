@@ -34,6 +34,7 @@
 | `synaps --attach --as NAME` / `synaps attach --as NAME` | Names this client in the session (also `SYNAPS_CLIENT_NAME`): 1–32 letters, digits, `-` or `_`, starting with a letter or digit, checked by the client and again by the daemon (an invalid name is `Refused{Protocol}` at the handshake). A label, not a login: every client is the daemon's own user. Without one a client gets its kind (`tui`, `attach`, `rpc`, …); a name already taken in the session gets the lowest free `-2`, `-3` suffix (case-insensitive). The resolved name rides `ClientJoined{name, mode}` and `Attached.roster`, and shows in `/clients`, `synaps daemon sessions` (`clients=2 (tui*, dash(observe))`, `*` = owns input), `input owned by tui (#1)` refusals, approval notices and the TUI's "input taken over by" toast. Older daemons ignore the name; older clients ignore the new fields. |
 | `/takeover` (TUI) / `SessionCommand::TakeInput` | The in-place `--takeover`: an attached read-only client takes input without re-attaching (no re-mirror), mid-turn too. Same `InputOwnerChanged{Takeover}` (`Attach` if nobody owned input); refused from an `--observe` client; a no-op from the owner. A read-only TUI's attach line and its "refused: input owned by …" errors name it. |
 | `client_input = shared` (default) / `exclusive` (config, `/settings` → Daemon) | Who may type in a session with several clients attached. Every client is the daemon's own user, so by default (`shared`) every drive client (not `--observe`) may send input; the one that did last is the *active* client: `InputOwnerChanged{Input}` moves the marker (older clients, without `ClientCapabilities::owner_reason_input`, read it as `Takeover`), it may choose "Allow all" (answering makes a client active), and it gets input back first after a daemon reload. When the active client leaves, input goes to whoever typed most recently. `exclusive` is the rule before `client_input`: only the input owner drives, the others are read-only until they `--takeover` or `/takeover`. The daemon reads it from config when it starts, for every session it creates or restores (`synaps daemon reload` picks up a change; `SessionConfig.client_input` overrides it per session). The snapshot carries it (`Attached.client_input`; absent from an older daemon, which means `exclusive`), and so does the listing (`synaps daemon sessions` says `active=` instead of `owner=`). An older client (no `owner_reason_input` capability) on a shared session knows only the owner rule, so the daemon presents it as owning input and never sends it `InputOwnerChanged`: it can type all along, and would otherwise announce "input is owned by …" on attach and "input taken over" whenever another client typed (every open TUI is an older client right after a `daemon reload` onto a new build). The TUI header shows `N clients` when another client is attached; a TUI that may not drive (`--observe`, or not the owner under `exclusive`) sends nothing on Enter or Esc and says why in a toast, keeping the text. |
+| `PromptResolved{outcome}` / `AnswerRefused` | What the session applied when a prompt closed: `allowed` (a Confirm's gate opened: y/yes, or Allow all at the tool-call gate), `denied` (any other answer, Allow all at the activation gate, or a Secret answered with nothing), `answered` (a Secret's value, even empty: never trimmed or parsed), `cancelled` (the turn was cancelled, revoked or checkpointed, the session ended, or the waiting call was already gone, so the call never passed its gate), `timed_out` (nobody attached by the abandonment deadline; the session denied it). `allowed` means the gate opened, not that the tool then succeeded. Each prompt's gate is fixed where it is raised (`SecretPromptHandle::confirm_tool_call` / `confirm_activation` / `secret`) and kept by the session, never read back from its title; one function (`ConfirmGate::decide`) reads an answer for the gate, the outcome and the "Allow all armed" notice. An `Answer` to a prompt that is no longer pending is answered `AnswerRefused{prompt_id, outcome}` to its sender alone (never replayed): `outcome` is what applied, absent when the id isn't remembered (never raised, or older than the last 64 closed), which never means denied. An answer the policy refuses while its prompt is pending (an observer's, Allow all from a non-owner, read from the raw `always` token on every Confirm) is the unchanged broadcast `Refused{command: "answer"}`. Feature `prompt_outcome`. A client draws its receipt from this, not from the tool's result text (a cancel at the gate reads "Tool call confirmation denied" there). |
 | `synaps --attach --no-confirm-answers` | TUI only, any attach mode: this client never answers a `Confirm` prompt (tool-call and tool-activation approvals). It never opens the approval pane for one, so no key typed into it can approve; it lists the waiting confirms in a toast until another client's answer resolves them (`PromptResolved`). `Secret` prompts are unchanged. Client-side only: no wire or daemon change, so it works against any daemon. For a TUI embedded where keystrokes may not come from the person approving (a terminal pane in another app). An `--observe` attach still can answer prompts without this flag: `Answer` is not an input command. |
 | `SYNAPS_SESSION_COMPACT_INLINE=1` | One-release kill-switch: run `/compact` and auto-compaction inline on the actor task (the #107 body — `Attach`/`Cancel` wait behind it) instead of the spawned job. Deleted in phase 4. |
 | `synaps daemon reload` / `stop` / `purge` / `close` / `pin` / `rename` / `reload-extension` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, `daemon close --attached` ends one session whoever owns its input (without `--attached` it refuses a session that has clients attached), `daemon pin` pins one session whoever owns its input (host authority, like `stop`), `daemon rename` names one session whoever owns its input (metadata only), and `daemon reload-extension` restarts an extension every session shares. `Checkpoint` over the wire is owner-only. |
@@ -565,6 +566,128 @@ nothing until the first real turn. The restore holds the daemon's idle exit.
 | `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket, exe, generation}` — never credentials. The daemon keeps the record in memory: when a Ping finds the file missing or naming another pid (an older `synaps` that lists sessions unlinks run-dir `*.json` files it can't parse as session cards), the lock holder writes it back (one INFO line `daemon.json rewritten` per 10 min). Every write of `daemon.json` and `daemon.pid` goes through that file's own `<name>.tmp`, created exclusively and without following a symlink, mode 0600, then renamed into place. One metadata lock serializes the start write, the heal, the reload's write and its restore, and the shutdown cleanup: a heal never writes back an older record than the one held, and nothing writes the files after the cleanup. `daemon status`, `daemon reload`, `daemon stop` and `daemon start --detach` Ping before they read it. |
 | `daemon.pid` | 0600 | pid |
 
+## Workers in the session list
+
+`SessionMeta.workers` lists the session's background workers (`subagent_start`) that hold its park,
+so a client sees a session whose turn has ended while its workers still run:
+
+```json
+"workers": {"running": 1, "rows": [
+  {"handle_id": "sa_12", "subagent_id": 12, "agent_name": "shady", "status": "running",
+   "started_at": "2026-11-16T06:41:10Z"},
+  {"handle_id": "sa_11", "subagent_id": 11, "agent_name": "shady", "status": "completed",
+   "started_at": "2026-11-16T06:38:02Z", "finished_at": "2026-11-16T06:40:30Z"}]}
+```
+
+- **Which workers**: exactly the ones that keep the session from parking
+  (`SubagentRegistry::holds_park`, one shared predicate): running (a cancelled one winding down
+  included), or finished on its own with its result uncollected, for up to 15 min
+  (`FINISHED_HANDLE_TTL`). A collected, cancelled-and-finished or expired worker is not listed.
+- **`running`**: running and not stopping (a cancelled worker is not counted; `/sessions` and
+  `synaps daemon sessions` show it as ` · 2 workers`). Independent of `busy` (a turn or a
+  compaction): a session whose turn ended with workers going is `busy: false` with workers.
+- **Rows**: running first (oldest first), then finished (newest first), at most 8; `more` counts
+  the rest. Times are wall clock, stamped once (`started_at` at registration, `finished_at` when the
+  run ends), so an unchanged worker gives an identical row. `status` is a string (`running`,
+  `completed`, `cancelled`, `timed_out`, `failed`); a client must accept new values. `step` and
+  `tools` are reserved: always empty for now. Keys at their default are left out (`more: 0`,
+  `cancel_requested: false`, an empty `model`, `finished_at` on a running worker, and the whole
+  `workers` key when there are none).
+- **Row fields are append-only**: a later daemon only adds fields (with a default), never removes,
+  renames or retypes one. A Rust client decodes a whole `session_list` / `welcome` as one frame, so
+  one unreadable row would fail its entire listing. `synaps daemon sessions --json` prints the rows
+  exactly as the daemon sent them, fields this build does not know included.
+- **Freshness**: the actor publishes the block to the handle's own cell (`publish_workers`), only
+  when it changed: with every presence publish; from the 1 Hz worker tick, which outlives the turn
+  while a worker runs (a start or finish shows within a second); at once on a cancel (`/workers
+  cancel`, Esc, the cost cap, a driver revoke, `/close force`); and from a one-shot at the earliest
+  listed result's expiry, which also re-arms the park. An idle session with no finished rows holds
+  no timer.
+- **Parked**: no runtime, so no workers (and a session with listed workers does not park).
+- **Ending**: none either. From the moment a session starts to end (`/close`, `daemon close`,
+  eviction, its owner gone) until it leaves the list, its workers are being stopped with it.
+- **Attach**: `Attached.meta` is the create-time record and never carries workers (nor the other
+  presence fields). Keep a session's workers from the listing, never from an attach.
+- **Handle ids**: never reused within a boot or across `daemon reload`; after a cold start they
+  begin again at `sa_1` and `Welcome.boot_id` changes, so a client keys worker state by
+  `(boot_id, handle_id)`.
+
+## Saved sessions (`catalog_page`)
+
+A client that cannot read the sessions dir itself (synaps-desktop, a remote client) pages through
+the **saved** sessions: the conversations on disk that this daemon does not hold. Held sessions come
+from `sessions` / `Welcome.sessions` as before; the two lists never overlap and together cover every
+listable conversation.
+
+```
+C: {"type":"catalog_page","req":7,"limit":50}
+D: {"type":"catalog_page","req":7,"sessions":[{"id":"20261110-202033-64fb","journal_id":"20261110-202033-64fb",
+    "lifecycle":"saved","name":"axel","title":"wire the desktop app","model":"claude-opus-4-6",
+    "cwd":"/home/u/Projects/x","created_at":"2026-11-10T20:20:33Z","updated_at":"2026-11-12T04:00:00Z",
+    "messages":800,"cost_usd":4.6,"host_pid":0, …}],
+    "next":{"updated_at":"2026-11-12T04:00:00Z","id":"20261110-202033-64fb"}}
+C: {"type":"catalog_page","req":8,"limit":50,"before":{"updated_at":"2026-11-12T04:00:00Z","id":"20261110-202033-64fb"}}
+```
+
+- **Feature**: `Welcome.features` lists `session_page`. An older daemon answers the frame with
+  `error` "malformed frame: unknown variant `catalog_page`…" and keeps the connection usable;
+  `SocketTransport::catalog_page` never sends it there (`DaemonTooOld`).
+- **A control frame**: no attach, no session allocated, on a plain control connection. Refused with
+  `error` on an attached connection.
+- **Rows** are `SessionMeta` with `lifecycle: "saved"` and `updated_at` set (the head journal's).
+  `id` equals `journal_id`. `name` is the head's, else the newest named predecessor's; `title` is
+  the header title, else the first message a person typed, on one line, no control or bidi
+  override characters, at most 120 characters; `model`, `cwd` and `cost_usd` are the head's;
+  `created_at` is the chain's first session's; `messages` the head's count (0 from a legacy
+  file). `host_pid` is 0 and every presence field has its default. `lifecycle: "saved"` appears **only** in `catalog_page` replies:
+  never in `welcome`, `session_list` or `attached.meta`, whose 0.12.0 readers have no fallback.
+- **One row per conversation**: a compacted predecessor folds into its chain head (`compacted_into`,
+  however long the chain). A chain that loops back on itself is not listed.
+- **Held vs saved**: a head is left out iff a session this daemon holds holds it
+  (`SessionHandle::holds`: its current journal, or one it compacted away from, whose successor may
+  not be on disk yet), or holds its parent (`parent_session`): a compaction saves the successor
+  before the actor moves onto it. Never by actor id: after `/clear`, actor `A` holds the new conversation `N`,
+  and conversation `A` is saved and listed. The held set is read after the disk load, so a session
+  resumed during the load is left out.
+- **Listable**: on disk, not a junk id, and named, or else neither in a sandbox cwd (under a temp
+  dir; `$HOME` never counts) nor under 3 messages without being a compaction's successor
+  (`parent_session`; a fresh successor holds just the summary). A named conversation is never
+  hidden. A session that never took a turn has nothing on disk and is never listed.
+- **Order and paging**: `updated_at` descending, then `id` descending. `before` is exclusive; `next`
+  is the last row's cursor and is absent on the last page. `limit` is 50 when absent, at least 1,
+  at most 200. `named_only` keeps named rows only. Held rows never take a slot.
+- **Freshness**: the catalog is read on one blocking thread, one load at a time daemon-wide. A
+  first page (no `before`) always gets a load that started after it was asked; requests that
+  queue behind a running load share the next one. A continuation page may reuse a load at most
+  30 s old, so paging through is one disk scan. Saved sessions changed by another process are seen
+  by the next first page.
+- **Cost** (`examples/catalog_page_bench.rs`, one thread, load + fold + a page of 50): the gate is a
+  warm first page under 250 ms at 1,500 sessions; cold is recorded, not gated. On bella: 19 ms
+  warm and a 256 ms median cold (page cache dropped) at 1,500; 14–18 ms warm and 243 ms cold on
+  1,161 real sessions. A cold load delays only the first paint of the saved list, about once per
+  boot; it runs off the control loop. Revisit when the warm first page nears 100 ms (about 8,000
+  sessions): an in-memory header cache in `SavedLoader`, keyed by file name, mtime and length.
+- **Never blocks the connection**: each page runs as its own task; `sessions`, `ping`, `reload` and
+  the rest are answered meanwhile, and a pipelining client matches the reply by type and `req`.
+  At most 4 pages are in flight per connection; a fifth is answered at once with
+  `{"type":"catalog_page","req":…,"sessions":[],"error":"too many catalog pages in flight …"}`. An
+  unreadable sessions dir is `error` too. A page still loading when the connection ends (`bye`,
+  stop, an announced reload) or attaches is dropped: no reply follows a `bye` or reaches an attach
+  stream. After sending `attach`, expect late `catalog_page` replies before `attached` (none, or
+  one per page already answered and queued) and treat every outstanding `req` as cancelled.
+- **Resume** a row with `Attach::Create` and `config.continue_session` set to its `journal_id` (by
+  id: a `/chain` name can shadow a session name). It then leaves the pages and appears in
+  `sessions`.
+- **After a reconnect** (a reload, a cold start, any disconnect) a client that shows saved rows
+  re-pages from the first page: sessions that ended, were evicted or failed to restore in the gap
+  are saved now, at their `updated_at` position.
+- **When the held set changes**: nothing pushes saved rows yet (no `session_watch`). Without it,
+  request a first page (`before` absent) whenever the set of `(id, journal_id)` in `sessions`
+  changes, and replace the saved list with it; never merge it into older pages. That covers a
+  session that ended, was closed or evicted (it leaves `sessions` and is saved now, above any
+  cursor), a saved row another client resumed, and a resumed conversation that compacted to a new
+  `journal_id`. A re-page is one warm scan (about 19 ms at 1,500 sessions).
+
 ## Per-session event endpoint ownership
 
 Session registry cards still use `<session-id>.json`, but active event sockets use
@@ -621,13 +744,14 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions"]}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions","session_workers","session_page","addressed_replies","prompt_outcome","cache_expiry"], boot_id?}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
 C: rename{session_id, name?, expect?}         → D: renamed{session_id, name, in_memory_only?} | rename_failed{session_id, reason, message, taken_by?, current_name?} | refused{unknown_session} (→ daemon closes)
 C: reload_extension{extension}                → D: extension_reloaded{report} | extension_reload_failed{extension, message, unloaded} | refused{busy} (→ daemon closes)
+C: catalog_page{req, before?, limit?, named_only?} → D: catalog_page{req, sessions:[SessionMeta saved], next?, error?}   (a task: other frames are answered meanwhile)
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode, owned?:{forward_secrets?:[[k,v]]}}
 D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients, owner_token?} | error
 C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event", session_id, seq, ts, event:WireSessionEvent} …
@@ -674,7 +798,7 @@ C: bye | socket close = Detach (turn keeps running)
   (`attach_to_session_with_history_over_1mib`), a 2 MiB `ping` is answered, a 64 MiB + 10 B frame is refused.
 - Query ids ≥ `RESERVED_QUERY_ID_BASE` (2^63) belong to the transport/daemon (`DIGEST_RESYNC_QUERY_ID`,
   `IDLE_PROBE_QUERY_ID`, `CHECKPOINT_QUERY_ID`, `CLOSE_QUERY_ID_BASE`+n); `SocketTransport` never surfaces them
-  as `QueryResult`.
+  as `QueryResult`. Who receives a reply: see "Request ids and replies" below.
 - `close` was added without a protocol bump: a daemon older than it answers the unknown frame with
   `Error{"malformed frame: unknown variant `close`…"}` and keeps the connection open, and
   `synaps daemon close` reports "daemon … predates `daemon close`; run `synaps daemon reload`" (exit 2).
@@ -711,6 +835,133 @@ C: bye | socket close = Detach (turn keeps running)
   `owner_gone` only to clients that declare the `owner_gone` capability and tells the others
   `client_quit` (`ended_for`). `Bye` gains `owner_lagged`, sent only to an owner (a client that
   knows the feature).
+- Session workers are additive the same way. `Welcome.features` lists `session_workers` when the
+  listings (`Welcome.sessions`, `session_list`) carry each session's `workers` block (see "Workers
+  in the session list"); `attached.meta` is the create-time record and carries none, like the
+  other state fields. The block is omitted while empty, so a session without
+  workers encodes exactly as before. `Welcome.boot_id` (16 hex characters) is minted at a cold start
+  and carried across `daemon reload` (`ReloadState.boot_id`): a new value means worker handle ids
+  (`sa_N`) started over. `SessionLifecycle` decodes a lifecycle this build does not know as
+  `unknown` (`#[serde(other)]`); the daemon never sends it.
+- Saved sessions are additive the same way. `Welcome.features` lists `session_page` when the daemon
+  answers `catalog_page` (see "Saved sessions"); the reply and `lifecycle: "saved"` reach only a
+  client that sent the frame. `SessionMeta.updated_at` is omitted on held rows.
+
+## Negotiation
+
+Three mechanisms, three questions. None substitutes for another.
+
+| Mechanism | Answers | Set by | Read where |
+|---|---|---|---|
+| `Welcome.features` | does this daemon support contract X? | daemon | the client, before it sends a frame an older daemon would reject or ignore (`DaemonTooOld`), or to discover a filled field |
+| `ClientCapabilities` (`hello.client.capabilities`) | can this client decode output Y? | client | the wire boundary only (`wire::client_decodes`, `ended_for`, `legacy_shared` in `daemon/conn.rs`), never the actor |
+| `Envelope.audience` (never serialized) | who asked? | the actor, at emit | `session::deliver`/`delivers`, at every subscriber |
+
+A feature names a contract a client can't detect any other way. A field whose absence already reads as
+"unknown" needs no token. Old × old behaves as before and new × new gets the whole contract; the mixed
+cases:
+
+| Name | Kind | Since | What it gates | New client × old daemon | Old client × new daemon |
+|---|---|---|---|---|---|
+| `owned_sessions` | feature | 0.12.0 | `Attach::Create{owned}`, the owner re-bind, `EndReason::OwnerGone` | the client refuses to ask (an older daemon would ignore `owned` and hand back an unowned session) | never asks |
+| `session_workers` | feature | 0.13.0 | `SessionMeta.workers` is filled | the block is always empty | the block is omitted while empty; filled rows are additive |
+| `session_page` | feature | 0.13.0 | `catalog_page`, `Watch{saved}`, `lifecycle: saved` | `DaemonTooOld` before sending | never asks; never sees `saved` rows |
+| `addressed_replies` | feature | 0.13.0 | replies reach only their asker (below) | replies remain broadcast; `SessionLink` draws its request ids from a random base in `[2^32, 2^62)`, which makes accidental request-id collisions with another client highly unlikely (a mitigation, not addressing: equal ids still correlate, and a peer can still pick an id it has seen) | only its own replies; host replies gone (Rust clients already dropped them); another client's `SettingChanged`/`Resumed` arrives with id `VIEW_CHANGED_SETTING_ID` (view-only) |
+| `prompt_outcome` | feature | 0.13.0 | `PromptResolved.outcome`; `AnswerRefused` for a late or unknown `Answer` | `outcome` is absent and a late answer is dropped without a word: the client infers what it can from the tool's result | ignores `outcome`; `AnswerRefused` is an unknown event tag (the TUI shows the generic unknown-event notice), and the connection stays up |
+| `cache_expiry` | feature | 0.13.0 | `SessionQuery::CacheExpiry` (below) | `DaemonTooOld` before sending (an older daemon fails the frame as malformed); the TUI's `/keepwarm status` leaves the line out | never asks |
+| `tool_queue` | capability | 0.11.0 | `LlmEvent::ToolQueued`/`ToolStarted`, live and in the attach replay | — | never sent them |
+| `owner_reason_input` | capability | 0.11.0 | `OwnerChangeReason::Input`, `Attached.client_input` | — | a shared session is presented in owner terms (`legacy_shared`) |
+| `owner_gone` | capability | 0.12.0 | `EndReason::OwnerGone` | — | told `Ended{client_quit}` (`ended_for`) |
+
+An unknown `ev` tag decodes as `WireSessionEvent::Unknown` (`#[serde(other)]`) and the TUI shows the
+generic unknown-event notice; it does not tear down the connection. Fields are only added, with
+`#[serde(default)]`, and never change name or type.
+
+## Request ids and replies
+
+Every client numbers its own requests (`Query`, `Set`, `Resume`, `EngineCommand`, `PluginCommand`), so
+two clients' request 5 share an id. Replies are addressed to the request's origin, which the daemon takes
+from the connection (it stamps every client frame; `LocalTransport` stamps its attachment), never from
+the frame:
+
+- `QueryResult` (every query, engine/plugin command, resume error, close/rename/checkpoint reply) and
+  `AnswerRefused` (a late or unknown `Answer`) reach only the attachment that asked; a host's (in-process `SessionHandle::send`: idle probe, reload
+  checkpoint, `daemon close`/`rename`, the reload's setting replay) reaches no attachment.
+- `SettingChanged` (a `Set`) and `Resumed` (a `Resume`) are shared state: every client gets them, and every
+  client but the asker sees the id as `VIEW_CHANGED_SETTING_ID` ("answers no request of yours"; old
+  clients already treated it as a view change). One the host asked for is view-only for everyone.
+- The audience is applied before anything else at every subscriber: the connection pump and its reload
+  drain project each envelope for their client before filtering and converting it, so a reply is never
+  serialized to a client that did not ask. `Attached`, `AttachRefused` and `Refused{client}` are unchanged
+  (the conn sends its own `Attached`; `Refused` is still broadcast and the client filters on `client`).
+- Ids are scoped per attachment and reusable once answered; the daemon never dedups them. Three kinds:
+  **application ids** (below `RESERVED_QUERY_ID_BASE`, what a client counts with); the one
+  **transport-internal id** `DIGEST_RESYNC_QUERY_ID`, which a Full-history `SocketTransport` (old or new)
+  sends from its own attachment on a digest miss, so its reply is that attachment's and never the
+  host's; and **host ids**, every other reserved id. A client that sends a host id gets its reply on its
+  own attachment; it can never satisfy a host waiter (they accept only host-addressed replies).
+- A client id is never reused within a session's life, so a reply addressed to an attachment that is gone
+  reaches nobody, never its replacement.
+- `seq` is gapless per session at emit. A connection's stream may skip seqs (replies to others, events
+  its capabilities exclude, the actor's `Attached`): a gap is not loss. A reply never enters the
+  mid-turn replay ring.
+
+## Prompt-cache evidence (`CacheExpiry`)
+
+`Query{query: "cache_expiry"}` (feature `cache_expiry`) answers what this session's **own** requests
+show about the provider's prompt cache for its next request. It is evidence, not provider state:
+other sessions on the same account, token renewal and provider-side eviction are blind spots.
+
+**Reply** (`QueryResult.value`): `{state, reason?, warm_for_secs?, lapse_by_secs?, proof_ttl_secs?,
+requested_ttl_secs?, proof_cache_tokens?, next_ping_in_secs?}`, every field after `state` optional.
+`state` is `warm`, `cold` or `unknown`; an unknown `state` or `reason` from a newer daemon reads as
+`unknown`. Durations are whole seconds from the daemon's emit, lower bounds rounded down, upper bounds
+up.
+
+| `state` | `reason` | Means |
+|---|---|---|
+| `warm` | — | the session's last accepted request, which the next request can read, read or wrote the cache, and the TTL the server is known to honour for it (`proof_ttl_secs`) has `warm_for_secs` left |
+| `unknown` | `may_have_expired` | that TTL ran out, but the TTL requested (`requested_ttl_secs`), counted from the session's latest send, runs until `lapse_by_secs` |
+| `cold` | `expired` | no send of this session can have kept it past now |
+| `cold` | `uncached` | that request read and wrote nothing |
+| `unknown` | `unmeasured` · `no_matching_request` · `busy` · `parked` · `not_anthropic` · `head_unresolved` · `history_unsettled` · `rollover_pending` · `probe_failed` | no answer from evidence (below) |
+
+How it is computed: from the session's cache anchor, the record keep-warm scheduling and
+cache-preserving compaction read too. It holds the session's last accepted (HTTP 2xx) request, of a
+turn's rounds, a keep-warm ping or a compaction's cached request: when it was sent, its cache
+identity (model, effort, system, thinking, tools, beta header, account) and its messages, the cache
+reads and writes the provider reported for it, and when the session last sent any request. Nothing
+older is kept. The query assembles the next request through the same builder as a ping (nothing is
+sent, no latch is touched); it matches when it has the same identity and starts with that request's
+messages, and otherwise answers `no_matching_request`. The honoured TTL is the one keep-warm
+schedules by: that request's own 1h/5m write split, else the session's downgrade and 1h latches (1h
+only with evidence). Ages count on both the monotonic and the wall clock (a machine that slept wakes
+to the provider's time). A switch to model B finds no match until B's own request, and switching back
+to A finds none either: only the latest request is known. A parked session answers `parked` without
+waking; a woken one, like a reloaded one, knows no request until its next.
+
+**Errors**: `{"error": {"code", "message"?}}` with `code` `busy` (four jobs live, or the image decoder
+is in use), `timeout` (5 s), `superseded` (the same client asked again under another id), `stale`
+(the history, a setting, the tools, the injection or the cache anchor changed before the answer was
+sent: ask once more) or `unavailable`; an unknown code reads as `internal`. The answer reaches only
+the client that asked (above); a client that detaches gets nothing.
+
+**Recommended rendering** (the TUI's `/keepwarm status` uses it word for word):
+
+| Reply | Say | Never say |
+|---|---|---|
+| `warm` | "Recent cache activity · about 4m left" | "cached", "next request will hit" |
+| `unknown{may_have_expired}` | amber "May have expired"; optionally "this session's last possible refresh ends in about 40m" | a second countdown, "warm until" |
+| `cold{expired}` | "No unexpired evidence from this session" | "cache is empty" |
+| `cold{uncached}` | "Last measured request reported no cache activity" | "next request will miss" |
+| other `unknown{…}` | the reason: parked · a turn is running · last turn didn't finish · no matching request yet · last request not measured yet · next turn starts a new context · couldn't check · not tracked for this provider | `0:00` or any timer |
+| `next_ping_in_secs` | "next keep-warm attempt in about 3m" | "renews", "keeps it warm until" |
+| `proof_cache_tokens` | "N tokens read or written by the last measured request" | "N tokens cached" |
+
+A desk counts `warm_for_secs` down from receipt, prefixed "about", in a neutral colour (never green);
+at zero it switches to the amber band and asks once more. It never extends the countdown locally and
+never runs `lapse_by_secs` as a timer. It asks again on `Done`, `SettingChanged`, `Conversation` and
+`Attached`, at the zero transition, and once on `stale`; it never polls.
 
 ## Security posture
 
@@ -950,8 +1201,10 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
    cancel (partial history kept + restart marker), answer prompts `None`, save, close PTYs, notice.
    Workers do not hold the drain: an idle parent waiting on workers counts as idle.
 3. **reload-state** `daemon[-P].reload.json` (0600): generation, per-session `{id, journal_id, config
-   (continue_session = journal_id, cwd, model), keep_warm, lifecycle, workers, tool_activations}`, and
-   `next_subagent_id` (the `sa_N` counter).
+   (continue_session = journal_id, cwd, model), keep_warm, lifecycle, workers, tool_activations,
+   supersedes, created_at}`, and `next_subagent_id` (the `sa_N` counter). `supersedes` and `created_at`
+   are the actor's [conversation cell](#conversation-identity): the next image's actor still holds the
+   journals it compacted away from, and the listing keeps the conversation's start.
 4. **Announce**: every other connection gets `Event(Reloading{generation, retry_after_ms: 500})` +
    `Bye{Reloading}` (forwarders drain the checkpoint's events first); the requester gets `Bye{Reloading}`.
 5. **Exec**: `daemon.json` rewritten (`generation+1`, same pid), sidecars stopped (≤ 5 s), the flock fd made
@@ -972,7 +1225,8 @@ Sequence (`daemon/reload.rs`, PLAN-phase3 §2.8), all on the requesting control 
 6. **New image**: `Daemon::start` sees `SYNAPS_DAEMON_RELOAD_STATE` → `DaemonLock::adopt(fd)` (same open file
    description = same flock, no gap), no `reap_stale`, rehydrates every recorded session
    (`create_session(continue_session = journal_id)`) **before** accepting; `reload_aliases` maps old→new
-   ids for one generation (they differ only after a LinkedSuccessor compaction). Before the first session
+   ids for one generation (they differ after a LinkedSuccessor compaction, a `/clear`, an in-session
+   `/resume`, or for an actor that took a minted id). Before the first session
    the handle counter is raised to `next_subagent_id` (and past every carried id); each continued
    session with tool activations gets the host-only `RestoreToolActivations` first, and each session
    with carried workers gets the host-only `AdoptWorkers` (both before any `Park`). The restore does not wait
@@ -989,8 +1243,8 @@ marker kept), pending prompts (`None`), PTY/background shells (closed, announced
 `turn_replay`, input ownership (re-established by reconnect order + `was_owner`), running reactive
 workers (stopped resumably, see below).
 **Preserved** — each session's `Checkpoint{Reload}` reply carries a `SessionReloadRecord` that the new
-image rehydrates from: the journal and session id (same journal continued; `reload_aliases` only after a
-LinkedSuccessor compaction), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
+image rehydrates from: the journal and session id (same journal continued; `reload_aliases` when the
+session comes back under another id, see step 6), the `SessionConfig` as created (cwd, `--system`, prompt manifest,
 compaction policy, auto-compact, persist), the keep-warm pin, the lifecycle (**a Parked session comes
 back Parked** — rehydrate creates it then sends the host-only `Park`), the non-persisted runtime knobs
 (`settings_replay`: `/context`, compaction model, API retries, subagent/bash timeouts, tool-output cap,
@@ -1000,9 +1254,12 @@ activations** (`activate_tools` grants under progressive disclosure; see
 [Tool activations across a reload](#tool-activations-across-a-reload-or-a-park)). A session that never ran a turn has no
 journal (`save` skips an empty conversation): it is recreated fresh under a new id and aliased.
 A session whose journal lock is held by another process (e.g. an in-process `synaps --continue X`) is
-NOT recreated — it is registered as a **Parked placeholder** under the same id with `locked_by` set
-in its metadata. Attach is refused with a message naming the lock holder's pid and kind (F23).
-`daemon sessions` shows it as Parked with the `locked_by` marker.
+NOT recreated — it is registered as a **Parked placeholder** with `locked_by` set in its metadata,
+under the id a real session on that journal would take (the journal id, or a minted one if a session
+restored earlier has it), never replacing a session already registered; the old id is aliased to it. Attach is refused with a message naming the lock holder's pid and kind (F23).
+`daemon sessions` shows it as Parked with the `locked_by` marker. Every attach retries the real create;
+the placeholder stays listed while it runs and the real session replaces it in place under its id
+(it never leaves the list).
 
 Tested against a **real** `synaps daemon --foreground` process (`tests/daemon_reload.rs`): same pid before
 and after, `generation` 1→2, flock held throughout, conversation identical after reconnect, client is
@@ -1016,6 +1273,43 @@ whole session's hit rate instead of restarting at the first request after the re
 miss). They live in the session's `.json` snapshot only (`Session::total_cache_read_tokens` /
 `total_cache_creation_tokens`), never in the journal: 0.10.1 rejects unknown journal fields. In
 journal mode they are as of the last snapshot. A session saved before they persisted resumes them at 0.
+
+### Conversation identity
+
+A session's `id` is the **actor**: what `Attach::Existing`, `close`, `pin` and `rename` take. Its
+`journal_id` is the **conversation**. They start equal and part when the actor moves to another journal:
+a linked-successor compaction (the same conversation continues in a successor journal), `/clear` and an
+in-session `/resume` (another conversation). Each actor keeps one conversation cell: the journal id, the
+journals it compacted away from since it last began a conversation (`supersedes`, at most 32), and when
+that conversation began.
+
+- **"Is this conversation running here"** has one answer, `SessionHandle::holds(journal)`: its current
+  journal or one in `supersedes`. `config.continue_session` (and `--continue`, `Attach::Create{continue}`)
+  attaches to the actor that holds the conversation, or that has the name; never to an actor merely
+  because its id matches. After `/clear`, actor `A` holds only the new journal `N`: resuming `A` builds a
+  second actor on `A`, and the cleared actor's old name no longer resolves to it (`/clear` publishes the
+  new conversation at once: no name, no title, zero messages, its own `created_at`).
+- **Minted ids:** the session map is keyed by actor id. A new actor whose journal id is already another
+  live actor's id (resuming `A` while the cleared actor `A` lives) takes a fresh id in the journal id
+  format instead. Both are listed; ending either leaves the other.
+- **Removal is by identity:** an actor that ends removes its own map entry only, never a session adopted
+  under the same id meanwhile.
+- **A lock-held placeholder** (a reload that found the journal locked elsewhere) holds the conversation
+  its reload record continues: after `/clear` that is `N`, not the actor id `A`. It is registered under
+  `N`'s id (the reload alias `A → N` covers the old one), so it never evicts a session restored before
+  it, such as the resumed conversation `A` that took the id `A`. Once the lock is free, the next attach
+  builds `N` in its place, never the pre-clear `A`.
+- **`--continue` with no argument right after `/clear`** continues the latest saved conversation, which is
+  the pre-clear `A` (`N` has no journal until its first turn, and the cleared actor no longer holds `A`):
+  it opens a second actor on `A` rather than reattaching to the cleared one.
+- **Known residual:** after `/clear` → resume `A` → `daemon reload`, both actors come back under their
+  journal ids (`N` and `A`). A client of the cleared actor that reconnects with `Attach::Existing{A}` gets
+  conversation `A`, not `N` (the live `A` is found before the reload alias). It should reconnect by the
+  journal id `Cleared{session_id}` gave it. Pinned by
+  `q11_reconnecting_by_a_cleared_actor_id_after_a_reload_finds_the_resumed_conversation`.
+
+Tested in `crates/agent-engine/tests/session_conversation_identity.rs`, the `live_match_tests` in
+`host.rs`, and `tests/daemon_reload.rs` (`supersedes_and_the_start_survive_a_reload`).
 
 ### Tool activations across a reload or a park
 

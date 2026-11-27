@@ -815,13 +815,16 @@ fn owner_field(m: &agent_engine::session::SessionMeta, c: agent_engine::session:
 }
 
 /// `streaming 2m` / `waiting 1m` / `idle 4m · parks in 42s` /
-/// `parked 12m · evicts in 48m` — what `/sessions` shows, for the CLI.
-/// An older daemon sends no `state_since`: the age is left out.
+/// `idle 3m · 2 workers` / `parked 12m · evicts in 48m` — what `/sessions`
+/// shows, for the CLI. An older daemon sends no `state_since`: the age is
+/// left out.
 fn state_phrase(m: &SessionMeta, now: chrono::DateTime<chrono::Utc>) -> String {
     let word = match m.lifecycle {
         SessionLifecycle::Parked => "parked",
         SessionLifecycle::Parking => "parking",
         SessionLifecycle::Ending => "ending",
+        SessionLifecycle::Saved => "saved",
+        SessionLifecycle::Unknown => "unknown",
         SessionLifecycle::Live if m.awaiting_input > 0 => "waiting",
         SessionLifecycle::Live if m.busy => "streaming",
         SessionLifecycle::Live => "idle",
@@ -831,6 +834,7 @@ fn state_phrase(m: &SessionMeta, now: chrono::DateTime<chrono::Utc>) -> String {
         s.push(' ');
         s.push_str(&short_dur(now - since));
     }
+    s.push_str(&m.workers_tag());
     if let Some(due) = m.park_due {
         s.push_str(&format!(" · parks in {}", short_dur(due - now)));
     }
@@ -874,11 +878,18 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
         }
         anyhow::bail!("daemon not running");
     }
+    if json {
+        // As the daemon sent them: a newer daemon's fields and values pass
+        // through rather than being decoded away.
+        let raw = SocketTransport::sessions_raw(&paths.sock)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("{}", serde_json::to_string_pretty(&raw)?);
+        return Ok(());
+    }
     let list = SocketTransport::sessions(&paths.sock).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let offline = pins::offline(book.load(), &list);
-    if json {
-        println!("{}", serde_json::to_string_pretty(&list)?);
-    } else if list.is_empty() && offline.is_empty() {
+    if list.is_empty() && offline.is_empty() {
         println!("no sessions");
     } else {
         let now = chrono::Utc::now();
@@ -907,10 +918,8 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
             );
         }
     }
-    if !json {
-        for e in &offline {
-            println!("{}", offline_line(e));
-        }
+    for e in &offline {
+        println!("{}", offline_line(e));
     }
     Ok(())
 }
@@ -987,6 +996,14 @@ mod state_phrase_tests {
         m.park_due = Some(now + TimeDelta::seconds(42));
         assert_eq!(state_phrase(&m, now), "idle 4m · parks in 42s");
         m.park_due = None;
+        // Idle with background workers still running is not plain idle.
+        m.workers.running = 2;
+        assert_eq!(state_phrase(&m, now), "idle 4m · 2 workers");
+        m.workers.running = 1;
+        m.busy = true;
+        assert_eq!(state_phrase(&m, now), "streaming 4m · 1 worker");
+        m.busy = false;
+        m.workers.running = 0;
         m.lifecycle = SessionLifecycle::Parked;
         m.state_since = Some(now - TimeDelta::minutes(12));
         m.evict_due = Some(now + TimeDelta::minutes(48) + TimeDelta::seconds(5));

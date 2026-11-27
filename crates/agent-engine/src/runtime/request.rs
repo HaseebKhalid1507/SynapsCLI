@@ -51,6 +51,81 @@ pub(super) struct RequestBody<'a> {
     tools: MarkedTools<'a>,
 }
 
+/// FNV-1a 64 as a byte sink, so a value is hashed while it serializes.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl std::io::Write for Fnv {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for b in buf {
+            self.0 ^= u64::from(*b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// How many leading messages of a request belong to the history: trailing
+/// request-only user messages (a context advisory, chained as its own user
+/// message by the stream loop, with or without turn-only context attached)
+/// do not, and the history never holds them.
+pub(super) fn durable_len(messages: &[SharedMessage]) -> usize {
+    use super::stream::is_ephemeral_turn_context_block as ephemeral;
+    let request_only = |m: &SharedMessage| {
+        m["role"] == "user"
+            && match &m["content"] {
+                Value::String(text) => ephemeral(&json!({"type": "text", "text": text})),
+                Value::Array(blocks) => !blocks.is_empty() && blocks.iter().all(ephemeral),
+                _ => false,
+            }
+    };
+    messages.len() - messages.iter().rev().take_while(|m| request_only(m)).count()
+}
+
+/// FNV-1a 64 over `messages` as a request holds them BEFORE the transport
+/// marks them, host keys dropped (`WireMessages`): what a later request must
+/// start with, message for message, to read the cache entry a request with
+/// these messages left behind.
+///
+/// The last message is hashed in its durable form: string content as one
+/// text block, without the turn-only context blocks a turn attaches to its
+/// newest user message (`stream::attach_turn_context`). Those ride after
+/// the cache marker and are never in the history, so the same message
+/// hashes the same whether it is read from a turn's request or, later, from
+/// the history. Earlier messages go on the wire exactly as the history
+/// holds them.
+pub(super) fn message_prefix_digest(messages: &[SharedMessage]) -> u64 {
+    use super::continuation::{WireMessage, WireMessages};
+    let mut h = Fnv::new();
+    let Some((last, earlier)) = messages.split_last() else {
+        return h.0;
+    };
+    let _ = serde_json::to_writer(&mut h, &WireMessages(earlier));
+    let _ = std::io::Write::write_all(&mut h, &[0x1f]);
+    let mut last = (**last).clone();
+    if let Some(content) = last.get_mut("content") {
+        *content = match content.take() {
+            Value::String(text) if text.is_empty() => json!([]),
+            Value::String(text) => json!([{"type": "text", "text": text}]),
+            Value::Array(mut blocks) => {
+                blocks.retain(|b| !super::stream::is_ephemeral_turn_context_block(b));
+                Value::Array(blocks)
+            }
+            other => other,
+        };
+    }
+    let _ = serde_json::to_writer(&mut h, &WireMessage(&last));
+    h.0
+}
+
 impl<'a> RequestBody<'a> {
     /// Assemble the request body. `messages` must already be sanitized +
     /// cache-annotated (`sanitize_thinking_blocks` / `annotate_cache_breakpoint`).
@@ -203,28 +278,19 @@ impl<'a> RequestBody<'a> {
     }
 
     /// FNV-1a 64 over the serialized cache-key prefix of this request:
-    /// model, `output_config` (effort), `system`, `thinking`, `tools` and the
-    /// first `history_len` messages exactly as they go on the wire (cache
-    /// markers included), plus the `anthropic-beta` header (`beta`: 1M
-    /// context and the like select the serving configuration). `max_tokens`
-    /// and `stream` are excluded: neither is rendered into the prompt. Two
-    /// requests with equal fingerprints send byte-identical prefixes through
-    /// the last history breakpoint.
+    /// model, `output_config` (effort), `system`, `thinking`, the loaded
+    /// `tools` and the first `history_len` messages exactly as they go on the
+    /// wire (cache markers included), plus the `anthropic-beta` header
+    /// (`beta`: 1M context and the like select the serving configuration).
+    /// `max_tokens` and `stream` are excluded: neither is rendered into the
+    /// prompt. So are the `defer_loading` definitions: they are not part of
+    /// the cached prefix, so a tool registered late onto the deferred list
+    /// leaves the fingerprint alone (a tool that is sent without
+    /// `defer_loading` is a loaded tool and is hashed). Two requests with
+    /// equal fingerprints send byte-identical prefixes through the last
+    /// history breakpoint.
     pub(super) fn prefix_fingerprint(&self, history_len: usize, beta: Option<&str>) -> u64 {
-        struct Fnv(u64);
-        impl std::io::Write for Fnv {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                for b in buf {
-                    self.0 ^= u64::from(*b);
-                    self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-                }
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        let mut h = Fnv::new();
         let sep = |h: &mut Fnv| {
             let _ = std::io::Write::write_all(h, &[0x1f]);
         };
@@ -236,13 +302,34 @@ impl<'a> RequestBody<'a> {
         sep(&mut h);
         let _ = serde_json::to_writer(&mut h, &self.thinking);
         sep(&mut h);
-        let _ = serde_json::to_writer(&mut h, &self.tools);
+        let _ = serde_json::to_writer(&mut h, &LoadedTools(&self.tools));
         sep(&mut h);
         let n = history_len.min(self.messages.0.len());
         let _ = serde_json::to_writer(&mut h, &super::continuation::WireMessages(&self.messages.0[..n]));
         sep(&mut h);
         let _ = serde_json::to_writer(&mut h, &beta);
         h.0
+    }
+
+    /// [`Self::prefix_fingerprint`] of everything ahead of the messages
+    /// (no message at all), mixed with the credential kind and the account
+    /// the request goes out on: what must be equal between two requests
+    /// for the later one to read the message cache the earlier one wrote.
+    /// Caches are per organization, so another account never shares one.
+    pub(super) fn cache_identity(
+        &self,
+        beta: Option<&str>,
+        auth_type: &str,
+        account: Option<&str>,
+    ) -> u64 {
+        let mut h = self.prefix_fingerprint(0, beta);
+        for part in [auth_type.as_bytes(), &[0x1f], account.unwrap_or("").as_bytes()] {
+            for b in part {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
     }
 
     /// Send `thinking.display = display` (`thinking_display`). Summarized
@@ -270,6 +357,24 @@ impl<'a> RequestBody<'a> {
     /// The output cap this body will send (keep-warm worst-case pricing).
     pub(super) fn max_tokens(&self) -> u64 {
         self.max_tokens
+    }
+
+    /// The `output_config.effort` value this body will send, if it sends one
+    /// (the api-log's `effort`).
+    pub(super) fn effort(&self) -> Option<&str> {
+        self.output_config.as_ref()?.get("effort")?.as_str()
+    }
+
+    /// `system` and `tools` as this body sends them (cache markers and the
+    /// transport identity block included), each as canonical JSON (object
+    /// keys sorted): the prompt stack ahead of the messages, for the
+    /// provenance of a summary this request produces. `"null"` for an
+    /// absent `system`.
+    pub(super) fn prompt_stack(&self) -> (String, String) {
+        fn canonical<T: Serialize>(v: &T) -> String {
+            serde_json::to_value(v).map(|v| v.to_string()).unwrap_or_default()
+        }
+        (canonical(&self.system), canonical(&self.tools))
     }
 
     /// Pre-assembly equivalent of the legacy `body["tools"]` non-empty probe.
@@ -319,9 +424,10 @@ impl<'a> MarkedTools<'a> {
     }
 }
 
-impl Serialize for MarkedTools<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut seq = serializer.serialize_seq(Some(self.tools.len() + self.deferred.len()))?;
+impl MarkedTools<'_> {
+    fn serialize_into<S: Serializer>(&self, serializer: S, deferred: bool) -> Result<S::Ok, S::Error> {
+        let deferred = if deferred { self.deferred } else { &[] };
+        let mut seq = serializer.serialize_seq(Some(self.tools.len() + deferred.len()))?;
         match &self.marked_last {
             Some(last) => {
                 for tool in &self.tools[..self.tools.len() - 1] {
@@ -335,10 +441,26 @@ impl Serialize for MarkedTools<'_> {
                 }
             }
         }
-        for tool in self.deferred {
+        for tool in deferred {
             seq.serialize_element(tool)?;
         }
         seq.end()
+    }
+}
+
+impl Serialize for MarkedTools<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.serialize_into(serializer, true)
+    }
+}
+
+/// The cached part of a [`MarkedTools`]: the loaded tools with their marker,
+/// without the `defer_loading` tail (`RequestBody::prefix_fingerprint`).
+struct LoadedTools<'b, 'a>(&'b MarkedTools<'a>);
+
+impl Serialize for LoadedTools<'_, '_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize_into(serializer, false)
     }
 }
 

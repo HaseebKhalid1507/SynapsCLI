@@ -111,12 +111,15 @@ impl WorkerDrive {
         marks: &mut ResponseMarks,
         totals: &mut Totals,
     ) -> Flow {
-        // Everything the worker shows, for clients watching its thread.
-        self.state
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .watch
-            .record(&event);
+        {
+            let mut s = self.state.write().unwrap_or_else(|p| p.into_inner());
+            // Everything the worker shows, for clients watching its thread.
+            s.watch.record(&event);
+            // What it used so far, for status/collect and its completion event.
+            if let StreamEvent::Session(session) = &event {
+                s.usage.add(session, &self.model);
+            }
+        }
         // Hosted web_search is egress: show worker searches in the parent.
         crate::runtime::openai::codex_wire::forward_worker_web_search(
             &self.label,
@@ -230,6 +233,10 @@ impl WorkerDrive {
             while let Some(event) = stream.next().await {
                 let mut s = self.state.write().unwrap_or_else(|p| p.into_inner());
                 s.watch.record(&event);
+                // A response that ends after the cancel was still billed.
+                if let StreamEvent::Session(session) = &event {
+                    s.usage.add(session, &self.model);
+                }
                 if let StreamEvent::Session(SessionEvent::MessageHistory(history)) = event {
                     s.history = Some(history);
                 }
@@ -569,7 +576,7 @@ mod tests {
         assert!(reason.contains("waiting for response headers"));
         let status = SubagentStatus::Failed(reason.clone());
         let event = super::super::finalize::build_completion_event(
-            "sa_test", 1, "test", &status, "", 1.0, None,
+            "sa_test", 1, "test", &status, "", 1.0, None, None,
         );
         assert_eq!(event.content.data.unwrap()["error"], reason);
         {
@@ -650,6 +657,61 @@ mod tests {
         let s = state.read().unwrap();
         assert_eq!(s.public_status(), SubagentStatus::Running);
         assert_eq!(s.history.as_ref().unwrap().len(), 7);
+    }
+
+    fn usage(input: u64, output: u64, read: u64) -> StreamEvent {
+        StreamEvent::Session(SessionEvent::Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: read,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m: None,
+            cache_creation_1h: None,
+            model: Some("claude-opus-5-5".into()),
+        })
+    }
+
+    /// Usage is kept live in the state, and a timed-out worker reports it,
+    /// including a response billed while it was being cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_worker_reports_its_usage() {
+        let (d, state, cancel) = drive(5);
+        let observed = Arc::clone(&state);
+        let stream = futures::stream::iter(vec![usage(1_000, 100, 0), usage(10, 200, 50_000)])
+            .chain(futures::stream::once(async move {
+                {
+                    let s = observed.read().unwrap();
+                    assert_eq!(s.usage.requests, 2, "live, before the run ends");
+                    assert_eq!(s.usage.context_tokens, 50_010);
+                }
+                cancel.cancelled().await;
+                usage(5, 7, 60_000)
+            }));
+        let r = d.run(Box::pin(stream)).await.unwrap();
+        assert!(r.timed_out);
+        let s = state.read().unwrap();
+        assert_eq!(s.status, SubagentStatus::TimedOut);
+        assert_eq!(s.usage.requests, 3);
+        assert_eq!(
+            (s.usage.input_tokens, s.usage.output_tokens, s.usage.cache_read_tokens),
+            (1_015, 307, 110_000)
+        );
+        assert_eq!(s.usage.context_tokens, 60_005);
+        assert!(s.usage.cost_usd.is_some(), "priced by the event's model");
+    }
+
+    #[tokio::test]
+    async fn a_failed_worker_keeps_its_usage() {
+        let (d, state, _) = drive(60);
+        let events = vec![
+            usage(2_000, 50, 0),
+            StreamEvent::Session(SessionEvent::Error(
+                agent_core::TurnError::interrupted_after_side_effect("c1"),
+            )),
+        ];
+        d.run(Box::pin(futures::stream::iter(events))).await.unwrap_err();
+        let s = state.read().unwrap();
+        assert_eq!((s.usage.requests, s.usage.input_tokens, s.usage.output_tokens), (1, 2_000, 50));
     }
 
     #[tokio::test(start_paused = true)]

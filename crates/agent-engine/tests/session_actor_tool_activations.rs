@@ -121,18 +121,8 @@ async fn record(
     t: &mut LocalTransport,
     reason: CheckpointReason,
 ) -> SessionReloadRecord {
-    handle
-        .send(SessionCommand::Checkpoint { reason })
-        .await
-        .unwrap();
-    let seen = until(
-        t,
-        |e| matches!(e, SessionEventWire::QueryResult { id, .. } if *id == CHECKPOINT_QUERY_ID),
-    )
-    .await;
-    let SessionEventWire::QueryResult { value, .. } = &seen.last().unwrap().event else {
-        unreachable!()
-    };
+    let _ = handle;
+    let (value, _) = host_reply(t, SessionCommand::Checkpoint { reason }, CHECKPOINT_QUERY_ID).await;
     serde_json::from_value(value["record"].clone()).unwrap()
 }
 

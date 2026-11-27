@@ -41,11 +41,6 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
             auth_kind: DevProviderAuth::OAuth("github-copilot"),
         },
         DevProviderSelection {
-            key: "google-gemini",
-            name: "Google Gemini (Code Assist)",
-            auth_kind: DevProviderAuth::OAuth("google-gemini"),
-        },
-        DevProviderSelection {
             key: "kimi-code",
             name: "Kimi Code",
             auth_kind: DevProviderAuth::OAuth("kimi-code"),
@@ -334,7 +329,7 @@ fn remove_favorite_compat(id: &str) {
 /// when the Models modal opens (logged-in OAuth discovery).
 ///
 /// `openai-codex` is intentionally absent: its picker rows are hardcoded to
-/// the nine source-controlled OAuth slugs (`codex_static_catalog_models`)
+/// the twelve source-controlled OAuth slugs (`codex_static_catalog_models`)
 /// and must never be replaced by live `/models` results.
 pub(crate) fn auto_refresh_catalog_providers() -> &'static [&'static str] {
     &["anthropic"]
@@ -345,7 +340,7 @@ pub(crate) fn auto_refresh_catalog_providers() -> &'static [&'static str] {
 /// ANY /models surface (main sections, /settings picker, expanded browser).
 const SOURCE_CONTROLLED_PROVIDER: &str = "openai-codex";
 
-/// The nine static OpenAI Codex OAuth models as expanded-browser entries,
+/// The twelve static OpenAI Codex OAuth models as expanded-browser entries,
 /// provider-qualified, in catalog order (`codex_static_catalog_models`).
 pub(crate) fn codex_static_expanded_entries() -> Vec<ExpandedModelEntry> {
     synaps_cli::runtime::openai::catalog::codex_static_catalog_models()
@@ -366,7 +361,7 @@ pub(crate) fn codex_static_expanded_entries() -> Vec<ExpandedModelEntry> {
 }
 
 /// Central invariant: canonicalize a model-list result before it reaches any
-/// state. For `openai-codex` the result is ALWAYS the nine static OAuth
+/// state. For `openai-codex` the result is ALWAYS the twelve static OAuth
 /// entries — live rows, injected rows, and fetch errors alike are replaced.
 /// All other providers (Anthropic included) pass through unchanged.
 pub(crate) fn canonicalize_model_list_result(
@@ -422,7 +417,7 @@ pub(crate) fn catalog_override_rows(
     models: &[ExpandedModelEntry],
 ) -> ProviderCatalogOverride {
     if provider_key == SOURCE_CONTROLLED_PROVIDER {
-        // openai-codex sections/pickers are hardcoded to the nine static
+        // openai-codex sections/pickers are hardcoded to the twelve static
         // OAuth slugs — override rows must never exist for it.
         return Vec::new();
     }
@@ -541,7 +536,6 @@ fn logged_in_oauth_providers() -> BTreeSet<&'static str> {
         synaps_cli::auth::OAuthProviderId::OpenAiCodex,
         synaps_cli::auth::OAuthProviderId::Xai,
         synaps_cli::auth::OAuthProviderId::GitHubCopilot,
-        synaps_cli::auth::OAuthProviderId::GoogleGemini,
         synaps_cli::auth::OAuthProviderId::KimiCode,
         synaps_cli::auth::OAuthProviderId::Muse,
     ]
@@ -753,7 +747,7 @@ fn provider_model_selections(
 
 fn provider_model_tier(provider_key: &str, model_id: &str) -> &'static str {
     match (provider_key, model_id) {
-        ("openai-codex", "gpt-6.1-sol" | "gpt-5.6-sol") => "S+",
+        ("openai-codex", "gpt-6.2-sol" | "gpt-6.1-sol" | "gpt-5.6-sol") => "S+",
         ("openai-codex", "gpt-5.6-terra" | "gpt-5.5") => "A",
         ("openai-codex", "gpt-5.6-luna") => "B+",
         _ => "",
@@ -806,19 +800,6 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
                 (model.id, model.label.unwrap_or_default(), tier.to_string())
             })
             .collect(),
-        "google-gemini" => {
-            synaps_cli::runtime::openai::catalog::google_gemini_static_catalog_models()
-                .into_iter()
-                .map(|model| {
-                    let tier = match model.id.as_str() {
-                        "gemini-2.5-pro" => "S",
-                        "gemini-2.5-flash" => "A",
-                        _ => "",
-                    };
-                    (model.id, model.label.unwrap_or_default(), tier.to_string())
-                })
-                .collect()
-        }
         "kimi-code" => synaps_cli::runtime::openai::catalog::kimi_code_static_catalog_models()
             .into_iter()
             .map(|model| {
@@ -1848,8 +1829,11 @@ mod tests {
         assert!(!ids.contains(&"auto"));
     }
 
+    /// The model picker has no Gemini Code Assist section, even
+    /// with a stale `google-gemini` login or a `google-gemini/*` current
+    /// model; no row offers a `google-gemini/` id.
     #[test]
-    fn google_gemini_section_lists_conservative_catalog_when_logged_in() {
+    fn removed_google_gemini_never_gets_a_picker_section() {
         let state = ModelsModalState {
             cursor: 0,
             search: String::new(),
@@ -1863,60 +1847,18 @@ mod tests {
             "google-gemini/gemini-2.5-pro",
             &state,
             &ProviderAvailability::default(),
-            &BTreeSet::from(["google-gemini"]),
-        );
-        let gemini = sections
-            .iter()
-            .find(|section| section.provider_key == "google-gemini")
-            .expect("logged-in Google Gemini section");
-        let ids: Vec<_> = gemini
-            .entries
-            .iter()
-            .map(|entry| entry.display_id.as_str())
-            .collect();
-        assert_eq!(
-            ids,
-            vec![
-                "gemini-3.1-pro-preview",
-                "gemini-3-pro-preview",
-                "gemini-3.5-flash",
-                "gemini-3-flash-preview",
-                "gemini-3.1-flash-lite",
-                "gemini-2.5-pro",
-                "gemini-2.5-flash",
-            ]
-        );
-        assert!(gemini
-            .entries
-            .iter()
-            .all(|entry| entry.id.starts_with("google-gemini/")));
-        // Routing aliases and non-chat models never leak into the TUI.
-        for banned in ["auto-gemini-2.5", "auto-gemini-3", "text-embedding-004"] {
-            assert!(!ids.contains(&banned));
-        }
-    }
-
-    #[test]
-    fn google_gemini_section_hidden_when_not_logged_in() {
-        let state = ModelsModalState {
-            cursor: 0,
-            search: String::new(),
-            view: ModelsView::All,
-            collapsed: HashSet::new(),
-            favorites: BTreeSet::new(),
-            expanded: None,
-            provider_catalog_overrides: std::collections::BTreeMap::new(),
-        };
-        // No login for google-gemini in the logged_in set.
-        let sections = build_sections_from_parts(
-            "claude/sonnet-4.5",
-            &state,
-            &ProviderAvailability::default(),
-            &BTreeSet::from(["claude"]),
+            &BTreeSet::from(["google-gemini", "claude"]),
         );
         assert!(sections
             .iter()
             .all(|section| section.provider_key != "google-gemini"));
+        assert!(sections
+            .iter()
+            .flat_map(|section| section.entries.iter())
+            .all(|entry| !entry.id.starts_with("google-gemini/")));
+        assert!(dev_model_providers()
+            .iter()
+            .all(|provider| provider.key != "google-gemini"));
     }
 
     #[test]
@@ -2007,8 +1949,11 @@ mod tests {
         assert_eq!(
             codex_ids,
             vec![
+                "openai-codex/gpt-6.2-sol",
+                "openai-codex/gpt-6.2-astra",
                 "openai-codex/gpt-6.1-sol",
                 "openai-codex/gpt-6-astra",
+                "openai-codex/gpt-6-luna",
                 "openai-codex/gpt-5.6-sol",
                 "openai-codex/gpt-5.6-terra",
                 "openai-codex/gpt-5.6-luna",
@@ -2158,10 +2103,10 @@ mod tests {
         );
     }
 
-    /// (c) The openai-codex picker rows are exactly the nine source-controlled
+    /// (c) The openai-codex picker rows are exactly the twelve source-controlled
     /// OAuth slugs, in catalog order — regardless of any injected override.
     #[test]
-    fn openai_codex_picker_rows_are_exactly_the_nine_static_oauth_slugs() {
+    fn openai_codex_picker_rows_are_exactly_the_eleven_static_oauth_slugs() {
         let provider = dev_model_providers()
             .into_iter()
             .find(|provider| provider.key == "openai-codex")
@@ -2176,8 +2121,11 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
                 "gpt-6.1-sol",
                 "gpt-6-astra",
+                "gpt-6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -2186,14 +2134,17 @@ mod tests {
                 "gpt-5.4-mini",
                 "gpt-5.3-codex-spark",
             ],
-            "openai-codex picker rows must be exactly the nine hardcoded OAuth slugs, in order"
+            "openai-codex picker rows must be exactly the twelve hardcoded OAuth slugs, in order"
         );
     }
 
     fn codex_static_qualified_ids() -> Vec<&'static str> {
         vec![
+            "openai-codex/gpt-6.2-sol",
+            "openai-codex/gpt-6.2-astra",
             "openai-codex/gpt-6.1-sol",
             "openai-codex/gpt-6-astra",
+            "openai-codex/gpt-6-luna",
             "openai-codex/gpt-5.6-sol",
             "openai-codex/gpt-5.6-terra",
             "openai-codex/gpt-5.6-luna",
@@ -2224,7 +2175,7 @@ mod tests {
 
     /// (d) Central invariant: a live/injected openai-codex list result must
     /// not affect main-section overrides NOR the expanded 'e' browser rows.
-    /// Expanded OpenAI rows are exactly the nine static OAuth models, in
+    /// Expanded OpenAI rows are exactly the twelve static OAuth models, in
     /// catalog order — dynamic IDs never appear anywhere in /models.
     #[test]
     fn injected_openai_codex_result_cannot_affect_overrides_or_expanded_rows() {
@@ -2256,7 +2207,7 @@ mod tests {
                 assert_eq!(
                     ids,
                     codex_static_qualified_ids(),
-                    "expanded OpenAI Codex rows must be exactly the nine static OAuth slugs"
+                    "expanded OpenAI Codex rows must be exactly the twelve static OAuth slugs"
                 );
             }
             other => panic!("expected static Ready rows, got {other:?}"),
@@ -2264,7 +2215,7 @@ mod tests {
     }
 
     /// (e) A failed live fetch for openai-codex also resolves to the static
-    /// nine — the expanded browser is source-controlled, never an error/
+    /// twelve — the expanded browser is source-controlled, never an error/
     /// loading surface for this provider.
     #[test]
     fn openai_codex_expanded_error_result_falls_back_to_static_rows() {

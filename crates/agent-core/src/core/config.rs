@@ -264,6 +264,33 @@ impl ContextManagementConfig {
     }
 }
 
+/// `compaction_model = match`: the chat's own model writes its summaries.
+pub const COMPACTION_MODEL_MATCH: &str = "match";
+/// `compaction_model = provider-small`: the small model pinned for the
+/// chat's provider ([`crate::models::PROVIDER_SMALL_MODELS`]) writes its
+/// summaries, on the chat's own account.
+pub const COMPACTION_MODEL_PROVIDER_SMALL: &str = "provider-small";
+
+/// `compaction_model`: empty or `match` is `None` (the chat's own model);
+/// `provider-small`, or one model id of a routable shape: a bare `claude-`
+/// id, or `provider/model`. The words are lowercase and exact. Whether the
+/// provider is one synaps can route to is checked when a summary's model is
+/// chosen.
+pub fn parse_compaction_model(value: &str) -> Result<Option<String>, &'static str> {
+    let value = value.trim();
+    if value.is_empty() || value == COMPACTION_MODEL_MATCH {
+        return Ok(None);
+    }
+    let routable = match value.split_once('/') {
+        Some((provider, model)) => !provider.is_empty() && !model.is_empty(),
+        None => value == COMPACTION_MODEL_PROVIDER_SMALL || value.starts_with("claude-"),
+    };
+    if !routable || value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("expected match, provider-small or a model id (provider/model)");
+    }
+    Ok(Some(value.to_string()))
+}
+
 /// Parse fields first; validate the complete policy after all lines so threshold
 /// ordering and an explicit context window do not depend on config key order.
 fn parse_context_management_config_key(
@@ -1305,7 +1332,7 @@ pub struct SynapsConfig {
     pub daemon: DaemonConfig,
     /// Subagent fan-out limits (`subagent.*`).
     pub subagent: SubagentLimits,
-    pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
+    pub compaction_model: Option<String>, // who writes summaries: None = match, else provider-small or a model id
     /// Where compaction summarization runs (spec §9.4): remote provider or
     /// local-only (zero network construction).
     pub compaction_mode: crate::core::compaction::CompactionMode,
@@ -1363,6 +1390,12 @@ pub struct SynapsConfig {
     pub subagent_transform_hooks: bool,
     /// Worker default, independent of foreground `thinking`; per-call overrides win.
     pub subagent_thinking: crate::core::reasoning::ReasoningLevel,
+    /// Worker model when a delegation omits `model` (`subagent_model`).
+    /// `None` (unset, empty or `inherit`) = the foreground model. The raw
+    /// value is normalised at dispatch like the foreground `model` key.
+    /// Naming a model here trusts it for workers the way `favorite_models`
+    /// does; an unknown id is denied, never replaced by the foreground.
+    pub subagent_model: Option<String>,
     pub api_retries: u32,        // default 3
     pub refusal_retries: u32,    // default 2 — retries on stop_reason=refusal
     pub telemetry: String,       // off | basic | full (default off)
@@ -1526,6 +1559,7 @@ impl Default for SynapsConfig {
             subagent_rollover_tokens: DEFAULT_SUBAGENT_ROLLOVER_TOKENS,
             subagent_transform_hooks: true,
             subagent_thinking: crate::core::reasoning::ReasoningLevel::XHigh,
+            subagent_model: None,
             api_retries: 3,
             refusal_retries: 2,
             telemetry: "off".to_string(),
@@ -1648,6 +1682,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "subagent_rollover_tokens",
     "subagent_transform_hooks",
     "subagent_thinking",
+    "subagent_model",
     "subagent.max_concurrent",
     "subagent.max_total",
     "subagent.max_depth",
@@ -2040,7 +2075,15 @@ fn apply_config_content_with(
                     }
                 }
             }
-            "compaction_model" => config.compaction_model = Some(val.to_string()),
+            "compaction_model" => match parse_compaction_model(val) {
+                Ok(model) => config.compaction_model = model,
+                Err(why) => {
+                    config.compaction_model = None;
+                    config.warnings.push(format!(
+                        "compaction_model = {val} — {why}; the chat's own model writes summaries"
+                    ));
+                }
+            },
             "compaction_mode" => match val {
                 "remote" => {
                     config.compaction_mode = crate::core::compaction::CompactionMode::Remote
@@ -2137,6 +2180,10 @@ fn apply_config_content_with(
                         config.subagent_thinking
                     )),
                 }
+            }
+            "subagent_model" => {
+                config.subagent_model = (!val.is_empty() && !val.eq_ignore_ascii_case("inherit"))
+                    .then(|| val.to_string());
             }
             "subagent_timeout" => {
                 if let Ok(timeout) = val.parse::<u64>() {
@@ -4376,6 +4423,24 @@ mod tests {
     }
 
     #[test]
+    fn subagent_model_config_unset_set_inherit_and_blank() {
+        assert_eq!(load_config_from_str("model = claude-opus-4-6\n").subagent_model, None);
+        let cfg = load_config_from_str("subagent_model =  claude-sonnet-4-6 \n");
+        assert_eq!(cfg.subagent_model.as_deref(), Some("claude-sonnet-4-6"));
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        let cfg = load_config_from_str("subagent_model = openai-codex/gpt-5.6-sol\n");
+        assert_eq!(cfg.subagent_model.as_deref(), Some("openai-codex/gpt-5.6-sol"));
+        for value in ["inherit", "INHERIT", "", "   "] {
+            let cfg = load_config_from_str(&format!(
+                "subagent_model = claude-sonnet-4-6\nsubagent_model = {value}\n"
+            ));
+            assert_eq!(cfg.subagent_model, None, "{value:?}");
+            assert!(cfg.warnings.is_empty(), "{value:?}: {:?}", cfg.warnings);
+        }
+        assert!(config_content_problems("subagent_model = inherit\n").is_empty());
+    }
+
+    #[test]
     fn test_parse_thinking_budget() {
         use crate::core::reasoning::ThinkingSpec;
         // ThinkingSpec::parse replaced parse_thinking_budget; verify budget values.
@@ -4664,6 +4729,53 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("compaction_mode")));
+    }
+
+    /// `compaction_model`: unset, empty and `match` are the chat's own
+    /// model; `provider-small` and a routable model id are kept; anything
+    /// else warns and is the chat's own model.
+    #[test]
+    fn compaction_model_parses_match_provider_small_or_one_model_id() {
+        for (value, want) in [
+            ("", None),
+            ("  ", None),
+            ("match", None),
+            (" match ", None),
+            ("provider-small", Some("provider-small")),
+            ("claude-haiku-5-5", Some("claude-haiku-5-5")),
+            ("openai-codex/gpt-6-luna", Some("openai-codex/gpt-6-luna")),
+        ] {
+            let parsed = parse_compaction_model(value);
+            assert_eq!(parsed, Ok(want.map(str::to_owned)), "{value:?}");
+        }
+        for bad in [
+            "Match",
+            "sonnet",
+            "gpt-6-luna",
+            "/x",
+            "openai/",
+            "openai/gpt 5",
+            "a b",
+        ] {
+            assert!(parse_compaction_model(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(load_config_from_str("").compaction_model, None);
+        let config = load_config_from_str("compaction_model = match\n");
+        assert_eq!(config.compaction_model, None);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        let config = load_config_from_str("compaction_model = sonnet\n");
+        assert_eq!(config.compaction_model, None);
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("compaction_model = sonnet")),
+            "{:?}",
+            config.warnings
+        );
+        let config = load_config_from_str("compaction_model = provider-small\n");
+        assert_eq!(config.compaction_model.as_deref(), Some("provider-small"));
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
     }
 
     #[test]

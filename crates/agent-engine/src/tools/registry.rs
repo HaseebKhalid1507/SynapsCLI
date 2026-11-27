@@ -3,11 +3,11 @@ use crate::tools::catalog::{tool_id_for, CapabilityRecord, CatalogError, ToolCat
 use crate::tools::Tool;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Registry of available tools. Maintains a name→tool map and a cached JSON schema
 /// array that gets sent to the API. Thread-safe via `Arc<RwLock<ToolRegistry>>`.
-#[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// Cached Anthropic-compatible schema — rebuilt on register(), shared via Arc for zero-copy reads.
@@ -20,6 +20,25 @@ pub struct ToolRegistry {
     /// and mutation path. Reads never change the exposed schema; mutations
     /// advance the catalog generation fail-closed (Task 14).
     catalog: ToolCatalog,
+    /// Lock-free change counter ([`Self::change_handle`]): advanced, while
+    /// the writer holds the registry's write guard, by every mutation of
+    /// THIS registry. It stays with the live owner across the candidate
+    /// replacements below; a clone (a snapshot, a candidate, a worker set)
+    /// gets its own, so mutating a copy never publishes to the original.
+    changes: Arc<AtomicU64>,
+}
+
+impl Clone for ToolRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            cached_schema: Arc::clone(&self.cached_schema),
+            api_to_runtime_names: self.api_to_runtime_names.clone(),
+            input_name_maps: self.input_name_maps.clone(),
+            catalog: self.catalog.clone(),
+            changes: Arc::new(AtomicU64::new(self.changes.load(Ordering::Acquire))),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -135,8 +154,33 @@ impl ToolRegistry {
         let prior = self.catalog.generation();
         let mut candidate = Self::try_from_tools(remaining)?;
         candidate.catalog.rebase_past(prior)?;
-        *self = candidate;
+        self.commit(candidate);
         Ok(())
+    }
+
+    /// The registry's change counter: read without its lock (a
+    /// `CacheExpiry` capture), compared again after the reads it guards.
+    pub fn change_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.changes)
+    }
+
+    /// Share this registry: its lock, and its change counter read without it.
+    pub fn into_shared(self) -> (Arc<tokio::sync::RwLock<Self>>, Arc<AtomicU64>) {
+        let changes = self.change_handle();
+        (Arc::new(tokio::sync::RwLock::new(self)), changes)
+    }
+
+    /// Replace this registry with `candidate`, keeping (and advancing) the
+    /// live owner's change counter.
+    fn commit(&mut self, candidate: Self) {
+        let changes = Arc::clone(&self.changes);
+        *self = candidate;
+        self.changes = changes;
+        self.changed();
+    }
+
+    fn changed(&self) {
+        self.changes.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Registry without subagent tool — used for subagent runtimes to prevent recursion.
@@ -218,6 +262,7 @@ impl ToolRegistry {
             api_to_runtime_names: HashMap::new(),
             input_name_maps: HashMap::new(),
             catalog: ToolCatalog::empty(),
+            changes: Arc::new(AtomicU64::new(0)),
         };
         // Insert all tools first, then rebuild schema once.
         // Calling register() in a loop would rebuild_schema() on every
@@ -437,6 +482,7 @@ impl ToolRegistry {
     pub fn try_register(&mut self, tool: Arc<dyn Tool>) -> Result<(), CatalogError> {
         self.insert_tool_with_catalog(tool)?;
         self.rebuild_schema();
+        self.changed();
         Ok(())
     }
 
@@ -480,7 +526,7 @@ impl ToolRegistry {
             candidate.insert_tool_with_catalog(tool)?;
         }
         candidate.rebuild_schema();
-        *self = candidate;
+        self.commit(candidate);
         Ok(count)
     }
 
@@ -522,6 +568,7 @@ impl ToolRegistry {
         generation: crate::tools::catalog::CatalogGeneration,
     ) {
         self.catalog.set_generation_for_tests(generation);
+        self.changed();
     }
 
     /// Boundary-test support: upsert one catalog record IN PLACE without
@@ -538,6 +585,7 @@ impl ToolRegistry {
         self.catalog
             .upsert(replaced, record)
             .expect("test upsert must be structurally valid");
+        self.changed();
     }
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {

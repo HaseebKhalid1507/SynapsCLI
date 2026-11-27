@@ -317,6 +317,12 @@ struct EventCtx<'t> {
     /// The round's keep-warm follows this response as it streams
     /// (`ApiOptions::round_signal`).
     round_signal: Option<&'t super::tool_keepwarm::RoundSignal>,
+    /// The cache anchor this response was stamped into, and its stamp: the
+    /// provider's cache reads and writes for it are measured there.
+    cache_anchor: Option<(
+        &'t super::keepwarm::CacheAnchorCell,
+        super::keepwarm::CacheAnchor,
+    )>,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -671,6 +677,17 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                     ctx.saw_1h_honored
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                if let Some((cell, at)) = ctx.cache_anchor {
+                    cell.measure(
+                        at,
+                        super::keepwarm::CacheUsage {
+                            read: usage.cache_read_input_tokens,
+                            write: usage.cache_creation_input_tokens,
+                            write_5m: state.msg_start_cache_5m,
+                            write_1h: state.msg_start_cache_1h,
+                        },
+                    );
+                }
                 // The prefix this request read from or wrote to the cache,
                 // known here and not booked until the response ends.
                 if let Some(signal) = ctx.round_signal {
@@ -976,6 +993,21 @@ pub struct ApiOptions {
     /// [`KeepWarmMode`]), every retry budget is zero, and the telemetry
     /// record carries `"keepwarm": true`.
     pub keepwarm: Option<KeepWarmRequest>,
+    /// Cache-preserving compaction (task 430). `None` on every other
+    /// request. When set (native Anthropic transport only; any other route
+    /// fails closed before a request is built) the request is assembled
+    /// exactly as a turn's — the caller appended the summary instructions
+    /// as the last user message — with the message cache marker on the
+    /// last HISTORY message, as a keep-warm ping has it, not on the
+    /// instructions. Otherwise it differs from a turn only off the wire: it
+    /// is not retried after a 429, 5xx, network or stream error (the
+    /// immediate resends that remain are listed at `single_attempt`), it
+    /// is refused before the network when it could not
+    /// read what the last accepted request left in the cache
+    /// ([`CompactionRequest`]), it never switches accounts at a limit, it
+    /// sends no `diagnostics` field, and its telemetry record carries
+    /// `"compaction": true` and `"summary_request": "chat_request"`.
+    pub compaction: Option<CompactionRequest>,
     /// Anthropic cache diagnostics chain (`cache_diagnostics = true`).
     /// `None` (default) keeps the wire byte-identical: no header, no
     /// `diagnostics` field. Set on the foreground turn stream (which threads
@@ -997,6 +1029,67 @@ pub struct ApiOptions {
     pub round_signal: Option<std::sync::Arc<super::tool_keepwarm::RoundSignal>>,
 }
 
+/// Wire-side knobs of a cache-preserving compaction request (see
+/// [`ApiOptions::compaction`]).
+#[derive(Debug, Clone)]
+pub struct CompactionRequest {
+    /// What the last accepted request of this chain left in the cache. The
+    /// request is sent only when it can read that: its own cache identity
+    /// is equal (after a model, effort, thinking, system prompt, tool or
+    /// account change the message cache cannot be read) and its history
+    /// starts with the messages that request sent (after `/resume` in
+    /// place, or any other replacement of the history, they are not the
+    /// cached ones). Otherwise the whole history would be WRITTEN, at the
+    /// cache-write price.
+    pub expect: super::keepwarm::CachedPrefix,
+    /// Filled, once the request has passed those checks, with the prompt
+    /// stack it carries ahead of the messages (`RequestBody::prompt_stack`):
+    /// the summary's provenance digests what was sent, not what the
+    /// caller meant to send.
+    pub sent: SentPromptStack,
+}
+
+impl CompactionRequest {
+    pub fn expecting(expect: super::keepwarm::CachedPrefix) -> Self {
+        Self {
+            expect,
+            sent: SentPromptStack::default(),
+        }
+    }
+}
+
+/// `(system, tools)` of a request as sent, as canonical JSON; empty until
+/// the request is built. Shared with the caller that reads it afterwards.
+#[derive(Debug, Clone, Default)]
+pub struct SentPromptStack(Arc<std::sync::Mutex<Option<(String, String)>>>);
+
+impl SentPromptStack {
+    fn set(&self, stack: (String, String)) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stack);
+    }
+
+    pub fn get(&self) -> Option<(String, String)> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Refusal text of a compaction request whose cache identity changed.
+pub(super) const COMPACTION_IDENTITY_CHANGED: &str = "cache-preserving compaction not sent: \
+     the model, effort, thinking, system prompt, tools or account changed since the last request";
+
+/// Refusal text of a compaction request whose history does not start with
+/// the messages the last accepted request sent.
+pub(super) const COMPACTION_HISTORY_CHANGED: &str = "cache-preserving compaction not sent: \
+     the history does not start with the messages the last request sent";
+
+/// Refusal text of a compaction request whose 401 recovery came back with
+/// another account's token: the resend is not sent.
+pub(super) const COMPACTION_ACCOUNT_CHANGED: &str = "cache-preserving compaction not re-sent \
+     after a 401: the refreshed token belongs to another account";
+
 /// What a keep-warm request does once its body is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeepWarmMode {
@@ -1012,6 +1105,13 @@ pub enum KeepWarmMode {
     /// own tools, system, thinking and options, so the prefix is that
     /// request's by construction and there is nothing to fingerprint.
     Replay,
+    /// `CacheExpiry`'s probe: [`Self::Probe`], plus `"reads_cache"`:
+    /// whether the request could read what `expect` (the last accepted
+    /// request) left in the cache, as a compaction request is checked
+    /// ([`CompactionRequest`]). Sends nothing.
+    Expiry {
+        expect: super::keepwarm::CachedPrefix,
+    },
 }
 
 /// Wire knobs for a keep-warm request (see [`ApiOptions::keepwarm`]).
@@ -1236,6 +1336,13 @@ impl ApiMethods {
         if options.keepwarm.is_some() && !super::auth::model_is_anthropic(model) {
             return Err(RuntimeError::Config(
                 "cache keep-warm ping requires the native Anthropic transport".into(),
+            ));
+        }
+        // Same for a cache-preserving compaction request: another route has no
+        // prefix cache to read, and may run a tool loop of its own.
+        if options.compaction.is_some() && !super::auth::model_is_anthropic(model) {
+            return Err(RuntimeError::Config(
+                "cache-preserving compaction requires the native Anthropic transport".into(),
             ));
         }
         super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
@@ -1516,6 +1623,23 @@ impl ApiMethods {
                 );
                 history_len
             }
+            // Cache-preserving compaction: the same placement, for the same
+            // reason. The instruction message is sent once and its reply
+            // replaces the history, so a marker on it would write a cache
+            // entry (the whole request, at the write price) that nothing
+            // ever reads. On the last history message the lookback finds
+            // the entry the previous request wrote, and only the reply that
+            // followed it is written. (When the history ends with a user
+            // message the instructions merge into it; the marker then walks
+            // back to the last markable block before it.)
+            None if options.compaction.is_some() && cleaned_messages.len() >= 2 => {
+                let history_len = cleaned_messages.len() - 1;
+                HelperMethods::annotate_cache_breakpoint(
+                    &mut cleaned_messages[..history_len],
+                    cache_ttl,
+                );
+                history_len
+            }
             _ => {
                 HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl);
                 cleaned_messages.len().saturating_sub(1)
@@ -1544,6 +1668,9 @@ impl ApiMethods {
             true,
         );
         let mut body = parts.body;
+        // api-log: the effort this body carries, read from the body itself so
+        // the record says what was sent, not what the level implies.
+        let telem_effort = body.effort().map(str::to_owned);
         // Before the keep-warm fingerprint below: a ping's prefix is the
         // turn's, `thinking` included.
         body.set_thinking_display(options.thinking_display);
@@ -1557,6 +1684,24 @@ impl ApiMethods {
         if let Some(d) = &diagnostics {
             body.set_diagnostics(d.clone());
         }
+        // The cache identity of `body` and the history part of `messages`:
+        // the last message of a ping (a replay's is appended above, not
+        // here) or of a compaction request is request-local, and so is a
+        // trailing context advisory.
+        let identify = |body: &super::request::RequestBody<'_>| {
+            let beta = Self::build_beta_header(&auth_type, options, model);
+            let local_tail = options.compaction.is_some()
+                || options
+                    .keepwarm
+                    .as_ref()
+                    .is_some_and(|k| k.mode != KeepWarmMode::Replay);
+            let sent = messages.len().saturating_sub(usize::from(local_tail));
+            let history = &messages[..super::request::durable_len(&messages[..sent])];
+            (
+                body.cache_identity(beta.as_deref(), &auth_type, auth_binding.as_deref()),
+                history,
+            )
+        };
         // Keep-warm: cut the output cap (not part of the cache key), then
         // fingerprint the prefix exactly as it would go on the wire. A probe —
         // or a ping whose prefix no longer matches what is cached — returns
@@ -1566,17 +1711,42 @@ impl ApiMethods {
             let beta = Self::build_beta_header(&auth_type, options, model);
             let actual = body.prefix_fingerprint(keepwarm_prefix_len, beta.as_deref());
             let send = match keepwarm.mode {
-                KeepWarmMode::Probe => false,
+                KeepWarmMode::Probe | KeepWarmMode::Expiry { .. } => false,
                 KeepWarmMode::Send { expect } => expect == actual,
                 KeepWarmMode::Replay => true,
             };
             if !send {
-                return Ok(serde_json::json!({
+                let mut out = serde_json::json!({
                     "keepwarm_prefix": actual,
                     "keepwarm_max_tokens": body.max_tokens(),
-                }));
+                });
+                if let KeepWarmMode::Expiry { expect } = keepwarm.mode {
+                    let (identity, history) = identify(&body);
+                    out["reads_cache"] =
+                        Value::Bool(expect.identity == identity && expect.leads(history));
+                }
+                return Ok(out);
             }
         }
+        // What this request leaves in the cache once accepted: stamped
+        // beside the cache anchor, and what a cache-preserving compaction
+        // request is checked against before it is sent (it returns here,
+        // before any trace, telemetry or network I/O, when it cannot read
+        // what the last accepted request left).
+        let cached_prefix = (options.cache_anchor.is_some() || options.compaction.is_some())
+            .then(|| identify(&body));
+        if let (Some(compaction), Some((identity, history))) = (&options.compaction, cached_prefix)
+        {
+            if compaction.expect.identity != identity {
+                return Err(RuntimeError::Config(COMPACTION_IDENTITY_CHANGED.into()));
+            }
+            if !compaction.expect.leads(history) {
+                return Err(RuntimeError::Config(COMPACTION_HISTORY_CHANGED.into()));
+            }
+            compaction.sent.set(body.prompt_stack());
+        }
+        let cached_prefix = cached_prefix
+            .map(|(identity, history)| super::keepwarm::CachedPrefix::of(identity, history));
         let translation_report = parts.report;
 
         // Did THIS request actually carry at least one 1h marker? Arms the
@@ -1707,8 +1877,36 @@ impl ApiMethods {
         // A cache keep-warm ping: it keeps the cache of the account it is
         // on, so a limit is reported but never switches accounts, and no
         // notice about it reaches the session.
-        let keepwarm_ping = options.keepwarm.is_some();
+        // A compaction summary reads the cache of the account the chat is
+        // on: it never switches either (another account's cache is cold).
+        let stays_on_account = options.keepwarm.is_some() || options.compaction.is_some();
+        // Neither is retried after a failure of the request itself: an
+        // HTTP 429 or 5xx, a network error, an in-stream error or an
+        // overload ends it, whatever `max_retries` says, with no wait.
+        // It is not always ONE send, though. Three immediate resends
+        // remain, each at most once per request and none of them waiting:
+        // - a 401 on a managed credential (OAuth, or a remote source)
+        //   re-sends after obtaining a fresh token. A local source
+        //   refreshes the same bound credential
+        //   (`AuthMethods::recover_local_rejection`). A remote (broker)
+        //   source re-vends the seat this request is pinned to; only under
+        //   `auto`, and only when that seat cannot be vended or is cooling
+        //   down, does it select again (`AuthMethods::vend_auto`). A ping
+        //   is then re-sent on the newly selected account. A compaction
+        //   request is not: when the binding after the recovery is not the
+        //   one the request was built with, it ends there
+        //   (`COMPACTION_ACCOUNT_CHANGED`) and its caller sends the
+        //   transcript request. So no resend of a compaction request
+        //   reaches another account;
+        // - a gzip body refused with 400 or 415 re-sends uncompressed
+        //   (`request_encoding`), on the same account;
+        // - with `cache_diagnostics` on and an API key, a 400 or 422 that
+        //   blames the cache-diagnosis beta header re-sends without it,
+        //   on the same account.
+        let single_attempt = stays_on_account;
         let mut sent_at_ms;
+        // The accepted attempt's stamp in `options.cache_anchor`.
+        let mut accepted_at = None;
 
         loop {
             let response = {
@@ -1747,6 +1945,9 @@ impl ApiMethods {
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
                     let sent_at = super::keepwarm::CacheAnchor::now();
+                    if let Some(anchor) = &options.cache_anchor {
+                        anchor.dispatch(sent_at);
+                    }
                     sent_at_ms = crate::epoch_millis();
                     let req = wire.encoding_header(req);
                     let req = match &options.keepwarm {
@@ -1781,7 +1982,16 @@ impl ApiMethods {
                                 // read or written by a request that started
                                 // no earlier than `sent_at`.
                                 if let Some(anchor) = &options.cache_anchor {
-                                    anchor.stamp(sent_at);
+                                    // After an account hop the identity
+                                    // built for the first seat is not this
+                                    // request's: stamped as unknown.
+                                    match cached_prefix.filter(|_| anthropic_failovers == 0) {
+                                        Some(prefix) => {
+                                            anchor.stamp_identified(sent_at, prefix)
+                                        }
+                                        None => anchor.stamp(sent_at),
+                                    }
+                                    accepted_at = Some(sent_at);
                                 }
                                 if !anthropic_cooled.is_empty() {
                                     let served = super::auth::turn_pinned_credential(
@@ -1793,7 +2003,7 @@ impl ApiMethods {
                                     {
                                         await_or_cancel(
                                             cancel,
-                                            router.report_served(&seat, sent_at_ms),
+                                            router.report_served(&seat, model, sent_at_ms),
                                         )
                                         .await?;
                                         anthropic_cooled.retain(|c| c != &seat);
@@ -1867,6 +2077,19 @@ impl ApiMethods {
                                 let (n, v, _t, binding) =
                                     await_or_cancel(cancel, Self::build_auth_snapshot(auth))
                                         .await?;
+                                // A compaction request reads the cache of
+                                // the account it was built for (the binding
+                                // is part of the cache identity checked
+                                // above). When the fresh token is another
+                                // account's, the resend would write the
+                                // whole history there: it is not sent. The
+                                // caller falls back to the transcript
+                                // request, as after any other failure.
+                                if options.compaction.is_some() && binding != auth_binding {
+                                    return Err(RuntimeError::Config(
+                                        COMPACTION_ACCOUNT_CHANGED.into(),
+                                    ));
+                                }
                                 auth_header_name = n;
                                 auth_header_value = v;
                                 auth_binding = binding;
@@ -1957,7 +2180,10 @@ impl ApiMethods {
                                     // AutoRepin selects away from this seat.
                                     match seat.as_ref() {
                                         Some(seat) => {
-                                            await_or_cancel(cancel, router.report_exhausted(seat, &evidence))
+                                            await_or_cancel(
+                                                cancel,
+                                                router.report_exhausted(seat, model, &evidence),
+                                            )
                                                 .await?;
                                             if !anthropic_cooled.contains(seat) {
                                                 anthropic_cooled.push(seat.clone());
@@ -1983,7 +2209,7 @@ impl ApiMethods {
                                         // attempted set (once).
                                         anthropic_attempted.retain(|c| c != seat);
                                         anthropic_attempted.push(seat.clone());
-                                        let permitted = if keepwarm_ping {
+                                        let permitted = if stays_on_account {
                                             Err(FailoverRefusal::KeepWarmPing)
                                         } else {
                                             failover_permitted(&gate)
@@ -2090,7 +2316,7 @@ impl ApiMethods {
                                     // budget a minute at a time) or keep the existing
                                     // retry path for short/unknown resets. No text
                                     // claims another account will serve.
-                                    if !keepwarm_ping {
+                                    if !stays_on_account {
                                         let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
                                             text.no_hop(no_hop),
                                         )));
@@ -2185,7 +2411,11 @@ impl ApiMethods {
 
                             // Decide whether we've exhausted retries for this error class.
                             // A keep-warm ping never retries: any error stops it.
-                            let retry_exhausted = if options.keepwarm.is_some() {
+                            // Nor does a compaction request: a header-timed
+                            // 429 wait can outlast the cache TTL it relies
+                            // on, and its caller has the transcript request
+                            // (with the normal retries) to fall back to.
+                            let retry_exhausted = if single_attempt {
                                 true
                             } else if is_429 {
                                 attempt >= MAX_429_RETRIES
@@ -2284,7 +2514,7 @@ impl ApiMethods {
                                 }
                             }
                             non_429_attempts += 1;
-                            if non_429_attempts > max_retries {
+                            if non_429_attempts > max_retries || single_attempt {
                                 if let Some(t) = tracer.take() {
                                     let terminal = t.failed_terminal("network");
                                     t.finish(clock, None, None, None, None, terminal);
@@ -2388,6 +2618,7 @@ impl ApiMethods {
                 usage_counters: options.usage_counters.clone(),
                 cache_diagnosis: diagnostics.is_some(),
                 round_signal: options.round_signal.as_deref(),
+                cache_anchor: options.cache_anchor.as_deref().zip(accepted_at),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -2551,6 +2782,8 @@ impl ApiMethods {
                     request_id: telem_request_id,
                     msg_id: state.telem_msg_id,
                     model: model.to_string(),
+                    thinking: Some(reasoning_level.as_str().to_string()),
+                    effort: telem_effort.clone(),
                     attempt: attempt + 1, // 1-based: 0 = first try, N = (N+1)th send
                     refusal_retries_used: if refusal_attempts > 0 {
                         Some(refusal_attempts)
@@ -2577,6 +2810,11 @@ impl ApiMethods {
                         breakpoints,
                     },
                     keepwarm: options.keepwarm.is_some(),
+                    compaction: options.compaction.is_some(),
+                    summary_request: options
+                        .compaction
+                        .as_ref()
+                        .map(|_| agent_core::compaction::SummaryRequest::ChatRequest),
                     worker: options.codex_request_role
                         == crate::runtime::openai::catalog::CodexRequestRole::Worker,
                     rollover_window: options.context_rollover.map(|r| r.window),
@@ -2652,10 +2890,7 @@ impl ApiMethods {
                     } else {
                         non_429_attempts
                     };
-                    if retries_used >= retry_budget
-                        || cancel.is_cancelled()
-                        || options.keepwarm.is_some()
-                    {
+                    if retries_used >= retry_budget || cancel.is_cancelled() || single_attempt {
                         // Budget exhausted (or user cancelled) — surface terminally
                         // rather than silently. Still loud, never the silent stop.
                         if let Some(t) = tracer.take() {
@@ -2937,6 +3172,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_anchor: None,
         }
     }
 
@@ -2971,6 +3207,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_anchor: None,
         }
     }
 
@@ -2997,6 +3234,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_anchor: None,
         }
     }
 
@@ -4630,6 +4868,7 @@ mod tests {
             usage_counters: None,
             cache_diagnosis: false,
             round_signal: None,
+            cache_anchor: None,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(
@@ -4981,6 +5220,134 @@ mod on401_tests {
             2,
             "expected exactly 2 calls to Anthropic (1×401 + 1×200)"
         );
+    }
+
+    /// The cache anchor cell (`CacheExpiry`): every attempt is a dispatch,
+    /// whatever becomes of it; only an accepted one is the anchor, and the
+    /// response's cache usage is measured against it.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn the_anchor_cell_sees_every_dispatch_and_measures_the_accepted_one() {
+        use crate::runtime::keepwarm::{CacheAnchorCell, CacheUsage};
+        let _config = crate::test_env::BaseDirGuard::new();
+        let source = CredentialSource::Remote {
+            endpoint: spawn_mock_broker("sk-fresh-token").await,
+            machine_token: "machine-tok".into(),
+        };
+        let cell = Arc::new(CacheAnchorCell::default());
+        let call = |url: String| {
+            let mut options = make_options(url, source.clone(), TokenCache::new());
+            options.cache_anchor = Some(Arc::clone(&cell));
+            drive_call(auth_with_token("sk-stale"), options)
+        };
+        let (refused, _) = spawn_mock_anthropic(usize::MAX).await;
+        call(refused).await.expect_err("every attempt gets a 401");
+        let state = cell.state();
+        assert!(state.dispatched.is_some(), "dispatched: {state:?}");
+        assert_eq!((state.anchor, state.usage), (None, None), "never accepted");
+
+        let (url, calls) = spawn_mock_anthropic(1).await;
+        call(url).await.expect("a 401, then accepted");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let state = cell.state();
+        assert!(
+            state.anchor.is_some() && state.anchor == state.dispatched,
+            "{state:?}"
+        );
+        assert_eq!(
+            state.usage,
+            Some(CacheUsage::default()),
+            "read and wrote nothing"
+        );
+    }
+
+    /// A compaction request (the chat's own request, reading the cache of
+    /// the account it is bound to) that gets a 401: re-sent when the
+    /// recovered token is the same account's, NOT sent when the recovery
+    /// came back bound to another account (the resend would write the
+    /// whole history to that account's cache). A turn in the same
+    /// situation is re-sent as before.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn on401_a_compaction_request_is_not_resent_on_another_account() {
+        use crate::runtime::auth::anthropic_binding;
+        use crate::runtime::keepwarm::{CacheAnchorCell, CachedPrefix};
+        let _config = crate::test_env::BaseDirGuard::new();
+        let broker_url = spawn_mock_broker("sk-fresh-token").await;
+        let source = CredentialSource::Remote {
+            endpoint: broker_url,
+            machine_token: "machine-tok".into(),
+        };
+        // The seat a 401 recovery vends here (no selector is configured),
+        // and another one of the same broker.
+        let default = anthropic_binding(
+            &source,
+            &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
+        );
+        let other = anthropic_binding(
+            &source,
+            &crate::auth::CredentialRef::new(
+                crate::auth::OAuthProviderId::Anthropic,
+                crate::auth::Account::parse("work").unwrap(),
+            ),
+        );
+        assert_ne!(other, default);
+        let stale = || {
+            let cache = TokenCache::new();
+            cache.put(
+                "anthropic",
+                crate::auth::BrokerToken {
+                    access_token: "sk-stale".into(),
+                    expires: 9_999_999_999_999,
+                    ttl_ms: None,
+                },
+            );
+            cache
+        };
+        let bound_to = |binding: &str| {
+            let auth = auth_with_token("sk-stale");
+            auth.try_write().unwrap().bound_credential = Some(binding.to_string());
+            auth
+        };
+
+        for (bound, same_account) in [(&default, true), (&other, false)] {
+            // The cache identity of a request on this binding, as an
+            // accepted turn stamps it.
+            let (warm_url, _) = spawn_mock_anthropic(0).await;
+            let cell = Arc::new(CacheAnchorCell::default());
+            let mut turn = make_options(warm_url, source.clone(), stale());
+            turn.cache_anchor = Some(Arc::clone(&cell));
+            drive_call(bound_to(bound), turn).await.expect("turn");
+            let identity = cell.prefix().expect("stamped").identity;
+
+            // One 401, then success, for a compaction request and a turn.
+            let (url, calls) = spawn_mock_anthropic(1).await;
+            let mut compaction = make_options(url, source.clone(), stale());
+            compaction.compaction = Some(super::CompactionRequest::expecting(
+                CachedPrefix::of(identity, &[]),
+            ));
+            let auth = bound_to(bound);
+            let result = drive_call(Arc::clone(&auth), compaction).await;
+            assert_eq!(
+                auth.read().await.bound_credential.as_deref(),
+                Some(default.as_str()),
+                "the recovery vends the default seat"
+            );
+            if same_account {
+                result.expect("re-sent on the same account");
+                assert_eq!(calls.load(Ordering::SeqCst), 2, "the 401 and one resend");
+            } else {
+                let error = result.expect_err("not re-sent on another account");
+                assert!(error.to_string().contains(super::COMPACTION_ACCOUNT_CHANGED), "{error}");
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "only the request that got the 401");
+            }
+
+            let (url, calls) = spawn_mock_anthropic(1).await;
+            drive_call(bound_to(bound), make_options(url, source.clone(), stale()))
+                .await
+                .expect("a turn is re-sent either way");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
     }
 
     // ─── T2: Persistent 401 — no infinite loop ────────────────────────────────
@@ -5524,6 +5891,9 @@ mod anthropic_failover_tests {
         Rejected429 { reset_in_secs: u64 },
         /// Ordinary 429: `retry-after` only, no exhaustion signal.
         Plain429 { retry_after: u64 },
+        /// 2026-11-15's real 429: unified status rejected by one model's own
+        /// weekly limit (`7d_oi`), the account's 7d window still allowed.
+        ModelRejected429 { reset_in_secs: u64 },
         SseOk,
         SsePartialThenOverloaded,
     }
@@ -5589,6 +5959,27 @@ mod anthropic_failover_tests {
                                 (
                                     "anthropic-ratelimit-unified-reset",
                                     (now_secs + reset_in_secs).to_string(),
+                                ),
+                            ],
+                            body_429,
+                        )
+                            .into_response(),
+                        Reply::ModelRejected429 { reset_in_secs } => (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [
+                                ("content-type", "application/json".to_string()),
+                                ("anthropic-ratelimit-unified-status", "rejected".to_string()),
+                                (
+                                    "anthropic-ratelimit-unified-reset",
+                                    (now_secs + reset_in_secs).to_string(),
+                                ),
+                                (
+                                    "anthropic-ratelimit-unified-7d-status",
+                                    "allowed_warning".to_string(),
+                                ),
+                                (
+                                    "anthropic-ratelimit-unified-7d_oi-status",
+                                    "rejected".to_string(),
                                 ),
                             ],
                             body_429,
@@ -5687,6 +6078,7 @@ mod anthropic_failover_tests {
         async fn report_exhausted(
             &self,
             failed: &CredentialRef,
+            _model: &str,
             evidence: &AnthropicQuotaEvidence,
         ) {
             self.reports
@@ -5694,7 +6086,7 @@ mod anthropic_failover_tests {
                 .unwrap()
                 .push((failed.clone(), *evidence));
         }
-        async fn report_served(&self, seat: &CredentialRef, _sent_at_ms: u64) {
+        async fn report_served(&self, seat: &CredentialRef, _model: &str, _sent_at_ms: u64) {
             self.served.lock().unwrap().push(seat.clone());
         }
         async fn failover(
@@ -5752,6 +6144,18 @@ mod anthropic_failover_tests {
         max_retries: u32,
         base: ApiOptions,
     ) -> Outcome {
+        drive_model(upstream, auth, router, max_retries, base, "claude-haiku-4-5").await
+    }
+
+    /// [`drive_with`] for `model`.
+    async fn drive_model(
+        upstream: &MockUpstream,
+        auth: Arc<RwLock<AuthState>>,
+        router: &dyn AnthropicAccountRouter,
+        max_retries: u32,
+        base: ApiOptions,
+        model: &str,
+    ) -> Outcome {
         let options = ApiOptions {
             anthropic_base_url: Some(upstream.base_url.clone()),
             credential_source: CredentialSource::Local,
@@ -5766,7 +6170,7 @@ mod anthropic_failover_tests {
         let result = ApiMethods::anthropic_stream_with_router(
             &auth,
             &client,
-            "claude-haiku-4-5",
+            model,
             tools.tools_schema(),
             &None,
             0,
@@ -5864,6 +6268,63 @@ mod anthropic_failover_tests {
             auth.read().await.bound_credential.as_deref(),
             Some(anthropic_binding(&CredentialSource::Local, &seat("claude4")).as_str())
         );
+    }
+
+    /// A cache-preserving compaction request reads the cache of the account
+    /// the chat is on: at a recognised limit it fails there (the caller
+    /// falls back to the transcript request) and never switches accounts.
+    /// Its cache identity, zero here, must match before anything is sent.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_compaction_request_at_a_limit_never_switches_accounts() {
+        let upstream = spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }]).await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+        let refused = ApiOptions {
+            compaction: Some(super::CompactionRequest::expecting(
+                crate::runtime::keepwarm::CachedPrefix::of(0, &[]),
+            )),
+            ..Default::default()
+        };
+        let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, refused).await;
+        let error = out.result.expect_err("another cache identity is refused");
+        assert!(error.to_string().contains(super::COMPACTION_IDENTITY_CHANGED), "{error}");
+        assert_eq!(upstream.calls(), 0, "refused before the network");
+
+        let cell = Arc::new(crate::runtime::keepwarm::CacheAnchorCell::default());
+        let turn = ApiOptions {
+            cache_anchor: Some(Arc::clone(&cell)),
+            ..Default::default()
+        };
+        let warm = spawn_upstream(vec![Reply::SseOk]).await;
+        drive_with(&warm, Arc::clone(&auth), &router, 2, turn).await.result.expect("turn");
+        let stamped = cell.prefix().expect("an accepted request stamps what it left");
+        assert_eq!(stamped.messages, 1, "with the messages it sent");
+        // The harness sends the turn's messages again, so the last of them
+        // counts as the compaction request's own: its history is one
+        // message short of what the turn sent, and it is refused.
+        let shorter = ApiOptions {
+            compaction: Some(super::CompactionRequest::expecting(stamped)),
+            ..Default::default()
+        };
+        let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, shorter).await;
+        let error = out.result.expect_err("another history is refused");
+        assert!(error.to_string().contains(super::COMPACTION_HISTORY_CHANGED), "{error}");
+        assert_eq!(upstream.calls(), 0, "refused before the network");
+
+        // With the identity the request really has and a history that
+        // starts with what was sent (nothing: an empty prefix), it is sent.
+        let compaction = ApiOptions {
+            compaction: Some(super::CompactionRequest::expecting(
+                crate::runtime::keepwarm::CachedPrefix::of(stamped.identity, &[]),
+            )),
+            ..Default::default()
+        };
+        let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, compaction).await;
+        out.result.expect_err("the request fails on its own account");
+        assert_eq!(upstream.calls(), 1, "no request on another account");
+        assert!(router.failovers().is_empty(), "no account lookup");
+        assert_eq!(auth.read().await.auth_token, "tok-claude4");
     }
 
     /// End to end through the real `LocalBroker` (auth.json, usage reads,
@@ -5967,6 +6428,40 @@ mod anthropic_failover_tests {
                     "{labels:?}: the turn stays on a"
                 );
             }
+        }
+
+        /// The real 429 path: a request for `anthropic/claude-fable-5` meets
+        /// Fable's own weekly limit on a. The broker holds a cooldown for the
+        /// requested model id with the prefix stripped (`claude-fable-5`), on
+        /// a only; a still serves Opus, and the request moves to b.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, anthropic_429_log_capture)]
+        async fn a_model_limit_429_cools_the_requested_model_on_that_account_only() {
+            let base = crate::test_env::BaseDirGuard::new();
+            let broker = auto_broker(base.path(), &["a", "b"]).await;
+            let router = BrokerAnthropicRouter::new(broker.clone());
+            let upstream = spawn_upstream(vec![
+                Reply::ModelRejected429 { reset_in_secs: 20 * 3600 },
+                Reply::SseOk,
+            ])
+            .await;
+            let auth = oauth_auth_pinned_to("a");
+            let out = drive_model(
+                &upstream,
+                Arc::clone(&auth),
+                &router,
+                2,
+                ApiOptions::default(),
+                "anthropic/claude-fable-5",
+            )
+            .await;
+            out.result.expect("b serves the request");
+            assert_eq!(upstream.auth_seen(), vec!["Bearer tok-a", "Bearer tok-b"]);
+            let a = seat("a");
+            assert!(broker.active_cooldown_for(&a, Some("claude-fable-5")).is_some());
+            assert_eq!(broker.active_cooldown_for(&a, Some("claude-opus-4-7")), None);
+            assert_eq!(broker.active_cooldown(&a), None, "the account is not cooling");
+            assert_eq!(broker.active_cooldown_for(&seat("b"), Some("claude-fable-5")), None);
         }
 
         /// Review fix 1 (belt and braces): a is cooling down and is the only
@@ -7366,5 +7861,406 @@ mod cancellation_tests {
             StreamEvent::Llm(LlmEvent::ResponseReset)
                 | StreamEvent::Session(SessionEvent::Retry(_))
         )));
+    }
+
+    // ── The cache anchor cell after an accepted attempt's output fails ───
+    //
+    // The policy: the cache activity the provider reports for an accepted
+    // attempt (its message_start usage) is what that request did to the
+    // cache, whatever becomes of its output. A cancelled, failed or refused
+    // output keeps the attempt the anchor, measured; only a newer accepted
+    // attempt replaces it, with its own usage.
+
+    use crate::runtime::keepwarm::{CacheAnchorCell, CacheAnchorState, CacheUsage};
+
+    /// An accepted attempt's start: read 5, wrote 3 (1h), then some text.
+    const START_CACHED: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1,"cache_read_input_tokens":5,"cache_creation_input_tokens":3,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":3}}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+        "\n\n",
+    );
+
+    /// What [`START_CACHED`] reports.
+    const CACHED: CacheUsage = CacheUsage {
+        read: 5,
+        write: 3,
+        write_5m: Some(0),
+        write_1h: Some(3),
+    };
+
+    /// An in-stream error the request is not retried for.
+    const FAILED: &str = concat!(
+        r#"data: {"type":"error","error":{"type":"invalid_request_error","message":"x"}}"#,
+        "\n\n",
+    );
+
+    /// An in-stream error the request is retried for.
+    const TRANSIENT: &str = concat!(
+        r#"data: {"type":"error","error":{"type":"api_error","message":"x"}}"#,
+        "\n\n",
+    );
+
+    /// The model declined: the request is retried (`refusal_retries`).
+    const REFUSED: &str = concat!(
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+
+    /// A complete reply, "second attempt", that read 40 and wrote nothing.
+    const READ_ONLY: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1,"cache_read_input_tokens":40,"cache_creation_input_tokens":0}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"second attempt"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+
+    /// What [`READ_ONLY`] reports.
+    const READ: CacheUsage = CacheUsage {
+        read: 40,
+        write: 0,
+        write_5m: None,
+        write_1h: None,
+    };
+
+    /// A 400 before any stream: refused, not retried.
+    fn bad_request() -> (u16, Body) {
+        (
+            400,
+            Body::from(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"x"}}"#,
+            ),
+        )
+    }
+
+    /// What a server answers request `n` (from 0) with: a status and a body.
+    type Script = fn(usize) -> (u16, Body);
+
+    /// Loopback only: answers request `n` (from 0) with `script(n)`.
+    async fn attempts_server(
+        script: Script,
+    ) -> (ApiOptions, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let (status, body) = script(counter.fetch_add(1, Ordering::SeqCst));
+                async move {
+                    let kind = if status == 200 {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", kind)
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            ApiOptions {
+                anthropic_base_url: Some(url),
+                ..Default::default()
+            },
+            hits,
+            task,
+        )
+    }
+
+    /// `call` with a cache anchor cell: its result, the cell when the first
+    /// retry is announced (attempt 0 is over), and the cell at the end.
+    async fn anchored(
+        mut options: ApiOptions,
+    ) -> (Result<Value>, Option<CacheAnchorState>, CacheAnchorState) {
+        let cell = Arc::new(CacheAnchorCell::default());
+        options.cache_anchor = Some(Arc::clone(&cell));
+        let auth = test_auth();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (result, first) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(call(&auth, &cancel, tx, &options), async {
+                let mut first = None;
+                while let Some(event) = rx.recv().await {
+                    if first.is_none()
+                        && matches!(event, StreamEvent::Session(SessionEvent::Retry(_)))
+                    {
+                        first = Some(cell.state());
+                    }
+                }
+                first
+            })
+        })
+        .await
+        .expect("the request must end well within 10 s");
+        (result, first, cell.state())
+    }
+
+    /// Cancelled after the attempt's usage and some text: the attempt stays
+    /// the anchor, measured.
+    #[tokio::test]
+    async fn reported_cache_activity_survives_a_cancelled_output() {
+        let (mut options, hits, _seen, server) = stalled_server(Stall::Sse).await;
+        let cell = Arc::new(CacheAnchorCell::default());
+        options.cache_anchor = Some(Arc::clone(&cell));
+        let auth = test_auth();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(call(&auth, &cancel, tx, &options), async {
+                while let Some(event) = rx.recv().await {
+                    if matches!(event, StreamEvent::Llm(LlmEvent::Text(_))) {
+                        cancel.cancel();
+                    }
+                }
+            })
+        })
+        .await
+        .expect("cancel must finish a stalled SSE stream");
+        server.abort();
+        assert_eq!(result.unwrap()["content"][0]["text"], "partial");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let state = cell.state();
+        assert!(
+            state.anchor.is_some() && state.anchor == state.dispatched,
+            "{state:?}"
+        );
+        assert_eq!(
+            state.usage,
+            Some(CacheUsage {
+                read: 5,
+                write: 3,
+                write_5m: None,
+                write_1h: None,
+            })
+        );
+    }
+
+    /// An in-stream error after the attempt's usage, not retried: the
+    /// request fails, the attempt stays the anchor, measured.
+    #[tokio::test]
+    async fn reported_cache_activity_survives_an_in_stream_failure() {
+        let (options, hits, server) =
+            attempts_server(|_| (200, scripted(vec![(0, START_CACHED), (0, FAILED)], None))).await;
+        let (result, first, end) = anchored(options).await;
+        server.abort();
+        assert!(result.is_err());
+        assert_eq!(
+            (hits.load(Ordering::SeqCst), first),
+            (1, None),
+            "not retried"
+        );
+        assert!(
+            end.anchor.is_some() && end.anchor == end.dispatched,
+            "{end:?}"
+        );
+        assert_eq!(end.usage, Some(CACHED));
+    }
+
+    /// An accepted attempt's output fails (a transient in-stream error, or
+    /// a refusal) and the retry is refused before it is accepted: the cell
+    /// keeps the accepted attempt and its usage; only the dispatch moves on.
+    #[tokio::test]
+    async fn a_retry_refused_before_acceptance_keeps_the_accepted_attempt() {
+        let scripts: [(&str, Script); 2] = [
+            ("in-stream error", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, TRANSIENT)], None)),
+                _ => bad_request(),
+            }),
+            ("refusal", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, REFUSED)], None)),
+                _ => bad_request(),
+            }),
+        ];
+        for (what, script) in scripts {
+            let (options, hits, server) = attempts_server(script).await;
+            let (result, first, end) = anchored(options).await;
+            server.abort();
+            assert!(result.is_err(), "{what}: the retry was refused");
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "{what}");
+            let first = first.expect("a retry");
+            assert!(
+                first.anchor.is_some() && first.usage == Some(CACHED),
+                "{what}: {first:?}"
+            );
+            assert_eq!(
+                (end.anchor, end.prefix, end.usage),
+                (first.anchor, first.prefix, first.usage),
+                "{what}: the accepted attempt stays"
+            );
+            assert!(
+                end.dispatched.unwrap().mono > end.anchor.unwrap().mono,
+                "{what}: the retry was dispatched: {end:?}"
+            );
+        }
+    }
+
+    /// The same, and the retry is accepted: the newer attempt is the
+    /// anchor, with its own usage, never the failed one's.
+    #[tokio::test]
+    async fn an_accepted_retry_replaces_the_failed_attempt_with_its_own_usage() {
+        let scripts: [(&str, Script); 2] = [
+            ("in-stream error", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, TRANSIENT)], None)),
+                _ => (200, scripted(vec![(0, READ_ONLY)], None)),
+            }),
+            ("refusal", |n| match n {
+                0 => (200, scripted(vec![(0, START_CACHED), (0, REFUSED)], None)),
+                _ => (200, scripted(vec![(0, READ_ONLY)], None)),
+            }),
+        ];
+        for (what, script) in scripts {
+            let (options, hits, server) = attempts_server(script).await;
+            let (result, first, end) = anchored(options).await;
+            server.abort();
+            assert_eq!(
+                result.unwrap()["content"][0]["text"],
+                "second attempt",
+                "{what}"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "{what}");
+            let first = first.expect("a retry");
+            assert_eq!(first.usage, Some(CACHED), "{what}: {first:?}");
+            assert!(
+                end.anchor.unwrap().mono > first.anchor.unwrap().mono
+                    && end.anchor == end.dispatched,
+                "{what}: {end:?}"
+            );
+            assert_eq!(end.usage, Some(READ), "{what}");
+        }
+    }
+
+    /// Which part of the older request [`overlap_server`] holds back.
+    #[derive(Clone, Copy, Debug)]
+    enum Held {
+        Headers,
+        Body,
+    }
+
+    /// Loopback only: request 0 (the older) answers [`START_CACHED`] then
+    /// [`FAILED`], held at `gate` before its headers or before its usage
+    /// (`held`); every later request answers [`READ_ONLY`] at once.
+    async fn overlap_server(
+        held: Held,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> (ApiOptions, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let gate = Arc::clone(&gate);
+                async move {
+                    let body = if n > 0 {
+                        scripted(vec![(0, READ_ONLY)], None)
+                    } else {
+                        if let Held::Headers = held {
+                            gate.notified().await;
+                        }
+                        let ping = futures::stream::once(async {
+                            Ok::<_, std::io::Error>(bytes::Bytes::from_static(PING.as_bytes()))
+                        });
+                        let rest = futures::stream::once(async move {
+                            if let Held::Body = held {
+                                gate.notified().await;
+                            }
+                            Ok(bytes::Bytes::from(format!("{START_CACHED}{FAILED}")))
+                        });
+                        Body::from_stream(ping.chain(rest))
+                    };
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            ApiOptions {
+                anthropic_base_url: Some(url),
+                ..Default::default()
+            },
+            hits,
+            task,
+        )
+    }
+
+    /// Two requests on one cell overlap (a turn and a keep-warm ping, say):
+    /// the later-dispatched one is accepted and measured while the older
+    /// one is open, and the older one's usage and failure land after it
+    /// (its body was held), or it is only accepted then (its headers were
+    /// held). The cell stays the newer request's, with its own usage.
+    #[tokio::test]
+    async fn an_overlapping_older_attempt_never_overwrites_the_newer_one() {
+        for held in [Held::Body, Held::Headers] {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (mut options, hits, server) = overlap_server(held, Arc::clone(&gate)).await;
+            let cell = Arc::new(CacheAnchorCell::default());
+            options.cache_anchor = Some(Arc::clone(&cell));
+            let auth = test_auth();
+            let cancel = CancellationToken::new();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let (older, (older_sent, newer, after_newer)) =
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::join!(call(&auth, &cancel, tx.clone(), &options), async {
+                        // The older request is out (and, body held, accepted).
+                        while match held {
+                            Held::Body => cell.state().anchor.is_none(),
+                            Held::Headers => hits.load(Ordering::SeqCst) == 0,
+                        } {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        let older_sent = cell.state().dispatched.unwrap();
+                        let newer = call(&auth, &cancel, tx.clone(), &options).await;
+                        let after_newer = cell.state();
+                        gate.notify_one();
+                        (older_sent, newer, after_newer)
+                    })
+                })
+                .await
+                .expect("both requests must end well within 10 s");
+            server.abort();
+            assert!(older.is_err(), "{held:?}: the older request failed");
+            assert_eq!(
+                newer.unwrap()["content"][0]["text"],
+                "second attempt",
+                "{held:?}"
+            );
+            assert!(
+                after_newer.anchor.unwrap().mono > older_sent.mono
+                    && after_newer.anchor == after_newer.dispatched
+                    && after_newer.usage == Some(READ),
+                "{held:?}: {after_newer:?}"
+            );
+            assert_eq!(
+                cell.state(),
+                after_newer,
+                "{held:?}: the older request changed nothing"
+            );
+        }
     }
 }

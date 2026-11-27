@@ -52,6 +52,8 @@ pub struct ScriptedTransport {
     input_owner: Option<ClientId>,
     /// `client_input()`; `Exclusive` (an older daemon's) unless a test sets it.
     client_input: agent_engine::session::ClientInput,
+    /// `addressed_replies()`; `true` unless a test plays an older daemon.
+    addressed_replies: bool,
 }
 
 impl ScriptedTransport {
@@ -87,6 +89,8 @@ impl ScriptedTransport {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            workers: Default::default(),
+            updated_at: None,
         };
         let view = Arc::new(RuntimeView::snapshot(&runtime, 0));
         Self {
@@ -107,6 +111,7 @@ impl ScriptedTransport {
             mode: AttachMode::Mirror,
             input_owner: Some(ClientId(1)),
             client_input: agent_engine::session::ClientInput::wire_default(),
+            addressed_replies: true,
         }
     }
 
@@ -119,6 +124,12 @@ impl ScriptedTransport {
     }
 
     /// Who may drive (`client_input()`), as the attach snapshot says.
+    /// Play a daemon without `addressed_replies` (it broadcasts replies).
+    pub fn with_addressed_replies(mut self, on: bool) -> Self {
+        self.addressed_replies = on;
+        self
+    }
+
     pub fn with_client_input(mut self, client_input: agent_engine::session::ClientInput) -> Self {
         self.client_input = client_input;
         self
@@ -171,12 +182,12 @@ impl ScriptedTransport {
 
     /// Queue an envelope for `next_event` (tape `SessionEvent` steps).
     pub fn push_event(&mut self, event: SessionEventWire) {
-        let env = Envelope {
-            session_id: self.id.clone(),
-            seq: self.seq,
-            ts: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
+        let env = Envelope::new(
+            self.id.clone(),
+            self.seq,
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
             event,
-        };
+        );
         self.seq += 1;
         self.queue.push_back(env);
     }
@@ -287,17 +298,19 @@ impl ScriptedTransport {
 
     async fn handle(&mut self, cmd: SessionCommand) {
         if let Some(reason) = self.refuse_input.clone() {
-            let command = match &cmd {
-                SessionCommand::Submit { .. } => Some("submit"),
-                SessionCommand::Steer { .. } => Some("steer"),
-                SessionCommand::Set { .. } => Some("set"),
-                SessionCommand::EngineCommand { .. } => Some("engine_command"),
-                SessionCommand::PluginCommand { .. } => Some("plugin_command"),
-                SessionCommand::Resume { .. } => Some("resume"),
-                SessionCommand::Compact { .. } => Some("compact"),
-                SessionCommand::NewSession => Some("new_session"),
-                _ => None,
-            };
+            // Named as the actor names them.
+            let command = matches!(
+                cmd,
+                SessionCommand::Submit { .. }
+                    | SessionCommand::Steer { .. }
+                    | SessionCommand::Set { .. }
+                    | SessionCommand::EngineCommand { .. }
+                    | SessionCommand::PluginCommand { .. }
+                    | SessionCommand::Resume { .. }
+                    | SessionCommand::Compact { .. }
+                    | SessionCommand::NewSession
+            )
+            .then(|| agent_engine::session::actor::command_name(&cmd));
             if let Some(command) = command {
                 self.push_event(SessionEventWire::Refused {
                     client: ClientId(1),
@@ -535,5 +548,8 @@ impl ClientTransport for ScriptedTransport {
     }
     fn daemon_pid(&self) -> u32 {
         self.daemon_pid
+    }
+    fn addressed_replies(&self) -> bool {
+        self.addressed_replies
     }
 }

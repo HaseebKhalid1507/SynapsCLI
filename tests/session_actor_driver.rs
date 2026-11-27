@@ -302,11 +302,15 @@ async fn checkpoint_reload_revokes_and_notifies() {
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
+    // Host-only (the daemon's reload sends it).
     actor
+        .t
+        .handle()
         .send(SessionCommand::Checkpoint {
             reason: agent_engine::session::CheckpointReason::Reload,
         })
-        .await;
+        .await
+        .unwrap();
     let ev = actor
         .until(|e| matches!(e, SessionEventWire::DriverRevoked { .. }))
         .await;
@@ -1124,7 +1128,7 @@ impl agent_engine::Tool for PromptFixtureTool {
             .capabilities
             .secret_prompt
             .expect("stream passes Some(handle)");
-        Ok(match handle.prompt("Secret".into(), "enter secret".into()).await {
+        Ok(match handle.secret("Secret".into(), "enter secret".into()).await {
             Some(v) => format!("answered:{}", v.len()),
             None => "cancelled".to_string(),
         })

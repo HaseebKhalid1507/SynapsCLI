@@ -9,7 +9,7 @@ SynapsCLI is a terminal-native AI agent runtime written in Rust. ~210K LOC acros
 - `synaps-tui` (`crates/agent-tui/`) — the ratatui TUI
 - `synaps` (`src/main.rs`) — the binary; CLI dispatch
 
-Each crate has `extern crate self as synaps_cli;` and re-exports its dependencies, so internal `synaps_cli::` paths still resolve for contributors navigating older references. Talks to Anthropic, OpenAI Codex, xAI, GitHub Copilot, Google Gemini, Azure OpenAI, Amazon Bedrock, Google Vertex AI, and Kimi natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, OpenRouter, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
+Each crate has `extern crate self as synaps_cli;` and re-exports its dependencies, so internal `synaps_cli::` paths still resolve for contributors navigating older references. Talks to Anthropic, OpenAI Codex, xAI, GitHub Copilot, Azure OpenAI, Amazon Bedrock, Google Vertex AI, and Kimi natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, OpenRouter, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
 
 ---
 
@@ -94,7 +94,8 @@ crates/agent-engine/src/  (crate: synaps-engine)
 ├── runtime/              — THE BRAIN
 │   ├── mod.rs            — Runtime struct, orchestration loop
 │   ├── api.rs            — Anthropic API body construction + SSE parsing
-│   ├── api_sync.rs       — non-streaming API path (used by /compact)
+│   ├── api_sync.rs       — non-streaming API path (the /compact transcript request)
+│   ├── compaction_cached.rs — /compact as the chat's own next request, read from the prompt cache; when it applies
 │   ├── request.rs        — request body assembly helpers
 │   ├── stream.rs         — tool dispatch from streamed tool_use events
 │   ├── helpers.rs        — annotate_cache_breakpoint, drain_steering, etc.
@@ -113,7 +114,7 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │       ├── stream.rs     — call_oai_stream_inner (streaming path)
 │       ├── ping.rs       — /ping health check (parallel, non-blocking)
 │       ├── account_routing.rs — Codex account selection + one-hop failover
-│       └── catalog/      — per-provider model catalogs (anthropic, codex, xai, copilot, gemini, groq, kimi, muse, nvidia, openrouter)
+│       └── catalog/      — per-provider model catalogs (anthropic, codex, xai, copilot, groq, kimi, muse, nvidia, openrouter)
 ├── events/               — event bus (per-session unix socket, inbox watcher, queue, registry)
 ├── tools/                — built-in tools, each impls the Tool trait
 │   ├── mod.rs            — Tool trait, ToolContext
@@ -208,7 +209,7 @@ This is the single most important flow to understand.
 
 Typed auth flows live in `crates/agent-core/src/core/auth/`. Three flow families:
 
-- **OAuth PKCE** — Anthropic, OpenAI Codex, xAI, GitHub Copilot, Google Gemini. Browser-based device flow with PKCE challenge, refresh token rotation.
+- **OAuth PKCE** — Anthropic, OpenAI Codex, xAI, GitHub Copilot. Browser-based device flow with PKCE challenge, refresh token rotation.
 - **OAuth device flow** — Meta Muse (`muse.rs`): the Meta login mints a Model API key; broker-proxy only, the runtime never holds either.
 - **Cloud identity** — Azure OpenAI (Azure CLI/managed identity), AWS Bedrock (STS/profile), Google Vertex AI (gcloud ADC). Cloud secrets never leave the broker.
 - **Static keys** — Groq, Cerebras, NVIDIA, OpenRouter, Kimi. Env var or config-file discovery, broker-owned.
@@ -459,7 +460,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `identity` | string | SynapsCLI default | System prompt preamble injected as the first message in the system block. Defines who the agent is. |
 | `agent_name` | string | — | Display name for the agent in the TUI |
 | `theme` | string | — | TUI color theme (21 built-in + user TOML) |
-| `compaction_model` | string | claude-sonnet-4-6 | Model used for `/compact` |
+| `compaction_model` | string | match | Who writes `/compact` and auto-compaction summaries: `match` (also unset or empty: the chat's own model), `provider-small` (the small model pinned for the chat's provider, on the chat's own account: `claude-haiku-5-5` for Anthropic, the chat's own model for any other provider, OpenAI Codex included; pins in `crates/agent-core/src/core/models.rs::PROVIDER_SMALL_MODELS`), or a model id. A summary goes to another provider only when a model there is named. A named or pinned model that can't be used (no route, its provider refuses the chat's reasoning level, a smaller context window than the chat's, no credential) gives way to the chat's own model, and the compaction line says so. Any other value warns at load and is `match` |
 | `max_tool_output` | int | 30000 | Max bytes per tool output |
 | `tool_output_spill_bytes` | int | 12288 | Tool output virtualisation: a text result of an output-dump tool (`bash`, `grep`, `find`, `ls`, shell and subagent tools, MCP/extension/plugin tools) bigger than this is saved whole to `<base>/spill/<session>/<tool_use_id>.txt` (0700/0600) and history gets a head + tail preview naming the file and the omitted line range; a default-range `read` points back at the file instead. `0` = off (history exactly as before). Spill dirs go with their session (retention) or after 7 idle days |
 | `tool_output_spill_head_bytes` | int | 4096 | Bytes from the start of a virtualised result kept in history (cut at a line boundary when possible) |
@@ -469,6 +470,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `bash_max_timeout` | int | 300 | Max allowed bash timeout |
 | `subagent_timeout` | int | 300 | Default subagent timeout (seconds; 0 = no limit) |
 | `subagent_thinking` | string | xhigh | Worker thinking default (`low`, `medium`, `high`, `xhigh`, `max`), independent of `thinking`; a per-call `thinking` argument wins ([docs/subagent-thinking.md](docs/subagent-thinking.md)) |
+| `subagent_model` | string | inherit | Worker model when a `subagent`/`subagent_start` call omits `model` (e.g. `claude-sonnet-4-6` or `openai-codex/gpt-5.6-sol`, same forms as `model`); `inherit` or empty = the foreground model. A per-call `model` wins; resume keeps the worker's own model. Naming a model here trusts it for workers the way a favorite does, and the trust lasts until the session ends, like a favorite; an unknown id is denied rather than replaced by the foreground model |
 | `subagent_context_management` | string | auto | `auto` or `off`: workers roll their context over instead of filling the window ([docs/design/subagent-rollover.md](docs/design/subagent-rollover.md)) |
 | `subagent_rollover_tokens` | int | 200000 | Estimated footprint at which a worker rolls over (at least 20000; a lower window band wins) |
 | `subagent_cold_resume_compact_tokens` | int | 100000 | `subagent_resume` of a worker whose cache has expired replays a compact context once history is at least this big; `0` = off |
@@ -493,7 +495,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `provider.<name>` | string | — | API key for provider (e.g. `provider.groq = gsk_...`) |
 | `provider.<name>.url` | string | — | Custom base URL (e.g. `provider.local.url = http://...`) |
 | `keybind.<key>` | string | — | Custom keybind (e.g. `keybind.F5 = /compact`) |
-| `telemetry` | string | off | Per-request API telemetry: `off`, `basic` (Anthropic streaming calls: turns, keep-warm, workers; timing incl. `ttft_ms`, usage, `cost_usd` estimated at API list prices, the persisted conversation `session_id` plus the request-trace `runtime_session_id`/`turn_id`/`trace_request_id`, worker identity on subagent records, plus the `cache_diag` verdict when `cache_diagnostics` is on), `full` (adds rate-limit headers). JSONL at `~/.cache/synaps/api-log.jsonl` (0600, O_NOFOLLOW); `basic`/`full` also write the metadata-only `~/.cache/synaps/request-trace.jsonl` ([docs/trace-schema.md](docs/trace-schema.md)) |
+| `telemetry` | string | off | Per-request API telemetry: `off`, `basic` (Anthropic streaming calls: turns, keep-warm, workers; timing incl. `ttft_ms`, usage, `cost_usd` estimated at API list prices, the request's thinking level as `thinking` and the `effort` it carried if any, the persisted conversation `session_id` plus the request-trace `runtime_session_id`/`turn_id`/`trace_request_id`, worker identity on subagent records, plus the `cache_diag` verdict when `cache_diagnostics` is on), `full` (adds rate-limit headers: an API key's per-minute limits, or a subscription login's usage windows as `ratelimit.unified_utilization`, e.g. `{"5h": 0.31, "7d": 0.62}` = share used as of that response). JSONL at `~/.cache/synaps/api-log.jsonl` (0600, O_NOFOLLOW); `basic`/`full` also write the metadata-only `~/.cache/synaps/request-trace.jsonl` ([docs/trace-schema.md](docs/trace-schema.md)) |
 | `telemetry_log_generations` | int | 1 | Rotated generations kept for `api-log.jsonl` and `request-trace.jsonl` (each rotates at 50 MB): `<log>.1` (newest) .. `<log>.N` (oldest), 1–100. `1` is the historical single `<log>.1`. Read when the session's telemetry writer starts |
 | `cache_diagnostics` | bool | false | Anthropic cache diagnostics: each turn sends `diagnostics.previous_message_id` and records the server's reason: how this request diverges from the previous request in the chain, not what the cache did (it can appear on a full cache hit — read it with `cache_read_input_tokens`). An unknown or nonexistent previous id returns 200 with `previous_message_not_found`. Written to `cache_diag` in `api-log.jsonl` (telemetry `basic`+) and `cache.server_diagnosis` in the request trace. Beta header `cache-diagnosis-2026-04-07` on API-key auth only; a rejection turns it off for the session and the request is re-sent without it |
 | `shell.*` / `server.*` | — | — | `shell.*`: the eight keys were removed in 0.12.0; a config that sets them loads, ignores them and gets one warning naming them (`REMOVED_SHELL_KEYS` in `crates/agent-core/src/core/config.rs`). `server.*`: parsed by `parse_server_config_key` in the same file; it is only `server.auto_approve_confirms` now: the other keys of the removed `synaps server` (and the removed watcher's `bridge.*` keys) load with one deprecation warning and are ignored |
@@ -687,7 +689,7 @@ Dispatch a specialist. **Not available to subagents.**
 | `task` | string | ✓ | — | |
 | `agent` | string | * | — | Loads `~/.synaps-cli/agents/{name}.md` |
 | `system_prompt` | string | * | — | Inline alternative to `agent` |
-| `model` | string | | sonnet | Override |
+| `model` | string | | `subagent_model`, else the foreground model | Exact qualified id from `subagent_models` |
 | `timeout` | integer | | 300 | Seconds |
 | `thinking` | string | | `subagent_thinking` (xhigh) | `low`, `medium`, `high`, `xhigh`, `max` |
 
@@ -750,6 +752,18 @@ subagent_steer(handle_id, message)      → {"acknowledged": true}
 subagent_collect(handle_id)             → {"status": "completed", "output": "full result"}
 subagent_resume(handle_id, instructions) → new handle_id; the worker continues its archived conversation
 ```
+
+`subagent_status`, `subagent_collect` (running and terminal) and the completion
+event's `data` carry `usage`, what this run used so far: `requests` (provider
+responses that reported usage, keep-warm pings included), `input_tokens`,
+`output_tokens`, `cache_read_tokens`, `cache_write_tokens` (plus
+`cache_write_5m_tokens`/`cache_write_1h_tokens` when split), `context_tokens`
+(the latest prompt) and `cost_usd` (list-price estimate from
+`agent_core::pricing`, 4 decimals; absent when nothing was used or the model has
+no list price). The completion text adds one "Used N requests, … tokens, about
+$X at list prices." sentence before "Call subagent_collect". A resumed worker
+counts its own run only; a reaped worker read back from its archive has no
+`usage`.
 
 Use `subagent` for simple sequential delegation (blocks until done).
 Use `subagent_start` for parallel execution or when you want to continue working while the subagent runs.

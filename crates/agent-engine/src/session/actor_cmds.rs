@@ -1,6 +1,6 @@
 //! `SessionActor` — command bodies that belong to the TUI port (A3):
 //! `engine_command` (structured reply), `submit_prepared`, `plugin_command`,
-//! `resume`, `session_name`, `emit_subagent_rows`. Kept apart from
+//! `resume`, `session_name`. Kept apart from
 //! `actor.rs` so the turn machine (B) and the command surface (A) never
 //! touch the same file.
 
@@ -102,27 +102,27 @@ impl SessionActor {
     /// reads (`notice`/`error`/`output`/`quit`/`unhandled`); the TUI reads
     /// the structured extras (`event`, `model`, `clamp`, `level`,
     /// `config_value`) to render its own lines byte-for-byte.
-    pub(crate) async fn engine_command(&mut self, id: u64, cmd: String, arg: String) {
+    pub(crate) async fn engine_command(&mut self, from: Option<ClientId>, id: u64, cmd: String, arg: String) {
         use crate::engine::commands::CommandResult;
         // TUI-only commands that need the actor's session (it owns the
         // journal): `saveas` names/unnames + force-saves.
         if cmd == "saveas" {
             let value = self.session_name(&arg).await;
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.reply(from, SessionEventWire::QueryResult { id, value });
             return;
         }
         // `/keepwarm [status|off|auto|<N>h]`: actor-owned prompt-cache
         // keep-warm state (task #444).
         if cmd == "keepwarm" {
             let value = self.cache_keepwarm_command(&arg).await;
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.reply(from, SessionEventWire::QueryResult { id, value });
             return;
         }
         // `/auth reload` is async (broker round-trip), so it cannot live in
         // the sync `handle_engine_command`. Never echoes a token.
         if cmd == "auth" {
             let value = auth_command_reply(&arg, &self.runtime).await;
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.reply(from, SessionEventWire::QueryResult { id, value });
             return;
         }
         crate::engine::commands::prepare_engine_command(&cmd, &arg, &self.runtime).await;
@@ -142,6 +142,8 @@ impl SessionActor {
             for (id, agent) in &cancelled_by_command(uncancelled, &after) {
                 self.note_in_main_conversation(super::actor::subagent_user_cancel_event(id, agent));
             }
+            // The listing shows the cancel at once, not a tick later.
+            self.publish_workers();
         }
         if view_changed {
             self.publish_view().await;
@@ -164,7 +166,7 @@ impl SessionActor {
         {
             self.compact(custom_instructions, "manual").await;
         }
-        self.emit(SessionEventWire::QueryResult { id, value });
+        self.reply(from, SessionEventWire::QueryResult { id, value });
     }
 
     /// `/close [force]`: end this session in the daemon. It is saved and
@@ -182,10 +184,11 @@ impl SessionActor {
     ///
     /// Owner-only, like every engine command. Replies on the `QueryResult`
     /// (`output` / `error`) before the `Ended`. `Some(reason)` = end now.
-    /// The host (`host`) may add [`super::actor::CLOSE_UNATTACHED_ARG`]:
-    /// refused while any client is attached.
-    pub(crate) fn close_command(&mut self, id: u64, arg: &str, host: bool) -> Option<EndReason> {
-        let reply = |text: String, kind: &str| SessionEventWire::QueryResult {
+    /// The host (`from: None`) may add [`super::actor::CLOSE_UNATTACHED_ARG`]:
+    /// refused while any client is attached. Every reply is the asker's.
+    pub(crate) fn close_command(&mut self, from: Option<ClientId>, id: u64, arg: &str) -> Option<EndReason> {
+        let host = from.is_none();
+        let answer = |text: String, kind: &str| SessionEventWire::QueryResult {
             id,
             value: serde_json::json!({ "kind": kind, "text": text }),
         };
@@ -195,14 +198,14 @@ impl SessionActor {
                 "force" if !force => force = true,
                 w if host && w == super::actor::CLOSE_UNATTACHED_ARG && !unattached => unattached = true,
                 _ => {
-                    self.emit(reply("usage: /close [force]".into(), "error"));
+                    self.reply(from, answer("usage: /close [force]".into(), "error"));
                     return None;
                 }
             }
         }
         if unattached && !self.attached.is_empty() {
             let n = self.attached.len();
-            self.emit(reply(format!("not closed: attached by {n} client(s)"), "error"));
+            self.reply(from, answer(format!("not closed: attached by {n} client(s)"), "error"));
             return None;
         }
         let live = self.runtime.is_live();
@@ -214,10 +217,7 @@ impl SessionActor {
                 .unwrap_or_else(|p| p.into_inner())
                 .display_rows()
                 .into_iter()
-                .filter(|r| {
-                    r.status == crate::runtime::subagent::SubagentStatus::Running
-                        && !r.cancel_requested
-                })
+                .filter(|r| r.is_live())
                 .map(|r| (r.handle_id, r.agent_name))
                 .collect();
             running.sort();
@@ -245,7 +245,7 @@ impl SessionActor {
             blockers.push("an /auto run is armed".to_string());
         }
         if !blockers.is_empty() && !force {
-            self.emit(reply(
+            self.reply(from, answer(
                 format!(
                     "not closed: {}. Closing the session would stop {}. Wait, or use /close force.",
                     blockers.join("; "),
@@ -265,8 +265,10 @@ impl SessionActor {
             for (handle_id, agent) in workers.iter().filter(|(h, _)| cancelled.contains(h)) {
                 self.note_in_main_conversation(super::actor::subagent_close_cancel_event(handle_id, agent));
             }
+            // At once on a cancel, like every other cancel site.
+            self.publish_workers();
         }
-        let session = (**self.journal_id.load()).clone();
+        let session = self.journal_id_now();
         // No history, no journal: there is nothing to continue (a parked
         // session always has one).
         let text = if self.conv.is_live() && self.conv.api_messages.is_empty() {
@@ -274,7 +276,7 @@ impl SessionActor {
         } else {
             format!("closing session {session}; resume it with: synaps --attach --continue {session}")
         };
-        self.emit(reply(text, "output"));
+        self.reply(from, answer(text, "output"));
         Some(EndReason::ClientQuit)
     }
 
@@ -356,7 +358,14 @@ impl SessionActor {
     /// commands.rs:123-158: tools-backed (non-interactive) plugin command on
     /// THE runtime's tool set. Reply `{kind:"plugin_output", status, stdout,
     /// stderr}` or `{kind:"error", text}`.
-    pub(crate) async fn plugin_command(&mut self, id: u64, plugin: String, name: String, arg: String) {
+    pub(crate) async fn plugin_command(
+        &mut self,
+        from: Option<ClientId>,
+        id: u64,
+        plugin: String,
+        name: String,
+        arg: String,
+    ) {
         let value = match Self::find_plugin_command(&plugin, &name) {
             None => serde_json::json!({
                 "kind": "error",
@@ -383,7 +392,7 @@ impl SessionActor {
                 Err(e) => serde_json::json!({ "kind": "error", "text": e.to_string() }),
             },
         };
-        self.emit(SessionEventWire::QueryResult { id, value });
+        self.reply(from, SessionEventWire::QueryResult { id, value });
     }
 
     fn find_plugin_command(
@@ -400,9 +409,9 @@ impl SessionActor {
     /// commands.rs:647-693 `/resume`: save current, load `query`, restore
     /// model/reasoning/system prompt, swap conversation. Reply `Resumed{id}`
     /// then `Conversation`; error → `QueryResult{id, {kind:"error", text}}`.
-    pub(crate) async fn resume(&mut self, id: u64, query: String) {
+    pub(crate) async fn resume(&mut self, from: Option<ClientId>, id: u64, query: String) {
         if self.streaming {
-            self.emit(SessionEventWire::QueryResult {
+            self.reply(from, SessionEventWire::QueryResult {
                 id,
                 value: serde_json::json!({ "kind": "error", "text": "cannot resume while streaming" }),
             });
@@ -414,7 +423,7 @@ impl SessionActor {
         let session = match crate::resolve_session(&query) {
             Ok(s) => s,
             Err(e) => {
-                self.emit(SessionEventWire::QueryResult {
+                self.reply(from, SessionEventWire::QueryResult {
                     id,
                     value: serde_json::json!({ "kind": "error", "text": e.to_string() }),
                 });
@@ -435,7 +444,7 @@ impl SessionActor {
                 Ok(lock) => Some(lock),
                 Err(e @ agent_core::session_lock::SessionLockError::Held { .. })
                 | Err(e @ agent_core::session_lock::SessionLockError::CompactedInto { .. }) => {
-                    self.emit(SessionEventWire::QueryResult {
+                    self.reply(from, SessionEventWire::QueryResult {
                         id,
                         value: serde_json::json!({
                             "kind": "error",
@@ -495,9 +504,13 @@ impl SessionActor {
         }
         self.consecutive_auto_turns = 0;
         self.runtime.begin_conversation(Some(new_id.clone()));
-        self.set_journal_id(new_id.clone());
+        self.set_journal_id(new_id.clone(), super::handle::JournalMove::Resume);
+        // The listing follows the conversation now held: its name, title,
+        // cost and messages (as `/clear` does).
+        self.sync_name();
+        self.publish_presence();
         self.publish_view().await;
-        self.emit(SessionEventWire::Resumed {
+        self.emit_shared(from, SessionEventWire::Resumed {
             id,
             old_id,
             new_id,
@@ -505,31 +518,6 @@ impl SessionActor {
             clamp_notice,
         });
         self.emit_conversation();
-    }
-
-    /// `runtime.subagent_registry().display_rows()` → `SubagentRows`
-    /// (called at Done/Error and from the 1 Hz arm B adds).
-    #[allow(dead_code)]
-    pub(crate) fn emit_subagent_rows(&mut self) {
-        let rows = self
-            .runtime
-            .subagent_registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .display_rows();
-        self.emit(SessionEventWire::SubagentRows(rows));
-    }
-
-    /// Any non-terminal subagent row (drives the 1 Hz arm).
-    #[allow(dead_code)]
-    pub(crate) fn has_live_subagents(&self) -> bool {
-        self.runtime
-            .subagent_registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .display_rows()
-            .iter()
-            .any(|r| matches!(r.status, crate::runtime::subagent::SubagentStatus::Running))
     }
 }
 
@@ -786,7 +774,7 @@ impl SessionActor {
     async fn rename_parked(&mut self, want: Option<String>, expect: Option<Option<String>>) -> serde_json::Value {
         use agent_core::session_catalog::RenameError;
         let dir = agent_core::session_lock::sessions_dir();
-        let id = (**self.journal_id.load()).clone();
+        let id = self.journal_id_now();
         let name = want.clone();
         let res = tokio::task::spawn_blocking(move || {
             let expect = expect.as_ref().map(|e| e.as_deref());

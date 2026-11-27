@@ -63,24 +63,6 @@ pub const PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const ANTHROPIC_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 
-/// Pinned Code Assist host for the broker-only Google Gemini proxy runtime.
-/// The service is treated as experimental and only the exact `v1internal`
-/// method paths reviewed in the spec are permitted (setup + streaming).
-pub const GOOGLE_GEMINI_CODE_ASSIST_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
-
-/// Exhaustive allowlist of `cloudcode-pa` methods the broker may proxy.
-/// Deliberately narrow: setup uses loadCodeAssist + onboardUser + operations
-/// polling, runtime uses streamGenerateContent. Anything else is denied.
-pub(crate) fn is_allowed_google_gemini_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1internal:loadCodeAssist"
-            | "/v1internal:onboardUser"
-            | "/v1internal:streamGenerateContent"
-            | "/v1internal:countTokens"
-    ) || path.starts_with("/v1internal/operations/")
-}
-
 /// Pinned ChatGPT backend host for OpenAI Codex catalog traffic.
 pub const OPENAI_CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api";
 
@@ -386,7 +368,6 @@ impl ProxyRequest {
         if provider != LOCAL_PROVIDER_KEY
             && provider != "xai-auth"
             && provider != "github-copilot"
-            && provider != "google-gemini"
             && provider != "openai-codex"
             && provider != "anthropic"
             && provider != "kimi-code"
@@ -412,7 +393,6 @@ impl ProxyRequest {
                     self.path.as_str(),
                     "/models" | "/chat/completions" | "/responses"
                 )
-            || provider == "google-gemini" && is_allowed_google_gemini_path(&self.path)
             // Managed Kimi Code endpoint allowlist: chat inference plus the
             // read-only catalog/profile/quota surfaces the official CLI uses.
             || provider == "kimi-code"
@@ -757,11 +737,40 @@ pub trait CredentialBroker: Send + Sync {
         Ok(())
     }
 
-    /// When `cred`'s active cooldown ends (epoch ms), if this broker knows
-    /// of one. No network request and no token refresh. Default: none.
+    /// Report that `cred` hit a provider limit that covers only `model`
+    /// (one model's own window, e.g. Fable's weekly limit): selection for
+    /// `model` skips the account until `until_ms`, every other model still
+    /// gets it. `model` is the requested id; brokers match it
+    /// case-insensitively. Default: the account-wide
+    /// [`report_cooldown`](Self::report_cooldown), so a broker that keeps no
+    /// per-model state errs toward not using the account.
+    async fn report_model_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: &str,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let _ = model;
+        self.report_cooldown(cred, until_ms, reason).await
+    }
+
+    /// When `cred`'s active ACCOUNT-WIDE cooldown ends (epoch ms), if this
+    /// broker knows of one. A cooldown that covers one model only is not
+    /// one ([`active_cooldown_for`](Self::active_cooldown_for)). No network
+    /// request and no token refresh. Default: none.
     fn active_cooldown(&self, cred: &CredentialRef) -> Option<u64> {
         let _ = cred;
         None
+    }
+
+    /// When the cooldown that keeps `cred` from serving `model` ends (epoch
+    /// ms): the later of its account-wide cooldown and the one reported for
+    /// `model` alone. `None` model: account-wide only. Default:
+    /// [`active_cooldown`](Self::active_cooldown).
+    fn active_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>) -> Option<u64> {
+        let _ = model;
+        self.active_cooldown(cred)
     }
 
     /// A request sent on `cred` at `sent_at_ms` (epoch ms) was accepted:
@@ -772,6 +781,15 @@ pub trait CredentialBroker: Send + Sync {
     /// nothing about it). Memory only. Default: no-op.
     fn clear_cooldown(&self, cred: &CredentialRef, sent_at_ms: u64) {
         let _ = (cred, sent_at_ms);
+    }
+
+    /// [`clear_cooldown`](Self::clear_cooldown) for a request for `model`:
+    /// also drops the cooldown reported for that model alone, never another
+    /// model's (a Sonnet answer says nothing about Fable's limit). Default:
+    /// [`clear_cooldown`](Self::clear_cooldown).
+    fn clear_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>, sent_at_ms: u64) {
+        let _ = model;
+        self.clear_cooldown(cred, sent_at_ms)
     }
 
     /// Re-vend `cred` for automatic selection (a turn keeping the account
@@ -1724,8 +1742,6 @@ pub struct LocalBroker {
     local_base_url: Option<String>,
     /// Test seam: overrides the pinned Anthropic usage URL.
     anthropic_usage_url: Option<String>,
-    /// Test seam: overrides the pinned cloudcode-pa base URL.
-    google_gemini_base_url: Option<String>,
     /// Test seam: overrides the pinned ChatGPT backend base URL.
     openai_codex_base_url: Option<String>,
     /// Test seam: overrides the pinned Meta Muse API origin.
@@ -1835,9 +1851,22 @@ type CachedPolicy = (Option<std::time::SystemTime>, AccountPolicy);
 struct Cooldown {
     until_ms: u64,
     reason: String,
+    /// The model the limit covers (normalized, [`cooldown_model`]); `None`:
+    /// the whole account.
+    model: Option<String>,
     /// When it was reported (epoch ms): only a request sent after this
     /// clears it ([`CredentialBroker::clear_cooldown`]).
     reported_at_ms: u64,
+}
+
+impl Cooldown {
+    fn state(&self) -> super::auth_state::CooldownState {
+        super::auth_state::CooldownState {
+            until_ms: self.until_ms,
+            reason: super::auth_state::CooldownReason::from_reported(&self.reason),
+            model: self.model.clone(),
+        }
+    }
 }
 
 /// The keys one account's cooldown is kept under
@@ -1864,6 +1893,24 @@ impl CooldownKeys {
     fn read(&self) -> impl Iterator<Item = &str> + '_ {
         self.seat.as_deref().into_iter().chain([self.slot.as_str()])
     }
+}
+
+/// A requested model id as cooldowns store and match it: trimmed and
+/// lowercased (`Claude-Fable-5` and `claude-fable-5` are one model).
+fn cooldown_model(model: &str) -> String {
+    model.trim().to_ascii_lowercase()
+}
+
+/// Where the cooldown of one model is kept beside the account's own `key`.
+fn model_cooldown_key(key: &str, model: &str) -> String {
+    format!("{key}|model={model}")
+}
+
+/// Whether `stored` is `key`'s account-wide cooldown or one of its models'.
+fn is_cooldown_under(stored: &str, key: &str) -> bool {
+    stored
+        .strip_prefix(key)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("|model="))
 }
 
 /// Cooldown applied when a limit is reported without a reset hint.
@@ -1958,14 +2005,9 @@ const MAX_COOLDOWN: Duration = Duration::from_secs(8 * 24 * 60 * 60);
 pub const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
 
 /// Idle timeout between bytes on the broker's per-request no-redirect
-/// client (Muse, Kimi, Gemini, Codex/Anthropic catalog). Matches the runtime
+/// client (Muse, Kimi, Codex/Anthropic catalog). Matches the runtime
 /// client's 90s read timeout that xAI streams already get.
 pub const BROKER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// Gemini (Code Assist) sends no data chunk while it thinks (thought
-/// streaming is off), and a hard prompt can think silently for minutes;
-/// its stream has no retry, so it gets a longer idle limit.
-pub const GEMINI_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Next per-process broker number for the usage-read log line.
 fn next_broker_instance() -> u64 {
@@ -1980,7 +2022,6 @@ impl LocalBroker {
             http,
             local_base_url: None,
             anthropic_usage_url: None,
-            google_gemini_base_url: None,
             openai_codex_base_url: None,
             muse_base_url: None,
             refresh_endpoints: Default::default(),
@@ -2075,16 +2116,7 @@ impl LocalBroker {
         self
     }
 
-    /// Idle (between-bytes) limit for `provider_key`'s no-redirect client.
-    fn stream_idle_timeout_for(&self, provider_key: &str) -> Duration {
-        if provider_key == "google-gemini" {
-            GEMINI_STREAM_IDLE_TIMEOUT.max(self.stream_idle_timeout)
-        } else {
-            self.stream_idle_timeout
-        }
-    }
-
-    /// Test seam: shorten [`BROKER_STREAM_IDLE_TIMEOUT`] (not Gemini's).
+    /// Test seam: shorten [`BROKER_STREAM_IDLE_TIMEOUT`].
     #[doc(hidden)]
     pub fn with_stream_idle_timeout_for_tests(mut self, idle: Duration) -> Self {
         self.stream_idle_timeout = idle;
@@ -2241,30 +2273,121 @@ impl LocalBroker {
             .any(|c| c.until_ms > now_ms)
     }
 
-    /// `cred`'s active cooldown: the latest one under its keys.
-    fn active_cooldown_at(&self, cred: &CredentialRef, now_ms: u64) -> Option<Cooldown> {
+    /// The active cooldown that keeps `cred` from serving `model` (`None`:
+    /// account-wide only): the latest one under its keys.
+    fn active_cooldown_at(
+        &self,
+        cred: &CredentialRef,
+        model: Option<&str>,
+        now_ms: u64,
+    ) -> Option<Cooldown> {
         // Nothing cooling, nothing to look up: no read of the stored login
         // (a turn asks before every request).
         if !self.any_cooldown_active(now_ms) {
             return None;
         }
-        self.cooldown_for_keys(&self.cooldown_keys(cred), now_ms)
+        self.cooldown_for_keys(&self.cooldown_keys(cred), model, now_ms)
     }
 
-    /// The latest active cooldown under `keys`.
-    fn cooldown_for_keys(&self, keys: &CooldownKeys, now_ms: u64) -> Option<Cooldown> {
+    /// The latest active cooldown under `keys` that covers `model`: the
+    /// account-wide ones, and with a model also that model's.
+    fn cooldown_for_keys(
+        &self,
+        keys: &CooldownKeys,
+        model: Option<&str>,
+        now_ms: u64,
+    ) -> Option<Cooldown> {
+        let model = model.map(cooldown_model).filter(|m| !m.is_empty());
         let cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
         keys.read()
-            .filter_map(|key| cooldowns.get(key))
+            .flat_map(|key| {
+                let scoped = model.as_deref().map(|m| model_cooldown_key(key, m));
+                [cooldowns.get(key), scoped.and_then(|k| cooldowns.get(&k))]
+            })
+            .flatten()
             .filter(|c| c.until_ms > now_ms)
             .max_by_key(|c| c.until_ms)
             .cloned()
     }
 
+    /// Every active cooldown of one model under `cred`'s keys, the latest
+    /// per model, by model (`synaps auth state`).
+    fn model_cooldowns_at(&self, cred: &CredentialRef, now_ms: u64) -> Vec<Cooldown> {
+        if !self.any_cooldown_active(now_ms) {
+            return Vec::new();
+        }
+        let keys = self.cooldown_keys(cred);
+        let cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        let mut latest: BTreeMap<String, Cooldown> = BTreeMap::new();
+        for key in keys.read() {
+            for (stored, c) in cooldowns.iter() {
+                let Some(model) = c.model.as_ref() else {
+                    continue;
+                };
+                if c.until_ms > now_ms
+                    && is_cooldown_under(stored, key)
+                    && latest.get(model).is_none_or(|l| l.until_ms < c.until_ms)
+                {
+                    latest.insert(model.clone(), c.clone());
+                }
+            }
+        }
+        latest.into_values().collect()
+    }
+
     /// Reading an expired cooldown is non-mutating (preview shares this path).
     fn cooldown_until(&self, storage_key: &str, now_ms: u64) -> Option<u64> {
         let cred = CredentialRef::parse_storage_key(storage_key)?;
-        self.active_cooldown_at(&cred, now_ms).map(|c| c.until_ms)
+        self.active_cooldown_at(&cred, None, now_ms).map(|c| c.until_ms)
+    }
+
+    /// Record a reported limit on `cred`: account-wide, or for `model`
+    /// (already [`cooldown_model`]-normalized) alone.
+    fn store_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: Option<&str>,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) {
+        let now_ms = crate::epoch_millis();
+        let max_until = now_ms.saturating_add(MAX_COOLDOWN.as_millis() as u64);
+        let until_ms = until_ms
+            .filter(|t| *t > now_ms)
+            .unwrap_or(now_ms + DEFAULT_COOLDOWN.as_millis() as u64)
+            .min(max_until);
+        let reason = crate::truncate_str(reason, 64).to_string();
+        tracing::info!(
+            credential = %cred,
+            model = model.unwrap_or("-"),
+            until_ms,
+            reason = %reason,
+            "account cooldown reported"
+        );
+        let keys = self.cooldown_keys(cred);
+        {
+            let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+            for key in keys.written() {
+                let stored = match model {
+                    Some(m) => model_cooldown_key(key, m),
+                    None => key.to_string(),
+                };
+                cooldowns.insert(
+                    stored,
+                    Cooldown {
+                        until_ms,
+                        reason: reason.clone(),
+                        model: model.map(str::to_string),
+                        reported_at_ms: now_ms,
+                    },
+                );
+            }
+        }
+        // The cached reading predates the limit report; drop it so the next
+        // selection re-reads instead of trusting stale headroom, and drop
+        // the slot's last good reading so grace can never outlive the limit.
+        self.forget_snapshots(cred);
+        self.usage_reads.forget_last_good(&self.read_key(cred));
     }
 
     // ── `synaps auth state` ─────────────────────────────────────────────
@@ -2279,17 +2402,27 @@ impl LocalBroker {
         auth_state_report(Some(self), query)
     }
 
-    /// The active cooldown of `cred`'s current seat, with its reason.
+    /// The active account-wide cooldown of `cred`'s current seat, with its
+    /// reason.
     fn cooldown_state(
         &self,
         cred: &CredentialRef,
         now_ms: u64,
     ) -> Option<super::auth_state::CooldownState> {
-        self.active_cooldown_at(cred, now_ms)
-            .map(|c| super::auth_state::CooldownState {
-                until_ms: c.until_ms,
-                reason: super::auth_state::CooldownReason::from_reported(&c.reason),
-            })
+        self.active_cooldown_at(cred, None, now_ms)
+            .map(|c| c.state())
+    }
+
+    /// The active cooldowns of single models on `cred`'s current seat.
+    fn model_cooldown_states(
+        &self,
+        cred: &CredentialRef,
+        now_ms: u64,
+    ) -> Vec<super::auth_state::CooldownState> {
+        self.model_cooldowns_at(cred, now_ms)
+            .iter()
+            .map(Cooldown::state)
+            .collect()
     }
 
     /// Drop the in-memory state of `creds`: cooldowns, cached usage
@@ -2305,7 +2438,7 @@ impl LocalBroker {
         {
             let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
             for key in keys.iter().flat_map(|k| k.read()) {
-                cooldowns.remove(key);
+                cooldowns.retain(|stored, _| !is_cooldown_under(stored, key));
             }
             for provider in whole_providers {
                 let prefix = format!("{store}|{provider}|");
@@ -3020,6 +3153,7 @@ impl LocalBroker {
             super::SelectionPlan,
             BTreeMap<String, SeatIdentity>,
             BTreeMap<String, (super::usage_reads::TransientReadFailure, u64)>,
+            BTreeMap<String, String>,
         ),
         BrokerError,
     > {
@@ -3028,6 +3162,7 @@ impl LocalBroker {
         let mut candidates = Vec::with_capacity(summaries.len());
         let mut seats = BTreeMap::new();
         let mut transient = BTreeMap::new();
+        let mut by_windows = BTreeMap::new();
         let mut grace = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         let mut exclude = exclude.to_vec();
@@ -3053,7 +3188,7 @@ impl LocalBroker {
             // check; the policy rejects it as cooling down.
             let read = if keys
                 .get(&cred.storage_key())
-                .and_then(|k| self.cooldown_for_keys(k, crate::epoch_millis()))
+                .and_then(|k| self.cooldown_for_keys(k, model, crate::epoch_millis()))
                 .is_some()
             {
                 CandidateRead {
@@ -3077,11 +3212,15 @@ impl LocalBroker {
             }
             // The same entitlement guard for a fresh reading and for a last
             // good reading standing in for a failed read.
-            require_requested_model(provider, model, &mut capacity);
+            let fresh = require_requested_model(provider, model, &mut capacity);
+            let mut graced = None;
             grace.extend(read.grace.map(|mut good| {
-                require_requested_model(provider, model, &mut good);
+                graced = require_requested_model(provider, model, &mut good);
                 good
             }));
+            if let Some(plan) = fresh.or(graced) {
+                by_windows.insert(cred.storage_key(), plan);
+            }
             if let Some(seat) = seat {
                 if !seen.insert(seat.as_str().to_string()) {
                     exclude.push(cred.clone());
@@ -3099,10 +3238,11 @@ impl LocalBroker {
             }
         }
         for capacity in &mut candidates {
-            capacity.cooldown_until_ms = keys
+            let cooldown = keys
                 .get(&capacity.credential.storage_key())
-                .and_then(|k| self.cooldown_for_keys(k, now_ms))
-                .map(|c| c.until_ms);
+                .and_then(|k| self.cooldown_for_keys(k, model, now_ms));
+            capacity.cooldown_until_ms = cooldown.as_ref().map(|c| c.until_ms);
+            capacity.cooldown_model = cooldown.and_then(|c| c.model);
         }
         let previous = self
             .current_accounts
@@ -3130,6 +3270,7 @@ impl LocalBroker {
             super::SelectionPlan::from_candidates(&request, &candidates),
             seats,
             transient,
+            by_windows,
         ))
     }
 
@@ -3142,7 +3283,7 @@ impl LocalBroker {
     ) -> Result<(CredentialRef, SeatIdentity), BrokerError> {
         use super::quota_policy::{Selection, SelectionFailure, SelectionFailureKind};
         use super::usage_reads::USAGE_READ_TARGET;
-        let (plan, mut seats, transient) = match self
+        let (plan, mut seats, transient, by_windows) = match self
             .selection_plan(provider, model, exclude, failed)
             .await
         {
@@ -3196,6 +3337,18 @@ impl LocalBroker {
                         "usage read"
                     );
                 }
+                // A model the reading doesn't list chosen on the plan's
+                // windows: a model Codex gates per model but the gated list
+                // misses is chosen this way, so each such choice is logged.
+                if let Some(plan_type) = by_windows.get(&credential.storage_key()) {
+                    tracing::info!(
+                        provider = %provider.as_str(),
+                        model = %model.unwrap_or_default(),
+                        account = %credential.account.label_str(),
+                        plan_type = %plan_type,
+                        "unlisted, judged by windows"
+                    );
+                }
                 tracing::info!(%credential, ?plan.strategy, tier, ?budget_reset_ms, ?utilization, "automatic subscription choice");
                 Ok((credential, seat))
             }
@@ -3237,20 +3390,6 @@ impl LocalBroker {
     pub fn with_local_base_url(http: reqwest::Client, base_url: impl Into<String>) -> Self {
         Self {
             local_base_url: Some(base_url.into()),
-            ..Self::new(http)
-        }
-    }
-
-    /// Test seam: point the pinned Google Code Assist host at a loopback fake.
-    /// Production code must never call this — it only relaxes the base URL,
-    /// not any of the path allowlist / bearer / redirect-denial invariants.
-    #[doc(hidden)]
-    pub fn with_google_gemini_base_url_for_tests(
-        http: reqwest::Client,
-        base_url: impl Into<String>,
-    ) -> Self {
-        Self {
-            google_gemini_base_url: Some(base_url.into().trim_end_matches('/').to_string()),
             ..Self::new(http)
         }
     }
@@ -3367,14 +3506,6 @@ impl LocalBroker {
                 bearer(&pinned)?,
                 super::github_copilot_models_base_url().to_string(),
             )
-        } else if provider_key == "google-gemini" {
-            // Google Gemini (Code Assist) is broker-proxy-only. Refresh stays
-            // broker-owned; runtime never receives it.
-            let base = self
-                .google_gemini_base_url
-                .clone()
-                .unwrap_or_else(|| GOOGLE_GEMINI_CODE_ASSIST_BASE_URL.to_string());
-            (bearer(&pinned)?, base)
         } else if provider_key == "openai-codex" {
             // Catalog-only OAuth proxy for ChatGPT backend models. Access token
             // never leaves the broker; account header is derived broker-side.
@@ -3483,10 +3614,9 @@ impl LocalBroker {
         pinned: &Option<PinnedToken>,
     ) -> Result<reqwest::Response, BrokerError> {
         let url = format!("{base}{}", request.path);
-        // Deny redirects for credential-bearing OAuth catalog traffic and
-        // google-gemini: a 3xx must not replay the bearer token off-origin.
-        let mut builder = if provider_key == "google-gemini"
-            || provider_key == "openai-codex"
+        // Deny redirects for credential-bearing OAuth catalog traffic: a 3xx
+        // must not replay the bearer token off-origin.
+        let mut builder = if provider_key == "openai-codex"
             || provider_key == "anthropic"
             || provider_key == "kimi-code"
             || provider_key == "muse"
@@ -3497,7 +3627,7 @@ impl LocalBroker {
             let no_redirect = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
-                .read_timeout(self.stream_idle_timeout_for(provider_key))
+                .read_timeout(self.stream_idle_timeout)
                 .build()
                 .map_err(|e| BrokerError::Transport(format!("client build failed: {e}")))?;
             match request.method {
@@ -3554,15 +3684,6 @@ impl LocalBroker {
                     .header("Openai-Intent", "conversation-edits")
                     .header("X-Initiator", "agent");
             }
-        }
-        if provider_key == "google-gemini" {
-            // The Code Assist reference client uses `?alt=sse` for streaming.
-            // Match that so upstream returns line-delimited SSE frames rather
-            // than JSON-in-one-response.
-            if request.stream && request.path == "/v1internal:streamGenerateContent" {
-                builder = builder.query(&[("alt", "sse")]);
-            }
-            builder = builder.header("user-agent", "SynapsCLI/0.6.0 (google-gemini)");
         }
         if provider_key == "muse" {
             // API-key requests need only Authorization (verified); identify
@@ -3675,7 +3796,9 @@ pub fn capacity_from_snapshot(
         observed_at_ms: Some(snapshot.observed_at),
         observation: QuotaObservation::Ok { windows, models },
         cooldown_until_ms: None,
+        cooldown_model: None,
         failure: None,
+        plan: snapshot.plan.clone(),
     }
 }
 
@@ -3759,28 +3882,59 @@ impl UsageReadError {
     }
 }
 
+/// Codex models gated per model: the usage reading must list them
+/// (`model_usage`); a plan's generic windows never prove them. Astra: the
+/// usage response gates it per model even on a paid plan with room (see
+/// usage.rs `CODEX_ASTRA_FIXTURE`). Kept by hand beside the Codex
+/// capability table (agent-engine `runtime/openai/catalog/codex.rs`,
+/// `codex_static_capability`), which agent-core can't see.
+const CODEX_GATED_MODELS: &[&str] = &["gpt-6-astra"];
+
+/// Codex `plan_type` values of a paid plan (as the usage response spells
+/// them). Any other plan, or none, proves no model the reading doesn't list.
+const CODEX_PAID_PLANS: &[&str] = &["plus", "pro", "team", "business", "enterprise", "edu"];
+
 /// A generic Codex window (including a free 30-day plan) does not prove
-/// entitlement to Astra or any other requested model: a requested model the
-/// reading does not list counts as unknown. Applied to every reading the
-/// policy judges, fresh or graced.
+/// entitlement to Astra or any other model gated per model: a requested
+/// model the reading does not list counts as unknown, unless it is not
+/// gated and the reading is of a paid plan (the plan's windows then judge
+/// it, as a request without a model; the plan is returned). Applied to
+/// every reading the policy judges, fresh or graced.
 fn require_requested_model(
     provider: OAuthProviderId,
     model: Option<&str>,
     capacity: &mut super::quota_policy::AccountCapacity,
-) {
+) -> Option<String> {
     use super::quota_policy::{model_matches, ModelAvailability, ModelState, QuotaObservation};
     if provider != OAuthProviderId::OpenAiCodex {
-        return;
+        return None;
     }
-    if let (Some(model), QuotaObservation::Ok { models, .. }) = (model, &mut capacity.observation) {
-        let availability = models.get_or_insert_with(Vec::new);
-        if !availability.iter().any(|m| model_matches(&m.model, model)) {
-            availability.push(ModelAvailability {
-                model: model.to_string(),
-                state: ModelState::Unknown,
-            });
-        }
+    let paid = capacity
+        .plan
+        .as_deref()
+        .is_some_and(|plan| CODEX_PAID_PLANS.contains(&plan));
+    let (Some(model), QuotaObservation::Ok { models, .. }) = (model, &mut capacity.observation)
+    else {
+        return None;
+    };
+    let requested = model.to_ascii_lowercase();
+    // Contained, so a prefixed or suffixed spelling stays gated too.
+    let gated = CODEX_GATED_MODELS.iter().any(|g| requested.contains(g));
+    if models
+        .iter()
+        .flatten()
+        .any(|m| model_matches(&m.model, model))
+    {
+        return None;
     }
+    if gated || !paid {
+        models.get_or_insert_with(Vec::new).push(ModelAvailability {
+            model: model.to_string(),
+            state: ModelState::Unknown,
+        });
+        return None;
+    }
+    capacity.plan.clone()
 }
 
 /// What a usage read that needs action asks of the user. A refresh that
@@ -4192,31 +4346,44 @@ impl CredentialBroker for LocalBroker {
     }
 
     fn active_cooldown(&self, cred: &CredentialRef) -> Option<u64> {
-        self.active_cooldown_at(cred, crate::epoch_millis())
+        self.active_cooldown_for(cred, None)
+    }
+
+    fn active_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>) -> Option<u64> {
+        self.active_cooldown_at(cred, model, crate::epoch_millis())
             .map(|c| c.until_ms)
     }
 
     fn clear_cooldown(&self, cred: &CredentialRef, sent_at_ms: u64) {
+        self.clear_cooldown_for(cred, None, sent_at_ms)
+    }
+
+    fn clear_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>, sent_at_ms: u64) {
         let now_ms = crate::epoch_millis();
         if !self.any_cooldown_active(now_ms) {
             return;
         }
         let keys = self.cooldown_keys(cred);
-        let mut cleared = None;
+        let model = model.map(cooldown_model).filter(|m| !m.is_empty());
+        let mut cleared = Vec::new();
         {
             let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
             for key in keys.read() {
-                if cooldowns
-                    .get(key)
-                    .is_some_and(|c| c.until_ms > now_ms && c.reported_at_ms <= sent_at_ms)
-                {
-                    cleared = cooldowns.remove(key).or(cleared);
+                let scoped = model.as_deref().map(|m| model_cooldown_key(key, m));
+                for stored in std::iter::once(key.to_string()).chain(scoped) {
+                    if cooldowns
+                        .get(&stored)
+                        .is_some_and(|c| c.until_ms > now_ms && c.reported_at_ms <= sent_at_ms)
+                    {
+                        cleared.extend(cooldowns.remove(&stored));
+                    }
                 }
             }
         }
-        if let Some(c) = cleared {
+        for c in cleared {
             tracing::info!(
                 credential = %cred,
+                model = c.model.as_deref().unwrap_or("-"),
                 until_ms = c.until_ms,
                 reason = %c.reason,
                 "account cooldown cleared: a request sent after it was reported was accepted"
@@ -4251,33 +4418,20 @@ impl CredentialBroker for LocalBroker {
         until_ms: Option<u64>,
         reason: &str,
     ) -> Result<(), BrokerError> {
-        let now_ms = crate::epoch_millis();
-        let max_until = now_ms.saturating_add(MAX_COOLDOWN.as_millis() as u64);
-        let until_ms = until_ms
-            .filter(|t| *t > now_ms)
-            .unwrap_or(now_ms + DEFAULT_COOLDOWN.as_millis() as u64)
-            .min(max_until);
-        let reason = crate::truncate_str(reason, 64).to_string();
-        tracing::info!(credential = %cred, until_ms, reason = %reason, "account cooldown reported");
-        let keys = self.cooldown_keys(cred);
-        {
-            let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
-            for key in keys.written() {
-                cooldowns.insert(
-                    key.to_string(),
-                    Cooldown {
-                        until_ms,
-                        reason: reason.clone(),
-                        reported_at_ms: now_ms,
-                    },
-                );
-            }
-        }
-        // The cached reading predates the limit report; drop it so the next
-        // selection re-reads instead of trusting stale headroom, and drop
-        // the slot's last good reading so grace can never outlive the limit.
-        self.forget_snapshots(cred);
-        self.usage_reads.forget_last_good(&self.read_key(cred));
+        self.store_cooldown(cred, None, until_ms, reason);
+        Ok(())
+    }
+
+    async fn report_model_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: &str,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let model = cooldown_model(model);
+        // No model to scope it to: the account cools, as before.
+        self.store_cooldown(cred, Some(model.as_str()).filter(|m| !m.is_empty()), until_ms, reason);
         Ok(())
     }
 
@@ -4455,6 +4609,43 @@ async fn route_missing(resp: reqwest::Response) -> bool {
 }
 
 impl RemoteBroker {
+    /// `POST /accounts/cooldown`; `model` only when the limit covers one
+    /// model (an old daemon ignores it and cools the account).
+    async fn post_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: Option<&str>,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let mut body = serde_json::json!({
+            "provider": cred.provider.as_str(),
+            "account": cred.account.label_str(),
+            "until_ms": until_ms,
+            "reason": crate::truncate_str(reason, 64),
+        });
+        if let Some(model) = model {
+            body["model"] = serde_json::Value::from(model);
+        }
+        let resp = self
+            .machine_token
+            .send(|t| {
+                self.http
+                    .post(format!("{}/accounts/cooldown", self.endpoint))
+                    .bearer_auth(t)
+                    .json(&body)
+            })
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => Err(BrokerError::Unauthorized),
+            s if !(200..300).contains(&s) => {
+                Err(BrokerError::Transport(format!("broker returned HTTP {s}")))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// True if the broker has no `/usage/snapshot` (0.10.2 and older). The
     /// probe sends an empty account, which a current broker rejects with a
     /// 400 before touching any credential.
@@ -4803,28 +4994,20 @@ impl CredentialBroker for RemoteBroker {
         until_ms: Option<u64>,
         reason: &str,
     ) -> Result<(), BrokerError> {
-        let resp = self
-            .machine_token
-            .send(|t| {
-                self.http
-                .post(format!("{}/accounts/cooldown", self.endpoint))
-                .bearer_auth(t)
-                .json(&serde_json::json!({
-                    "provider": cred.provider.as_str(),
-                    "account": cred.account.label_str(),
-                    "until_ms": until_ms,
-                    "reason": crate::truncate_str(reason, 64),
-                }))
-            })
-            .await
-            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
-        match resp.status().as_u16() {
-            401 => Err(BrokerError::Unauthorized),
-            s if !(200..300).contains(&s) => {
-                Err(BrokerError::Transport(format!("broker returned HTTP {s}")))
-            }
-            _ => Ok(()),
-        }
+        self.post_cooldown(cred, None, until_ms, reason).await
+    }
+
+    /// Sends `model` beside the account. A daemon that predates per-model
+    /// cooldowns ignores the field (its body type allows unknown fields)
+    /// and cools the whole account, as it always did.
+    async fn report_model_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: &str,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        self.post_cooldown(cred, Some(model), until_ms, reason).await
     }
 
     async fn proxy(&self, request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
@@ -5149,6 +5332,9 @@ fn auth_state_report(
             },
             access_expires_ms: (summary.expires != 0).then_some(summary.expires),
             cooldown: broker.and_then(|b| b.cooldown_state(&cred, now_ms)),
+            model_cooldowns: broker
+                .map(|b| b.model_cooldown_states(&cred, now_ms))
+                .unwrap_or_default(),
             last_usage: observed.last_usage,
             last_usage_ok_ms: observed.last_usage_ok_ms,
             last_refresh: super::token::last_refresh_exchange(&store, &cred.storage_key()).map(
@@ -5292,6 +5478,10 @@ pub fn global_broker() -> Arc<dyn CredentialBroker> {
 
 /// Legacy signature bridge: resolve an access token via the appropriate
 /// broker for `source`. Kept for CLI paths (`synaps status`).
+///
+/// Catalog / usage reads only: it asks with no model, so a limit or
+/// cooldown on one model does not apply to it. Inference must vend with
+/// its model (`access_token_pinned_for`).
 pub async fn broker_access_token(
     provider: OAuthProviderId,
     source: &super::CredentialSource,
@@ -5889,51 +6079,25 @@ mod tests {
         assert!(is_allowed_anthropic_path(page1));
     }
 
-    /// google-gemini is pinned to the reviewed cloudcode-pa v1internal methods.
+    /// The broker no longer proxies the removed Gemini Code Assist provider:
+    /// every path, named account or not, is an unknown provider.
     #[test]
-    fn proxy_allows_only_pinned_google_gemini_paths() {
-        for path in [
-            "/v1internal:loadCodeAssist",
-            "/v1internal:onboardUser",
-            "/v1internal:streamGenerateContent",
-            "/v1internal:countTokens",
-            "/v1internal/operations/op-12345",
-        ] {
-            let req = ProxyRequest {
-                provider: "google-gemini".into(),
-                method: ProxyMethod::Post,
-                path: path.into(),
-                body: None,
-                stream: false,
-                body_bytes: None,
-            };
-            assert!(req.validate().is_ok(), "{path} must be allowed");
-        }
-        for path in [
-            // No arbitrary same-host methods.
-            "/v1internal:listExperiments",
-            "/v1internal:fetchAdminControls",
-            "/v1internal:setCodeAssistGlobalUserSetting",
-            "/v1internal:generateContent",
-            // No unrelated versions.
-            "/v2/models",
-            "/v1beta/models",
-            // No path traversal or root probe.
-            "/",
-            "/v1internal:",
-        ] {
-            let req = ProxyRequest {
-                provider: "google-gemini".into(),
-                method: ProxyMethod::Post,
-                path: path.into(),
-                body: None,
-                stream: false,
-                body_bytes: None,
-            };
-            assert!(
-                matches!(req.validate(), Err(BrokerError::Denied(_))),
-                "{path} must be denied"
-            );
+    fn proxy_refuses_the_removed_google_gemini_provider() {
+        for provider in ["google-gemini", "google-gemini@work"] {
+            for path in ["/", "/models", "/chat/completions", "/v1beta/models"] {
+                let req = ProxyRequest {
+                    provider: provider.into(),
+                    method: ProxyMethod::Post,
+                    path: path.into(),
+                    body: None,
+                    stream: false,
+                    body_bytes: None,
+                };
+                assert!(
+                    matches!(req.validate(), Err(BrokerError::UnknownProvider(_))),
+                    "{provider} {path} must be an unknown provider"
+                );
+            }
         }
     }
 
@@ -6266,8 +6430,7 @@ mod tests {
 
     /// LocalBroker::proxy_stream: a non-2xx upstream body must never enter the
     /// error, while the stable `provider request failed: {status}` prefix and
-    /// typed Transport category are retained for engine-side classification
-    /// (including Gemini 429 detection on the status reason phrase).
+    /// typed Transport category are retained for engine-side classification.
     #[tokio::test]
     async fn local_broker_stream_error_omits_upstream_body() {
         use axum::routing::post;
@@ -6569,21 +6732,6 @@ mod tests {
         }
     }
 
-    /// R2-I1: Gemini can think silently for minutes before its first data
-    /// chunk, so its no-redirect client idles longer than everyone else's.
-    #[test]
-    fn gemini_gets_the_longer_stream_idle_timeout() {
-        let broker = LocalBroker::new(reqwest::Client::new());
-        assert_eq!(broker.stream_idle_timeout_for("google-gemini"), Duration::from_secs(300));
-        for key in ["muse", "kimi-code", "openai-codex", "anthropic"] {
-            assert_eq!(broker.stream_idle_timeout_for(key), Duration::from_secs(90), "{key}");
-        }
-        let short = LocalBroker::new(reqwest::Client::new())
-            .with_stream_idle_timeout_for_tests(Duration::from_millis(10));
-        assert_eq!(short.stream_idle_timeout_for("muse"), Duration::from_millis(10));
-        assert!(short.stream_idle_timeout_for("google-gemini") >= Duration::from_secs(300));
-    }
-
     async fn spawn_remote_broker_body(status: u16, body: String) -> RemoteBroker {
         use axum::routing::post;
         let code = axum::http::StatusCode::from_u16(status).unwrap();
@@ -6810,5 +6958,174 @@ mod tests {
             .retry_after_s,
             Some(9)
         );
+    }
+
+    // ── Codex: a requested model the reading doesn't list ────────────────
+
+    /// Sol: the Codex usage reading doesn't gate it per model. Astra: it does.
+    const SOL: &str = "gpt-6.1-sol";
+    const ASTRA: &str = "gpt-6-astra";
+
+    /// The policy's verdict, through the broker's own mapping and model
+    /// guard, on a synthetic Codex reading (`plan_type` `plan` when given, a
+    /// weekly window `used` percent used, `model_usage` as given) for a
+    /// request for `model`.
+    fn codex_verdict(
+        plan: Option<&str>,
+        used: f64,
+        model_usage: serde_json::Value,
+        model: &str,
+    ) -> Result<super::super::quota_policy::Eligible, super::super::quota_policy::RejectReason>
+    {
+        codex_verdict_with_limits(plan, used, model_usage, serde_json::Value::Null, model)
+    }
+
+    /// [`codex_verdict`] with the reading's `additional_rate_limits` (model
+    /// windows) as given.
+    fn codex_verdict_with_limits(
+        plan: Option<&str>,
+        used: f64,
+        model_usage: serde_json::Value,
+        limits: serde_json::Value,
+        model: &str,
+    ) -> Result<super::super::quota_policy::Eligible, super::super::quota_policy::RejectReason>
+    {
+        use super::super::quota_policy::{evaluate, SelectionRequest};
+        const AT: u64 = 1_800_000_000_000;
+        let mut body = serde_json::json!({
+            "rate_limit": {"allowed": true, "limit_reached": false,
+                "primary_window": {"used_percent": used, "limit_window_seconds": 604_800,
+                    "reset_after_seconds": 3_600}},
+            "model_usage": model_usage,
+            "additional_rate_limits": limits,
+        });
+        if let Some(plan) = plan {
+            body["plan_type"] = plan.into();
+        }
+        let snapshot =
+            super::super::usage::parse_codex_usage(&body.to_string(), "x", AT, None).unwrap();
+        let provider = OAuthProviderId::OpenAiCodex;
+        let cred = CredentialRef::new(provider, Account::named("x").unwrap());
+        let mut capacity = capacity_from_snapshot(&cred, &snapshot);
+        require_requested_model(provider, Some(model), &mut capacity);
+        let req = SelectionRequest {
+            model: Some(model),
+            ..SelectionRequest::new(provider, AT, 60_000)
+        };
+        evaluate(&req, &capacity)
+    }
+
+    fn model_unknown(model: &str) -> super::super::quota_policy::RejectReason {
+        super::super::quota_policy::RejectReason::ModelUnknown {
+            model: model.to_string(),
+        }
+    }
+
+    /// Sol on a paid plan, not listed by the reading (no `model_usage`, or
+    /// one naming only Astra): the plan's generic windows decide, as for a
+    /// request without a model. Room selects it; a spent window rejects it
+    /// as exhausted, not as an unknown model.
+    #[test]
+    fn an_unlisted_ungated_codex_model_is_judged_by_a_paid_plans_windows() {
+        use super::super::quota_policy::RejectReason;
+        let astra_only = serde_json::json!({ (ASTRA): {"available": true} });
+        for plan in ["plus", "pro", "team", "business", "enterprise", "edu"] {
+            for usage in [serde_json::Value::Null, astra_only.clone()] {
+                let room = codex_verdict(Some(plan), 10.0, usage.clone(), SOL);
+                assert!(room.is_ok(), "{plan} {usage}: {room:?}");
+                let spent = codex_verdict(Some(plan), 100.0, usage.clone(), SOL);
+                assert!(
+                    matches!(spent, Err(RejectReason::Exhausted { .. })),
+                    "{plan} {usage}: {spent:?}"
+                );
+            }
+        }
+    }
+
+    /// Astra is gated per model: unlisted, it stays unknown on a paid plan
+    /// with room, however the request spells it.
+    #[test]
+    fn an_unlisted_gated_codex_model_stays_unknown_on_a_paid_plan() {
+        let sol_only = serde_json::json!({ (SOL): {"available": true} });
+        for model in [ASTRA, "GPT-6-Astra", "openai-codex/gpt-6-astra"] {
+            for usage in [serde_json::Value::Null, sol_only.clone()] {
+                assert_eq!(
+                    codex_verdict(Some("pro"), 10.0, usage.clone(), model),
+                    Err(model_unknown(model)),
+                    "{model} {usage}"
+                );
+            }
+        }
+    }
+
+    /// A free plan, a reading without a plan, or a plan not known here as
+    /// paid (one never seen before, "platinum") proves no requested model
+    /// the reading doesn't list: the paid list is closed.
+    #[test]
+    fn an_unlisted_codex_model_stays_unknown_without_a_known_paid_plan() {
+        for plan in [
+            Some("free"),
+            Some("free_workspace"),
+            Some("unknown"),
+            Some("platinum"),
+            Some("PRO"),
+            Some(""),
+            None,
+        ] {
+            for model in [SOL, ASTRA] {
+                assert_eq!(
+                    codex_verdict(plan, 10.0, serde_json::Value::Null, model),
+                    Err(model_unknown(model)),
+                    "{plan:?} {model}"
+                );
+            }
+        }
+    }
+
+    /// A model the reading lists keeps the reading's verdict on a paid plan
+    /// with room: used up is rejected, unknown stays unknown, available is
+    /// chosen.
+    #[test]
+    fn a_listed_codex_model_keeps_the_readings_verdict_on_a_paid_plan() {
+        use super::super::quota_policy::RejectReason;
+        for model in [SOL, ASTRA] {
+            let usage = |available: serde_json::Value| -> serde_json::Value {
+                serde_json::json!({ (model): {"available": available} })
+            };
+            assert_eq!(
+                codex_verdict(Some("pro"), 10.0, usage(false.into()), model),
+                Err(RejectReason::ModelUnavailable {
+                    model: model.to_string()
+                }),
+                "{model}"
+            );
+            assert_eq!(
+                codex_verdict(Some("pro"), 10.0, usage("maybe".into()), model),
+                Err(model_unknown(model)),
+                "{model}"
+            );
+            let available = codex_verdict(Some("pro"), 10.0, usage(true.into()), model);
+            assert!(available.is_ok(), "{model}: {available:?}");
+        }
+    }
+
+    /// A listed, exhausted Sol is refused on a paid plan whose generic
+    /// windows have room: listed by its own spent model window, alone or
+    /// merged with a `model_usage` entry saying available.
+    #[test]
+    fn a_listed_exhausted_codex_model_is_refused_while_the_plans_windows_have_room() {
+        use super::super::quota_policy::RejectReason;
+        let spent = serde_json::json!([{"limit_name": "sol", "normal_model_slug": SOL,
+            "rate_limit": {"primary_window": {"used_percent": 100, "reset_after_seconds": 3_600}}}]);
+        let available = serde_json::json!({ (SOL): {"available": true} });
+        for usage in [serde_json::Value::Null, available] {
+            assert_eq!(
+                codex_verdict_with_limits(Some("pro"), 10.0, usage.clone(), spent.clone(), SOL),
+                Err(RejectReason::ModelUnavailable {
+                    model: SOL.to_string()
+                }),
+                "{usage}"
+            );
+        }
     }
 }

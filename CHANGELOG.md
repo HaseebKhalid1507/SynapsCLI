@@ -2,6 +2,554 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0] — 2026-11-27
+
+Several clients can share a daemon session safely: a reply reaches only the
+client that asked, a resolved prompt says what was applied, and the session
+list shows a session's background workers and, over the socket, the saved
+conversations on disk. Extension context from `before_message` is saved in
+the conversation by default. Compaction summaries are written by the chat's
+own model, and on a warm Anthropic cache they read the history from the
+cache instead of paying for it again. Workers report what they used and can
+default to a model of their own, every provider's models are priced at
+their own list price, and a limit on one Claude model no longer blocks the
+whole account. GPT-6.2 Sol and GPT-6.2 Astra join the Codex models; the
+Gemini Code Assist sign-in is removed.
+
+Read the Upgrade notes first if you write an extension with a
+`before_message` hook, signed in with `google-gemini`, relied on the old
+compaction model, or build a client on the daemon socket. Full notes:
+[docs/upgrading/0.13.0.md](docs/upgrading/0.13.0.md).
+
+### Upgrade notes
+
+- **Reload the daemon after installing:** `synaps daemon reload`, then
+  restart attached TUIs. A reload stops running subagents (they can be
+  resumed), so let them finish first. Daemon protocol (v3) and extension
+  protocol (1) are unchanged; the new daemon contracts are additive
+  features in `Welcome.features`.
+- **Extensions: `before_message` inject is saved by default** (#425).
+  Content an extension injects is now written into the stored conversation
+  and stays in history. Content meant for one turn only (recall, status
+  lines) must set `"forget": true`; it is then shown for every request of
+  that turn, never stored, and leaves a one-line marker. A saved part over
+  16 KiB is handled as `forget`. Hosts announce this with
+  `features: ["inject.forget"]` in `initialize`.
+- **`google-gemini` is removed** (#460). `synaps login --provider
+  google-gemini` refuses, `google-gemini/...` models no longer route, and a
+  saved `google-gemini` sign-in is dropped from `auth.json` at start. Use a
+  Google AI Studio API key instead: `synaps login --provider google`, then
+  a `google/...` model. Change any `model`, `subagent_model`,
+  `compaction_model` or favorite that names a `google-gemini/...` model.
+- **`compaction_model` no longer defaults to or falls back to
+  `claude-sonnet-4-6`.** Unset, empty or `match` (the default) has the
+  chat's own model write summaries, so an Opus chat compacts with Opus.
+  Set `compaction_model = claude-sonnet-4-6` to keep the old model,
+  or `provider-small` for the provider's small model (Haiku 5.5 on
+  Anthropic). Any other value warns at load and is `match`.
+- **Daemon replies reach only the client that asked** (#448). A client that
+  read another client's `QueryResult` (or a command reply) off the shared
+  stream no longer gets it and has to ask itself. `SettingChanged` and
+  `Resumed` still reach every client, with the id
+  `VIEW_CHANGED_SETTING_ID` for all but the asker.
+- **New session ids end in 8 hex characters, not 4**
+  (`20261117-015328-1f2e3d4c`). Ids from before stay valid; a script that
+  matches exactly 4 needs `{4,}`.
+- **`synaps daemon sessions --json` prints the daemon's rows as sent**:
+  keys in alphabetical order, fields an older daemon doesn't send left out
+  instead of defaulted, and fields a newer daemon adds (`workers`) kept.
+  `created_at` is when the conversation began, and `title` is the saved
+  row's title.
+- **Credential broker:** upgrade a `synaps auth-broker` and its clients
+  together; an older side treats one model's 429 as the whole account's.
+- **`synaps rpc` sessions no longer take shared-inbox mail** (#455). A
+  bridge or script that relied on a `synaps send` without a session
+  reaching its rpc session must send to that session instead.
+
+### Added
+
+- **A resolved prompt says what was applied, and a late answer is refused.**
+  `PromptResolved` carries `outcome`: `allowed` (the gate opened),
+  `denied`, `answered` (a Secret's value), `cancelled` (the turn or session
+  ended first, or the waiting call was gone) or `timed_out` (nobody attached
+  by the abandonment deadline). A client no longer guesses from the tool's
+  result text, where a cancel at the gate reads like a denial. An `Answer`
+  to a prompt that is no longer pending gets `AnswerRefused{prompt_id,
+  outcome}`, to its sender only, instead of being dropped silently; the TUI
+  shows it as a toast and never takes it for a setting's reply. Each prompt
+  is raised for a gate (`SecretPromptHandle::confirm_tool_call`,
+  `confirm_activation`, `secret`), and one function reads an answer for it:
+  Allow all opens the tool-call gate and denies at the activation gate, as
+  each gate always did. Answers the policy refuses (an observer's, Allow all
+  from a non-owner) are the same `Refused{command: "answer"}` as before.
+  Feature `prompt_outcome`. Additive on the wire: older daemons omit the
+  field, older clients ignore it and read `AnswerRefused` as an unknown
+  event, and an outcome a client doesn't know reads as `unknown`.
+
+- **What a session's prompt cache looks like, from its own requests.**
+  `SessionQuery::CacheExpiry` (daemon feature `cache_expiry`) answers
+  `warm` (with about how long the last accepted request's entry has left),
+  `unknown{may_have_expired}` (until this session's last possible refresh
+  ends), `cold{expired|uncached}`, or `unknown` with a reason (`parked`,
+  `busy`, `no_matching_request`, …). It reads the session's cache anchor,
+  the record keep-warm and cache-preserving compaction read: the last
+  accepted request, its cache identity and messages, the cache usage the
+  provider reported for it, and the latest send. It is not provider state.
+  Errors are typed (`busy`, `timeout`, `superseded`, `stale`).
+  `/keepwarm status` shows the line. See daemon-mode.md, "Prompt-cache
+  evidence".
+
+- **Workers report what they used.** `subagent_status`, `subagent_collect`
+  and a worker's completion event (`data.usage`) carry `usage`: provider
+  requests (the worker's keep-warm pings included), input / output /
+  cache-read / cache-write tokens (with the 5m/1h split when reported),
+  `context_tokens` (the latest prompt) and `cost_usd`, estimated at API list
+  prices from `agent_core::pricing`. `cost_usd` is left out when nothing was
+  used or the model has no list price (`pricing::has_list_price`), never
+  guessed. The completion text gains one sentence, e.g. "Used 325 requests,
+  1.2k input, 61.2M cache-read and 370k output tokens, about $19.64 at list
+  prices." Every terminal status reports it (completed, failed, timed out,
+  cancelled); a resumed worker reports its own run only. A reaped worker read
+  back from its archive has no `usage`. Tool names, parameters and
+  descriptions are unchanged.
+
+- **The api-log can record how much of a subscription's usage windows is
+  used** (`telemetry = full`). On a subscription login the provider
+  reports usage windows in `anthropic-ratelimit-unified-*` response
+  headers. Only the per-minute limits of an API key were kept, so a
+  subscription's records had no `ratelimit` at all. When a response
+  carries those headers, its record now has `ratelimit.unified_utilization`
+  (the used share of each window under the provider's own name, e.g.
+  `{"5h": 0.31, "7d": 0.62}`), `unified_status`, `unified_claim` and
+  `unified_reset`. With that the log shows how fast a run is using up the
+  weekly allowance, before the provider starts refusing requests. Nothing
+  is recorded when the headers are absent.
+- **The api-log records the thinking level of each request**
+  (`telemetry = basic` and up): `thinking` is the level the request was
+  made at by its config name (`medium`, `xhigh`, ...; a worker's own level
+  on a worker record), and `effort` is the `output_config.effort` value the
+  request carried, read from the body that was sent. `effort` is absent
+  when the request carried none (thinking off or adaptive, or a model that
+  takes a token budget). Until now the level was in no log, so what a
+  level costs could only be worked out from worker archives.
+
+- **`subagent_model`: a default model for subagent workers.** A
+  `subagent` or `subagent_start` call that omits `model` used to inherit the
+  foreground model, so switching the foreground to an expensive model
+  silently moved every worker to it. Set `subagent_model` (config or
+  `/settings`; `claude-sonnet-4-6` or a qualified id) and workers use it
+  instead; unset, empty or `inherit` keeps today's behaviour, and a per-call
+  `model` still wins. Naming a model in `subagent_model` trusts it for
+  workers the way a favorite does, and the trust lasts until the session
+  ends, like a favorite. An unknown id is denied
+  (`selection_source: configured_default`, with a remediation asking to tell
+  the user) rather than replaced by the foreground model. `subagent_models`
+  reports the configured default; `subagent_resume` keeps the worker's own
+  model.
+
+- **A session's background workers show in the session list.**
+  `SessionMeta.workers` lists the `subagent_start` workers that keep a
+  session from parking (running, or finished with the result not yet
+  collected), with a `running` count, and `/sessions` and
+  `synaps daemon sessions` tag such a session ` · N workers`, so a session
+  whose turn ended while its workers run no longer looks idle. The daemon
+  advertises it as the `session_workers` feature, and `Welcome.boot_id`
+  (kept across `daemon reload`) tells a client when worker handle ids
+  started over. `SessionLifecycle` decodes a lifecycle this build does not
+  know as `unknown`. See "Workers in the session list" in
+  [docs/daemon-mode.md](docs/daemon-mode.md).
+
+- **Daemon: saved sessions over the socket** (`catalog_page`), for clients
+  that can't read the sessions dir themselves, like synaps-desktop or a
+  remote client. A control frame (no attach) returns one page of the
+  conversations on disk that the daemon does not hold, newest first, as
+  `SessionMeta` rows with `lifecycle: "saved"` and `updated_at`: name,
+  title, model, cwd, cost, message count, when the conversation began.
+  A compacted chain is one row (its head). Held and saved never overlap:
+  a session the daemon holds (or compacted away from) is left out, and
+  after `/clear` the old conversation is listed. Keyset paging: `before`
+  takes the previous reply's `next`; `limit` defaults to 50, at most 200;
+  `named_only` keeps named rows. A named conversation is never hidden as
+  noise. The daemon reads the catalog on one thread, one load at a time;
+  a page never holds up another frame, a stop or a reload, and at most 4
+  are in flight per connection. Additive, no protocol bump: the daemon
+  lists `session_page` in `Welcome.features`, and `saved` never appears
+  in `Welcome`, `session_list` or `attached.meta`. Resume a row with
+  `Attach::Create` and `continue_session` set to its id.
+  `SocketTransport::catalog_page` asks for one page.
+  [docs/daemon-mode.md](docs/daemon-mode.md#saved-sessions-catalog_page)
+
+- **GPT-6.2 Sol and GPT-6.2 Astra on OpenAI Codex** (ChatGPT sign-in),
+  listed first in the picker. Each copies its predecessor's reasoning levels
+  and default (Sol as GPT-6.1 Sol, default `low`; Astra as GPT-6 Astra,
+  default `medium`; both up to Ultra) and has a 1,050,000-token context
+  window. Their API refuses `reasoning.effort: none`, so Off is sent as
+  `low`; the system prompt goes as the first developer message in `input`
+  instead of top-level `instructions`, so it stays ahead of the
+  conversation; no `service_tier` is sent. Requests still ask for at most
+  64,000 output tokens. Neither has a list price in synaps yet: their cost
+  reads at the Sonnet fallback, and a worker on one reports no `cost_usd`.
+  Other Codex models are unchanged.
+
+### Changed
+
+- **A held session's listing title is its saved row's title**: the header
+  title, else the first message a person typed (not an injected event),
+  on one line without control or bidi override characters, up to 120
+  characters (was the first 80 characters of the first user message,
+  raw). A row's title no longer changes when the session ends. The title a save stores
+  (`auto_title`) skips injected events and context notes too, so a
+  session an event started is titled by what was typed.
+
+- **New session ids end in 8 random hex characters, not 4**
+  (`20261117-015328-1f2e3d4c`). They still start with the time they were
+  made and sort by it. Ids from before, with 4, stay valid everywhere.
+
+- **Daemon: a session's `created_at` is when its conversation began.** It
+  was when the session was created. It now holds across a compaction (the
+  start of the chain) and a reload, and moves with `/clear` and an in-session
+  `/resume`. `SessionMeta.journal_id`, not `id`, names the conversation: they
+  also differ after `/clear`, `/resume`, and on a session that took a fresh
+  id because another live session had its journal's id.
+- **`synaps --attach --continue` with no argument right after `/clear`**
+  continues the conversation from before the `/clear` in a second session.
+  The cleared session no longer counts as holding it, and its new
+  conversation has nothing on disk until its first turn.
+
+- **`synaps daemon sessions --json` prints each session as the daemon sent
+  it**, with its keys in alphabetical order. Fields a newer daemon adds are
+  kept, and an older daemon's missing fields are left out, not defaulted.
+
+- **Behaviour change for extensions: `before_message` inject is saved by
+  default (#425, for #414).** Injected content used to be shown for one request and
+  never kept, so the model disowned answers it had given from it and lost
+  it after its first tool call. Now each part is written once into the
+  stored conversation on the user message the hook ran for, fenced with the
+  extension id, and is ordinary history from then on (later requests,
+  sessions, rollover archives, compaction). `"forget": true` shows content
+  at the tail of every request of the turn instead, never stored, and saves
+  a marker `[<extension id> context was shown here for one turn and not
+  kept]`; `parts` mixes both in one result. A saved part over 16 KiB is
+  handled as `forget`. Hosts announce this with `features:
+  ["inject.forget"]` in the `initialize` params; extension protocol stays
+  1 and `content` remains required, so older hosts keep working. The hook
+  now runs once per new user message of a turn (prompt, steer, event
+  message), and its `message`, titles, previews and search never include
+  saved extension context. Clients see saved blocks and markers in history
+  (display tails show them as extra user-role items; the TUI renders them
+  dimmed under the user message with their source). Daemon protocol is
+  unchanged. A message is hooked once, ever: the host records every new
+  user message (also with no `before_message` handler, count 0) and how
+  many trailing blocks it added (`_synaps_hooked`, beside the message, never
+  sent to a provider), so a resend or resumed turn never re-runs the hook
+  and forget content is not shown again. Titles, previews, display and
+  compaction go by that count, never by the text, so a user's own text that
+  looks like a fence stays theirs. Framing look-alikes in extension content
+  are escaped with a `\` before their `[`, anywhere in a line and after any
+  line break (`\r`, `\n`, U+0085, U+2028, U+2029). In journal mode the
+  hook's edit of a prompt the frontend already saved is one append-only
+  amend record (O(message)) instead of a full snapshot; only that edit
+  amends, any other change still snapshots. Builds without amends keep their
+  copy of that message (they lose the saved context, not the history);
+  after a downgrade a snapshot loses the counts, so saved blocks read as the
+  user's text and an unanswered last message can be hooked again.
+  Rollover archives keep `_synaps_hooked` on stored user messages (an
+  optional key, counted over the stored blocks).
+  Migration: `docs/extensions/protocol.md` §`inject`.
+
+- **`compaction_model` chooses who writes compaction summaries.** `match`
+  (also unset or empty, the default) has the chat's own model write
+  `/compact` and auto-compaction summaries; `provider-small` uses the small
+  model pinned for the chat's provider on the chat's own account
+  (`claude-haiku-5-5` for Anthropic, the chat's own model elsewhere,
+  OpenAI Codex included); a model id names any routable model. A
+  summary goes to another provider only when a model there is named. A
+  named or pinned model that can't be used (no route, a reasoning level its
+  provider refuses, a smaller context window than the chat's, no
+  credential) gives way to the chat's own model, and the compaction line
+  says so. The `claude-sonnet-4-6` default and fallback are gone; any other
+  value warns at load and is `match`. Haiku 5.5 and GPT-6-Luna join the
+  known models.
+
+### Removed
+
+- **The Gemini Code Assist sign-in (`google-gemini`) is removed.** It
+  was built on Gemini CLI's internal Code Assist API and sign-in flow,
+  which Google's terms do not permit third-party tools to use. `synaps login --provider google-gemini`
+  (or `gemini`, `gemini-cli`, `gemini-code-assist`) now refuses and names
+  the replacement: a Google AI Studio API key,
+  `synaps login --provider google`, then a `google/...` model.
+  `google-gemini/...` models no longer route, and the
+  `SYNAPS_GOOGLE_GEMINI_CLIENT_ID` / `_SECRET` variables are no longer
+  read. A saved `google-gemini` sign-in is dropped from `auth.json` when
+  synaps starts, by name and without reading its value, with one log line,
+  "removed saved google-gemini sign-in". AI Studio keys and Vertex are
+  unchanged.
+
+### Fixed
+
+- **Daemon replies reach only the client that asked** (`Welcome.features`:
+  `addressed_replies`). Every client numbers its own requests, so two
+  clients attached to one session both send request 5, and the daemon used
+  to broadcast every reply: each client could take the other's `Query`,
+  `Set`, `Resume` or command reply for its own. Now a `QueryResult` goes to
+  the attachment that asked (a daemon-internal one to nobody), and a
+  `SettingChanged`/`Resumed` still reaches every client but carries the
+  view-only id `VIEW_CHANGED_SETTING_ID` for all but the asker. The wire is
+  unchanged: an older client simply stops receiving replies that were never
+  its own. Against an older daemon (replies still broadcast) the TUI draws
+  its request ids from a random base, which makes an accidental collision
+  highly unlikely. In process, `LocalTransport::send` now sends as its
+  attachment, like a socket client (input ownership applies, replies come
+  back to it); `synaps chat` numbers its post-compaction readout like its
+  other requests. `docs/daemon-mode.md` gains "Negotiation" and "Request ids
+  and replies", and `docs/STABILITY.md` a daemon-protocol section (§5).
+
+- **A tool that loads while a session is idle no longer ends its keep-warm.**
+  With deferred tool loading, a tool registered mid-session (e.g. an
+  extension installed live) joins the `defer_loading` list, which is not part
+  of the cached prefix. The keep-warm check still hashed that list, so the
+  next ping saw a "changed" prefix, ended the period with
+  `reason=prefix changed` and let the cache expire; the next turn wrote the
+  whole context again (over 200k tokens per session). The check now covers
+  exactly the cached bytes: the loaded tools with their cache marker, not the
+  deferred definitions. A tool that joins the loaded tools (e.g. one listed in
+  `tools.always_loaded`, or any tool without deferred loading) still ends the
+  period, as it changes what is cached.
+
+- **Compaction reads the history from the prompt cache instead of paying
+  for it again.** `/compact` and auto-compaction sent a request of their
+  own: a different system prompt, no tools, no cache markers and the whole
+  transcript in one user message. None of it matched what the chat had
+  cached, so the provider billed the entire history as fresh input and
+  counted it against the per-minute input limit. An Opus session at about
+  400K tokens sent one 1.6 MB request and got HTTP 429 on all 27 attempts,
+  while its own turns, larger but cached, went through. On Anthropic the
+  summary request is now the chat's own next request (same system prompt,
+  tools, thinking, effort and messages) with one more user message that
+  asks for the summary, so the history is a cache read: about a twentieth
+  to a tenth of the input price, and not counted against the per-minute
+  limit. The cache marker stays on the last message of the history, so the
+  one-off instructions are not written to the cache.
+  It is used when all of this holds: the chat's own model writes the
+  summary; `compaction_exclude` is empty; the request fits the context
+  window; the cache is known to be warm (a request or keep-warm ping within
+  the cache TTL, with the same model, effort, thinking, system prompt,
+  tools and account); and the history starts with exactly the messages
+  that last request sent, so `/resume` followed by `/compact` does not send
+  the resumed history as a full cache write. Two model-specific cases keep
+  the transcript request: models other than Opus 4.5 and later, Sonnet 4.6
+  and later, Haiku 5.5, Fable and Mythos drop earlier thinking blocks (and
+  the cached messages after them) when a user message is added, so for them
+  it is used only when the history has no thinking blocks; and on Haiku
+  5.5, which bills a prompt of over 100,000 tokens at its long-context
+  rate, it is not used when the full history is over that size and the
+  transcript is not. Otherwise the transcript request is sent as before:
+  with a cold cache it is the cheaper one, since writing the full history
+  to the cache costs 1.25 to 2 times the input price and the transcript
+  request truncates tool results and thinking.
+  The tools stay in the request (removing them would invalidate the
+  cache); if the model answers with a tool call, nothing runs. The request
+  is not retried: on a 429, a 5xx, a network or stream error, a tool call
+  or an empty reply, the transcript request is sent instead, with its usual
+  retries, and a failed attempt leaves the conversation as it was. Three
+  immediate resends remain, none of which waits: after a 401, with a
+  refreshed token for the same account (if the refresh comes back with
+  another account's token, the request is not re-sent there and the
+  transcript request is sent instead);
+  uncompressed, after a refused gzip body; and without the cache-diagnosis
+  header, after that header is refused. The line shown before a
+  compaction says which request goes out ("sending the
+  conversation as the chat sends it (N messages, ~T tokens, read from
+  cache) ... if that fails, a ~K KB transcript"), and the compaction sends
+  what the line said: the request is chosen once, for the line. Before, it
+  was chosen again when the compaction started, so a keep-warm ping landing
+  in between could send the full history under a line that said
+  "transcript". A line that names the chat request is still checked again
+  before anything is sent, and falls back to the transcript it names. The
+  saved compaction record names the request that wrote the summary
+  (`summary_request`: `chat_request` or `transcript`), and for a chat
+  request its prompt-stack
+  digest covers the system blocks, tools and instructions as sent; the
+  history went out untruncated then. A chat request that wrote more to the
+  cache than it read logs a warning with both numbers and tells the user
+  after the line above: "compaction: the summary request missed the cache
+  (wrote N, read M tokens)".
+  A compaction's own usage now counts: every summary request whose usage
+  the provider reported is added to the session's token totals and cost,
+  once, like a turn's usage. That includes a chat request whose reply was
+  not used (a tool call, an empty reply) together with the transcript
+  request sent after it, and what a chat request had reported when the
+  compaction was cancelled (Cancel stops the request as a turn is stopped,
+  waits at most two seconds for the compaction to end, then at most two
+  more for the save). A transcript request cancelled mid-flight books
+  nothing: it is not streamed, and the cancel drops it before any usage
+  arrives.
+  When compaction starts a successor session, the spend is saved
+  with the session that was summarized and the successor starts at zero,
+  as before; a compaction that failed or was cancelled saves the session
+  with its new totals and the history it had. `synaps rpc` adds the
+  tokens to its totals and saves them also when compaction fails (it does
+  not price usage, for turns either).
+  In the api-log both summary requests have `"compaction": true` and a
+  `summary_request` field, `chat_request` or `transcript`, the same words
+  as the saved compaction record. The transcript request wrote no api-log
+  record before; it now writes one per accepted request at the same
+  telemetry levels, with model, thinking and effort as sent, attempt,
+  total time, stop reason, usage, cost, rate-limit headers (`full`) and
+  context. It has no `ttft_ms` (the request does not stream). On the chat
+  request `usage.cache_read` is the history. Other providers are
+  unchanged, and their requests are still not in the api-log.
+  Known, not changed: when both requests fail, the keep-warm period
+  that ended for the compaction is not restored (the next turn
+  starts one); and a 1h-to-5m cache downgrade first seen by the compaction
+  request may not show its notice.
+- **A compaction request larger than the account's per-minute input limit
+  fails at once.** A 429 was retried eight times whatever the cause. When
+  the response states the limit (`anthropic-ratelimit-input-tokens-limit`,
+  sent to API keys) and the request is certainly larger, no wait can make
+  room for it: it now stops after the first attempt and says so, with the
+  two sizes. A 429 without that header, as on a subscription login, keeps
+  its retries.
+
+- **OpenAI, Gemini, Grok, Groq and Kimi models cost their own list price.**
+  Every model the pricing table didn't know was billed at Sonnet's $3 / $15
+  per million tokens, with Anthropic's 0.1× cache-read rate. Synaps's own
+  table now has the provider's input, output and cached-input price for the
+  models it offers (Codex and Copilot models at the OpenAI API price of the
+  same model), and the long-context tier where the provider has one (GPT
+  over 272k, Gemini Pro over 200k, Grok from 200k prompt tokens). Claude
+  prices are unchanged, and a model with no published price still falls
+  back to Sonnet's. No new dependency.
+
+- **A worker resumed cold many times keeps one copy of its task.** A cold
+  resume (the worker's cache had expired, so it gets a summary instead of a
+  replay) took "your original task" from the worker's first message, which
+  after one cold resume is the previous summary. Each further resume wrapped
+  the whole earlier summary inside the task again, so a worker resumed five
+  or ten times carried every earlier summary, nested. The task is now read
+  out of the earlier summary, so it appears once however often the worker is
+  resumed, and the previous resume's instructions stay in the summary's
+  recent steps. Archives that are already nested are unwrapped the same way.
+
+- **Sign-in opens the whole page on Windows.** The browser was started
+  through `cmd /c start <url>`, and `cmd` ends a command at the first `&`:
+  the Claude, ChatGPT and Grok authorize URLs (all full of `&`)
+  opened cut short, a broken page and a stray `cmd` window with it. The URL
+  now goes straight to `ShellExecuteW`, unchanged, and only `http(s)` URLs
+  with no quote, space or control character are opened. Linux and macOS are
+  as before. Grok's sign-in also never printed the URL, so a user, or a GUI
+  client reading stderr, had no way to open it by hand when the auto-open
+  failed; it now prints "If the browser didn't open, visit this URL:" and
+  the URL, as the other providers do. Every sign-in now prints its URL
+  before it tries to open the browser.
+
+- **Releases carry the `.deb` again.** The `.deb` was uploaded after the
+  GitHub release was published, and this repository has immutable releases,
+  so 0.12.0 shipped without one (`Cannot upload assets to an immutable
+  release`). It is now built before the release is published and attached
+  with the other files, and it holds the exact x86_64 Linux binaries of the
+  release tarball instead of a separate build. If it fails, the release
+  waits instead of going out without it.
+
+- **A limit on one model no longer blocks the whole Anthropic account.**
+  When Fable's own weekly limit ran out, the 429 put the account in a
+  cooldown for every model until the reset, so Opus and Sonnet requests
+  failed without being sent while the account still had weekly usage left.
+  Now a 429 that only rejects a per-model limit (the account-wide 5-hour and
+  weekly limits reported and not rejected) cools just that model on that
+  account; other models keep using it, and a later answer for another model
+  does not clear it. A missing header, or a rejected limit not known to
+  cover one model, still cools the whole account. The usage reading also
+  reads Anthropic's new `limits` list, so the per-model limit is seen
+  before the first 429. `synaps status` shows it by name (e.g. `Fable 7d:
+  100% used · resets in 13h 48m · EXHAUSTED`), and `synaps auth state` shows
+  a model's cooldown with its model.
+
+  Upgrade a credential broker and its clients together (e.g. a machine that
+  uses another machine's `synaps auth-broker`): an older client reports a
+  429 on one model's limit as the whole account's, and an older broker
+  ignores the model in a newer client's report and cools the whole account.
+
+- **Two sessions that drew the same id no longer share a journal.** Two
+  sessions started in the same second could draw the same id. The second
+  then ran on the first's journal without its lock, and in the daemon the
+  first dropped out of the session list while it kept running. A new
+  session whose id is taken now draws another one.
+
+- **Daemon: `/clear` and an in-session `/resume` update the session list at
+  once.** The list showed the old conversation's name, title, cost and
+  message count until the next turn.
+- **Daemon: resuming a conversation after `/clear` resumes it.** Resuming
+  `A` (by id or by its old name) attached to the session that had cleared
+  `A` and now holds a new conversation. It now starts a second session on
+  `A`, and either one can end without taking the other out of the list.
+- **Daemon: a reload that finds a cleared session's journal locked brings
+  the right conversation back.** Once the lock was free, the next attach
+  loaded the conversation from before the `/clear` instead of the one the
+  session held. The waiting session no longer replaces a session restored
+  before it under the same id (the old conversation, resumed after the
+  `/clear`), which dropped that session from the list.
+
+- **A config edit reaches the daemon without a restart.** The daemon read
+  the config file once at boot, so an edit made afterwards (for example
+  `context_window = 1m`) was silently ignored: a 1M-window session was
+  budgeted against 200k and its context bar read about 60% on the first
+  turn. Each session create now reloads the config when the file changed.
+  New sessions take everything `apply_config` reads; live sessions take
+  what they read at use time (turn budgets, `events.auto_turn`,
+  `auto_turn_cap`, the extensions-ready timeout), and a parked session that
+  wakes takes the new values. Workers of every session pick up a changed
+  `disabled_tools` (and the retry settings) at the next session create,
+  while each foreground session keeps the list it booted with. Provider
+  keys, identity, MCP, skills, `progressive_tool_disclosure` and a changed
+  `auth.*` source still need a restart.
+
+- **Keep-warm on a cooling account you chose.** With an explicit account
+  (the default), a cooldown on it no longer stops keep-warm pings. On
+  2026-11-11 a rejection at 04:10 EST left the account cooling until Nov 16
+  although requests were served again within seconds, and keep-warm refused
+  52 pings over ten hours while the requests went through. Another model's
+  limit no longer cools the account at all (see the per-model cooldown
+  above), so the cooldowns left are account-wide ones and the ping's own
+  model's. Under an explicit selector the ping now goes through both: a
+  limit that still holds meets the ping with a 429, at most one per
+  keep-warm period, which ends keep-warm and bills no tokens. Under `auto` a
+  cooling account still stops the ping (the next request leaves it).
+
+- **A Codex model the usage reading doesn't list can be used on a paid
+  plan.** The reading lists only the models Codex gates one by one (GPT-6
+  Astra), and every other requested model counted as unknown, so an
+  ordinary model such as GPT-6.1 Sol failed account selection on every
+  account, even on a paid plan with room in its windows. On a paid plan
+  (`plus`, `pro`, `team`, `business`, `enterprise`, `edu`) such a model is
+  now judged by the plan's windows, from a fresh reading or the last good
+  one, with one INFO log line per choice. A model gated per model, and any
+  unlisted model on a free, unknown or missing plan, still needs the
+  reading to list it.
+
+- **Windows: a client connecting to a busy daemon waits for the pipe.** A
+  named pipe has one listening instance, so when several clients connected
+  at once (a TUI and `synaps daemon status`, clients racing an auto-spawn,
+  reconnects after a reload) one could fail with `connect: protocol:
+  connect timed out` while the daemon was busy. The pipe-busy retry, which
+  the 500 ms connect bound cut short, now gets its full time, up to 5
+  seconds (was 2), and if that runs out the error says the pipe was busy.
+  With no daemon a client still fails at once. Unix is unchanged.
+
+- **`synaps rpc` never takes shared-inbox mail.** A `synaps send` without
+  a session goes to the shared inbox, and every session's watcher raced to
+  take it, so a session another program drives (`synaps rpc`, such as a
+  chat bridge) running next to your own chat could take an event meant for
+  that chat. An rpc session's watcher now never takes shared-inbox files,
+  for its whole life; events sent to its own session socket still arrive.
+  Daemon sessions already took them only while a client owned input.
+
+### Internal
+
+- The README introduces Capri, a desktop client built on the daemon
+  socket (#418).
+
 ## [0.12.0] — 2026-11-14
 
 Memory in core is plain files only, and Axel is an extension. The Axel

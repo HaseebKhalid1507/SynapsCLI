@@ -18,7 +18,7 @@ use tokio::sync::broadcast;
 use super::DaemonState;
 use crate::session::actor::{CLOSE_COMMAND, CLOSE_UNATTACHED_ARG};
 use crate::session::wire::{DaemonFrame, RefuseReason, CLOSE_QUERY_ID_BASE};
-use crate::session::{EndReason, SessionCommand, SessionEventWire, SessionHandle, SessionId, SessionMeta, TransportError};
+use crate::session::{Audience, EndReason, SessionCommand, SessionEventWire, SessionHandle, SessionId, SessionMeta, TransportError};
 
 /// How long a full command queue is retried before giving up (the actor
 /// drains it between commands).
@@ -119,7 +119,7 @@ async fn close_in_actor(state: &DaemonState, handle: &SessionHandle, force: bool
                 };
             }
             Err(_) => {
-                state.remove(&sid);
+                state.remove(handle);
                 return DaemonFrame::Closed { session_id: sid.clone(), text: format!("session {sid} had already ended") };
             }
         }
@@ -129,7 +129,8 @@ async fn close_in_actor(state: &DaemonState, handle: &SessionHandle, force: bool
         loop {
             match rx.recv().await {
                 Ok(env) => match env.event {
-                    SessionEventWire::QueryResult { id, value } if id == query_id => {
+                    // Only the host's reply (a client's never reaches a host waiter).
+                    SessionEventWire::QueryResult { id, value } if id == query_id && env.audience == Audience::Host => {
                         let text = value.get("text").and_then(|t| t.as_str()).unwrap_or_default().to_string();
                         let ok = value.get("kind").and_then(|k| k.as_str()) != Some("error");
                         return Reply::Answered { ok, text };
@@ -161,7 +162,7 @@ async fn close_in_actor(state: &DaemonState, handle: &SessionHandle, force: bool
     let ended = tokio::time::timeout(CLOSE_END_BUDGET, handle.closed()).await.is_ok();
     // Idempotent with the host task's own removal; makes the very next
     // `daemon sessions` exact.
-    state.remove(&sid);
+    state.remove(handle);
     let text = if ended { text } else { format!("{text} (still ending in the background)") };
     DaemonFrame::Closed { session_id: sid, text }
 }
@@ -178,7 +179,7 @@ async fn close_placeholder(state: &DaemonState, handle: &SessionHandle, holder: 
     let sid = handle.id.clone();
     let _ = handle.send(SessionCommand::End { reason: EndReason::ClientQuit }).await;
     let _ = tokio::time::timeout(CLOSE_REPLY_BUDGET, handle.closed()).await;
-    state.remove(&sid);
+    state.remove(handle);
     DaemonFrame::Closed {
         session_id: sid.clone(),
         text: format!(

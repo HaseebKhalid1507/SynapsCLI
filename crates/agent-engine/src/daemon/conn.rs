@@ -246,6 +246,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         generation: state.generation,
         daemon_build: crate::session::wire::build_id().to_string(),
         features: crate::session::wire::daemon_features(),
+        boot_id: state.boot_id.clone(),
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
@@ -253,11 +254,23 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     tracing::debug!(kind = ?hello.client.kind, "daemon: client connected");
 
     // ── control loop (no session allocated) ──
+    // `CatalogPage`s run beside the loop, one task each, so a slow catalog
+    // load never holds up a frame, a stop or a reload. Every way out of
+    // the loop aborts them first: no reply follows a `Bye`, and none
+    // reaches an attach stream.
+    let mut pages = tokio::task::JoinSet::new();
     let attach = loop {
+        while pages.try_join_next().is_some() {}
         let announce = state.announce();
         let frame = tokio::select! {
-            _ = shutdown.cancelled() => { let _ = tx.send(DaemonFrame::Bye { reason: None }).await; let _ = writer.await; return; }
+            _ = shutdown.cancelled() => {
+                pages.shutdown().await;
+                let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
+                let _ = writer.await;
+                return;
+            }
             _ = announce.cancelled() => {
+                pages.shutdown().await;
                 let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
                 let _ = writer.await;
                 return;
@@ -277,6 +290,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 tracing::info!(force, "daemon: shutdown requested over the socket");
+                pages.shutdown().await;
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 let _ = writer.await;
                 state.request_shutdown(force);
@@ -289,6 +303,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                         .await;
                     continue;
                 }
+                // A page still loading is dropped: the attach stream
+                // carries no catalog replies.
+                pages.shutdown().await;
                 break a;
             }
             Ok(Read::Frame(ClientFrame::Cmd { session_id, .. })) => {
@@ -309,6 +326,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                     }
                     Ok(prepared) => {
                         // Tell the requester, flush, close — then exec.
+                        pages.shutdown().await;
                         let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
                         drop(tx);
                         let _ = tokio::time::timeout(
@@ -364,12 +382,32 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
             }
+            // Its own task (see `pages`); the reply carries `req`. PR 3:
+            // the feed loop serves `CatalogPage` the same way, from its
+            // own `JoinSet`.
+            Ok(Read::Frame(ClientFrame::CatalogPage { req, before, limit, named_only })) => {
+                while pages.try_join_next().is_some() {}
+                if pages.len() >= super::saved::CATALOG_PAGES_IN_FLIGHT {
+                    let error = format!(
+                        "too many catalog pages in flight (at most {} per connection)",
+                        super::saved::CATALOG_PAGES_IN_FLIGHT
+                    );
+                    let _ = tx.send(super::saved::page_error(req, error)).await;
+                } else {
+                    let (state, tx) = (Arc::clone(&state), tx.clone());
+                    pages.spawn(async move {
+                        let _ = tx.send(super::saved::catalog_page(&state, req, before, limit, named_only).await).await;
+                    });
+                }
+            }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => {
+                pages.shutdown().await;
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 let _ = writer.await;
                 return;
             }
             Ok(Read::Oversize) => {
+                pages.shutdown().await;
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: frame_limit_msg() }).await;
                 drop(tx);
                 let _ = writer.await;
@@ -593,15 +631,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     }
     tracing::debug!(session = %handle.id, client = client.0, "daemon: client attached");
     if attached_to_live {
-        let env = Envelope {
-            session_id: handle.id.clone(),
-            seq: u64::MAX,
-            ts: chrono::Utc::now(),
-            event: SessionEventWire::SystemNotice(format!(
-                "session {} is already running in this daemon — attached to it instead of creating a second copy",
-                handle.id
-            )),
-        };
+        let notice = format!(
+            "session {} is already running in this daemon — attached to it instead of creating a second copy",
+            handle.id
+        );
+        let env = Envelope::new(handle.id.clone(), u64::MAX, chrono::Utc::now(), SessionEventWire::SystemNotice(notice));
         let _ = tx.send(DaemonFrame::Event(env.into())).await;
     }
 
@@ -614,9 +648,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     // the `Conversation` digest the actor emits right after is what they key on.
     let history = hello.client.history;
     let caps = hello.client.capabilities;
-    let skip = move |env: &Envelope| -> bool {
-        !forwarded(history, caps, env) || (legacy && matches!(env.event, SessionEventWire::InputOwnerChanged { .. }))
-    };
+    // What this client receives of `env`, as a wire frame: its audience
+    // first (another attachment's reply never leaves; a shared reply is
+    // projected for this client), then what it can decode.
+    let frame = move |env: Envelope| pump_frame(client, history, caps, legacy, env);
     // The owner of an owned session must never miss a frame silently (a
     // headless client keys on `Usage`/`Done`/tool results): its lag closes
     // its connection with `Bye{owner_lagged}` (and so ends the session).
@@ -633,27 +668,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                 // notice, Conversation with the kept partial history) are already in
                 // the broadcast; drain what is there, then stop.
                 _ = fwd_announce.cancelled() => {
-                    loop {
-                        match rx.try_recv() {
-                            Ok(env) => {
-                                if skip(&env) {
-                                    continue;
-                                }
-                                if fwd_tx.send(DaemonFrame::Event(ended_for(caps, env).into())).await.is_err() {
-                                    break;
-                                }
-                            }
-                            // The owner lost events here too: never a
-                            // silent gap it would re-bind across.
-                            Err(broadcast::error::TryRecvError::Lagged(n)) if owner => {
-                                tracing::warn!(session = %fwd_handle.id, dropped = n, "daemon: the owner lagged during a reload");
-                                fwd_lag_dropped.store(n, Ordering::SeqCst);
-                                fwd_lag.cancel();
-                                break;
-                            }
-                            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                            Err(_) => break,
-                        }
+                    // The owner lost events here too: never a silent gap
+                    // it would re-bind across.
+                    if let Some(n) = drain_announced(&mut rx, &frame, &fwd_tx, owner).await {
+                        tracing::warn!(session = %fwd_handle.id, dropped = n, "daemon: the owner lagged during a reload");
+                        fwd_lag_dropped.store(n, Ordering::SeqCst);
+                        fwd_lag.cancel();
                     }
                     break;
                 }
@@ -661,11 +681,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             match next {
                 Ok(env) => {
                     // Attached is addressed to one client; ours already went out as a frame.
-                    if skip(&env) {
-                        continue;
-                    }
                     let ended = matches!(env.event, SessionEventWire::Ended { .. });
-                    if fwd_tx.send(DaemonFrame::Event(ended_for(caps, env).into())).await.is_err() {
+                    let Some(frame) = frame(env) else { continue };
+                    if fwd_tx.send(frame).await.is_err() {
                         break;
                     }
                     if ended {
@@ -680,12 +698,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(session = %fwd_handle.id, dropped = n, "daemon: client lagged");
-                    let env = Envelope {
-                        session_id: fwd_handle.id.clone(),
-                        seq: u64::MAX,
-                        ts: chrono::Utc::now(),
-                        event: SessionEventWire::SystemNotice(format!("event stream lagged; {n} dropped")),
-                    };
+                    let env = Envelope::new(fwd_handle.id.clone(), u64::MAX, chrono::Utc::now(), SessionEventWire::SystemNotice(format!("event stream lagged; {n} dropped")));
                     if fwd_tx.send(DaemonFrame::Event(env.into())).await.is_err() {
                         break;
                     }
@@ -769,7 +782,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             | Ok(Read::Frame(ClientFrame::Pin { .. }))
             | Ok(Read::Frame(ClientFrame::Rename { .. }))
             | Ok(Read::Frame(ClientFrame::ReloadExtension { .. }))
-            | Ok(Read::Frame(ClientFrame::AuthState(_))) => {
+            | Ok(Read::Frame(ClientFrame::AuthState(_)))
+            | Ok(Read::Frame(ClientFrame::CatalogPage { .. })) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,
@@ -812,12 +826,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             ByeReason::Reloading { generation, retry_after_ms } => (generation, retry_after_ms),
             _ => unreachable!(),
         };
-        let env = crate::session::Envelope {
-            session_id: sid.clone(),
-            seq: u64::MAX,
-            ts: chrono::Utc::now(),
-            event: SessionEventWire::Reloading { generation, retry_after_ms },
-        };
+        let env = crate::session::Envelope::new(sid.clone(), u64::MAX, chrono::Utc::now(), SessionEventWire::Reloading { generation, retry_after_ms });
         let _ = tx.send(DaemonFrame::Event(env.into())).await;
         let _ = tx.send(DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation, retry_after_ms }) }).await;
         let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
@@ -851,7 +860,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         let _ = handle.send(SessionCommand::Detach { client }).await;
     }
     if !handle.is_alive() {
-        state.remove(&sid);
+        state.remove(&handle);
     }
     if lagged {
         send_owner_lagged(&tx, &sid, owner_lag_dropped.load(Ordering::SeqCst)).await;
@@ -899,6 +908,52 @@ async fn adopt_live_continue_target(state: &DaemonState, live: &SessionHandle) -
              take over a session others use (attach to it instead, or detach them first)"
         )),
         other => Err(format!("{sid} is running in this daemon; ending it returned {other:?}")),
+    }
+}
+
+/// The frame the pump sends `client` for `env`, or `None`. The audience
+/// check runs first, on the envelope itself ([`deliver`]): a reply to
+/// another attachment or to the host never leaves, and a shared reply
+/// (`SettingChanged`/`Resumed`) is projected for this client before it is
+/// filtered and converted, so the unprojected original is never serialized
+/// to a client that did not ask. The live pump and the reload drain both
+/// use it.
+fn pump_frame(
+    client: ClientId,
+    history: HistoryMode,
+    caps: ClientCapabilities,
+    legacy: bool,
+    env: Envelope,
+) -> Option<DaemonFrame> {
+    let env = deliver(env, Subscriber::Attachment(client))?;
+    if !forwarded(history, caps, &env) || (legacy && matches!(env.event, SessionEventWire::InputOwnerChanged { .. })) {
+        return None;
+    }
+    Some(DaemonFrame::Event(ended_for(caps, env).into()))
+}
+
+/// C3: after a reload's announce, what is still in the broadcast goes out
+/// through the live pump's own [`pump_frame`] (so a reply to someone else
+/// never leaks in the drain either), then the pump stops. `Some(n)`: the
+/// owner lagged by `n` events meanwhile.
+async fn drain_announced(
+    rx: &mut broadcast::Receiver<Envelope>,
+    frame: &impl Fn(Envelope) -> Option<DaemonFrame>,
+    tx: &mpsc::Sender<DaemonFrame>,
+    owner: bool,
+) -> Option<u64> {
+    loop {
+        match rx.try_recv() {
+            Ok(env) => {
+                let Some(f) = frame(env) else { continue };
+                if tx.send(f).await.is_err() {
+                    return None;
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(n)) if owner => return Some(n),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => return None,
+        }
     }
 }
 
@@ -979,13 +1034,87 @@ mod tests {
         assert!(client_may_send(&SessionCommand::TakeInput, ClientId(2)).is_ok());
     }
 
-    fn stream_env(ev: StreamEvent) -> Envelope {
-        Envelope {
-            session_id: SessionId::from("s"),
-            seq: 1,
-            ts: chrono::Utc::now(),
-            event: SessionEventWire::Stream(ev),
+    fn env(event: SessionEventWire, audience: Audience) -> Envelope {
+        Envelope::new(SessionId::from("s"), 1, chrono::Utc::now(), event).to(audience)
+    }
+
+    fn reply(id: u64, audience: Audience) -> Envelope {
+        env(SessionEventWire::QueryResult { id, value: serde_json::json!({ "id": id }) }, audience)
+    }
+
+    fn setting(id: u64, audience: Audience) -> Envelope {
+        let applied = SettingApplied {
+            id,
+            setting: "api_retries".into(),
+            ok: true,
+            message: None,
+            view: crate::session::handle::echo::view_for(),
+            clamp: None,
+        };
+        env(SessionEventWire::SettingChanged(applied), audience)
+    }
+
+    fn event_of(f: DaemonFrame) -> WireSessionEvent {
+        match f {
+            DaemonFrame::Event(env) => env.event,
+            other => panic!("not an event: {other:?}"),
         }
+    }
+
+    /// Contract v2 §1.4: the audience is checked on the envelope before
+    /// anything is filtered or converted. Another attachment's reply and
+    /// the host's never become a frame; a shared reply is serialized as this
+    /// client sees it (view-only unless it asked), never the original.
+    #[test]
+    fn the_pump_sends_a_client_only_what_is_its_own() {
+        let (me, other) = (ClientId(1), ClientId(2));
+        let frame = |e| pump_frame(me, HistoryMode::Full, ClientCapabilities::default(), false, e).map(event_of);
+        assert!(matches!(frame(reply(5, Audience::Client(me))), Some(WireSessionEvent::QueryResult { id: 5, .. })));
+        assert!(frame(reply(5, Audience::Client(other))).is_none());
+        assert!(frame(reply(5, Audience::Host)).is_none());
+        let id_of = |f: Option<WireSessionEvent>| match f {
+            Some(WireSessionEvent::SettingChanged { applied }) => applied.id,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(id_of(frame(setting(5, Audience::Shared { reply_to: me }))), 5, "its own Set");
+        assert_eq!(
+            id_of(frame(setting(5, Audience::Shared { reply_to: other }))),
+            crate::session::wire::VIEW_CHANGED_SETTING_ID,
+            "another client's Set, view-only"
+        );
+        assert!(matches!(frame(env(SessionEventWire::Idle, Audience::All)), Some(WireSessionEvent::Idle)));
+    }
+
+    /// The reload drain goes through the same projection as the live pump.
+    #[tokio::test]
+    async fn the_reload_drain_sends_a_client_only_what_is_its_own() {
+        let (me, other) = (ClientId(1), ClientId(2));
+        let (btx, mut rx) = broadcast::channel(16);
+        for e in [
+            reply(5, Audience::Client(other)),
+            reply(crate::session::wire::CHECKPOINT_QUERY_ID, Audience::Host),
+            setting(5, Audience::Shared { reply_to: other }),
+            reply(6, Audience::Client(me)),
+            env(SessionEventWire::SystemNotice("daemon reloading".into()), Audience::All),
+        ] {
+            btx.send(e).unwrap();
+        }
+        let (tx, mut frames) = mpsc::channel(16);
+        let frame = move |e| pump_frame(me, HistoryMode::Full, ClientCapabilities::default(), false, e);
+        assert_eq!(drain_announced(&mut rx, &frame, &tx, false).await, None);
+        drop(tx);
+        let mut got = Vec::new();
+        while let Some(f) = frames.recv().await {
+            got.push(event_of(f));
+        }
+        assert_eq!(got.len(), 3, "{got:#?}");
+        assert!(matches!(&got[0], WireSessionEvent::SettingChanged { applied } if applied.id == crate::session::wire::VIEW_CHANGED_SETTING_ID));
+        assert!(matches!(&got[1], WireSessionEvent::QueryResult { id: 6, .. }));
+        assert!(matches!(&got[2], WireSessionEvent::SystemNotice { .. }));
+    }
+
+    fn stream_env(ev: StreamEvent) -> Envelope {
+        Envelope::new(SessionId::from("s"), 1, chrono::Utc::now(), SessionEventWire::Stream(ev))
     }
 
     /// An older client (no `tool_queue` capability) is never sent the queue

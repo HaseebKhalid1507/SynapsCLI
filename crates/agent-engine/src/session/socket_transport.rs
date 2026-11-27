@@ -21,7 +21,16 @@ use super::view::RuntimeView;
 use super::wire::*;
 use crate::ipc::{ClientReadHalf, ClientWriteHalf};
 
+/// Bound on reaching the daemon's endpoint. Unix: a connect to a listening
+/// socket completes at once (kernel backlog), so this only guards a wedge.
+#[cfg(unix)]
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Windows: a named pipe has no backlog; `ipc::connect` retries
+/// `ERROR_PIPE_BUSY` for [`crate::ipc::BUSY_RETRY`] while a live daemon
+/// creates its next instance. A shorter bound here cut that retry to 500 ms
+/// and failed concurrent first clients with "connect timed out".
+#[cfg(windows)]
+pub const CONNECT_TIMEOUT: Duration = crate::ipc::BUSY_RETRY.saturating_add(Duration::from_millis(500));
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long `close` waits for the daemon's answer: its queue retry, the
 /// actor's reply and the session's end (`daemon/close.rs` budgets), plus a
@@ -47,6 +56,17 @@ pub const RENAME_TIMEOUT: Duration = Duration::from_secs(
 /// timeouts, around 15 s together). Generous, because giving up early only
 /// hides the answer: the daemon finishes the reload either way.
 pub const RELOAD_EXTENSION_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long `catalog_page` waits: a cold read of a few thousand session
+/// headers on one thread, plus a margin.
+pub const CATALOG_PAGE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// One `CatalogPage` reply: saved rows (`lifecycle: saved`), newest first,
+/// and the cursor for the next page (`None`: the last page).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedPage {
+    pub sessions: Vec<SessionMeta>,
+    pub next: Option<CatalogCursor>,
+}
 
 /// A connection past `Hello`/`Welcome`, before `Attach`.
 pub struct Connected {
@@ -58,6 +78,8 @@ pub struct Connected {
     path: PathBuf,
     hello: Hello,
     buf: FrameBuf,
+    /// The last `req` sent (`CatalogPage`).
+    req: u64,
 }
 
 pub struct Pong {
@@ -106,6 +128,14 @@ impl FrameBuf {
 }
 
 async fn read_frame(reader: &mut BufReader<ClientReadHalf>, buf: &mut FrameBuf) -> Result<Option<DaemonFrame>, TransportError> {
+    read_frame_as(reader, buf).await
+}
+
+/// [`read_frame`], decoded as `T` (`serde_json::Value`: the frame as sent).
+async fn read_frame_as<T: serde::de::DeserializeOwned>(
+    reader: &mut BufReader<ClientReadHalf>,
+    buf: &mut FrameBuf,
+) -> Result<Option<T>, TransportError> {
     // Cancel-safe: the TUI polls this inside `select!`, so a partial line
     // stays in `buf.line` across a dropped future and is cleared only once
     // a whole frame has been taken out of it.
@@ -128,7 +158,12 @@ async fn read_frame(reader: &mut BufReader<ClientReadHalf>, buf: &mut FrameBuf) 
                 .map(str::trim_end);
             match t {
                 Ok("") => None,
-                Ok(t) => Some((decode_line::<DaemonFrame>(t).map(Some).map_err(TransportError::Protocol), t.len())),
+                Ok(t) => Some((
+                    decode_line::<T>(t)
+                        .map(Some)
+                        .map_err(TransportError::Protocol),
+                    t.len(),
+                )),
                 Err(e) => Some((Err(e), 0)),
             }
         };
@@ -188,7 +223,7 @@ impl Connected {
                 if welcome.protocol_version != client_version {
                     return Err(TransportError::Version { client: client_version, daemon: welcome.protocol_version });
                 }
-                Ok(Self { reader, writer, writer_task, welcome, path: path.to_path_buf(), hello: hello_copy, buf })
+                Ok(Self { reader, writer, writer_task, welcome, path: path.to_path_buf(), hello: hello_copy, buf, req: 0 })
             }
             Some(DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version, .. }, .. }) => {
                 Err(TransportError::Version { client: client_version, daemon: daemon_version })
@@ -220,6 +255,29 @@ impl Connected {
         match self.request(ClientFrame::Sessions).await? {
             DaemonFrame::SessionList { sessions } => Ok(sessions),
             other => Err(TransportError::Protocol(format!("expected session list, got {other:?}"))),
+        }
+    }
+
+    /// [`Self::sessions`] as the daemon sent them, untyped: a newer daemon's
+    /// fields and values (a lifecycle or worker-row field this build does
+    /// not know) are kept. For printing (`synaps daemon sessions --json`).
+    pub async fn sessions_raw(&mut self) -> Result<serde_json::Value, TransportError> {
+        self.writer
+            .send(ClientFrame::Sessions)
+            .await
+            .map_err(|_| TransportError::Closed)?;
+        let mut frame: serde_json::Value = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            read_frame_as(&mut self.reader, &mut self.buf),
+        )
+        .await
+        .map_err(|_| TransportError::Protocol("reply timed out".into()))??
+        .ok_or(TransportError::Closed)?;
+        match frame.get("type").and_then(|t| t.as_str()) {
+            Some("session_list") => Ok(frame["sessions"].take()),
+            _ => Err(TransportError::Protocol(format!(
+                "expected session list, got {frame}"
+            ))),
         }
     }
 
@@ -341,6 +399,49 @@ impl Connected {
             .await
             .map_err(|_| TransportError::Protocol("extension reload reply timed out".into()))??;
         reload_extension_reply(frame, &self.welcome.daemon_version)
+    }
+
+    /// `CatalogPage{before, limit, named_only}`: one page of the saved
+    /// sessions (see `ClientFrame::CatalogPage`). Strictly request/reply:
+    /// the reply must carry this request's `req`. A daemon that does not
+    /// list [`FEATURE_SESSION_PAGE`] is `DaemonTooOld`, and the frame is
+    /// never sent to it; the reply's `error` is `Protocol`.
+    pub async fn catalog_page(
+        &mut self,
+        before: Option<CatalogCursor>,
+        limit: Option<u32>,
+        named_only: bool,
+    ) -> Result<SavedPage, TransportError> {
+        if !self.welcome.supports(FEATURE_SESSION_PAGE) {
+            return Err(TransportError::DaemonTooOld {
+                daemon_version: self.welcome.daemon_version.clone(),
+                request: "saved sessions",
+            });
+        }
+        self.req += 1;
+        let req = self.req;
+        self.writer
+            .send(ClientFrame::CatalogPage { req, before, limit, named_only })
+            .await
+            .map_err(|_| TransportError::Closed)?;
+        // A page an earlier call gave up on (timed out, or its future was
+        // dropped) may still answer first: skip it, within this deadline.
+        let deadline = tokio::time::Instant::now() + CATALOG_PAGE_TIMEOUT;
+        let frame = loop {
+            let frame = tokio::time::timeout_at(deadline, read_frame(&mut self.reader, &mut self.buf))
+                .await
+                .map_err(|_| TransportError::Protocol("catalog page reply timed out".into()))??;
+            match frame {
+                Some(DaemonFrame::CatalogPage { req: r, .. }) if r < req => continue,
+                f => break f,
+            }
+        };
+        match frame.ok_or(TransportError::Closed)? {
+            DaemonFrame::CatalogPage { req: r, error: Some(e), .. } if r == req => Err(TransportError::Protocol(e)),
+            DaemonFrame::CatalogPage { req: r, sessions, next, .. } if r == req => Ok(SavedPage { sessions, next }),
+            DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
+            other => Err(TransportError::Protocol(format!("expected catalog page {req}, got {other:?}"))),
+        }
     }
 
     /// Say goodbye and drop the connection.
@@ -730,9 +831,31 @@ impl SocketTransport {
         s
     }
 
+    /// [`Connected::sessions_raw`] on a fresh connection.
+    pub async fn sessions_raw(path: &Path) -> Result<serde_json::Value, TransportError> {
+        let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
+        let s = c.sessions_raw().await;
+        c.bye().await;
+        s
+    }
+
     pub async fn shutdown(path: &Path, force: bool) -> Result<(), TransportError> {
         let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
         c.shutdown(force).await
+    }
+
+    /// `CatalogPage` on a fresh control connection (see
+    /// [`Connected::catalog_page`]).
+    pub async fn catalog_page(
+        path: &Path,
+        before: Option<CatalogCursor>,
+        limit: Option<u32>,
+        named_only: bool,
+    ) -> Result<SavedPage, TransportError> {
+        let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
+        let r = c.catalog_page(before, limit, named_only).await;
+        c.bye().await;
+        r
     }
 
     pub async fn purge(path: &Path) -> Result<Pong, TransportError> {
@@ -815,7 +938,7 @@ impl SocketTransport {
     }
 
     fn notice(&self, text: String) -> Envelope {
-        Envelope { session_id: self.session.clone(), seq: u64::MAX, ts: chrono::Utc::now(), event: SessionEventWire::SystemNotice(text) }
+        Envelope::new(self.session.clone(), u64::MAX, chrono::Utc::now(), SessionEventWire::SystemNotice(text))
     }
 
     /// The client's view of `api_messages` (kept current by the digest
@@ -846,12 +969,12 @@ impl SocketTransport {
             WireSessionEvent::Conversation { digest } => {
                 if digest.matches(&self.messages) {
                     let event = SessionEventWire::Conversation(digest.into_snapshot(self.messages.clone()));
-                    return Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event });
+                    return Some(Envelope::new(w.session_id, w.seq, w.ts, event));
                 }
                 if digest.messages_len == 0 {
                     self.messages.clear();
                     let event = SessionEventWire::Conversation(digest.into_snapshot(Vec::new()));
-                    return Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event });
+                    return Some(Envelope::new(w.session_id, w.seq, w.ts, event));
                 }
                 // Mirror drifted (compaction, abort repair, flushed events): re-fetch.
                 let first = self.pending_digest.is_none();
@@ -873,11 +996,11 @@ impl SocketTransport {
                     tracing::debug!("socket_transport: messages re-query still disagrees with digest; using fetched history");
                 }
                 let event = SessionEventWire::Conversation(digest.into_snapshot(self.messages.clone()));
-                Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event })
+                Some(Envelope::new(w.session_id, w.seq, w.ts, event))
             }
             WireSessionEvent::QueryResult { id, .. } if id >= RESERVED_QUERY_ID_BASE => None,
             event => {
-                let env = Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event: event.into() };
+                let env = Envelope::new(w.session_id, w.seq, w.ts, event.into());
                 match &env.event {
                     SessionEventWire::Stream(crate::StreamEvent::Session(crate::SessionEvent::MessageHistory(m))) => {
                         self.messages = m.clone();
@@ -902,11 +1025,11 @@ impl SocketTransport {
         match w.event {
             WireSessionEvent::Conversation { digest } => {
                 let event = SessionEventWire::Conversation(digest.into_snapshot(Vec::new()));
-                Some(Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event })
+                Some(Envelope::new(w.session_id, w.seq, w.ts, event))
             }
             WireSessionEvent::QueryResult { id, .. } if id >= RESERVED_QUERY_ID_BASE => None,
             event => {
-                let env = Envelope { session_id: w.session_id, seq: w.seq, ts: w.ts, event: event.into() };
+                let env = Envelope::new(w.session_id, w.seq, w.ts, event.into());
                 if matches!(
                     env.event,
                     SessionEventWire::Stream(crate::StreamEvent::Session(crate::SessionEvent::MessageHistory(_)))
@@ -916,6 +1039,19 @@ impl SocketTransport {
                 Some(env)
             }
         }
+    }
+}
+
+/// The `Welcome.features` entry a command needs, if an older daemon could
+/// not decode it (it would answer the whole frame as malformed), and how a
+/// refusal names it.
+fn feature_needed(cmd: &SessionCommand) -> Option<(&'static str, &'static str)> {
+    match cmd {
+        SessionCommand::Query {
+            query: crate::session::SessionQuery::CacheExpiry,
+            ..
+        } => Some((super::wire::FEATURE_CACHE_EXPIRY, "cache expiry")),
+        _ => None,
     }
 }
 
@@ -930,6 +1066,14 @@ impl ClientTransport for SocketTransport {
     }
 
     async fn send(&self, cmd: SessionCommand) -> Result<(), TransportError> {
+        if let Some((feature, request)) = feature_needed(&cmd) {
+            if !self.welcome.supports(feature) {
+                return Err(TransportError::DaemonTooOld {
+                    daemon_version: self.welcome.daemon_version.clone(),
+                    request,
+                });
+            }
+        }
         match self.writer.try_send(ClientFrame::Cmd { session_id: self.session.clone(), cmd }) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(TransportError::Backpressure),
@@ -1095,6 +1239,10 @@ impl ClientTransport for SocketTransport {
     fn socket_path(&self) -> Option<&Path> {
         Some(&self.path)
     }
+
+    fn addressed_replies(&self) -> bool {
+        self.welcome.supports(FEATURE_ADDRESSED_REPLIES)
+    }
 }
 
 #[cfg(test)]
@@ -1138,6 +1286,7 @@ mod tests {
                         generation: 1,
                         daemon_build: String::new(),
                         features: Vec::new(),
+                        boot_id: String::new(),
                     })
                 }
                 ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
@@ -1504,6 +1653,7 @@ mod tests {
                 generation: 1,
                 daemon_build: String::new(),
                 features: Vec::new(),
+                boot_id: String::new(),
             });
             w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
             line.clear();
@@ -1517,6 +1667,52 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, TransportError::Refused(ref m) if m == "unknown session"), "{err}");
+        srv.await.unwrap();
+    }
+
+    /// `sessions_raw` hands back a newer daemon's listing as sent: a
+    /// lifecycle and fields this build does not know survive (the typed
+    /// decode would read `unknown` and drop the fields).
+    #[tokio::test]
+    async fn raw_sessions_keep_what_a_newer_daemon_sends() {
+        let (_d, path) = sock();
+        let mut l = Listener::bind(&path).unwrap();
+        let list = r#"{"type":"session_list","sessions":[{"id":"s","name":null,"model":"m","cwd":null,"created_at":"2026-11-16T06:00:00Z","continued":false,"continue_info":null,"host_pid":1,"lifecycle":"saved","journal_id":"s","future":7,"workers":{"running":1,"rows":[{"handle_id":"sa_1","subagent_id":1,"agent_name":"a","status":"running","started_at":"2026-11-16T06:00:00Z","new_field":"x"}]}}]}"#;
+        let srv = tokio::spawn(async move {
+            let stream = l.accept().await.unwrap();
+            let (r, mut w) = crate::ipc::split_server(stream);
+            let mut reader = BufReader::new(r);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let welcome = DaemonFrame::Welcome(Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "t".into(),
+                pid: 1,
+                profile: None,
+                sessions: vec![],
+                progressive_tool_disclosure: true,
+                generation: 1,
+                daemon_build: String::new(),
+                features: Vec::new(),
+                boot_id: String::new(),
+            });
+            w.write_all(encode_line(&welcome).unwrap().as_bytes())
+                .await
+                .unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(matches!(
+                decode_line::<ClientFrame>(line.trim_end()),
+                Ok(ClientFrame::Sessions)
+            ));
+            w.write_all(format!("{list}\n").as_bytes()).await.unwrap();
+            line.clear();
+            let _ = reader.read_line(&mut line).await; // bye
+        });
+        let raw = SocketTransport::sessions_raw(&path).await.unwrap();
+        assert_eq!(raw[0]["lifecycle"], "saved");
+        assert_eq!(raw[0]["future"], 7);
+        assert_eq!(raw[0]["workers"]["rows"][0]["new_field"], "x");
         srv.await.unwrap();
     }
 
@@ -1539,6 +1735,7 @@ mod tests {
             generation: 1,
             daemon_build: String::new(),
             features,
+            boot_id: String::new(),
         });
         w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
         let mut sent = Vec::new();
@@ -1592,6 +1789,79 @@ mod tests {
         );
         assert!(err.to_string().contains("daemon reload"), "{err}");
         assert_eq!(srv.await.unwrap(), vec!["Bye".to_string()], "no Attach ever reached the daemon");
+    }
+
+    /// A daemon without `session_page` in `Welcome.features` would answer
+    /// "unknown variant": the client never asks it, and says why.
+    #[tokio::test]
+    async fn catalog_page_against_a_daemon_without_the_feature_is_too_old() {
+        let (_d, path) = sock();
+        let l = Listener::bind(&path).unwrap();
+        let srv = tokio::spawn(owned_fake_daemon(l, vec![FEATURE_OWNED_SESSIONS.into()]));
+        let mut conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        assert!(!conn.welcome.supports(FEATURE_SESSION_PAGE));
+        let err = conn.catalog_page(None, None, false).await.unwrap_err();
+        assert!(
+            matches!(err, TransportError::DaemonTooOld { request: "saved sessions", ref daemon_version } if daemon_version == "0.0.1-old"),
+            "{err}"
+        );
+        conn.bye().await;
+        assert_eq!(srv.await.unwrap(), vec!["Bye".to_string()], "no CatalogPage ever reached the daemon");
+    }
+
+    /// A daemon without `cache_expiry` would fail the frame as malformed:
+    /// the client never sends the query, and says why; with the feature
+    /// the query goes out (arch-review-435-436-437 Contract v3 §3).
+    #[tokio::test]
+    async fn cache_expiry_against_a_daemon_without_the_feature_is_too_old() {
+        let query = || SessionCommand::Query {
+            id: 4,
+            query: crate::session::SessionQuery::CacheExpiry,
+        };
+        for (features, sent) in [
+            // The detach is a `Cmd` and a `Bye`.
+            (
+                vec![FEATURE_ADDRESSED_REPLIES.to_string()],
+                vec!["Attach", "Cmd", "Bye"],
+            ),
+            (
+                vec![
+                    FEATURE_ADDRESSED_REPLIES.to_string(),
+                    FEATURE_CACHE_EXPIRY.to_string(),
+                ],
+                vec!["Attach", "Cmd", "Cmd", "Bye"],
+            ),
+        ] {
+            let (_d, path) = sock();
+            let l = Listener::bind(&path).unwrap();
+            let gated = !features.iter().any(|f| f == FEATURE_CACHE_EXPIRY);
+            let srv = tokio::spawn(owned_fake_daemon(l, features));
+            let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test))
+                .await
+                .unwrap();
+            let (t, _) = SocketTransport::attach(
+                conn,
+                Attach::Existing {
+                    session_id: "fake-1".into(),
+                    mode: AttachMode::Mirror,
+                },
+            )
+            .await
+            .unwrap();
+            let r = t.send(query()).await;
+            if gated {
+                let err = r.unwrap_err();
+                assert!(
+                    matches!(err, TransportError::DaemonTooOld { request: "cache expiry", ref daemon_version } if daemon_version == "0.0.1-old"),
+                    "{err}"
+                );
+            } else {
+                r.unwrap();
+            }
+            t.detach().await;
+            drop(t);
+            assert_eq!(srv.await.unwrap(), sent);
+        }
     }
 
     /// A daemon that advertises the feature but grants no owner token: the

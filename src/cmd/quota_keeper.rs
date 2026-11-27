@@ -1594,6 +1594,7 @@ mod tests {
                 reset_at: Some(observed + HOUR),
                 reset_kind: usage::ResetKind::QuotaWindow,
                 limit_reached: Some(false),
+                limit_status: None,
             },
             usage::UsageWindow {
                 id: "secondary".into(),
@@ -1606,6 +1607,7 @@ mod tests {
                 reset_at: reset,
                 reset_kind: usage::ResetKind::QuotaWindow,
                 limit_reached: Some(weekly_used >= 100.0),
+                limit_status: None,
             },
         ];
         s
@@ -1906,6 +1908,7 @@ mod tests {
             reset_at: None,
             reset_kind: usage::ResetKind::QuotaWindow,
             limit_reached: Some(true),
+            limit_status: None,
         });
         s.windows.push(usage::UsageWindow {
             id: "gpt-6-astra".into(),
@@ -1922,6 +1925,7 @@ mod tests {
             reset_at: None,
             reset_kind: usage::ResetKind::QuotaWindow,
             limit_reached: None,
+            limit_status: None,
         });
         s.model_availability = vec![usage::ModelAvailability {
             model: "gpt-6-astra".into(),

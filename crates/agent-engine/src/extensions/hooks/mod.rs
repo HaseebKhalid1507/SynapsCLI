@@ -41,6 +41,37 @@ fn extensions_trace_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Injections gathered from one emit, in handler order (#414). `content`
+/// joins every extension's `content` the way it always did (what
+/// `on_session_start` and older consumers use); `parts` keeps each
+/// extension's parts with the host-known source stamped on, so the runtime
+/// can save, show and mark them per extension.
+#[derive(Default)]
+struct Injections {
+    contents: Vec<String>,
+    parts: Vec<events::InjectPart>,
+}
+
+impl Injections {
+    fn push(&mut self, source: &str, result: &HookResult) {
+        if let HookResult::Inject { content, .. } = result {
+            self.contents.push(content.clone());
+        }
+        // Any `source` on the wire is ignored (`#[serde(skip)]`); this is
+        // the only place one is set.
+        self.parts
+            .extend(result.inject_parts().into_iter().map(|p| p.from_source(source)));
+    }
+
+    fn finish(self) -> Option<HookResult> {
+        (!self.contents.is_empty()).then(|| HookResult::Inject {
+            content: self.contents.join("\n\n"),
+            forget: false,
+            parts: self.parts,
+        })
+    }
+}
+
 fn hook_result_action(result: &HookResult) -> &'static str {
     match result {
         HookResult::Continue => "continue",
@@ -138,6 +169,9 @@ pub struct HookBus {
     /// Keyed by conversation session id: one process may host N sessions
     /// (Phase 2 daemon), and each must read only its own injection.
     session_injection: RwLock<HashMap<String, String>>,
+    /// Advanced under `session_injection`'s write guard by every set and
+    /// clear ([`Self::injection_generation`]): a lock-free change counter.
+    injection_gen: std::sync::atomic::AtomicU64,
     /// `Some(host)`: this bus is a subagent worker's view of `host`
     /// ([`Self::worker_transforms`]) and has no handlers of its own.
     transforms_of: Option<Arc<HookBus>>,
@@ -152,6 +186,7 @@ impl HookBus {
         Self {
             handlers: RwLock::new(HashMap::new()),
             session_injection: RwLock::new(HashMap::new()),
+            injection_gen: std::sync::atomic::AtomicU64::new(0),
             generations: std::sync::Mutex::new(HashMap::new()),
             transforms_of: None,
             notify_slots: Arc::new(tokio::sync::Semaphore::new(NOTIFY_MAX_IN_FLIGHT)),
@@ -227,10 +262,17 @@ impl HookBus {
     /// after extensions have loaded. Later calls for the same id replace the
     /// stored value.
     pub async fn set_session_injection_for(&self, session_id: &str, content: String) {
-        self.session_injection
-            .write()
-            .await
-            .insert(session_id.to_string(), content);
+        let mut map = self.session_injection.write().await;
+        map.insert(session_id.to_string(), content);
+        self.injection_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The injection change counter, read without the lock (a `CacheExpiry`
+    /// capture), compared again after the reads it guards.
+    pub fn injection_generation(&self) -> u64 {
+        self.injection_gen
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Context injected at session start for `session_id`, if any. Read on
@@ -241,7 +283,19 @@ impl HookBus {
 
     /// Drop the injection recorded for `session_id` (session teardown).
     pub async fn clear_session_injection(&self, session_id: &str) {
-        self.session_injection.write().await.remove(session_id);
+        let mut map = self.session_injection.write().await;
+        map.remove(session_id);
+        self.injection_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Test seam: hold the injection's write lock, as a set or a clear
+    /// holds it, until the guard drops.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn hold_session_injection(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, String>> {
+        self.session_injection.write().await
     }
 
     /// Compatibility shim: writes under the empty key.
@@ -339,7 +393,7 @@ impl HookBus {
         }; // lock dropped here
 
         // Collect injections from all handlers rather than returning on first
-        let mut injections: Vec<String> = Vec::new();
+        let mut injections = Injections::default();
         // First valid advisory context-phase report wins; the chain continues
         // so later observers still see the event.
         let mut context_phase: Option<String> = None;
@@ -443,15 +497,14 @@ impl HookBus {
                     return HookResult::Block { reason };
                 }
                 Ok(HookResult::Continue) => {}
-                Ok(HookResult::Inject { content }) => {
+                Ok(result @ HookResult::Inject { .. }) => {
                     tracing::debug!(
                         hook = %ev.kind.as_str(),
                         extension = %reg.handler.id(),
-                        len = content.len(),
                         "Extension injected context"
                     );
                     // Accumulate — don't early-return. Multiple extensions can inject.
-                    injections.push(content);
+                    injections.push(reg.handler.id(), &result);
                 }
                 Ok(HookResult::Modify { input }) => {
                     if !confirms.is_empty() {
@@ -589,10 +642,8 @@ impl HookBus {
         // Merge accumulated injections from all handlers. An advisory phase
         // report is returned only when nothing else would be (Block/Inject
         // take precedence; on_message_complete permits neither).
-        if !injections.is_empty() {
-            HookResult::Inject {
-                content: injections.join("\n\n"),
-            }
+        if let Some(inject) = injections.finish() {
+            inject
         } else if let Some(phase) = context_phase {
             HookResult::ContextPhase { phase }
         } else {
@@ -674,7 +725,7 @@ impl HookBus {
 
         let results = join_all(futures).await;
 
-        let mut injections: Vec<String> = Vec::new();
+        let mut injections = Injections::default();
         // First accepted report in completion order (registration order for
         // the collected results); advisory only, never stops the chain.
         let mut context_phase: Option<String> = None;
@@ -684,8 +735,8 @@ impl HookBus {
                 Ok(HookResult::Block { reason }) => {
                     return HookResult::Block { reason };
                 }
-                Ok(HookResult::Inject { content }) => {
-                    injections.push(content);
+                Ok(result @ HookResult::Inject { .. }) => {
+                    injections.push(reg.handler.id(), &result);
                 }
                 Ok(HookResult::Modify { input }) => {
                     return HookResult::Modify { input };
@@ -730,10 +781,8 @@ impl HookBus {
             }
         }
 
-        if !injections.is_empty() {
-            HookResult::Inject {
-                content: injections.join("\n\n"),
-            }
+        if let Some(inject) = injections.finish() {
+            inject
         } else if let Some(phase) = context_phase {
             HookResult::ContextPhase { phase }
         } else {
@@ -909,6 +958,18 @@ impl HookBus {
         }
         let handlers = self.handlers.read().await;
         handlers.values().map(|v| v.len()).sum()
+    }
+
+    /// Whether any handler is registered for `kind` (its matchers and tool
+    /// filters aside): whether an `emit` of it can reach an extension.
+    pub async fn has_handlers(&self, kind: HookKind) -> bool {
+        match &self.transforms_of {
+            Some(host) => host
+                .worker_transform_registrations(kind)
+                .await
+                .is_some_and(|regs| !regs.is_empty()),
+            None => self.handlers.read().await.get(&kind).is_some_and(|regs| !regs.is_empty()),
+        }
     }
 
     /// Check if any handlers are registered (for fast-path decisions).
@@ -1436,9 +1497,7 @@ mod tests {
             "block"
         );
         assert_eq!(
-            hook_result_action(&HookResult::Inject {
-                content: "context".into(),
-            }),
+            hook_result_action(&HookResult::inject("context")),
             "inject"
         );
         assert_eq!(
@@ -2397,7 +2456,7 @@ mod worker_view_tests {
             },
         );
         let block = Probe::new("blocker", HookResult::Block { reason: "no".into() });
-        let inject = Probe::new("injector", HookResult::Inject { content: "ctx".into() });
+        let inject = Probe::new("injector", HookResult::inject("ctx"));
         let observer = Probe::new("observer", HookResult::Replace { output: "SNEAKY".into() });
         let crush = Probe::new("crush", HookResult::Replace { output: "CRUSHED".into() });
         let intercept = perms(&[Permission::ToolsIntercept]);
@@ -2618,6 +2677,48 @@ mod worker_view_tests {
         assert!(Arc::ptr_eq(nested.transforms_of.as_ref().unwrap(), &host));
         assert_eq!(nested.handler_count().await, 0);
     }
+
+    /// #414: two extensions inject; the merged result carries each one's
+    /// parts in handler order with the host-known id stamped on (never the
+    /// wire's), and `content` still joins every `content` as before.
+    #[tokio::test]
+    async fn before_message_injections_keep_parts_and_host_stamped_sources() {
+        let bus = HookBus::new();
+        let a: HookResult = serde_json::from_value(serde_json::json!({
+            "action": "inject", "content": "fallback-a",
+            "parts": [{"content": "A1", "source": "b"}, {"content": "A2", "forget": true}]
+        }))
+        .unwrap();
+        let b: HookResult = serde_json::from_value(
+            serde_json::json!({"action": "inject", "content": "B", "forget": true}),
+        )
+        .unwrap();
+        for (id, result) in [("ext-a", a), ("ext-b", b)] {
+            bus.subscribe(
+                HookKind::BeforeMessage,
+                Probe::new(id, result),
+                None,
+                None,
+                perms(&[Permission::LlmContent]),
+            )
+            .await
+            .unwrap();
+        }
+        let merged = bus.emit(&HookEvent::before_message("hi")).await;
+        let HookResult::Inject { content, parts, .. } = &merged else {
+            panic!("expected Inject, got {merged:?}");
+        };
+        assert_eq!(content, "fallback-a\n\nB");
+        assert_eq!(
+            parts,
+            &vec![
+                events::InjectPart::saved("A1").from_source("ext-a"),
+                events::InjectPart::forget("A2").from_source("ext-a"),
+                events::InjectPart::forget("B").from_source("ext-b"),
+            ]
+        );
+        assert_eq!(merged.inject_parts(), *parts);
+    }
 }
 
 /// A hook subscriber for tests of code that sends notify-only events.
@@ -2811,7 +2912,7 @@ mod notify_tests {
     async fn notify_ignores_block_and_inject_results() {
         let listeners = [
             Listener::answering("block", HookResult::Block { reason: "no".into() }),
-            Listener::answering("inject", HookResult::Inject { content: "ctx".into() }),
+            Listener::answering("inject", HookResult::inject("ctx")),
             Listener::answering("replace", HookResult::Replace { output: "x".into() }),
             Listener::answering("confirm", HookResult::confirm("sure?")),
             Listener::answering("phase", HookResult::ContextPhase { phase: "new_task".into() }),

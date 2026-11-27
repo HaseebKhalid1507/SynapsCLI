@@ -22,6 +22,7 @@ pub mod pins;
 pub mod registry;
 pub mod reload;
 pub mod rename;
+pub mod saved;
 #[cfg(windows)]
 pub(crate) mod win;
 
@@ -148,6 +149,11 @@ pub fn echo_factory() -> SessionFactory {
     })
 }
 
+/// A fresh `Welcome.boot_id`: 16 hex characters.
+pub fn mint_boot_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
+}
+
 /// The default factory for a booted host: `EngineHost::create_session` (A1) —
 /// the real `SessionActor` owning one `Runtime` + `ConversationState`.
 pub fn host_factory(host: &Arc<EngineHost>) -> SessionFactory {
@@ -204,6 +210,8 @@ pub struct DaemonState {
     // ── C3 reload ──
     /// Reload counter (`Welcome.generation`; starts at 1).
     pub generation: u64,
+    /// `Welcome.boot_id`: minted at a cold start, carried across reloads.
+    pub boot_id: String,
     /// Drain: refuse `Attach::Create` / new turns while set.
     pub reloading: AtomicBool,
     /// Generation announced in `Reloading`/`Bye{Reloading}`.
@@ -215,8 +223,11 @@ pub struct DaemonState {
     /// The flock, held here (not on `Daemon`) so `reload` can hand its fd
     /// to the next image.
     pub lock_fd: Mutex<Option<DaemonLock>>,
-    /// `old id → new id` for one generation (ids differ only if a
-    /// LinkedSuccessor compaction happened since boot).
+    /// `old id → new id` for one generation: a session restored under
+    /// another id than it had (its journal id after a LinkedSuccessor
+    /// compaction or a `/clear`/`/resume`, or a minted one; a lock-held
+    /// placeholder's id), and a placeholder replaced by its real session
+    /// under another id. Consulted only when no live session has the id.
     pub reload_aliases: Mutex<HashMap<String, String>>,
     /// The `daemon.json` record this image wrote, and its writes. A Ping
     /// that finds the file missing or naming another pid puts it back
@@ -226,6 +237,9 @@ pub struct DaemonState {
     pub pins: Arc<pins::PinBook>,
     /// A cold start's pin restore is running (holds the idle exit).
     pub restoring: AtomicBool,
+    /// `CatalogPage`: one catalog load at a time, shared by the requests
+    /// that arrive before it starts.
+    pub saved: saved::SavedLoader,
 }
 
 impl DaemonState {
@@ -299,9 +313,9 @@ impl DaemonState {
     }
 
     /// Live handle by id; falls back to the C3 reload alias
-    /// (`old id → new id`, set when a LinkedSuccessor compaction happened
-    /// since boot) so clients reconnecting after `daemon reload` find
-    /// their session under the id they last saw.
+    /// (`old id → new id`, [`Self::reload_aliases`]) so clients
+    /// reconnecting after `daemon reload` find their session under the id
+    /// they last saw.
     pub fn attach(&self, id: &SessionId) -> Option<SessionHandle> {
         self.host.attach(id).filter(|h| h.is_alive()).or_else(|| {
             let alias = self
@@ -320,8 +334,11 @@ impl DaemonState {
         self.host.adopt_session(handle);
     }
 
-    pub fn remove(&self, id: &SessionId) {
-        self.host.remove_session(id);
+    /// Drop `handle`'s session from the map, only if the entry under its
+    /// id is that session (`EngineHost::remove_session_if`).
+    pub fn remove(&self, handle: &SessionHandle) {
+        self.host
+            .remove_session_if(&handle.id, &handle.session_ref());
     }
 
     pub async fn create(&self, cfg: SessionConfig) -> Result<SessionHandle, String> {
@@ -331,39 +348,64 @@ impl DaemonState {
     }
 
     /// F23: a lock-held placeholder (`meta.locked_by.is_some()`) is retried on
-    /// every attach. Pull it out of the map first — otherwise the host's
-    /// attach-if-live short-circuit hands the placeholder straight back —
-    /// and re-run the real `create` from the journal. Success replaces the
-    /// placeholder under the same id; still-held puts it back and the caller
-    /// attaches to it (→ `AttachRefused` naming the holder).
+    /// every attach: re-run the real `create` of the conversation it holds
+    /// (its config's `continue_session`: after a `/clear` that is not its
+    /// actor id). The placeholder stays listed meanwhile, flagged
+    /// `retrying` so the host's attach-if-live short-circuit does not hand
+    /// it straight back and its id is free for its real session. Success
+    /// replaces the placeholder: in place (rehydrate registered it under
+    /// the id the real session takes), or, when the journal resolved to its
+    /// successor, under that one's id with the alias `old id → new id`.
+    /// Still held: the retry ends and the caller attaches to the placeholder
+    /// (→ `AttachRefused` naming the holder).
     pub async fn retry_locked_placeholder(&self, placeholder: SessionHandle) -> SessionHandle {
-        let cfg = SessionConfig {
-            continue_session: Some(Some(placeholder.id.as_str().to_string())),
-            ..placeholder.placeholder_config().cloned().unwrap_or_default()
-        };
-        self.remove(&placeholder.id);
-        match (self.factory)(cfg).await {
-            Ok(real) if real.id == placeholder.id || real.journal_id() == placeholder.id.as_str() => {
-                tracing::info!(session = %placeholder.id, "daemon: locked journal released — placeholder replaced by the real session");
-                self.insert(real.clone());
-                // A restored owned session: the daemon accepts connections.
-                if real.is_owned() {
-                    arm_owner_rebind(&real).await;
-                }
-                real
-            }
-            Ok(other) => {
-                // Journal resolved somewhere else (e.g. compacted_into follow): keep it, drop the placeholder.
-                tracing::warn!(session = %placeholder.id, resolved = %other.id, "daemon: placeholder retry resolved to a different id");
-                self.insert(other.clone());
-                other
-            }
+        let journal = placeholder.journal_id();
+        let mut cfg = placeholder
+            .placeholder_config()
+            .cloned()
+            .unwrap_or_default();
+        cfg.continue_session = Some(Some(journal.clone()));
+        // Held until the placeholder is replaced, not just across the
+        // create: until then the real session and the placeholder are both
+        // listed, and only the mark keeps resolvers off the placeholder.
+        let _retrying = placeholder.retry_guard();
+        let real = match (self.factory)(cfg).await {
+            Ok(real) => real,
             Err(e) => {
                 tracing::debug!(session = %placeholder.id, error = %e, "daemon: journal still locked; keeping placeholder");
-                self.insert(placeholder.clone());
-                placeholder
+                return placeholder;
             }
+        };
+        // The real session holds the journal (replaced in place, its id
+        // being the one the placeholder took), or the journal resolved to
+        // its on-disk successor (`compacted_into`), a session that does not
+        // hold it. Either way it replaces the placeholder, and the old id
+        // reaches it by alias.
+        let same = real.holds(&journal);
+        if same {
+            tracing::info!(session = %placeholder.id, journal, "daemon: locked journal released — placeholder replaced by the real session");
+        } else {
+            tracing::warn!(session = %placeholder.id, resolved = %real.id, "daemon: placeholder retry resolved to another conversation");
         }
+        if real.id != placeholder.id {
+            self.remove(&placeholder);
+            // Every id that reached the placeholder reaches its successor:
+            // its own, and the old ids aliased to it at rehydrate.
+            let mut aliases = self
+                .reload_aliases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for to in aliases.values_mut().filter(|to| **to == placeholder.id.0) {
+                *to = real.id.0.clone();
+            }
+            aliases.insert(placeholder.id.0.clone(), real.id.0.clone());
+        }
+        self.insert(real.clone());
+        // A restored owned session: the daemon accepts connections.
+        if same && real.is_owned() {
+            arm_owner_rebind(&real).await;
+        }
+        real
     }
 
     pub fn request_shutdown(&self, force: bool) {
@@ -417,6 +459,13 @@ impl Daemon {
             }
         };
         let generation = reload_state.as_ref().map_or(1, |rs| rs.generation);
+        // An image from before `boot_id` carried none: mint one (clients see
+        // one spurious "new boot", which is safe).
+        let boot_id = reload_state
+            .as_ref()
+            .map(|rs| rs.boot_id.clone())
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(mint_boot_id);
         let listener = listener::bind(&paths.sock)?;
 
         let info = DaemonInfo {
@@ -442,6 +491,7 @@ impl Daemon {
             shutdown: CancellationToken::new(),
             force_shutdown: AtomicBool::new(false),
             generation,
+            boot_id,
             reloading: AtomicBool::new(false),
             reload_generation: std::sync::atomic::AtomicU64::new(generation),
             reload_announce: Mutex::new(CancellationToken::new()),
@@ -450,6 +500,7 @@ impl Daemon {
             meta,
             pins: Arc::new(pins::PinBook::for_active_profile()),
             restoring: AtomicBool::new(false),
+            saved: saved::SavedLoader::default(),
         });
         state.host.set_pin_sink(Arc::clone(&state.pins) as Arc<dyn crate::session::PinSink>);
 
@@ -539,7 +590,9 @@ pub async fn session_is_idle(handle: &SessionHandle) -> bool {
     let probe = async {
         loop {
             match rx.recv().await {
-                Ok(env) => {
+                // Only the host's own reply: a client that sends this id
+                // gets its answer on its attachment, never here.
+                Ok(env) if env.audience == crate::session::Audience::Host => {
                     if let SessionEventWire::QueryResult { id, value } = env.event {
                         if id == IDLE_PROBE_QUERY_ID {
                             // Real actor: {"streaming": bool, "pending_prompts": n}. A backend that
@@ -550,6 +603,7 @@ pub async fn session_is_idle(handle: &SessionHandle) -> bool {
                         }
                     }
                 }
+                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return true,
             }

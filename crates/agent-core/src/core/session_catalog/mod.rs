@@ -34,7 +34,7 @@ pub use query::{parse_query, DateBound, Query};
 pub use rename::{rename_past_session, rename_past_session_if, RenameError, SessionMtimes};
 pub use time::{Clock, When};
 pub use view::{
-    build_view, day_groups, noise_reasons, DateKey, DayGroup, FacetCount, FacetSelection, Facets,
+    build_view, day_groups, is_sandbox_cwd, noise_reasons, DateKey, DayGroup, FacetCount, FacetSelection, Facets,
     NoiseCounts, NoiseReasons, Sort, View, MIN_MESSAGES,
 };
 
@@ -69,6 +69,49 @@ impl CatalogPaths {
     }
 }
 
+/// The text a person typed in message `m`, as previews and titles show it:
+/// a user message's displayable content, never a context note or text the
+/// host injected (events, abort context, interrupt markers). `None` for
+/// anything else, and for blank text.
+pub fn typed_user_text(m: &serde_json::Value) -> Option<String> {
+    if m["role"] != "user" || body::is_context_note(m) {
+        return None;
+    }
+    crate::core::session::user_message_for_display(m)
+        .filter(|t| !body::is_host_injected(t) && !t.trim().is_empty())
+}
+
+/// [`listing_title`] is cut to this many characters (`…` included).
+pub const LISTING_TITLE_CHARS: usize = 120;
+
+/// A session's title as listings show it, held or saved alike: the header
+/// title, else the first user message; one line, no control or bidi
+/// override characters (a terminal client prints it), at most
+/// [`LISTING_TITLE_CHARS`] characters with `…`. Empty when there is
+/// neither.
+pub fn listing_title(title: &str, first_user: Option<&str>) -> String {
+    // Control and bidi override/isolate characters out (as
+    // `user_content_for_display` does for document names), then one line.
+    let clean = |s: &str| -> String {
+        let kept: String = s
+            .chars()
+            .filter(|&c| !c.is_control() || c.is_whitespace())
+            .filter(|c| !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+            .collect();
+        kept.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let line = Some(clean(title))
+        .filter(|t| !t.is_empty())
+        .or_else(|| first_user.map(clean))
+        .unwrap_or_default();
+    if line.chars().count() <= LISTING_TITLE_CHARS {
+        return line;
+    }
+    let mut cut: String = line.chars().take(LISTING_TITLE_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
 /// One past session as the Past tab sees it.
 #[derive(Debug, Clone)]
 pub struct CatalogEntry {
@@ -85,6 +128,8 @@ pub struct CatalogEntry {
     pub message_count: Option<usize>,
     /// Successor id when this session was compacted into another.
     pub compacted_into: Option<String>,
+    /// Predecessor id when this session is a compaction's successor.
+    pub parent_session: Option<String>,
     // ── index.jsonl join ──
     /// Most recent `start` cwd.
     pub cwd: Option<PathBuf>,
@@ -210,6 +255,13 @@ impl Catalog {
 /// `paths.index_path`. Pure + blocking: run it on `spawn_blocking`.
 /// A missing dir or index is empty, not an error.
 pub fn load_catalog(paths: &CatalogPaths) -> std::io::Result<Catalog> {
+    load_catalog_with(paths, 8)
+}
+
+/// [`load_catalog`] on at most `threads` header-reading threads; `1` reads
+/// on the calling thread and spawns none (a long-lived process that must
+/// not fan out, like the daemon).
+pub fn load_catalog_with(paths: &CatalogPaths, threads: usize) -> std::io::Result<Catalog> {
     let index = read_index(&paths.index_path);
     let dir = &paths.sessions_dir;
     let entries = crate::core::session_journal::session_dir_entries(dir)?;
@@ -228,7 +280,7 @@ pub fn load_catalog(paths: &CatalogPaths) -> std::io::Result<Catalog> {
         .collect();
     // Header reads are tiny but latency-bound on a cold page cache: a few
     // threads keep the disk queue busy (≈4× faster cold, same warm).
-    let headers = parallel_map(&snapshots, 8, |(file, _)| read_header(dir, &file.name));
+    let headers = parallel_map(&snapshots, threads, |(file, _)| read_header(dir, &file.name));
 
     let mut out = Catalog::default();
     for ((file, stem), h) in snapshots.iter().zip(headers) {
@@ -253,6 +305,7 @@ pub fn load_catalog(paths: &CatalogPaths) -> std::io::Result<Catalog> {
             cost: h.session_cost,
             message_count: h.message_count,
             compacted_into: h.compacted_into,
+            parent_session: h.parent_session,
             cwd: joined.and_then(|j| j.cwd.clone()),
             profile: joined.and_then(|j| j.profile.clone()),
             turns: joined.and_then(|j| j.turns),
@@ -311,6 +364,7 @@ struct Header {
     session_cost: f64,
     message_count: Option<usize>,
     compacted_into: Option<String>,
+    parent_session: Option<String>,
 }
 
 /// Same header read + journal overlay as `session::parse_session_header`,
@@ -334,6 +388,8 @@ fn read_header(dir: &Path, file_name: &str) -> Option<Header> {
         message_count: Option<usize>,
         #[serde(default)]
         compacted_into: Option<String>,
+        #[serde(default)]
+        parent_session: Option<String>,
     }
     let file = crate::core::session_journal::confined_open(dir, file_name).ok()??;
     let text = crate::core::session::read_session_header_from_file(file)?;
@@ -348,6 +404,7 @@ fn read_header(dir: &Path, file_name: &str) -> Option<Header> {
         session_cost: raw.session_cost,
         message_count: raw.message_count,
         compacted_into: raw.compacted_into,
+        parent_session: raw.parent_session,
     };
     if let Some(tail) = crate::core::session_journal::journal_meta_tail_for_generation(
         dir,

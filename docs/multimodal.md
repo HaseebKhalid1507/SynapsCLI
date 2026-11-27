@@ -124,7 +124,7 @@ The observed Astra catalog does **not** advertise PDF/file input, so PDFs are
 rejected rather than guessed supported. Native known Anthropic models accept
 PDF document blocks; compatible routes require exact advertised file capability.
 This implements inline request attachments, not a provider Files API upload/delete
-lifecycle. Native Gemini Code Assist, explicit cloud invokes and extension
+lifecycle. Explicit cloud invokes and extension
 providers currently reject attachments. Clipboard image decoding and WebSocket
 binary uploads are not implemented; use `/attach` or local stdio RPC.
 

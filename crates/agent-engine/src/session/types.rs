@@ -351,6 +351,20 @@ pub struct SessionConfig {
     /// presents its token (see `docs/daemon-mode.md`, "Owned sessions").
     #[serde(skip)]
     pub owned: Option<OwnedConfig>,
+    /// Set by a daemon reload (never on the wire; the reload record carries
+    /// it beside the config): what the old image's actor held besides its
+    /// journal, restored into the new actor's conversation cell.
+    #[serde(skip)]
+    pub restore_conversation: Option<RestoredConversation>,
+}
+
+/// A reloaded actor's conversation cell (`SessionConfig::restore_conversation`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoredConversation {
+    /// Applied only when the new actor continues this journal.
+    pub journal_id: String,
+    pub supersedes: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn default_true() -> bool {
@@ -397,6 +411,7 @@ impl Default for SessionConfig {
             restore_parked: false,
             message_clock: None,
             owned: None,
+            restore_conversation: None,
         }
     }
 }
@@ -424,12 +439,18 @@ impl From<&crate::engine::setup::ContinueInfo> for ContinueInfoWire {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
+    /// The actor (what `Attach::Existing` takes). Not a conversation: see
+    /// `journal_id`.
     pub id: SessionId,
     pub name: Option<String>,
     pub model: String,
     pub cwd: Option<PathBuf>,
+    /// When the conversation this actor holds began. Kept across a
+    /// compaction (the chain's start) and a reload; moves with `/clear` and
+    /// an in-session `/resume` (in listings; `Attached.meta` is the record
+    /// at create).
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub continued: bool,
     pub continue_info: Option<ContinueInfoWire>,
@@ -452,7 +473,11 @@ pub struct SessionMeta {
     /// active client, not the only one that may type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_input: Option<ClientInput>,
-    /// `conv.session.id` — differs from `id` after a LinkedSuccessor compaction.
+    /// `conv.session.id`: the conversation this actor holds now. Key
+    /// conversations by this, never by `id`. It differs from `id` after a
+    /// LinkedSuccessor compaction, a `/clear`, an in-session `/resume`, and
+    /// on an actor created while another live actor had the journal's id
+    /// (it took a minted id). Empty from a very old daemon.
     #[serde(default)]
     pub journal_id: String,
     /// Set when the session's journal is locked by another process (F23):
@@ -489,6 +514,94 @@ pub struct SessionMeta {
     /// API message count, as of the last publish.
     #[serde(default)]
     pub messages: usize,
+    /// The workers that hold this session's park. Empty when none, when
+    /// parked or ending, and from a daemon without `session_workers`
+    /// (`wire::FEATURE_SESSION_WORKERS`). Filled in listings (`meta_live`:
+    /// `Welcome.sessions`, `SessionList`) only. `Attached.meta` is the
+    /// create-time record and never carries them, like the presence fields
+    /// (design Q14): a client keeps workers from the listing, never from an
+    /// attach. `busy` stays a turn or a compaction: clients combine the two.
+    #[serde(default, skip_serializing_if = "SessionWorkers::is_empty")]
+    pub workers: SessionWorkers,
+    /// Saved rows only (`lifecycle: saved`, `CatalogPage`): the head
+    /// journal's `updated_at`. Absent on held rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl SessionMeta {
+    /// ` · 2 workers` while background workers run, else empty: listings
+    /// append it to the state so idle-with-workers never reads as idle.
+    pub fn workers_tag(&self) -> String {
+        match self.workers.running {
+            0 => String::new(),
+            1 => " · 1 worker".into(),
+            n => format!(" · {n} workers"),
+        }
+    }
+}
+
+/// How many worker rows a [`SessionMeta`] carries ([`SessionWorkers::more`]
+/// counts the rest).
+pub const SESSION_WORKER_ROWS: usize = 8;
+
+/// A session's workers as listings see them: exactly the ones that hold its
+/// park (`SubagentRegistry::holds_park`), the same predicate that keeps it
+/// from parking.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionWorkers {
+    /// Running and not stopping (a cancelled worker is not counted).
+    #[serde(default)]
+    pub running: u32,
+    /// Running first (oldest first), then finished with an uncollected
+    /// result (newest first). At most [`SESSION_WORKER_ROWS`].
+    #[serde(default)]
+    pub rows: Vec<WorkerRow>,
+    /// Workers that hold the park but did not fit in `rows`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub more: u32,
+}
+
+impl SessionWorkers {
+    pub fn is_empty(&self) -> bool {
+        self.running == 0 && self.rows.is_empty() && self.more == 0
+    }
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// One worker in [`SessionWorkers`]. Field names match `SubagentDisplayRow`
+/// and the status labels `WatchPage::status`, so a client keys both by
+/// `handle_id`. Times are wall clock, stamped once.
+///
+/// Append-only: fields are only ever added, with `#[serde(default)]`; an
+/// existing one is never removed, renamed or retyped. Rust clients (TUI,
+/// `synaps daemon sessions`) decode a whole `SessionList` / `Welcome` as one
+/// frame, so one row they cannot read would fail the entire listing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerRow {
+    /// `sa_12`: what `SessionQuery::SubagentWatch` and `subagent_*` take.
+    pub handle_id: String,
+    pub subagent_id: u64,
+    pub agent_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// `running` | `completed` | `cancelled` | `timed_out` | `failed`: a
+    /// string, so a new status never breaks a client.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancel_requested: bool,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Latest progress line. Not sampled yet: always empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub step: String,
+    /// Tool calls so far; sent with `step`, under the same condition.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tools: u32,
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).
@@ -501,14 +614,26 @@ pub enum SessionLifecycle {
     Parking = 1,
     Parked = 2,
     Ending = 3,
+    /// A conversation on disk that this daemon does not hold. Sent only in
+    /// `CatalogPage` replies (feature `session_page`); never in
+    /// `Welcome.sessions`, `SessionList` or `Attached.meta`, whose 0.12.0
+    /// readers have no fallback variant. Never stored by an actor.
+    Saved = 4,
+    /// A lifecycle this build does not know (from a newer daemon). Never
+    /// stored by an actor, never sent.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 impl SessionLifecycle {
+    /// The handle's lifecycle cell. Never [`Self::Saved`]: a held session
+    /// is not saved, so a listing built from handles cannot carry it.
     pub fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Parking,
             2 => Self::Parked,
             3 => Self::Ending,
+            255 => Self::Unknown,
             _ => Self::Live,
         }
     }
@@ -837,14 +962,135 @@ pub const CONFIRM_PROMPT_TITLE: &str = "Confirm tool call";
 /// `Secret` (masked input).
 pub const CONFIRM_ACTIVATION_PROMPT_TITLE: &str = "Confirm tool activation";
 
-impl PromptKind {
-    /// Derive the kind from the prompt title (the actor classifies at receipt;
-    /// `SecretPromptHandle::prompt` classifies for the in-process TUI).
-    pub fn from_title(title: &str) -> Self {
-        if title == CONFIRM_PROMPT_TITLE || title == CONFIRM_ACTIVATION_PROMPT_TITLE {
-            Self::Confirm
+/// Which gate a `Confirm` prompt opens. Chosen where the prompt is raised
+/// (`SecretPromptHandle::confirm_tool_call` / `confirm_activation`), never
+/// read back from its title, and never on the wire: the gates differ in
+/// what they take, so the answer's meaning is the gate's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmGate {
+    /// The runtime's per-tool-call gate (`resolve_before_tool_call_result`):
+    /// Allow, Allow all, Deny.
+    ToolCall,
+    /// The `activate_tools` gate (`tools::discovery`): Allow or Deny. Allow
+    /// all is not an answer here.
+    Activation,
+}
+
+/// What a raised prompt is, kept by the session beside the pending
+/// [`PromptRequest`]. Its title and [`PromptKind`] are derived from it for
+/// display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptPolicy {
+    Confirm(ConfirmGate),
+    /// A masked value (an API key, a sudo password): never trimmed or parsed.
+    Secret,
+}
+
+/// What a `Confirm` answer decides, read by [`ConfirmGate::decide`]: the
+/// one reading the gates, the session's notices and the outcome share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmDecision {
+    /// Allow this call.
+    Allow,
+    /// Allow this call and latch its source extensions (tool-call gate
+    /// only; with no latch scope it allows this call only).
+    AllowAll,
+    Deny,
+}
+
+impl ConfirmGate {
+    /// The dialog title for this gate.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::ToolCall => CONFIRM_PROMPT_TITLE,
+            Self::Activation => CONFIRM_ACTIVATION_PROMPT_TITLE,
+        }
+    }
+
+    /// What `answer` decides at this gate. Trimmed, ASCII case-insensitive:
+    /// `y` / `yes` allow; at the tool-call gate
+    /// [`crate::tools::CONFIRM_ANSWER_ALLOW_ALL`] allows all; anything
+    /// else, or no answer, denies. At the activation gate Allow all denies.
+    pub fn decide(self, answer: Option<&str>) -> ConfirmDecision {
+        let Some(answer) = answer.map(str::trim) else {
+            return ConfirmDecision::Deny;
+        };
+        if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+            ConfirmDecision::Allow
+        } else if self == Self::ToolCall && answer.eq_ignore_ascii_case(crate::tools::CONFIRM_ANSWER_ALLOW_ALL) {
+            ConfirmDecision::AllowAll
         } else {
-            Self::Secret
+            ConfirmDecision::Deny
+        }
+    }
+}
+
+impl ConfirmDecision {
+    /// Whether the gate opens for this call.
+    pub fn allows(self) -> bool {
+        self != Self::Deny
+    }
+}
+
+impl PromptPolicy {
+    pub fn kind(self) -> PromptKind {
+        match self {
+            Self::Confirm(_) => PromptKind::Confirm,
+            Self::Secret => PromptKind::Secret,
+        }
+    }
+
+    /// What answering `value` applies once the waiting call has it. A
+    /// Secret's value is taken as given: `Some` (even empty) is
+    /// `Answered`, `None` is `Denied`. `Allowed` means the gate opened, not
+    /// that the tool then succeeded.
+    pub fn outcome(self, value: Option<&str>) -> PromptOutcome {
+        match self {
+            Self::Confirm(gate) if gate.decide(value).allows() => PromptOutcome::Allowed,
+            Self::Confirm(_) => PromptOutcome::Denied,
+            Self::Secret if value.is_some() => PromptOutcome::Answered,
+            Self::Secret => PromptOutcome::Denied,
+        }
+    }
+}
+
+/// What the session applied when a prompt left the pending set, carried on
+/// `PromptResolved` and `AnswerRefused`. An older daemon sends none; a newer
+/// one may send an outcome this build does not know, read as
+/// [`PromptOutcome::Unknown`] rather than failing the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOutcome {
+    /// A Confirm's gate opened (Allow, or Allow all at the tool-call gate).
+    Allowed,
+    /// A Confirm's gate stayed shut (any other answer), or a Secret was
+    /// answered with no value.
+    Denied,
+    /// A Secret prompt's value was handed to the waiting call.
+    Answered,
+    /// No answer was applied: the turn was cancelled, revoked or
+    /// checkpointed, or the session ended, while the prompt waited; or an
+    /// answer came after the waiting call had already gone. The call never
+    /// passed its gate.
+    Cancelled,
+    /// Nobody was attached to answer before the abandonment deadline
+    /// (`SYNAPS_DAEMON_PROMPT_ABANDON_SECS`): the session denied it.
+    TimedOut,
+    /// An outcome this build does not know (a newer daemon's).
+    #[serde(other)]
+    Unknown,
+}
+
+impl PromptOutcome {
+    /// Its wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::Answered => "answered",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -1337,6 +1583,13 @@ pub enum SessionQuery {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         tool_queue: bool,
     },
+    /// [`CacheExpiry`](super::CacheExpiry): what
+    /// this session's own requests show about its prompt cache, or a
+    /// [`QueryError`](super::query::QueryError) (`busy`, `timeout`,
+    /// `superseded`, `stale`). Never wakes a parked session. Gated on
+    /// [`FEATURE_CACHE_EXPIRY`](super::wire::FEATURE_CACHE_EXPIRY): an
+    /// older daemon cannot decode it.
+    CacheExpiry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1380,8 +1633,15 @@ pub enum SessionEventWire {
     /// mirrors never diverge: the actor's api_messages IS the truth.
     Conversation(ConversationSnapshot),
     Prompt(PromptRequest),
-    /// So mirrors dismiss the modal.
-    PromptResolved { prompt_id: u64 },
+    /// So mirrors dismiss the modal. `outcome`: what the session applied;
+    /// `None` only from an older daemon over the wire.
+    PromptResolved { prompt_id: u64, outcome: Option<PromptOutcome> },
+    /// To its sender only, never replayed: an `Answer` to a prompt that is
+    /// not pending changed nothing. `outcome`: what applied when it closed;
+    /// `None` = not remembered (an id never raised, or older than the last
+    /// 64 closed), never "denied". Refusals of a pending prompt's answer by
+    /// policy (an observer, Allow all from a non-owner) stay `Refused`.
+    AnswerRefused { prompt_id: u64, outcome: Option<PromptOutcome> },
     /// Drained event card — presentation only.
     External(crate::events::types::Event),
     AutoTurnCapReached { cap: u32 },
@@ -1417,7 +1677,7 @@ pub enum SessionEventWire {
     Aborted { context_saved: bool },
     /// `/clear`. TUI: transcript.clear, counters=0, "new session started".
     Cleared { session_id: String },
-    /// (B2) `disclosure` = preview_compaction_disclosure().render_line().
+    /// (B2) `disclosure` = preview_compaction_request().render_line().
     CompactionStarted { source: String, disclosure: String },
     CompactionApplied {
         previous_session_id: String,
@@ -1514,13 +1774,123 @@ pub enum TurnTrigger {
 }
 
 /// Per-session, gapless `seq` assigned at the single emit site
-/// (`SessionActor::emit`); `ts` from the host clock.
+/// (`SessionActor::emit`); `ts` from the host clock. `audience` says who
+/// may receive it ([`delivers`]); it is never serialized, so the v3 wire is
+/// unchanged. Envelopes built anywhere but the actor, and every envelope
+/// decoded off a socket (the daemon already routed it), are [`Audience::All`].
 #[derive(Debug, Clone)]
 pub struct Envelope {
     pub session_id: SessionId,
     pub seq: u64,
     pub ts: chrono::DateTime<chrono::Utc>,
     pub event: SessionEventWire,
+    pub audience: Audience,
+}
+
+impl Envelope {
+    /// An envelope for everyone ([`Audience::All`]).
+    pub fn new(
+        session_id: SessionId,
+        seq: u64,
+        ts: chrono::DateTime<chrono::Utc>,
+        event: SessionEventWire,
+    ) -> Self {
+        Self { session_id, seq, ts, event, audience: Audience::All }
+    }
+
+    /// The same envelope for `audience`.
+    pub fn to(mut self, audience: Audience) -> Self {
+        self.audience = audience;
+        self
+    }
+}
+
+/// Who an [`Envelope`] is for. Set by the actor at emit, from the command's
+/// trusted origin (`Addressed.from`: the daemon stamps every client frame,
+/// `LocalTransport` stamps its attachment; `None` only from in-process host
+/// callers via `SessionHandle::send`). Never client-supplied, never on the
+/// wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Audience {
+    /// Shared state: every subscriber.
+    #[default]
+    All,
+    /// A reply to that attachment's request: it alone receives it.
+    Client(ClientId),
+    /// A reply to an in-process host caller (idle probe, reload checkpoint,
+    /// `daemon close`/`rename`): no attachment receives it.
+    Host,
+    /// Shared state that also answers `reply_to`'s request (`SettingChanged`
+    /// for a `Set`, `Resumed` for a `Resume`): everyone receives it, and
+    /// every recipient but `reply_to` sees its id as
+    /// [`VIEW_CHANGED_SETTING_ID`](super::wire::VIEW_CHANGED_SETTING_ID)
+    /// ("answers no request of yours").
+    Shared { reply_to: ClientId },
+}
+
+/// Who is reading an event stream, for [`delivers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subscriber {
+    /// An attached client (the daemon's per-connection pump, `LocalTransport`).
+    Attachment(ClientId),
+    /// An in-process host listener that sent with `SessionHandle::send`.
+    Host,
+}
+
+/// `env` as `to` may receive it, or `None` when it isn't for `to`. Every
+/// subscriber applies this BEFORE any wire conversion or capability
+/// projection, so the original envelope is never what a non-recipient
+/// gets: a [`Audience::Shared`] reply is projected per recipient
+/// (borrowed for its asker, an owned copy with the view-only id for
+/// everyone else).
+pub fn delivers(env: &Envelope, to: Subscriber) -> Option<std::borrow::Cow<'_, Envelope>> {
+    use std::borrow::Cow;
+    Some(match seen_as(env.audience, to)? {
+        Seen::AsIs => Cow::Borrowed(env),
+        Seen::ViewOnly => Cow::Owned(projected(env.clone())),
+    })
+}
+
+/// [`delivers`] for an envelope the subscriber already owns (its broadcast
+/// copy): no second copy.
+pub fn deliver(env: Envelope, to: Subscriber) -> Option<Envelope> {
+    Some(match seen_as(env.audience, to)? {
+        Seen::AsIs => env,
+        Seen::ViewOnly => projected(env),
+    })
+}
+
+enum Seen {
+    AsIs,
+    ViewOnly,
+}
+
+fn seen_as(audience: Audience, to: Subscriber) -> Option<Seen> {
+    match (audience, to) {
+        (Audience::All, _) => Some(Seen::AsIs),
+        (Audience::Client(c), Subscriber::Attachment(me)) if c == me => Some(Seen::AsIs),
+        (Audience::Client(_), _) => None,
+        (Audience::Host, Subscriber::Host) => Some(Seen::AsIs),
+        (Audience::Host, _) => None,
+        (Audience::Shared { reply_to }, Subscriber::Attachment(me)) if reply_to == me => Some(Seen::AsIs),
+        (Audience::Shared { .. }, _) => Some(Seen::ViewOnly),
+    }
+}
+
+fn projected(mut env: Envelope) -> Envelope {
+    env.audience = Audience::All;
+    view_only(&mut env.event);
+    env
+}
+
+/// A shared reply's request id, as a recipient that did not ask sees it.
+pub(crate) fn view_only(event: &mut SessionEventWire) {
+    let view = super::wire::VIEW_CHANGED_SETTING_ID;
+    match event {
+        SessionEventWire::SettingChanged(applied) => applied.id = view,
+        SessionEventWire::Resumed { id, .. } => *id = view,
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1756,14 +2126,45 @@ mod tests {
         assert_eq!(sanitize_prompt_text(persian), persian, "ZWNJ intact");
     }
 
+    /// One reading for every gate: the tool-call gate takes Allow all, the
+    /// activation gate denies it; a Secret's value is never parsed.
     #[test]
-    fn prompt_kind_from_title() {
-        assert_eq!(PromptKind::from_title("Confirm tool call"), PromptKind::Confirm);
-        assert_eq!(
-            PromptKind::from_title("Confirm tool activation"),
-            PromptKind::Confirm
-        );
-        assert_eq!(PromptKind::from_title("API key"), PromptKind::Secret);
+    fn each_gate_decides_its_own_answers() {
+        use ConfirmDecision::*;
+        use ConfirmGate::*;
+        for (gate, answer, want) in [
+            (ToolCall, Some("y"), Allow),
+            (ToolCall, Some(" YES "), Allow),
+            (ToolCall, Some("always"), AllowAll),
+            (ToolCall, Some(" Always\n"), AllowAll),
+            (ToolCall, Some("n"), Deny),
+            (ToolCall, Some(""), Deny),
+            (ToolCall, Some("yess"), Deny),
+            (ToolCall, None, Deny),
+            (Activation, Some("y"), Allow),
+            (Activation, Some("Yes"), Allow),
+            (Activation, Some("always"), Deny),
+            (Activation, Some("n"), Deny),
+            (Activation, None, Deny),
+        ] {
+            assert_eq!(gate.decide(answer), want, "{gate:?} {answer:?}");
+        }
+        use PromptOutcome::*;
+        for (policy, value, want) in [
+            (PromptPolicy::Confirm(ToolCall), Some("always"), Allowed),
+            (PromptPolicy::Confirm(ToolCall), Some("y"), Allowed),
+            (PromptPolicy::Confirm(ToolCall), None, Denied),
+            (PromptPolicy::Confirm(Activation), Some("always"), Denied),
+            (PromptPolicy::Confirm(Activation), Some("yes"), Allowed),
+            (PromptPolicy::Secret, Some("hunter2"), Answered),
+            (PromptPolicy::Secret, Some(""), Answered),
+            (PromptPolicy::Secret, Some(" y "), Answered),
+            (PromptPolicy::Secret, None, Denied),
+        ] {
+            assert_eq!(policy.outcome(value), want, "{policy:?} {value:?}");
+        }
+        assert_eq!(ToolCall.title(), CONFIRM_PROMPT_TITLE);
+        assert_eq!(Activation.title(), CONFIRM_ACTIVATION_PROMPT_TITLE);
     }
 
     #[test]
@@ -2104,9 +2505,18 @@ mod tests {
 
     #[test]
     fn session_lifecycle_u8_round_trip() {
-        for l in [SessionLifecycle::Live, SessionLifecycle::Parking, SessionLifecycle::Parked, SessionLifecycle::Ending] {
+        for l in [
+            SessionLifecycle::Live,
+            SessionLifecycle::Parking,
+            SessionLifecycle::Parked,
+            SessionLifecycle::Ending,
+            SessionLifecycle::Unknown,
+        ] {
             assert_eq!(SessionLifecycle::from_u8(l as u8), l);
         }
+        // No lifecycle cell value reads as `Saved`: a listing built from
+        // handles (`meta_live`) never carries it.
+        assert!((0..=u8::MAX).all(|v| SessionLifecycle::from_u8(v) != SessionLifecycle::Saved));
         assert_eq!(serde_json::to_string(&SessionLifecycle::Parked).unwrap(), r#""parked""#);
     }
 
