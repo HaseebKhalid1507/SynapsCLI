@@ -195,10 +195,16 @@ async fn attach_detach_counts_and_seq_is_gapless() {
             .unwrap();
     assert_eq!(snap_b.clients.len(), 2);
     assert_ne!(a.client_id(), b.client_id());
+    // b's `Attached` is b's alone (#457): a's stream skips that seq, like
+    // any reply addressed to another client. From b's join on it is whole.
+    let joined = b.client_id();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::ClientJoined { client, .. } if *client == joined)).await;
+    assert!(!seen.iter().any(|e| matches!(e.event, SessionEventWire::Attached { .. })));
+    let join_seq = seen.last().unwrap().seq;
 
     a.send(submit("hello")).await.unwrap();
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
-    let seqs: Vec<u64> = seen.iter().map(|e| e.seq).collect();
+    let seqs: Vec<u64> = std::iter::once(join_seq).chain(seen.iter().map(|e| e.seq)).collect();
     assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "gapless: {seqs:?}");
     assert!(seen
         .iter()
