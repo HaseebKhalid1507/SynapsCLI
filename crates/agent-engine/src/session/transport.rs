@@ -675,6 +675,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(await_attach(&handle, &mut rx_b, &ticket_b, ATTACH_TIMEOUT).await, AttachAnswer::Refused(_)));
+        assert!(ticket_b.is_sent() && ticket_b.client().is_none(), "a refusal is marked sent and names no client");
     }
 
     /// A waiter that gave up leaves nobody attached: the session answers an
