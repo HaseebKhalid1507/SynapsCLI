@@ -10,7 +10,8 @@ use tokio::sync::broadcast;
 
 use super::handle::SessionHandle;
 use super::types::{
-    deliver, AttachMode, AttachSnapshot, ClientId, ClientInput, ClientMeta, Envelope, Roster,
+    deliver, Addressed, AttachMode, AttachSnapshot, AttachTicket, Audience, ClientId, ClientInput, ClientMeta,
+    Envelope, Roster,
     SessionCommand, SessionEventWire, SessionId, SessionMeta, Subscriber,
 };
 use super::view::RuntimeView;
@@ -223,6 +224,136 @@ pub struct LocalTransport {
     ended: bool,
 }
 
+/// How long [`await_attach`] still waits for an answer the session had
+/// already begun when the attach budget ran out. The session emits it
+/// without awaiting, so this only runs out if the session died there.
+pub(crate) const ATTACH_ANSWER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`await_attach`] retrying the `Detach` of a client it gave up on, while
+/// the session's command queue is full.
+const DETACH_RETRIES: u32 = 5;
+const DETACH_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How an Attach was answered ([`await_attach`]).
+#[allow(clippy::large_enum_variant)] // one, short-lived, moved straight out (as `SessionEventWire::Attached`)
+pub(crate) enum AttachAnswer {
+    Attached(ClientId, AttachSnapshot),
+    Refused(String),
+    /// The session's event stream closed first.
+    Closed,
+    /// No answer within the budget; the session attaches nobody for it.
+    TimedOut,
+    /// The session answered, but this waiter never read the answer: it
+    /// lagged past it, or the session died while answering.
+    Lost,
+}
+
+/// The answer to the Attach sent with `ticket`, read off `rx` (subscribed
+/// before the send): the one event addressed to that ticket. Everything
+/// before it is dropped (the snapshot covers it); `rx` is left right after
+/// it. Another attach's answer is never taken.
+///
+/// Returns within `budget` + [`ATTACH_ANSWER_GRACE`]. Whenever it does not
+/// return `Attached` (and when the caller drops this future), nobody stays
+/// attached for this ticket: before the session answers, the ticket is
+/// abandoned and the session attaches nobody for it; after, the client the
+/// ticket names is sent a `Detach`. If the session's command queue is full,
+/// that `Detach` is retried for [`DETACH_RETRIES`] x [`DETACH_RETRY_EVERY`];
+/// if the queue stays full that long, the client stays.
+pub(crate) async fn await_attach(
+    handle: &SessionHandle,
+    rx: &mut broadcast::Receiver<Envelope>,
+    ticket: &AttachTicket,
+    budget: std::time::Duration,
+) -> AttachAnswer {
+    struct GiveUp<'a> {
+        handle: &'a SessionHandle,
+        ticket: &'a AttachTicket,
+        taken: bool,
+    }
+    impl Drop for GiveUp<'_> {
+        fn drop(&mut self) {
+            if self.taken || self.ticket.abandon() {
+                return;
+            }
+            let Some(client) = self.ticket.client() else { return };
+            let detach = move || Addressed { from: None, cmd: SessionCommand::Detach { client } };
+            match (self.handle.send_addressed(detach()), tokio::runtime::Handle::try_current()) {
+                // The session is gone, and its clients with it.
+                (Ok(()) | Err(TransportError::Closed), _) => {}
+                // Its command queue is full: try again for a moment.
+                (Err(TransportError::Backpressure), Ok(rt)) => {
+                    let handle = self.handle.clone();
+                    rt.spawn(async move {
+                        for _ in 0..DETACH_RETRIES {
+                            tokio::time::sleep(DETACH_RETRY_EVERY).await;
+                            match handle.send_addressed(detach()) {
+                                Err(TransportError::Backpressure) => {}
+                                _ => return,
+                            }
+                        }
+                        tracing::warn!(session = %handle.id, ?client, "attach: given up on after the session attached it, and the detach was not sent: its command queue stayed full");
+                    });
+                }
+                (Err(e), _) => {
+                    tracing::warn!(session = %self.handle.id, ?client, "attach: given up on after the session attached it, and the detach was not sent: {e}");
+                }
+            }
+        }
+    }
+    fn mine(env: Envelope, to: Audience) -> Option<AttachAnswer> {
+        if env.audience != to {
+            return None;
+        }
+        match env.event {
+            SessionEventWire::Attached { client, snapshot } => Some(AttachAnswer::Attached(client, snapshot)),
+            SessionEventWire::AttachRefused { message } => Some(AttachAnswer::Refused(message)),
+            _ => None,
+        }
+    }
+    use broadcast::error::{RecvError, TryRecvError};
+    let to = ticket.audience();
+    let mut give_up = GiveUp { handle, ticket, taken: false };
+    let mut deadline = tokio::time::Instant::now() + budget;
+    let mut answering = false;
+    let answer = loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Ok(env)) => {
+                if let Some(a) = mine(env, to) {
+                    break a;
+                }
+            }
+            // Events were dropped. An answer already on the stream may be
+            // among them: it is in what is left to read now, or it is gone.
+            // (One not sent yet comes after everything dropped.)
+            Ok(Err(RecvError::Lagged(_))) if ticket.is_sent() => loop {
+                match rx.try_recv() {
+                    Ok(env) => {
+                        if let Some(a) = mine(env, to) {
+                            give_up.taken = matches!(a, AttachAnswer::Attached(..));
+                            return a;
+                        }
+                    }
+                    Err(TryRecvError::Lagged(_)) => {}
+                    Err(TryRecvError::Empty) => return AttachAnswer::Lost,
+                    Err(TryRecvError::Closed) => return AttachAnswer::Closed,
+                }
+            },
+            Ok(Err(RecvError::Lagged(_))) => {}
+            Ok(Err(RecvError::Closed)) => break AttachAnswer::Closed,
+            Err(_) if answering => break AttachAnswer::Lost,
+            Err(_) if ticket.abandon() => break AttachAnswer::TimedOut,
+            // Already answering: the answer is emitted without awaiting.
+            Err(_) => {
+                answering = true;
+                deadline = tokio::time::Instant::now() + ATTACH_ANSWER_GRACE;
+            }
+        }
+    };
+    give_up.taken = matches!(answer, AttachAnswer::Attached(..));
+    answer
+}
+
 impl LocalTransport {
     /// Attach in-process as a `Mirror` (= `attach_with(.., Mirror)`).
     pub async fn attach(
@@ -240,44 +371,30 @@ impl LocalTransport {
         mode: AttachMode,
     ) -> Result<(Self, AttachSnapshot), TransportError> {
         // Subscribe BEFORE sending so the Attached reply cannot be missed.
-        // `Attached` is broadcast; with one attach in flight per handle at a
-        // time (every host today) the first one seen is ours.
+        // The answer is addressed to this Attach's ticket: other attaches
+        // may be in flight on the same handle (the daemon's connections).
         let mut rx = handle.subscribe();
+        let ticket = AttachTicket::new();
         handle
             .send(SessionCommand::Attach {
                 client: meta,
                 mode,
                 owner: None,
+                ticket: Some(ticket.clone()),
             })
             .await?;
 
-        let wait = async {
-            loop {
-                match rx.recv().await {
-                    Ok(env) => match env.event {
-                        SessionEventWire::Attached { client, snapshot } => {
-                            return Ok((client, snapshot));
-                        }
-                        SessionEventWire::AttachRefused { message } => {
-                            return Err(TransportError::Refused(message));
-                        }
-                        _ => {}
-                    },
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return Err(TransportError::Closed)
-                    }
-                }
-            }
-        };
         let timeout = if handle.lifecycle() == super::types::SessionLifecycle::Parked {
             ATTACH_TIMEOUT_PARKED
         } else {
             ATTACH_TIMEOUT
         };
-        let (client, snapshot) = match tokio::time::timeout(timeout, wait).await {
-            Ok(r) => r?,
-            Err(_) => return Err(TransportError::Protocol("attach timed out".into())),
+        let (client, snapshot) = match await_attach(&handle, &mut rx, &ticket, timeout).await {
+            AttachAnswer::Attached(client, snapshot) => (client, snapshot),
+            AttachAnswer::Refused(message) => return Err(TransportError::Refused(message)),
+            AttachAnswer::Closed => return Err(TransportError::Closed),
+            AttachAnswer::TimedOut => return Err(TransportError::Protocol("attach timed out".into())),
+            AttachAnswer::Lost => return Err(TransportError::Protocol("attach: the answer was lost".into())),
         };
         let meta = snapshot.meta.clone();
         Ok((
@@ -489,6 +606,310 @@ mod tests {
             }
         }
         out
+    }
+
+    fn digest_meta() -> ClientMeta {
+        let mut m = ClientMeta::new(ClientKind::Attach);
+        m.history = HistoryMode::Digest;
+        m
+    }
+
+    /// #457: a waiter takes the answer to its own Attach. `b` subscribed
+    /// before `a`'s answer was emitted, so that answer is the first one on
+    /// its stream; it is another client's id and a snapshot built for
+    /// another `ClientMeta`.
+    #[tokio::test]
+    async fn a_waiter_skips_another_attachs_answer() {
+        let (handle, task) = SessionHandle::echo_for_test(SessionId::from("lt-race"));
+        let mut rx_b = handle.subscribe();
+        let (mut a, snap_a) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui)).await.unwrap();
+        assert!(snap_a.display_tail.is_none(), "a full client's snapshot");
+
+        let ticket = AttachTicket::new();
+        handle
+            .send(SessionCommand::Attach {
+                client: digest_meta(),
+                mode: AttachMode::Mirror,
+                owner: None,
+                ticket: Some(ticket.clone()),
+            })
+            .await
+            .unwrap();
+        let AttachAnswer::Attached(b, snap_b) = await_attach(&handle, &mut rx_b, &ticket, ATTACH_TIMEOUT).await else {
+            panic!("b's attach is answered");
+        };
+        assert_ne!(b, a.client_id(), "b got its own client id, not a's");
+        assert!(snap_b.display_tail.is_some(), "b got the digest snapshot built for it, not a's");
+        // What follows b's own answer on its stream is kept: its join.
+        assert!(matches!(
+            rx_b.recv().await.unwrap().event,
+            SessionEventWire::ClientJoined { client, .. } if client == b
+        ));
+
+        // a, already attached, is never delivered b's answer.
+        handle.send(SessionCommand::Detach { client: b }).await.unwrap();
+        loop {
+            match next(&mut a).await.event {
+                SessionEventWire::Attached { .. } => panic!("another attach's answer reached an attached client"),
+                SessionEventWire::ClientLeft { client } if client == b => break,
+                _ => {}
+            }
+        }
+        drop(a);
+        drop(handle);
+        let _ = task.await;
+    }
+
+    /// #457, the journal-locked endpoint: its refusal reaches the attach
+    /// that asked, not another waiter on the same handle, and no subscriber.
+    #[tokio::test]
+    async fn a_refusal_reaches_only_its_asker() {
+        let id = SessionId::from("lt-locked");
+        let (handle, _task) =
+            crate::session::handle::locked_placeholder::spawn(id, SessionConfig::default(), "pid 1 (tui)".into());
+        // b waits on the same handle; its own Attach is not answered yet.
+        let mut rx_b = handle.subscribe();
+        let mut watch = handle.subscribe();
+        let ticket_b = AttachTicket::new();
+
+        let refused = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui)).await;
+        assert!(matches!(refused, Err(TransportError::Refused(ref m)) if m.contains("journal locked")), "a is refused");
+
+        let env = loop {
+            let env = watch.recv().await.unwrap();
+            if matches!(env.event, SessionEventWire::AttachRefused { .. }) {
+                break env;
+            }
+        };
+        assert!(delivers(&env, Subscriber::Attachment(ClientId(1))).is_none(), "not for an attachment");
+        assert!(delivers(&env, Subscriber::Host).is_none(), "not for a host listener");
+
+        let waited = await_attach(&handle, &mut rx_b, &ticket_b, std::time::Duration::from_millis(200)).await;
+        assert!(matches!(waited, AttachAnswer::TimedOut), "b did not take a's refusal");
+
+        // b's own Attach gets its own refusal.
+        let ticket_b = AttachTicket::new();
+        handle
+            .send(SessionCommand::Attach {
+                client: digest_meta(),
+                mode: AttachMode::Mirror,
+                owner: None,
+                ticket: Some(ticket_b.clone()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(await_attach(&handle, &mut rx_b, &ticket_b, ATTACH_TIMEOUT).await, AttachAnswer::Refused(_)));
+        assert!(ticket_b.is_sent() && ticket_b.client().is_none(), "a refusal is marked sent and names no client");
+    }
+
+    /// A waiter that gave up leaves nobody attached: the session answers an
+    /// abandoned ticket with nothing. A ticket the session is already
+    /// answering cannot be abandoned: the answer is there to take.
+    #[tokio::test]
+    async fn an_abandoned_attach_attaches_nobody() {
+        let (handle, task) = SessionHandle::echo_for_test(SessionId::from("lt-gone"));
+        let mut rx = handle.subscribe();
+        let gone = AttachTicket::new();
+        assert!(gone.abandon());
+        assert!(!gone.answer(Some(ClientId(1))), "abandoned first: never answered");
+        assert_eq!(gone.client(), None);
+        handle
+            .send(SessionCommand::Attach {
+                client: ClientMeta::new(ClientKind::Tui),
+                mode: AttachMode::Mirror,
+                owner: None,
+                ticket: Some(gone),
+            })
+            .await
+            .unwrap();
+        // The next attach is the session's first client.
+        let (t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui)).await.unwrap();
+        assert_eq!(t.client_id(), ClientId(1), "the abandoned attach minted no client");
+        while let Ok(env) = rx.try_recv() {
+            assert!(
+                !matches!(env.event, SessionEventWire::ClientJoined { client, .. } if client != t.client_id()),
+                "nobody joined for the abandoned attach"
+            );
+        }
+
+        let answering = AttachTicket::new();
+        assert!(answering.answer(Some(ClientId(7))));
+        assert!(!answering.abandon(), "the answer is on its way: the waiter takes it");
+        assert_eq!(answering.client(), Some(ClientId(7)), "and the ticket names the client meanwhile");
+        drop(t);
+        drop(handle);
+        let _ = task.await;
+    }
+
+    /// Attach on `handle` with a ticket and let the session answer it,
+    /// read by nobody: the ticket's client is attached.
+    async fn answered_unread(handle: &SessionHandle) -> (AttachTicket, ClientId) {
+        let mut watch = handle.subscribe();
+        let ticket = AttachTicket::new();
+        handle
+            .send(SessionCommand::Attach {
+                client: ClientMeta::new(ClientKind::Tui),
+                mode: AttachMode::Mirror,
+                owner: None,
+                ticket: Some(ticket.clone()),
+            })
+            .await
+            .unwrap();
+        loop {
+            if let SessionEventWire::ClientJoined { client, .. } = watch.recv().await.unwrap().event {
+                assert_eq!(ticket.client(), Some(client), "the ticket names the attached client");
+                assert!(ticket.is_sent());
+                return (ticket, client);
+            }
+        }
+    }
+
+    /// `client` left, and the next attach finds the session empty.
+    async fn left_nobody_attached(handle: &SessionHandle, watch: &mut broadcast::Receiver<Envelope>, client: ClientId) {
+        loop {
+            let env = tokio::time::timeout(std::time::Duration::from_secs(5), watch.recv())
+                .await
+                .expect("the lost attach's client is detached");
+            match env {
+                Ok(env) if matches!(env.event, SessionEventWire::ClientLeft { client: c } if c == client) => break,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let (_t, snap) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test)).await.unwrap();
+        assert_eq!(snap.clients.len(), 1, "only the new client is attached: {:?}", snap.clients);
+    }
+
+    /// The waiter lagged past its own answer: the stream dropped it. It
+    /// does not wait for an event that will never come: it fails at once,
+    /// and the client the session attached for it is detached.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_that_lagged_past_its_answer_fails_and_detaches() {
+        let (handle, task) = SessionHandle::echo_for_test(SessionId::from("lt-lag"));
+        let mut rx = handle.subscribe();
+        let mut watch = handle.subscribe();
+        let (ticket, client) = answered_unread(&handle).await;
+        // Flood the stream past its capacity; `rx` reads none of it.
+        let flood = crate::session::handle::events_cap() as u64 + 8;
+        for id in 0..flood {
+            handle.send(SessionCommand::Query { id, query: SessionQuery::View }).await.unwrap();
+            loop {
+                match watch.recv().await {
+                    Ok(env) if matches!(env.event, SessionEventWire::QueryResult { id: got, .. } if got == id) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        }
+        let mut watch = handle.subscribe();
+        let t0 = tokio::time::Instant::now();
+        let got = await_attach(&handle, &mut rx, &ticket, ATTACH_TIMEOUT).await;
+        assert!(matches!(got, AttachAnswer::Lost), "the answer was dropped from the stream");
+        assert_eq!(t0.elapsed(), std::time::Duration::ZERO, "known at once, not after a wait");
+        left_nobody_attached(&handle, &mut watch, client).await;
+        drop(handle);
+        let _ = task.await;
+    }
+
+    /// Lagging before the answer is sent loses nothing: the answer comes
+    /// after everything that was dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_that_lagged_before_its_answer_still_takes_it() {
+        let (handle, task) = SessionHandle::echo_for_test(SessionId::from("lt-lag-early"));
+        let mut rx = handle.subscribe();
+        let mut watch = handle.subscribe();
+        let flood = crate::session::handle::events_cap() as u64 + 8;
+        for id in 0..flood {
+            handle.send(SessionCommand::Query { id, query: SessionQuery::View }).await.unwrap();
+            while !matches!(watch.recv().await, Ok(env) if matches!(env.event, SessionEventWire::QueryResult { id: got, .. } if got == id)) {}
+        }
+        let (ticket, client) = answered_unread(&handle).await;
+        let got = await_attach(&handle, &mut rx, &ticket, ATTACH_TIMEOUT).await;
+        assert!(matches!(got, AttachAnswer::Attached(c, _) if c == client));
+        assert!(matches!(rx.recv().await.unwrap().event, SessionEventWire::ClientJoined { client: c, .. } if c == client));
+        drop(handle);
+        let _ = task.await;
+    }
+
+    /// The budget runs out with the ticket already answered, and the answer
+    /// never reaches this waiter (here: it subscribed too late to see it,
+    /// standing in for a session that died while answering). The wait is
+    /// bounded by the grace, and the client is detached.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_that_never_arrives_is_waited_for_only_so_long() {
+        let (handle, task) = SessionHandle::echo_for_test(SessionId::from("lt-noanswer"));
+        let (ticket, client) = answered_unread(&handle).await;
+        let mut rx = handle.subscribe();
+        let mut watch = handle.subscribe();
+        let budget = std::time::Duration::from_millis(50);
+        let t0 = tokio::time::Instant::now();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(60), await_attach(&handle, &mut rx, &ticket, budget))
+            .await
+            .expect("bounded");
+        assert!(matches!(got, AttachAnswer::Lost));
+        assert_eq!(t0.elapsed(), budget + ATTACH_ANSWER_GRACE);
+        left_nobody_attached(&handle, &mut watch, client).await;
+        drop(handle);
+        let _ = task.await;
+    }
+
+    /// The caller drops the wait after the session answered: the client it
+    /// never learned about is detached all the same.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_wait_detaches_the_client_it_never_took() {
+        let (handle, task) = SessionHandle::echo_for_test(SessionId::from("lt-dropped"));
+        let (ticket, client) = answered_unread(&handle).await;
+        let mut rx = handle.subscribe();
+        let mut watch = handle.subscribe();
+        let wait = await_attach(&handle, &mut rx, &ticket, ATTACH_TIMEOUT);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), wait).await.is_err());
+        left_nobody_attached(&handle, &mut watch, client).await;
+        drop(handle);
+        let _ = task.await;
+    }
+
+    /// A ticket is settled once: answering it again (or after it was
+    /// abandoned) changes nothing, so it never names a client that was not
+    /// attached for it.
+    #[test]
+    fn a_settled_ticket_keeps_the_client_it_was_answered_with() {
+        let t = AttachTicket::new();
+        assert!(t.answer(Some(ClientId(7))));
+        assert!(!t.answer(Some(ClientId(9))));
+        assert_eq!(t.client(), Some(ClientId(7)));
+        t.sent();
+        assert!(!t.answer(None));
+        assert_eq!(t.client(), Some(ClientId(7)));
+        assert!(t.is_sent());
+
+        let refused = AttachTicket::new();
+        assert!(refused.answer(None));
+        assert!(!refused.answer(Some(ClientId(3))));
+        assert_eq!(refused.client(), None);
+    }
+
+    /// The session's command queue is full when the wait gives up on an
+    /// attached client: the Detach is retried until it fits.
+    #[tokio::test(start_paused = true)]
+    async fn a_detach_that_does_not_fit_the_queue_is_retried() {
+        use crate::session::handle::{echo, CMD_CHAN_CAP};
+        let (handle, mut ep) = SessionHandle::new(echo::meta_for(&SessionId::from("lt-full")), echo::view_for());
+        let ticket = AttachTicket::new();
+        assert!(ticket.answer(Some(ClientId(5))));
+        for _ in 0..CMD_CHAN_CAP {
+            handle.send(SessionCommand::Cancel).await.unwrap();
+        }
+        assert!(matches!(handle.send(SessionCommand::Cancel).await, Err(TransportError::Backpressure)));
+        let mut rx = handle.subscribe();
+        let wait = await_attach(&handle, &mut rx, &ticket, ATTACH_TIMEOUT);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), wait).await.is_err());
+        // Still full for two retries, then the session catches up.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        for _ in 0..CMD_CHAN_CAP {
+            assert!(matches!(ep.cmd_rx.recv().await.unwrap().cmd, SessionCommand::Cancel));
+        }
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), ep.cmd_rx.recv()).await.expect("retried");
+        assert!(matches!(next.unwrap().cmd, SessionCommand::Detach { client: ClientId(5) }));
     }
 
     #[tokio::test]

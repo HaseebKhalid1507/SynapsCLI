@@ -266,7 +266,7 @@ async fn client_commands_are_whitelisted() {
     assert!(refused(&mut b).await.contains("not your client id"));
     b.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
     assert!(refused(&mut b).await.contains("end:"));
-    b.send(SessionCommand::Attach { client: ClientMeta::new(ClientKind::Test), mode: AttachMode::Mirror, owner: None }).await.unwrap();
+    b.send(SessionCommand::Attach { client: ClientMeta::new(ClientKind::Test), mode: AttachMode::Mirror, owner: None, ticket: None }).await.unwrap();
     assert!(refused(&mut b).await.contains("attach:"));
     b.send(SessionCommand::Resync { client: other, since_seq: 0 }).await.unwrap();
     assert!(refused(&mut b).await.contains("resync:"));

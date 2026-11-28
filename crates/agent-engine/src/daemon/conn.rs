@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::DaemonState;
 use crate::session::handle::CMD_CHAN_CAP;
-use crate::session::transport::{TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
+use crate::session::transport::{await_attach, AttachAnswer, TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
 use crate::session::wire::*;
 use crate::session::*;
 use crate::ipc::{ServerReadHalf, ServerStream, ServerWriteHalf};
@@ -572,36 +572,28 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     let owner_bind = owner_claim.map(|claim| OwnerBind { claim, alive: owner_alive.clone() });
 
     let mut rx = handle.subscribe();
-    if let Err(e) = handle.send(SessionCommand::Attach { client: hello.client.clone(), mode, owner: owner_bind }).await {
+    // Other connections attach to this session at the same time: the ticket
+    // is what makes the answer below this connection's own.
+    let ticket = AttachTicket::new();
+    let attach = SessionCommand::Attach { client: hello.client.clone(), mode, owner: owner_bind, ticket: Some(ticket.clone()) };
+    if let Err(e) = handle.send(attach).await {
         let _ = tx.send(DaemonFrame::Error { session_id: Some(handle.id.clone()), message: format!("attach: {e}") }).await;
         let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
         let _ = writer.await;
         return;
     }
     let attach_budget = if handle.lifecycle() == SessionLifecycle::Parked { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT };
-    let attached = tokio::time::timeout(attach_budget, async {
-        loop {
-            match rx.recv().await {
-                Ok(env) => match env.event {
-                    SessionEventWire::Attached { client, snapshot } => return Some(Ok((client, snapshot))),
-                    SessionEventWire::AttachRefused { message } => return Some(Err(message)),
-                    _ => {}
-                },
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
-        }
-    })
-    .await;
+    let attached = await_attach(&handle, &mut rx, &ticket, attach_budget).await;
     let (client, snapshot) = match attached {
-        Ok(Some(Ok(x))) => x,
-        Ok(Some(Err(message))) => {
+        AttachAnswer::Attached(client, snapshot) => (client, snapshot),
+        AttachAnswer::Refused(message) => {
             let _ = tx.send(DaemonFrame::Error { session_id: Some(handle.id.clone()), message }).await;
             let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
             let _ = writer.await;
             return;
         }
-        _ => {
+        // `Lost`: `await_attach` already sent the client's Detach.
+        AttachAnswer::Closed | AttachAnswer::TimedOut | AttachAnswer::Lost => {
             let _ = tx.send(DaemonFrame::Error { session_id: Some(handle.id.clone()), message: "attach timed out".into() }).await;
             let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
             let _ = writer.await;

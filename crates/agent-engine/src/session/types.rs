@@ -165,6 +165,97 @@ pub struct OwnerBind {
     pub alive: tokio_util::sync::CancellationToken,
 }
 
+/// Host-side (never wire): ties one `SessionCommand::Attach` to its answer.
+/// The waiter keeps a clone and sends the other in the command; the session
+/// answers with [`Audience::Attach`] of this ticket's id, which only that
+/// waiter matches. Unique per process.
+///
+/// It also settles a waiter that gives up: giving up and answering race on
+/// one flag, so either the session attaches nobody for it, or it is
+/// answered and the ticket says which client was attached
+/// ([`client`](Self::client)), so a waiter that never reads the answer can
+/// still detach it.
+#[derive(Clone, Debug)]
+pub struct AttachTicket {
+    id: u64,
+    state: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl AttachTicket {
+    // `state` = phase (top 2 bits) | the attached client's id (the rest,
+    // 0 = none), so answering sets both in one step.
+    const SHIFT: u32 = 62;
+    const WAITING: u64 = 0;
+    const ANSWERED: u64 = 1;
+    const ABANDONED: u64 = 2;
+    /// Answered, and the answer is on the event stream.
+    const SENT: u64 = 3;
+
+    #[allow(clippy::new_without_default)] // each one is unique: not a default value
+    pub fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            state: Default::default(),
+        }
+    }
+
+    /// The audience of this ticket's answer.
+    pub fn audience(&self) -> Audience {
+        Audience::Attach(self.id)
+    }
+
+    fn phase(&self) -> u64 {
+        self.state.load(std::sync::atomic::Ordering::SeqCst) >> Self::SHIFT
+    }
+
+    /// From `WAITING` only: a ticket is settled once.
+    fn settle(&self, phase: u64, client: u64) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let to = phase << Self::SHIFT | (client & ((1 << Self::SHIFT) - 1));
+        self.state.compare_exchange(Self::WAITING, to, SeqCst, SeqCst).is_ok()
+    }
+
+    /// The session, about to answer: with `Attached` for `client`, or with
+    /// a refusal (`None`). `false` when the waiter already gave up (or the
+    /// ticket was answered before), and then it must not attach anyone.
+    /// After `true` it emits the answer without awaiting anything, then
+    /// calls [`sent`](Self::sent).
+    #[must_use]
+    pub(crate) fn answer(&self, client: Option<ClientId>) -> bool {
+        self.settle(Self::ANSWERED, client.map_or(0, |c| c.0))
+    }
+
+    /// The session: the answer is on the event stream.
+    pub(crate) fn sent(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        // ANSWERED (01) -> SENT (11); the client bits stay.
+        let _ = self.state.fetch_update(SeqCst, SeqCst, |s| {
+            (s >> Self::SHIFT == Self::ANSWERED).then_some(s | Self::SENT << Self::SHIFT)
+        });
+    }
+
+    /// The waiter, giving up: `false` when the session answered first.
+    #[must_use]
+    pub fn abandon(&self) -> bool {
+        self.settle(Self::ABANDONED, 0) || self.phase() == Self::ABANDONED
+    }
+
+    /// The client the session attached for this ticket: `None` until it
+    /// answers, and for a refused or abandoned attach.
+    pub fn client(&self) -> Option<ClientId> {
+        let s = self.state.load(std::sync::atomic::Ordering::SeqCst);
+        let client = s & ((1 << Self::SHIFT) - 1);
+        (matches!(s >> Self::SHIFT, Self::ANSWERED | Self::SENT) && client != 0).then_some(ClientId(client))
+    }
+
+    /// The answer is on the event stream: a waiter that reads to the end of
+    /// its subscription without finding it has lost it (it lagged).
+    pub fn is_sent(&self) -> bool {
+        self.phase() == Self::SENT
+    }
+}
+
 /// A connection's claim to be an owned session's owner: the token, plus the
 /// secrets it forwards (`None` = forward none).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1238,6 +1329,11 @@ pub enum SessionCommand {
         /// (an owned create, or a re-bind after a reload).
         #[serde(skip)]
         owner: Option<OwnerBind>,
+        /// Host-set (never wire): the answer comes back addressed to this
+        /// ticket ([`Audience::Attach`]), so the waiter that sent this
+        /// Attach takes its own answer and nobody else's.
+        #[serde(skip)]
+        ticket: Option<AttachTicket>,
     },
     Detach { client: ClientId },
     /// Host shutdown of this session: save → on_session_end → leases → Ended.
@@ -1449,7 +1545,7 @@ impl std::fmt::Debug for SessionCommand {
             Self::Query { id, query } => {
                 f.debug_struct("Query").field("id", id).field("query", query).finish()
             }
-            Self::Attach { client, mode, owner } => {
+            Self::Attach { client, mode, owner, ticket: _ } => {
                 f.debug_struct("Attach")
                     .field("client", client)
                     .field("mode", mode)
@@ -1820,12 +1916,28 @@ pub enum Audience {
     /// A reply to an in-process host caller (idle probe, reload checkpoint,
     /// `daemon close`/`rename`): no attachment receives it.
     Host,
+    /// The answer (`Attached`, `AttachRefused`) to the Attach that carried
+    /// this [`AttachTicket`]: no subscriber receives it; the waiter holding
+    /// the ticket picks it off its own subscription.
+    Attach(u64),
     /// Shared state that also answers `reply_to`'s request (`SettingChanged`
     /// for a `Set`, `Resumed` for a `Resume`): everyone receives it, and
     /// every recipient but `reply_to` sees its id as
     /// [`VIEW_CHANGED_SETTING_ID`](super::wire::VIEW_CHANGED_SETTING_ID)
     /// ("answers no request of yours").
     Shared { reply_to: ClientId },
+}
+
+/// For a session answering an Attach: `None` when the ticket's waiter gave
+/// up (answer nothing, attach nobody); else the ticket's audience, or
+/// `Some(None)` for an Attach without a ticket (an in-process caller that
+/// reads the raw stream), which the session addresses as best it can
+/// (`Attached` to the new client, a refusal to the host).
+pub(crate) fn attach_audience(ticket: Option<&AttachTicket>, client: Option<ClientId>) -> Option<Option<Audience>> {
+    match ticket {
+        Some(t) => t.answer(client).then(|| Some(t.audience())),
+        None => Some(None),
+    }
 }
 
 /// Who is reading an event stream, for [`delivers`].
@@ -1872,6 +1984,7 @@ fn seen_as(audience: Audience, to: Subscriber) -> Option<Seen> {
         (Audience::Client(_), _) => None,
         (Audience::Host, Subscriber::Host) => Some(Seen::AsIs),
         (Audience::Host, _) => None,
+        (Audience::Attach(_), _) => None,
         (Audience::Shared { reply_to }, Subscriber::Attachment(me)) if reply_to == me => Some(Seen::AsIs),
         (Audience::Shared { .. }, _) => Some(Seen::ViewOnly),
     }
@@ -2064,6 +2177,32 @@ pub mod reasoning_level_serde {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #457: the attach ticket is host-side only. An `Attach` with one is
+    /// the same bytes on the wire as one without, and one read off the wire
+    /// has none.
+    #[test]
+    fn the_attach_ticket_is_never_on_the_wire() {
+        let attach = |ticket| SessionCommand::Attach {
+            client: ClientMeta { instance: "i".into(), ..ClientMeta::new(ClientKind::Tui) },
+            mode: AttachMode::Mirror,
+            owner: None,
+            ticket,
+        };
+        let with = serde_json::to_value(attach(Some(AttachTicket::new()))).unwrap();
+        assert_eq!(with, serde_json::to_value(attach(None)).unwrap());
+        let mut keys: Vec<&str> = with.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["client", "cmd", "mode"]);
+        let SessionCommand::Attach { ticket, .. } = serde_json::from_value(with).unwrap() else { panic!("an Attach") };
+        assert!(ticket.is_none());
+
+        // Its answer goes to no subscriber: only the ticket's waiter takes it.
+        let env = Envelope::new(SessionId::from("s"), 0, chrono::Utc::now(), SessionEventWire::Idle)
+            .to(AttachTicket::new().audience());
+        assert!(delivers(&env, Subscriber::Attachment(ClientId(1))).is_none());
+        assert!(delivers(&env, Subscriber::Host).is_none());
+    }
 
     #[test]
     fn client_names_are_short_plain_labels() {
