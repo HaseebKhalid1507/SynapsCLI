@@ -229,6 +229,11 @@ pub struct LocalTransport {
 /// without awaiting, so this only runs out if the session died there.
 pub(crate) const ATTACH_ANSWER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// [`await_attach`] retrying the `Detach` of a client it gave up on, while
+/// the session's command queue is full.
+const DETACH_RETRIES: u32 = 5;
+const DETACH_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// How an Attach was answered ([`await_attach`]).
 #[allow(clippy::large_enum_variant)] // one, short-lived, moved straight out (as `SessionEventWire::Attached`)
 pub(crate) enum AttachAnswer {
@@ -252,8 +257,9 @@ pub(crate) enum AttachAnswer {
 /// return `Attached` (and when the caller drops this future), nobody stays
 /// attached for this ticket: before the session answers, the ticket is
 /// abandoned and the session attaches nobody for it; after, the client the
-/// ticket names is sent a `Detach`. That `Detach` is not retried: if the
-/// session's command queue is full at that moment, the client stays.
+/// ticket names is sent a `Detach`. If the session's command queue is full,
+/// that `Detach` is retried for [`DETACH_RETRIES`] x [`DETACH_RETRY_EVERY`];
+/// if the queue stays full that long, the client stays.
 pub(crate) async fn await_attach(
     handle: &SessionHandle,
     rx: &mut broadcast::Receiver<Envelope>,
@@ -271,9 +277,27 @@ pub(crate) async fn await_attach(
                 return;
             }
             let Some(client) = self.ticket.client() else { return };
-            let detach = Addressed { from: None, cmd: SessionCommand::Detach { client } };
-            if let Err(e) = self.handle.send_addressed(detach) {
-                tracing::warn!(session = %self.handle.id, ?client, "attach: given up on after the session attached it, and the detach was not sent: {e}");
+            let detach = move || Addressed { from: None, cmd: SessionCommand::Detach { client } };
+            match (self.handle.send_addressed(detach()), tokio::runtime::Handle::try_current()) {
+                // The session is gone, and its clients with it.
+                (Ok(()) | Err(TransportError::Closed), _) => {}
+                // Its command queue is full: try again for a moment.
+                (Err(TransportError::Backpressure), Ok(rt)) => {
+                    let handle = self.handle.clone();
+                    rt.spawn(async move {
+                        for _ in 0..DETACH_RETRIES {
+                            tokio::time::sleep(DETACH_RETRY_EVERY).await;
+                            match handle.send_addressed(detach()) {
+                                Err(TransportError::Backpressure) => {}
+                                _ => return,
+                            }
+                        }
+                        tracing::warn!(session = %handle.id, ?client, "attach: given up on after the session attached it, and the detach was not sent: its command queue stayed full");
+                    });
+                }
+                (Err(e), _) => {
+                    tracing::warn!(session = %self.handle.id, ?client, "attach: given up on after the session attached it, and the detach was not sent: {e}");
+                }
             }
         }
     }
@@ -842,6 +866,50 @@ mod tests {
         left_nobody_attached(&handle, &mut watch, client).await;
         drop(handle);
         let _ = task.await;
+    }
+
+    /// A ticket is settled once: answering it again (or after it was
+    /// abandoned) changes nothing, so it never names a client that was not
+    /// attached for it.
+    #[test]
+    fn a_settled_ticket_keeps_the_client_it_was_answered_with() {
+        let t = AttachTicket::new();
+        assert!(t.answer(Some(ClientId(7))));
+        assert!(!t.answer(Some(ClientId(9))));
+        assert_eq!(t.client(), Some(ClientId(7)));
+        t.sent();
+        assert!(!t.answer(None));
+        assert_eq!(t.client(), Some(ClientId(7)));
+        assert!(t.is_sent());
+
+        let refused = AttachTicket::new();
+        assert!(refused.answer(None));
+        assert!(!refused.answer(Some(ClientId(3))));
+        assert_eq!(refused.client(), None);
+    }
+
+    /// The session's command queue is full when the wait gives up on an
+    /// attached client: the Detach is retried until it fits.
+    #[tokio::test(start_paused = true)]
+    async fn a_detach_that_does_not_fit_the_queue_is_retried() {
+        use crate::session::handle::{echo, CMD_CHAN_CAP};
+        let (handle, mut ep) = SessionHandle::new(echo::meta_for(&SessionId::from("lt-full")), echo::view_for());
+        let ticket = AttachTicket::new();
+        assert!(ticket.answer(Some(ClientId(5))));
+        for _ in 0..CMD_CHAN_CAP {
+            handle.send(SessionCommand::Cancel).await.unwrap();
+        }
+        assert!(matches!(handle.send(SessionCommand::Cancel).await, Err(TransportError::Backpressure)));
+        let mut rx = handle.subscribe();
+        let wait = await_attach(&handle, &mut rx, &ticket, ATTACH_TIMEOUT);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), wait).await.is_err());
+        // Still full for two retries, then the session catches up.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        for _ in 0..CMD_CHAN_CAP {
+            assert!(matches!(ep.cmd_rx.recv().await.unwrap().cmd, SessionCommand::Cancel));
+        }
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), ep.cmd_rx.recv()).await.expect("retried");
+        assert!(matches!(next.unwrap().cmd, SessionCommand::Detach { client: ClientId(5) }));
     }
 
     #[tokio::test]

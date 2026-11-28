@@ -19,9 +19,9 @@ All notable changes to this project will be documented in this file.
   attached with nobody using it.** If the daemon gives up waiting for a
   session to load, the session attaches nobody for that request when it gets
   to it. If the session had already attached the client but the answer never
-  reached the waiting connection, that client is detached. The detach is
-  sent once: if the session's command queue is full at that moment, the
-  client stays attached.
+  reached the waiting connection, that client is detached. If the session is too
+  busy to take the detach, the daemon keeps trying for half a second; only
+  if the session is still too busy after that does the client stay attached.
 - **A connection can no longer wait forever for the answer to its attach.**
   Once its time is up it waits at most 2 more seconds for an answer the
   session had already started, and it fails at once when it can tell the
