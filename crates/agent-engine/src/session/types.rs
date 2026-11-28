@@ -178,23 +178,18 @@ pub struct OwnerBind {
 #[derive(Clone, Debug)]
 pub struct AttachTicket {
     id: u64,
-    state: std::sync::Arc<AttachTicketState>,
-}
-
-#[derive(Debug, Default)]
-struct AttachTicketState {
-    phase: std::sync::atomic::AtomicU8,
-    /// The client attached for this ticket (0 = none). Only meaningful
-    /// once `phase` is past `WAITING`.
-    client: std::sync::atomic::AtomicU64,
+    state: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AttachTicket {
-    const WAITING: u8 = 0;
-    const ANSWERED: u8 = 1;
-    const ABANDONED: u8 = 2;
+    // `state` = phase (top 2 bits) | the attached client's id (the rest,
+    // 0 = none), so answering sets both in one step.
+    const SHIFT: u32 = 62;
+    const WAITING: u64 = 0;
+    const ANSWERED: u64 = 1;
+    const ABANDONED: u64 = 2;
     /// Answered, and the answer is on the event stream.
-    const SENT: u8 = 3;
+    const SENT: u64 = 3;
 
     #[allow(clippy::new_without_default)] // each one is unique: not a default value
     pub fn new() -> Self {
@@ -210,49 +205,48 @@ impl AttachTicket {
         Audience::Attach(self.id)
     }
 
-    fn phase(&self) -> u8 {
-        self.state.phase.load(std::sync::atomic::Ordering::SeqCst)
+    fn phase(&self) -> u64 {
+        self.state.load(std::sync::atomic::Ordering::SeqCst) >> Self::SHIFT
     }
 
-    fn settle(&self, to: u8) -> bool {
+    /// From `WAITING` only: a ticket is settled once.
+    fn settle(&self, phase: u64, client: u64) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
-        self.state.phase.compare_exchange(Self::WAITING, to, SeqCst, SeqCst).is_ok()
+        let to = phase << Self::SHIFT | (client & ((1 << Self::SHIFT) - 1));
+        self.state.compare_exchange(Self::WAITING, to, SeqCst, SeqCst).is_ok()
     }
 
     /// The session, about to answer: with `Attached` for `client`, or with
-    /// a refusal (`None`). `false` when the waiter already gave up, and
-    /// then it must not attach anyone. After `true` it emits the answer
-    /// without awaiting anything, then calls [`sent`](Self::sent).
+    /// a refusal (`None`). `false` when the waiter already gave up (or the
+    /// ticket was answered before), and then it must not attach anyone.
+    /// After `true` it emits the answer without awaiting anything, then
+    /// calls [`sent`](Self::sent).
     #[must_use]
     pub(crate) fn answer(&self, client: Option<ClientId>) -> bool {
-        use std::sync::atomic::Ordering::SeqCst;
-        // Before the flag: whoever sees it answered sees the client too.
-        // One session answers a ticket, once, so nothing else writes this.
-        self.state.client.store(client.map_or(0, |c| c.0), SeqCst);
-        self.settle(Self::ANSWERED)
+        self.settle(Self::ANSWERED, client.map_or(0, |c| c.0))
     }
 
     /// The session: the answer is on the event stream.
     pub(crate) fn sent(&self) {
         use std::sync::atomic::Ordering::SeqCst;
-        let _ = self.state.phase.compare_exchange(Self::ANSWERED, Self::SENT, SeqCst, SeqCst);
+        // ANSWERED (01) -> SENT (11); the client bits stay.
+        let _ = self.state.fetch_update(SeqCst, SeqCst, |s| {
+            (s >> Self::SHIFT == Self::ANSWERED).then_some(s | Self::SENT << Self::SHIFT)
+        });
     }
 
     /// The waiter, giving up: `false` when the session answered first.
     #[must_use]
     pub fn abandon(&self) -> bool {
-        self.settle(Self::ABANDONED) || self.phase() == Self::ABANDONED
+        self.settle(Self::ABANDONED, 0) || self.phase() == Self::ABANDONED
     }
 
     /// The client the session attached for this ticket: `None` until it
     /// answers, and for a refused or abandoned attach.
     pub fn client(&self) -> Option<ClientId> {
-        use std::sync::atomic::Ordering::SeqCst;
-        if matches!(self.phase(), Self::ANSWERED | Self::SENT) {
-            Some(self.state.client.load(SeqCst)).filter(|c| *c != 0).map(ClientId)
-        } else {
-            None
-        }
+        let s = self.state.load(std::sync::atomic::Ordering::SeqCst);
+        let client = s & ((1 << Self::SHIFT) - 1);
+        (matches!(s >> Self::SHIFT, Self::ANSWERED | Self::SENT) && client != 0).then_some(ClientId(client))
     }
 
     /// The answer is on the event stream: a waiter that reads to the end of
