@@ -583,7 +583,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         return;
     }
     let attach_budget = if handle.lifecycle() == SessionLifecycle::Parked { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT };
-    let attached = await_attach(&mut rx, &ticket, attach_budget).await;
+    let attached = await_attach(&handle, &mut rx, &ticket, attach_budget).await;
     let (client, snapshot) = match attached {
         AttachAnswer::Attached(client, snapshot) => (client, snapshot),
         AttachAnswer::Refused(message) => {
@@ -592,7 +592,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             let _ = writer.await;
             return;
         }
-        AttachAnswer::Closed | AttachAnswer::TimedOut => {
+        // `Lost`: `await_attach` already sent the client's Detach.
+        AttachAnswer::Closed | AttachAnswer::TimedOut | AttachAnswer::Lost => {
             let _ = tx.send(DaemonFrame::Error { session_id: Some(handle.id.clone()), message: "attach timed out".into() }).await;
             let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
             let _ = writer.await;

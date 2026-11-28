@@ -5046,18 +5046,22 @@ impl SessionActor {
             return;
         }
         let live = self.ensure_live().await;
+        let cid = ClientId(self.next_client_id);
         // Its waiter gave up (timed out behind the load above): attach
         // nobody, or that client would stay attached with no one to detach
-        // it. Nothing awaits between here and the answer.
-        let Some(to) = super::types::attach_audience(ticket.as_ref()) else {
+        // it. Otherwise the ticket now names the client, for a waiter that
+        // never reads the answer. Nothing awaits between here and the answer.
+        let Some(to) = super::types::attach_audience(ticket.as_ref(), live.is_ok().then_some(cid)) else {
             tracing::debug!(session = %self.id, "attach: the waiter is gone; not attaching");
             return;
         };
         if let Err(e) = live {
             self.emit_to(to.unwrap_or(Audience::Host), SessionEventWire::AttachRefused { message: e });
+            if let Some(t) = &ticket {
+                t.sent();
+            }
             return;
         }
-        let cid = ClientId(self.next_client_id);
         self.next_client_id += 1;
         let kind = client.kind;
         self.cache_keepwarm_note_attach(kind, mode);
@@ -5120,6 +5124,9 @@ impl SessionActor {
             client: cid,
             snapshot,
         });
+        if let Some(t) = &ticket {
+            t.sent();
+        }
         self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode });
         if resumed && !self.event_queue.is_empty() {
             self.on_queue_wake().await;

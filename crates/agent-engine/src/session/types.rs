@@ -170,20 +170,31 @@ pub struct OwnerBind {
 /// answers with [`Audience::Attach`] of this ticket's id, which only that
 /// waiter matches. Unique per process.
 ///
-/// It also settles a waiter that gives up: [`abandon`](Self::abandon) and
-/// [`answer`](Self::answer) race on one flag, so either the session never
-/// attaches a client nobody is waiting for, or the answer is already on its
-/// way and the waiter takes it.
+/// It also settles a waiter that gives up: giving up and answering race on
+/// one flag, so either the session attaches nobody for it, or it is
+/// answered and the ticket says which client was attached
+/// ([`client`](Self::client)), so a waiter that never reads the answer can
+/// still detach it.
 #[derive(Clone, Debug)]
 pub struct AttachTicket {
     id: u64,
-    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    state: std::sync::Arc<AttachTicketState>,
+}
+
+#[derive(Debug, Default)]
+struct AttachTicketState {
+    phase: std::sync::atomic::AtomicU8,
+    /// The client attached for this ticket (0 = none). Only meaningful
+    /// once `phase` is past `WAITING`.
+    client: std::sync::atomic::AtomicU64,
 }
 
 impl AttachTicket {
     const WAITING: u8 = 0;
     const ANSWERED: u8 = 1;
     const ABANDONED: u8 = 2;
+    /// Answered, and the answer is on the event stream.
+    const SENT: u8 = 3;
 
     #[allow(clippy::new_without_default)] // each one is unique: not a default value
     pub fn new() -> Self {
@@ -199,24 +210,55 @@ impl AttachTicket {
         Audience::Attach(self.id)
     }
 
-    fn settle(&self, to: u8) -> bool {
-        use std::sync::atomic::Ordering::SeqCst;
-        self.state.compare_exchange(Self::WAITING, to, SeqCst, SeqCst).is_ok()
+    fn phase(&self) -> u8 {
+        self.state.phase.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// The session, about to answer: `false` when the waiter already gave
-    /// up, and then it must not attach anyone. After `true` it emits the
-    /// answer without awaiting anything.
+    fn settle(&self, to: u8) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.state.phase.compare_exchange(Self::WAITING, to, SeqCst, SeqCst).is_ok()
+    }
+
+    /// The session, about to answer: with `Attached` for `client`, or with
+    /// a refusal (`None`). `false` when the waiter already gave up, and
+    /// then it must not attach anyone. After `true` it emits the answer
+    /// without awaiting anything, then calls [`sent`](Self::sent).
     #[must_use]
-    pub fn answer(&self) -> bool {
+    pub(crate) fn answer(&self, client: Option<ClientId>) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        // Before the flag: whoever sees it answered sees the client too.
+        // One session answers a ticket, once, so nothing else writes this.
+        self.state.client.store(client.map_or(0, |c| c.0), SeqCst);
         self.settle(Self::ANSWERED)
     }
 
-    /// The waiter, giving up: `false` when the answer is already being
-    /// emitted, and then it is there to take.
+    /// The session: the answer is on the event stream.
+    pub(crate) fn sent(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _ = self.state.phase.compare_exchange(Self::ANSWERED, Self::SENT, SeqCst, SeqCst);
+    }
+
+    /// The waiter, giving up: `false` when the session answered first.
     #[must_use]
     pub fn abandon(&self) -> bool {
-        self.settle(Self::ABANDONED) || self.state.load(std::sync::atomic::Ordering::SeqCst) == Self::ABANDONED
+        self.settle(Self::ABANDONED) || self.phase() == Self::ABANDONED
+    }
+
+    /// The client the session attached for this ticket: `None` until it
+    /// answers, and for a refused or abandoned attach.
+    pub fn client(&self) -> Option<ClientId> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if matches!(self.phase(), Self::ANSWERED | Self::SENT) {
+            Some(self.state.client.load(SeqCst)).filter(|c| *c != 0).map(ClientId)
+        } else {
+            None
+        }
+    }
+
+    /// The answer is on the event stream: a waiter that reads to the end of
+    /// its subscription without finding it has lost it (it lagged).
+    pub fn is_sent(&self) -> bool {
+        self.phase() == Self::SENT
     }
 }
 
@@ -1897,9 +1939,9 @@ pub enum Audience {
 /// `Some(None)` for an Attach without a ticket (an in-process caller that
 /// reads the raw stream), which the session addresses as best it can
 /// (`Attached` to the new client, a refusal to the host).
-pub(crate) fn attach_audience(ticket: Option<&AttachTicket>) -> Option<Option<Audience>> {
+pub(crate) fn attach_audience(ticket: Option<&AttachTicket>, client: Option<ClientId>) -> Option<Option<Audience>> {
     match ticket {
-        Some(t) => t.answer().then(|| Some(t.audience())),
+        Some(t) => t.answer(client).then(|| Some(t.audience())),
         None => Some(None),
     }
 }

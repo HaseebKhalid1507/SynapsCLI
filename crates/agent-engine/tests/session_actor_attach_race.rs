@@ -208,3 +208,54 @@ async fn an_attach_whose_waiter_gave_up_attaches_nobody() {
     }
     end(&handle).await;
 }
+
+/// The real actor names the client on the ticket and marks the answer sent:
+/// what lets a waiter that never reads its answer (it lagged past it) know
+/// so, and detach that client. A refusal is marked sent and names nobody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_ticket_names_the_attached_client_and_says_when_the_answer_is_sent() {
+    let _h = Home::new();
+    let _g = Grace::zero();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = parked_session(&host).await;
+    let attach = |ticket: &AttachTicket| SessionCommand::Attach {
+        client: ClientMeta::new(ClientKind::Tui),
+        mode: AttachMode::Mirror,
+        owner: None,
+        ticket: Some(ticket.clone()),
+    };
+    async fn sent(ticket: &AttachTicket) -> bool {
+        for _ in 0..200 {
+            if ticket.is_sent() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    let lock = agent_core::session_lock::SessionLock::try_acquire(
+        &agent_core::session_lock::sessions_dir(),
+        &handle.journal_id(),
+        agent_core::session_lock::LockHolder { pid: std::process::id(), kind: "test".into() },
+    )
+    .expect("the parked session released its journal lock");
+    let refused = AttachTicket::new();
+    assert!(!refused.is_sent() && refused.client().is_none());
+    handle.send(attach(&refused)).await.unwrap();
+    assert!(sent(&refused).await, "the refusal is marked sent");
+    assert_eq!(refused.client(), None, "a refusal names no client");
+    lock.release_and_remove();
+
+    let ticket = AttachTicket::new();
+    handle.send(attach(&ticket)).await.unwrap();
+    assert!(sent(&ticket).await, "the answer is marked sent");
+    let p = handle.presence();
+    assert_eq!(p.roster.len(), 1);
+    assert_eq!(ticket.client(), Some(p.roster[0].id), "the ticket names the client the actor attached");
+    assert!(!ticket.abandon(), "answered: no longer the waiter's to abandon");
+    end(&handle).await;
+}

@@ -310,7 +310,7 @@ impl SessionHandle {
         self.send_addressed(Addressed { from: Some(from), cmd })
     }
 
-    fn send_addressed(&self, cmd: Addressed) -> Result<(), TransportError> {
+    pub(crate) fn send_addressed(&self, cmd: Addressed) -> Result<(), TransportError> {
         match self.cmd_tx.try_send(cmd) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(TransportError::Backpressure),
@@ -626,8 +626,8 @@ pub mod echo {
         fn handle(&mut self, from: Option<ClientId>, cmd: SessionCommand) -> bool {
             match cmd {
                 SessionCommand::Attach { client, mode, ticket, .. } => {
-                    let Some(to) = attach_audience(ticket.as_ref()) else { return true };
                     let cid = ClientId(self.next_client);
+                    let Some(to) = attach_audience(ticket.as_ref(), Some(cid)) else { return true };
                     self.next_client += 1;
                     let kind = client.kind;
                     let snapshot_meta = client.clone();
@@ -642,6 +642,9 @@ pub mod echo {
                         client: cid,
                         snapshot,
                     });
+                    if let Some(t) = &ticket {
+                        t.sent();
+                    }
                     let name = kind.default_name().to_string();
                     self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode: AttachMode::Mirror });
                 }
@@ -886,7 +889,7 @@ pub mod locked_placeholder {
                     rebind_deadline = Some(crate::session::owned::armed_rebind_deadline(rebind_deadline));
                 }
                 SessionCommand::Attach { ticket, .. } => {
-                    let Some(to) = attach_audience(ticket.as_ref()) else { continue };
+                    let Some(to) = attach_audience(ticket.as_ref(), None) else { continue };
                     let msg = format!(
                         "session {}: journal locked by {} \
                          — close it or use synaps --attach from that process",
@@ -894,6 +897,9 @@ pub mod locked_placeholder {
                         holder_desc
                     );
                     emit_to(&mut seq, &ep.events, to.unwrap_or(Audience::Host), SessionEventWire::AttachRefused { message: msg });
+                    if let Some(t) = &ticket {
+                        t.sent();
+                    }
                 }
                 SessionCommand::Park => {
                     // Already parked, no-op.
