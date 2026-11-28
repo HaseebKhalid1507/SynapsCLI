@@ -10,7 +10,8 @@ use tokio::sync::broadcast;
 
 use super::handle::SessionHandle;
 use super::types::{
-    deliver, AttachMode, AttachSnapshot, ClientId, ClientInput, ClientMeta, Envelope, Roster,
+    deliver, AttachMode, AttachSnapshot, AttachTicket, Audience, ClientId, ClientInput, ClientMeta,
+    Envelope, Roster,
     SessionCommand, SessionEventWire, SessionId, SessionMeta, Subscriber,
 };
 use super::view::RuntimeView;
@@ -223,6 +224,59 @@ pub struct LocalTransport {
     ended: bool,
 }
 
+/// How an Attach was answered ([`await_attach`]).
+#[allow(clippy::large_enum_variant)] // one, short-lived, moved straight out (as `SessionEventWire::Attached`)
+pub(crate) enum AttachAnswer {
+    Attached(ClientId, AttachSnapshot),
+    Refused(String),
+    /// The session's event stream closed first.
+    Closed,
+    TimedOut,
+}
+
+/// The answer to the Attach sent with `ticket`, read off `rx` (subscribed
+/// before the send): the one event addressed to that ticket. Everything
+/// before it is dropped (the snapshot covers it); `rx` is left right after
+/// it. Another attach's answer is never taken.
+///
+/// Giving up (the budget, or the caller dropping this future) abandons the
+/// ticket, so the session attaches nobody for it later. If the session was
+/// already answering at that instant, the answer is taken instead: a client
+/// is never left attached with no one holding its id.
+pub(crate) async fn await_attach(
+    rx: &mut broadcast::Receiver<Envelope>,
+    ticket: &AttachTicket,
+    budget: std::time::Duration,
+) -> AttachAnswer {
+    struct Abandon<'a>(&'a AttachTicket);
+    impl Drop for Abandon<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.abandon();
+        }
+    }
+    async fn answer(rx: &mut broadcast::Receiver<Envelope>, to: Audience) -> AttachAnswer {
+        loop {
+            match rx.recv().await {
+                Ok(env) if env.audience != to => {}
+                Ok(env) => match env.event {
+                    SessionEventWire::Attached { client, snapshot } => return AttachAnswer::Attached(client, snapshot),
+                    SessionEventWire::AttachRefused { message } => return AttachAnswer::Refused(message),
+                    _ => {}
+                },
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return AttachAnswer::Closed,
+            }
+        }
+    }
+    let _abandon = Abandon(ticket);
+    match tokio::time::timeout(budget, answer(rx, ticket.audience())).await {
+        Ok(a) => a,
+        Err(_) if ticket.abandon() => AttachAnswer::TimedOut,
+        // Already answering: the answer is emitted without awaiting.
+        Err(_) => answer(rx, ticket.audience()).await,
+    }
+}
+
 impl LocalTransport {
     /// Attach in-process as a `Mirror` (= `attach_with(.., Mirror)`).
     pub async fn attach(
@@ -240,44 +294,29 @@ impl LocalTransport {
         mode: AttachMode,
     ) -> Result<(Self, AttachSnapshot), TransportError> {
         // Subscribe BEFORE sending so the Attached reply cannot be missed.
-        // `Attached` is broadcast; with one attach in flight per handle at a
-        // time (every host today) the first one seen is ours.
+        // The answer is addressed to this Attach's ticket: other attaches
+        // may be in flight on the same handle (the daemon's connections).
         let mut rx = handle.subscribe();
+        let ticket = AttachTicket::new();
         handle
             .send(SessionCommand::Attach {
                 client: meta,
                 mode,
                 owner: None,
+                ticket: Some(ticket.clone()),
             })
             .await?;
 
-        let wait = async {
-            loop {
-                match rx.recv().await {
-                    Ok(env) => match env.event {
-                        SessionEventWire::Attached { client, snapshot } => {
-                            return Ok((client, snapshot));
-                        }
-                        SessionEventWire::AttachRefused { message } => {
-                            return Err(TransportError::Refused(message));
-                        }
-                        _ => {}
-                    },
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return Err(TransportError::Closed)
-                    }
-                }
-            }
-        };
         let timeout = if handle.lifecycle() == super::types::SessionLifecycle::Parked {
             ATTACH_TIMEOUT_PARKED
         } else {
             ATTACH_TIMEOUT
         };
-        let (client, snapshot) = match tokio::time::timeout(timeout, wait).await {
-            Ok(r) => r?,
-            Err(_) => return Err(TransportError::Protocol("attach timed out".into())),
+        let (client, snapshot) = match await_attach(&mut rx, &ticket, timeout).await {
+            AttachAnswer::Attached(client, snapshot) => (client, snapshot),
+            AttachAnswer::Refused(message) => return Err(TransportError::Refused(message)),
+            AttachAnswer::Closed => return Err(TransportError::Closed),
+            AttachAnswer::TimedOut => return Err(TransportError::Protocol("attach timed out".into())),
         };
         let meta = snapshot.meta.clone();
         Ok((

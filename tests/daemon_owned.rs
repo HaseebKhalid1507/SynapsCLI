@@ -381,6 +381,7 @@ async fn bind_via_host(h: &SessionHandle, token: &OwnerToken, lease: &tokio_util
         client: Hello::new(ClientKind::Test).client,
         mode: AttachMode::Mirror,
         owner: Some(OwnerBind { claim, alive: lease.clone() }),
+        ticket: None,
     })
     .await
     .unwrap();
@@ -764,7 +765,7 @@ async fn an_owned_continue_never_closes_a_session_a_client_is_attaching_to() {
     }
 
     let mut rx = h.subscribe();
-    h.send(SessionCommand::Attach { client: Hello::new(ClientKind::Test).client, mode: AttachMode::Mirror, owner: None })
+    h.send(SessionCommand::Attach { client: Hello::new(ClientKind::Test).client, mode: AttachMode::Mirror, owner: None, ticket: None })
         .await
         .unwrap();
     let cont = SessionConfig { continue_session: Some(Some(sid.as_str().to_string())), ..config(guard.home.path()) };

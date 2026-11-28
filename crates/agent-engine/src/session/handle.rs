@@ -625,7 +625,8 @@ pub mod echo {
 
         fn handle(&mut self, from: Option<ClientId>, cmd: SessionCommand) -> bool {
             match cmd {
-                SessionCommand::Attach { client, mode, .. } => {
+                SessionCommand::Attach { client, mode, ticket, .. } => {
+                    let Some(to) = attach_audience(ticket.as_ref()) else { return true };
                     let cid = ClientId(self.next_client);
                     self.next_client += 1;
                     let kind = client.kind;
@@ -637,7 +638,7 @@ pub mod echo {
                         )));
                     }
                     let snapshot = self.snapshot_for(&snapshot_meta);
-                    self.emit(SessionEventWire::Attached {
+                    self.emit_to(to.unwrap_or(Audience::Client(cid)), SessionEventWire::Attached {
                         client: cid,
                         snapshot,
                     });
@@ -884,14 +885,15 @@ pub mod locked_placeholder {
                 SessionCommand::ArmOwnerRebind if config.owned.is_some() => {
                     rebind_deadline = Some(crate::session::owned::armed_rebind_deadline(rebind_deadline));
                 }
-                SessionCommand::Attach { .. } => {
+                SessionCommand::Attach { ticket, .. } => {
+                    let Some(to) = attach_audience(ticket.as_ref()) else { continue };
                     let msg = format!(
                         "session {}: journal locked by {} \
                          — close it or use synaps --attach from that process",
                         id.as_str(),
                         holder_desc
                     );
-                    emit(&mut seq, &ep.events, SessionEventWire::AttachRefused { message: msg });
+                    emit_to(&mut seq, &ep.events, to.unwrap_or(Audience::Host), SessionEventWire::AttachRefused { message: msg });
                 }
                 SessionCommand::Park => {
                     // Already parked, no-op.

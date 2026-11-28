@@ -5029,14 +5029,32 @@ impl SessionActor {
     /// (else read-only + notice); `Takeover` steals with
     /// `InputOwnerChanged{reason: Takeover}` to everyone (the old owner's
     /// client renders the toast).
-    async fn attach(&mut self, client: ClientMeta, mode: AttachMode, owner: Option<super::types::OwnerBind>) {
+    ///
+    /// The answer (`Attached`, `AttachRefused`) is addressed: to `ticket`
+    /// when the Attach carries one (every transport's does), so concurrent
+    /// attaches each take their own.
+    async fn attach(
+        &mut self,
+        client: ClientMeta,
+        mode: AttachMode,
+        owner: Option<super::types::OwnerBind>,
+        ticket: Option<super::types::AttachTicket>,
+    ) {
         // An owner claim whose connection already gave up: nobody to attach,
         // nothing binds, nothing held is released.
         if owner.as_ref().is_some_and(|b| self.drop_dead_claim(b)) {
             return;
         }
-        if let Err(e) = self.ensure_live().await {
-            self.emit(SessionEventWire::AttachRefused { message: e });
+        let live = self.ensure_live().await;
+        // Its waiter gave up (timed out behind the load above): attach
+        // nobody, or that client would stay attached with no one to detach
+        // it. Nothing awaits between here and the answer.
+        let Some(to) = super::types::attach_audience(ticket.as_ref()) else {
+            tracing::debug!(session = %self.id, "attach: the waiter is gone; not attaching");
+            return;
+        };
+        if let Err(e) = live {
+            self.emit_to(to.unwrap_or(Audience::Host), SessionEventWire::AttachRefused { message: e });
             return;
         }
         let cid = ClientId(self.next_client_id);
@@ -5098,7 +5116,7 @@ impl SessionActor {
         }
         self.publish_presence();
         let snapshot = self.snapshot_for(&snapshot_meta);
-        self.emit(SessionEventWire::Attached {
+        self.emit_to(to.unwrap_or(Audience::Client(cid)), SessionEventWire::Attached {
             client: cid,
             snapshot,
         });
@@ -5721,7 +5739,7 @@ impl SessionActor {
             SessionCommand::EngineCommand { id, name, arg } => {
                 self.engine_command(from, id, name, arg).await
             }
-            SessionCommand::Attach { client, mode, owner } => self.attach(client, mode, owner).await,
+            SessionCommand::Attach { client, mode, owner, ticket } => self.attach(client, mode, owner, ticket).await,
             SessionCommand::Detach { client } => {
                 // An owned session ends with its owner.
                 if let Some(reason) = self.detach_client(client) {
