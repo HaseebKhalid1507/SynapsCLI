@@ -15,9 +15,25 @@ All notable changes to this project will be documented in this file.
   reconnected to a parked session at once, for example after a daemon
   reload. Nothing changes on the socket: no new field and no new protocol
   version.
-- **An attach that times out no longer leaves a client attached with nobody
-  using it.** If the daemon gives up waiting for a session to load, the
-  session attaches nobody for that request when it gets to it.
+- **An attach that times out or loses its answer no longer leaves a client
+  attached with nobody using it.** If the daemon gives up waiting for a
+  session to load, the session attaches nobody for that request when it gets
+  to it. If the session had already attached the client but the answer never
+  reached the waiting connection, that client is detached. The detach is
+  sent once: if the session's command queue is full at that moment, the
+  client stays attached.
+- **A connection can no longer wait forever for the answer to its attach.**
+  Once its time is up it waits at most 2 more seconds for an answer the
+  session had already started, and it fails at once when it can tell the
+  answer was dropped from a backed-up event stream.
+- **An owned session whose creator gave up on the attach ends at once**
+  instead of waiting out the re-bind grace for a creator that is not coming.
+
+### Changed
+
+- **For crates that use `synaps-engine`:** `SessionCommand::Attach` has a
+  new `ticket` field (write `ticket: None` in struct literals), and
+  `Audience` has a new `Attach` variant.
 
 ## [0.13.0] — 2026-11-27
 
