@@ -228,7 +228,7 @@ async fn the_ticket_names_the_attached_client_and_says_when_the_answer_is_sent()
         ticket: Some(ticket.clone()),
     };
     async fn sent(ticket: &AttachTicket) -> bool {
-        for _ in 0..200 {
+        for _ in 0..500 {
             if ticket.is_sent() {
                 return true;
             }

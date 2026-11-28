@@ -176,10 +176,10 @@ impl SessionActor {
     pub(crate) fn drop_claim(&mut self, bind: &OwnerBind) {
         let Some(owned) = self.owned.as_mut() else { return };
         if owned.creator_pending && owned.token.matches(&bind.claim.token) {
-            tracing::info!(session = %self.id, "owned session: the creator's connection is gone before it bound; ending");
+            tracing::info!(session = %self.id, "owned session: the creator gave up or went away before it bound; ending");
             owned.rebind_deadline = Some(tokio::time::Instant::now());
         } else {
-            tracing::info!(session = %self.id, "owned session: a re-bind whose connection is already gone; ignored");
+            tracing::info!(session = %self.id, "owned session: a re-bind that gave up or whose connection is already gone; ignored");
         }
     }
 
