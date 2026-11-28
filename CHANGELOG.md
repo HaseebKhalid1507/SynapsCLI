@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Two clients attaching to the same session at the same moment no longer
+  get mixed up** (#457). Each attach now gets the answer to its own request.
+  Before, both could be told the same client id, or each the other's, with a
+  snapshot built for the other client. Disconnecting one could then detach
+  the other and take its input, and a refused attach could be reported to a
+  client whose attach had worked. This was most likely when several clients
+  reconnected to a parked session at once, for example after a daemon
+  reload. Nothing changes on the socket: no new field and no new protocol
+  version.
+- **An attach that times out no longer leaves a client attached with nobody
+  using it.** If the daemon gives up waiting for a session to load, the
+  session attaches nobody for that request when it gets to it.
+
 ## [0.13.0] — 2026-11-27
 
 Several clients can share a daemon session safely: a reply reaches only the

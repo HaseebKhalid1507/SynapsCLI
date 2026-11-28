@@ -530,6 +530,136 @@ mod tests {
         out
     }
 
+    fn digest_meta() -> ClientMeta {
+        let mut m = ClientMeta::new(ClientKind::Attach);
+        m.history = HistoryMode::Digest;
+        m
+    }
+
+    /// #457: a waiter takes the answer to its own Attach. `b` subscribed
+    /// before `a`'s answer was emitted, so that answer is the first one on
+    /// its stream; it is another client's id and a snapshot built for
+    /// another `ClientMeta`.
+    #[tokio::test]
+    async fn a_waiter_skips_another_attachs_answer() {
+        let (handle, task) = SessionHandle::echo_for_test(SessionId::from("lt-race"));
+        let mut rx_b = handle.subscribe();
+        let (mut a, snap_a) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui)).await.unwrap();
+        assert!(snap_a.display_tail.is_none(), "a full client's snapshot");
+
+        let ticket = AttachTicket::new();
+        handle
+            .send(SessionCommand::Attach {
+                client: digest_meta(),
+                mode: AttachMode::Mirror,
+                owner: None,
+                ticket: Some(ticket.clone()),
+            })
+            .await
+            .unwrap();
+        let AttachAnswer::Attached(b, snap_b) = await_attach(&mut rx_b, &ticket, ATTACH_TIMEOUT).await else {
+            panic!("b's attach is answered");
+        };
+        assert_ne!(b, a.client_id(), "b got its own client id, not a's");
+        assert!(snap_b.display_tail.is_some(), "b got the digest snapshot built for it, not a's");
+        // What follows b's own answer on its stream is kept: its join.
+        assert!(matches!(
+            rx_b.recv().await.unwrap().event,
+            SessionEventWire::ClientJoined { client, .. } if client == b
+        ));
+
+        // a, already attached, is never delivered b's answer.
+        handle.send(SessionCommand::Detach { client: b }).await.unwrap();
+        loop {
+            match next(&mut a).await.event {
+                SessionEventWire::Attached { .. } => panic!("another attach's answer reached an attached client"),
+                SessionEventWire::ClientLeft { client } if client == b => break,
+                _ => {}
+            }
+        }
+        drop(a);
+        drop(handle);
+        let _ = task.await;
+    }
+
+    /// #457, the journal-locked endpoint: its refusal reaches the attach
+    /// that asked, not another waiter on the same handle, and no subscriber.
+    #[tokio::test]
+    async fn a_refusal_reaches_only_its_asker() {
+        let id = SessionId::from("lt-locked");
+        let (handle, _task) =
+            crate::session::handle::locked_placeholder::spawn(id, SessionConfig::default(), "pid 1 (tui)".into());
+        // b waits on the same handle; its own Attach is not answered yet.
+        let mut rx_b = handle.subscribe();
+        let mut watch = handle.subscribe();
+        let ticket_b = AttachTicket::new();
+
+        let refused = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui)).await;
+        assert!(matches!(refused, Err(TransportError::Refused(ref m)) if m.contains("journal locked")), "a is refused");
+
+        let env = loop {
+            let env = watch.recv().await.unwrap();
+            if matches!(env.event, SessionEventWire::AttachRefused { .. }) {
+                break env;
+            }
+        };
+        assert!(delivers(&env, Subscriber::Attachment(ClientId(1))).is_none(), "not for an attachment");
+        assert!(delivers(&env, Subscriber::Host).is_none(), "not for a host listener");
+
+        let waited = await_attach(&mut rx_b, &ticket_b, std::time::Duration::from_millis(200)).await;
+        assert!(matches!(waited, AttachAnswer::TimedOut), "b did not take a's refusal");
+
+        // b's own Attach gets its own refusal.
+        let ticket_b = AttachTicket::new();
+        handle
+            .send(SessionCommand::Attach {
+                client: digest_meta(),
+                mode: AttachMode::Mirror,
+                owner: None,
+                ticket: Some(ticket_b.clone()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(await_attach(&mut rx_b, &ticket_b, ATTACH_TIMEOUT).await, AttachAnswer::Refused(_)));
+    }
+
+    /// A waiter that gave up leaves nobody attached: the session answers an
+    /// abandoned ticket with nothing. A ticket the session is already
+    /// answering cannot be abandoned: the answer is there to take.
+    #[tokio::test]
+    async fn an_abandoned_attach_attaches_nobody() {
+        let (handle, task) = SessionHandle::echo_for_test(SessionId::from("lt-gone"));
+        let mut rx = handle.subscribe();
+        let gone = AttachTicket::new();
+        assert!(gone.abandon());
+        assert!(!gone.answer(), "abandoned first: never answered");
+        handle
+            .send(SessionCommand::Attach {
+                client: ClientMeta::new(ClientKind::Tui),
+                mode: AttachMode::Mirror,
+                owner: None,
+                ticket: Some(gone),
+            })
+            .await
+            .unwrap();
+        // The next attach is the session's first client.
+        let (t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui)).await.unwrap();
+        assert_eq!(t.client_id(), ClientId(1), "the abandoned attach minted no client");
+        while let Ok(env) = rx.try_recv() {
+            assert!(
+                !matches!(env.event, SessionEventWire::ClientJoined { client, .. } if client != t.client_id()),
+                "nobody joined for the abandoned attach"
+            );
+        }
+
+        let answering = AttachTicket::new();
+        assert!(answering.answer());
+        assert!(!answering.abandon(), "the answer is on its way: the waiter takes it");
+        drop(t);
+        drop(handle);
+        let _ = task.await;
+    }
+
     #[tokio::test]
     async fn local_transport_round_trip_over_echo() {
         let (handle, task) = SessionHandle::echo_for_test(SessionId::from("lt-1"));

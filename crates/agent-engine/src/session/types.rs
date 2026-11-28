@@ -2142,6 +2142,32 @@ pub mod reasoning_level_serde {
 mod tests {
     use super::*;
 
+    /// #457: the attach ticket is host-side only. An `Attach` with one is
+    /// the same bytes on the wire as one without, and one read off the wire
+    /// has none.
+    #[test]
+    fn the_attach_ticket_is_never_on_the_wire() {
+        let attach = |ticket| SessionCommand::Attach {
+            client: ClientMeta { instance: "i".into(), ..ClientMeta::new(ClientKind::Tui) },
+            mode: AttachMode::Mirror,
+            owner: None,
+            ticket,
+        };
+        let with = serde_json::to_value(attach(Some(AttachTicket::new()))).unwrap();
+        assert_eq!(with, serde_json::to_value(attach(None)).unwrap());
+        let mut keys: Vec<&str> = with.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["client", "cmd", "mode"]);
+        let SessionCommand::Attach { ticket, .. } = serde_json::from_value(with).unwrap() else { panic!("an Attach") };
+        assert!(ticket.is_none());
+
+        // Its answer goes to no subscriber: only the ticket's waiter takes it.
+        let env = Envelope::new(SessionId::from("s"), 0, chrono::Utc::now(), SessionEventWire::Idle)
+            .to(AttachTicket::new().audience());
+        assert!(delivers(&env, Subscriber::Attachment(ClientId(1))).is_none());
+        assert!(delivers(&env, Subscriber::Host).is_none());
+    }
+
     #[test]
     fn client_names_are_short_plain_labels() {
         for ok in ["tui", "discord", "Dash_2", "a", "9lives", &"x".repeat(CLIENT_NAME_MAX)] {
