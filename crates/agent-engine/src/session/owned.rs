@@ -166,14 +166,21 @@ impl SessionActor {
         if !bind.alive.is_cancelled() {
             return false;
         }
-        let Some(owned) = self.owned.as_mut() else { return true };
+        self.drop_claim(bind);
+        true
+    }
+
+    /// What [`Self::drop_dead_claim`] does with a dead claim. Also for a
+    /// claim whose attach waiter gave up while its connection is still
+    /// closing: it is as dead.
+    pub(crate) fn drop_claim(&mut self, bind: &OwnerBind) {
+        let Some(owned) = self.owned.as_mut() else { return };
         if owned.creator_pending && owned.token.matches(&bind.claim.token) {
             tracing::info!(session = %self.id, "owned session: the creator's connection is gone before it bound; ending");
             owned.rebind_deadline = Some(tokio::time::Instant::now());
         } else {
             tracing::info!(session = %self.id, "owned session: a re-bind whose connection is already gone; ignored");
         }
-        true
     }
 
     /// `client` just attached claiming ownership: bind it if the token

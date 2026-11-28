@@ -5053,6 +5053,11 @@ impl SessionActor {
         // never reads the answer. Nothing awaits between here and the answer.
         let Some(to) = super::types::attach_audience(ticket.as_ref(), live.is_ok().then_some(cid)) else {
             tracing::debug!(session = %self.id, "attach: the waiter is gone; not attaching");
+            // An owner that gave up is a dead claim, whether or not its
+            // connection has finished closing yet.
+            if let Some(bind) = &owner {
+                self.drop_claim(bind);
+            }
             return;
         };
         if let Err(e) = live {

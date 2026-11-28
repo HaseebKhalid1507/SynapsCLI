@@ -435,6 +435,37 @@ async fn a_claim_whose_connection_is_already_gone_ends_the_session() {
     stop_in_process(d).await;
 }
 
+/// The creating connection gave up on the attach, but is still closing when
+/// the actor gets to its claim (its lease is not cancelled yet). The claim
+/// is as dead: the session ends on the spot, not after the grace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_claim_whose_waiter_gave_up_ends_the_session() {
+    let guard = HomeGuard::new();
+    let d = start_in_process(&guard, Script::Sse(ANTHROPIC_SSE), None).await;
+    let sock = d.paths.sock.clone();
+    let (h, token) = owned_via_host(&d, guard.home.path(), false).await;
+    let mut obs = observe(&sock, &h.id).await;
+    let lease = tokio_util::sync::CancellationToken::new();
+    let ticket = AttachTicket::new();
+    assert!(ticket.abandon());
+    let t0 = std::time::Instant::now();
+    h.send(SessionCommand::Attach {
+        client: Hello::new(ClientKind::Test).client,
+        mode: AttachMode::Mirror,
+        owner: Some(OwnerBind { claim: OwnerClaim { token: token.clone(), forward_secrets: None }, alive: lease.clone() }),
+        ticket: Some(ticket),
+    })
+    .await
+    .unwrap();
+    expect_owner_gone(&mut obs).await;
+    assert!(t0.elapsed() < Duration::from_secs(5), "ended at once, not after the grace: {:?}", t0.elapsed());
+    assert!(!lease.is_cancelled(), "its connection was still there");
+    assert!(h.presence().owning_client.is_none(), "the abandoned claim never bound");
+    wait_gone(&sock, &h.id, Duration::from_secs(5)).await;
+    stop_in_process(d).await;
+}
+
 // ── restored sessions ───────────────────────────────────────────────────────
 
 struct EnvVar(&'static str);
